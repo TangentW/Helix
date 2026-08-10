@@ -1,0 +1,177 @@
+import Foundation
+import HelixBytecode
+import HelixCore
+
+extension Verification {
+public struct ResolvedEntry: Hashable, Sendable {
+    public var index: Core.EntryIndex
+    public var key: Core.FunctionKey
+    public var parameterTypes: [Bytecode.ValueType]
+    public var resultType: Bytecode.ValueType
+    public var effects: Core.Effects
+    public var fallbackAllowed: Bool
+
+    public init(
+        index: Core.EntryIndex,
+        key: Core.FunctionKey,
+        parameterTypes: [Bytecode.ValueType],
+        resultType: Bytecode.ValueType,
+        effects: Core.Effects = .init(),
+        fallbackAllowed: Bool = false
+    ) {
+        self.index = index
+        self.key = key
+        self.parameterTypes = parameterTypes
+        self.resultType = resultType
+        self.effects = effects
+        self.fallbackAllowed = fallbackAllowed
+    }
+}
+
+public struct ResolvedNativeImport: Hashable, Sendable {
+    public var id: Core.NativeImportID
+    public var key: Core.NativeImportKey
+    public var parameterTypes: [Bytecode.ValueType]
+    public var resultType: Bytecode.ValueType
+    public var signature: Core.LoweredSignature
+    public var effects: Core.Effects
+    public var contract: Core.NativeImportContract
+    public var capability: Core.Capability
+
+    public init(
+        id: Core.NativeImportID,
+        key: Core.NativeImportKey,
+        parameterTypes: [Bytecode.ValueType],
+        resultType: Bytecode.ValueType,
+        signature: Core.LoweredSignature,
+        effects: Core.Effects,
+        contract: Core.NativeImportContract,
+        capability: Core.Capability = .nativeImportsV2
+    ) {
+        self.id = id
+        self.key = key
+        self.parameterTypes = parameterTypes
+        self.resultType = resultType
+        self.signature = signature
+        self.effects = effects
+        self.contract = contract
+        self.capability = capability
+    }
+}
+
+public enum NativeTypeKind: String, Hashable, Sendable {
+    case value
+    case reference
+    case enumeration
+}
+
+public struct ResolvedNativeType: Hashable, Sendable {
+    public var id: Core.TypeID
+    public var canonicalName: String
+    public var kind: Verification.NativeTypeKind
+    public var layoutFingerprint: Core.Digest
+    public var isCopyable: Bool
+    public var requiresMainActor: Bool
+    public var estimatedSize: UInt64
+
+    public init(
+        id: Core.TypeID,
+        canonicalName: String,
+        kind: Verification.NativeTypeKind,
+        layoutFingerprint: Core.Digest,
+        isCopyable: Bool,
+        requiresMainActor: Bool = false,
+        estimatedSize: UInt64
+    ) {
+        self.id = id
+        self.canonicalName = canonicalName
+        self.kind = kind
+        self.layoutFingerprint = layoutFingerprint
+        self.isCopyable = isCopyable
+        self.requiresMainActor = requiresMainActor
+        self.estimatedSize = estimatedSize
+    }
+}
+
+public struct ShellInterface: Sendable {
+    public var interfaceHash: Core.Digest
+    public var compatibility: Core.Compatibility
+    public var capabilities: Set<Core.Capability>
+    public var entries: [Core.EntryIndex: Verification.ResolvedEntry]
+    public var imports: [Core.NativeImportID: Verification.ResolvedNativeImport]
+    public var types: [Core.TypeID: Verification.ResolvedNativeType]
+
+    public init(
+        interfaceHash: Core.Digest,
+        compatibility: Core.Compatibility,
+        capabilities: Set<Core.Capability> = [.baselineV1],
+        entries: [Verification.ResolvedEntry] = [],
+        imports: [Verification.ResolvedNativeImport] = [],
+        types: [Verification.ResolvedNativeType] = []
+    ) throws {
+        self.interfaceHash = interfaceHash
+        self.compatibility = compatibility
+        self.capabilities = capabilities
+        self.entries = try Self.uniqueDictionary(entries, key: \.index, label: "entry")
+        self.imports = try Self.uniqueDictionary(imports, key: \.id, label: "native import")
+        self.types = try Self.uniqueDictionary(types, key: \.id, label: "native type")
+        try validateBoundarySignatures()
+    }
+
+    func validateBoundarySignatures() throws {
+        for index in entries.keys.sorted() {
+            guard let entry = entries[index] else { continue }
+            for type in entry.parameterTypes + [entry.resultType] {
+                try Self.validateBoundaryType(type, owner: "entry \(entry.index)")
+            }
+        }
+        for id in imports.keys.sorted() {
+            guard let descriptor = imports[id] else { continue }
+            for type in descriptor.parameterTypes + [descriptor.resultType] {
+                try Self.validateBoundaryType(
+                    type,
+                    owner: "native import \(descriptor.id)"
+                )
+            }
+        }
+    }
+
+    private static func validateBoundaryType(
+        _ type: Bytecode.ValueType,
+        owner: String
+    ) throws {
+        switch type {
+        case .local, .error, .address, .closure:
+            // Local nominal identities exist only inside one verified image and
+            // therefore cannot be frozen into a Shell ABI or NativeImport catalog.
+            throw Verification.Error.invalidShellInterface(
+                "patch-local nominal, Error, address, and closure values cannot appear in \(owner) signature"
+            )
+        case let .array(element), let .optional(element):
+            try validateBoundaryType(element, owner: owner)
+        case let .dictionary(key, value):
+            try validateBoundaryType(key, owner: owner)
+            try validateBoundaryType(value, owner: owner)
+        case let .tuple(elements):
+            for element in elements { try validateBoundaryType(element, owner: owner) }
+        case .void, .never, .bool, .integer, .float, .string, .native:
+            break
+        }
+    }
+
+    private static func uniqueDictionary<Element, Key: Hashable>(
+        _ elements: [Element],
+        key: KeyPath<Element, Key>,
+        label: String
+    ) throws -> [Key: Element] {
+        var result: [Key: Element] = [:]
+        for element in elements {
+            let value = element[keyPath: key]
+            guard result.updateValue(element, forKey: value) == nil else {
+                throw Verification.Error.invalidShellInterface("duplicate \(label) \(value)")
+            }
+        }
+        return result
+    }
+}
+}

@@ -1,0 +1,504 @@
+import HelixBytecode
+import HelixCore
+import Testing
+@testable import HelixVerifier
+
+extension VerificationTests {
+@Suite("HLBC address and exclusivity verifier")
+struct AddressSemantics {
+    @Test("A projected local-struct address can be mutated by an inout helper")
+    func acceptsProjectedInoutCall() throws {
+        let counter = Bytecode.LocalTypeKey(rawValue: "Fixture.Counter")
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "mutateCounter",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64,
+                .bool,
+                .local(counter),
+                .address(.local(counter)),
+                .address(.local(counter)),
+                .address(.int64),
+                .int64,
+                .local(counter),
+                .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantBool(result: .init(rawValue: 1), value: true),
+                        .makeStruct(
+                            result: .init(rawValue: 2),
+                            fields: [.init(rawValue: 0), .init(rawValue: 1)]
+                        ),
+                        .storeStack(
+                            slot: .init(rawValue: 0),
+                            source: .init(rawValue: 2),
+                            mode: .initialize
+                        ),
+                        .stackAddress(
+                            result: .init(rawValue: 3),
+                            slot: .init(rawValue: 0)
+                        ),
+                        .beginAccess(
+                            result: .init(rawValue: 4),
+                            address: .init(rawValue: 3),
+                            kind: .modify
+                        ),
+                        .projectStructAddress(
+                            result: .init(rawValue: 5),
+                            base: .init(rawValue: 4),
+                            fieldIndex: 0
+                        ),
+                        .constantInteger(result: .init(rawValue: 6), value: 41),
+                        .apply(
+                            result: nil,
+                            function: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 5), .init(rawValue: 6)]
+                        ),
+                        .endAccess(.init(rawValue: 4)),
+                        .loadStack(
+                            result: .init(rawValue: 7),
+                            slot: .init(rawValue: 0),
+                            mode: .take
+                        ),
+                        .structExtract(
+                            result: .init(rawValue: 8),
+                            structure: .init(rawValue: 7),
+                            fieldIndex: 0
+                        ),
+                        .returnValue(.init(rawValue: 8)),
+                    ]
+                ),
+            ],
+            stackSlotTypes: [.local(counter)]
+        )
+        let image = try verify(
+            root: root,
+            additionalFunctions: [inoutSetter(id: 1)],
+            localTypes: [
+                .init(
+                    key: counter,
+                    kind: .structure(
+                        fields: [
+                            .init(name: "value", type: .int64),
+                            .init(name: "enabled", type: .bool),
+                        ]
+                    )
+                ),
+            ],
+            capabilities: [.baselineV1, .addressValuesV1, .localNominalsV1]
+        )
+
+        #expect(image.module.functions.count == 2)
+    }
+
+    @Test("Address types cannot nest, escape as results, or use copy_value")
+    func rejectsAddressShapeAndOwnershipMisuse() throws {
+        let nested = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "nestedAddress",
+            parameterRegisters: [],
+            resultType: .void,
+            registerTypes: [.address(.address(.int64))],
+            entryBlock: .init(rawValue: 0),
+            blocks: [.init(id: .init(rawValue: 0), instructions: [.returnValue(nil)])]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [nested])
+        }
+
+        let returned = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "returnAddress",
+            parameterRegisters: [.init(rawValue: 0)],
+            parameterConventions: [.inout],
+            resultType: .address(.int64),
+            registerTypes: [.address(.int64)],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [returned])
+        }
+
+        let copied = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "copyAddress",
+            parameterRegisters: [.init(rawValue: 0)],
+            parameterConventions: [.inout],
+            resultType: .void,
+            registerTypes: [.address(.int64), .address(.int64)],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .copyValue(
+                            result: .init(rawValue: 1),
+                            source: .init(rawValue: 0)
+                        ),
+                        .returnValue(nil),
+                    ]
+                ),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [copied])
+        }
+    }
+
+    @Test("Address operations require a live scope with sufficient permission")
+    func rejectsInvalidAccessScopes() throws {
+        let unscoped = addressFunction(
+            id: 1,
+            instructions: initializedPrefix + [
+                .loadAddress(
+                    result: .init(rawValue: 3),
+                    address: .init(rawValue: 1),
+                    mode: .copy
+                ),
+                .destroyStack(.init(rawValue: 0)),
+                .returnValue(nil),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [unscoped])
+        }
+
+        let readWrite = addressFunction(
+            id: 1,
+            instructions: initializedPrefix + [
+                .beginAccess(
+                    result: .init(rawValue: 2),
+                    address: .init(rawValue: 1),
+                    kind: .read
+                ),
+                .storeAddress(
+                    address: .init(rawValue: 2),
+                    source: .init(rawValue: 0),
+                    mode: .assign
+                ),
+                .endAccess(.init(rawValue: 2)),
+                .destroyStack(.init(rawValue: 0)),
+                .returnValue(nil),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [readWrite])
+        }
+
+        let useAfterEnd = addressFunction(
+            id: 1,
+            instructions: initializedPrefix + [
+                .beginAccess(
+                    result: .init(rawValue: 2),
+                    address: .init(rawValue: 1),
+                    kind: .read
+                ),
+                .endAccess(.init(rawValue: 2)),
+                .loadAddress(
+                    result: .init(rawValue: 3),
+                    address: .init(rawValue: 2),
+                    mode: .copy
+                ),
+                .destroyStack(.init(rawValue: 0)),
+                .returnValue(nil),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [useAfterEnd])
+        }
+
+        let missingEnd = addressFunction(
+            id: 1,
+            instructions: initializedPrefix + [
+                .beginAccess(
+                    result: .init(rawValue: 2),
+                    address: .init(rawValue: 1),
+                    kind: .modify
+                ),
+                .trap(.explicit("fixture")),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [missingEnd])
+        }
+    }
+
+    @Test("Exclusive accesses reject overlap and aliased inout arguments")
+    func rejectsExclusiveAccessViolations() throws {
+        let overlapping = addressFunction(
+            id: 1,
+            instructions: initializedPrefix + [
+                .beginAccess(
+                    result: .init(rawValue: 2),
+                    address: .init(rawValue: 1),
+                    kind: .modify
+                ),
+                .beginAccess(
+                    result: .init(rawValue: 4),
+                    address: .init(rawValue: 1),
+                    kind: .read
+                ),
+                .trap(.explicit("fixture")),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [overlapping])
+        }
+
+        let aliasing = addressFunction(
+            id: 1,
+            instructions: initializedPrefix + [
+                .beginAccess(
+                    result: .init(rawValue: 2),
+                    address: .init(rawValue: 1),
+                    kind: .modify
+                ),
+                .apply(
+                    result: nil,
+                    function: .init(rawValue: 2),
+                    arguments: [.init(rawValue: 2), .init(rawValue: 2)]
+                ),
+                .endAccess(.init(rawValue: 2)),
+                .destroyStack(.init(rawValue: 0)),
+                .returnValue(nil),
+            ]
+        )
+        let twoInout = Bytecode.Function(
+            id: .init(rawValue: 2),
+            name: "twoInout",
+            parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+            parameterConventions: [.inout, .inout],
+            resultType: .void,
+            registerTypes: [.address(.int64), .address(.int64)],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [.returnValue(nil)]
+                ),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [aliasing, twoInout])
+        }
+    }
+
+    @Test("Address loads and assignments require initialized storage")
+    func rejectsUninitializedAddressStorage() throws {
+        let load = addressFunction(
+            id: 1,
+            instructions: [
+                .stackAddress(
+                    result: .init(rawValue: 1),
+                    slot: .init(rawValue: 0)
+                ),
+                .beginAccess(
+                    result: .init(rawValue: 2),
+                    address: .init(rawValue: 1),
+                    kind: .read
+                ),
+                .loadAddress(
+                    result: .init(rawValue: 3),
+                    address: .init(rawValue: 2),
+                    mode: .copy
+                ),
+                .endAccess(.init(rawValue: 2)),
+                .returnValue(nil),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [load])
+        }
+
+        let store = addressFunction(
+            id: 1,
+            instructions: [
+                .constantInteger(result: .init(rawValue: 0), value: 1),
+                .stackAddress(
+                    result: .init(rawValue: 1),
+                    slot: .init(rawValue: 0)
+                ),
+                .beginAccess(
+                    result: .init(rawValue: 2),
+                    address: .init(rawValue: 1),
+                    kind: .modify
+                ),
+                .storeAddress(
+                    address: .init(rawValue: 2),
+                    source: .init(rawValue: 0),
+                    mode: .assign
+                ),
+                .endAccess(.init(rawValue: 2)),
+                .returnValue(nil),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [store])
+        }
+    }
+
+    private var initializedPrefix: [Bytecode.Instruction] {
+        [
+            .constantInteger(result: .init(rawValue: 0), value: 1),
+            .storeStack(
+                slot: .init(rawValue: 0),
+                source: .init(rawValue: 0),
+                mode: .initialize
+            ),
+            .stackAddress(
+                result: .init(rawValue: 1),
+                slot: .init(rawValue: 0)
+            ),
+        ]
+    }
+
+    private func addressFunction(
+        id: UInt32,
+        instructions: [Bytecode.Instruction]
+    ) -> Bytecode.Function {
+        .init(
+            id: .init(rawValue: id),
+            name: "addressFixture",
+            parameterRegisters: [],
+            resultType: .void,
+            registerTypes: [
+                .int64,
+                .address(.int64),
+                .address(.int64),
+                .int64,
+                .address(.int64),
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [.init(id: .init(rawValue: 0), instructions: instructions)],
+            stackSlotTypes: [.int64]
+        )
+    }
+
+    private func inoutSetter(id: UInt32) -> Bytecode.Function {
+        .init(
+            id: .init(rawValue: id),
+            name: "setInout",
+            parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+            parameterConventions: [.inout, .owned],
+            resultType: .void,
+            registerTypes: [.address(.int64), .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .storeAddress(
+                            address: .init(rawValue: 0),
+                            source: .init(rawValue: 1),
+                            mode: .assign
+                        ),
+                        .returnValue(nil),
+                    ]
+                ),
+            ]
+        )
+    }
+
+    @discardableResult
+    private func verify(
+        root: Bytecode.Function? = nil,
+        additionalFunctions: [Bytecode.Function] = [],
+        localTypes: [Bytecode.LocalTypeDefinition] = [],
+        capabilities: Set<Core.Capability> = [.baselineV1, .addressValuesV1]
+    ) throws -> Verification.Image {
+        let root = root ?? identityRoot()
+        let shellHash = Core.Digest.sha256("address-verifier-shell")
+        let namespace = Core.ShellNamespaceID.derive(
+            bundleID: "dev.helix.verifier.address",
+            buildNumber: "1",
+            seed: "fixture"
+        )
+        let signature = Core.LoweredSignature(
+            parameters: ["Swift.Int"],
+            result: "Swift.Int"
+        )
+        let key = try Core.FunctionKey.derive(
+            namespace: namespace,
+            module: "Fixture",
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            canonicalDeclaration: "func run(_: Int) -> Int",
+            loweredSignature: signature,
+            role: .function
+        )
+        let compatibility = Core.Compatibility(
+            runtime: Core.Versions.runtime,
+            bytecode: Core.Versions.bytecode,
+            interfaceArchive: Core.Versions.interfaceArchive,
+            compilerFingerprint: "swift-address-verifier-fixture"
+        )
+        let module = Bytecode.Module(
+            name: "AddressVerifierFixture",
+            shellInterfaceHash: shellHash,
+            compatibility: compatibility,
+            capabilities: capabilities,
+            localTypes: localTypes,
+            functions: [root] + additionalFunctions,
+            entries: [
+                .init(
+                    entryIndex: .init(rawValue: 0),
+                    functionKey: key,
+                    functionID: root.id
+                ),
+            ]
+        )
+        let shell = try Verification.ShellInterface(
+            interfaceHash: shellHash,
+            compatibility: compatibility,
+            capabilities: capabilities,
+            entries: [
+                .init(
+                    index: .init(rawValue: 0),
+                    key: key,
+                    parameterTypes: [.int64],
+                    resultType: .int64
+                ),
+            ]
+        )
+        return try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(module),
+            shell: shell,
+            policy: .init(acceptedCapabilities: capabilities)
+        )
+    }
+
+    private func identityRoot() -> Bytecode.Function {
+        .init(
+            id: .init(rawValue: 0),
+            name: "identity",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
+    }
+}
+}

@@ -1,0 +1,1106 @@
+import Foundation
+import HelixBytecode
+import HelixCore
+import HelixInterface
+
+public enum ReleaseCompiler {}
+
+extension ReleaseCompiler {
+    public struct ToolchainIdentity: Codable, Hashable, Sendable {
+        public var fingerprint: String
+        public var versionOutput: String
+        public var targetInfo: String
+        public var compilerBinaryHash: Core.Digest
+
+        public init(
+            fingerprint: String,
+            versionOutput: String,
+            targetInfo: String,
+            compilerBinaryHash: Core.Digest
+        ) {
+            self.fingerprint = fingerprint
+            self.versionOutput = versionOutput
+            self.targetInfo = targetInfo
+            self.compilerBinaryHash = compilerBinaryHash
+        }
+    }
+
+    public struct BuildRequest: Sendable {
+        public var archive: InterfaceArchive.Archive
+        public var sourceFiles: [URL]
+        public var selectedFunctionKeys: Set<Core.FunctionKey>?
+        public var compilerURL: URL
+        public var enforceToolchainFingerprint: Bool
+        public var requestedResources: Core.ResourceLimits
+
+        public init(
+            archive: InterfaceArchive.Archive,
+            sourceFiles: [URL],
+            selectedFunctionKeys: Set<Core.FunctionKey>? = nil,
+            compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
+            enforceToolchainFingerprint: Bool = true,
+            requestedResources: Core.ResourceLimits = .init()
+        ) {
+            self.archive = archive
+            self.sourceFiles = sourceFiles
+            self.selectedFunctionKeys = selectedFunctionKeys
+            self.compilerURL = compilerURL
+            self.enforceToolchainFingerprint = enforceToolchainFingerprint
+            self.requestedResources = requestedResources
+        }
+    }
+
+    public struct BuildResult: Sendable {
+        public var module: Bytecode.Module
+        public var bytecode: Data
+        public var disassembly: String
+        public var changedFunctions: [InterfaceArchive.FunctionRecord]
+        public var bodyFingerprints: [Core.FunctionKey: Core.Digest]
+        public var toolchain: ToolchainIdentity
+    }
+
+    public enum DriverError: Error, Equatable, Sendable, CustomStringConvertible {
+        case emptySourceSet
+        case sourceDoesNotExist(String)
+        case sourceSetMismatch(String)
+        case mixedModules
+        case unknownFunction(Core.FunctionKey)
+        case functionMissingFromSIL(Core.FunctionKey)
+        case changedIneligibleFunction(Core.FunctionKey, reason: String)
+        case loweredSignatureChanged(Core.FunctionKey)
+        case noSemanticChanges
+        case generatedFunctionUnsupported(String, reason: String)
+        case toolchainMismatch(expected: String, actual: String)
+        case compilerIdentityFailed(String)
+
+        public var description: String {
+            switch self {
+            case .emptySourceSet: "Patch Driver requires the complete Swift source set for one module"
+            case let .sourceDoesNotExist(path): "Patch Driver source does not exist: \(path)"
+            case let .sourceSetMismatch(reason): "Patch Driver source set mismatch: \(reason)"
+            case .mixedModules: "selected HLXI functions belong to more than one Swift module"
+            case let .unknownFunction(key): "selected function \(key) is absent from HLXI"
+            case let .functionMissingFromSIL(key): "frozen function \(key) is missing from current canonical SIL"
+            case let .changedIneligibleFunction(key, reason):
+                "changed function \(key) requires a full build: \(reason)"
+            case let .loweredSignatureChanged(key):
+                "function \(key) changed its lowered Swift/SIL signature"
+            case .noSemanticChanges: "no selected function body differs from the HLXI baseline"
+            case let .generatedFunctionUnsupported(symbol, reason):
+                "compiler-generated function \(symbol) is outside the HLBC 1.8 profile: \(reason)"
+            case let .toolchainMismatch(expected, actual):
+                "exact Swift toolchain mismatch; HLXI requires \(expected), current compiler is \(actual)"
+            case let .compilerIdentityFailed(reason): "cannot fingerprint Swift compiler: \(reason)"
+            }
+        }
+    }
+}
+
+extension ReleaseCompiler {
+    public struct Driver: Sendable {
+        private struct TargetInfoDocument: Decodable {
+            struct Target: Decodable {
+                var swiftRuntimeCompatibilityVersion: String?
+            }
+
+            struct Paths: Decodable {
+                var runtimeResourcePath: String
+            }
+
+            var compilerVersion: String?
+            var swiftCompilerTag: String?
+            var target: Target?
+            var paths: Paths
+        }
+
+        public init() {}
+
+        public func toolchainIdentity(
+            compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
+            environment: [String: String] = ProcessInfo.processInfo.environment
+        ) throws -> ToolchainIdentity {
+            let requestedURL = compilerURL.resolvingSymlinksInPath()
+            guard FileManager.default.isExecutableFile(atPath: requestedURL.path) else {
+                throw DriverError.compilerIdentityFailed(
+                    "compiler is not executable at \(requestedURL.path)"
+                )
+            }
+            let identityEnvironment = toolchainIdentityEnvironment(environment)
+            let requested = SwiftFrontend.Driver(
+                compilerURL: requestedURL,
+                environment: identityEnvironment
+            )
+            let requestedTarget = try requested.run(arguments: ["-print-target-info"])
+            guard requestedTarget.terminationStatus == 0 else {
+                throw DriverError.compilerIdentityFailed(requestedTarget.standardError)
+            }
+            let canonicalURL = canonicalFrontendURL(
+                targetInfo: requestedTarget.standardOutput,
+                fallback: requestedURL
+            )
+            let frontend = SwiftFrontend.Driver(
+                compilerURL: canonicalURL,
+                environment: identityEnvironment
+            )
+            let version = try frontend.run(arguments: ["-version"])
+            guard version.terminationStatus == 0 else {
+                throw DriverError.compilerIdentityFailed(version.standardError)
+            }
+            let target = try frontend.run(arguments: ["-print-target-info"])
+            guard target.terminationStatus == 0 else {
+                throw DriverError.compilerIdentityFailed(target.standardError)
+            }
+            guard let targetData = target.standardOutput.data(using: .utf8),
+                  let targetDocument = try? JSONDecoder().decode(
+                      TargetInfoDocument.self,
+                      from: targetData
+                  ),
+                  let compilerVersion = targetDocument.compilerVersion,
+                  !compilerVersion.isEmpty
+            else {
+                throw DriverError.compilerIdentityFailed(
+                    "Swift frontend returned malformed target information"
+                )
+            }
+            let binary: Data
+            do {
+                binary = try Data(contentsOf: canonicalURL, options: .mappedIfSafe)
+            } catch {
+                throw DriverError.compilerIdentityFailed(String(describing: error))
+            }
+            let binaryHash = Core.Digest.sha256(binary)
+            var hasher = Core.StableHasher(domain: "HLX.SwiftToolchain.v3")
+            hasher.append(compilerVersion)
+            hasher.append(targetDocument.swiftCompilerTag ?? "")
+            hasher.append(
+                targetDocument.target?.swiftRuntimeCompatibilityVersion ?? ""
+            )
+            hasher.append(binaryHash)
+            return .init(
+                fingerprint: "sha256:\(hasher.finalize().hex)",
+                versionOutput: (version.standardOutput + version.standardError)
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                targetInfo: target.standardOutput,
+                compilerBinaryHash: binaryHash
+            )
+        }
+
+        /// Toolchain identity must not depend on the target currently selected
+        /// by an Xcode Scheme action. The SDK and deployment target are frozen
+        /// separately in HLXI; leaking them into `swiftc -version` can add
+        /// context-only warnings and split one compiler into two fingerprints.
+        private func toolchainIdentityEnvironment(
+            _ environment: [String: String]
+        ) -> [String: String] {
+            var result = environment
+            for name in [
+                "SDKROOT",
+                "MACOSX_DEPLOYMENT_TARGET",
+                "IPHONEOS_DEPLOYMENT_TARGET",
+                "TVOS_DEPLOYMENT_TARGET",
+                "WATCHOS_DEPLOYMENT_TARGET",
+                "XROS_DEPLOYMENT_TARGET",
+                "DRIVERKIT_DEPLOYMENT_TARGET",
+            ] {
+                result.removeValue(forKey: name)
+            }
+            return result
+        }
+
+        /// `/usr/bin/swiftc` is an Apple tool-selection proxy whose own bytes
+        /// describe macOS, not the selected Swift toolchain. Target info exposes
+        /// the runtime resource root, which lets both the proxy and Xcode's
+        /// direct `swiftc` converge on the same `swift-frontend` identity.
+        private func canonicalFrontendURL(targetInfo: String, fallback: URL) -> URL {
+            guard let data = targetInfo.data(using: .utf8),
+                  let document = try? JSONDecoder().decode(
+                      TargetInfoDocument.self,
+                      from: data
+                  )
+            else { return fallback }
+            let runtime = URL(fileURLWithPath: document.paths.runtimeResourcePath)
+            let candidate = runtime
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("bin/swift-frontend")
+                .resolvingSymlinksInPath()
+            guard FileManager.default.isExecutableFile(atPath: candidate.path) else {
+                return fallback
+            }
+            return candidate
+        }
+
+        public func build(_ request: BuildRequest) throws -> BuildResult {
+            try request.archive.validate()
+            guard !request.sourceFiles.isEmpty else { throw DriverError.emptySourceSet }
+            for source in request.sourceFiles {
+                guard source.pathExtension == "swift",
+                      FileManager.default.fileExists(atPath: source.path)
+                else {
+                    throw DriverError.sourceDoesNotExist(source.path)
+                }
+            }
+            let orderedSourceFiles = try orderedCompleteSourceSet(
+                request.sourceFiles,
+                archive: request.archive
+            )
+            let toolchain = try toolchainIdentity(compilerURL: request.compilerURL)
+            if request.enforceToolchainFingerprint,
+               request.archive.compatibility.compilerFingerprint != toolchain.fingerprint {
+                throw DriverError.toolchainMismatch(
+                    expected: request.archive.compatibility.compilerFingerprint,
+                    actual: toolchain.fingerprint
+                )
+            }
+
+            let allByKey = Dictionary(
+                uniqueKeysWithValues: request.archive.functions.map { ($0.key, $0) }
+            )
+            let selected: [InterfaceArchive.FunctionRecord]
+            if let keys = request.selectedFunctionKeys {
+                selected = try keys.map { key in
+                    guard let record = allByKey[key] else { throw DriverError.unknownFunction(key) }
+                    return record
+                }
+            } else {
+                selected = request.archive.functions
+            }
+            let modules = Set(selected.map(\.moduleName))
+            guard modules.count == 1, let moduleName = modules.first else {
+                throw DriverError.mixedModules
+            }
+            let canonicalSIL = try SwiftFrontend.Driver(compilerURL: request.compilerURL)
+                .emitCanonicalSIL(
+                    sourceFiles: orderedSourceFiles,
+                    invocation: request.archive.metadata.frontendInvocation
+                )
+            let silFile = try CanonicalSIL.File(text: canonicalSIL)
+            let archivedSymbols = Set(request.archive.functions.map(\.mangledName))
+
+            var directlyChanged: [(
+                record: InterfaceArchive.FunctionRecord,
+                function: CanonicalSIL.Function,
+                fingerprint: Core.Digest
+            )] = []
+            for record in selected.sorted(by: recordOrder) {
+                guard let silFunction = silFile.function(mangledName: record.mangledName) else {
+                    throw DriverError.functionMissingFromSIL(record.key)
+                }
+                let fingerprint = ReleaseCompiler.ImplementationFingerprint.compute(
+                    root: silFunction,
+                    in: silFile,
+                    archivedSymbols: archivedSymbols
+                )
+                guard fingerprint != record.bodyFingerprint else { continue }
+                guard record.patchability.isEligible
+                        || isLocalArchivedHelper(record)
+                        || isGenericSpecializationSource(record)
+                else {
+                    throw DriverError.changedIneligibleFunction(
+                        record.key,
+                        reason: record.patchability.explanation ?? "HLXI marks this declaration ineligible"
+                    )
+                }
+                directlyChanged.append((record, silFunction, fingerprint))
+            }
+            guard !directlyChanged.isEmpty else { throw DriverError.noSemanticChanges }
+
+            let recordsBySymbol = Dictionary(
+                uniqueKeysWithValues: request.archive.functions.map { ($0.mangledName, $0) }
+            )
+            let specializationSources = request.archive.functions.filter {
+                isLocalArchivedHelper($0) || isGenericSpecializationSource($0)
+            }.sorted { left, right in
+                left.mangledName.count > right.mangledName.count
+            }
+            let callGraph = Dictionary(uniqueKeysWithValues: request.archive.functions.map {
+                record -> (Core.FunctionKey, Set<Core.FunctionKey>) in
+                let references = silFile.function(mangledName: record.mangledName)
+                    .map {
+                        ReleaseCompiler.ImplementationFingerprint
+                            .referencedSymbols(in: $0.body)
+                    } ?? []
+                return (
+                    record.key,
+                    Set(references.compactMap { symbol in
+                        if let exact = recordsBySymbol[symbol] { return exact.key }
+                        return specializationSources.first {
+                            symbol.hasPrefix($0.mangledName)
+                                && isCompilerGeneratedSymbol(symbol)
+                        }?.key
+                    })
+                )
+            })
+            var reverseGraph: [Core.FunctionKey: Set<Core.FunctionKey>] = [:]
+            for (caller, callees) in callGraph {
+                for callee in callees { reverseGraph[callee, default: []].insert(caller) }
+            }
+
+            var rootKeys = Set(directlyChanged.compactMap {
+                $0.record.patchability.isEligible ? $0.record.key : nil
+            })
+            let changedHelpers = Set(directlyChanged.compactMap {
+                $0.record.patchability.isEligible ? nil : $0.record.key
+            })
+            var reverseWorklist = Array(changedHelpers)
+            var reverseVisited = changedHelpers
+            while let callee = reverseWorklist.popLast() {
+                for caller in reverseGraph[callee, default: []]
+                where reverseVisited.insert(caller).inserted {
+                    if allByKey[caller]?.patchability.isEligible == true {
+                        rootKeys.insert(caller)
+                    } else {
+                        reverseWorklist.append(caller)
+                    }
+                }
+            }
+            guard !rootKeys.isEmpty else {
+                guard let helper = directlyChanged.first(where: {
+                    !$0.record.patchability.isEligible
+                }) else {
+                    throw DriverError.sourceSetMismatch(
+                        "changed eligible functions produced no patch root"
+                    )
+                }
+                throw DriverError.changedIneligibleFunction(
+                    helper.record.key,
+                    reason: "changed local helper or generic specialization source has no patchable caller to route into HLBC"
+                )
+            }
+
+            var compilationKeys = rootKeys
+            var forwardWorklist = Array(rootKeys)
+            while let caller = forwardWorklist.popLast() {
+                for callee in callGraph[caller, default: []] {
+                    guard let record = allByKey[callee],
+                          isLocalArchivedHelper(record),
+                          compilationKeys.insert(callee).inserted
+                    else { continue }
+                    forwardWorklist.append(callee)
+                }
+            }
+            let unroutedHelper = directlyChanged.first { item in
+                guard !item.record.patchability.isEligible else { return false }
+                if isLocalArchivedHelper(item.record) {
+                    return !compilationKeys.contains(item.record.key)
+                }
+                return !hasPatchableReversePath(
+                    from: item.record.key,
+                    reverseGraph: reverseGraph,
+                    records: allByKey
+                )
+            }
+            if let helper = unroutedHelper {
+                throw DriverError.changedIneligibleFunction(
+                    helper.record.key,
+                    reason: "changed local helper or generic specialization source is not reachable from a patchable caller"
+                )
+            }
+            let changedFingerprintByKey = Dictionary(uniqueKeysWithValues: directlyChanged.map {
+                ($0.record.key, $0.fingerprint)
+            })
+            let changedSIL = try compilationKeys.compactMap { key -> (
+                record: InterfaceArchive.FunctionRecord,
+                function: CanonicalSIL.Function,
+                fingerprint: Core.Digest
+            )? in
+                guard let record = allByKey[key] else { return nil }
+                guard let function = silFile.function(mangledName: record.mangledName) else {
+                    throw DriverError.functionMissingFromSIL(record.key)
+                }
+                return (
+                    record,
+                    function,
+                    changedFingerprintByKey[key]
+                        ?? ReleaseCompiler.ImplementationFingerprint.compute(
+                            root: function,
+                            in: silFile,
+                            archivedSymbols: archivedSymbols
+                        )
+                )
+            }.sorted { recordOrder($0.record, $1.record) }
+
+            // The exact optimized SIL remains the source of change identity
+            // and is also the preferred lowering input. Swift commonly
+            // scalarizes local aggregates and inlines nonescaping closures in
+            // this representation, so HLBC does not need to emulate objects
+            // that exist only during compilation. A second, toolchain-pinned
+            // pass remains a deterministic fallback for public operations such
+            // as String and Array APIs whose optimized SIL exposes private
+            // standard-library storage layouts.
+            let loweringSILFile: CanonicalSIL.File
+            if request.archive.metadata.frontendInvocation.optimization == "-Onone" {
+                loweringSILFile = silFile
+            } else {
+                let loweringSIL = try SwiftFrontend.Driver(compilerURL: request.compilerURL)
+                    .emitCanonicalSIL(
+                        sourceFiles: orderedSourceFiles,
+                        invocation: request.archive.metadata.frontendInvocation,
+                        additionalArguments: semanticPreservationArguments(
+                            compilerURL: request.compilerURL
+                        )
+                    )
+                loweringSILFile = try CanonicalSIL.File(text: loweringSIL)
+            }
+
+            var localFunctionIDs: [Core.FunctionKey: Bytecode.FunctionID] = [:]
+            for (offset, item) in changedSIL.enumerated() {
+                guard let rawValue = UInt32(exactly: offset) else {
+                    throw DriverError.sourceSetMismatch("too many changed functions for HLBC")
+                }
+                localFunctionIDs[item.record.key] = .init(rawValue: rawValue)
+            }
+            let compilationSymbols = Set(changedSIL.map(\.record.mangledName))
+            let optimizedGenerated = try discoverGeneratedFunctions(
+                in: silFile,
+                startingAt: compilationSymbols,
+                archive: request.archive
+            )
+            let semanticGenerated = try discoverGeneratedFunctions(
+                in: loweringSILFile,
+                startingAt: compilationSymbols,
+                archive: request.archive
+            )
+            let generatedSymbols = Set(optimizedGenerated.keys)
+                .union(semanticGenerated.keys)
+                .sorted()
+            var generatedFunctions: [GeneratedFunction] = []
+            var generatedBindings: [CanonicalSIL.DirectCallBinding] = []
+            for (offset, symbol) in generatedSymbols.enumerated() {
+                let rawID = changedSIL.count.addingReportingOverflow(offset)
+                guard !rawID.overflow, let id = UInt32(exactly: rawID.partialValue) else {
+                    throw DriverError.sourceSetMismatch(
+                        "too many archived and compiler-generated functions for HLBC"
+                    )
+                }
+                let optimized = optimizedGenerated[symbol]
+                let semantic = semanticGenerated[symbol]
+                let selected = optimized ?? semantic
+                guard let selected else {
+                    throw DriverError.generatedFunctionUnsupported(
+                        symbol,
+                        reason: "discovery produced no SIL body"
+                    )
+                }
+                if let optimized, let semantic, optimized.kind != semantic.kind {
+                    throw DriverError.generatedFunctionUnsupported(
+                        symbol,
+                        reason: "optimized and semantic SIL disagree on function role"
+                    )
+                }
+                let optimizedSignature = try optimized.map {
+                    try generatedSignature(
+                        of: $0.function,
+                        environment: silFile.typeEnvironment,
+                        symbol: symbol
+                    )
+                }
+                let semanticSignature = try semantic.map {
+                    try generatedSignature(
+                        of: $0.function,
+                        environment: loweringSILFile.typeEnvironment,
+                        symbol: symbol
+                    )
+                }
+                if let optimizedSignature, let semanticSignature,
+                   optimizedSignature != semanticSignature {
+                    throw DriverError.generatedFunctionUnsupported(
+                        symbol,
+                        reason: "optimized and semantic SIL disagree on its concrete signature"
+                    )
+                }
+                guard let signature = optimizedSignature ?? semanticSignature else {
+                    throw DriverError.generatedFunctionUnsupported(
+                        symbol,
+                        reason: "no concrete signature is available"
+                    )
+                }
+                let functionID = Bytecode.FunctionID(rawValue: id)
+                generatedFunctions.append(
+                    .init(
+                        symbol: symbol,
+                        id: functionID,
+                        kind: selected.kind,
+                        signature: signature,
+                        optimized: optimized?.function,
+                        semantic: semantic?.function
+                    )
+                )
+                generatedBindings.append(
+                    .init(
+                        mangledName: symbol,
+                        parameterTypes: signature.parameters,
+                        parameterConventions: signature.parameterConventions,
+                        resultType: signature.result,
+                        effects: signature.effects,
+                        target: .function(functionID)
+                    )
+                )
+            }
+            let directCalls = try PatchCompiler.DirectCalls.make(
+                archive: request.archive,
+                localFunctionIDs: localFunctionIDs,
+                additionalBindings: generatedBindings
+            )
+            var changed: [(
+                record: InterfaceArchive.FunctionRecord,
+                function: IntermediateRepresentation.Function,
+                fingerprint: Core.Digest
+            )] = []
+            for item in changedSIL {
+                guard let loweringFunction = loweringSILFile.function(
+                    mangledName: item.record.mangledName
+                ) else {
+                    throw DriverError.functionMissingFromSIL(item.record.key)
+                }
+                let lowered = try lowerProductionFunction(
+                    optimized: item.function,
+                    semantic: loweringFunction,
+                    optimizedTypeEnvironment: silFile.typeEnvironment,
+                    semanticTypeEnvironment: loweringSILFile.typeEnvironment,
+                    displayName: item.record.canonicalDeclaration,
+                    directCalls: directCalls,
+                    expectedEffects: item.record.effects,
+                    hasDistinctSemanticFallback:
+                        request.archive.metadata.frontendInvocation.optimization != "-Onone"
+                )
+                let actualParameters = lowered.parameterRegisters.compactMap { register in
+                    lowered.registerTypes.indices.contains(Int(register.rawValue))
+                        ? lowered.registerTypes[Int(register.rawValue)]
+                        : nil
+                }
+                let conventions = item.record.parameterConventions
+                    ?? Array(repeating: .owned, count: item.record.parameterTypes.count)
+                let expectedParameters = zip(item.record.parameterTypes, conventions).map {
+                    type, convention in convention == .inout ? .address(type) : type
+                }
+                guard actualParameters.count == lowered.parameterRegisters.count,
+                      actualParameters == expectedParameters,
+                      lowered.parameterConventions == conventions,
+                      lowered.resultType == item.record.resultType
+                else {
+                    throw DriverError.loweredSignatureChanged(item.record.key)
+                }
+                changed.append((item.record, lowered, item.fingerprint))
+            }
+
+            var generatedLowered: [(
+                id: Bytecode.FunctionID,
+                function: IntermediateRepresentation.Function
+            )] = []
+            for item in generatedFunctions {
+                let lowered: IntermediateRepresentation.Function
+                do {
+                    if let optimized = item.optimized {
+                        do {
+                            lowered = try CanonicalSIL.Lowerer(
+                                typeEnvironment: silFile.typeEnvironment
+                            ).lower(
+                                optimized,
+                                displayName: item.symbol,
+                                kind: item.kind,
+                                directCalls: directCalls
+                            )
+                        } catch let error as CanonicalSIL.LoweringError {
+                            guard let semantic = item.semantic,
+                                  permitsSemanticFallback(error)
+                            else { throw error }
+                            lowered = try CanonicalSIL.Lowerer(
+                                typeEnvironment: loweringSILFile.typeEnvironment
+                            ).lower(
+                                semantic,
+                                displayName: item.symbol,
+                                kind: item.kind,
+                                directCalls: directCalls
+                            )
+                        }
+                    } else if let semantic = item.semantic {
+                        lowered = try CanonicalSIL.Lowerer(
+                            typeEnvironment: loweringSILFile.typeEnvironment
+                        ).lower(
+                            semantic,
+                            displayName: item.symbol,
+                            kind: item.kind,
+                            directCalls: directCalls
+                        )
+                    } else {
+                        throw DriverError.generatedFunctionUnsupported(
+                            item.symbol,
+                            reason: "no lowering body is available"
+                        )
+                    }
+                } catch let error as DriverError {
+                    throw error
+                } catch {
+                    throw DriverError.generatedFunctionUnsupported(
+                        item.symbol,
+                        reason: String(describing: error)
+                    )
+                }
+                let parameterTypes = lowered.parameterRegisters.compactMap { register in
+                    lowered.registerTypes.indices.contains(Int(register.rawValue))
+                        ? lowered.registerTypes[Int(register.rawValue)]
+                        : nil
+                }
+                guard parameterTypes.count == lowered.parameterRegisters.count,
+                      parameterTypes == item.signature.parameters,
+                      lowered.parameterConventions
+                        == item.signature.parameterConventions,
+                      lowered.resultType == item.signature.result,
+                      lowered.effects == item.signature.effects
+                else {
+                    throw DriverError.generatedFunctionUnsupported(
+                        item.symbol,
+                        reason: "lowering changed its discovered concrete signature"
+                    )
+                }
+                generatedLowered.append((item.id, lowered))
+            }
+
+            var entries: [Bytecode.EntryPoint] = []
+            var fingerprints: [Core.FunctionKey: Core.Digest] = [:]
+            var loweredByID: [(
+                id: Bytecode.FunctionID,
+                function: IntermediateRepresentation.Function
+            )] = []
+            for item in changed {
+                guard let functionID = localFunctionIDs[item.record.key] else {
+                    throw DriverError.sourceSetMismatch(
+                        "local function ID allocation is incomplete"
+                    )
+                }
+                loweredByID.append((functionID, item.function))
+                guard rootKeys.contains(item.record.key) else { continue }
+                guard let entry = item.record.entryIndex else {
+                    throw DriverError.changedIneligibleFunction(
+                        item.record.key,
+                        reason: "patch root has no allocated entry"
+                    )
+                }
+                entries.append(
+                    .init(
+                        entryIndex: entry,
+                        functionKey: item.record.key,
+                        functionID: functionID
+                    )
+                )
+                fingerprints[item.record.key] = item.fingerprint
+            }
+            loweredByID.append(contentsOf: generatedLowered)
+            let reachableIDs = reachableFunctions(
+                roots: Set(entries.map(\.functionID)),
+                functions: loweredByID
+            )
+            let reachable = loweredByID.filter { reachableIDs.contains($0.id) }
+                .sorted { $0.id < $1.id }
+            let reachableIR = reachable.map(\.function)
+            let imports = try directCalls.importRequirements(
+                referencedBy: reachableIR
+            )
+            let localTypes = try mergedLocalTypeDefinitions(
+                optimized: silFile.typeEnvironment,
+                semantic: loweringSILFile.typeEnvironment,
+                referencedBy: reachableIR
+            )
+            let capabilities = CompilerCapabilities.infer(
+                for: reachableIR,
+                imports: imports,
+                localTypes: localTypes
+            )
+            let functions = reachable.map {
+                IntermediateRepresentation.ToBytecode.lower($0.function, id: $0.id)
+            }
+            let module = Bytecode.Module(
+                name: "HelixPatch_\(moduleName)",
+                shellInterfaceHash: request.archive.shellInterfaceHash,
+                compatibility: request.archive.compatibility,
+                capabilities: capabilities,
+                requestedResources: request.requestedResources,
+                localTypes: localTypes,
+                functions: functions,
+                entries: entries,
+                imports: imports
+            )
+            let bytes = try Bytecode.Encoder.encode(module)
+            return .init(
+                module: module,
+                bytecode: bytes,
+                disassembly: Bytecode.Disassembler.disassemble(module),
+                changedFunctions: changed.filter { rootKeys.contains($0.record.key) }.map(\.record),
+                bodyFingerprints: fingerprints,
+                toolchain: toolchain
+            )
+        }
+
+        private struct DiscoveredGeneratedFunction {
+            var function: CanonicalSIL.Function
+            var kind: Bytecode.FunctionKind
+        }
+
+        private struct GeneratedFunction {
+            var symbol: String
+            var id: Bytecode.FunctionID
+            var kind: Bytecode.FunctionKind
+            var signature: GeneratedSignature
+            var optimized: CanonicalSIL.Function?
+            var semantic: CanonicalSIL.Function?
+        }
+
+        private struct GeneratedSignature: Equatable {
+            var parameters: [Bytecode.ValueType]
+            var parameterConventions: [Bytecode.ParameterConvention]
+            var result: Bytecode.ValueType
+            var effects: Core.Effects
+        }
+
+        private func isLocalArchivedHelper(
+            _ record: InterfaceArchive.FunctionRecord
+        ) -> Bool {
+            switch record.patchability.reasonCode {
+            case "HLXIDX006":
+                (record.parameterConventions ?? []).contains(.inout)
+            case "HLXIDX022":
+                true
+            default:
+                false
+            }
+        }
+
+        private func isGenericSpecializationSource(
+            _ record: InterfaceArchive.FunctionRecord
+        ) -> Bool {
+            record.patchability.reasonCode == "HLXIDX007"
+        }
+
+        private func hasPatchableReversePath(
+            from helper: Core.FunctionKey,
+            reverseGraph: [Core.FunctionKey: Set<Core.FunctionKey>],
+            records: [Core.FunctionKey: InterfaceArchive.FunctionRecord]
+        ) -> Bool {
+            var visited: Set<Core.FunctionKey> = [helper]
+            var worklist = [helper]
+            while let callee = worklist.popLast() {
+                for caller in reverseGraph[callee, default: []]
+                where visited.insert(caller).inserted {
+                    if records[caller]?.patchability.isEligible == true { return true }
+                    worklist.append(caller)
+                }
+            }
+            return false
+        }
+
+        private func discoverGeneratedFunctions(
+            in file: CanonicalSIL.File,
+            startingAt archivedSymbols: Set<String>,
+            archive: InterfaceArchive.Archive
+        ) throws -> [String: DiscoveredGeneratedFunction] {
+            let archived = Set(archive.functions.map(\.mangledName))
+            var pending = try archivedSymbols.sorted().flatMap { symbol in
+                try file.function(mangledName: symbol)
+                    .map { try generatedReferences(in: $0.body, archive: archive) }
+                    ?? []
+            }
+            var visited = Set<String>()
+            var kindBySymbol: [String: Bytecode.FunctionKind] = [:]
+            var result: [String: DiscoveredGeneratedFunction] = [:]
+            while let reference = pending.popLast() {
+                let symbol = reference.symbol
+                if let existingKind = kindBySymbol[symbol], existingKind != reference.kind {
+                    throw DriverError.generatedFunctionUnsupported(
+                        symbol,
+                        reason: "different callers use the same generated function as incompatible roles"
+                    )
+                }
+                kindBySymbol[symbol] = reference.kind
+                guard visited.insert(symbol).inserted, !archived.contains(symbol) else {
+                    continue
+                }
+                guard let function = file.function(mangledName: symbol) else { continue }
+                result[symbol] = .init(function: function, kind: reference.kind)
+                pending.append(
+                    contentsOf: try generatedReferences(
+                        in: function.body,
+                        archive: archive
+                    )
+                )
+            }
+            return result
+        }
+
+        private enum GeneratedReferenceUsage: Hashable {
+            case closureConstruction
+            case directCall
+        }
+
+        private func generatedReferences(
+            in body: String,
+            archive: InterfaceArchive.Archive
+        ) throws -> [(symbol: String, kind: Bytecode.FunctionKind)] {
+            var symbolByValue: [String: String] = [:]
+            var usageBySymbol: [String: Set<GeneratedReferenceUsage>] = [:]
+
+            for rawLine in body.split(separator: "\n") {
+                let line = String(rawLine).trimmingCharacters(in: .whitespaces)
+                if let marker = line.range(of: " = function_ref @"),
+                   let result = silResultValue(in: line) {
+                    let suffix = line[marker.upperBound...]
+                    let end = suffix.firstIndex { $0 == " " || $0 == ":" }
+                        ?? suffix.endIndex
+                    let symbol = String(suffix[..<end])
+                    if !symbol.isEmpty { symbolByValue[result] = symbol }
+                    continue
+                }
+                for marker in [" = begin_borrow ", " = copy_value ", " = move_value "] {
+                    guard line.contains(marker),
+                          let result = silResultValue(in: line),
+                          let source = silValue(after: marker, in: line),
+                          let symbol = symbolByValue[source]
+                    else { continue }
+                    symbolByValue[result] = symbol
+                }
+                if let source = silValue(after: "partial_apply", in: line)
+                    ?? silValue(after: "thin_to_thick_function", in: line),
+                   let symbol = symbolByValue[source] {
+                    usageBySymbol[symbol, default: []].insert(.closureConstruction)
+                    continue
+                }
+                if let source = silValue(after: "apply", in: line),
+                   let symbol = symbolByValue[source] {
+                    usageBySymbol[symbol, default: []].insert(.directCall)
+                }
+            }
+
+            return try ReleaseCompiler.ImplementationFingerprint
+                .referencedSymbols(in: body).sorted().compactMap { symbol in
+                    guard isCompilerGeneratedSymbol(symbol),
+                          let fallback = generatedFunctionKind(
+                            symbol,
+                            archive: archive
+                          )
+                    else { return nil }
+                    let usages = usageBySymbol[symbol, default: []]
+                    guard usages.count <= 1 else {
+                        throw DriverError.generatedFunctionUnsupported(
+                            symbol,
+                            reason: "the same generated function is both directly called and used as a closure body"
+                        )
+                    }
+                    let kind: Bytecode.FunctionKind = switch usages.first {
+                    case .closureConstruction: .closureBody
+                    case .directCall: .concreteSpecialization
+                    case nil: fallback
+                    }
+                    return (symbol, kind)
+                }
+        }
+
+        private func silResultValue(in line: String) -> String? {
+            guard let equals = line.range(of: " =") else { return nil }
+            let value = line[..<equals.lowerBound]
+                .trimmingCharacters(in: .whitespaces)
+            return value.first == "%" ? value : nil
+        }
+
+        private func silValue(after marker: String, in line: String) -> String? {
+            guard let range = line.range(of: marker) else { return nil }
+            let suffix = line[range.upperBound...]
+            guard let percent = suffix.firstIndex(of: "%") else { return nil }
+            let tail = suffix[percent...]
+            let end = tail.dropFirst().firstIndex { !$0.isNumber } ?? tail.endIndex
+            let value = String(tail[..<end])
+            return value.count > 1 ? value : nil
+        }
+
+        private func generatedSignature(
+            of function: CanonicalSIL.Function,
+            environment: CanonicalSIL.TypeEnvironment,
+            symbol: String
+        ) throws -> GeneratedSignature {
+            do {
+                let parsed = try CanonicalSIL.Lowerer(
+                    typeEnvironment: environment
+                ).parseFunctionType(function.loweredType)
+                guard !parsed.effects.isAsync else {
+                    throw DriverError.generatedFunctionUnsupported(
+                        symbol,
+                        reason: "async generated helpers require a suspension-aware call contract"
+                    )
+                }
+                return .init(
+                    parameters: parsed.parameters,
+                    parameterConventions: parsed.parameterConventions,
+                    result: parsed.result,
+                    effects: parsed.effects
+                )
+            } catch {
+                throw DriverError.generatedFunctionUnsupported(
+                    symbol,
+                    reason: "its lowered signature is not fully concrete: \(error)"
+                )
+            }
+        }
+
+        private func generatedFunctionKind(
+            _ symbol: String,
+            archive: InterfaceArchive.Archive
+        ) -> Bytecode.FunctionKind? {
+            guard archive.functions.contains(where: {
+                symbol != $0.mangledName && symbol.hasPrefix($0.mangledName)
+            }) else { return nil }
+            if symbol.contains("_Tg") || symbol.contains("Tf") {
+                return .concreteSpecialization
+            }
+            if symbol.contains("cfU") || symbol.contains("fU") {
+                return .closureBody
+            }
+            return nil
+        }
+
+        private func isCompilerGeneratedSymbol(_ symbol: String) -> Bool {
+            ReleaseCompiler.ImplementationFingerprint
+                .isCompilerGeneratedSymbol(symbol)
+        }
+
+        private func reachableFunctions(
+            roots: Set<Bytecode.FunctionID>,
+            functions: [(id: Bytecode.FunctionID, function: IntermediateRepresentation.Function)]
+        ) -> Set<Bytecode.FunctionID> {
+            let byID = Dictionary(uniqueKeysWithValues: functions.map { ($0.id, $0.function) })
+            var reachable = roots
+            var worklist = Array(roots)
+            while let id = worklist.popLast(), let function = byID[id] {
+                for instruction in function.blocks.flatMap(\.instructions) {
+                    let target: Bytecode.FunctionID? = switch instruction {
+                    case let .apply(_, function, _),
+                         let .tryApply(function, _, _, _),
+                         let .makeClosure(_, function, _):
+                        function
+                    default:
+                        nil
+                    }
+                    guard let target, byID[target] != nil,
+                          reachable.insert(target).inserted
+                    else { continue }
+                    worklist.append(target)
+                }
+            }
+            return reachable
+        }
+
+        private func mergedLocalTypeDefinitions(
+            optimized: CanonicalSIL.TypeEnvironment,
+            semantic: CanonicalSIL.TypeEnvironment,
+            referencedBy functions: [IntermediateRepresentation.Function]
+        ) throws -> [Bytecode.LocalTypeDefinition] {
+            let candidates = try optimized.definitions(referencedBy: functions)
+                + semantic.definitions(referencedBy: functions)
+            var byKey: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition] = [:]
+            for candidate in candidates {
+                if let existing = byKey[candidate.key], existing != candidate {
+                    throw DriverError.sourceSetMismatch(
+                        "optimized and semantic SIL disagree on local type \(candidate.key)"
+                    )
+                }
+                byKey[candidate.key] = candidate
+            }
+            return byKey.values.sorted { $0.key < $1.key }
+        }
+
+        private func semanticPreservationArguments(compilerURL: URL) -> [String] {
+            if compilerURL.resolvingSymlinksInPath().lastPathComponent == "swift-frontend" {
+                return ["-disable-sil-perf-optzns"]
+            }
+            return ["-Xfrontend", "-disable-sil-perf-optzns"]
+        }
+
+        private func lowerProductionFunction(
+            optimized: CanonicalSIL.Function,
+            semantic: CanonicalSIL.Function,
+            optimizedTypeEnvironment: CanonicalSIL.TypeEnvironment,
+            semanticTypeEnvironment: CanonicalSIL.TypeEnvironment,
+            displayName: String,
+            directCalls: CanonicalSIL.DirectCallTable,
+            expectedEffects: Core.Effects,
+            hasDistinctSemanticFallback: Bool
+        ) throws -> IntermediateRepresentation.Function {
+            do {
+                return try CanonicalSIL.Lowerer(
+                    typeEnvironment: optimizedTypeEnvironment
+                ).lower(
+                    optimized,
+                    displayName: displayName,
+                    directCalls: directCalls,
+                    expectedEffects: expectedEffects
+                )
+            } catch let error as CanonicalSIL.LoweringError
+                where hasDistinctSemanticFallback && permitsSemanticFallback(error) {
+                return try CanonicalSIL.Lowerer(
+                    typeEnvironment: semanticTypeEnvironment
+                ).lower(
+                    semantic,
+                    displayName: displayName,
+                    directCalls: directCalls,
+                    expectedEffects: expectedEffects
+                )
+            }
+        }
+
+        /// Only compiler-SIL shape failures may select the semantic fallback.
+        /// Function selection and call-table failures describe frozen build
+        /// inputs and must remain hard failures instead of being hidden by a
+        /// second compilation pass.
+        private func permitsSemanticFallback(_ error: CanonicalSIL.LoweringError) -> Bool {
+            switch error {
+            case .malformedSIL,
+                 .unsupportedType,
+                 .unsupportedInstruction,
+                 .undefinedValue,
+                 .unboundCallee,
+                 .unavailableNativeImport,
+                 .callSignatureMismatch:
+                true
+            case .functionSelection, .invalidCallTable:
+                false
+            }
+        }
+
+        private func recordOrder(_ lhs: InterfaceArchive.FunctionRecord, _ rhs: InterfaceArchive.FunctionRecord) -> Bool {
+            switch (lhs.entryIndex, rhs.entryIndex) {
+            case let (.some(left), .some(right)): left < right
+            case (.some, .none): true
+            case (.none, .some): false
+            case (.none, .none): lhs.key.rawValue < rhs.key.rawValue
+            }
+        }
+
+        private func orderedCompleteSourceSet(
+            _ sourceFiles: [URL],
+            archive: InterfaceArchive.Archive
+        ) throws -> [URL] {
+            guard sourceFiles.count == archive.sources.count else {
+                throw DriverError.sourceSetMismatch(
+                    "expected \(archive.sources.count) files from HLXI, received \(sourceFiles.count)"
+                )
+            }
+            let resolvedPaths = sourceFiles.map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
+            guard Set(resolvedPaths).count == resolvedPaths.count else {
+                throw DriverError.sourceSetMismatch("the same physical source was supplied more than once")
+            }
+
+            let supplied = sourceFiles.map { ($0.standardizedFileURL.path, $0) }
+            var ordered: [URL] = []
+            for source in archive.sources.sorted(by: { $0.logicalPath < $1.logicalPath }) {
+                let suffix = "/\(source.logicalPath)"
+                let matches = supplied.filter { $0.0 == source.logicalPath || $0.0.hasSuffix(suffix) }
+                guard matches.count == 1 else {
+                    throw DriverError.sourceSetMismatch(
+                        "logical source \(source.logicalPath) must map to exactly one input file"
+                    )
+                }
+                ordered.append(matches[0].1)
+            }
+            return ordered
+        }
+
+    }
+}

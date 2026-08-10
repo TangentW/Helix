@@ -1,0 +1,42 @@
+{
+  "approvalPolicyID": "helix-demo-local",
+  "antiRollbackCounter": 1,
+  "campaignID": "helix-demo-delivery-fee",
+  "distributionPolicy": "internalHLBC",
+  "distributionPolicyApprovalID": "helix-demo-only",
+  "emergencyPolicyEpoch": 0,
+  "incidentID": "DEMO-DELIVERY-001",
+  "maximumTestedOSVersion": {
+    "major": 99,
+    "minor": 0,
+    "patch": 0
+  },
+  "ownerTeam": "Helix Demo",
+  "packageID": "HLX-DEMO-DELIVERY-001",
+  "payloadPath": "payloads/demo-patch.hlbc",
+  "purpose": "Correct the intentionally broken free-delivery calculation",
+  "requestedResources": {
+    "instructionFuelPerEntry": 100000,
+    "maxCallDepth": 64,
+    "maxFrameRegisters": 4096,
+    "maxNativeCallsPerEntry": 1024,
+    "maxNativeOwnedBytes": 8388608,
+    "maxSuspendedFrames": 0,
+    "maxVMHeapBytes": 8388608,
+    "maxWallTimeBackgroundMilliseconds": 1000,
+    "maxWallTimeMainThreadMilliseconds": 16
+  },
+  "revision": 1,
+  "rollback": {
+    "mutuallyExclusivePackageIDs": [],
+    "parentGenerationPackageHash": null
+  },
+  "rollout": {
+    "cohortSalt": "SEVMSVhfREVNT19MT0NBTF9PTkxZX1NFQ1JFVA==",
+    "installationAllowlist": [],
+    "installationDenylist": [],
+    "percentageBasisPoints": 10000
+  },
+  "schemaVersion": 1,
+  "validityDurationSeconds": 86400
+}

@@ -1,0 +1,2819 @@
+import Foundation
+import HelixBytecode
+import HelixCore
+
+extension Verification {
+public struct Engine: Verification.ImageVerifying {
+    public let decodingLimits: Bytecode.DecodingLimits
+    public let structuralLimits: Verification.StructuralLimits
+
+    public init(
+        decodingLimits: Bytecode.DecodingLimits = .init(),
+        structuralLimits: Verification.StructuralLimits = .init()
+    ) {
+        self.decodingLimits = decodingLimits
+        self.structuralLimits = structuralLimits
+    }
+
+    public func verify(
+        bytes: Data,
+        shell: Verification.ShellInterface,
+        policy: Core.RuntimePolicy
+    ) throws -> Verification.Image {
+        // ShellInterface remains mutable for host assembly and tests, so recheck
+        // its ABI boundary at the trust transition instead of relying on init.
+        try shell.validateBoundarySignatures()
+        let container = try Bytecode.Decoder.decode(bytes, limits: decodingLimits)
+        let module = container.module
+
+        try verifyModuleStructure(module)
+
+        guard container.header.shellInterfaceHash.constantTimeEquals(shell.interfaceHash) else {
+            throw Verification.Error.shellInterfaceHashMismatch
+        }
+        guard shell.compatibility.isCompatible(with: module.compatibility) else {
+            throw Verification.Error.incompatibleToolchain
+        }
+        guard container.header.minimumRuntimeMajor <= Core.Versions.runtime.major else {
+            throw Verification.Error.runtimeVersionTooOld(
+                requiredMajor: container.header.minimumRuntimeMajor,
+                actualMajor: Core.Versions.runtime.major
+            )
+        }
+        guard module.capabilities.contains(.baselineV1) else {
+            throw Verification.Error.missingBaselineCapability
+        }
+        for capability in module.capabilities {
+            guard Verification.Metadata.supportedCapabilities.contains(capability) else {
+                throw Verification.Error.unsupportedCapability(capability)
+            }
+            guard policy.acceptedCapabilities.contains(capability) else {
+                throw Verification.Error.capabilityDenied(capability)
+            }
+            guard shell.capabilities.contains(capability) else {
+                throw Verification.Error.capabilityUnavailableInShell(capability)
+            }
+        }
+        let localTypes = try verifyLocalTypes(
+            module.localTypes,
+            capabilities: module.capabilities
+        )
+
+        let effectiveLimits = module.requestedResources.constrained(by: policy.resourceCeiling)
+        let functionMap = try verifyUniqueFunctions(module.functions)
+        let entryFunctionIDs = Set(module.entries.map(\.functionID))
+        try verifyLocalTypeReferences(module.functions, localTypes: localTypes)
+        try verifySourceMap(module.sourceMap, functions: functionMap)
+        try verifyEntries(
+            module.entries,
+            functions: functionMap,
+            shell: shell,
+            policy: policy,
+            capabilities: module.capabilities
+        )
+        let declaredImports = try verifyImports(
+            module.imports,
+            shell: shell,
+            policy: policy,
+            capabilities: module.capabilities
+        )
+        try verifyNativeTypes(module.functions, shell: shell)
+        try verifyTypeCapabilities(
+            module.functions,
+            localTypes: module.localTypes,
+            capabilities: module.capabilities
+        )
+        for function in module.functions {
+            try verifyFunction(
+                function,
+                functions: functionMap,
+                shell: shell,
+                effectiveLimits: effectiveLimits,
+                declaredImports: declaredImports,
+                localTypes: localTypes,
+                capabilities: module.capabilities,
+                entryFunctionIDs: entryFunctionIDs
+            )
+        }
+
+        return Verification.Image(
+            imageHash: container.header.imageHash,
+            module: module,
+            shell: shell,
+            effectiveResourceLimits: effectiveLimits
+        )
+    }
+
+    private func verifyModuleStructure(_ module: Bytecode.Module) throws {
+        try verifyIdentifier(module.name, label: "module name")
+        guard !module.functions.isEmpty else {
+            throw Verification.Error.invalidModule("at least one function is required")
+        }
+        guard !module.entries.isEmpty else {
+            throw Verification.Error.invalidModule("at least one patch entry is required")
+        }
+        guard module.functions.count <= structuralLimits.maximumFunctions else {
+            throw Verification.Error.invalidModule("function count exceeds the structural limit")
+        }
+        guard module.entries.count <= structuralLimits.maximumEntries else {
+            throw Verification.Error.invalidModule("entry count exceeds the structural limit")
+        }
+        guard module.imports.count <= structuralLimits.maximumImports else {
+            throw Verification.Error.invalidModule("native import count exceeds the structural limit")
+        }
+        guard module.sourceMap.count <= structuralLimits.maximumSourceMapEntries else {
+            throw Verification.Error.invalidModule("source map count exceeds the structural limit")
+        }
+        guard module.capabilities.count <= structuralLimits.maximumCapabilities else {
+            throw Verification.Error.invalidModule("capability count exceeds the structural limit")
+        }
+        guard module.localTypes.count <= structuralLimits.maximumLocalTypes else {
+            throw Verification.Error.invalidModule("local type count exceeds the structural limit")
+        }
+        for capability in module.capabilities {
+            try verifyIdentifier(capability.rawValue, label: "capability")
+        }
+
+        var totalInstructions = 0
+        for function in module.functions {
+            try verifyIdentifier(function.name, label: "function name")
+            guard function.blocks.count <= structuralLimits.maximumBlocksPerFunction else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "block count exceeds the structural limit"
+                )
+            }
+            var instructionCount = 0
+            for block in function.blocks {
+                let addition = instructionCount.addingReportingOverflow(block.instructions.count)
+                guard !addition.overflow,
+                      addition.partialValue <= structuralLimits.maximumInstructionsPerFunction
+                else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "instruction count exceeds the structural limit"
+                    )
+                }
+                instructionCount = addition.partialValue
+            }
+            let addition = totalInstructions.addingReportingOverflow(instructionCount)
+            guard !addition.overflow,
+                  addition.partialValue <= structuralLimits.maximumTotalInstructions
+            else {
+                throw Verification.Error.invalidModule("total instruction count exceeds the structural limit")
+            }
+            totalInstructions = addition.partialValue
+            if let location = function.sourceLocation {
+                try verifySourceLocation(location) { reason in
+                    Verification.Error.invalidFunction(function: function.id, reason: reason)
+                }
+            }
+        }
+    }
+
+    private func verifyLocalTypes(
+        _ definitions: [Bytecode.LocalTypeDefinition],
+        capabilities: Set<Core.Capability>
+    ) throws -> [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition] {
+        if !definitions.isEmpty, !capabilities.contains(.localNominalsV1) {
+            throw Verification.Error.capabilityDenied(.localNominalsV1)
+        }
+        var result: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition] = [:]
+        var totalMembers = 0
+        for definition in definitions {
+            try verifyIdentifier(definition.key.rawValue, label: "local type key")
+            guard result.updateValue(definition, forKey: definition.key) == nil else {
+                throw Verification.Error.invalidModule(
+                    "duplicate local type \(definition.key)"
+                )
+            }
+            let members: Int
+            switch definition.kind {
+            case let .structure(fields):
+                members = fields.count
+                guard Set(fields.map(\.name)).count == fields.count else {
+                    throw Verification.Error.invalidModule(
+                        "local struct \(definition.key) has duplicate fields"
+                    )
+                }
+                for field in fields {
+                    try verifyIdentifier(field.name, label: "local struct field")
+                }
+            case let .enumeration(cases):
+                members = cases.count
+                guard !cases.isEmpty else {
+                    throw Verification.Error.invalidModule(
+                        "local enum \(definition.key) has no cases"
+                    )
+                }
+                guard Set(cases.map(\.name)).count == cases.count else {
+                    throw Verification.Error.invalidModule(
+                        "local enum \(definition.key) has duplicate cases"
+                    )
+                }
+                for item in cases {
+                    try verifyIdentifier(item.name, label: "local enum case")
+                }
+            }
+            guard members <= structuralLimits.maximumLocalTypeMembers else {
+                throw Verification.Error.invalidModule(
+                    "local type \(definition.key) has too many members"
+                )
+            }
+            let addition = totalMembers.addingReportingOverflow(members)
+            guard !addition.overflow,
+                  addition.partialValue <= structuralLimits.maximumTotalLocalTypeMembers
+            else {
+                throw Verification.Error.invalidModule(
+                    "total local type member count exceeds the structural limit"
+                )
+            }
+            totalMembers = addition.partialValue
+        }
+
+        func verifyMemberType(_ type: Bytecode.ValueType, depth: Int) throws {
+            guard depth <= structuralLimits.maximumLocalTypeNestingDepth else {
+                throw Verification.Error.invalidModule(
+                    "local type member nesting exceeds "
+                        + "\(structuralLimits.maximumLocalTypeNestingDepth) levels"
+                )
+            }
+            switch type {
+            case .void, .never:
+                throw Verification.Error.invalidModule(
+                    "local type members cannot be Void or Never"
+                )
+            case .native:
+                // HLBC 1.6 local values are fully VM-managed. Native-handle
+                // ownership inside recursive aggregates is deferred until the
+                // address/exclusivity model can prove destruction paths.
+                throw Verification.Error.invalidModule(
+                    "HLBC 1.6 local types cannot contain native values"
+                )
+            case .address:
+                throw Verification.Error.invalidModule(
+                    "local type members cannot contain address values"
+                )
+            case .closure:
+                throw Verification.Error.invalidModule(
+                    "local type members cannot contain closure values"
+                )
+            case let .local(key):
+                guard result[key] != nil else {
+                    throw Verification.Error.invalidModule(
+                        "local type references unknown definition \(key)"
+                    )
+                }
+            case .error:
+                // A dynamic Error payload could recursively contain its owning
+                // local value and evade the statically bounded nominal graph.
+                throw Verification.Error.invalidModule(
+                    "HLBC 1.6 local types cannot contain Error existential values"
+                )
+            case let .integer(bitWidth, _):
+                guard [8, 16, 32, 64].contains(bitWidth) else {
+                    throw Verification.Error.invalidModule(
+                        "local type contains unsupported integer width \(bitWidth)"
+                    )
+                }
+            case let .float(bitWidth):
+                guard bitWidth == 32 || bitWidth == 64 else {
+                    throw Verification.Error.invalidModule(
+                        "local type contains unsupported float width \(bitWidth)"
+                    )
+                }
+            case let .array(element), let .optional(element):
+                try verifyMemberType(element, depth: depth + 1)
+            case let .dictionary(key, value):
+                guard isSupportedDictionaryKey(key) else {
+                    throw Verification.Error.invalidModule(
+                        "local type Dictionary key must be Bool, integer, or String"
+                    )
+                }
+                try verifyMemberType(key, depth: depth + 1)
+                try verifyMemberType(value, depth: depth + 1)
+            case let .tuple(elements):
+                guard elements.count <= 64 else {
+                    throw Verification.Error.invalidModule(
+                        "local type tuple contains more than 64 elements"
+                    )
+                }
+                for element in elements {
+                    try verifyMemberType(element, depth: depth + 1)
+                }
+            case .bool, .string:
+                break
+            }
+        }
+        for definition in definitions {
+            switch definition.kind {
+            case let .structure(fields):
+                for field in fields { try verifyMemberType(field.type, depth: 0) }
+            case let .enumeration(cases):
+                for item in cases {
+                    if let payload = item.payloadType {
+                        try verifyMemberType(payload, depth: 0)
+                    }
+                }
+            }
+        }
+        try verifyLocalTypeGraph(result)
+        return result
+    }
+
+    private func verifyLocalTypeGraph(
+        _ definitions: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
+    ) throws {
+        var visiting = Set<Bytecode.LocalTypeKey>()
+        var depths: [Bytecode.LocalTypeKey: Int] = [:]
+        for key in definitions.keys.sorted() {
+            _ = try localTypeExpansionDepth(
+                key,
+                definitions: definitions,
+                visiting: &visiting,
+                depths: &depths
+            )
+        }
+    }
+
+    private func localTypeExpansionDepth(
+        _ key: Bytecode.LocalTypeKey,
+        definitions: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        visiting: inout Set<Bytecode.LocalTypeKey>,
+        depths: inout [Bytecode.LocalTypeKey: Int]
+    ) throws -> Int {
+        if let depth = depths[key] { return depth }
+        guard visiting.insert(key).inserted else {
+            throw Verification.Error.invalidModule(
+                "local type graph is recursive at \(key); "
+                    + "recursive local values are unsupported in HLBC 1.6"
+            )
+        }
+        defer { visiting.remove(key) }
+        guard let definition = definitions[key] else {
+            throw Verification.Error.invalidModule(
+                "local type references unknown definition \(key)"
+            )
+        }
+
+        func typeDepth(_ type: Bytecode.ValueType) throws -> Int {
+            switch type {
+            case let .local(dependency):
+                try localTypeExpansionDepth(
+                    dependency,
+                    definitions: definitions,
+                    visiting: &visiting,
+                    depths: &depths
+                )
+            case let .array(element), let .optional(element):
+                try typeDepth(element) + 1
+            case let .dictionary(key, value):
+                try max(typeDepth(key), typeDepth(value)) + 1
+            case let .tuple(elements):
+                try (elements.map(typeDepth).max() ?? 0) + 1
+            case .void, .never, .bool, .integer, .float, .string, .native, .error,
+                 .address, .closure:
+                0
+            }
+        }
+
+        let memberTypes: [Bytecode.ValueType] = switch definition.kind {
+        case let .structure(fields): fields.map(\.type)
+        case let .enumeration(cases): cases.compactMap(\.payloadType)
+        }
+        let depth = try (memberTypes.map(typeDepth).max() ?? 0) + 1
+        guard depth <= structuralLimits.maximumLocalTypeNestingDepth else {
+            throw Verification.Error.invalidModule(
+                "local type expanded shape exceeds "
+                    + "\(structuralLimits.maximumLocalTypeNestingDepth) levels"
+            )
+        }
+        depths[key] = depth
+        return depth
+    }
+
+    private func verifyLocalTypeReferences(
+        _ functions: [Bytecode.Function],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
+    ) throws {
+        func visit(_ type: Bytecode.ValueType) throws {
+            switch type {
+            case let .local(key):
+                guard localTypes[key] != nil else {
+                    throw Verification.Error.invalidModule(
+                        "function type references unknown local type \(key)"
+                    )
+                }
+            case let .array(element), let .optional(element):
+                try visit(element)
+            case let .address(pointee):
+                try visit(pointee)
+            case let .closure(signature):
+                for component in signature.parameters + [signature.result] {
+                    try visit(component)
+                }
+            case let .dictionary(key, value):
+                try visit(key)
+                try visit(value)
+            case let .tuple(elements):
+                for element in elements { try visit(element) }
+            case .void, .never, .bool, .integer, .float, .string, .native, .error:
+                break
+            }
+        }
+        for function in functions {
+            for type in function.registerTypes + function.stackSlotTypes + [function.resultType] {
+                try visit(type)
+            }
+        }
+    }
+
+    private func verifyIdentifier(_ value: String, label: String) throws {
+        guard !value.isEmpty,
+              value.utf8.count <= structuralLimits.maximumIdentifierUTF8Bytes,
+              !value.utf8.contains(0)
+        else {
+            throw Verification.Error.invalidModule("\(label) is empty, oversized, or contains NUL")
+        }
+    }
+
+    private func verifySourceMap(
+        _ sourceMap: [Bytecode.SourceMapEntry],
+        functions: [Bytecode.FunctionID: Bytecode.Function]
+    ) throws {
+        struct Coordinate: Hashable {
+            var functionID: Bytecode.FunctionID
+            var blockID: Bytecode.BlockID
+            var instructionOffset: UInt32
+        }
+
+        var seen = Set<Coordinate>()
+        for entry in sourceMap {
+            let coordinate = Coordinate(
+                functionID: entry.functionID,
+                blockID: entry.blockID,
+                instructionOffset: entry.instructionOffset
+            )
+            guard seen.insert(coordinate).inserted else {
+                throw Verification.Error.invalidSourceMap("duplicate location for \(entry.functionID).\(entry.blockID)#\(entry.instructionOffset)")
+            }
+            guard let function = functions[entry.functionID] else {
+                throw Verification.Error.invalidSourceMap("unknown function \(entry.functionID)")
+            }
+            guard let block = function.blocks.first(where: { $0.id == entry.blockID }) else {
+                throw Verification.Error.invalidSourceMap("unknown block \(entry.functionID).\(entry.blockID)")
+            }
+            guard let offset = Int(exactly: entry.instructionOffset),
+                  block.instructions.indices.contains(offset)
+            else {
+                throw Verification.Error.invalidSourceMap(
+                    "instruction offset is outside \(entry.functionID).\(entry.blockID)"
+                )
+            }
+            try verifySourceLocation(entry.location) { Verification.Error.invalidSourceMap($0) }
+        }
+    }
+
+    private func verifySourceLocation<Failure: Swift.Error>(
+        _ location: Core.SourceLocation,
+        error: (String) -> Failure
+    ) throws {
+        guard !location.file.isEmpty,
+              location.file.utf8.count <= structuralLimits.maximumSourcePathUTF8Bytes,
+              !location.file.utf8.contains(0),
+              location.line > 0,
+              location.column > 0
+        else {
+            throw error("source location has an invalid path, line, or column")
+        }
+    }
+
+    private func verifyUniqueFunctions(_ functions: [Bytecode.Function]) throws -> [Bytecode.FunctionID: Bytecode.Function] {
+        var result: [Bytecode.FunctionID: Bytecode.Function] = [:]
+        for function in functions {
+            guard result.updateValue(function, forKey: function.id) == nil else {
+                throw Verification.Error.duplicateFunction(function.id)
+            }
+        }
+        return result
+    }
+
+    private func verifyEntries(
+        _ entries: [Bytecode.EntryPoint],
+        functions: [Bytecode.FunctionID: Bytecode.Function],
+        shell: Verification.ShellInterface,
+        policy: Core.RuntimePolicy,
+        capabilities: Set<Core.Capability>
+    ) throws {
+        var seen = Set<Core.EntryIndex>()
+        for entry in entries {
+            guard seen.insert(entry.entryIndex).inserted else {
+                throw Verification.Error.duplicateEntry(entry.entryIndex)
+            }
+            guard let shellEntry = shell.entries[entry.entryIndex] else {
+                throw Verification.Error.unknownEntry(entry.entryIndex)
+            }
+            guard shellEntry.key == entry.functionKey else {
+                throw Verification.Error.entryKeyMismatch(entry.entryIndex)
+            }
+            guard let function = functions[entry.functionID] else {
+                throw Verification.Error.invalidFunction(
+                    function: entry.functionID,
+                    reason: "entry references a missing function"
+                )
+            }
+            guard function.kind == .ordinary else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "closure bodies and compiler specializations cannot be patch entries"
+                )
+            }
+            let parameterTypes = try function.parameterRegisters.map { register -> Bytecode.ValueType in
+                guard let type = function.type(of: register) else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "parameter register \(register) is out of range"
+                    )
+                }
+                return type
+            }
+            guard parameterTypes == shellEntry.parameterTypes,
+                  !function.parameterConventions.contains(.inout),
+                  function.resultType == shellEntry.resultType,
+                  function.effects == shellEntry.effects
+            else {
+                throw Verification.Error.entrySignatureMismatch(entry.entryIndex)
+            }
+            if shellEntry.effects.requiresMainActor {
+                guard policy.allowMainActorSynchronousEntries,
+                      shell.capabilities.contains(.mainActorSyncV1),
+                      capabilities.contains(.mainActorSyncV1)
+                else {
+                    throw Verification.Error.capabilityDenied(.mainActorSyncV1)
+                }
+            }
+            if shellEntry.effects.isAsync,
+               !capabilities.contains(.asyncLeafEntriesV1) {
+                throw Verification.Error.capabilityDenied(.asyncLeafEntriesV1)
+            }
+            if shellEntry.effects.mayThrow,
+               !capabilities.contains(.untypedThrowsV1),
+               !capabilities.contains(.structuredErrorsV1) {
+                throw Verification.Error.capabilityDenied(.untypedThrowsV1)
+            }
+        }
+    }
+
+    private func verifyImports(
+        _ imports: [Bytecode.ImportRequirement],
+        shell: Verification.ShellInterface,
+        policy: Core.RuntimePolicy,
+        capabilities: Set<Core.Capability>
+    ) throws -> [Core.NativeImportID: Bytecode.ImportRequirement] {
+        if !imports.isEmpty, !capabilities.contains(.nativeImportsV2) {
+            throw Verification.Error.capabilityDenied(.nativeImportsV2)
+        }
+        var seen = Set<Core.NativeImportID>()
+        var result: [Core.NativeImportID: Bytecode.ImportRequirement] = [:]
+        for requirement in imports {
+            guard seen.insert(requirement.id).inserted else {
+                throw Verification.Error.duplicateImport(requirement.id)
+            }
+            guard policy.allowedNativeImports.contains(requirement.id) else {
+                throw Verification.Error.importDenied(requirement.id)
+            }
+            guard let descriptor = shell.imports[requirement.id] else {
+                throw Verification.Error.unknownImport(requirement.id)
+            }
+            guard capabilities.contains(requirement.requiredCapability) else {
+                throw Verification.Error.capabilityDenied(requirement.requiredCapability)
+            }
+            guard let contract = requirement.contract,
+                  descriptor.key == requirement.key,
+                  descriptor.signature == requirement.signature,
+                  descriptor.effects == requirement.effects,
+                  descriptor.contract == contract,
+                  descriptor.capability == requirement.requiredCapability
+            else {
+                throw Verification.Error.importDescriptorMismatch(requirement.id)
+            }
+            if descriptor.effects.mayThrow,
+               !capabilities.contains(.untypedThrowsV1),
+               !capabilities.contains(.structuredErrorsV1) {
+                throw Verification.Error.capabilityDenied(.untypedThrowsV1)
+            }
+            do {
+                try descriptor.contract.validate(effects: descriptor.effects)
+            } catch {
+                throw Verification.Error.invalidShellInterface(
+                    "native import \(requirement.id) contract is invalid: \(error)"
+                )
+            }
+            if !descriptor.effects.requiresMainActor,
+               (descriptor.parameterTypes + [descriptor.resultType]).contains(where: {
+                   usesMainActorNativeType($0, shell: shell)
+               }) {
+                throw Verification.Error.importDescriptorMismatch(requirement.id)
+            }
+            result[requirement.id] = requirement
+        }
+        return result
+    }
+
+    private func verifyNativeTypes(_ functions: [Bytecode.Function], shell: Verification.ShellInterface) throws {
+        for function in functions {
+            for type in function.registerTypes + function.stackSlotTypes + [function.resultType] {
+                try verifyNativeTypes(type, shell: shell)
+            }
+            if !function.effects.requiresMainActor,
+               (function.registerTypes + function.stackSlotTypes + [function.resultType])
+                .contains(where: { usesMainActorNativeType($0, shell: shell) }) {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "MainActor native type is used by a nonisolated function"
+                )
+            }
+        }
+    }
+
+    private func usesMainActorNativeType(
+        _ type: Bytecode.ValueType,
+        shell: Verification.ShellInterface
+    ) -> Bool {
+        switch type {
+        case let .native(id): shell.types[id]?.requiresMainActor == true
+        case let .array(element), let .optional(element), let .address(element):
+            usesMainActorNativeType(element, shell: shell)
+        case let .dictionary(key, value):
+            usesMainActorNativeType(key, shell: shell)
+                || usesMainActorNativeType(value, shell: shell)
+        case let .tuple(elements):
+            elements.contains { usesMainActorNativeType($0, shell: shell) }
+        case let .closure(signature):
+            (signature.parameters + [signature.result]).contains {
+                usesMainActorNativeType($0, shell: shell)
+            }
+        case .void, .never, .bool, .integer, .float, .string, .local, .error:
+            false
+        }
+    }
+
+    private func verifyNativeTypes(_ type: Bytecode.ValueType, shell: Verification.ShellInterface) throws {
+        switch type {
+        case let .native(id):
+            guard shell.types[id] != nil else { throw Verification.Error.unknownNativeType(id) }
+        case let .tuple(elements):
+            for element in elements { try verifyNativeTypes(element, shell: shell) }
+        case let .optional(wrapped), let .address(wrapped):
+            try verifyNativeTypes(wrapped, shell: shell)
+        case let .array(element):
+            try verifyNativeTypes(element, shell: shell)
+        case let .dictionary(key, value):
+            try verifyNativeTypes(key, shell: shell)
+            try verifyNativeTypes(value, shell: shell)
+        case let .closure(signature):
+            for component in signature.parameters + [signature.result] {
+                try verifyNativeTypes(component, shell: shell)
+            }
+        case .void, .never, .bool, .integer, .float, .string, .local, .error:
+            break
+        }
+    }
+
+    private func verifyTypeCapabilities(
+        _ functions: [Bytecode.Function],
+        localTypes: [Bytecode.LocalTypeDefinition],
+        capabilities: Set<Core.Capability>
+    ) throws {
+        func visit(_ type: Bytecode.ValueType) throws {
+            switch type {
+            case .string:
+                guard capabilities.contains(.stringsV1) else {
+                    throw Verification.Error.capabilityDenied(.stringsV1)
+                }
+            case .native:
+                guard capabilities.contains(.nativeTypesV1) else {
+                    throw Verification.Error.capabilityDenied(.nativeTypesV1)
+                }
+            case .local:
+                guard capabilities.contains(.localNominalsV1) else {
+                    throw Verification.Error.capabilityDenied(.localNominalsV1)
+                }
+            case .error:
+                guard capabilities.contains(.structuredErrorsV1) else {
+                    throw Verification.Error.capabilityDenied(.structuredErrorsV1)
+                }
+            case let .address(pointee):
+                guard capabilities.contains(.addressValuesV1) else {
+                    throw Verification.Error.capabilityDenied(.addressValuesV1)
+                }
+                try visit(pointee)
+            case let .closure(signature):
+                guard capabilities.contains(.closureValuesV1) else {
+                    throw Verification.Error.capabilityDenied(.closureValuesV1)
+                }
+                for component in signature.parameters + [signature.result] {
+                    try visit(component)
+                }
+            case let .array(element):
+                guard capabilities.contains(.collectionsV1) else {
+                    throw Verification.Error.capabilityDenied(.collectionsV1)
+                }
+                try visit(element)
+            case let .dictionary(key, value):
+                guard capabilities.contains(.collectionsV1) else {
+                    throw Verification.Error.capabilityDenied(.collectionsV1)
+                }
+                try visit(key)
+                try visit(value)
+            case let .tuple(elements):
+                for element in elements { try visit(element) }
+            case let .optional(wrapped):
+                try visit(wrapped)
+            case .void, .never, .bool, .integer, .float:
+                break
+            }
+        }
+        for function in functions {
+            for type in function.registerTypes + function.stackSlotTypes + [function.resultType] {
+                try visit(type)
+            }
+        }
+        for definition in localTypes {
+            switch definition.kind {
+            case let .structure(fields):
+                for field in fields { try visit(field.type) }
+            case let .enumeration(cases):
+                for item in cases {
+                    if let payload = item.payloadType { try visit(payload) }
+                }
+            }
+        }
+    }
+
+    private func verifyFunction(
+        _ function: Bytecode.Function,
+        functions: [Bytecode.FunctionID: Bytecode.Function],
+        shell: Verification.ShellInterface,
+        effectiveLimits: Core.ResourceLimits,
+        declaredImports: [Core.NativeImportID: Bytecode.ImportRequirement],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        capabilities: Set<Core.Capability>,
+        entryFunctionIDs: Set<Bytecode.FunctionID>
+    ) throws {
+        switch function.kind {
+        case .ordinary:
+            break
+        case .closureBody:
+            guard capabilities.contains(.closureValuesV1) else {
+                throw Verification.Error.capabilityDenied(.closureValuesV1)
+            }
+        case .concreteSpecialization:
+            guard capabilities.contains(.compilerSpecializationsV1) else {
+                throw Verification.Error.capabilityDenied(.compilerSpecializationsV1)
+            }
+        }
+        if function.effects.mayThrow,
+           !capabilities.contains(.untypedThrowsV1),
+           !capabilities.contains(.structuredErrorsV1) {
+            throw Verification.Error.capabilityDenied(.untypedThrowsV1)
+        }
+        if function.effects.requiresMainActor, !capabilities.contains(.mainActorSyncV1) {
+            throw Verification.Error.capabilityDenied(.mainActorSyncV1)
+        }
+        if function.effects.isAsync {
+            guard capabilities.contains(.asyncLeafEntriesV1) else {
+                throw Verification.Error.capabilityDenied(.asyncLeafEntriesV1)
+            }
+            guard function.kind == .ordinary, entryFunctionIDs.contains(function.id) else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "async functions must be non-suspending Shell entries"
+                )
+            }
+        }
+        guard function.parameterConventions.count == function.parameterRegisters.count else {
+            throw Verification.Error.invalidFunction(
+                function: function.id,
+                reason: "parameter convention count does not match parameter registers"
+            )
+        }
+        for (register, convention) in zip(
+            function.parameterRegisters,
+            function.parameterConventions
+        ) {
+            guard let type = function.type(of: register) else { continue }
+            switch (convention, type) {
+            case (.inout, .address):
+                guard capabilities.contains(.addressValuesV1) else {
+                    throw Verification.Error.capabilityDenied(.addressValuesV1)
+                }
+            case (.borrowed, .address), (.owned, .address), (.inout, _):
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "parameter convention does not match its value/address type"
+                )
+            case (.borrowed, _):
+                guard capabilities.contains(.borrowCallsV1) else {
+                    throw Verification.Error.capabilityDenied(.borrowCallsV1)
+                }
+            case (.owned, _):
+                break
+            }
+        }
+        let frameValueCount = function.registerTypes.count.addingReportingOverflow(
+            function.stackSlotTypes.count
+        )
+        guard !frameValueCount.overflow,
+              frameValueCount.partialValue <= Int(effectiveLimits.maxFrameRegisters)
+        else {
+            throw Verification.Error.invalidFunction(
+                function: function.id,
+                reason: "register and stack-slot count exceeds policy"
+            )
+        }
+        guard !function.blocks.isEmpty else {
+            throw Verification.Error.invalidFunction(function: function.id, reason: "function has no blocks")
+        }
+        try verifyTypeShapes(function)
+
+        var blocks: [Bytecode.BlockID: Bytecode.Block] = [:]
+        for block in function.blocks {
+            guard blocks.updateValue(block, forKey: block.id) == nil else {
+                throw Verification.Error.invalidBlock(function: function.id, block: block.id, reason: "duplicate block")
+            }
+        }
+        guard let entry = blocks[function.entryBlock] else {
+            throw Verification.Error.invalidFunction(function: function.id, reason: "entry block is missing")
+        }
+        guard entry.parameters == function.parameterRegisters else {
+            throw Verification.Error.invalidBlock(
+                function: function.id,
+                block: entry.id,
+                reason: "entry block parameters must equal function parameter registers"
+            )
+        }
+        for block in function.blocks where block.id != function.entryBlock {
+            guard !block.parameters.contains(where: {
+                guard let type = function.type(of: $0) else { return false }
+                if case .address = type { return true }
+                return false
+            }) else {
+                throw Verification.Error.invalidBlock(
+                    function: function.id,
+                    block: block.id,
+                    reason: "address values cannot be block parameters in HLBC 1.7"
+                )
+            }
+        }
+
+        var definitions: [Bytecode.Register: (block: Bytecode.BlockID, offset: Int)] = [:]
+        for block in function.blocks {
+            for parameter in block.parameters {
+                try requireRegister(parameter, function: function, block: block.id, offset: -1)
+                guard definitions.updateValue((block.id, -1), forKey: parameter) == nil else {
+                    throw Verification.Error.invalidBlock(
+                        function: function.id,
+                        block: block.id,
+                        reason: "register \(parameter) has more than one definition"
+                    )
+                }
+            }
+            guard let terminator = block.instructions.last, terminator.isTerminator else {
+                throw Verification.Error.invalidBlock(
+                    function: function.id,
+                    block: block.id,
+                    reason: "block must end in exactly one terminator"
+                )
+            }
+            for (offset, instruction) in block.instructions.enumerated() {
+                if instruction.isTerminator && offset != block.instructions.count - 1 {
+                    throw Verification.Error.invalidInstruction(
+                        function: function.id,
+                        block: block.id,
+                        offset: offset,
+                        reason: "terminator is not the final instruction"
+                    )
+                }
+                for result in instruction.resultRegisters {
+                    try requireRegister(result, function: function, block: block.id, offset: offset)
+                    guard definitions.updateValue((block.id, offset), forKey: result) == nil else {
+                        throw Verification.Error.invalidInstruction(
+                            function: function.id,
+                            block: block.id,
+                            offset: offset,
+                            reason: "register \(result) has more than one definition"
+                        )
+                    }
+                }
+            }
+        }
+
+        let predecessors = try buildPredecessors(function: function, blocks: blocks)
+        let reachable = computeReachable(entry: function.entryBlock, predecessors: predecessors)
+        guard reachable.count == blocks.count else {
+            let missing = Set(blocks.keys).subtracting(reachable).sorted()
+            throw Verification.Error.invalidFunction(function: function.id, reason: "unreachable blocks: \(missing)")
+        }
+        let dominators = computeDominators(entry: function.entryBlock, blocks: Set(blocks.keys), predecessors: predecessors)
+
+        for block in function.blocks {
+            for (offset, instruction) in block.instructions.enumerated() {
+                for operand in instruction.operandRegisters {
+                    try requireRegister(operand, function: function, block: block.id, offset: offset)
+                    guard let definition = definitions[operand] else {
+                        throw Verification.Error.invalidInstruction(
+                            function: function.id,
+                            block: block.id,
+                            offset: offset,
+                            reason: "register \(operand) is used before definition"
+                        )
+                    }
+                    if definition.block == block.id {
+                        guard definition.offset < offset else {
+                            throw Verification.Error.invalidInstruction(
+                                function: function.id,
+                                block: block.id,
+                                offset: offset,
+                                reason: "register \(operand) does not dominate its use"
+                            )
+                        }
+                    } else if !(dominators[block.id]?.contains(definition.block) ?? false) {
+                        throw Verification.Error.invalidInstruction(
+                            function: function.id,
+                            block: block.id,
+                            offset: offset,
+                            reason: "register \(operand) does not dominate its use"
+                        )
+                    }
+                }
+                try verifyInstructionTypes(
+                    instruction,
+                    function: function,
+                    block: block,
+                    offset: offset,
+                    functions: functions,
+                    blocks: blocks,
+                    shell: shell,
+                    declaredImports: declaredImports,
+                    localTypes: localTypes,
+                    capabilities: capabilities,
+                    effectiveLimits: effectiveLimits
+                )
+            }
+            try verifyOwnership(
+                function: function,
+                block: block,
+                blocks: blocks,
+                functions: functions,
+                shell: shell
+            )
+        }
+        try verifyStackLifecycle(function: function, blocks: blocks)
+        try verifyAddressLifecycle(function: function, functions: functions)
+    }
+
+    private func verifyTypeShapes(_ function: Bytecode.Function) throws {
+        func verify(_ type: Bytecode.ValueType, depth: Int, isRegister: Bool) throws {
+            guard depth <= 32 else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "type nesting exceeds 32 levels"
+                )
+            }
+            switch type {
+            case let .integer(bitWidth, _):
+                guard [8, 16, 32, 64].contains(bitWidth) else {
+                    throw Verification.Error.invalidFunction(function: function.id, reason: "unsupported integer width \(bitWidth)")
+                }
+            case let .float(bitWidth):
+                guard bitWidth == 32 || bitWidth == 64 else {
+                    throw Verification.Error.invalidFunction(function: function.id, reason: "unsupported float width \(bitWidth)")
+                }
+            case let .tuple(elements):
+                guard elements.count <= 64 else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "tuple contains more than 64 elements"
+                    )
+                }
+                for element in elements {
+                    try verify(element, depth: depth + 1, isRegister: false)
+                }
+            case let .optional(wrapped):
+                try verify(wrapped, depth: depth + 1, isRegister: false)
+            case let .array(element):
+                try verify(element, depth: depth + 1, isRegister: false)
+            case let .dictionary(key, value):
+                guard isSupportedDictionaryKey(key) else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "Dictionary key must be Bool, integer, or String"
+                    )
+                }
+                try verify(key, depth: depth + 1, isRegister: false)
+                try verify(value, depth: depth + 1, isRegister: false)
+            case let .address(pointee):
+                guard isRegister, depth == 0 else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "address values must be top-level registers"
+                    )
+                }
+                switch pointee {
+                case .void, .never, .address:
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "address pointee must be a concrete non-address value type"
+                    )
+                default:
+                    try verify(pointee, depth: depth + 1, isRegister: false)
+                }
+            case let .closure(signature):
+                guard isRegister, depth == 0 else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "closure values must be top-level registers"
+                    )
+                }
+                guard signature.parameters.count <= 64 else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "closure signature contains more than 64 parameters"
+                    )
+                }
+                guard !signature.effects.mayThrow, !signature.effects.isAsync else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "throwing or async closures require a future suspension-aware closure contract"
+                    )
+                }
+                for parameter in signature.parameters {
+                    switch parameter {
+                    case .void, .never, .address, .closure:
+                        throw Verification.Error.invalidFunction(
+                            function: function.id,
+                            reason: "closure parameters must be concrete non-address values"
+                        )
+                    default:
+                        try verify(parameter, depth: depth + 1, isRegister: false)
+                    }
+                }
+                switch signature.result {
+                case .never, .address, .closure:
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "closure result must be Void or a concrete non-address value"
+                    )
+                default:
+                    try verify(signature.result, depth: depth + 1, isRegister: false)
+                }
+            case .void, .never:
+                guard !isRegister else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "Void/Never cannot be stored in a register"
+                    )
+                }
+            case .bool, .string, .native, .local, .error:
+                break
+            }
+        }
+        for type in function.registerTypes {
+            try verify(type, depth: 0, isRegister: true)
+        }
+        for type in function.stackSlotTypes {
+            if case .address = type {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "stack slots store values rather than addresses"
+                )
+            }
+            if case .closure = type {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "HLBC 1.8 closure values cannot be stored in stack slots"
+                )
+            }
+            try verify(type, depth: 0, isRegister: true)
+        }
+        if case .address = function.resultType {
+            throw Verification.Error.invalidFunction(
+                function: function.id,
+                reason: "address values cannot be returned"
+            )
+        }
+        if case .closure = function.resultType {
+            throw Verification.Error.invalidFunction(
+                function: function.id,
+                reason: "HLBC 1.8 closures are nonescaping and cannot be returned"
+            )
+        }
+        try verify(function.resultType, depth: 0, isRegister: false)
+    }
+
+    private func buildPredecessors(
+        function: Bytecode.Function,
+        blocks: [Bytecode.BlockID: Bytecode.Block]
+    ) throws -> [Bytecode.BlockID: Set<Bytecode.BlockID>] {
+        var result = Dictionary(uniqueKeysWithValues: blocks.keys.map { ($0, Set<Bytecode.BlockID>()) })
+        for block in function.blocks {
+            guard let terminator = block.instructions.last else { continue }
+            for target in successors(of: terminator) {
+                guard blocks[target] != nil else {
+                    throw Verification.Error.invalidBlock(
+                        function: function.id,
+                        block: block.id,
+                        reason: "branch targets missing block \(target)"
+                    )
+                }
+                result[target, default: []].insert(block.id)
+            }
+        }
+        return result
+    }
+
+    private func successors(of instruction: Bytecode.Instruction) -> [Bytecode.BlockID] {
+        switch instruction {
+        case let .branch(target, _): [target]
+        case let .conditionalBranch(_, trueTarget, _, falseTarget, _): [trueTarget, falseTarget]
+        case let .switchOptional(_, someTarget, noneTarget): [someTarget, noneTarget]
+        case let .switchEnum(_, cases, defaultTarget):
+            cases.map(\.target) + (defaultTarget.map { [$0] } ?? [])
+        case let .tryApply(_, _, normalTarget, errorTarget),
+             let .entryTryApply(_, _, normalTarget, errorTarget),
+             let .nativeTryApply(_, _, normalTarget, errorTarget):
+            [normalTarget, errorTarget]
+        default: []
+        }
+    }
+
+    private func computeReachable(
+        entry: Bytecode.BlockID,
+        predecessors: [Bytecode.BlockID: Set<Bytecode.BlockID>]
+    ) -> Set<Bytecode.BlockID> {
+        var successors: [Bytecode.BlockID: Set<Bytecode.BlockID>] = [:]
+        for (block, values) in predecessors {
+            for predecessor in values { successors[predecessor, default: []].insert(block) }
+        }
+        var reached: Set<Bytecode.BlockID> = [entry]
+        var worklist = [entry]
+        while let block = worklist.popLast() {
+            for successor in successors[block, default: []] where reached.insert(successor).inserted {
+                worklist.append(successor)
+            }
+        }
+        return reached
+    }
+
+    private func computeDominators(
+        entry: Bytecode.BlockID,
+        blocks: Set<Bytecode.BlockID>,
+        predecessors: [Bytecode.BlockID: Set<Bytecode.BlockID>]
+    ) -> [Bytecode.BlockID: Set<Bytecode.BlockID>] {
+        var dominators = Dictionary(uniqueKeysWithValues: blocks.map { ($0, $0 == entry ? Set([$0]) : blocks) })
+        var changed = true
+        while changed {
+            changed = false
+            for block in blocks where block != entry {
+                let incoming = predecessors[block, default: []]
+                var next = incoming.compactMap { dominators[$0] }.reduce(blocks) { $0.intersection($1) }
+                next.insert(block)
+                if next != dominators[block] {
+                    dominators[block] = next
+                    changed = true
+                }
+            }
+        }
+        return dominators
+    }
+
+    private func verifyInstructionTypes(
+        _ instruction: Bytecode.Instruction,
+        function: Bytecode.Function,
+        block: Bytecode.Block,
+        offset: Int,
+        functions: [Bytecode.FunctionID: Bytecode.Function],
+        blocks: [Bytecode.BlockID: Bytecode.Block],
+        shell: Verification.ShellInterface,
+        declaredImports: [Core.NativeImportID: Bytecode.ImportRequirement],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        capabilities: Set<Core.Capability>,
+        effectiveLimits: Core.ResourceLimits
+    ) throws {
+        func type(_ register: Bytecode.Register) -> Bytecode.ValueType { function.type(of: register)! }
+        func fail(_ reason: String) -> Verification.Error {
+            .invalidInstruction(function: function.id, block: block.id, offset: offset, reason: reason)
+        }
+        func parameterTypes(
+            of callee: Bytecode.Function
+        ) throws -> [Bytecode.ValueType] {
+            try callee.parameterRegisters.map { register in
+                guard let type = callee.type(of: register) else {
+                    throw fail(
+                        "callee \(callee.id) has a parameter register outside its type table"
+                    )
+                }
+                return type
+            }
+        }
+        switch instruction {
+        case let .constantInteger(result, value):
+            guard case let .integer(width, signed) = type(result) else {
+                throw fail("const_int result must be an integer")
+            }
+            if signed {
+                let minimum = width == 64 ? Int64.min : -(Int64(1) << (width - 1))
+                let maximum = width == 64 ? Int64.max : (Int64(1) << (width - 1)) - 1
+                guard value >= minimum, value <= maximum else {
+                    throw fail("integer literal does not fit Int\(width)")
+                }
+            } else {
+                let maximum = width == 64 ? UInt64.max : (UInt64(1) << width) - 1
+                guard value >= 0, UInt64(value) <= maximum else {
+                    throw fail("integer literal does not fit UInt\(width)")
+                }
+            }
+        case let .constantBool(result, _):
+            guard type(result) == .bool else { throw fail("const_bool result must be Bool") }
+        case let .constantFloat(result, value):
+            guard case .float = type(result) else { throw fail("const_float result must be a float") }
+            guard value.isFinite else { throw fail("const_float must be finite") }
+            if case .float(bitWidth: 32) = type(result) {
+                guard Float(value).isFinite else { throw fail("const_float does not fit Float32") }
+            }
+        case let .constantString(result, value):
+            guard capabilities.contains(.stringsV1) else {
+                throw fail("const_string requires \(Core.Capability.stringsV1)")
+            }
+            guard type(result) == .string else { throw fail("const_string result must be String") }
+            guard UInt64(value.utf8.count) <= effectiveLimits.maxVMHeapBytes else {
+                throw fail("string literal exceeds VM heap quota")
+            }
+        case let .copyValue(result, source):
+            guard type(result) == type(source) else { throw fail("copy source and result types differ") }
+            guard isCopyable(type(source), shell: shell) else {
+                throw fail("copy_value requires a copyable type")
+            }
+        case let .moveValue(result, source):
+            guard type(result) == type(source) else { throw fail("copy/move source and result types differ") }
+            if case .address = type(source) {
+                throw fail("address values cannot be moved")
+            }
+        case let .destroyValue(register):
+            if case .address = type(register) {
+                throw fail("address values are ended with end_access, not destroy_value")
+            }
+        case let .makeTuple(result, elements):
+            guard case let .tuple(expected) = type(result),
+                  expected == elements.map(type)
+            else {
+                throw fail("make_tuple elements do not match the result tuple type")
+            }
+        case let .unpackTuple(results, tuple):
+            guard case let .tuple(elements) = type(tuple),
+                  elements == results.map(type)
+            else {
+                throw fail("unpack_tuple results do not match the tuple element types")
+            }
+        case let .makeStruct(result, fields):
+            guard capabilities.contains(.localNominalsV1),
+                  case let .local(key) = type(result),
+                  let definition = localTypes[key],
+                  case let .structure(expectedFields) = definition.kind,
+                  expectedFields.map(\.type) == fields.map(type)
+            else {
+                throw fail("make_struct fields do not match the local struct definition")
+            }
+        case let .structExtract(result, structure, fieldIndex):
+            guard capabilities.contains(.localNominalsV1),
+                  case let .local(key) = type(structure),
+                  let definition = localTypes[key],
+                  case let .structure(fields) = definition.kind,
+                  let index = Int(exactly: fieldIndex),
+                  fields.indices.contains(index),
+                  type(result) == fields[index].type
+            else {
+                throw fail("struct_extract field does not match the local struct definition")
+            }
+        case let .makeEnum(result, caseIndex, payload):
+            guard capabilities.contains(.localNominalsV1),
+                  case let .local(key) = type(result),
+                  let definition = localTypes[key],
+                  case let .enumeration(cases) = definition.kind,
+                  let index = Int(exactly: caseIndex),
+                  cases.indices.contains(index)
+            else {
+                throw fail("make_enum references an invalid local enum case")
+            }
+            guard payload.map(type) == cases[index].payloadType else {
+                throw fail("make_enum payload does not match the local enum case")
+            }
+        case let .switchEnum(enumeration, caseTargets, defaultTarget):
+            guard capabilities.contains(.localNominalsV1),
+                  case let .local(key) = type(enumeration),
+                  let definition = localTypes[key],
+                  case let .enumeration(cases) = definition.kind
+            else {
+                throw fail("switch_enum operand must be a declared local enum")
+            }
+            guard caseTargets.count <= cases.count else {
+                throw fail("switch_enum contains more targets than enum cases")
+            }
+            let indices = caseTargets.map(\.caseIndex)
+            guard Set(indices).count == indices.count else {
+                throw fail("switch_enum contains duplicate case indices")
+            }
+            for item in caseTargets {
+                guard let index = Int(exactly: item.caseIndex),
+                      cases.indices.contains(index),
+                      let target = blocks[item.target]
+                else {
+                    throw fail("switch_enum references an invalid case or target")
+                }
+                if let payload = cases[index].payloadType {
+                    guard target.parameters.count == 1,
+                          target.parameters.first.map(type) == payload
+                    else {
+                        throw fail("switch_enum payload target has the wrong parameter")
+                    }
+                } else if !target.parameters.isEmpty {
+                    throw fail("switch_enum no-payload target must not accept parameters")
+                }
+            }
+            if let defaultTarget {
+                guard caseTargets.count < cases.count,
+                      let target = blocks[defaultTarget],
+                      target.parameters.isEmpty
+                else {
+                    throw fail("switch_enum default must cover omitted cases without a payload")
+                }
+            } else {
+                guard Set(indices) == Set(cases.indices.map(UInt32.init)) else {
+                    throw fail("switch_enum without a default must be exhaustive")
+                }
+            }
+        case let .makeError(result, payload):
+            guard capabilities.contains(.structuredErrorsV1),
+                  type(result) == .error,
+                  case let .local(key) = type(payload),
+                  localTypes[key]?.conformsToError == true
+            else {
+                throw fail("make_error requires a local Error-conforming payload")
+            }
+        case let .castError(result, error, expectedType):
+            guard capabilities.contains(.structuredErrorsV1),
+                  type(error) == .error,
+                  type(result) == .optional(.local(expectedType)),
+                  localTypes[expectedType]?.conformsToError == true
+            else {
+                throw fail("cast_error requires Error and Optional<local Error> types")
+            }
+        case let .makeOptionalSome(result, value):
+            guard case let .optional(wrapped) = type(result), wrapped == type(value) else {
+                throw fail("optional_some payload does not match the Optional type")
+            }
+        case let .makeOptionalNone(result):
+            guard case .optional = type(result) else {
+                throw fail("optional_none result must be Optional")
+            }
+        case let .optionalIsSome(result, optional):
+            guard type(result) == .bool, case .optional = type(optional) else {
+                throw fail("optional_is_some needs an Optional operand and Bool result")
+            }
+        case let .unwrapOptional(result, optional):
+            guard case let .optional(wrapped) = type(optional), wrapped == type(result) else {
+                throw fail("optional_unwrap result does not match the wrapped type")
+            }
+        case let .switchOptional(optional, someTarget, noneTarget):
+            guard case let .optional(wrapped) = type(optional) else {
+                throw fail("switch_optional operand must be Optional")
+            }
+            guard let someBlock = blocks[someTarget],
+                  someBlock.parameters.count == 1,
+                  someBlock.parameters.first.map(type) == wrapped
+            else {
+                throw fail("switch_optional some target must accept the wrapped value")
+            }
+            guard let noneBlock = blocks[noneTarget], noneBlock.parameters.isEmpty else {
+                throw fail("switch_optional none target must not accept arguments")
+            }
+        case let .storeStack(slot, source, _):
+            guard let slotType = function.type(of: slot), slotType == type(source) else {
+                throw fail("store_stack source does not match a declared stack slot")
+            }
+        case let .loadStack(result, slot, mode):
+            guard let slotType = function.type(of: slot), slotType == type(result) else {
+                throw fail("load_stack result does not match a declared stack slot")
+            }
+            if mode == .copy, !isCopyable(slotType, shell: shell) {
+                throw fail("load_stack.copy requires a copyable slot type")
+            }
+        case let .destroyStack(slot):
+            guard function.type(of: slot) != nil else {
+                throw fail("destroy_stack references an unknown slot")
+            }
+        case let .stackAddress(result, slot):
+            guard capabilities.contains(.addressValuesV1),
+                  let slotType = function.type(of: slot),
+                  type(result) == .address(slotType)
+            else {
+                throw fail("stack_address result must address its declared stack slot")
+            }
+        case let .projectStructAddress(result, base, fieldIndex):
+            guard capabilities.contains(.addressValuesV1),
+                  case let .address(.local(key)) = type(base),
+                  let definition = localTypes[key],
+                  case let .structure(fields) = definition.kind,
+                  let index = Int(exactly: fieldIndex),
+                  fields.indices.contains(index),
+                  type(result) == .address(fields[index].type)
+            else {
+                throw fail("project_struct_address must reference a valid local struct field")
+            }
+        case let .beginAccess(result, address, _):
+            guard capabilities.contains(.addressValuesV1),
+                  case .address = type(address),
+                  type(result) == type(address)
+            else {
+                throw fail("begin_access requires matching address operands")
+            }
+        case let .endAccess(address):
+            guard capabilities.contains(.addressValuesV1), case .address = type(address) else {
+                throw fail("end_access requires an address")
+            }
+        case let .loadAddress(result, address, mode):
+            guard capabilities.contains(.addressValuesV1),
+                  case let .address(pointee) = type(address),
+                  type(result) == pointee
+            else {
+                throw fail("load_address result must match its address pointee")
+            }
+            guard mode == .copy, isCopyable(type(result), shell: shell) else {
+                throw fail("HLBC 1.7 load_address requires copy mode and a copyable pointee")
+            }
+        case let .storeAddress(address, source, mode):
+            guard capabilities.contains(.addressValuesV1),
+                  case let .address(pointee) = type(address),
+                  type(source) == pointee
+            else {
+                throw fail("store_address source must match its address pointee")
+            }
+            guard mode == .assign else {
+                throw fail("HLBC 1.7 store_address requires assign mode")
+            }
+        case let .checkedBinary(result, overflow, operation, lhs, rhs):
+            guard type(result) == type(lhs), type(lhs) == type(rhs), case .integer = type(lhs) else {
+                throw fail("checked binary operands and result must use one integer type")
+            }
+            guard type(overflow) == .bool else { throw fail("checked binary overflow result must be Bool") }
+            if operation == .shiftLeft || operation == .shiftRight {
+                guard case .integer = type(rhs) else { throw fail("shift amount must be an integer") }
+            }
+        case let .floatingBinary(result, _, lhs, rhs):
+            guard type(result) == type(lhs),
+                  type(lhs) == type(rhs),
+                  case .float = type(lhs)
+            else {
+                throw fail("floating binary operands and result must use one float type")
+            }
+        case let .floatingUnary(result, _, operand):
+            guard type(result) == type(operand), case .float = type(operand) else {
+                throw fail("floating unary operand and result must use one float type")
+            }
+        case let .integerConvert(result, operation, value):
+            guard case let .integer(sourceWidth, sourceSigned) = type(value),
+                  case let .integer(targetWidth, _) = type(result)
+            else {
+                throw fail("integer_convert requires integer input and result")
+            }
+            switch operation {
+            case .truncate:
+                guard targetWidth < sourceWidth else {
+                    throw fail("integer truncation requires a narrower result")
+                }
+            case .signExtend:
+                guard sourceSigned, targetWidth > sourceWidth else {
+                    throw fail("sign extension requires a signed input and wider result")
+                }
+            case .zeroExtend:
+                guard !sourceSigned, targetWidth > sourceWidth else {
+                    throw fail("zero extension requires an unsigned input and wider result")
+                }
+            case .reinterpret:
+                guard targetWidth == sourceWidth else {
+                    throw fail("integer reinterpretation must preserve bit width")
+                }
+            }
+        case let .floatingConvert(result, operation, value):
+            guard case let .float(targetWidth) = type(result) else {
+                throw fail("floating_convert result must be Float32 or Float64")
+            }
+            switch operation {
+            case .truncate:
+                guard type(value) == .float(bitWidth: 64), targetWidth == 32 else {
+                    throw fail("floating truncation requires Float64 to Float32")
+                }
+            case .extend:
+                guard type(value) == .float(bitWidth: 32), targetWidth == 64 else {
+                    throw fail("floating extension requires Float32 to Float64")
+                }
+            case .signedIntegerToFloat:
+                guard case .integer(_, signed: true) = type(value) else {
+                    throw fail("signed integer-to-float conversion requires a signed integer")
+                }
+            case .unsignedIntegerToFloat:
+                guard case .integer(_, signed: false) = type(value) else {
+                    throw fail("unsigned integer-to-float conversion requires an unsigned integer")
+                }
+            }
+        case let .booleanBinary(result, _, lhs, rhs):
+            guard type(result) == .bool, type(lhs) == .bool, type(rhs) == .bool else {
+                throw fail("boolean binary operands and result must be Bool")
+            }
+        case let .stringConcat(result, lhs, rhs):
+            guard capabilities.contains(.stringsV1) else {
+                throw fail("String concatenation requires \(Core.Capability.stringsV1)")
+            }
+            guard type(result) == .string, type(lhs) == .string, type(rhs) == .string else {
+                throw fail("string_concat operands and result must be String")
+            }
+        case let .stringCount(result, string):
+            guard capabilities.contains(.stringsV1) else {
+                throw fail("String.count requires \(Core.Capability.stringsV1)")
+            }
+            guard type(result) == .int64, type(string) == .string else {
+                throw fail("string_count needs a String operand and Int64 result")
+            }
+        case let .stringIsEmpty(result, string):
+            guard capabilities.contains(.stringsV1) else {
+                throw fail("String.isEmpty requires \(Core.Capability.stringsV1)")
+            }
+            guard type(result) == .bool, type(string) == .string else {
+                throw fail("string_is_empty needs a String operand and Bool result")
+            }
+        case let .stringPredicate(result, _, string, pattern):
+            guard capabilities.contains(.stringsV1) else {
+                throw fail("String predicates require \(Core.Capability.stringsV1)")
+            }
+            guard type(result) == .bool,
+                  type(string) == .string,
+                  type(pattern) == .string
+            else {
+                throw fail("String predicates need two String operands and a Bool result")
+            }
+        case let .stringify(result, value):
+            guard capabilities.contains(.stringsV1) else {
+                throw fail("String interpolation requires \(Core.Capability.stringsV1)")
+            }
+            guard type(result) == .string else {
+                throw fail("stringify result must be String")
+            }
+            switch type(value) {
+            case .bool, .integer, .float:
+                break
+            default:
+                throw fail("stringify supports only Bool, integer, and floating-point scalars")
+            }
+        case let .makeArray(result, elements):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("make_array requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(elementType) = type(result),
+                  elements.allSatisfy({ type($0) == elementType })
+            else {
+                throw fail("make_array elements must match its Array element type")
+            }
+        case let .arrayCount(result, array):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array.count requires \(Core.Capability.collectionsV1)")
+            }
+            guard type(result) == .int64, case .array = type(array) else {
+                throw fail("array_count needs an Array operand and Int64 result")
+            }
+        case let .arrayIsEmpty(result, array):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array.isEmpty requires \(Core.Capability.collectionsV1)")
+            }
+            guard type(result) == .bool, case .array = type(array) else {
+                throw fail("array_is_empty needs an Array operand and Bool result")
+            }
+        case let .arrayGet(result, array, index):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array subscript requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(index) == .int64,
+                  type(result) == element
+            else {
+                throw fail("array_get types do not match Array.Element and Int index")
+            }
+            guard isCopyable(element, shell: shell) else {
+                throw fail("array_get requires a copyable element type")
+            }
+        case let .arrayFirst(result, array):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array.first requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(result) == .optional(element)
+            else {
+                throw fail("array_first result must be Optional<Array.Element>")
+            }
+            guard isCopyable(element, shell: shell) else {
+                throw fail("array_first requires a copyable element type")
+            }
+        case let .arrayContains(result, array, value):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array.contains requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(value) == element,
+                  type(result) == .bool
+            else {
+                throw fail("array_contains value must match Array.Element and return Bool")
+            }
+            switch element {
+            case .bool, .integer, .float, .string:
+                break
+            default:
+                throw fail("array_contains supports only scalar Equatable elements")
+            }
+        case let .arrayAppend(result, array, value):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array.append requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(result) == .array(element),
+                  type(value) == element
+            else {
+                throw fail("array_append value and result must match Array.Element")
+            }
+            guard isCopyable(element, shell: shell) else {
+                throw fail("array_append requires a copyable element type")
+            }
+        case let .arrayUpdate(result, array, index, value):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array subscript update requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(result) == .array(element),
+                  type(index) == .int64,
+                  type(value) == element
+            else {
+                throw fail("array_update types do not match Array.Element and Int index")
+            }
+            guard isCopyable(element, shell: shell) else {
+                throw fail("array_update requires a copyable element type")
+            }
+        case let .arrayNext(result, array, indexSlot):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array iteration requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(result) == .optional(element),
+                  function.type(of: indexSlot) == .int64
+            else {
+                throw fail("array_next needs Array<T>, Optional<T>, and an Int64 index slot")
+            }
+            guard isCopyable(element, shell: shell) else {
+                throw fail("array_next requires a copyable element type")
+            }
+        case let .makeDictionary(result, pairs):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("make_dictionary requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .dictionary(key, value) = type(result),
+                  type(pairs) == .array(.tuple([key, value])),
+                  isSupportedDictionaryKey(key)
+            else {
+                throw fail("make_dictionary needs Array<(Key, Value)> and Dictionary<Key, Value>")
+            }
+            guard isCopyable(key, shell: shell), isCopyable(value, shell: shell) else {
+                throw fail("make_dictionary requires copyable key and value types")
+            }
+        case let .dictionaryCount(result, dictionary):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Dictionary.count requires \(Core.Capability.collectionsV1)")
+            }
+            guard type(result) == .int64, case .dictionary = type(dictionary) else {
+                throw fail("dictionary_count needs a Dictionary operand and Int64 result")
+            }
+        case let .dictionaryIsEmpty(result, dictionary):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Dictionary.isEmpty requires \(Core.Capability.collectionsV1)")
+            }
+            guard type(result) == .bool, case .dictionary = type(dictionary) else {
+                throw fail("dictionary_is_empty needs a Dictionary operand and Bool result")
+            }
+        case let .dictionaryGet(result, dictionary, key):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Dictionary subscript requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .dictionary(keyType, valueType) = type(dictionary),
+                  type(key) == keyType,
+                  type(result) == .optional(valueType)
+            else {
+                throw fail("dictionary_get key and result must match Dictionary types")
+            }
+            guard isCopyable(valueType, shell: shell) else {
+                throw fail("dictionary_get requires a copyable value type")
+            }
+        case let .dictionaryUpdate(result, dictionary, key, value):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Dictionary update requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .dictionary(keyType, valueType) = type(dictionary),
+                  type(result) == type(dictionary),
+                  type(key) == keyType,
+                  type(value) == .optional(valueType)
+            else {
+                throw fail("dictionary_update operands and result must match Dictionary types")
+            }
+            guard isCopyable(keyType, shell: shell), isCopyable(valueType, shell: shell) else {
+                throw fail("dictionary_update requires copyable key and value types")
+            }
+        case let .dictionaryNext(result, dictionary, indexSlot):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Dictionary iteration requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .dictionary(key, value) = type(dictionary),
+                  type(result) == .optional(.tuple([key, value])),
+                  function.type(of: indexSlot) == .int64
+            else {
+                throw fail("dictionary_next needs Dictionary<K,V>, Optional<(K,V)>, and Int64 slot")
+            }
+            guard isCopyable(key, shell: shell), isCopyable(value, shell: shell) else {
+                throw fail("dictionary_next requires copyable key and value types")
+            }
+        case let .compare(result, _, lhs, rhs):
+            guard type(result) == .bool, type(lhs) == type(rhs) else {
+                throw fail("comparison needs matching operands and Bool result")
+            }
+            switch type(lhs) {
+            case .bool, .integer, .float:
+                break
+            case .string:
+                guard capabilities.contains(.stringsV1) else {
+                    throw fail("String comparison requires \(Core.Capability.stringsV1)")
+                }
+            default:
+                throw fail("comparison is unavailable for \(type(lhs))")
+            }
+        case let .branch(target, arguments):
+            try verifyBranchArguments(arguments, target: target, function: function, block: block, offset: offset, blocks: blocks)
+        case let .conditionalBranch(condition, trueTarget, trueArguments, falseTarget, falseArguments):
+            guard type(condition) == .bool else { throw fail("cond_br condition must be Bool") }
+            try verifyBranchArguments(trueArguments, target: trueTarget, function: function, block: block, offset: offset, blocks: blocks)
+            try verifyBranchArguments(falseArguments, target: falseTarget, function: function, block: block, offset: offset, blocks: blocks)
+        case let .apply(result, calleeID, arguments):
+            guard let callee = functions[calleeID] else { throw fail("unknown HLBC function \(calleeID)") }
+            guard callee.kind != .closureBody else {
+                throw fail("closure bodies must be invoked through closure_apply")
+            }
+            try verifyEffects(
+                callee.effects,
+                allowedBy: function.effects,
+                operation: "hlbc_apply",
+                fail: fail
+            )
+            try verifyCall(
+                arguments: arguments,
+                result: result,
+                parameterTypes: try parameterTypes(of: callee),
+                resultType: callee.resultType,
+                function: function,
+                block: block,
+                offset: offset
+            )
+        case let .entryApply(result, entry, arguments):
+            guard let descriptor = shell.entries[entry] else { throw fail("unknown Shell entry \(entry)") }
+            try verifyEffects(
+                descriptor.effects,
+                allowedBy: function.effects,
+                operation: "entry_apply",
+                fail: fail
+            )
+            try verifyCall(arguments: arguments, result: result, parameterTypes: descriptor.parameterTypes, resultType: descriptor.resultType, function: function, block: block, offset: offset)
+        case let .nativeApply(result, importID, arguments):
+            guard let requirement = declaredImports[importID] else {
+                throw fail("native import \(importID) is used but not declared")
+            }
+            guard capabilities.contains(requirement.requiredCapability) else {
+                throw fail("native import capability is not declared")
+            }
+            guard let descriptor = shell.imports[importID] else { throw fail("unknown native import \(importID)") }
+            try verifyEffects(
+                descriptor.effects,
+                allowedBy: function.effects,
+                operation: "native_apply",
+                fail: fail
+            )
+            try verifyCall(arguments: arguments, result: result, parameterTypes: descriptor.parameterTypes, resultType: descriptor.resultType, function: function, block: block, offset: offset)
+        case let .makeClosure(result, calleeID, captures):
+            guard capabilities.contains(.closureValuesV1) else {
+                throw fail("make_closure requires \(Core.Capability.closureValuesV1)")
+            }
+            guard case let .closure(signature) = type(result) else {
+                throw fail("make_closure result must have a closure type")
+            }
+            guard let callee = functions[calleeID] else {
+                throw fail("unknown closure body \(calleeID)")
+            }
+            guard callee.kind == .closureBody else {
+                throw fail("make_closure target must be a closure body")
+            }
+            guard callee.resultType == signature.result,
+                  callee.effects == signature.effects
+            else {
+                throw fail("closure body result or effects do not match its closure signature")
+            }
+            let calleeParameters = try parameterTypes(of: callee)
+            let captureTypes = captures.map(type)
+            guard calleeParameters == signature.parameters + captureTypes else {
+                throw fail("closure body parameters must equal invocation parameters followed by captures")
+            }
+            guard callee.parameterConventions.allSatisfy({ $0 != .inout }) else {
+                throw fail("HLBC 1.8 closure bodies cannot carry inout parameters")
+            }
+            let invocationConventions = callee.parameterConventions
+                .prefix(signature.parameters.count)
+            for (parameterType, convention) in zip(
+                signature.parameters,
+                invocationConventions
+            ) where convention == .borrowed && parameterType.requiresLinearOwnership {
+                // ClosureSignature v1 does not encode conventions. Restrict
+                // borrowed invocation parameters to VM value types so the
+                // ownership dataflow remains independent of dynamic targets.
+                throw fail(
+                    "HLBC 1.8 borrowed closure parameters cannot require linear ownership"
+                )
+            }
+            for captureType in captureTypes {
+                if case .address = captureType {
+                    throw fail("closure captures cannot contain address values")
+                }
+                if case .closure = captureType {
+                    throw fail("nested closure captures are not supported in HLBC 1.8")
+                }
+                guard !captureType.requiresLinearOwnership,
+                      isCopyable(captureType, shell: shell)
+                else {
+                    throw fail("closure captures must be copyable VM-managed values")
+                }
+            }
+        case let .closureApply(result, closure, arguments):
+            guard capabilities.contains(.closureValuesV1) else {
+                throw fail("closure_apply requires \(Core.Capability.closureValuesV1)")
+            }
+            guard case let .closure(signature) = type(closure) else {
+                throw fail("closure_apply operand must have a closure type")
+            }
+            try verifyEffects(
+                signature.effects,
+                allowedBy: function.effects,
+                operation: "closure_apply",
+                fail: fail
+            )
+            try verifyCall(
+                arguments: arguments,
+                result: result,
+                parameterTypes: signature.parameters,
+                resultType: signature.result,
+                function: function,
+                block: block,
+                offset: offset
+            )
+        case let .tryApply(calleeID, arguments, normalTarget, errorTarget):
+            guard capabilities.contains(.untypedThrowsV1)
+                    || capabilities.contains(.structuredErrorsV1)
+            else {
+                throw fail("try_apply requires an Error capability")
+            }
+            guard let callee = functions[calleeID] else {
+                throw fail("unknown HLBC function \(calleeID)")
+            }
+            guard callee.effects.mayThrow else {
+                throw fail("try_apply requires a throwing callee")
+            }
+            try verifyEffects(
+                callee.effects,
+                allowedBy: function.effects,
+                operation: "try_apply",
+                catchesError: true,
+                fail: fail
+            )
+            try verifyTryCall(
+                arguments: arguments,
+                parameterTypes: try parameterTypes(of: callee),
+                resultType: callee.resultType,
+                normalTarget: normalTarget,
+                errorTarget: errorTarget,
+                function: function,
+                block: block,
+                offset: offset,
+                blocks: blocks,
+                capabilities: capabilities
+            )
+        case let .entryTryApply(entry, arguments, normalTarget, errorTarget):
+            guard capabilities.contains(.untypedThrowsV1)
+                    || capabilities.contains(.structuredErrorsV1)
+            else {
+                throw fail("entry_try_apply requires an Error capability")
+            }
+            guard let descriptor = shell.entries[entry] else {
+                throw fail("unknown Shell entry \(entry)")
+            }
+            guard descriptor.effects.mayThrow else {
+                throw fail("entry_try_apply requires a throwing Shell entry")
+            }
+            try verifyEffects(
+                descriptor.effects,
+                allowedBy: function.effects,
+                operation: "entry_try_apply",
+                catchesError: true,
+                fail: fail
+            )
+            try verifyTryCall(
+                arguments: arguments,
+                parameterTypes: descriptor.parameterTypes,
+                resultType: descriptor.resultType,
+                normalTarget: normalTarget,
+                errorTarget: errorTarget,
+                function: function,
+                block: block,
+                offset: offset,
+                blocks: blocks,
+                capabilities: capabilities
+            )
+        case let .nativeTryApply(importID, arguments, normalTarget, errorTarget):
+            guard capabilities.contains(.untypedThrowsV1)
+                    || capabilities.contains(.structuredErrorsV1)
+            else {
+                throw fail("native_try_apply requires an Error capability")
+            }
+            guard let requirement = declaredImports[importID] else {
+                throw fail("native import \(importID) is used but not declared")
+            }
+            guard capabilities.contains(requirement.requiredCapability) else {
+                throw fail("native import capability is not declared")
+            }
+            guard let descriptor = shell.imports[importID] else {
+                throw fail("unknown native import \(importID)")
+            }
+            guard descriptor.effects.mayThrow else {
+                throw fail("native_try_apply requires a throwing native import")
+            }
+            try verifyEffects(
+                descriptor.effects,
+                allowedBy: function.effects,
+                operation: "native_try_apply",
+                catchesError: true,
+                fail: fail
+            )
+            try verifyTryCall(
+                arguments: arguments,
+                parameterTypes: descriptor.parameterTypes,
+                resultType: descriptor.resultType,
+                normalTarget: normalTarget,
+                errorTarget: errorTarget,
+                function: function,
+                block: block,
+                offset: offset,
+                blocks: blocks,
+                capabilities: capabilities
+            )
+        case let .returnValue(value):
+            if function.resultType == .void {
+                guard value == nil else { throw fail("Void function cannot return a value") }
+            } else {
+                guard let value, type(value) == function.resultType else {
+                    throw fail("return type does not match function result")
+                }
+            }
+        case let .throwError(error):
+            switch type(error) {
+            case .string:
+                guard capabilities.contains(.untypedThrowsV1), function.effects.mayThrow else {
+                    throw fail(
+                        "throw_error requires a throwing function and untyped-throws capability"
+                    )
+                }
+            case .error:
+                guard capabilities.contains(.structuredErrorsV1), function.effects.mayThrow else {
+                    throw fail(
+                        "throw_error requires a throwing function and structured-errors capability"
+                    )
+                }
+            default:
+                throw fail("throw_error payload does not match its declared Error capability")
+            }
+        case .trap:
+            break
+        }
+    }
+
+    private func isCopyable(
+        _ type: Bytecode.ValueType,
+        shell: Verification.ShellInterface
+    ) -> Bool {
+        switch type {
+        case let .native(id):
+            shell.types[id]?.isCopyable == true
+        case .closure:
+            true
+        case let .tuple(elements):
+            elements.allSatisfy { isCopyable($0, shell: shell) }
+        case let .optional(wrapped):
+            isCopyable(wrapped, shell: shell)
+        case let .array(element):
+            isCopyable(element, shell: shell)
+        case let .dictionary(key, value):
+            isCopyable(key, shell: shell) && isCopyable(value, shell: shell)
+        case .void, .never, .address:
+            false
+        case .bool, .integer, .float, .string, .local, .error:
+            true
+        }
+    }
+
+    private func isSupportedDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
+        switch type {
+        case .bool, .integer, .string:
+            true
+        default:
+            false
+        }
+    }
+
+    private func verifyEffects(
+        _ callee: Core.Effects,
+        allowedBy caller: Core.Effects,
+        operation: String,
+        catchesError: Bool = false,
+        fail: (String) -> Verification.Error
+    ) throws {
+        if callee.isAsync {
+            throw fail("\(operation) calls an async entry without a suspension contract")
+        }
+        if callee.mayThrow, !caller.mayThrow, !catchesError {
+            throw fail("\(operation) calls a throwing operation from a nonthrowing function")
+        }
+        if callee.mayAllocate, !caller.mayAllocate {
+            throw fail("\(operation) calls an allocating operation from a nonallocating function")
+        }
+        if callee.hasExternalSideEffects, !caller.hasExternalSideEffects {
+            throw fail("\(operation) calls an externally side-effecting operation from a pure function")
+        }
+        if callee.requiresMainActor, !caller.requiresMainActor {
+            throw fail("\(operation) crosses into MainActor from a nonisolated function")
+        }
+    }
+
+    private func verifyTryCall(
+        arguments: [Bytecode.Register],
+        parameterTypes: [Bytecode.ValueType],
+        resultType: Bytecode.ValueType,
+        normalTarget: Bytecode.BlockID,
+        errorTarget: Bytecode.BlockID,
+        function: Bytecode.Function,
+        block: Bytecode.Block,
+        offset: Int,
+        blocks: [Bytecode.BlockID: Bytecode.Block],
+        capabilities: Set<Core.Capability>
+    ) throws {
+        let fail: (String) -> Verification.Error = {
+            .invalidInstruction(function: function.id, block: block.id, offset: offset, reason: $0)
+        }
+        guard normalTarget != errorTarget else {
+            throw fail("try_apply normal and error targets must differ")
+        }
+        guard arguments.count == parameterTypes.count else {
+            throw fail("try_apply argument count mismatch")
+        }
+        for (argument, expected) in zip(arguments, parameterTypes)
+        where function.type(of: argument) != expected {
+            throw fail("try_apply argument type mismatch")
+        }
+        guard let normal = blocks[normalTarget] else {
+            throw fail("unknown try_apply normal target \(normalTarget)")
+        }
+        if resultType == .void {
+            guard normal.parameters.isEmpty else {
+                throw fail("Void try_apply normal target must not accept a result")
+            }
+        } else {
+            guard normal.parameters.count == 1,
+                  normal.parameters.first.flatMap({ function.type(of: $0) }) == resultType
+            else {
+                throw fail("try_apply normal target must accept the callee result")
+            }
+        }
+        guard let failure = blocks[errorTarget], failure.parameters.count == 1,
+              let errorType = failure.parameters.first.flatMap({ function.type(of: $0) })
+        else {
+            throw fail("try_apply error target must accept one Error value")
+        }
+        switch errorType {
+        case .string where capabilities.contains(.untypedThrowsV1):
+            break
+        case .error where capabilities.contains(.structuredErrorsV1):
+            break
+        default:
+            if capabilities.contains(.untypedThrowsV1),
+               !capabilities.contains(.structuredErrorsV1) {
+                throw fail("try_apply error target must accept one untyped String error")
+            }
+            throw fail("try_apply error target does not match its Error capability")
+        }
+    }
+
+    private func verifyBranchArguments(
+        _ arguments: [Bytecode.Register],
+        target: Bytecode.BlockID,
+        function: Bytecode.Function,
+        block: Bytecode.Block,
+        offset: Int,
+        blocks: [Bytecode.BlockID: Bytecode.Block]
+    ) throws {
+        guard let targetBlock = blocks[target] else {
+            throw Verification.Error.invalidInstruction(
+                function: function.id, block: block.id, offset: offset, reason: "unknown target \(target)"
+            )
+        }
+        guard arguments.count == targetBlock.parameters.count else {
+            throw Verification.Error.invalidInstruction(
+                function: function.id, block: block.id, offset: offset, reason: "branch argument count mismatch"
+            )
+        }
+        for (argument, parameter) in zip(arguments, targetBlock.parameters) {
+            guard function.type(of: argument) == function.type(of: parameter) else {
+                throw Verification.Error.invalidInstruction(
+                    function: function.id, block: block.id, offset: offset, reason: "branch argument type mismatch"
+                )
+            }
+        }
+    }
+
+    private func verifyCall(
+        arguments: [Bytecode.Register],
+        result: Bytecode.Register?,
+        parameterTypes: [Bytecode.ValueType],
+        resultType: Bytecode.ValueType,
+        function: Bytecode.Function,
+        block: Bytecode.Block,
+        offset: Int
+    ) throws {
+        let fail: (String) -> Verification.Error = {
+            .invalidInstruction(function: function.id, block: block.id, offset: offset, reason: $0)
+        }
+        guard arguments.count == parameterTypes.count else { throw fail("call argument count mismatch") }
+        for (argument, expected) in zip(arguments, parameterTypes) where function.type(of: argument) != expected {
+            throw fail("call argument type mismatch")
+        }
+        if resultType == .void {
+            guard result == nil else { throw fail("Void call must not define a result") }
+        } else {
+            guard let result, function.type(of: result) == resultType else { throw fail("call result type mismatch") }
+        }
+    }
+
+    private func verifyOwnership(
+        function: Bytecode.Function,
+        block: Bytecode.Block,
+        blocks: [Bytecode.BlockID: Bytecode.Block],
+        functions: [Bytecode.FunctionID: Bytecode.Function],
+        shell: Verification.ShellInterface
+    ) throws {
+        let borrowedParameters = Set(zip(
+            function.parameterRegisters,
+            function.parameterConventions
+        ).compactMap { register, convention in
+            convention == .borrowed ? register : nil
+        })
+        var live = Set(block.parameters.filter {
+            function.type(of: $0)?.requiresLinearOwnership == true
+                && !borrowedParameters.contains($0)
+        })
+        for (offset, instruction) in block.instructions.enumerated() {
+            func fail(_ reason: String) -> Verification.Error {
+                .invalidInstruction(function: function.id, block: block.id, offset: offset, reason: reason)
+            }
+            for operand in instruction.operandRegisters
+            where function.type(of: operand)?.requiresLinearOwnership == true {
+                guard live.contains(operand) || borrowedParameters.contains(operand) else {
+                    throw fail("instruction uses a consumed owned value")
+                }
+            }
+            switch instruction {
+            case let .copyValue(result, source):
+                if function.type(of: source)?.requiresLinearOwnership == true {
+                    guard live.contains(source) else { throw fail("copy_value uses a consumed value") }
+                    live.insert(result)
+                }
+            case let .moveValue(result, source):
+                if function.type(of: source)?.requiresLinearOwnership == true {
+                    guard live.remove(source) != nil else { throw fail("move_value uses a consumed value") }
+                    live.insert(result)
+                }
+            case let .destroyValue(register):
+                if function.type(of: register)?.requiresLinearOwnership == true,
+                   live.remove(register) == nil {
+                    throw fail("destroy_value uses a consumed value")
+                }
+            case let .makeTuple(result, elements):
+                for element in elements
+                where function.type(of: element)?.requiresLinearOwnership == true {
+                    guard live.remove(element) != nil else {
+                        throw fail("make_tuple consumes a non-live element")
+                    }
+                }
+                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+            case let .unpackTuple(results, tuple):
+                if function.type(of: tuple)?.requiresLinearOwnership == true,
+                   live.remove(tuple) == nil {
+                    throw fail("unpack_tuple consumes a non-live tuple")
+                }
+                for result in results
+                where function.type(of: result)?.requiresLinearOwnership == true {
+                    live.insert(result)
+                }
+            case .makeStruct, .structExtract, .makeEnum, .makeError, .castError,
+                 .stackAddress, .projectStructAddress, .beginAccess, .endAccess:
+                // HLBC 1.6 rejects native handles inside local nominal values,
+                // so these fully VM-managed operations cannot change the
+                // explicit native-ownership set.
+                break
+            case .switchEnum:
+                guard live.isEmpty else {
+                    throw fail("owned values remain live across switch_enum")
+                }
+            case let .makeOptionalSome(result, value):
+                if function.type(of: value)?.requiresLinearOwnership == true,
+                   live.remove(value) == nil {
+                    throw fail("optional_some consumes a non-live payload")
+                }
+                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+            case let .makeOptionalNone(result):
+                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+            case .optionalIsSome:
+                break
+            case let .unwrapOptional(result, optional):
+                if function.type(of: optional)?.requiresLinearOwnership == true,
+                   live.remove(optional) == nil {
+                    throw fail("optional_unwrap consumes a non-live Optional")
+                }
+                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+            case let .switchOptional(optional, _, _):
+                if function.type(of: optional)?.requiresLinearOwnership == true,
+                   live.remove(optional) == nil {
+                    throw fail("switch_optional consumes a non-live Optional")
+                }
+                guard live.isEmpty else {
+                    throw fail("owned values remain live across switch_optional")
+                }
+            case let .storeStack(_, source, _):
+                if function.type(of: source)?.requiresLinearOwnership == true,
+                   live.remove(source) == nil {
+                    throw fail("store_stack consumes a non-live value")
+                }
+            case let .loadStack(result, _, _):
+                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+            case .destroyStack:
+                break
+            case let .loadAddress(result, _, _):
+                if function.type(of: result)?.requiresLinearOwnership == true {
+                    live.insert(result)
+                }
+            case let .storeAddress(_, source, _):
+                if function.type(of: source)?.requiresLinearOwnership == true {
+                    guard live.remove(source) != nil else {
+                        throw fail("store_address consumes a non-live value")
+                    }
+                }
+            case let .makeArray(result, elements):
+                for element in elements
+                where function.type(of: element)?.requiresLinearOwnership == true {
+                    guard live.remove(element) != nil else {
+                        throw fail("make_array consumes a non-live element")
+                    }
+                }
+                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+            case let .arrayGet(result, _, _), let .arrayFirst(result, _),
+                 let .arrayAppend(result, _, _), let .arrayUpdate(result, _, _, _),
+                 let .arrayNext(result, _, _),
+                 let .makeDictionary(result, _), let .dictionaryGet(result, _, _),
+                 let .dictionaryUpdate(result, _, _, _),
+                 let .dictionaryNext(result, _, _):
+                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+            case .constantString:
+                break
+            case let .apply(result, callee, arguments):
+                try consumeOwnedCallArguments(
+                    arguments,
+                    conventions: functions[callee]?.parameterConventions
+                        ?? Array(repeating: .owned, count: arguments.count),
+                    live: &live,
+                    function: function,
+                    fail: fail
+                )
+                if let result,
+                   let target = functions[callee]?.resultType,
+                   target.requiresLinearOwnership {
+                    live.insert(result)
+                }
+            case let .entryApply(result, entry, arguments):
+                try consumeOwnedCallArguments(
+                    arguments,
+                    conventions: Array(repeating: .owned, count: arguments.count),
+                    live: &live,
+                    function: function,
+                    fail: fail
+                )
+                if let result,
+                   let type = shell.entries[entry]?.resultType,
+                   type.requiresLinearOwnership {
+                    live.insert(result)
+                }
+            case let .nativeApply(result, importID, arguments):
+                try consumeOwnedCallArguments(
+                    arguments,
+                    conventions: Array(repeating: .owned, count: arguments.count),
+                    live: &live,
+                    function: function,
+                    fail: fail
+                )
+                if let result,
+                   let type = shell.imports[importID]?.resultType,
+                   type.requiresLinearOwnership {
+                    live.insert(result)
+                }
+            case .makeClosure:
+                // Captures are copied into a VM-managed closure context. The
+                // type checker rejects addresses and explicit-linear values.
+                break
+            case let .closureApply(result, closure, arguments):
+                let signature: Bytecode.ClosureSignature? = if case let .closure(value)
+                    = function.type(of: closure) { value } else { nil }
+                try consumeOwnedCallArguments(
+                    arguments,
+                    conventions: Array(repeating: .owned, count: arguments.count),
+                    live: &live,
+                    function: function,
+                    fail: fail
+                )
+                if let result,
+                   signature?.result.requiresLinearOwnership == true {
+                    live.insert(result)
+                }
+            case let .tryApply(callee, arguments, _, _):
+                try consumeOwnedCallArguments(
+                    arguments,
+                    conventions: functions[callee]?.parameterConventions
+                        ?? Array(repeating: .owned, count: arguments.count),
+                    live: &live,
+                    function: function,
+                    fail: fail
+                )
+                // Linear arguments transfer into the call on both edges. Until
+                // HLBC has explicit cleanup regions, no unrelated owned value
+                // may remain live across a throwing call.
+                guard live.isEmpty else {
+                    throw fail("owned values cannot remain live across try_apply")
+                }
+            case let .entryTryApply(_, arguments, _, _),
+                 let .nativeTryApply(_, arguments, _, _):
+                try consumeOwnedCallArguments(
+                    arguments,
+                    conventions: Array(repeating: .owned, count: arguments.count),
+                    live: &live,
+                    function: function,
+                    fail: fail
+                )
+                guard live.isEmpty else {
+                    throw fail("owned values cannot remain live across try_apply")
+                }
+            case let .branch(target, arguments):
+                try consumeForwarded(arguments, target: target, live: &live, function: function, blocks: blocks, fail: fail)
+                guard live.isEmpty else { throw fail("owned values are neither forwarded nor destroyed at branch") }
+            case let .conditionalBranch(_, trueTarget, trueArguments, falseTarget, falseArguments):
+                var trueLive = live
+                var falseLive = live
+                try consumeForwarded(trueArguments, target: trueTarget, live: &trueLive, function: function, blocks: blocks, fail: fail)
+                try consumeForwarded(falseArguments, target: falseTarget, live: &falseLive, function: function, blocks: blocks, fail: fail)
+                guard trueLive.isEmpty, falseLive.isEmpty else {
+                    throw fail("owned values are not balanced on every cond_br edge")
+                }
+            case let .returnValue(result):
+                if let result,
+                   function.type(of: result)?.requiresLinearOwnership == true {
+                    guard live.remove(result) != nil else { throw fail("return consumes a non-live value") }
+                }
+                guard live.isEmpty else { throw fail("owned values remain live at return") }
+            case let .throwError(error):
+                if function.type(of: error)?.requiresLinearOwnership == true,
+                   live.remove(error) == nil {
+                    throw fail("throw_error consumes a non-live error payload")
+                }
+                guard live.isEmpty else {
+                    throw fail("owned values remain live at throw")
+                }
+            case .trap:
+                live.removeAll()
+            case .constantInteger, .constantBool, .constantFloat, .checkedBinary,
+                 .floatingBinary, .floatingUnary, .integerConvert, .floatingConvert,
+                 .booleanBinary, .stringConcat, .stringCount, .stringIsEmpty,
+                 .stringPredicate, .stringify, .arrayCount, .arrayIsEmpty, .arrayContains,
+                 .dictionaryCount, .dictionaryIsEmpty, .compare:
+                break
+            }
+        }
+    }
+
+    private func consumeForwarded(
+        _ arguments: [Bytecode.Register],
+        target: Bytecode.BlockID,
+        live: inout Set<Bytecode.Register>,
+        function: Bytecode.Function,
+        blocks: [Bytecode.BlockID: Bytecode.Block],
+        fail: (String) -> Verification.Error
+    ) throws {
+        guard let targetBlock = blocks[target] else { return }
+        for (argument, parameter) in zip(arguments, targetBlock.parameters)
+        where function.type(of: parameter)?.requiresLinearOwnership == true {
+            guard live.remove(argument) != nil else { throw fail("branch forwards a consumed owned value") }
+        }
+    }
+
+    /// The callee signature owns the call convention. Owned linear arguments
+    /// transfer into the callee; borrowed arguments remain live in the caller
+    /// and are constrained separately by the verifier's borrow rules.
+    private func consumeOwnedCallArguments(
+        _ arguments: [Bytecode.Register],
+        conventions: [Bytecode.ParameterConvention],
+        live: inout Set<Bytecode.Register>,
+        function: Bytecode.Function,
+        fail: (String) -> Verification.Error
+    ) throws {
+        for (argument, convention) in zip(arguments, conventions)
+        where convention == .owned
+            && function.type(of: argument)?.requiresLinearOwnership == true {
+            guard live.remove(argument) != nil else {
+                throw fail("call consumes a non-live owned argument")
+            }
+        }
+    }
+
+    private enum AddressRoot: Hashable {
+        case stack(Bytecode.StackSlot)
+        case parameter(Bytecode.Register)
+    }
+
+    private enum AddressScope: Hashable {
+        case parameter(Bytecode.Register)
+        case local(Bytecode.Register)
+    }
+
+    private struct AddressProvenance: Hashable {
+        var root: AddressRoot
+        var path: [UInt32]
+        var scope: AddressScope?
+
+        func overlaps(_ other: Self) -> Bool {
+            guard root == other.root else { return false }
+            let shared = min(path.count, other.path.count)
+            return Array(path.prefix(shared)) == Array(other.path.prefix(shared))
+        }
+    }
+
+    private func addressProvenance(
+        function: Bytecode.Function
+    ) throws -> [Bytecode.Register: AddressProvenance] {
+        var definitions: [Bytecode.Register: Bytecode.Instruction] = [:]
+        for block in function.blocks {
+            for instruction in block.instructions {
+                for result in instruction.resultRegisters {
+                    definitions[result] = instruction
+                }
+            }
+        }
+        let inoutParameters = Dictionary(uniqueKeysWithValues: zip(
+            function.parameterRegisters,
+            function.parameterConventions
+        ).compactMap { register, convention -> (Bytecode.Register, AddressProvenance)? in
+            guard convention == .inout else { return nil }
+            return (
+                register,
+                .init(root: .parameter(register), path: [], scope: .parameter(register))
+            )
+        })
+        var result = inoutParameters
+        var visiting = Set<Bytecode.Register>()
+
+        func resolve(_ register: Bytecode.Register) throws -> AddressProvenance {
+            if let known = result[register] { return known }
+            guard visiting.insert(register).inserted else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "address provenance is recursive"
+                )
+            }
+            defer { visiting.remove(register) }
+            guard let instruction = definitions[register] else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "address register \(register) has no supported origin"
+                )
+            }
+            let provenance: AddressProvenance
+            switch instruction {
+            case let .stackAddress(_, slot):
+                provenance = .init(root: .stack(slot), path: [], scope: nil)
+            case let .projectStructAddress(_, base, fieldIndex):
+                var base = try resolve(base)
+                base.path.append(fieldIndex)
+                provenance = base
+            case let .beginAccess(result, address, _):
+                var base = try resolve(address)
+                guard base.scope == nil else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "begin_access cannot nest an already-scoped address"
+                    )
+                }
+                base.scope = .local(result)
+                provenance = base
+            default:
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "address register \(register) is defined by an unsupported instruction"
+                )
+            }
+            result[register] = provenance
+            return provenance
+        }
+
+        for register in function.registerTypes.indices.compactMap({ index -> Bytecode.Register? in
+            guard case .address = function.registerTypes[index],
+                  let raw = UInt32(exactly: index)
+            else { return nil }
+            return .init(rawValue: raw)
+        }) {
+            _ = try resolve(register)
+        }
+        return result
+    }
+
+    /// HLBC 1.7 keeps local access scopes within one basic block. This makes
+    /// exclusivity decidable before execution while still covering canonical
+    /// SIL's common nonthrowing `inout` and mutating-method shapes.
+    private func verifyAddressLifecycle(
+        function: Bytecode.Function,
+        functions: [Bytecode.FunctionID: Bytecode.Function]
+    ) throws {
+        guard function.registerTypes.contains(where: {
+            if case .address = $0 { return true }
+            return false
+        }) else { return }
+        let provenance = try addressProvenance(function: function)
+
+        for block in function.blocks {
+            var active: [Bytecode.Register: (AddressProvenance, Bytecode.AccessKind)] = [:]
+            var ended = Set<Bytecode.Register>()
+            for (offset, instruction) in block.instructions.enumerated() {
+                func fail(_ reason: String) -> Verification.Error {
+                    .invalidInstruction(
+                        function: function.id,
+                        block: block.id,
+                        offset: offset,
+                        reason: reason
+                    )
+                }
+                func checked(_ register: Bytecode.Register) throws -> AddressProvenance {
+                    guard let value = provenance[register] else {
+                        throw fail("address operand has no verified provenance")
+                    }
+                    if case let .local(scope)? = value.scope, ended.contains(scope) {
+                        throw fail("address is used after end_access")
+                    }
+                    return value
+                }
+                func requireScoped(
+                    _ register: Bytecode.Register,
+                    modify: Bool = false
+                ) throws -> AddressProvenance {
+                    let value = try checked(register)
+                    guard let scope = value.scope else {
+                        throw fail("address operation requires an active access scope")
+                    }
+                    if case let .local(scopeRegister) = scope {
+                        guard let (_, kind) = active[scopeRegister] else {
+                            throw fail("address access scope is not active in this block")
+                        }
+                        if modify, kind != .modify {
+                            throw fail("write requires a modify access")
+                        }
+                    }
+                    return value
+                }
+
+                switch instruction {
+                case let .beginAccess(result, address, kind):
+                    let base = try checked(address)
+                    guard base.scope == nil else {
+                        throw fail("begin_access cannot nest an active address")
+                    }
+                    guard active.values.allSatisfy({ existing, existingKind in
+                        !base.overlaps(existing) || (kind == .read && existingKind == .read)
+                    }) else {
+                        throw fail("begin_access violates exclusive access")
+                    }
+                    guard let resultProvenance = provenance[result] else {
+                        throw fail("begin_access result has no verified provenance")
+                    }
+                    active[result] = (resultProvenance, kind)
+                case let .endAccess(address):
+                    guard case let .local(scope)? = try checked(address).scope,
+                          scope == address,
+                          active.removeValue(forKey: scope) != nil
+                    else {
+                        throw fail("end_access must close its matching begin_access result")
+                    }
+                    ended.insert(scope)
+                case let .loadAddress(_, address, _):
+                    _ = try requireScoped(address)
+                case let .storeAddress(address, _, _):
+                    _ = try requireScoped(address, modify: true)
+                case let .projectStructAddress(_, base, _):
+                    _ = try checked(base)
+                case let .apply(_, calleeID, arguments):
+                    guard let callee = functions[calleeID] else { break }
+                    var inoutValues: [AddressProvenance] = []
+                    for (argument, convention) in zip(arguments, callee.parameterConventions) {
+                        if convention == .inout {
+                            inoutValues.append(try requireScoped(argument, modify: true))
+                        } else if case .address = function.type(of: argument) {
+                            throw fail("address argument requires an inout callee parameter")
+                        }
+                    }
+                    for left in inoutValues.indices {
+                        for right in inoutValues.indices where right > left {
+                            guard !inoutValues[left].overlaps(inoutValues[right]) else {
+                                throw fail("call has overlapping inout arguments")
+                            }
+                        }
+                    }
+                case let .tryApply(calleeID, _, _, _):
+                    if functions[calleeID]?.parameterConventions.contains(.inout) == true {
+                        throw fail("HLBC 1.7 does not carry inout access scopes across try_apply")
+                    }
+                case let .storeStack(slot, _, _), let .loadStack(_, slot, _),
+                     let .destroyStack(slot):
+                    let root = AddressProvenance(root: .stack(slot), path: [], scope: nil)
+                    guard active.values.allSatisfy({ !$0.0.overlaps(root) }) else {
+                        throw fail("direct stack access overlaps an active address access")
+                    }
+                case .entryApply, .nativeApply, .entryTryApply, .nativeTryApply:
+                    for operand in instruction.operandRegisters
+                    where function.type(of: operand).map({ type in
+                        if case .address = type { return true }
+                        return false
+                    }) == true {
+                        throw fail("address values cannot cross Shell or NativeImport boundaries")
+                    }
+                default:
+                    for operand in instruction.operandRegisters
+                    where function.type(of: operand).map({ type in
+                        if case .address = type { return true }
+                        return false
+                    }) == true {
+                        throw fail("instruction cannot consume or escape an address value")
+                    }
+                }
+            }
+            guard active.isEmpty else {
+                throw Verification.Error.invalidBlock(
+                    function: function.id,
+                    block: block.id,
+                    reason: "begin_access scope is not ended in the same block"
+                )
+            }
+        }
+    }
+
+    /// Stack slots never escape an HLBC frame. Requiring an identical
+    /// initialized-slot set on every incoming edge keeps their ownership
+    /// decidable, including loops, without trusting runtime address state.
+    private func verifyStackLifecycle(
+        function: Bytecode.Function,
+        blocks: [Bytecode.BlockID: Bytecode.Block]
+    ) throws {
+        guard !function.stackSlotTypes.isEmpty else { return }
+        let addresses = try addressProvenance(function: function)
+        var incoming: [Bytecode.BlockID: Set<Bytecode.StackSlot>] = [
+            function.entryBlock: [],
+        ]
+        var worklist = [function.entryBlock]
+
+        while let blockID = worklist.popLast() {
+            guard let block = blocks[blockID], var initialized = incoming[blockID] else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "stack-state analysis reached an unknown block"
+                )
+            }
+            for (offset, instruction) in block.instructions.enumerated() {
+                func fail(_ reason: String) -> Verification.Error {
+                    .invalidInstruction(
+                        function: function.id,
+                        block: block.id,
+                        offset: offset,
+                        reason: reason
+                    )
+                }
+                switch instruction {
+                case let .storeStack(slot, _, mode):
+                    switch mode {
+                    case .initialize:
+                        guard initialized.insert(slot).inserted else {
+                            throw fail("store_stack.initialize targets an initialized slot")
+                        }
+                    case .assign:
+                        guard initialized.contains(slot) else {
+                            throw fail("store_stack.assign targets an uninitialized slot")
+                        }
+                    }
+                case let .loadStack(_, slot, mode):
+                    guard initialized.contains(slot) else {
+                        throw fail("load_stack reads an uninitialized slot")
+                    }
+                    if mode == .take { initialized.remove(slot) }
+                case let .destroyStack(slot):
+                    guard initialized.remove(slot) != nil else {
+                        throw fail("destroy_stack targets an uninitialized slot")
+                    }
+                case let .loadAddress(_, address, _):
+                    if case let .stack(slot)? = addresses[address]?.root,
+                       !initialized.contains(slot) {
+                        throw fail("load_address reads an uninitialized stack slot")
+                    }
+                case let .storeAddress(address, _, _):
+                    if case let .stack(slot)? = addresses[address]?.root,
+                       !initialized.contains(slot) {
+                        throw fail("store_address assigns an uninitialized stack slot")
+                    }
+                case let .arrayNext(_, _, slot):
+                    guard initialized.contains(slot) else {
+                        throw fail("array_next uses an uninitialized index slot")
+                    }
+                case let .dictionaryNext(_, _, slot):
+                    guard initialized.contains(slot) else {
+                        throw fail("dictionary_next uses an uninitialized index slot")
+                    }
+                case .returnValue, .throwError:
+                    guard initialized.isEmpty else {
+                        throw fail("initialized stack slots remain at function exit")
+                    }
+                case .trap:
+                    // Runtime unwinding releases the entire verified frame.
+                    initialized.removeAll()
+                default:
+                    break
+                }
+            }
+
+            guard let terminator = block.instructions.last else { continue }
+            for successor in successors(of: terminator) {
+                if let existing = incoming[successor] {
+                    guard existing == initialized else {
+                        throw Verification.Error.invalidBlock(
+                            function: function.id,
+                            block: successor,
+                            reason: "incoming stack-slot initialization states disagree"
+                        )
+                    }
+                } else {
+                    incoming[successor] = initialized
+                    worklist.append(successor)
+                }
+            }
+        }
+    }
+
+    private func requireRegister(
+        _ register: Bytecode.Register,
+        function: Bytecode.Function,
+        block: Bytecode.BlockID,
+        offset: Int
+    ) throws {
+        guard function.type(of: register) != nil else {
+            throw Verification.Error.invalidInstruction(
+                function: function.id,
+                block: block,
+                offset: offset,
+                reason: "register \(register) is out of range"
+            )
+        }
+    }
+}
+}

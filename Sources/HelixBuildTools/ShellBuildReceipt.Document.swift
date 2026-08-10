@@ -1,0 +1,666 @@
+import Foundation
+import HelixCompiler
+import HelixCore
+import HelixDevProtocol
+import HelixInterface
+import HelixLiveReloadAPI
+
+/// A typed compiler-to-build-tools boundary. The Swift compiler adapter emits
+/// this document; downstream tools consume it without rediscovering declarations
+/// from source text.
+public enum ShellBuildReceipt {}
+
+extension ShellBuildReceipt {
+public struct Source: Codable, Hashable, Sendable {
+    public var logicalPath: String
+    public var contentHash: Core.Digest
+
+    public init(logicalPath: String, contentHash: Core.Digest) {
+        self.logicalPath = logicalPath
+        self.contentHash = contentHash
+    }
+}
+
+public struct NominalType: Codable, Hashable, Sendable {
+    public var moduleName: String
+    public var canonicalName: String
+
+    public init(moduleName: String, canonicalName: String) {
+        self.moduleName = moduleName
+        self.canonicalName = canonicalName
+    }
+
+    public var id: LiveReload.NominalTypeID {
+        .derive(module: moduleName, canonicalName: canonicalName)
+    }
+
+    fileprivate var orderKey: String { "\(moduleName).\(canonicalName)" }
+}
+
+public struct NativeReplacement: Codable, Hashable, Sendable {
+    public var declarationAnchor: String
+    public var declarationOccurrence: UInt32
+    public var loweredType: String
+    public var originalReference: String
+    public var replacementDeclaration: String
+    public var enclosingPrefix: String
+    public var enclosingSuffix: String
+    public var importedModules: [String]
+
+    public init(
+        declarationAnchor: String,
+        declarationOccurrence: UInt32 = 0,
+        loweredType: String,
+        originalReference: String,
+        replacementDeclaration: String,
+        enclosingPrefix: String = "",
+        enclosingSuffix: String = "",
+        importedModules: [String] = []
+    ) {
+        self.declarationAnchor = declarationAnchor
+        self.declarationOccurrence = declarationOccurrence
+        self.loweredType = loweredType
+        self.originalReference = originalReference
+        self.replacementDeclaration = replacementDeclaration
+        self.enclosingPrefix = enclosingPrefix
+        self.enclosingSuffix = enclosingSuffix
+        self.importedModules = importedModules.sorted()
+    }
+}
+
+public struct Bridge: Codable, Hashable, Sendable {
+    public var privateImportSourceFile: String
+    public var originalReference: String
+    public var replacementDeclaration: String
+    public var parameterExpressions: [String]
+    public var parameterSwiftTypes: [String]
+    public var resultSwiftType: String
+    public var originalInvocation: String
+    public var bridgeInvocation: String
+    public var enclosingPrefix: String
+    public var enclosingSuffix: String
+
+    public init(
+        privateImportSourceFile: String,
+        originalReference: String,
+        replacementDeclaration: String,
+        parameterExpressions: [String],
+        parameterSwiftTypes: [String],
+        resultSwiftType: String,
+        originalInvocation: String,
+        bridgeInvocation: String,
+        enclosingPrefix: String = "",
+        enclosingSuffix: String = ""
+    ) {
+        self.privateImportSourceFile = privateImportSourceFile
+        self.originalReference = originalReference
+        self.replacementDeclaration = replacementDeclaration
+        self.parameterExpressions = parameterExpressions
+        self.parameterSwiftTypes = parameterSwiftTypes
+        self.resultSwiftType = resultSwiftType
+        self.originalInvocation = originalInvocation
+        self.bridgeInvocation = bridgeInvocation
+        self.enclosingPrefix = enclosingPrefix
+        self.enclosingSuffix = enclosingSuffix
+    }
+}
+
+public struct Root: Codable, Hashable, Sendable {
+    public var declarationMangledName: String
+    public var declarationUTF8Offset: Int
+    public var expectedDeclarationPrefix: String
+    public var reloadRole: ReloadIndex.FunctionRole
+    public var nominalType: ShellBuildReceipt.NominalType?
+    public var bridge: ShellBuildReceipt.Bridge?
+    public var nativeReplacement: ShellBuildReceipt.NativeReplacement?
+
+    public init(
+        declarationMangledName: String,
+        declarationUTF8Offset: Int,
+        expectedDeclarationPrefix: String,
+        reloadRole: ReloadIndex.FunctionRole = .unknown,
+        nominalType: ShellBuildReceipt.NominalType? = nil,
+        bridge: ShellBuildReceipt.Bridge? = nil,
+        nativeReplacement: ShellBuildReceipt.NativeReplacement? = nil
+    ) {
+        self.declarationMangledName = declarationMangledName
+        self.declarationUTF8Offset = declarationUTF8Offset
+        self.expectedDeclarationPrefix = expectedDeclarationPrefix
+        self.reloadRole = reloadRole
+        self.nominalType = nominalType
+        self.bridge = bridge
+        self.nativeReplacement = nativeReplacement
+    }
+}
+
+public struct NativeImportBinding: Codable, Hashable, Sendable {
+    public var key: Core.NativeImportKey
+    public var invokerExpression: String
+    public var importedModules: [String]
+    public var generated: ShellBuildReceipt.GeneratedNativeImport?
+
+    public init(
+        key: Core.NativeImportKey,
+        invokerExpression: String,
+        importedModules: [String] = [],
+        generated: ShellBuildReceipt.GeneratedNativeImport? = nil
+    ) {
+        self.key = key
+        self.invokerExpression = invokerExpression
+        self.importedModules = importedModules.sorted()
+        self.generated = generated
+    }
+}
+
+/// Structured call metadata for a source-discovered invoker. Keeping this
+/// data structured lets the Bridge generator render Swift without persisting
+/// arbitrary source snippets in the receipt.
+public struct GeneratedNativeImport: Codable, Hashable, Sendable {
+    public enum Dispatch: String, Codable, Hashable, Sendable {
+        case globalFunction
+        case staticMethod
+    }
+
+    public var declarationMangledName: String
+    public var sourceFileLogicalID: String
+    public var dispatch: Dispatch
+    public var ownerType: String?
+    public var baseName: String
+    public var argumentLabels: [String]
+    public var parameterSwiftTypes: [String]
+    public var resultSwiftType: String
+
+    public init(
+        declarationMangledName: String,
+        sourceFileLogicalID: String,
+        dispatch: Dispatch,
+        ownerType: String? = nil,
+        baseName: String,
+        argumentLabels: [String],
+        parameterSwiftTypes: [String],
+        resultSwiftType: String
+    ) {
+        self.declarationMangledName = declarationMangledName
+        self.sourceFileLogicalID = sourceFileLogicalID
+        self.dispatch = dispatch
+        self.ownerType = ownerType
+        self.baseName = baseName
+        self.argumentLabels = argumentLabels
+        self.parameterSwiftTypes = parameterSwiftTypes
+        self.resultSwiftType = resultSwiftType
+    }
+}
+
+public struct NativeTypeBinding: Codable, Hashable, Sendable {
+    public var canonicalName: String
+    public var layoutFingerprint: Core.Digest
+    public var requiresMainActor: Bool
+    public var operationsExpression: String
+    public var importedModules: [String]
+
+    public init(
+        canonicalName: String,
+        layoutFingerprint: Core.Digest,
+        requiresMainActor: Bool = false,
+        operationsExpression: String,
+        importedModules: [String] = []
+    ) {
+        self.canonicalName = canonicalName
+        self.layoutFingerprint = layoutFingerprint
+        self.requiresMainActor = requiresMainActor
+        self.operationsExpression = operationsExpression
+        self.importedModules = importedModules.sorted()
+    }
+}
+
+public struct SuperclassEdge: Codable, Hashable, Sendable {
+    public var subtype: ShellBuildReceipt.NominalType
+    public var superclass: ShellBuildReceipt.NominalType
+
+    public init(
+        subtype: ShellBuildReceipt.NominalType,
+        superclass: ShellBuildReceipt.NominalType
+    ) {
+        self.subtype = subtype
+        self.superclass = superclass
+    }
+
+    fileprivate var orderKey: String { "\(subtype.orderKey):\(superclass.orderKey)" }
+}
+
+public struct ReloadRule: Codable, Hashable, Sendable {
+    public var sourceLogicalPaths: [String]
+    public var controllerType: ShellBuildReceipt.NominalType
+    public var policy: LiveReload.Policy
+    public var invalidationHints: LiveReload.InvalidationHints
+    public var factoryID: LiveReload.FactoryID?
+
+    public init(
+        sourceLogicalPaths: [String],
+        controllerType: ShellBuildReceipt.NominalType,
+        policy: LiveReload.Policy,
+        invalidationHints: LiveReload.InvalidationHints = [],
+        factoryID: LiveReload.FactoryID? = nil
+    ) {
+        self.sourceLogicalPaths = sourceLogicalPaths.sorted()
+        self.controllerType = controllerType
+        self.policy = policy
+        self.invalidationHints = invalidationHints
+        self.factoryID = factoryID
+    }
+
+    fileprivate var orderKey: String {
+        "\(controllerType.orderKey):\(policy.rawValue):\(invalidationHints.rawValue):"
+            + "\(factoryID?.rawValue ?? ""):\(sourceLogicalPaths.joined(separator: ","))"
+    }
+}
+
+public struct Factory: Codable, Hashable, Sendable {
+    public var id: LiveReload.FactoryID
+    public var controllerType: ShellBuildReceipt.NominalType
+
+    public init(id: LiveReload.FactoryID, controllerType: ShellBuildReceipt.NominalType) {
+        self.id = id
+        self.controllerType = controllerType
+    }
+}
+
+public struct Document: Codable, Hashable, Sendable {
+    public static let currentSchemaVersion: UInt16 = 6
+
+    public var schemaVersion: UInt16
+    public var metadata: InterfaceArchive.ReleaseMetadata
+    public var compatibility: Core.Compatibility
+    public var configuration: PatchConfiguration.Document
+    public var capabilities: [Core.Capability]
+    public var sources: [ShellBuildReceipt.Source]
+    public var declarations: [ReleaseCompiler.DeclarationCandidate]
+    public var roots: [ShellBuildReceipt.Root]
+    public var nativeImportCandidates: [InterfaceArchive.NativeImportRecord]
+    public var nativeImportBindings: [ShellBuildReceipt.NativeImportBinding]
+    public var nativeTypes: [InterfaceArchive.TypeRecord]
+    public var nativeTypeBindings: [ShellBuildReceipt.NativeTypeBinding]
+    public var superclassEdges: [ShellBuildReceipt.SuperclassEdge]
+    public var reloadRules: [ShellBuildReceipt.ReloadRule]
+    public var factories: [ShellBuildReceipt.Factory]
+
+    public init(
+        schemaVersion: UInt16 = Self.currentSchemaVersion,
+        metadata: InterfaceArchive.ReleaseMetadata,
+        compatibility: Core.Compatibility,
+        configuration: PatchConfiguration.Document,
+        capabilities: Set<Core.Capability> = [.baselineV1],
+        sources: [ShellBuildReceipt.Source],
+        declarations: [ReleaseCompiler.DeclarationCandidate],
+        roots: [ShellBuildReceipt.Root],
+        nativeImportCandidates: [InterfaceArchive.NativeImportRecord] = [],
+        nativeImportBindings: [ShellBuildReceipt.NativeImportBinding] = [],
+        nativeTypes: [InterfaceArchive.TypeRecord] = [],
+        nativeTypeBindings: [ShellBuildReceipt.NativeTypeBinding] = [],
+        superclassEdges: [ShellBuildReceipt.SuperclassEdge] = [],
+        reloadRules: [ShellBuildReceipt.ReloadRule] = [],
+        factories: [ShellBuildReceipt.Factory] = []
+    ) {
+        self.schemaVersion = schemaVersion
+        self.metadata = metadata
+        self.compatibility = compatibility
+        self.configuration = configuration
+        self.capabilities = capabilities.sorted()
+        self.sources = sources.sorted { $0.logicalPath < $1.logicalPath }
+        self.declarations = declarations.sorted { $0.mangledName < $1.mangledName }
+        self.roots = roots.sorted { $0.declarationMangledName < $1.declarationMangledName }
+        self.nativeImportCandidates = nativeImportCandidates.sorted {
+            $0.key.rawValue < $1.key.rawValue
+        }
+        self.nativeImportBindings = nativeImportBindings.sorted {
+            $0.key.rawValue < $1.key.rawValue
+        }
+        self.nativeTypes = nativeTypes.sorted { $0.id.rawValue < $1.id.rawValue }
+        self.nativeTypeBindings = nativeTypeBindings.sorted {
+            ($0.canonicalName, $0.layoutFingerprint.hex)
+                < ($1.canonicalName, $1.layoutFingerprint.hex)
+        }
+        self.superclassEdges = superclassEdges.sorted { $0.orderKey < $1.orderKey }
+        self.reloadRules = reloadRules.sorted { $0.orderKey < $1.orderKey }
+        self.factories = factories.sorted { $0.id.rawValue < $1.id.rawValue }
+    }
+
+    public func contentHash() throws -> Core.Digest {
+        try validate()
+        return .sha256(try Core.CanonicalJSON.encode(self))
+    }
+
+    public func validate() throws {
+        guard schemaVersion == 5 || schemaVersion == Self.currentSchemaVersion else {
+            throw ShellBuildReceipt.Error.unsupportedSchema(schemaVersion)
+        }
+        guard metadata.machOUUIDs.isEmpty else {
+            throw ShellBuildReceipt.Error.invalid(
+                "a pre-link receipt must not claim a Mach-O UUID"
+            )
+        }
+        guard metadata.transformPipelineHash == ShellBuild.transformPipelineHash else {
+            throw ShellBuildReceipt.Error.invalid("transform pipeline identity is stale")
+        }
+        try metadata.frontendInvocation.validate()
+        do {
+            try configuration.validate()
+        } catch {
+            throw ShellBuildReceipt.Error.invalid(
+                "patchability configuration is incomplete: \(error)"
+            )
+        }
+        guard schemaVersion >= 6 || configuration.schema == 1 else {
+            throw ShellBuildReceipt.Error.invalid(
+                "source NativeImport discovery requires Shell receipt schema 6"
+            )
+        }
+        guard capabilities == Array(Set(capabilities)).sorted(),
+              capabilities.contains(.baselineV1)
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "capabilities are duplicated, unordered, or omit the baseline"
+            )
+        }
+        guard sources == sources.sorted(by: { $0.logicalPath < $1.logicalPath }),
+              Set(sources.map(\.logicalPath)).count == sources.count,
+              !sources.isEmpty,
+              sources.allSatisfy({ Self.isSafeLogicalPath($0.logicalPath) })
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "source paths are empty, duplicated, unordered, absolute, or traversing"
+            )
+        }
+        let sourcePaths = Set(sources.map(\.logicalPath))
+        guard declarations == declarations.sorted(by: { $0.mangledName < $1.mangledName }),
+              Set(declarations.map(\.mangledName)).count == declarations.count,
+              !declarations.isEmpty,
+              declarations.allSatisfy({
+                  sourcePaths.contains($0.sourceFileLogicalID)
+                      && !$0.mangledName.isEmpty
+                      && !$0.canonicalDeclaration.isEmpty
+              })
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "declarations are empty, duplicated, unordered, or reference unknown sources"
+            )
+        }
+        let declarationNames = Set(declarations.map(\.mangledName))
+        guard roots == roots.sorted(by: {
+            $0.declarationMangledName < $1.declarationMangledName
+        }), Set(roots.map(\.declarationMangledName)).count == roots.count,
+            roots.allSatisfy({ declarationNames.contains($0.declarationMangledName) })
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "bridge roots are duplicated, unordered, or reference unknown declarations"
+            )
+        }
+        try roots.forEach(Self.validateRoot)
+        guard nativeImportCandidates == nativeImportCandidates.sorted(by: {
+            $0.key.rawValue < $1.key.rawValue
+        }), Set(nativeImportCandidates.map(\.key)).count == nativeImportCandidates.count,
+            nativeImportBindings == nativeImportBindings.sorted(by: {
+                $0.key.rawValue < $1.key.rawValue
+            }), Set(nativeImportBindings.map(\.key)).count == nativeImportBindings.count,
+            nativeImportBindings.allSatisfy({
+                Self.isBoundExpression($0.invokerExpression)
+                    && $0.importedModules == Array(Set($0.importedModules)).sorted()
+                    && $0.importedModules.allSatisfy(Self.isModulePath)
+                    && Self.isValidGeneratedNativeImport(
+                        $0.generated,
+                        declarations: declarations,
+                        sourcePaths: sourcePaths
+                    )
+            }), Set(nativeImportBindings.map(\.key))
+                == Set(nativeImportCandidates.filter(\.isEmittedToDevice).map(\.key))
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "native import candidates or bindings are duplicated, unordered, or empty"
+            )
+        }
+        guard schemaVersion >= 6
+                || nativeImportBindings.allSatisfy({ $0.generated == nil })
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "generated NativeImport bindings require Shell receipt schema 6"
+            )
+        }
+        guard nativeTypes == nativeTypes.sorted(by: { $0.id.rawValue < $1.id.rawValue }),
+              Set(nativeTypes.map(\.id)).count == nativeTypes.count,
+              nativeTypeBindings == nativeTypeBindings.sorted(by: {
+                  ($0.canonicalName, $0.layoutFingerprint.hex)
+                      < ($1.canonicalName, $1.layoutFingerprint.hex)
+              }),
+              Set(nativeTypeBindings.map {
+                  "\($0.canonicalName):\($0.layoutFingerprint.hex):\($0.requiresMainActor)"
+              }).count == nativeTypeBindings.count,
+              nativeTypeBindings.allSatisfy({
+                  !$0.canonicalName.isEmpty
+                      && Self.isBoundExpression($0.operationsExpression)
+                      && $0.importedModules == Array(Set($0.importedModules)).sorted()
+                      && $0.importedModules.allSatisfy(Self.isModulePath)
+              }), Set(nativeTypeBindings.map {
+                  "\($0.canonicalName):\($0.layoutFingerprint.hex):\($0.requiresMainActor)"
+              }) == Set(nativeTypes.filter(\.isEmittedToDevice).map {
+                  "\($0.canonicalName):\($0.layoutFingerprint.hex):\($0.requiresMainActor)"
+              })
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "native types or bindings are duplicated, unordered, or empty"
+            )
+        }
+        guard superclassEdges == superclassEdges.sorted(by: { $0.orderKey < $1.orderKey }),
+              Set(superclassEdges.map(\.subtype)).count == superclassEdges.count,
+              superclassEdges.allSatisfy({ $0.subtype != $0.superclass }),
+              reloadRules == reloadRules.sorted(by: { $0.orderKey < $1.orderKey }),
+              Set(reloadRules).count == reloadRules.count,
+              factories == factories.sorted(by: { $0.id.rawValue < $1.id.rawValue }),
+              Set(factories.map(\.id)).count == factories.count,
+              Set(factories.map(\.controllerType)).count == factories.count
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "reload metadata is duplicated, unordered, or self-referential"
+            )
+        }
+        for rule in reloadRules {
+            guard !rule.sourceLogicalPaths.isEmpty,
+                  rule.sourceLogicalPaths == rule.sourceLogicalPaths.sorted(),
+                  Set(rule.sourceLogicalPaths).count == rule.sourceLogicalPaths.count,
+                  Set(rule.sourceLogicalPaths).isSubset(of: sourcePaths)
+            else {
+                throw ShellBuildReceipt.Error.invalid(
+                    "a reload rule has an empty, duplicated, or unknown source"
+                )
+            }
+            try rule.invalidationHints.validate()
+            try Self.validateNominal(rule.controllerType)
+        }
+        try superclassEdges.forEach {
+            try Self.validateNominal($0.subtype)
+            try Self.validateNominal($0.superclass)
+        }
+        try factories.forEach { try Self.validateNominal($0.controllerType) }
+    }
+
+    private static func validateRoot(_ root: ShellBuildReceipt.Root) throws {
+        guard root.declarationUTF8Offset >= 0,
+              !root.expectedDeclarationPrefix.isEmpty,
+              Self.isBoundText(root.declarationMangledName),
+              Self.isBoundText(root.expectedDeclarationPrefix),
+              root.bridge != nil || root.nativeReplacement != nil
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "bridge root \(root.declarationMangledName) is incomplete or oversized"
+            )
+        }
+        if let bridge = root.bridge {
+            let requiredStrings = [
+                bridge.privateImportSourceFile, bridge.originalReference,
+                bridge.replacementDeclaration, bridge.resultSwiftType,
+                bridge.originalInvocation, bridge.bridgeInvocation,
+            ] + bridge.parameterExpressions + bridge.parameterSwiftTypes
+            guard bridge.replacementDeclaration.contains("func "),
+                  bridge.enclosingPrefix.isEmpty == bridge.enclosingSuffix.isEmpty,
+                  requiredStrings.allSatisfy(Self.isBoundText),
+                  Self.isBoundOptionalText(bridge.enclosingPrefix),
+                  Self.isBoundOptionalText(bridge.enclosingSuffix)
+            else {
+                throw ShellBuildReceipt.Error.invalid(
+                    "HLBC Bridge metadata for \(root.declarationMangledName) is invalid"
+                )
+            }
+        }
+        if let replacement = root.nativeReplacement {
+            guard replacement.declarationAnchor.utf8.last == UInt8(ascii: "{"),
+                  replacement.declarationAnchor.range(
+                      of: #"^func\s+"#,
+                      options: .regularExpression
+                  ) != nil,
+                  replacement.declarationOccurrence <= 65_535,
+                  Self.isBoundText(replacement.declarationAnchor),
+                  !replacement.loweredType.isEmpty,
+                  Self.isBoundText(replacement.loweredType),
+                  Self.isBoundText(replacement.originalReference),
+                  replacement.replacementDeclaration.contains("func "),
+                  Self.isBoundText(replacement.replacementDeclaration),
+                  replacement.enclosingPrefix.isEmpty == replacement.enclosingSuffix.isEmpty,
+                  Self.isBoundOptionalText(replacement.enclosingPrefix),
+                  Self.isBoundOptionalText(replacement.enclosingSuffix),
+                  replacement.importedModules == replacement.importedModules.sorted(),
+                  Set(replacement.importedModules).count == replacement.importedModules.count,
+                  replacement.importedModules.allSatisfy(Self.isModulePath)
+            else {
+                throw ShellBuildReceipt.Error.invalid(
+                    "native replacement metadata for \(root.declarationMangledName) is invalid"
+                )
+            }
+        }
+        if let nominal = root.nominalType {
+            try validateNominal(nominal)
+        }
+    }
+
+    private static func validateNominal(_ nominal: ShellBuildReceipt.NominalType) throws {
+        guard isModulePath(nominal.moduleName), isBoundText(nominal.canonicalName) else {
+            throw ShellBuildReceipt.Error.invalid("nominal type identity is invalid")
+        }
+    }
+
+    private static func isValidGeneratedNativeImport(
+        _ generated: ShellBuildReceipt.GeneratedNativeImport?,
+        declarations: [ReleaseCompiler.DeclarationCandidate],
+        sourcePaths: Set<String>
+    ) -> Bool {
+        guard let generated else { return true }
+        guard sourcePaths.contains(generated.sourceFileLogicalID),
+              declarations.contains(where: {
+                  $0.mangledName == generated.declarationMangledName
+                      && $0.sourceFileLogicalID == generated.sourceFileLogicalID
+              }),
+              isBoundText(generated.declarationMangledName),
+              isSwiftIdentifier(generated.baseName),
+              generated.argumentLabels.count == generated.parameterSwiftTypes.count,
+              generated.argumentLabels.allSatisfy({
+                  $0 == "_" || isSwiftIdentifier($0)
+              }),
+              generated.parameterSwiftTypes.allSatisfy(isBoundText),
+              isBoundText(generated.resultSwiftType)
+        else { return false }
+        switch generated.dispatch {
+        case .globalFunction:
+            return generated.ownerType == nil
+        case .staticMethod:
+            guard let owner = generated.ownerType else { return false }
+            return owner.split(separator: ".", omittingEmptySubsequences: false)
+                .allSatisfy { isSwiftIdentifier(String($0)) }
+        }
+    }
+
+    private static func isSafeLogicalPath(_ path: String) -> Bool {
+        guard !path.isEmpty, !path.hasPrefix("/"), path.utf8.count <= 16 * 1_024 else {
+            return false
+        }
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        return !components.contains("..") && !components.contains("")
+            && !path.unicodeScalars.contains(where: { $0.value == 0 })
+    }
+
+    private static func isBoundText(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 64 * 1_024
+            && !value.unicodeScalars.contains(where: { $0.value == 0 })
+    }
+
+    private static func isBoundOptionalText(_ value: String) -> Bool {
+        value.utf8.count <= 64 * 1_024
+            && !value.unicodeScalars.contains(where: { $0.value == 0 })
+    }
+
+    private static func isBoundExpression(_ value: String) -> Bool {
+        isBoundText(value)
+    }
+
+    private static func isModulePath(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 512 else { return false }
+        return value.split(separator: ".", omittingEmptySubsequences: false).allSatisfy {
+            guard let first = $0.first, first == "_" || first.isLetter else { return false }
+            return $0.dropFirst().allSatisfy { $0 == "_" || $0.isLetter || $0.isNumber }
+        }
+    }
+
+    private static func isSwiftIdentifier(_ value: String) -> Bool {
+        guard let first = value.first, first == "_" || first.isLetter else { return false }
+        return value.dropFirst().allSatisfy {
+            $0 == "_" || $0.isLetter || $0.isNumber
+        }
+    }
+}
+
+public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
+    case unsupportedSchema(UInt16)
+    case documentTooLarge(actual: Int, maximum: Int)
+    case nonCanonical
+    case invalid(String)
+
+    public var description: String {
+        switch self {
+        case let .unsupportedSchema(version):
+            "unsupported Shell Build Receipt schema \(version)"
+        case let .documentTooLarge(actual, maximum):
+            "Shell Build Receipt is \(actual) bytes; maximum is \(maximum)"
+        case .nonCanonical:
+            "Shell Build Receipt is not canonical JSON"
+        case let .invalid(reason):
+            "invalid Shell Build Receipt: \(reason)"
+        }
+    }
+}
+
+public enum Codec {
+    public static let maximumDocumentBytes = 32 * 1_024 * 1_024
+
+    public static func encode(_ document: ShellBuildReceipt.Document) throws -> Data {
+        try document.validate()
+        return try Core.CanonicalJSON.encode(document)
+    }
+
+    public static func decode(_ data: Data) throws -> ShellBuildReceipt.Document {
+        guard data.count <= maximumDocumentBytes else {
+            throw ShellBuildReceipt.Error.documentTooLarge(
+                actual: data.count,
+                maximum: maximumDocumentBytes
+            )
+        }
+        let document: ShellBuildReceipt.Document
+        do {
+            document = try JSONDecoder().decode(ShellBuildReceipt.Document.self, from: data)
+        } catch {
+            throw ShellBuildReceipt.Error.invalid("JSON decoding failed: \(error)")
+        }
+        guard try Core.CanonicalJSON.encode(document) == data else {
+            throw ShellBuildReceipt.Error.nonCanonical
+        }
+        try document.validate()
+        return document
+    }
+}
+}

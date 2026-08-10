@@ -1,0 +1,2873 @@
+import Foundation
+import HelixBytecode
+import HelixCore
+import HelixVerifier
+import Testing
+@testable import HelixVM
+
+private let vmPureImportContract = Core.NativeImportContract.bounded(
+    kind: .globalFunction,
+    domain: .application,
+    access: .pure,
+    maximumDurationMicroseconds: 1_000,
+    allowsMainThread: true
+)
+
+private let vmWriteImportContract = Core.NativeImportContract.bounded(
+    kind: .serviceMethod,
+    domain: .application,
+    access: .write,
+    maximumDurationMicroseconds: 1_000,
+    allowsMainThread: true
+)
+
+enum VMTests {}
+
+extension VMTests {
+@Suite("HLVM typed-register interpreter")
+struct Interpreter {
+    @Test("Local enums preserve associated values across a typed Error edge")
+    func executesTypedLocalErrorCatch() throws {
+        let errorKey = Bytecode.LocalTypeKey(rawValue: "Fixture.DetailedError")
+        let localTypes = [
+            Bytecode.LocalTypeDefinition(
+                key: errorKey,
+                kind: .enumeration(
+                    cases: [
+                        .init(name: "invalid", payloadType: .int64),
+                        .init(name: "unavailable"),
+                    ]
+                ),
+                conformsToError: true
+            ),
+        ]
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "catchTypedError",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64,
+                .int64,
+                .error,
+                .optional(.local(errorKey)),
+                .local(errorKey),
+                .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .tryApply(
+                            function: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 0)],
+                            normalTarget: .init(rawValue: 1),
+                            errorTarget: .init(rawValue: 2)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 1)],
+                    instructions: [.returnValue(.init(rawValue: 1))]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 2)],
+                    instructions: [
+                        .castError(
+                            result: .init(rawValue: 3),
+                            error: .init(rawValue: 2),
+                            expectedType: errorKey
+                        ),
+                        .switchOptional(
+                            optional: .init(rawValue: 3),
+                            someTarget: .init(rawValue: 3),
+                            noneTarget: .init(rawValue: 4)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 3),
+                    parameters: [.init(rawValue: 4)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+                .init(
+                    id: .init(rawValue: 4),
+                    instructions: [
+                        .constantInteger(result: .init(rawValue: 5), value: -1),
+                        .returnValue(.init(rawValue: 5)),
+                    ]
+                ),
+            ]
+        )
+        let throwing = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "throwTypedError",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64, .local(errorKey), .error],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeEnum(
+                            result: .init(rawValue: 1),
+                            caseIndex: 0,
+                            payload: .init(rawValue: 0)
+                        ),
+                        .makeError(
+                            result: .init(rawValue: 2),
+                            payload: .init(rawValue: 1)
+                        ),
+                        .throwError(.init(rawValue: 2)),
+                    ]
+                ),
+            ],
+            effects: .init(mayThrow: true)
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [.baselineV1, .localNominalsV1, .structuredErrorsV1],
+            localTypes: localTypes,
+            additionalFunctions: [throwing]
+        )
+        let input = VM.Value.integer(
+            try VM.Integer(signed: 42, bitWidth: 64, isSigned: true)
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [input]
+            ) == .returned(input)
+        )
+    }
+
+    @Test("Checked arithmetic and CFG branching produce the patched result")
+    func executesCheckedAdd() throws {
+        let fixture = try makeVerified(function: addFunction())
+        let input = try VM.Integer(signed: 3, bitWidth: 64, isSigned: true)
+
+        let result = VM.Interpreter().invoke(
+            entry: .init(rawValue: 0),
+            image: fixture,
+            arguments: [.integer(input)]
+        )
+
+        #expect(result == .returned(.integer(try VM.Integer(signed: 30, bitWidth: 64, isSigned: true))))
+    }
+
+    @Test("The overflow edge traps instead of returning wrapped data")
+    func trapsOnOverflowEdge() throws {
+        let fixture = try makeVerified(function: addFunction())
+        let input = try VM.Integer(signed: Int64.max, bitWidth: 64, isSigned: true)
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: fixture,
+                arguments: [.integer(input)]
+            ) == .trapped(.integerOverflow)
+        )
+    }
+
+    @Test("A loop cannot mint new fuel")
+    func fuelStopsInfiniteLoop() throws {
+        let limits = Core.ResourceLimits(
+            instructionFuelPerEntry: 5,
+            maxWallTimeMainThreadMilliseconds: 1_000
+        )
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "loop",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.branch(target: .init(rawValue: 0), arguments: [.init(rawValue: 0)])]
+                ),
+            ]
+        )
+        let fixture = try makeVerified(function: function, limits: limits)
+        let input = try VM.Integer(signed: 1, bitWidth: 64, isSigned: true)
+
+        #expect(
+            VM.Interpreter().invoke(entry: .init(rawValue: 0), image: fixture, arguments: [.integer(input)])
+                == .trapped(.instructionFuelExhausted)
+        )
+    }
+
+    @Test("Linear collection work consumes proportional instruction fuel")
+    func collectionWorkConsumesProportionalFuel() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let elementRegisters = (0..<8).map { Bytecode.Register(rawValue: UInt32($0)) }
+        let resultRegister = Bytecode.Register(rawValue: 8)
+        var instructions = elementRegisters.enumerated().map { index, register in
+            Bytecode.Instruction.constantInteger(
+                result: register,
+                value: Int64(index)
+            )
+        }
+        instructions.append(
+            .makeArray(result: resultRegister, elements: elementRegisters)
+        )
+        instructions.append(.returnValue(resultRegister))
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "linearFuel",
+            parameterRegisters: [],
+            resultType: arrayType,
+            registerTypes: Array(repeating: .int64, count: 8) + [arrayType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    instructions: instructions
+                ),
+            ]
+        )
+
+        func image(fuel: UInt64) throws -> Verification.Image {
+            try makeVerified(
+                function: function,
+                limits: .init(
+                    instructionFuelPerEntry: fuel,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                capabilities: [.baselineV1, .collectionsV1],
+                signature: .init(parameters: [], result: "Swift.Array<Swift.Int>"),
+                parameterTypes: [],
+                resultType: arrayType
+            )
+        }
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(fuel: 10),
+                arguments: []
+            ) == .trapped(.instructionFuelExhausted)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(fuel: 18),
+                arguments: []
+            ) == .returned(
+                .array(
+                    try (0..<8).map {
+                        .integer(
+                            try VM.Integer(
+                                signed: Int64($0),
+                                bitWidth: 64,
+                                isSigned: true
+                            )
+                        )
+                    },
+                    elementType: .int64
+                )
+            )
+        )
+    }
+
+    @Test("HLBC 1.5 numeric conversions preserve raw bits and IEEE rounding")
+    func numericConversionSemantics() throws {
+        func invoke(
+            operation: Bytecode.IntegerConversionOperation,
+            sourceType: Bytecode.ValueType,
+            resultType: Bytecode.ValueType,
+            value: VM.Integer
+        ) throws -> VM.ExecutionResult {
+            let function = Bytecode.Function(
+                id: .init(rawValue: 0),
+                name: "integerConversion",
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: resultType,
+                registerTypes: [sourceType, resultType],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .integerConvert(
+                                result: .init(rawValue: 1),
+                                operation: operation,
+                                value: .init(rawValue: 0)
+                            ),
+                            .returnValue(.init(rawValue: 1)),
+                        ]
+                    ),
+                ]
+            )
+            return VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try makeVerified(
+                    function: function,
+                    signature: .init(
+                        parameters: [sourceType.description],
+                        result: resultType.description
+                    ),
+                    parameterTypes: [sourceType],
+                    resultType: resultType
+                ),
+                arguments: [.integer(value)]
+            )
+        }
+
+        #expect(
+            try invoke(
+                operation: .truncate,
+                sourceType: .int64,
+                resultType: .integer(bitWidth: 8, signed: true),
+                value: .init(signed: -129, bitWidth: 64, isSigned: true)
+            ) == .returned(.integer(try .init(signed: 127, bitWidth: 8, isSigned: true)))
+        )
+        #expect(
+            try invoke(
+                operation: .signExtend,
+                sourceType: .integer(bitWidth: 8, signed: true),
+                resultType: .int64,
+                value: .init(signed: -1, bitWidth: 8, isSigned: true)
+            ) == .returned(.integer(try .init(signed: -1, bitWidth: 64, isSigned: true)))
+        )
+        #expect(
+            try invoke(
+                operation: .zeroExtend,
+                sourceType: .integer(bitWidth: 8, signed: false),
+                resultType: .integer(bitWidth: 64, signed: false),
+                value: .init(rawBits: 255, bitWidth: 8, isSigned: false)
+            ) == .returned(.integer(try .init(rawBits: 255, bitWidth: 64, isSigned: false)))
+        )
+        #expect(
+            try invoke(
+                operation: .reinterpret,
+                sourceType: .integer(bitWidth: 8, signed: true),
+                resultType: .integer(bitWidth: 8, signed: false),
+                value: .init(signed: -1, bitWidth: 8, isSigned: true)
+            ) == .returned(.integer(try .init(rawBits: 255, bitWidth: 8, isSigned: false)))
+        )
+
+        func floating(
+            operation: Bytecode.FloatingConversionOperation,
+            sourceType: Bytecode.ValueType,
+            resultType: Bytecode.ValueType,
+            argument: VM.Value
+        ) throws -> VM.ExecutionResult {
+            let function = Bytecode.Function(
+                id: .init(rawValue: 0),
+                name: "floatingConversion",
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: resultType,
+                registerTypes: [sourceType, resultType],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .floatingConvert(
+                                result: .init(rawValue: 1),
+                                operation: operation,
+                                value: .init(rawValue: 0)
+                            ),
+                            .returnValue(.init(rawValue: 1)),
+                        ]
+                    ),
+                ]
+            )
+            return VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try makeVerified(
+                    function: function,
+                    signature: .init(
+                        parameters: [sourceType.description],
+                        result: resultType.description
+                    ),
+                    parameterTypes: [sourceType],
+                    resultType: resultType
+                ),
+                arguments: [argument]
+            )
+        }
+
+        let unrepresentable = 16_777_217.0
+        #expect(
+            try floating(
+                operation: .truncate,
+                sourceType: .float(bitWidth: 64),
+                resultType: .float(bitWidth: 32),
+                argument: .float(unrepresentable, bitWidth: 64)
+            ) == .returned(.float(Double(Float(unrepresentable)), bitWidth: 32))
+        )
+        #expect(
+            try floating(
+                operation: .unsignedIntegerToFloat,
+                sourceType: .integer(bitWidth: 64, signed: false),
+                resultType: .float(bitWidth: 64),
+                argument: .integer(
+                    try .init(rawBits: UInt64.max, bitWidth: 64, isSigned: false)
+                )
+            ) == .returned(.float(Double(UInt64.max), bitWidth: 64))
+        )
+    }
+
+    @Test("String predicates are Unicode-correct and substring work is fuel-bounded")
+    func stringPredicateSemanticsAndFuel() throws {
+        func image(
+            operation: Bytecode.StringPredicateOperation,
+            fuel: UInt64 = Core.ResourceLimits().instructionFuelPerEntry
+        ) throws -> Verification.Image {
+            let function = Bytecode.Function(
+                id: .init(rawValue: 0),
+                name: "stringPredicate",
+                parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+                resultType: .bool,
+                registerTypes: [.string, .string, .bool],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                        instructions: [
+                            .stringPredicate(
+                                result: .init(rawValue: 2),
+                                operation: operation,
+                                string: .init(rawValue: 0),
+                                pattern: .init(rawValue: 1)
+                            ),
+                            .destroyValue(.init(rawValue: 0)),
+                            .destroyValue(.init(rawValue: 1)),
+                            .returnValue(.init(rawValue: 2)),
+                        ]
+                    ),
+                ]
+            )
+            return try makeVerified(
+                function: function,
+                limits: .init(
+                    instructionFuelPerEntry: fuel,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                capabilities: [.baselineV1, .stringsV1],
+                signature: .init(
+                    parameters: ["Swift.String", "Swift.String"],
+                    result: "Swift.Bool"
+                ),
+                parameterTypes: [.string, .string],
+                resultType: .bool
+            )
+        }
+
+        let value = "Cafe\u{301} · Helix🧬"
+        for (operation, pattern, expected) in [
+            (Bytecode.StringPredicateOperation.hasPrefix, "Café", value.hasPrefix("Café")),
+            (.hasSuffix, "Helix🧬", value.hasSuffix("Helix🧬")),
+            (.contains, "é · H", value.contains("é · H")),
+            (.contains, "missing", value.contains("missing")),
+        ] {
+            #expect(
+                VM.Interpreter().invoke(
+                    entry: .init(rawValue: 0),
+                    image: try image(operation: operation),
+                    arguments: [.string(value), .string(pattern)]
+                ) == .returned(.bool(expected))
+            )
+        }
+
+        let haystack = String(repeating: "a", count: 1_024) + "z"
+        let pattern = String(repeating: "a", count: 64) + "z"
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(operation: .contains, fuel: 1_000),
+                arguments: [.string(haystack), .string(pattern)]
+            ) == .trapped(.instructionFuelExhausted)
+        )
+    }
+
+    @Test("Substring work arithmetic is total at Int limits")
+    func substringWorkArithmeticDoesNotOverflow() throws {
+        let budget = VM.InvocationBudget(
+            limits: .init(
+                instructionFuelPerEntry: UInt64.max,
+                maxWallTimeBackgroundMilliseconds: UInt32.max
+            ),
+            isMainThread: false
+        )
+        try budget.consumeSubstringSearchWork(
+            haystackByteCount: Int.max,
+            patternByteCount: 0
+        )
+    }
+
+    @Test("Array subscript update is value-semantic, bounds-checked, and fuel-bounded")
+    func arrayUpdateSemanticsAndFuel() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "arrayUpdate",
+            parameterRegisters: [
+                .init(rawValue: 0), .init(rawValue: 1), .init(rawValue: 2),
+            ],
+            resultType: arrayType,
+            registerTypes: [arrayType, .int64, .int64, arrayType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0), .init(rawValue: 1), .init(rawValue: 2),
+                    ],
+                    instructions: [
+                        .arrayUpdate(
+                            result: .init(rawValue: 3),
+                            array: .init(rawValue: 0),
+                            index: .init(rawValue: 1),
+                            value: .init(rawValue: 2)
+                        ),
+                        .destroyValue(.init(rawValue: 0)),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+        func image(fuel: UInt64) throws -> Verification.Image {
+            try makeVerified(
+                function: function,
+                limits: .init(
+                    instructionFuelPerEntry: fuel,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                capabilities: [.baselineV1, .collectionsV1],
+                signature: .init(
+                    parameters: ["Swift.Array<Swift.Int>", "Swift.Int", "Swift.Int"],
+                    result: "Swift.Array<Swift.Int>"
+                ),
+                parameterTypes: [arrayType, .int64, .int64],
+                resultType: arrayType
+            )
+        }
+        let elements = try (0..<32).map {
+            VM.Value.integer(
+                try .init(signed: Int64($0), bitWidth: 64, isSigned: true)
+            )
+        }
+        let input = VM.Value.array(elements, elementType: .int64)
+        let index = VM.Value.integer(
+            try .init(signed: 17, bitWidth: 64, isSigned: true)
+        )
+        let replacement = VM.Value.integer(
+            try .init(signed: 999, bitWidth: 64, isSigned: true)
+        )
+        var expected = elements
+        expected[17] = replacement
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(fuel: 10_000),
+                arguments: [input, index, replacement]
+            ) == .returned(.array(expected, elementType: .int64))
+        )
+        #expect(input == .array(elements, elementType: .int64))
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(fuel: 100),
+                arguments: [input, index, replacement]
+            ) == .trapped(.instructionFuelExhausted)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(fuel: 10_000),
+                arguments: [
+                    input,
+                    .integer(try .init(signed: 32, bitWidth: 64, isSigned: true)),
+                    replacement,
+                ]
+            ) == .trapped(.arrayIndexOutOfBounds(index: 32, count: 32))
+        )
+    }
+
+    @Test("Aggregate call shape validation consumes proportional fuel")
+    func aggregateCallShapeConsumesFuel() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "callArrayIdentity",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: arrayType,
+            registerTypes: [arrayType, arrayType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .apply(
+                            result: .init(rawValue: 1),
+                            function: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let identity = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "arrayIdentity",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: arrayType,
+            registerTypes: [arrayType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
+        let input = VM.Value.array(
+            try (0..<4).map {
+                .integer(
+                    try VM.Integer(
+                        signed: Int64($0),
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
+            },
+            elementType: .int64
+        )
+
+        func image(fuel: UInt64) throws -> Verification.Image {
+            try makeVerified(
+                function: root,
+                limits: .init(
+                    instructionFuelPerEntry: fuel,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                capabilities: [.baselineV1, .collectionsV1],
+                signature: .init(
+                    parameters: ["Swift.Array<Swift.Int>"],
+                    result: "Swift.Array<Swift.Int>"
+                ),
+                parameterTypes: [arrayType],
+                resultType: arrayType,
+                additionalFunctions: [identity]
+            )
+        }
+
+        // Five units each cover the root boundary, the call argument shape,
+        // and the call result shape; three more cover apply and both returns.
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(fuel: 17),
+                arguments: [input]
+            ) == .trapped(.instructionFuelExhausted)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(fuel: 18),
+                arguments: [input]
+            ) == .returned(input)
+        )
+    }
+
+    @Test("The deadline is rechecked after an instruction body")
+    func deadlineIsCheckedAfterInstruction() throws {
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "deadline",
+            parameterRegisters: [],
+            resultType: .void,
+            registerTypes: [],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    instructions: [.returnValue(nil)]
+                ),
+            ]
+        )
+        let limits = Core.ResourceLimits(
+            maxWallTimeMainThreadMilliseconds: 1
+        )
+        let image = try makeVerified(
+            function: function,
+            limits: limits,
+            signature: .init(parameters: [], result: "Swift.Void"),
+            parameterTypes: [],
+            resultType: .void
+        )
+        let clock = SequenceClock(values: [0, 0, 2_000_000])
+        let budget = VM.InvocationBudget(
+            limits: limits,
+            isMainThread: true,
+            nowNanoseconds: { clock.now() }
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [],
+                budget: budget
+            ) == .trapped(.wallTimeExceeded)
+        )
+    }
+
+    @Test("Recursive calls share the root depth budget")
+    func recursionSharesDepthBudget() throws {
+        let limits = Core.ResourceLimits(
+            instructionFuelPerEntry: 1_000,
+            maxCallDepth: 4,
+            maxWallTimeMainThreadMilliseconds: 1_000
+        )
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "recursive",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .apply(result: .init(rawValue: 1), function: .init(rawValue: 0), arguments: [.init(rawValue: 0)]),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let fixture = try makeVerified(function: function, limits: limits)
+        let input = try VM.Integer(signed: 1, bitWidth: 64, isSigned: true)
+
+        #expect(
+            VM.Interpreter().invoke(entry: .init(rawValue: 0), image: fixture, arguments: [.integer(input)])
+                == .trapped(.callDepthExceeded)
+        )
+    }
+
+    @Test("MainActor entries fail closed when invoked off the main thread")
+    func mainActorEntryRequiresMainThread() async throws {
+        let limits = Core.ResourceLimits(maxWallTimeMainThreadMilliseconds: 1_000)
+        let capabilities: Set<Core.Capability> = [.baselineV1, .mainActorSyncV1]
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "mainActorIdentity",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ],
+            effects: .init(requiresMainActor: true)
+        )
+        let image = try makeVerified(
+            function: function,
+            limits: limits,
+            capabilities: capabilities,
+            policy: .init(
+                acceptedCapabilities: capabilities,
+                resourceCeiling: limits,
+                allowMainActorSynchronousEntries: true
+            )
+        )
+        let input = VM.Value.integer(
+            try VM.Integer(signed: 1, bitWidth: 64, isSigned: true)
+        )
+
+        let result = await Task.detached {
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [input]
+            )
+        }.value
+        #expect(result == .trapped(.mainActorViolation))
+    }
+
+    @Test("Native calls use a typed catalog and mark committed side effects")
+    func invokesNativeCatalog() throws {
+        let fixture = try makeNativeIncrementImage()
+        let catalog = try VM.NativeCatalog([IncrementInvoker(key: fixture.shell.imports[.init(rawValue: 0)]!.key)])
+        let budget = VM.InvocationBudget(limits: fixture.effectiveResourceLimits)
+        let input = try VM.Integer(signed: 4, bitWidth: 64, isSigned: true)
+
+        let result = VM.Interpreter(nativeCatalog: catalog).invoke(
+            entry: .init(rawValue: 0),
+            image: fixture,
+            arguments: [.integer(input)],
+            budget: budget
+        )
+        #expect(result == .returned(.integer(try VM.Integer(signed: 5, bitWidth: 64, isSigned: true))))
+        #expect(budget.sideEffectsCommitted)
+
+        let rejectedBudget = VM.InvocationBudget(
+            limits: .init(
+                instructionFuelPerEntry: 2,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        #expect(
+            VM.Interpreter(nativeCatalog: catalog).invoke(
+                entry: .init(rawValue: 0),
+                image: fixture,
+                arguments: [.integer(input)],
+                budget: rejectedBudget
+            ) == .trapped(.instructionFuelExhausted)
+        )
+        #expect(!rejectedBudget.sideEffectsCommitted)
+    }
+
+    @Test("Native catalog effects must exactly match the frozen Shell descriptor")
+    func rejectsMisdeclaredNativeEffectsBeforeInvocation() throws {
+        let fixture = try makeNativeIncrementImage()
+        let catalog = try VM.NativeCatalog([
+            MisdeclaredIncrementInvoker(key: fixture.shell.imports[.init(rawValue: 0)]!.key),
+        ])
+        let budget = VM.InvocationBudget(limits: fixture.effectiveResourceLimits)
+        let input = try VM.Integer(signed: 4, bitWidth: 64, isSigned: true)
+
+        #expect(
+            VM.Interpreter(nativeCatalog: catalog).invoke(
+                entry: .init(rawValue: 0),
+                image: fixture,
+                arguments: [.integer(input)],
+                budget: budget
+            ) == .trapped(.nativeImportDescriptorMismatch(.init(rawValue: 0)))
+        )
+        #expect(!budget.sideEffectsCommitted)
+    }
+
+    @Test("Native catalog identity must match the frozen NativeImportKey")
+    func rejectsWrongNativeImportIdentity() throws {
+        let fixture = try makeNativeIncrementImage()
+        let catalog = try VM.NativeCatalog([
+            IncrementInvoker(key: .init(rawValue: .sha256("wrong native import"))),
+        ])
+
+        #expect(
+            VM.Interpreter(nativeCatalog: catalog).invoke(
+                entry: .init(rawValue: 0),
+                image: fixture,
+                arguments: [.integer(try VM.Integer(signed: 4, bitWidth: 64, isSigned: true))]
+            ) == .trapped(.nativeImportDescriptorMismatch(.init(rawValue: 0)))
+        )
+    }
+
+    @Test("Synchronous native policies enforce thread, cooperation, work, and import deadlines")
+    func enforcesNativeExecutionPolicies() throws {
+        let id = Core.NativeImportID(rawValue: 9)
+        let cooperative = Core.NativeImportContract.cooperative(
+            kind: .serviceMethod,
+            domain: .application,
+            access: .read,
+            maximumDurationMicroseconds: 10_000,
+            allowsMainThread: false
+        )
+        let limits = Core.ResourceLimits(
+            instructionFuelPerEntry: 10,
+            maxWallTimeMainThreadMilliseconds: 1_000,
+            maxWallTimeBackgroundMilliseconds: 1_000
+        )
+
+        let mainThreadBudget = VM.InvocationBudget(
+            limits: limits,
+            isMainThread: true,
+            nowNanoseconds: { 0 }
+        )
+        #expect(throws: VM.RuntimeTrap.nativeImportThreadViolation(id)) {
+            try mainThreadBudget.beginNativeInvocation(
+                id: id,
+                effects: .init(),
+                contract: cooperative,
+                isMainThread: true
+            )
+        }
+
+        let missingCheckpointBudget = VM.InvocationBudget(
+            limits: limits,
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let missingCheckpoint = try missingCheckpointBudget.beginNativeInvocation(
+            id: id,
+            effects: .init(),
+            contract: cooperative,
+            isMainThread: false
+        )
+        #expect(throws: VM.RuntimeTrap.nativeImportCooperationViolation(id)) {
+            try missingCheckpoint.finish(requireCooperation: true)
+        }
+
+        let cooperativeBudget = VM.InvocationBudget(
+            limits: limits,
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let checked = try cooperativeBudget.beginNativeInvocation(
+            id: id,
+            effects: .init(),
+            contract: cooperative,
+            isMainThread: false
+        )
+        try checked.checkpoint(workUnits: 3)
+        try checked.finish(requireCooperation: true)
+
+        let bounded = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: false
+        )
+        let deadlineClock = SequenceClock(values: [0, 0, 0, 1_000_000])
+        let deadlineBudget = VM.InvocationBudget(
+            limits: limits,
+            isMainThread: false,
+            nowNanoseconds: { deadlineClock.now() }
+        )
+        let expired = try deadlineBudget.beginNativeInvocation(
+            id: id,
+            effects: .init(),
+            contract: bounded,
+            isMainThread: false
+        )
+        #expect(throws: VM.RuntimeTrap.nativeImportDeadlineExceeded(id)) {
+            try expired.finish(requireCooperation: true)
+        }
+    }
+
+    @MainActor
+    @Test("A verified MainActor contract provides a compile-time-safe UIKit entry")
+    func authorizesMainActorNativeBody() throws {
+        let id = Core.NativeImportID(rawValue: 10)
+        let contract = Core.NativeImportContract.cooperative(
+            kind: .instanceGetter,
+            domain: .uiKit,
+            access: .read,
+            maximumDurationMicroseconds: 10_000,
+            allowsMainThread: true
+        )
+        let budget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 100),
+            isMainThread: true,
+            nowNanoseconds: { 0 }
+        )
+        let context = try budget.beginNativeInvocation(
+            id: id,
+            effects: .init(requiresMainActor: true),
+            contract: contract,
+            isMainThread: true
+        )
+        let box = MainActorBox(value: 41)
+        let value = try context.withMainActor { box.value + 1 }
+        try context.finish(requireCooperation: true)
+        #expect(value == 42)
+    }
+
+    @Test("Floating-point comparisons preserve unordered NaN semantics")
+    func preservesNaNComparisonSemantics() throws {
+        let signature = Core.LoweredSignature(parameters: [], result: "Swift.Double")
+        let importKey = try Core.NativeImportKey.derive(
+            namespace: namespace(),
+            canonicalCallee: "Fixture.nan()",
+            signature: signature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: .init(rawValue: 1),
+            key: importKey,
+            signature: signature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let descriptor = Verification.ResolvedNativeImport(
+            id: .init(rawValue: 1),
+            key: importKey,
+            parameterTypes: [],
+            resultType: .float(bitWidth: 64),
+            signature: signature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let policy = Core.RuntimePolicy(
+            acceptedCapabilities: [.baselineV1, .nativeImportsV2],
+            allowedNativeImports: [.init(rawValue: 1)]
+        )
+        let catalog = try VM.NativeCatalog([NaNInvoker(key: importKey)])
+        for (predicate, expected) in [
+            (Bytecode.ComparisonPredicate.equal, false),
+            (.notEqual, true),
+            (.lessThan, false),
+            (.lessThanOrEqual, false),
+            (.greaterThan, false),
+            (.greaterThanOrEqual, false),
+        ] {
+            let function = Bytecode.Function(
+                id: .init(rawValue: 0),
+                name: "compareNaN",
+                parameterRegisters: [],
+                resultType: .bool,
+                registerTypes: [.float(bitWidth: 64), .float(bitWidth: 64), .bool],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        instructions: [
+                            .nativeApply(result: .init(rawValue: 0), importID: .init(rawValue: 1), arguments: []),
+                            .constantFloat(result: .init(rawValue: 1), value: 1),
+                            .compare(
+                                result: .init(rawValue: 2),
+                                predicate: predicate,
+                                lhs: .init(rawValue: 0),
+                                rhs: .init(rawValue: 1)
+                            ),
+                            .returnValue(.init(rawValue: 2)),
+                        ]
+                    ),
+                ]
+            )
+            let fixture = try makeVerified(
+                function: function,
+                capabilities: [.baselineV1, .nativeImportsV2],
+                imports: [requirement],
+                shellImports: [descriptor],
+                policy: policy,
+                signature: .init(parameters: [], result: "Swift.Bool"),
+                parameterTypes: [],
+                resultType: .bool
+            )
+            #expect(
+                VM.Interpreter(nativeCatalog: catalog)
+                    .invoke(entry: .init(rawValue: 0), image: fixture, arguments: [])
+                    == .returned(.bool(expected))
+            )
+        }
+    }
+
+    @Test("Integer shifts match Swift for negative and oversized amounts")
+    func integerShiftSemantics() throws {
+        let value = try VM.Integer(signed: -2, bitWidth: 64, isSigned: true)
+        let cases: [(amount: Int64, right: Int64, left: Int64)] = [
+            (-65, 0, -1),
+            (-1, -4, -1),
+            (0, -2, -2),
+            (63, -1, 0),
+            (64, -1, 0),
+        ]
+        for item in cases {
+            let right = try makeVerified(
+                function: shiftFunction(operation: .shiftRight, amount: item.amount)
+            )
+            #expect(
+                VM.Interpreter().invoke(
+                    entry: .init(rawValue: 0),
+                    image: right,
+                    arguments: [.integer(value)]
+                ) == .returned(
+                    .integer(
+                        try VM.Integer(
+                            signed: item.right,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    )
+                )
+            )
+
+            let left = try makeVerified(
+                function: shiftFunction(operation: .shiftLeft, amount: item.amount)
+            )
+            #expect(
+                VM.Interpreter().invoke(
+                    entry: .init(rawValue: 0),
+                    image: left,
+                    arguments: [.integer(value)]
+                ) == .returned(
+                    .integer(
+                        try VM.Integer(
+                            signed: item.left,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    )
+                )
+            )
+        }
+    }
+
+    @Test("Narrow signed division reports the same overflow boundary as Swift")
+    func narrowSignedDivisionOverflow() throws {
+        let type = Bytecode.ValueType.integer(bitWidth: 8, signed: true)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "int8DivisionOverflow",
+            parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+            resultType: .bool,
+            registerTypes: [type, type, type, .bool],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .checkedBinary(
+                            result: .init(rawValue: 2),
+                            overflow: .init(rawValue: 3),
+                            operation: .divide,
+                            lhs: .init(rawValue: 0),
+                            rhs: .init(rawValue: 1)
+                        ),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            signature: .init(parameters: ["Swift.Int8", "Swift.Int8"], result: "Swift.Bool"),
+            parameterTypes: [type, type],
+            resultType: .bool
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    .integer(try VM.Integer(signed: -128, bitWidth: 8, isSigned: true)),
+                    .integer(try VM.Integer(signed: -1, bitWidth: 8, isSigned: true)),
+                ]
+            ) == .returned(.bool(true))
+        )
+    }
+
+    @Test("Generated TypeOps preserve Swift values and enforce native-owned memory")
+    func nativeTypeOperationsAndQuota() throws {
+        let pointType = Core.TypeID.derive(namespace: namespace(), canonicalType: "Fixture.Point")
+        let pointLayout = Core.Digest.sha256("Fixture.Point.layout.v1")
+        let operations = VM.NativeTypeOperations(
+            id: pointType,
+            canonicalName: "Fixture.Point",
+            kind: .value,
+            layoutFingerprint: pointLayout,
+            estimatedSize: 16,
+            estimatedByteCount: { (_: Point) -> UInt64 in 1 }
+        )
+        let typeCatalog = try VM.NativeTypeCatalog([operations])
+        let boxed = try typeCatalog.box(Point(x: 3, y: 4), as: pointType)
+        #expect(boxed.value(as: Point.self) == Point(x: 3, y: 4))
+        #expect(boxed.estimatedByteCount == 16)
+        #expect(try operations.copy(boxed) == boxed)
+
+        let makeSignature = Core.LoweredSignature(parameters: [], result: "Fixture.Point")
+        let sumSignature = Core.LoweredSignature(parameters: ["Fixture.Point"], result: "Swift.Int")
+        let makeKey = try Core.NativeImportKey.derive(
+            namespace: namespace(),
+            canonicalCallee: "Fixture.makePoint()",
+            signature: makeSignature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let sumKey = try Core.NativeImportKey.derive(
+            namespace: namespace(),
+            canonicalCallee: "Fixture.sum(_:)",
+            signature: sumSignature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let requirements = [
+            Bytecode.ImportRequirement(
+                id: .init(rawValue: 2),
+                key: makeKey,
+                signature: makeSignature,
+                effects: .init(),
+                contract: vmPureImportContract
+            ),
+            Bytecode.ImportRequirement(
+                id: .init(rawValue: 3),
+                key: sumKey,
+                signature: sumSignature,
+                effects: .init(),
+                contract: vmPureImportContract
+            ),
+        ]
+        let descriptors = [
+            Verification.ResolvedNativeImport(
+                id: .init(rawValue: 2),
+                key: makeKey,
+                parameterTypes: [],
+                resultType: .native(pointType),
+                signature: makeSignature,
+                effects: .init(),
+                contract: vmPureImportContract
+            ),
+            Verification.ResolvedNativeImport(
+                id: .init(rawValue: 3),
+                key: sumKey,
+                parameterTypes: [.native(pointType)],
+                resultType: .int64,
+                signature: sumSignature,
+                effects: .init(),
+                contract: vmPureImportContract
+            ),
+        ]
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "nativePoint",
+            parameterRegisters: [],
+            resultType: .int64,
+            registerTypes: [.native(pointType), .native(pointType), .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    instructions: [
+                        .nativeApply(result: .init(rawValue: 0), importID: .init(rawValue: 2), arguments: []),
+                        .copyValue(result: .init(rawValue: 1), source: .init(rawValue: 0)),
+                        .destroyValue(.init(rawValue: 0)),
+                        .nativeApply(
+                            result: .init(rawValue: 2),
+                            importID: .init(rawValue: 3),
+                            arguments: [.init(rawValue: 1)]
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let capabilities: Set<Core.Capability> = [.baselineV1, .nativeImportsV2, .nativeTypesV1]
+        let nativeCatalog = try VM.NativeCatalog([
+            MakePointInvoker(key: makeKey, operations: operations),
+            SumPointInvoker(key: sumKey, typeID: pointType),
+        ])
+
+        func verified(maximumNativeBytes: UInt64) throws -> Verification.Image {
+            let limits = Core.ResourceLimits(
+                maxNativeOwnedBytes: maximumNativeBytes,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+            return try makeVerified(
+                function: function,
+                limits: limits,
+                capabilities: capabilities,
+                imports: requirements,
+                shellImports: descriptors,
+                policy: .init(
+                    acceptedCapabilities: capabilities,
+                    resourceCeiling: limits,
+                    allowedNativeImports: [.init(rawValue: 2), .init(rawValue: 3)]
+                ),
+                signature: .init(parameters: [], result: "Swift.Int"),
+                parameterTypes: [],
+                resultType: .int64,
+                shellTypes: [
+                    .init(
+                        id: pointType,
+                        canonicalName: "Fixture.Point",
+                        kind: .value,
+                        layoutFingerprint: pointLayout,
+                        isCopyable: true,
+                        estimatedSize: 16
+                    ),
+                ]
+            )
+        }
+
+        #expect(
+            VM.Interpreter(nativeCatalog: nativeCatalog, nativeTypeCatalog: typeCatalog)
+                .invoke(entry: .init(rawValue: 0), image: try verified(maximumNativeBytes: 32), arguments: [])
+                == .returned(.integer(try VM.Integer(signed: 7, bitWidth: 64, isSigned: true)))
+        )
+        #expect(
+            VM.Interpreter(nativeCatalog: nativeCatalog, nativeTypeCatalog: typeCatalog)
+                .invoke(entry: .init(rawValue: 0), image: try verified(maximumNativeBytes: 31), arguments: [])
+                == .trapped(.nativeOwnedMemoryLimitExceeded)
+        )
+    }
+
+    @Test("Generated TypeOps support non-Hashable values and reference identity")
+    func customNativeTypeOperations() throws {
+        let valueType = Core.TypeID.derive(
+            namespace: namespace(),
+            canonicalType: "Fixture.NonHashableValue"
+        )
+        let valueOperations = VM.NativeTypeOperations(
+            id: valueType,
+            canonicalName: "Fixture.NonHashableValue",
+            kind: .value,
+            layoutFingerprint: .sha256("Fixture.NonHashableValue.layout.v1"),
+            estimatedSize: 24,
+            estimatedByteCount: { (_: NonHashableValue) in 24 },
+            equals: { $0.values == $1.values },
+            hash: { value, hasher in hasher.combine(value.values) },
+            describe: { $0.values.description }
+        )
+        let original = try valueOperations.box(NonHashableValue(values: [1, 2, 3]))
+        let copied = try valueOperations.copy(original)
+
+        #expect(original == copied)
+        #expect(Set([original, copied]).count == 1)
+        #expect(copied.value(as: NonHashableValue.self)?.values == [1, 2, 3])
+
+        let referenceType = Core.TypeID.derive(
+            namespace: namespace(),
+            canonicalType: "Fixture.ReferenceToken"
+        )
+        let referenceOperations = VM.NativeTypeOperations.reference(
+            id: referenceType,
+            canonicalName: "Fixture.ReferenceToken",
+            layoutFingerprint: .sha256("Fixture.ReferenceToken.layout.v1"),
+            describe: { (value: ReferenceToken) in value.label }
+        )
+        let token = ReferenceToken(label: "shared")
+        let boxedReference = try referenceOperations.box(token)
+        let copiedReference = try referenceOperations.copy(boxedReference)
+        let copiedToken = try #require(copiedReference.value(as: ReferenceToken.self))
+
+        #expect(boxedReference == copiedReference)
+        #expect(Set([boxedReference, copiedReference]).count == 1)
+        #expect(copiedToken === token)
+    }
+
+    @Test("MainActor native TypeOps reject background boxing")
+    func mainActorNativeTypeRejectsBackgroundAccess() async {
+        let typeID = Core.TypeID.derive(
+            namespace: namespace(),
+            canonicalType: "Fixture.MainActorReference"
+        )
+        let operations = VM.NativeTypeOperations.reference(
+            id: typeID,
+            canonicalName: "Fixture.MainActorReference",
+            layoutFingerprint: .sha256("Fixture.MainActorReference.layout.v1"),
+            requiresMainActor: true,
+            describe: { (_: ReferenceToken) in "main-actor-reference" }
+        )
+        let trap = await Task.detached { () -> VM.RuntimeTrap? in
+            do {
+                _ = try operations.box(ReferenceToken(label: "background"))
+                return nil
+            } catch let trap as VM.RuntimeTrap {
+                return trap
+            } catch {
+                return .nativeFailure(String(describing: error))
+            }
+        }.value
+        #expect(trap == .mainActorViolation)
+    }
+
+    @Test("Optional values can move through a verified stack slot")
+    func optionalStackLifecycle() throws {
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "optionalStack",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .string,
+            registerTypes: [
+                .string,
+                .optional(.string),
+                .optional(.string),
+                .bool,
+                .optional(.string),
+                .string,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeOptionalSome(
+                            result: .init(rawValue: 1),
+                            value: .init(rawValue: 0)
+                        ),
+                        .storeStack(
+                            slot: .init(rawValue: 0),
+                            source: .init(rawValue: 1),
+                            mode: .initialize
+                        ),
+                        .loadStack(
+                            result: .init(rawValue: 2),
+                            slot: .init(rawValue: 0),
+                            mode: .copy
+                        ),
+                        .optionalIsSome(
+                            result: .init(rawValue: 3),
+                            optional: .init(rawValue: 2)
+                        ),
+                        .destroyValue(.init(rawValue: 2)),
+                        .loadStack(
+                            result: .init(rawValue: 4),
+                            slot: .init(rawValue: 0),
+                            mode: .take
+                        ),
+                        .unwrapOptional(
+                            result: .init(rawValue: 5),
+                            optional: .init(rawValue: 4)
+                        ),
+                        .returnValue(.init(rawValue: 5)),
+                    ]
+                ),
+            ],
+            stackSlotTypes: [.optional(.string)]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .stringsV1],
+            signature: .init(parameters: ["Swift.String"], result: "Swift.String"),
+            parameterTypes: [.string],
+            resultType: .string
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.string("persisted")]
+            ) == .returned(.string("persisted"))
+        )
+    }
+
+    @Test("Tuple construction and destruction preserve element order")
+    func tupleRoundTrip() throws {
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "tuple",
+            parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+            resultType: .int64,
+            registerTypes: [
+                .int64, .int64, .tuple([.int64, .int64]), .int64, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .makeTuple(
+                            result: .init(rawValue: 2),
+                            elements: [.init(rawValue: 0), .init(rawValue: 1)]
+                        ),
+                        .unpackTuple(
+                            results: [.init(rawValue: 3), .init(rawValue: 4)],
+                            tuple: .init(rawValue: 2)
+                        ),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            signature: .init(parameters: ["Swift.Int", "Swift.Int"], result: "Swift.Int"),
+            parameterTypes: [.int64, .int64]
+        )
+        let first = try VM.Integer(signed: 3, bitWidth: 64, isSigned: true)
+        let second = try VM.Integer(signed: 9, bitWidth: 64, isSigned: true)
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.integer(first), .integer(second)]
+            ) == .returned(.integer(second))
+        )
+    }
+
+    @Test("Optional switching transfers an owned payload only along the some edge")
+    func optionalSwitchTransfersPayload() throws {
+        let optionalString = Bytecode.ValueType.optional(.string)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "optionalDefault",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .string,
+            registerTypes: [optionalString, .string, .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .switchOptional(
+                            optional: .init(rawValue: 0),
+                            someTarget: .init(rawValue: 1),
+                            noneTarget: .init(rawValue: 2)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 1)],
+                    instructions: [.returnValue(.init(rawValue: 1))]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    instructions: [
+                        .constantString(result: .init(rawValue: 2), value: "fallback"),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .stringsV1],
+            signature: .init(
+                parameters: ["Swift.Optional<Swift.String>"],
+                result: "Swift.String"
+            ),
+            parameterTypes: [optionalString],
+            resultType: .string
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.optional(.string("patched"))]
+            ) == .returned(.string("patched"))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.optional(nil)]
+            ) == .returned(.string("fallback"))
+        )
+    }
+
+    @Test("String operations use Swift grapheme and ordering semantics")
+    func executesStringOperations() throws {
+        let resultType = Bytecode.ValueType.tuple([.string, .int64, .bool, .bool])
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "strings",
+            parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+            resultType: resultType,
+            registerTypes: [.string, .string, .string, .int64, .bool, .bool, resultType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .stringConcat(
+                            result: .init(rawValue: 2),
+                            lhs: .init(rawValue: 0),
+                            rhs: .init(rawValue: 1)
+                        ),
+                        .stringCount(result: .init(rawValue: 3), string: .init(rawValue: 2)),
+                        .stringIsEmpty(result: .init(rawValue: 4), string: .init(rawValue: 2)),
+                        .compare(
+                            result: .init(rawValue: 5),
+                            predicate: .lessThan,
+                            lhs: .init(rawValue: 0),
+                            rhs: .init(rawValue: 1)
+                        ),
+                        .makeTuple(
+                            result: .init(rawValue: 6),
+                            elements: [
+                                .init(rawValue: 2), .init(rawValue: 3),
+                                .init(rawValue: 4), .init(rawValue: 5),
+                            ]
+                        ),
+                        .returnValue(.init(rawValue: 6)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .stringsV1],
+            signature: .init(
+                parameters: ["Swift.String", "Swift.String"],
+                result: "(Swift.String, Swift.Int, Swift.Bool, Swift.Bool)"
+            ),
+            parameterTypes: [.string, .string],
+            resultType: resultType
+        )
+        let left = "Helix"
+        let right = "🧬"
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.string(left), .string(right)]
+            ) == .returned(
+                .tuple([
+                    .string(left + right),
+                    .integer(try VM.Integer(signed: 6, bitWidth: 64, isSigned: true)),
+                    .bool(false),
+                    .bool(left < right),
+                ])
+            )
+        )
+    }
+
+    @Test("String inputs and concatenation are both charged to the VM heap budget")
+    func stringConcatenationConsumesHeapBudget() throws {
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "concat",
+            parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+            resultType: .string,
+            registerTypes: [.string, .string, .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .stringConcat(
+                            result: .init(rawValue: 2),
+                            lhs: .init(rawValue: 0),
+                            rhs: .init(rawValue: 1)
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let left = "abc"
+        let right = "🧬"
+        let payloadBytes = UInt64(left.utf8.count + right.utf8.count)
+        let frameBytes = UInt64(3 * MemoryLayout<VM.Value?>.stride)
+        let exactBudget = frameBytes + payloadBytes + payloadBytes
+
+        func image(maximumHeapBytes: UInt64) throws -> Verification.Image {
+            try makeVerified(
+                function: function,
+                limits: .init(
+                    maxVMHeapBytes: maximumHeapBytes,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                capabilities: [.baselineV1, .stringsV1],
+                signature: .init(
+                    parameters: ["Swift.String", "Swift.String"],
+                    result: "Swift.String"
+                ),
+                parameterTypes: [.string, .string],
+                resultType: .string
+            )
+        }
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: exactBudget - 1),
+                arguments: [.string(left), .string(right)]
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: exactBudget),
+                arguments: [.string(left), .string(right)]
+            ) == .returned(.string(left + right))
+        )
+    }
+
+    @Test("Array boundary storage is typed and charged before execution")
+    func arrayBoundaryConsumesHeapBudget() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "arrayIdentity",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: arrayType,
+            registerTypes: [arrayType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
+        let elements = try [1, 2, 3].map {
+            VM.Value.integer(
+                try VM.Integer(signed: Int64($0), bitWidth: 64, isSigned: true)
+            )
+        }
+        let input = VM.Value.array(elements, elementType: .int64)
+        let frameBytes = UInt64(MemoryLayout<VM.Value?>.stride)
+        let aggregateBytes: UInt64 = 64
+
+        func image(maximumHeapBytes: UInt64) throws -> Verification.Image {
+            try makeVerified(
+                function: function,
+                limits: .init(
+                    maxVMHeapBytes: maximumHeapBytes,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                capabilities: [.baselineV1, .collectionsV1],
+                signature: .init(
+                    parameters: ["Swift.Array<Swift.Int>"],
+                    result: "Swift.Array<Swift.Int>"
+                ),
+                parameterTypes: [arrayType],
+                resultType: arrayType
+            )
+        }
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: frameBytes + aggregateBytes - 1),
+                arguments: [input]
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: frameBytes + aggregateBytes),
+                arguments: [input]
+            ) == .returned(input)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: frameBytes + aggregateBytes),
+                arguments: [.array([.string("wrong")], elementType: .int64)]
+            ) == .trapped(.typeMismatch(expected: .int64, actual: .string))
+        )
+    }
+
+    @Test("Dictionary literals reject duplicate keys at runtime")
+    func dictionaryLiteralRejectsDuplicateKeys() throws {
+        let pairType = Bytecode.ValueType.tuple([.string, .int64])
+        let dictionaryType = Bytecode.ValueType.dictionary(key: .string, value: .int64)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "duplicateDictionaryLiteral",
+            parameterRegisters: [],
+            resultType: dictionaryType,
+            registerTypes: [
+                .string, .int64, pairType,
+                .string, .int64, pairType,
+                .array(pairType), dictionaryType,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    instructions: [
+                        .constantString(result: .init(rawValue: 0), value: "duplicate"),
+                        .constantInteger(result: .init(rawValue: 1), value: 1),
+                        .makeTuple(
+                            result: .init(rawValue: 2),
+                            elements: [.init(rawValue: 0), .init(rawValue: 1)]
+                        ),
+                        .constantString(result: .init(rawValue: 3), value: "duplicate"),
+                        .constantInteger(result: .init(rawValue: 4), value: 2),
+                        .makeTuple(
+                            result: .init(rawValue: 5),
+                            elements: [.init(rawValue: 3), .init(rawValue: 4)]
+                        ),
+                        .makeArray(
+                            result: .init(rawValue: 6),
+                            elements: [.init(rawValue: 2), .init(rawValue: 5)]
+                        ),
+                        .makeDictionary(
+                            result: .init(rawValue: 7),
+                            pairs: .init(rawValue: 6)
+                        ),
+                        .returnValue(.init(rawValue: 7)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .stringsV1, .collectionsV1],
+            signature: .init(
+                parameters: [],
+                result: "Swift.Dictionary<Swift.String, Swift.Int>"
+            ),
+            parameterTypes: [],
+            resultType: dictionaryType
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: []
+            ) == .trapped(.explicit("Dictionary literal contains duplicate keys"))
+        )
+    }
+
+    @Test("Dictionary boundary storage is typed, unique, and charged before execution")
+    func dictionaryBoundaryConsumesHeapBudget() throws {
+        let dictionaryType = Bytecode.ValueType.dictionary(key: .string, value: .int64)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "dictionaryIdentity",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: dictionaryType,
+            registerTypes: [dictionaryType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
+        let one = VM.Value.integer(
+            try VM.Integer(signed: 1, bitWidth: 64, isSigned: true)
+        )
+        let two = VM.Value.integer(
+            try VM.Integer(signed: 2, bitWidth: 64, isSigned: true)
+        )
+        let entries: [VM.DictionaryEntry] = [
+            .init(key: .string("a"), value: one),
+            .init(key: .string("beta"), value: two),
+        ]
+        let input = VM.Value.dictionary(
+            entries,
+            keyType: .string,
+            valueType: .int64
+        )
+        let frameBytes = UInt64(MemoryLayout<VM.Value?>.stride)
+        // 80 bytes for Dictionary storage plus 48 bytes for the transient
+        // duplicate-key validation set.
+        let aggregateBytes: UInt64 = 128
+        let stringBytes: UInt64 = 5
+        let exactBudget = frameBytes + aggregateBytes + stringBytes
+
+        func image(maximumHeapBytes: UInt64) throws -> Verification.Image {
+            try makeVerified(
+                function: function,
+                limits: .init(
+                    maxVMHeapBytes: maximumHeapBytes,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                capabilities: [.baselineV1, .stringsV1, .collectionsV1],
+                signature: .init(
+                    parameters: ["Swift.Dictionary<Swift.String, Swift.Int>"],
+                    result: "Swift.Dictionary<Swift.String, Swift.Int>"
+                ),
+                parameterTypes: [dictionaryType],
+                resultType: dictionaryType
+            )
+        }
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: exactBudget - 1),
+                arguments: [input]
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: exactBudget),
+                arguments: [input]
+            ) == .returned(input)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: exactBudget * 2),
+                arguments: [
+                    .dictionary(
+                        entries + [entries[0]],
+                        keyType: .string,
+                        valueType: .int64
+                    ),
+                ]
+            ) == .trapped(
+                .nativeFailure("Dictionary boundary value contains a duplicate key")
+            )
+        )
+    }
+
+    @Test("Copying a tuple is charged against the VM heap budget")
+    func tupleCopyConsumesHeapBudget() throws {
+        let tupleType = Bytecode.ValueType.tuple([.int64, .int64])
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "copyTuple",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: tupleType,
+            registerTypes: [tupleType, tupleType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .copyValue(
+                            result: .init(rawValue: 1),
+                            source: .init(rawValue: 0)
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let frameBytes = UInt64(2 * MemoryLayout<VM.Value?>.stride)
+        let aggregateBytes: UInt64 = 48
+        let boundaryBytes = aggregateBytes
+        let input: VM.Value = .tuple([
+            .integer(try VM.Integer(signed: 4, bitWidth: 64, isSigned: true)),
+            .integer(try VM.Integer(signed: 8, bitWidth: 64, isSigned: true)),
+        ])
+
+        func image(maximumHeapBytes: UInt64) throws -> Verification.Image {
+            try makeVerified(
+                function: function,
+                limits: .init(
+                    maxVMHeapBytes: maximumHeapBytes,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                signature: .init(
+                    parameters: ["(Swift.Int, Swift.Int)"],
+                    result: "(Swift.Int, Swift.Int)"
+                ),
+                parameterTypes: [tupleType],
+                resultType: tupleType
+            )
+        }
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(
+                    maximumHeapBytes: frameBytes + boundaryBytes + aggregateBytes - 1
+                ),
+                arguments: [input]
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(
+                    maximumHeapBytes: frameBytes + boundaryBytes + aggregateBytes
+                ),
+                arguments: [input]
+            ) == .returned(input)
+        )
+    }
+
+    @Test("Nil unwrap is a runtime trap, while explicit throw is a business error")
+    func optionalTrapAndBusinessThrow() throws {
+        let nilFunction = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "nilUnwrap",
+            parameterRegisters: [],
+            resultType: .string,
+            registerTypes: [.optional(.string), .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    instructions: [
+                        .makeOptionalNone(result: .init(rawValue: 0)),
+                        .unwrapOptional(
+                            result: .init(rawValue: 1),
+                            optional: .init(rawValue: 0)
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let nilImage = try makeVerified(
+            function: nilFunction,
+            capabilities: [.baselineV1, .stringsV1],
+            signature: .init(parameters: [], result: "Swift.String"),
+            parameterTypes: [],
+            resultType: .string
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: nilImage,
+                arguments: []
+            ) == .trapped(.optionalUnwrapOfNil)
+        )
+
+        let throwingFunction = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "throwing",
+            parameterRegisters: [],
+            resultType: .void,
+            registerTypes: [.string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    instructions: [
+                        .constantString(result: .init(rawValue: 0), value: "fixture failure"),
+                        .throwError(.init(rawValue: 0)),
+                    ]
+                ),
+            ],
+            effects: .init(mayThrow: true)
+        )
+        let throwingImage = try makeVerified(
+            function: throwingFunction,
+            capabilities: [.baselineV1, .stringsV1, .untypedThrowsV1],
+            signature: .init(parameters: [], result: "Swift.Void", isThrowing: true),
+            parameterTypes: [],
+            resultType: .void
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: throwingImage,
+                arguments: []
+            ) == .businessError("fixture failure")
+        )
+    }
+
+    @Test("try_apply catches business errors but never catches VM traps")
+    func tryApplySeparatesBusinessErrorsFromRuntimeTraps() throws {
+        let caller = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "catching",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.bool, .int64, .string, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .tryApply(
+                            function: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 0)],
+                            normalTarget: .init(rawValue: 1),
+                            errorTarget: .init(rawValue: 2)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 1)],
+                    instructions: [.returnValue(.init(rawValue: 1))]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 2)],
+                    instructions: [
+                        .destroyValue(.init(rawValue: 2)),
+                        .constantInteger(result: .init(rawValue: 3), value: -1),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+
+        func callee(failure: Bytecode.Instruction) -> Bytecode.Function {
+            Bytecode.Function(
+                id: .init(rawValue: 1),
+                name: "mayFail",
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: .int64,
+                registerTypes: [.bool, .string, .int64],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .conditionalBranch(
+                                condition: .init(rawValue: 0),
+                                trueTarget: .init(rawValue: 1),
+                                trueArguments: [],
+                                falseTarget: .init(rawValue: 2),
+                                falseArguments: []
+                            ),
+                        ]
+                    ),
+                    .init(
+                        id: .init(rawValue: 1),
+                        instructions: [
+                            .constantString(result: .init(rawValue: 1), value: "fixture failure"),
+                            failure,
+                        ]
+                    ),
+                    .init(
+                        id: .init(rawValue: 2),
+                        instructions: [
+                            .constantInteger(result: .init(rawValue: 2), value: 7),
+                            .returnValue(.init(rawValue: 2)),
+                        ]
+                    ),
+                ],
+                effects: .init(mayThrow: true)
+            )
+        }
+
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .stringsV1, .untypedThrowsV1,
+        ]
+        let businessImage = try makeVerified(
+            function: caller,
+            capabilities: capabilities,
+            signature: .init(parameters: ["Swift.Bool"], result: "Swift.Int"),
+            parameterTypes: [.bool],
+            resultType: .int64,
+            additionalFunctions: [callee(failure: .throwError(.init(rawValue: 1)))]
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: businessImage,
+                arguments: [.bool(false)]
+            ) == .returned(.integer(try VM.Integer(signed: 7, bitWidth: 64, isSigned: true)))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: businessImage,
+                arguments: [.bool(true)]
+            ) == .returned(.integer(try VM.Integer(signed: -1, bitWidth: 64, isSigned: true)))
+        )
+
+        let trapImage = try makeVerified(
+            function: caller,
+            capabilities: capabilities,
+            signature: .init(parameters: ["Swift.Bool"], result: "Swift.Int"),
+            parameterTypes: [.bool],
+            resultType: .int64,
+            additionalFunctions: [callee(failure: .trap(.explicit("fatal fixture")))]
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: trapImage,
+                arguments: [.bool(true)]
+            ) == .trapped(.explicit("fatal fixture"))
+        )
+    }
+
+    @Test("native_try_apply catches only a declared native business error")
+    func nativeTryApplyCatchesBusinessError() throws {
+        let signature = Core.LoweredSignature(
+            parameters: ["Swift.Bool"],
+            result: "Swift.Int",
+            isThrowing: true
+        )
+        let effects = Core.Effects(mayThrow: true)
+        let key = try Core.NativeImportKey.derive(
+            namespace: namespace(),
+            canonicalCallee: "Fixture.mayFail(_:)",
+            signature: signature,
+            effects: effects,
+            contract: vmPureImportContract
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: .init(rawValue: 2),
+            key: key,
+            signature: signature,
+            effects: effects,
+            contract: vmPureImportContract
+        )
+        let descriptor = Verification.ResolvedNativeImport(
+            id: .init(rawValue: 2),
+            key: key,
+            parameterTypes: [.bool],
+            resultType: .int64,
+            signature: signature,
+            effects: effects,
+            contract: vmPureImportContract
+        )
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "catchNative",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.bool, .int64, .string, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .nativeTryApply(
+                            importID: .init(rawValue: 2),
+                            arguments: [.init(rawValue: 0)],
+                            normalTarget: .init(rawValue: 1),
+                            errorTarget: .init(rawValue: 2)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 1)],
+                    instructions: [.returnValue(.init(rawValue: 1))]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 2)],
+                    instructions: [
+                        .destroyValue(.init(rawValue: 2)),
+                        .constantInteger(result: .init(rawValue: 3), value: -1),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .stringsV1, .nativeImportsV2, .untypedThrowsV1,
+        ]
+        let image = try makeVerified(
+            function: function,
+            capabilities: capabilities,
+            imports: [requirement],
+            shellImports: [descriptor],
+            policy: .init(
+                acceptedCapabilities: capabilities,
+                allowedNativeImports: [.init(rawValue: 2)]
+            ),
+            signature: .init(parameters: ["Swift.Bool"], result: "Swift.Int"),
+            parameterTypes: [.bool],
+            resultType: .int64
+        )
+        let interpreter = VM.Interpreter(
+            nativeCatalog: try .init([ThrowingInvoker(key: key)])
+        )
+        #expect(
+            interpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.bool(false)]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 7, bitWidth: 64, isSigned: true))
+            )
+        )
+        #expect(
+            interpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.bool(true)]
+            ) == .returned(
+                .integer(try VM.Integer(signed: -1, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
+    @Test("Nonescaping closures execute captured Swift value semantics")
+    func executesNonescapingClosure() throws {
+        let closureType = Bytecode.ValueType.closure(
+            .init(parameters: [.int64], result: .int64)
+        )
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "closureRoot",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64, .int64, closureType, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(result: .init(rawValue: 1), value: 3),
+                        .makeClosure(
+                            result: .init(rawValue: 2),
+                            function: .init(rawValue: 2),
+                            captures: [.init(rawValue: 1)]
+                        ),
+                        .apply(
+                            result: .init(rawValue: 3),
+                            function: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 0), .init(rawValue: 2)]
+                        ),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+        let applyTwice = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "applyTwice",
+            parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+            resultType: .int64,
+            registerTypes: [.int64, closureType, .int64, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .closureApply(
+                            result: .init(rawValue: 2),
+                            closure: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .closureApply(
+                            result: .init(rawValue: 3),
+                            closure: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 2)]
+                        ),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+        let closureBody = Bytecode.Function(
+            id: .init(rawValue: 2),
+            name: "closureBody",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+            resultType: .int64,
+            registerTypes: [.int64, .int64, .int64, .bool],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .checkedBinary(
+                            result: .init(rawValue: 2),
+                            overflow: .init(rawValue: 3),
+                            operation: .add,
+                            lhs: .init(rawValue: 0),
+                            rhs: .init(rawValue: 1)
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let capabilities: Set<Core.Capability> = [.baselineV1, .closureValuesV1]
+        let image = try makeVerified(
+            function: root,
+            capabilities: capabilities,
+            additionalFunctions: [applyTwice, closureBody]
+        )
+        let input = VM.Value.integer(
+            try VM.Integer(signed: 4, bitWidth: 64, isSigned: true)
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [input]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 10, bitWidth: 64, isSigned: true))
+            )
+        )
+
+        let shallowLimits = Core.ResourceLimits(
+            maxCallDepth: 2,
+            maxWallTimeMainThreadMilliseconds: 1_000
+        )
+        let shallowImage = try makeVerified(
+            function: root,
+            limits: shallowLimits,
+            capabilities: capabilities,
+            additionalFunctions: [applyTwice, closureBody]
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: shallowImage,
+                arguments: [input]
+            ) == .trapped(.callDepthExceeded)
+        )
+    }
+
+    @Test("Borrowed closure arguments remain live in their caller")
+    func preservesBorrowedClosureArguments() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.string],
+            result: .string
+        )
+        let closureType = Bytecode.ValueType.closure(signature)
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "borrowedClosureRoot",
+            parameterRegisters: [.init(rawValue: 0)],
+            parameterConventions: [.borrowed],
+            resultType: .string,
+            registerTypes: [.string, .string, closureType, .string, .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantString(result: .init(rawValue: 1), value: "!"),
+                        .makeClosure(
+                            result: .init(rawValue: 2),
+                            function: .init(rawValue: 1),
+                            captures: [.init(rawValue: 1)]
+                        ),
+                        .closureApply(
+                            result: .init(rawValue: 3),
+                            closure: .init(rawValue: 2),
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .stringConcat(
+                            result: .init(rawValue: 4),
+                            lhs: .init(rawValue: 3),
+                            rhs: .init(rawValue: 0)
+                        ),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ]
+        )
+        let closureBody = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "borrowedClosureBody",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+            parameterConventions: [.borrowed, .borrowed],
+            resultType: .string,
+            registerTypes: [.string, .string, .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .stringConcat(
+                            result: .init(rawValue: 2),
+                            lhs: .init(rawValue: 0),
+                            rhs: .init(rawValue: 1)
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [.baselineV1, .stringsV1, .closureValuesV1, .borrowCallsV1],
+            signature: .init(
+                parameters: ["Swift.String"],
+                result: "Swift.String"
+            ),
+            parameterTypes: [.string],
+            resultType: .string,
+            additionalFunctions: [closureBody]
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.string("A")]
+            ) == .returned(.string("A!A"))
+        )
+    }
+
+    @Test("Closure values cannot cross a VM boundary")
+    func rejectsClosureBoundaryValue() throws {
+        let signature = Bytecode.ClosureSignature(parameters: [.int64], result: .int64)
+        let value = VM.Value.closure(
+            .init(functionID: .init(rawValue: 1), signature: signature, captures: [])
+        )
+
+        #expect(throws: VM.RuntimeTrap.explicit("closure values cannot cross a VM boundary")) {
+            try VM.InvocationBudget(limits: .init()).consumeBoundaryValue(value)
+        }
+    }
+
+    private struct Point: Hashable, Sendable {
+        var x: Int
+        var y: Int
+    }
+
+    private struct NonHashableValue: Sendable {
+        var values: [Int]
+    }
+
+    private final class ReferenceToken {
+        let label: String
+
+        init(label: String) {
+            self.label = label
+        }
+    }
+
+    @MainActor
+    private final class MainActorBox {
+        let value: Int
+
+        init(value: Int) { self.value = value }
+    }
+
+    private struct MakePointInvoker: VM.NativeInvoker {
+        let id = Core.NativeImportID(rawValue: 2)
+        let key: Core.NativeImportKey
+        let parameterTypes: [Bytecode.ValueType] = []
+        let resultType: Bytecode.ValueType
+        let effects = Core.Effects()
+        let contract = vmPureImportContract
+        let operations: VM.NativeTypeOperations
+
+        init(key: Core.NativeImportKey, operations: VM.NativeTypeOperations) {
+            self.key = key
+            self.operations = operations
+            resultType = .native(operations.id)
+        }
+
+        func invoke(
+            arguments: [VM.Value],
+            context: VM.NativeInvocationContext
+        ) -> VM.NativeInvocationResult {
+            .returned(.native(try! operations.box(Point(x: 3, y: 4))))
+        }
+    }
+
+    private struct SumPointInvoker: VM.NativeInvoker {
+        let id = Core.NativeImportID(rawValue: 3)
+        let key: Core.NativeImportKey
+        let parameterTypes: [Bytecode.ValueType]
+        let resultType: Bytecode.ValueType = .int64
+        let effects = Core.Effects()
+        let contract = vmPureImportContract
+
+        init(key: Core.NativeImportKey, typeID: Core.TypeID) {
+            self.key = key
+            parameterTypes = [.native(typeID)]
+        }
+
+        func invoke(
+            arguments: [VM.Value],
+            context: VM.NativeInvocationContext
+        ) -> VM.NativeInvocationResult {
+            guard case let .native(box) = arguments[0],
+                  let point = box.value(as: Point.self)
+            else { return .businessError("bad Point") }
+            return .returned(
+                .integer(try! VM.Integer(signed: Int64(point.x + point.y), bitWidth: 64, isSigned: true))
+            )
+        }
+    }
+
+    private struct IncrementInvoker: VM.NativeInvoker {
+        let id = Core.NativeImportID(rawValue: 0)
+        let key: Core.NativeImportKey
+        let parameterTypes: [Bytecode.ValueType] = [.int64]
+        let resultType: Bytecode.ValueType = .int64
+        let effects = Core.Effects(hasExternalSideEffects: true)
+        let contract = vmWriteImportContract
+
+        func invoke(
+            arguments: [VM.Value],
+            context: VM.NativeInvocationContext
+        ) -> VM.NativeInvocationResult {
+            guard case let .integer(value) = arguments[0] else { return .businessError("bad argument") }
+            return .returned(.integer(try! VM.Integer(signed: value.signedValue + 1, bitWidth: 64, isSigned: true)))
+        }
+    }
+
+    private struct MisdeclaredIncrementInvoker: VM.NativeInvoker {
+        let id = Core.NativeImportID(rawValue: 0)
+        let key: Core.NativeImportKey
+        let parameterTypes: [Bytecode.ValueType] = [.int64]
+        let resultType: Bytecode.ValueType = .int64
+        let effects = Core.Effects()
+        let contract = vmPureImportContract
+
+        func invoke(
+            arguments: [VM.Value],
+            context: VM.NativeInvocationContext
+        ) -> VM.NativeInvocationResult {
+            .businessError("descriptor validation must run before this invoker")
+        }
+    }
+
+    private struct NaNInvoker: VM.NativeInvoker {
+        let id = Core.NativeImportID(rawValue: 1)
+        let key: Core.NativeImportKey
+        let parameterTypes: [Bytecode.ValueType] = []
+        let resultType: Bytecode.ValueType = .float(bitWidth: 64)
+        let effects = Core.Effects()
+        let contract = vmPureImportContract
+
+        func invoke(
+            arguments: [VM.Value],
+            context: VM.NativeInvocationContext
+        ) -> VM.NativeInvocationResult {
+            .returned(.float(.nan, bitWidth: 64))
+        }
+    }
+
+    private struct ThrowingInvoker: VM.NativeInvoker {
+        let id = Core.NativeImportID(rawValue: 2)
+        let key: Core.NativeImportKey
+        let parameterTypes: [Bytecode.ValueType] = [.bool]
+        let resultType: Bytecode.ValueType = .int64
+        let effects = Core.Effects(mayThrow: true)
+        let contract = vmPureImportContract
+
+        func invoke(
+            arguments: [VM.Value],
+            context: VM.NativeInvocationContext
+        ) -> VM.NativeInvocationResult {
+            guard case let .bool(shouldFail) = arguments.first else {
+                return .businessError("invalid fixture argument")
+            }
+            if shouldFail { return .businessError("fixture failure") }
+            return .returned(
+                .integer(try! VM.Integer(signed: 7, bitWidth: 64, isSigned: true))
+            )
+        }
+    }
+
+    private func addFunction() -> Bytecode.Function {
+        Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "add27",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64, .int64, .int64, .bool, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(result: .init(rawValue: 1), value: 27),
+                        .checkedBinary(
+                            result: .init(rawValue: 2),
+                            overflow: .init(rawValue: 3),
+                            operation: .add,
+                            lhs: .init(rawValue: 0),
+                            rhs: .init(rawValue: 1)
+                        ),
+                        .conditionalBranch(
+                            condition: .init(rawValue: 3),
+                            trueTarget: .init(rawValue: 1),
+                            trueArguments: [],
+                            falseTarget: .init(rawValue: 2),
+                            falseArguments: [.init(rawValue: 2)]
+                        ),
+                    ]
+                ),
+                .init(id: .init(rawValue: 1), instructions: [.trap(.integerOverflow)]),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 4)],
+                    instructions: [.returnValue(.init(rawValue: 4))]
+                ),
+            ]
+        )
+    }
+
+    private func shiftFunction(
+        operation: Bytecode.BinaryOperation,
+        amount: Int64
+    ) -> Bytecode.Function {
+        Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "shift",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64, .int64, .int64, .bool],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(result: .init(rawValue: 1), value: amount),
+                        .checkedBinary(
+                            result: .init(rawValue: 2),
+                            overflow: .init(rawValue: 3),
+                            operation: operation,
+                            lhs: .init(rawValue: 0),
+                            rhs: .init(rawValue: 1)
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+    }
+
+    private func makeNativeIncrementImage() throws -> Verification.Image {
+        let signature = Core.LoweredSignature(parameters: ["Swift.Int"], result: "Swift.Int")
+        let effects = Core.Effects(hasExternalSideEffects: true)
+        let importKey = try Core.NativeImportKey.derive(
+            namespace: namespace(),
+            canonicalCallee: "Fixture.increment(_:)",
+            signature: signature,
+            effects: effects,
+            contract: vmWriteImportContract
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: .init(rawValue: 0),
+            key: importKey,
+            signature: signature,
+            effects: effects,
+            contract: vmWriteImportContract
+        )
+        let descriptor = Verification.ResolvedNativeImport(
+            id: .init(rawValue: 0),
+            key: importKey,
+            parameterTypes: [.int64],
+            resultType: .int64,
+            signature: signature,
+            effects: effects,
+            contract: vmWriteImportContract
+        )
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "native",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .nativeApply(
+                            result: .init(rawValue: 1),
+                            importID: .init(rawValue: 0),
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ],
+            effects: effects
+        )
+        return try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .nativeImportsV2],
+            imports: [requirement],
+            shellImports: [descriptor],
+            policy: .init(
+                acceptedCapabilities: [.baselineV1, .nativeImportsV2],
+                allowedNativeImports: [.init(rawValue: 0)]
+            )
+        )
+    }
+
+    private func namespace() -> Core.ShellNamespaceID {
+        .derive(bundleID: "dev.helix.vm", buildNumber: "1", seed: "fixture")
+    }
+
+    private final class SequenceClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private let values: [UInt64]
+        private var index = 0
+
+        init(values: [UInt64]) {
+            precondition(!values.isEmpty)
+            self.values = values
+        }
+
+        func now() -> UInt64 {
+            lock.lock()
+            defer { lock.unlock() }
+            let value = values[min(index, values.count - 1)]
+            index += 1
+            return value
+        }
+    }
+
+    private func makeVerified(
+        function: Bytecode.Function,
+        limits: Core.ResourceLimits = .init(maxWallTimeMainThreadMilliseconds: 1_000),
+        capabilities: Set<Core.Capability> = [.baselineV1],
+        imports: [Bytecode.ImportRequirement] = [],
+        shellImports: [Verification.ResolvedNativeImport] = [],
+        policy: Core.RuntimePolicy? = nil,
+        signature: Core.LoweredSignature = .init(parameters: ["Swift.Int"], result: "Swift.Int"),
+        parameterTypes: [Bytecode.ValueType] = [.int64],
+        resultType: Bytecode.ValueType = .int64,
+        shellTypes: [Verification.ResolvedNativeType] = [],
+        localTypes: [Bytecode.LocalTypeDefinition] = [],
+        additionalFunctions: [Bytecode.Function] = []
+    ) throws -> Verification.Image {
+        let shellHash = Core.Digest.sha256("vm-shell")
+        let key = try Core.FunctionKey.derive(
+            namespace: namespace(),
+            module: "Fixture",
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            canonicalDeclaration: "func run(_: Int) -> Int",
+            loweredSignature: signature,
+            role: .function
+        )
+        let compatibility = Core.Compatibility(
+            runtime: Core.Versions.runtime,
+            bytecode: Core.Versions.bytecode,
+            interfaceArchive: Core.Versions.interfaceArchive,
+            compilerFingerprint: "swift-vm-fixture"
+        )
+        let module = Bytecode.Module(
+            name: "VMFixture",
+            shellInterfaceHash: shellHash,
+            compatibility: compatibility,
+            capabilities: capabilities,
+            requestedResources: limits,
+            localTypes: localTypes,
+            functions: [function] + additionalFunctions,
+            entries: [.init(entryIndex: .init(rawValue: 0), functionKey: key, functionID: function.id)],
+            imports: imports
+        )
+        let shell = try Verification.ShellInterface(
+            interfaceHash: shellHash,
+            compatibility: compatibility,
+            capabilities: capabilities,
+            entries: [
+                .init(
+                    index: .init(rawValue: 0),
+                    key: key,
+                    parameterTypes: parameterTypes,
+                    resultType: resultType,
+                    effects: function.effects
+                ),
+            ],
+            imports: shellImports,
+            types: shellTypes
+        )
+        let resolvedPolicy = policy ?? Core.RuntimePolicy(
+            acceptedCapabilities: capabilities,
+            resourceCeiling: limits
+        )
+        return try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(module),
+            shell: shell,
+            policy: resolvedPolicy
+        )
+    }
+}
+}

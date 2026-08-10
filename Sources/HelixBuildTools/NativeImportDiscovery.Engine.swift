@@ -1,0 +1,299 @@
+import HelixBytecode
+import HelixCompiler
+import HelixCore
+import HelixInterface
+
+/// Build-time source discovery for NativeImport. A selected range is always
+/// expanded into exact per-operation records; no wildcard reaches the device.
+enum NativeImportDiscovery {}
+
+extension NativeImportDiscovery {
+    enum Dispatch: String, Codable, Hashable, Sendable {
+        case globalFunction
+        case staticMethod
+        case instanceMethod
+    }
+
+    struct Declaration: Hashable, Sendable {
+        var moduleName: String
+        var sourceFileLogicalID: String
+        var mangledName: String
+        var canonicalCallee: String
+        var accessLevel: String
+        var dispatch: NativeImportDiscovery.Dispatch
+        var ownerType: String?
+        var baseName: String
+        var argumentLabels: [String]
+        var parameterSwiftTypes: [String]
+        var resultSwiftType: String
+        var parameterTypes: [Bytecode.ValueType]
+        var resultType: Bytecode.ValueType
+        var signature: Core.LoweredSignature
+        var inferredEffects: Core.Effects
+        var isGeneric: Bool
+        var hasInOut: Bool
+        var hasTypedThrows: Bool
+        var hasUnsupportedAttributes: Bool
+    }
+
+    struct GeneratedBinding: Hashable, Sendable {
+        var declarationMangledName: String
+        var sourceFileLogicalID: String
+        var dispatch: NativeImportDiscovery.Dispatch
+        var ownerType: String?
+        var baseName: String
+        var argumentLabels: [String]
+        var parameterSwiftTypes: [String]
+        var resultSwiftType: String
+    }
+
+    struct Candidate: Hashable, Sendable {
+        var record: InterfaceArchive.NativeImportRecord
+        var generatedBinding: NativeImportDiscovery.GeneratedBinding
+    }
+
+    struct Result: Sendable {
+        var candidates: [NativeImportDiscovery.Candidate]
+        var diagnostics: [Core.Diagnostic]
+    }
+
+    struct Engine: Sendable {
+        func discover(
+            declarations: [NativeImportDiscovery.Declaration],
+            metadata: InterfaceArchive.ReleaseMetadata,
+            configuration: PatchConfiguration.Document
+        ) throws -> NativeImportDiscovery.Result {
+            try configuration.validate()
+            guard let module = configuration.modules[metadata.frontendInvocation.moduleName],
+                  module.nativeImports.effectiveCandidateIndex == .sourceAndCatalog,
+                  module.nativeImports.effectiveEmission == .scoped,
+                  let scope = module.nativeImports.sourceScope,
+                  let profile = scope.profile
+            else {
+                return .init(candidates: [], diagnostics: [])
+            }
+            guard declarations.allSatisfy({
+                $0.moduleName == metadata.frontendInvocation.moduleName
+            }) else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "source NativeImport discovery received declarations from another Swift module"
+                )
+            }
+
+            var candidates: [NativeImportDiscovery.Candidate] = []
+            var diagnostics: [Core.Diagnostic] = []
+            for declaration in declarations.sorted(by: declarationOrder) {
+                guard scope.includes(
+                    logicalPath: declaration.sourceFileLogicalID,
+                    canonicalCallee: declaration.canonicalCallee,
+                    accessLevel: declaration.accessLevel
+                ) else { continue }
+                if let rejection = rejection(
+                    for: declaration,
+                    scope: scope
+                ) {
+                    diagnostics.append(
+                        .init(
+                            code: rejection.code,
+                            severity: .note,
+                            message: "\(declaration.canonicalCallee): \(rejection.reason)",
+                            location: .init(
+                                file: declaration.sourceFileLogicalID,
+                                line: 1,
+                                column: 1
+                            )
+                        )
+                    )
+                    continue
+                }
+
+                let effects = Core.Effects(
+                    mayThrow: declaration.inferredEffects.mayThrow,
+                    mayAllocate: true,
+                    hasExternalSideEffects: profile == .boundedReadWrite,
+                    requiresMainActor: declaration.inferredEffects.requiresMainActor
+                )
+                let contract = Core.NativeImportContract.bounded(
+                    kind: declaration.dispatch == .globalFunction
+                        ? .globalFunction : .staticMethod,
+                    domain: .application,
+                    access: access(for: profile),
+                    maximumDurationMicroseconds: scope.maximumDurationMicroseconds,
+                    allowsMainThread: scope.allowsMainThread
+                )
+                try contract.validate(effects: effects)
+                let key = try Core.NativeImportKey.derive(
+                    namespace: metadata.shellNamespaceID,
+                    canonicalCallee: declaration.canonicalCallee,
+                    signature: declaration.signature,
+                    effects: effects,
+                    contract: contract
+                )
+                candidates.append(
+                    .init(
+                        record: .init(
+                            id: nil,
+                            key: key,
+                            canonicalCallee: declaration.canonicalCallee,
+                            silMangledNames: [declaration.mangledName],
+                            parameterTypes: declaration.parameterTypes,
+                            resultType: declaration.resultType,
+                            signature: declaration.signature,
+                            effects: effects,
+                            contract: contract,
+                            capability: .nativeImportsV2,
+                            isEmittedToDevice: true
+                        ),
+                        generatedBinding: .init(
+                            declarationMangledName: declaration.mangledName,
+                            sourceFileLogicalID: declaration.sourceFileLogicalID,
+                            dispatch: declaration.dispatch,
+                            ownerType: declaration.ownerType,
+                            baseName: declaration.baseName,
+                            argumentLabels: declaration.argumentLabels,
+                            parameterSwiftTypes: declaration.parameterSwiftTypes,
+                            resultSwiftType: declaration.resultSwiftType
+                        )
+                    )
+                )
+            }
+            guard Set(candidates.map(\.record.key)).count == candidates.count,
+                  Set(candidates.flatMap(\.record.silMangledNames)).count == candidates.count
+            else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "source NativeImport discovery produced duplicate identities"
+                )
+            }
+            return .init(
+                candidates: candidates.sorted { $0.record.key.rawValue < $1.record.key.rawValue },
+                diagnostics: diagnostics.sorted(by: diagnosticOrder)
+            )
+        }
+
+        private func rejection(
+            for declaration: NativeImportDiscovery.Declaration,
+            scope: PatchConfiguration.NativeImportSourceScope
+        ) -> (code: String, reason: String)? {
+            switch declaration.dispatch {
+            case .globalFunction, .staticMethod:
+                break
+            case .instanceMethod:
+                return (
+                    "HLXNID001",
+                    "automatic v1 discovery does not synthesize a native receiver; use an explicit catalog factory"
+                )
+            }
+            if declaration.inferredEffects.isAsync {
+                return ("HLXNID002", "async NativeImport requires a suspension-aware contract")
+            }
+            if declaration.isGeneric || declaration.hasInOut || declaration.hasTypedThrows {
+                return (
+                    "HLXNID003",
+                    "generic, inout/ownership, and typed-throws declarations require an explicit ABI adapter"
+                )
+            }
+            if declaration.hasUnsupportedAttributes {
+                return (
+                    "HLXNID004",
+                    "custom calling or isolation attributes require an explicit catalog factory"
+                )
+            }
+            guard isSwiftIdentifier(declaration.baseName),
+                  declaration.argumentLabels.allSatisfy({
+                      $0 == "_" || isSwiftIdentifier($0)
+                  })
+            else {
+                return ("HLXNID007", "callee name or argument label is not representable in generated Swift")
+            }
+            guard declaration.argumentLabels.count == declaration.parameterTypes.count,
+                  declaration.parameterSwiftTypes.count == declaration.parameterTypes.count,
+                  declaration.parameterTypes.allSatisfy(isAutomaticallyBridgeable),
+                  isAutomaticallyBridgeableResult(declaration.resultType)
+            else {
+                return (
+                    "HLXNID005",
+                    "signature is outside the automatic value-only Bridge profile"
+                )
+            }
+            if declaration.inferredEffects.requiresMainActor && !scope.allowsMainThread {
+                return (
+                    "HLXNID006",
+                    "MainActor declaration is excluded because the sourceScope forbids main-thread execution"
+                )
+            }
+            guard declaration.dispatch != .staticMethod
+                    || declaration.ownerType?.split(separator: ".").allSatisfy({
+                        isSwiftIdentifier(String($0))
+                    }) == true
+            else {
+                return ("HLXNID007", "static owner is not a representable Swift type path")
+            }
+            return nil
+        }
+
+        private func access(
+            for profile: PatchConfiguration.NativeImportSourceProfile
+        ) -> Core.NativeImportAccess {
+            switch profile {
+            case .boundedPure: .pure
+            case .boundedRead: .read
+            case .boundedReadWrite: .readWrite
+            }
+        }
+
+        private func isAutomaticallyBridgeable(_ type: Bytecode.ValueType) -> Bool {
+            switch type {
+            case .bool, .integer, .float, .string:
+                true
+            case let .array(element), let .optional(element):
+                isAutomaticallyBridgeable(element)
+            case let .dictionary(key, value):
+                isDictionaryKey(key) && isAutomaticallyBridgeable(value)
+            case let .tuple(elements):
+                !elements.isEmpty && elements.allSatisfy(isAutomaticallyBridgeable)
+            case .void, .never, .native, .local, .error, .address, .closure:
+                false
+            }
+        }
+
+        private func isAutomaticallyBridgeableResult(_ type: Bytecode.ValueType) -> Bool {
+            type == .void || isAutomaticallyBridgeable(type)
+        }
+
+        private func isDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
+            switch type {
+            case .bool, .integer, .string: true
+            default: false
+            }
+        }
+
+        private func isSwiftIdentifier(_ value: String) -> Bool {
+            guard let first = value.first, first == "_" || first.isLetter else { return false }
+            return value.dropFirst().allSatisfy {
+                $0 == "_" || $0.isLetter || $0.isNumber
+            }
+        }
+
+        private func declarationOrder(
+            _ lhs: NativeImportDiscovery.Declaration,
+            _ rhs: NativeImportDiscovery.Declaration
+        ) -> Bool {
+            (lhs.sourceFileLogicalID, lhs.canonicalCallee, lhs.mangledName)
+                < (rhs.sourceFileLogicalID, rhs.canonicalCallee, rhs.mangledName)
+        }
+
+        private func diagnosticOrder(_ lhs: Core.Diagnostic, _ rhs: Core.Diagnostic) -> Bool {
+            (
+                lhs.location?.file ?? "",
+                lhs.location?.line ?? 0,
+                lhs.code,
+                lhs.message
+            ) < (
+                rhs.location?.file ?? "",
+                rhs.location?.line ?? 0,
+                rhs.code,
+                rhs.message
+            )
+        }
+    }
+}
