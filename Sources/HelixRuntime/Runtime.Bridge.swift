@@ -3,12 +3,21 @@ import HelixCore
 import HelixVM
 
 extension Runtime {
+/// Result of asking Runtime to route one exact-ABI generated wrapper.
 public enum BridgeDispatchResult<Result> {
+    /// The wrapper must call its lexical previous/original Swift implementation.
     case originalRequired
+    /// Patched code returned a decoded Swift result.
     case returned(Result)
 }
 
+/// Stable gateway called by compiler-generated wrappers in the App binary.
+///
+/// The bridge is installed once with a compatible ``Engine``. Unpatched calls
+/// stay on a low-cost original path; patched calls lazily encode arguments only
+/// after route resolution proves that a generation supplies the entry.
 public final class Bridge: @unchecked Sendable {
+    /// Process-wide bridge used by generated App wrappers.
     public static let shared = Runtime.Bridge()
 
     private final class OriginalBypassState: NSObject {
@@ -38,10 +47,15 @@ public final class Bridge: @unchecked Sendable {
     private let originalBypassKey: String
     private let installation = Runtime.AtomicReference<Installation>()
 
+    /// Creates an independent bridge, primarily for generated integration tests.
     public init() {
         originalBypassKey = "dev.helix.original-bypass.\(UUID().uuidString)"
     }
 
+    /// Installs one Runtime engine after checking interface and registration identity.
+    ///
+    /// Reinstalling the exact same engine is idempotent. Installing a different
+    /// engine or Bridge contract into the same instance fails closed.
     public func install(
         runtime: Runtime.Engine,
         interfaceHash: Core.Digest,
@@ -83,6 +97,11 @@ public final class Bridge: @unchecked Sendable {
         }
     }
 
+    /// Invokes an entry from already encoded values through the installed engine.
+    ///
+    /// This compatibility path returns a trap when called before installation;
+    /// generated exact-ABI wrappers normally use
+    /// ``dispatch(isolation:entry:arguments:decodeResult:)``.
     public func invoke(entry: Core.EntryIndex, arguments: [VM.Value]) -> VM.ExecutionResult {
         let runtime = installation.loadAcquire()?.runtime
         guard let runtime else {
@@ -154,10 +173,12 @@ public final class Bridge: @unchecked Sendable {
         return try operation()
     }
 
+    /// Native type catalog of the installed Runtime, or `nil` before bootstrap.
     public var nativeTypeCatalog: VM.NativeTypeCatalog? {
         installation.loadAcquire()?.runtime.nativeTypeCatalog
     }
 
+    /// Returns the installed native type catalog or throws before bootstrap.
     public func requireNativeTypeCatalog() throws -> VM.NativeTypeCatalog {
         guard let catalog = nativeTypeCatalog else {
             throw Runtime.BridgeDispatchError.notInstalled
@@ -165,10 +186,15 @@ public final class Bridge: @unchecked Sendable {
         return catalog
     }
 
+    /// Terminates when a nonthrowing generated Swift signature cannot be honored.
+    ///
+    /// Only compiler-generated wrappers should call this method. Throwing Shell
+    /// entries propagate errors normally instead.
     public static func terminate(_ error: any Swift.Error) -> Never {
         fatalError("Helix permanent bridge could not complete a nonthrowing call: \(error)")
     }
 
+    /// Shell interface identity of the installed engine, or `nil` before bootstrap.
     public var installedInterfaceHash: Core.Digest? {
         installation.loadAcquire()?.interfaceHash
     }
@@ -193,12 +219,18 @@ public final class Bridge: @unchecked Sendable {
     }
 }
 
+/// Permanent Bridge installation contract failures.
 public enum BridgeBootstrapError: Error, Equatable, Sendable, CustomStringConvertible {
+    /// The supplied engine was not bound to a generated Shell interface.
     case runtimeHasNoShellIdentity
+    /// The generated wrapper archive and Runtime target different interfaces.
     case interfaceHashMismatch
+    /// Generated wrapper roots do not exactly cover the original entry catalog.
     case registrationCountMismatch(expected: UInt32, actual: Int)
+    /// A different engine or contract is already installed.
     case conflictingInstallation
 
+    /// Human-readable bootstrap failure detail.
     public var description: String {
         switch self {
         case .runtimeHasNoShellIdentity:
@@ -213,10 +245,14 @@ public enum BridgeBootstrapError: Error, Equatable, Sendable, CustomStringConver
     }
 }
 
+/// Errors surfaced while a generated wrapper dispatches patched code.
 public enum BridgeDispatchError: Error, Equatable, Sendable, CustomStringConvertible {
+    /// Generated code reached a bridge that has not been installed.
     case notInstalled
+    /// Patched code returned a declared business-error payload.
     case businessError(String)
 
+    /// Human-readable bridge dispatch failure detail.
     public var description: String {
         switch self {
         case .notInstalled:

@@ -3,44 +3,76 @@ import Foundation
 import HelixDevProtocol
 import HelixLiveReloadAPI
 
+/// Observable, presentation-ready state for a Helix development session.
 public enum DevStatus {}
 
 extension DevStatus {
+/// High-level stage displayed by the on-device debug overlay.
 public enum Phase: String, Codable, Hashable, Sendable {
+    /// Live Reload has not started or has stopped cleanly.
     case idle
+    /// The App is discovering or connecting to its paired daemon.
     case connecting
+    /// The authenticated session is ready for messages.
     case authenticated
+    /// The daemon is compiling a source revision.
     case compiling
+    /// The App is receiving a compiled generation.
     case transferring
+    /// A generation is active, regardless of whether UI refresh succeeded.
     case codeActive
+    /// The edited source cannot be applied without a full rebuild.
     case rebuildRequired
+    /// Native runtime state is uncertain and the App must restart.
     case restartRequired
+    /// The connection closed and may be retried.
     case disconnected
+    /// Compilation, validation, transfer, or activation failed safely.
     case failed
 }
 
+/// Semantic color category for a development status presentation.
 public enum Tone: String, Codable, Hashable, Sendable {
+    /// Informational state with no success or failure implication.
     case neutral
+    /// Work is currently in progress.
     case progress
+    /// The latest requested operation completed successfully.
     case success
+    /// Code may be active but developer attention is required.
     case warning
+    /// The requested operation failed.
     case error
 }
 
+/// Immutable status value suitable for UIKit, SwiftUI, logs, or tests.
 public struct Snapshot: Codable, Hashable, Sendable {
+    /// Monotonically increasing local publication sequence.
     public let sequence: UInt64
+    /// Current development-session stage.
     public let phase: DevStatus.Phase
+    /// Presentation tone associated with ``phase``.
     public let tone: DevStatus.Tone
+    /// Short user-facing summary.
     public let headline: String
+    /// Optional diagnostic or next-action detail.
     public let detail: String?
+    /// Source revision involved in the latest event.
     public let sourceRevision: DevProtocol.SourceRevision?
+    /// Generation involved in the latest event.
     public let generationID: DevProtocol.GenerationID?
+    /// Most recently activated source revision.
     public let activeSourceRevision: DevProtocol.SourceRevision?
+    /// Generation whose code currently owns dispatch routes.
     public let activeGenerationID: DevProtocol.GenerationID?
+    /// Code activation result associated with the latest event.
     public let codeStatus: DevProtocol.CodeActivationStatus?
+    /// UI refresh result associated with the latest event.
     public let reloadStatus: DevProtocol.UIReloadStatus?
+    /// Local publication time.
     public let updatedAt: Date
 
+    /// Creates an explicit status snapshot.
     public init(
         sequence: UInt64 = 0,
         phase: DevStatus.Phase = .idle,
@@ -70,15 +102,30 @@ public struct Snapshot: Codable, Hashable, Sendable {
     }
 }
 
+/// Opaque token identifying a callback registered with ``Store``.
 public struct ObservationToken: Hashable, Sendable {
     fileprivate let rawValue: UUID
 }
 
+/// Reduces connection, activation, and reload events into observable UI state.
+///
+/// The current value is available through ``snapshot`` and is also published
+/// through `ObservableObject`. Callback observation is useful for UIKit:
+///
+/// ```swift
+/// let token = store.observe { snapshot in
+///     label.text = snapshot.headline
+/// }
+/// // Later: store.removeObserver(token)
+/// ```
 @MainActor
 public final class Store: ObservableObject {
+    /// Main-actor callback invoked with each published snapshot.
     public typealias Observer = @MainActor (DevStatus.Snapshot) -> Void
 
+    /// Most recently reduced development status.
     @Published public private(set) var snapshot = DevStatus.Snapshot()
+    /// Up to 50 recent publications, ordered from oldest to newest.
     public private(set) var history: [DevStatus.Snapshot] = []
 
     private let historyLimit = 50
@@ -92,8 +139,13 @@ public final class Store: ObservableObject {
         errors: [String]
     )?
 
+    /// Creates an idle status store.
     public init() {}
 
+    /// Registers an observer and immediately sends the current snapshot.
+    ///
+    /// Retain the returned token and pass it to ``removeObserver(_:)`` when the
+    /// observer no longer needs updates.
     @discardableResult
     public func observe(
         _ observer: @escaping Observer
@@ -104,10 +156,12 @@ public final class Store: ObservableObject {
         return token
     }
 
+    /// Removes a callback observer. Unknown tokens are ignored.
     public func removeObserver(_ token: DevStatus.ObservationToken) {
         observers.removeValue(forKey: token)
     }
 
+    /// Reduces an authenticated session event into presentation state.
     public func handle(_ event: DevRuntimeSession.Event) {
         switch event {
         case .authenticated:
@@ -159,6 +213,7 @@ public final class Store: ObservableObject {
     }
 
     #if canImport(Network) && canImport(Security)
+    /// Reduces a connection lifecycle event into presentation state.
     public func handle(_ event: DevConnection.ClientEvent) {
         switch event {
         case let .connecting(attempt):
@@ -187,6 +242,7 @@ public final class Store: ObservableObject {
         }
     }
 
+    /// Returns a weakly capturing adapter suitable for ``DevConnection/Client``.
     public func connectionEventHandler() -> DevConnection.Client.EventHandler {
         { [weak self] event in
             await self?.handle(event)
@@ -194,6 +250,10 @@ public final class Store: ObservableObject {
     }
     #endif
 
+    /// Records a final code activation result.
+    ///
+    /// A UI result reported slightly before activation completion is correlated
+    /// by source revision and generation rather than being lost.
     public func record(_ result: DevProtocol.ActivationResult) {
         let pending = pendingUIResult.flatMap {
             $0.context.generationID == result.generationID.rawValue
@@ -243,6 +303,10 @@ public final class Store: ObservableObject {
         }
     }
 
+    /// Records the UI refresh outcome for an activated generation.
+    ///
+    /// The result updates the current presentation immediately when the matching
+    /// generation is already active, or is held until its activation result arrives.
     public func recordUIResult(
         context: LiveReload.Context,
         _ status: DevProtocol.UIReloadStatus,

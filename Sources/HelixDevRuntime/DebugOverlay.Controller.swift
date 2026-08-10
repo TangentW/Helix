@@ -2,14 +2,22 @@
 import Foundation
 import UIKit
 
+/// On-device development UI for connection, compilation, and reload status.
 public enum DebugOverlay {}
 
 extension DebugOverlay {
+/// Visual placement and initial presentation options for the debug overlay.
 public struct Configuration: Hashable, Sendable {
+    /// Whether each scene's status panel starts in its expanded form.
     public var startsExpanded: Bool
+    /// Distance from the host window's horizontal safe-area edges.
     public var horizontalMargin: CGFloat
+    /// Distance from the host window's top safe-area edge.
     public var verticalMargin: CGFloat
 
+    /// Creates overlay layout options.
+    ///
+    /// Margins are expressed in UIKit points.
     public init(
         startsExpanded: Bool = false,
         horizontalMargin: CGFloat = 12,
@@ -21,11 +29,26 @@ public struct Configuration: Hashable, Sendable {
     }
 }
 
+/// Attaches a Helix status panel to every active foreground UIKit scene.
+///
+/// ``DevRuntime/ApplicationSession`` owns and starts this controller by
+/// default. Custom integrations can use the same status store and supply a
+/// manual reload action:
+///
+/// ```swift
+/// let overlay = DebugOverlay.Controller(store: statusStore) {
+///     await reloadCoordinator.manualReloadLatest()
+/// }
+/// overlay.start()
+/// ```
 @MainActor
 public final class Controller {
+    /// Async action invoked when the user taps the overlay's manual reload control.
     public typealias ManualReloadHandler = @MainActor () async -> Void
 
+    /// Observable source rendered by every scene panel.
     public let store: DevStatus.Store
+    /// Immutable layout and presentation options.
     public let configuration: DebugOverlay.Configuration
 
     private let manualReloadHandler: ManualReloadHandler
@@ -34,6 +57,10 @@ public final class Controller {
     private var notificationTokens: [NSObjectProtocol] = []
     private var isRunning = false
 
+    /// Creates an overlay controller without attaching it to any windows.
+    ///
+    /// Call ``start()`` after application scenes are available. The controller
+    /// observes later scene activation and disconnection automatically.
     public init(
         store: DevStatus.Store,
         configuration: DebugOverlay.Configuration = .init(),
@@ -44,6 +71,9 @@ public final class Controller {
         self.manualReloadHandler = manualReloadHandler
     }
 
+    /// Starts status observation and attaches panels to active foreground scenes.
+    ///
+    /// Calling this method more than once is safe and has no additional effect.
     public func start() {
         guard !isRunning else { return }
         isRunning = true
@@ -84,6 +114,9 @@ public final class Controller {
         synchronizeScenes()
     }
 
+    /// Removes all panels and observers owned by the controller.
+    ///
+    /// Calling this method more than once is safe.
     public func stop() {
         guard isRunning else { return }
         isRunning = false
@@ -98,6 +131,7 @@ public final class Controller {
         hosts.removeAll()
     }
 
+    /// Number of foreground scenes that currently host a Helix panel.
     public var visibleSceneCount: Int { hosts.count }
 
     private func synchronizeScenes() {

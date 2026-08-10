@@ -7,10 +7,34 @@ import HelixVerifier
 extension DevRuntime {
 /// Thin App-owned composition root for the generated Bridge, Runtime Engine,
 /// authenticated Dev connection, UI reload coordinators, and debug overlay.
+///
+/// Keep one session alive for the App process while using a Helix-enabled Debug
+/// scheme. The session is inert when no Helix launch configuration is present;
+/// partial or malformed configuration fails initialization.
+///
+/// ```swift
+/// @MainActor
+/// final class DevelopmentRuntimeOwner {
+///     let session: DevRuntime.ApplicationSession
+///
+///     init() throws {
+///         session = try DevRuntime.ApplicationSession(
+///             options: .init(
+///                 supportedBackends: [.nativeDynamicReplacement, .hlbc],
+///                 nativeChainingProbePassed: true
+///             )
+///         )
+///     }
+/// }
+/// ```
 @MainActor
 public final class ApplicationSession {
+    /// UI refresh, status, and debug-overlay environment owned by this session.
     public let environment: DevRuntime.LiveReloadEnvironment
+    /// Runtime Engine that receives temporary development generations.
     public let runtime: Runtime.Engine
+    /// Active authenticated connection graph, or `nil` when disabled or
+    /// awaiting debugger handoff.
     public private(set) var bootstrap: DevRuntime.Bootstrap?
 
     private var debuggerHandoffTask: Task<Void, Never>?
@@ -18,6 +42,15 @@ public final class ApplicationSession {
     /// Creates a Dev session from the hidden Bridge linked by the Helix Xcode
     /// phase. The optional provider exists for tests and advanced composition;
     /// ordinary App code uses the linked provider automatically.
+    ///
+    /// - Parameters:
+    ///   - environment: UI refresh and diagnostics environment to retain.
+    ///   - options: Enabled backends, limits, reconnect policy, and cache path.
+    ///   - debuggerHandoffEnabled: Whether to wait for late Xcode credential
+    ///     injection when launch variables are initially absent.
+    ///   - launchEnvironment: Process environment containing one-run credentials.
+    ///   - bridgeProvider: Explicit provider for tests; production Debug builds
+    ///     should use the linked provider.
     public convenience init(
         environment: DevRuntime.LiveReloadEnvironment = .init(),
         options: DevRuntime.Bootstrap.Options = .init(),
@@ -44,6 +77,11 @@ public final class ApplicationSession {
         )
     }
 
+    /// Creates a session from explicitly assembled Runtime components.
+    ///
+    /// This initializer is intended for tests and alternate build adapters.
+    /// Applications using the generated Xcode integration should use the
+    /// convenience initializer.
     public init(
         build: DevRuntime.BuildContract,
         runtime: Runtime.Engine,
@@ -91,6 +129,10 @@ public final class ApplicationSession {
         }
     }
 
+    /// Stops the authenticated Dev connection and cancels pending debugger handoff.
+    ///
+    /// Scheme lifecycle scripts normally stop the daemon automatically. Call
+    /// this method when an application explicitly tears down its runtime owner.
     public func stop() async {
         debuggerHandoffTask?.cancel()
         debuggerHandoffTask = nil

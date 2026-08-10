@@ -3,16 +3,24 @@ import HelixDevProtocol
 import HelixLiveReloadAPI
 import SwiftUI
 
+/// Development-time orchestration for SwiftUI Live Reload boundaries.
 public enum SwiftUIReload {}
 
 extension SwiftUIReload {
+/// Outcome of publishing a generation to active SwiftUI boundaries.
 public struct Report: Sendable {
+    /// Protocol-level refresh outcome.
     public var status: DevProtocol.UIReloadStatus
+    /// Number of active boundary registrations matched by the changed types.
     public var matchedBoundaryCount: Int
+    /// Number of matching registrations that received a new pulse.
     public var refreshedBoundaryCount: Int
+    /// Non-fatal target-resolution details.
     public var warnings: [String]
+    /// Invalid hints, contexts, or pulse transitions.
     public var errors: [String]
 
+    /// Creates a SwiftUI refresh report.
     public init(
         status: DevProtocol.UIReloadStatus,
         matchedBoundaryCount: Int,
@@ -28,14 +36,33 @@ public struct Report: Sendable {
     }
 }
 
+/// Publishes activated generations through a `LiveReload.Pulse`.
+///
+/// Applications usually establish targets with
+/// `View/liveReloadBoundary(for:mode:pulse:)`; the default application session
+/// invokes this coordinator automatically.
 @MainActor
 public final class Coordinator {
+    /// Pulse shared with the SwiftUI boundaries managed by this coordinator.
     public let pulse: LiveReload.Pulse
 
+    /// Creates a coordinator.
+    ///
+    /// Pass a dedicated pulse for previews or tests; production development
+    /// sessions normally use `LiveReload.Pulse.shared`.
     public init(pulse: LiveReload.Pulse = .shared) {
         self.pulse = pulse
     }
 
+    /// Publishes a targeted refresh derived from compiler reload hints.
+    ///
+    /// Observe-only actions are ignored. Changed nominal type identities are
+    /// matched against active boundaries, and the returned report identifies
+    /// missing boundaries instead of silently claiming success.
+    ///
+    /// - Parameters:
+    ///   - context: Metadata for the generation that is already active.
+    ///   - hints: Compiler-produced reload policies and target identities.
     public func reload(
         context: LiveReload.Context,
         hints: [DevProtocol.ReloadHint]
@@ -109,6 +136,10 @@ public final class Coordinator {
         }
     }
 
+    /// Publishes a catch-all refresh to every active SwiftUI boundary.
+    ///
+    /// The supplied context is copied with its reason changed to `.manual`, so
+    /// repeated manual refreshes of the same active generation remain valid.
     public func manualReload(
         context: LiveReload.Context
     ) -> SwiftUIReload.Report {

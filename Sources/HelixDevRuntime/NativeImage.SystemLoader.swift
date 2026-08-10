@@ -6,14 +6,25 @@ import HelixDevProtocol
 import Darwin
 #endif
 
+/// Development-only loading support for signed Swift replacement images.
 public enum NativeImage {}
 
 extension NativeImage {
+/// Retained ownership record for one mapped native replacement generation.
+///
+/// Helix intentionally keeps the dynamic-loader handle alive until process exit:
+/// Swift frames, metadata, closures, and witness tables may retain addresses in
+/// an older generation even after a newer implementation becomes active.
 public final class LoadedImage: @unchecked Sendable {
+    /// Generation registered by the image.
     public let generationID: DevProtocol.GenerationID
+    /// Private App-container URL from which dyld mapped the image.
     public let fileURL: URL
+    /// Mapped artifact size used for session budgeting.
     public let byteCount: Int
+    /// Mach-O metadata captured during preflight.
     public let descriptor: MachO.Descriptor
+    /// Number of Dynamic Replacement roots registered by the image entry point.
     public let registeredRootCount: UInt32
     let handle: UnsafeMutableRawPointer
 
@@ -37,12 +48,21 @@ public final class LoadedImage: @unchecked Sendable {
     // tables can retain addresses in a prior generation until process exit.
 }
 
+/// Native image preflight, persistence, and dynamic-loader failures.
 public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
+    /// Mach-O structure, platform, architecture, signing, UUID, or dependencies failed preflight.
     case invalidImage(String)
+    /// The image could not be persisted safely in the private cache.
     case writeFailed(String)
+    /// `dlopen` rejected the preflighted image before registration.
     case dynamicLoaderRejected(String)
+    /// The image was mapped but its generated registration root did not complete.
+    ///
+    /// Further native injection is unsafe because mapped Swift state cannot be
+    /// rolled back; the App must restart.
     case stateUncertain(String)
 
+    /// Human-readable native image failure detail.
     public var description: String {
         switch self {
         case let .invalidImage(reason): "native image preflight failed: \(reason)"
@@ -53,7 +73,9 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     }
 }
 
+/// Abstraction over native image loading, primarily for deterministic tests.
 public protocol Loading: Sendable {
+    /// Preflights, persists, maps, and registers one offered native generation.
     func load(
         bytes: Data,
         offer: DevProtocol.PatchOffer,
@@ -62,9 +84,19 @@ public protocol Loading: Sendable {
     ) throws -> NativeImage.LoadedImage
 }
 
+/// System implementation backed by Mach-O inspection, `dlopen`, and `dlsym`.
+///
+/// This loader is development-only and relies on a correctly signed image built
+/// for the exact process identity. Production hot patches use HLBC instead.
 public struct SystemLoader: NativeImage.Loading {
+    /// Creates a stateless system loader.
     public init() {}
 
+    /// Loads and registers a complete native payload.
+    ///
+    /// The image UUID, signing presence, architecture, platform, install name,
+    /// dependencies, and registration count are checked against the authenticated
+    /// offer before a ``LoadedImage`` is returned.
     public func load(
         bytes: Data,
         offer: DevProtocol.PatchOffer,

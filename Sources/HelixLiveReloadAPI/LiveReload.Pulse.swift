@@ -4,6 +4,7 @@ import Foundation
 import SwiftUI
 
 extension LiveReload {
+/// How a SwiftUI boundary responds to a matching Live Reload generation.
 public enum SwiftUIRefreshMode: String, Codable, Hashable, Sendable {
     /// Re-evaluates the existing identity tree and preserves local @State.
     case invalidateBody
@@ -11,13 +12,23 @@ public enum SwiftUIRefreshMode: String, Codable, Hashable, Sendable {
     case recreateSubtree
 }
 
+/// Publishes targeted generation changes to active SwiftUI boundaries.
+///
+/// Applications normally use ``SwiftUIBoundary`` or
+/// `View/liveReloadBoundary(for:mode:pulse:)` instead of registering boundaries
+/// directly. A custom host may inspect ``snapshot`` or call ``advance(_:affectedNominalTypes:)``.
 @MainActor
 public final class Pulse: ObservableObject {
+    /// The latest SwiftUI reload event published by a pulse.
     public struct Snapshot: Hashable, Sendable {
+        /// A monotonically increasing presentation sequence.
         public let sequence: UInt64
+        /// The generation associated with the sequence, if one has been published.
         public let context: LiveReload.Context?
+        /// Nominal type identities affected by the generation.
         public let affectedNominalTypes: Set<LiveReload.NominalTypeID>
 
+        /// Creates a pulse snapshot.
         public init(
             sequence: UInt64 = 0,
             context: LiveReload.Context? = nil,
@@ -29,18 +40,25 @@ public final class Pulse: ObservableObject {
         }
     }
 
+    /// An opaque registration token used to unregister a boundary.
     public struct BoundaryToken: Hashable, Sendable {
         fileprivate let rawValue: UUID
     }
 
+    /// The result of publishing a context to active SwiftUI boundaries.
     public struct AdvanceResult: Hashable, Sendable {
+        /// Whether a new snapshot was published.
         public let didPublish: Bool
+        /// The number of active boundary registrations that matched.
         public let matchedBoundaryCount: Int
+        /// The resulting pulse sequence.
         public let sequence: UInt64
     }
 
+    /// An observable sequence scoped to one boundary identity.
     @MainActor
     public final class Signal: ObservableObject {
+        /// The latest matching pulse sequence.
         @Published public fileprivate(set) var sequence: UInt64 = 0
 
         fileprivate func advance(to sequence: UInt64) {
@@ -48,8 +66,10 @@ public final class Pulse: ObservableObject {
         }
     }
 
+    /// The process-wide pulse used by default SwiftUI integration.
     public static let shared = LiveReload.Pulse()
 
+    /// The most recently published reload snapshot.
     @Published public private(set) var snapshot = Snapshot()
 
     private enum SignalKey: Hashable {
@@ -65,8 +85,15 @@ public final class Pulse: ObservableObject {
     private var signals: [SignalKey: LiveReload.Pulse.Signal] = [:]
     private var registrations: [LiveReload.Pulse.BoundaryToken: Registration] = [:]
 
+    /// Creates an isolated pulse, typically for previews or tests.
     public init() {}
 
+    /// Registers an active SwiftUI reload boundary.
+    ///
+    /// - Parameters:
+    ///   - nominalTypeID: A target type, or `nil` for a catch-all boundary.
+    ///   - mode: Whether matching reloads preserve or recreate subtree identity.
+    /// - Returns: A token that must be passed to ``unregisterBoundary(_:)``.
     @discardableResult
     public func registerBoundary(
         for nominalTypeID: LiveReload.NominalTypeID? = nil,
@@ -79,12 +106,15 @@ public final class Pulse: ObservableObject {
         return token
     }
 
+    /// Removes a previously registered boundary.
     public func unregisterBoundary(_ token: LiveReload.Pulse.BoundaryToken) {
         registrations.removeValue(forKey: token)
     }
 
+    /// The number of currently registered SwiftUI boundaries.
     public var activeBoundaryCount: Int { registrations.count }
 
+    /// Type-specific identities represented by active boundaries.
     public var registeredTypeIDs: Set<LiveReload.NominalTypeID> {
         Set(registrations.values.compactMap {
             guard case let .type(id) = $0.key else { return nil }
@@ -92,14 +122,17 @@ public final class Pulse: ObservableObject {
         })
     }
 
+    /// Whether an active boundary accepts every affected type.
     public var hasCatchAllBoundary: Bool {
         registrations.values.contains { $0.key == .all }
     }
 
+    /// Returns whether a type-specific or catch-all boundary can refresh `id`.
     public func containsBoundary(for id: LiveReload.NominalTypeID) -> Bool {
         hasCatchAllBoundary || registeredTypeIDs.contains(id)
     }
 
+    /// Counts registrations that would receive the supplied affected types.
     public func matchingBoundaryCount(
         affectedNominalTypes: Set<LiveReload.NominalTypeID>
     ) -> Int {
@@ -113,10 +146,21 @@ public final class Pulse: ObservableObject {
         }
     }
 
+    /// Returns the latest matching sequence for a boundary identity.
     public func refreshSequence(for nominalTypeID: LiveReload.NominalTypeID?) -> UInt64 {
         signals[key(for: nominalTypeID)]?.sequence ?? 0
     }
 
+    /// Publishes an activated generation to matching SwiftUI boundaries.
+    ///
+    /// Duplicate automatic publication of the same context is idempotent.
+    /// Reusing a generation ID for different metadata or moving backwards is
+    /// rejected.
+    ///
+    /// - Parameters:
+    ///   - context: The generation that is already active.
+    ///   - affectedNominalTypes: Types changed by the transaction. An empty set
+    ///     matches every boundary.
     @discardableResult
     public func advance(
         _ context: LiveReload.Context,
@@ -198,6 +242,9 @@ public final class Pulse: ObservableObject {
     }
 }
 
+/// A SwiftUI view that subscribes a subtree to Helix Live Reload pulses.
+///
+/// Prefer `View/liveReloadBoundary(for:mode:pulse:)` for normal composition.
 public struct SwiftUIBoundary<Content: View>: View {
     private let pulse: LiveReload.Pulse
     private let nominalTypeID: LiveReload.NominalTypeID?
@@ -207,6 +254,13 @@ public struct SwiftUIBoundary<Content: View>: View {
     @ObservedObject private var signal: LiveReload.Pulse.Signal
     @SwiftUI.State private var registrationToken: LiveReload.Pulse.BoundaryToken?
 
+    /// Creates a reload boundary around `content`.
+    ///
+    /// - Parameters:
+    ///   - pulse: The pulse that publishes activated generations.
+    ///   - nominalTypeID: A target type, or `nil` to receive every pulse.
+    ///   - mode: Whether local SwiftUI state is preserved or reset.
+    ///   - content: The subtree protected by the boundary.
     @MainActor
     public init(
         pulse: LiveReload.Pulse = .shared,
@@ -222,6 +276,7 @@ public struct SwiftUIBoundary<Content: View>: View {
         _registrationToken = SwiftUI.State(initialValue: nil)
     }
 
+    /// SwiftUI subtree whose identity or body invalidation follows matching pulses.
     public var body: some View {
         renderedContent
             .onAppear {
@@ -251,6 +306,20 @@ public struct SwiftUIBoundary<Content: View>: View {
 }
 
 public extension View {
+    /// Subscribes this SwiftUI subtree to Helix Live Reload.
+    ///
+    /// ```swift
+    /// ProfileScreen()
+    ///     .liveReloadBoundary(
+    ///         for: .derive(
+    ///             module: "ProfileFeature",
+    ///             canonicalName: "ProfileFeature.ProfileScreen"
+    ///         )
+    ///     )
+    /// ```
+    ///
+    /// Use `.invalidateBody` to preserve local `@State`. Select
+    /// `.recreateSubtree` only when the edit requires fresh subtree identity.
     @MainActor
     func liveReloadBoundary(
         for nominalTypeID: LiveReload.NominalTypeID? = nil,

@@ -13,14 +13,22 @@ extension DevRuntime {
 /// Frozen values that are known before the final application executable is
 /// linked. The executable UUID and process-local fields are measured at launch.
 public struct BuildContract: Hashable, Sendable {
+    /// Bundle identifier expected by the development Shell.
     public var bundleID: String
+    /// Apple platform for which the Feature and Bridge were built.
     public var platform: DevProtocol.ApplePlatform
+    /// Target architecture.
     public var architecture: String
+    /// Xcode build identifier used for compilation.
     public var xcodeBuild: String
+    /// Canonical Swift compiler fingerprint.
     public var swiftCompilerFingerprint: String
+    /// Hash of the Reload Index installed in the App.
     public var liveReloadIndexHash: Core.Digest
+    /// Runtime image ABI identity expected by this framework build.
     public var runtimeImageIdentity: Core.RuntimeImageIdentity
 
+    /// Creates and validates an explicit development build contract.
     public init(
         bundleID: String,
         platform: DevProtocol.ApplePlatform,
@@ -40,6 +48,7 @@ public struct BuildContract: Hashable, Sendable {
         try validate()
     }
 
+    /// Creates a contract from the hidden Bridge linked into the App.
     public init(bridge descriptor: Runtime.BridgeDescriptor) throws {
         try descriptor.validate()
         let platform: DevProtocol.ApplePlatform
@@ -59,6 +68,7 @@ public struct BuildContract: Hashable, Sendable {
         )
     }
 
+    /// Validates required build identities before opening a Dev connection.
     public func validate() throws {
         guard [bundleID, architecture, xcodeBuild, swiftCompilerFingerprint].allSatisfy({
                   !$0.isEmpty && $0.utf8.count <= 4_096
@@ -73,13 +83,20 @@ public struct BuildContract: Hashable, Sendable {
 /// Process facts measured by the App rather than accepted from launch
 /// variables. Keeping these separate makes stale-install checks testable.
 public struct ProcessIdentity: Hashable, Sendable {
+    /// Bundle identifier measured from the running App.
     public var bundleID: String
+    /// Mach-O UUID measured from the running executable.
     public var executableUUID: UUID
+    /// Current process identifier.
     public var processID: Int32
+    /// Running Apple platform.
     public var platform: DevProtocol.ApplePlatform
+    /// Running process architecture.
     public var architecture: String
+    /// Operating-system build string reported by the process.
     public var operatingSystemBuild: String
 
+    /// Creates and validates an explicit process identity.
     public init(
         bundleID: String,
         executableUUID: UUID,
@@ -97,6 +114,7 @@ public struct ProcessIdentity: Hashable, Sendable {
         try validate()
     }
 
+    /// Validates required process facts.
     public func validate() throws {
         guard !bundleID.isEmpty, bundleID.utf8.count <= 4_096,
               !executableUUID.isHelixZero,
@@ -108,6 +126,9 @@ public struct ProcessIdentity: Hashable, Sendable {
         }
     }
 
+    /// Measures identity from the running App bundle and executable.
+    ///
+    /// This method is used automatically by ``Bootstrap``.
     public static func current(
         bundle: Bundle = .main,
         fileManager: FileManager = .default
@@ -195,9 +216,16 @@ public struct ProcessIdentity: Hashable, Sendable {
     #endif
 }
 
+/// Combines trusted build metadata with measured process facts for authentication.
 public struct IdentityFactory: Sendable {
+    /// Creates a stateless identity factory.
     public init() {}
 
+    /// Validates all inputs and creates the session identity advertised to the daemon.
+    ///
+    /// Build and process bundle, platform, and architecture values must match.
+    /// The runtime image identity must also prove that exactly one compatible
+    /// Helix aggregate product is linked into this configuration.
     public func make(
         connection: DevConnection.Configuration,
         build: DevRuntime.BuildContract,
@@ -240,19 +268,32 @@ public struct IdentityFactory: Sendable {
     }
 }
 
+/// Fail-closed setup errors raised before a development connection starts.
 public enum BootstrapError: Swift.Error, Equatable, Sendable, CustomStringConvertible {
+    /// Required generated or frozen build metadata is malformed.
     case invalidBuildContract
+    /// Measured process facts are missing or malformed.
     case invalidProcessIdentity
+    /// The running executable cannot be located or read.
     case executableUnavailable
+    /// Mach-O inspection of the running executable failed.
     case executableInspectionFailed(String)
+    /// The running executable has no `LC_UUID` identity.
     case executableUUIDMissing
+    /// A named frozen build field does not match the running process.
     case buildMismatch(String)
+    /// Runtime and generated Shell compatibility identities differ.
     case runtimeShellMismatch
+    /// No generated Bridge provider is linked and installed.
     case bridgeNotInstalled
+    /// A generation was already active before a fresh Dev Runtime bootstrap.
     case runtimeAlreadyActive
+    /// A private local cache directory could not be established.
     case cacheDirectoryUnavailable
+    /// More than one incompatible Helix runtime image is linked into the process.
     case duplicateRuntimeImages
 
+    /// Human-readable bootstrap failure detail.
     public var description: String {
         switch self {
         case .invalidBuildContract:
@@ -284,17 +325,41 @@ public enum BootstrapError: Swift.Error, Equatable, Sendable, CustomStringConver
 
 #if canImport(Network) && canImport(Security)
 extension DevRuntime {
+/// Owns one authenticated development connection and activation pipeline.
+///
+/// Applications normally retain `DevRuntime.ApplicationSession` rather than
+/// constructing a bootstrap directly.
 public final class Bootstrap: @unchecked Sendable {
+    /// Product and safety options for a development session.
     public struct Options: Hashable, Sendable {
+        /// Whether Dev Runtime startup is allowed at all.
         public var isEnabled: Bool
+        /// Backends this App build is prepared to activate.
         public var supportedBackends: [LiveReload.Backend]
+        /// Whether Dynamic Replacement chaining passed this product's device matrix.
         public var nativeChainingProbePassed: Bool
+        /// Optional override for the HLBC Runtime policy.
         public var runtimePolicy: Core.RuntimePolicy?
+        /// Limits on temporary native images, generations, and cached artifacts.
         public var activationLimits: DevActivation.Limits
+        /// Retry and backoff behavior for transient Dev connection failures.
         public var reconnectPolicy: DevConnection.ReconnectPolicy
+        /// Ping, timeout, and clock-skew rules for the authenticated session.
         public var liveness: DevProtocol.LivenessConfiguration
+        /// Optional private cache root. The default is scoped by session ID.
         public var cacheDirectory: URL?
 
+        /// Creates development-session options.
+        ///
+        /// ```swift
+        /// let options = DevRuntime.Bootstrap.Options(
+        ///     supportedBackends: [.nativeDynamicReplacement, .hlbc],
+        ///     nativeChainingProbePassed: true
+        /// )
+        /// ```
+        ///
+        /// Native Dynamic Replacement is rejected unless
+        /// `nativeChainingProbePassed` is explicitly true.
         public init(
             isEnabled: Bool = _isDebugAssertConfiguration(),
             supportedBackends: [LiveReload.Backend] = [.hlbc],
@@ -316,12 +381,19 @@ public final class Bootstrap: @unchecked Sendable {
         }
     }
 
+    /// Callbacks that connect activation to product diagnostics and UI refresh.
     public struct Handlers: Sendable {
+        /// Receives authenticated connection lifecycle events.
         public var connectionEvent: DevConnection.Client.EventHandler
+        /// Refreshes UI after a generation is active.
         public var activationReload: DevActivation.Controller.ReloadHandler
+        /// Handles a developer-initiated refresh request.
         public var manualReload: DevRuntimeSession.Controller.ManualReloadHandler
+        /// Runs once after the bootstrap has fully stopped.
         public var stopped: @Sendable () async -> Void
 
+        /// Creates handler callbacks. Defaults keep the transport functional but
+        /// do not claim that UI was refreshed.
         public init(
             connectionEvent: @escaping DevConnection.Client.EventHandler = { _ in },
             activationReload: @escaping DevActivation.Controller.ReloadHandler = {
@@ -339,8 +411,11 @@ public final class Bootstrap: @unchecked Sendable {
         }
     }
 
+    /// Immutable identity advertised to the paired Mac daemon.
     public let identity: DevProtocol.SessionIdentity
+    /// Controller that verifies and activates temporary generations.
     public let activation: DevActivation.Controller
+    /// Private directory used for native images and session artifacts.
     public let cacheDirectory: URL
 
     private let client: DevConnection.Client
@@ -373,6 +448,9 @@ public final class Bootstrap: @unchecked Sendable {
 
     /// Starts only when explicitly enabled and a complete launch environment
     /// is present. Optimized builds are disabled by default.
+    ///
+    /// - Returns: A running bootstrap, or `nil` when disabled or when no Helix
+    ///   launch variables are present.
     public static func startIfConfigured(
         build: DevRuntime.BuildContract,
         runtime: Runtime.Engine,
@@ -397,6 +475,7 @@ public final class Bootstrap: @unchecked Sendable {
         )
     }
 
+    /// Idempotently stops transport, activation work, and the stopped callback.
     public func stop() async {
         let shouldStop = stopLock.withLock {
             guard !hasStopped else { return false }
@@ -502,6 +581,17 @@ public final class Bootstrap: @unchecked Sendable {
 
 #if canImport(UIKit) && canImport(SwiftUI)
 extension DevRuntime.Bootstrap {
+/// Starts a configured development session and wires the standard UI environment.
+///
+/// The environment supplies status reduction, automatic UIKit/SwiftUI refresh,
+/// and the optional debug overlay. The overlay starts only when launch variables
+/// produce a real bootstrap and is stopped with the session.
+///
+/// Applications normally use `DevRuntime.ApplicationSession`; this overload is
+/// available for custom ownership while retaining the standard UI integration.
+///
+/// - Returns: A running bootstrap, or `nil` when development runtime is disabled
+///   or no Helix launch variables are present.
 @MainActor
 public static func startIfConfigured(
     build: DevRuntime.BuildContract,

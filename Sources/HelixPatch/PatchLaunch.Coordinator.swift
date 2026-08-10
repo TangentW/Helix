@@ -2,30 +2,48 @@ import Foundation
 import HelixCore
 import HelixRuntime
 
+/// Launch-time restoration, crash-loop rollback, and health confirmation.
 public enum PatchLaunch {}
 
 extension PatchLaunch {
+/// Stable category for a launch-recovery issue.
 public enum RecoveryIssueCode: String, Hashable, Sendable {
+    /// The active-state file was corrupt and had to be discarded.
     case activationStateReset
+    /// The crash-guard journal was corrupt and had to be recreated.
     case crashGuardJournalReset
+    /// A failed package could not be fully recorded as contained.
     case containmentPersistenceFailed
+    /// The committed generation could not be restored at launch.
     case launchRestoreFailed
+    /// The fallback generation could not be restored after rollback.
     case fallbackRestoreFailed
+    /// Anti-rollback state was corrupt and had to be recreated.
     case rollbackStateReset
 }
 
+/// A non-fatal recovery problem surfaced to application telemetry.
 public struct RecoveryIssue: Hashable, Sendable {
+    /// Stable machine-readable category.
     public var code: PatchLaunch.RecoveryIssueCode
+    /// Human-readable failure detail.
     public var detail: String
 }
 
+/// Result of restoring and protecting patch state during App launch.
 public struct Result: Sendable {
+    /// Nonce that must be supplied when marking this launch healthy.
     public var sessionNonce: UUID
+    /// Generation active after launch recovery.
     public var activeGenerationID: Runtime.GenerationID?
+    /// Interrupted activation recovered from the write-ahead log, if any.
     public var interruptedActivation: PatchStore.Recovery?
+    /// Generation rolled back by crash protection, if any.
     public var crashGuardRollbackGenerationID: Runtime.GenerationID?
+    /// Contained recovery issues that did not make startup fail closed.
     public var recoveryIssues: [PatchLaunch.RecoveryIssue]
 
+    /// Combined recovery detail, retained for source compatibility.
     public var restoreFailure: String? {
         guard !recoveryIssues.isEmpty else { return nil }
         return recoveryIssues
@@ -34,10 +52,16 @@ public struct Result: Sendable {
     }
 }
 
+/// Advanced coordinator for launch restoration and crash protection.
+///
+/// ``PatchRuntime/ApplicationSession`` invokes this automatically.
 public final class Coordinator: @unchecked Sendable {
+    /// Package activation controller used to restore committed state.
     public let activation: PatchActivation.Controller
+    /// Crash journal guard used to detect unhealthy launch loops.
     public let crashGuard: CrashProtection.Guard
 
+    /// Creates an explicitly assembled launch coordinator.
     public init(
         activation: PatchActivation.Controller,
         crashGuard: CrashProtection.Guard
@@ -47,6 +71,7 @@ public final class Coordinator: @unchecked Sendable {
         self.crashGuard = crashGuard
     }
 
+    /// Recovers interrupted transactions, applies crash policy, and restores active code.
     public func prepareLaunch(nowUnixSeconds: Int64) throws -> PatchLaunch.Result {
         var issues: [PatchLaunch.RecoveryIssue] = []
         var interrupted: PatchStore.Recovery?
@@ -208,6 +233,7 @@ public final class Coordinator: @unchecked Sendable {
         )
     }
 
+    /// Marks the current launch healthy after checking its nonce.
     public func markHealthy(sessionNonce: UUID, nowUnixSeconds: Int64) throws {
         try crashGuard.markHealthy(
             sessionNonce: sessionNonce,

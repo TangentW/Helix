@@ -7,12 +7,22 @@ extension PatchDownload {
 /// control-plane-independent integrations. Bytes still pass through the same
 /// streaming receiver, hash checks, verifier, store, and activation WAL.
 public struct LocalFileTransport: Sendable {
+    /// Number of bytes read and appended per streaming iteration.
     public var chunkByteCount: Int
 
+    /// Creates a local transport with a bounded chunk size.
     public init(chunkByteCount: Int = 64 * 1_024) {
         self.chunkByteCount = chunkByteCount
     }
 
+    /// Streams a regular, non-symbolic-link file into a Patch Store transaction.
+    ///
+    /// - Parameters:
+    ///   - sourceURL: Private local package file.
+    ///   - store: Store that owns the incoming transaction.
+    ///   - expectedSHA256: Optional digest supplied by the download control plane.
+    ///   - maximumPackageBytes: Hard package-size ceiling.
+    /// - Returns: A finalized artifact ready for activation.
     public func receive(
         from sourceURL: URL,
         into store: PatchStore.Storage,

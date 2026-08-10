@@ -3,8 +3,23 @@ import Foundation
 extension LiveReload {
 /// Debug-oriented side storage for values that cannot be added to an already
 /// instantiated Swift object's frozen layout.
+///
+/// Native Live Reload can replace method bodies but cannot change the stored
+/// layout of an existing object. Use `DevState` for temporary development-only
+/// state introduced while iterating, then move the property into the real type
+/// on the next normal build.
+///
+/// ```swift
+/// extension ProfileViewController {
+///     var previewCount: Int {
+///         get { LiveReload.DevState.shared[self, key: "previewCount", default: 0] }
+///         set { LiveReload.DevState.shared[self, key: "previewCount", default: 0] = newValue }
+///     }
+/// }
+/// ```
 @MainActor
 public final class DevState {
+    /// The process-wide development side store.
     public static let shared = LiveReload.DevState()
 
     private final class OwnerReference {
@@ -22,8 +37,13 @@ public final class DevState {
 
     private var buckets: [ObjectIdentifier: Bucket] = [:]
 
+    /// Creates an independent side store, primarily for tests or isolation.
     public init() {}
 
+    /// Reads or writes a value associated with an object and static key.
+    ///
+    /// The default value is created lazily. Entries are removed after their
+    /// weakly held owner is released.
     public subscript<Value>(
         _ owner: AnyObject,
         key key: StaticString,
@@ -57,10 +77,12 @@ public final class DevState {
         }
     }
 
+    /// Removes every development value associated with `owner` immediately.
     public func removeAllValues(for owner: AnyObject) {
         buckets.removeValue(forKey: ObjectIdentifier(owner))
     }
 
+    /// The number of still-live owners with side-storage buckets.
     public var liveOwnerCount: Int {
         removeReleasedOwners()
         return buckets.count

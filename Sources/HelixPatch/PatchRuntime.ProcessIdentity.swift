@@ -2,14 +2,29 @@ import Foundation
 import HelixCore
 
 extension PatchRuntime {
+/// Security-relevant facts measured from the running App process.
+///
+/// Helix combines this value with the installation ID and compares the result
+/// with ``BuildContract`` and each package target, preventing a patch compiled
+/// for a different installation, executable, architecture, or OS from activating.
 public struct ProcessIdentity: Hashable, Sendable {
+    /// Bundle identifier read from the running bundle.
     public var bundleID: String
+    /// `CFBundleShortVersionString` read from the running bundle.
     public var marketingVersion: String
+    /// `LC_UUID` measured from the current App executable.
     public var executableUUID: UUID
+    /// Runtime architecture, currently `arm64` or `x86_64`.
     public var architecture: String
+    /// Whether this is an iOS device or Simulator process.
     public var platform: PatchPackage.Platform
+    /// Operating-system version reported by the process.
     public var operatingSystemVersion: Core.SemanticVersion
 
+    /// Creates and validates an explicit process identity.
+    ///
+    /// This initializer is primarily useful in tests. Production code should
+    /// use ``current(bundle:)``.
     public init(
         bundleID: String,
         marketingVersion: String,
@@ -27,6 +42,7 @@ public struct ProcessIdentity: Hashable, Sendable {
         try validate()
     }
 
+    /// Validates required values and supported architecture constraints.
     public func validate() throws {
         guard !bundleID.isEmpty, bundleID.utf8.count <= 4_096,
               !marketingVersion.isEmpty, marketingVersion.utf8.count <= 256,
@@ -40,6 +56,15 @@ public struct ProcessIdentity: Hashable, Sendable {
         }
     }
 
+    /// Measures identity from an iOS App bundle and its Mach-O executable.
+    ///
+    /// ```swift
+    /// let identity = try PatchRuntime.ProcessIdentity.current()
+    /// ```
+    ///
+    /// - Parameter bundle: The application bundle to inspect. Defaults to main.
+    /// - Throws: ``PatchRuntime/Error/invalidProcessIdentity(_:)`` when metadata
+    ///   is missing, the platform is unsupported, or `LC_UUID` is malformed.
     public static func current(bundle: Bundle = .main) throws -> Self {
         #if os(iOS)
         #if targetEnvironment(macCatalyst)

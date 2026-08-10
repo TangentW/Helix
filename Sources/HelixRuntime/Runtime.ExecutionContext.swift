@@ -3,7 +3,12 @@ import HelixCore
 import HelixVM
 
 extension Runtime {
+/// Internal invocation scope that pins one immutable generation across nested calls.
+///
+/// Runtime exposes the pinned lease for diagnostics, but applications do not
+/// construct or retain execution contexts directly.
 public final class ExecutionContext: @unchecked Sendable {
+    /// Lease retaining the generation selected at the root call boundary.
     public let lease: Runtime.GenerationLease
     private let lock = NSLock()
     private var budgetStorage: VM.InvocationBudget?

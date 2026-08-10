@@ -3,13 +3,20 @@ import Foundation
 import HelixCore
 
 extension PatchPackage {
+/// Hard ceilings applied before untrusted container fields are allocated.
 public struct DecodingLimits: Sendable, Hashable {
+    /// Maximum bytes in the complete `.hlxp`.
     public var maximumPackageBytes: Int
+    /// Maximum canonical manifest bytes.
     public var maximumManifestBytes: Int
+    /// Maximum canonical signature-envelope bytes.
     public var maximumSignatureBytes: Int
+    /// Maximum number of payload files.
     public var maximumPayloadCount: Int
+    /// Maximum bytes in any single payload.
     public var maximumPayloadBytes: Int
 
+    /// Creates decode limits. Defaults are suitable for ordinary HLBC packages.
     public init(
         maximumPackageBytes: Int = 64 * 1_024 * 1_024,
         maximumManifestBytes: Int = 2 * 1_024 * 1_024,
@@ -25,14 +32,24 @@ public struct DecodingLimits: Sendable, Hashable {
     }
 }
 
+/// The decoded contents of one signed `.hlxp` container.
+///
+/// Use ``signed(manifest:payloads:signer:)`` on trusted build infrastructure
+/// and ``decode(_:limits:)`` only as part of a verification pipeline.
 public struct Container: Sendable {
+    /// Binary file magic for `.hlxp` containers.
     public static let magic = Data([0x48, 0x4c, 0x58, 0x50, 0x00, 0x0d, 0x0a, 0x1a])
+    /// Binary framing version emitted by this framework.
     public static let containerVersion: UInt16 = 1
 
+    /// Canonical signed manifest.
     public var manifest: PatchPackage.Manifest
+    /// Payload bytes keyed by safe relative path.
     public var payloads: [String: Data]
+    /// Certificate and signature covering manifest and payload identities.
     public var signatureEnvelope: PatchPackage.SignatureEnvelope
 
+    /// Creates an in-memory container. This does not verify or sign its fields.
     public init(
         manifest: PatchPackage.Manifest,
         payloads: [String: Data],
@@ -43,6 +60,16 @@ public struct Container: Sendable {
         self.signatureEnvelope = signatureEnvelope
     }
 
+    /// Validates and signs a manifest and its exact payload bytes.
+    ///
+    /// ```swift
+    /// let package = try PatchPackage.Container.signed(
+    ///     manifest: manifest,
+    ///     payloads: ["Patch.hlbc": bytecode],
+    ///     signer: signer
+    /// )
+    /// let bytes = try package.encoded()
+    /// ```
     public static func signed(
         manifest: PatchPackage.Manifest,
         payloads: [String: Data],
@@ -77,6 +104,7 @@ public struct Container: Sendable {
         return .init(manifest: manifest, payloads: payloads, signatureEnvelope: envelope)
     }
 
+    /// Encodes this container using canonical manifest and envelope JSON.
     public func encoded() throws -> Data {
         try manifest.validateStructure()
         try verifyPayloadDescriptors()
@@ -117,6 +145,11 @@ public struct Container: Sendable {
         return writer.data
     }
 
+    /// Decodes an untrusted container under strict size and count limits.
+    ///
+    /// Decoding validates framing and canonical JSON but does not establish
+    /// signing trust. Pass the original bytes to ``PatchPackage/Verifier``
+    /// before activation.
     public static func decode(
         _ bytes: Data,
         limits: PatchPackage.DecodingLimits = .init()
@@ -219,6 +252,7 @@ public struct Container: Sendable {
         return package
     }
 
+    /// Confirms every manifest payload descriptor matches the in-memory bytes.
     public func verifyPayloadDescriptors() throws {
         try Self.verifyPayloadDescriptors(manifest: manifest, payloads: payloads)
     }

@@ -3,29 +3,48 @@ import Foundation
 import HelixCore
 
 extension PatchPackage {
+/// Payload execution format stored in a patch package.
 public enum Backend: String, Codable, Hashable, Sendable {
+    /// Verified Helix bytecode interpreted by the production Runtime.
     case hlbc
+    /// A controlled native image restricted to separately qualified channels.
     case controlledNative
 }
 
+/// Apple platform targeted by one manifest entry.
 public enum Platform: String, Codable, Hashable, Sendable {
+    /// A physical iOS device build.
     case iOS
+    /// An iOS Simulator build.
     case iOSSimulator
 }
 
+/// Exact Shell build that may consume a package payload.
 public struct Target: Codable, Hashable, Sendable {
+    /// Target App bundle identifier.
     public var bundleID: String
+    /// Target App marketing version.
     public var marketingVersion: String
+    /// Target App build number.
     public var buildNumber: String
+    /// Stable namespace of the target Shell.
     public var shellNamespaceID: Core.ShellNamespaceID
+    /// Mach-O UUID of the target App executable.
     public var machOUUID: UUID
+    /// Exact callable interface hash of the target Shell.
     public var shellInterfaceHash: Core.Digest
+    /// Target architecture.
     public var architecture: String
+    /// Target Apple platform.
     public var platform: PatchPackage.Platform
+    /// Oldest OS version accepted by this target.
     public var minimumOSVersion: Core.SemanticVersion
+    /// Newest OS version qualified when the package was built.
     public var maximumTestedOSVersion: Core.SemanticVersion
+    /// Runtime, bytecode, archive, and compiler compatibility facts.
     public var compatibility: Core.Compatibility
 
+    /// Creates an exact package target.
     public init(
         bundleID: String,
         marketingVersion: String,
@@ -53,17 +72,28 @@ public struct Target: Codable, Hashable, Sendable {
     }
 }
 
+/// Signed metadata for one package payload file.
 public struct PayloadDescriptor: Codable, Hashable, Sendable {
+    /// Execution backend required by the payload.
     public var backend: PatchPackage.Backend
+    /// Index into ``Manifest/targets``.
     public var targetIndex: UInt32
+    /// Safe relative path of the payload inside the container.
     public var path: String
+    /// Exact encoded payload length.
     public var byteLength: UInt64
+    /// SHA-256 of payload bytes.
     public var sha256: Core.Digest
+    /// Stable functions changed by this payload.
     public var changedFunctionKeys: [Core.FunctionKey]
+    /// Dense Shell entries routed by this payload.
     public var entryIndices: [Core.EntryIndex]
+    /// Runtime capabilities required by this payload.
     public var capabilities: Set<Core.Capability>
+    /// Execution and allocation limits requested by this payload.
     public var quotas: Core.ResourceLimits
 
+    /// Creates a signed payload descriptor.
     public init(
         backend: PatchPackage.Backend,
         targetIndex: UInt32,
@@ -87,12 +117,18 @@ public struct PayloadDescriptor: Codable, Hashable, Sendable {
     }
 }
 
+/// Deterministic installation-level rollout rules for a package.
 public struct Rollout: Codable, Hashable, Sendable {
+    /// Campaign-specific salt used for cohort hashing.
     public var cohortSalt: Data
+    /// Percentage in basis points, from `0` through `10_000`.
     public var percentageBasisPoints: UInt16
+    /// Installations included regardless of percentage.
     public var installationAllowlist: Set<String>
+    /// Installations excluded regardless of percentage or allowlist.
     public var installationDenylist: Set<String>
 
+    /// Creates rollout rules.
     public init(
         cohortSalt: Data,
         percentageBasisPoints: UInt16,
@@ -105,6 +141,7 @@ public struct Rollout: Codable, Hashable, Sendable {
         self.installationDenylist = installationDenylist
     }
 
+    /// Returns whether an installation belongs to this package's rollout cohort.
     public func includes(installationID: String, packageID: String) -> Bool {
         if installationDenylist.contains(installationID) { return false }
         if installationAllowlist.contains(installationID) { return true }
@@ -119,10 +156,14 @@ public struct Rollout: Codable, Hashable, Sendable {
     }
 }
 
+/// Manifest-declared lineage and package conflicts used during rollback checks.
 public struct RollbackPlan: Codable, Hashable, Sendable {
+    /// Expected hash of the parent generation package, or `nil` for App original.
     public var parentGenerationPackageHash: Core.Digest?
+    /// Package IDs that must not coexist with this package.
     public var mutuallyExclusivePackageIDs: Set<String>
 
+    /// Creates a rollback plan.
     public init(
         parentGenerationPackageHash: Core.Digest? = nil,
         mutuallyExclusivePackageIDs: Set<String> = []
@@ -132,12 +173,18 @@ public struct RollbackPlan: Codable, Hashable, Sendable {
     }
 }
 
+/// Security counters and approval identities covered by the package signature.
 public struct Security: Codable, Hashable, Sendable {
+    /// Leaf key expected in the signature envelope.
     public var signerKeyID: String
+    /// Incident or release approval policy authorizing this package.
     public var approvalPolicyID: String
+    /// Monotonic counter scoped to the signer or campaign.
     public var antiRollbackCounter: UInt64
+    /// Monotonic epoch for emergency policy changes.
     public var emergencyPolicyEpoch: UInt64
 
+    /// Creates package security metadata.
     public init(
         signerKeyID: String,
         approvalPolicyID: String,
@@ -151,27 +198,50 @@ public struct Security: Codable, Hashable, Sendable {
     }
 }
 
+/// Canonical, signed policy and content index for one `.hlxp` package.
+///
+/// Release tooling creates manifests; shipping applications validate them and
+/// should not mutate decoded values before verification.
 public struct Manifest: Codable, Hashable, Sendable {
+    /// Manifest schema emitted by this framework version.
     public static let currentSchemaVersion: UInt16 = 1
 
+    /// Encoded manifest schema.
     public var schemaVersion: UInt16
+    /// Globally unique package identifier.
     public var packageID: String
+    /// Stable incident or rollout campaign identifier.
     public var campaignID: String
+    /// Monotonic revision within the campaign.
     public var revision: UInt64
+    /// Package creation time as Unix seconds.
     public var createdAtUnixSeconds: Int64
+    /// Earliest accepted activation time as Unix seconds.
     public var notBeforeUnixSeconds: Int64
+    /// Latest accepted activation time as Unix seconds.
     public var expiresAtUnixSeconds: Int64
+    /// Human-readable reason for the patch.
     public var purpose: String
+    /// Incident or change-management identifier.
     public var incidentID: String
+    /// Team accountable for this package.
     public var ownerTeam: String
+    /// Distribution channel under which the package is authorized.
     public var distributionPolicy: Core.DistributionPolicy
+    /// Product-owned approval identifier for the distribution policy.
     public var distributionPolicyApprovalID: String
+    /// Exact Shell builds that may consume payloads.
     public var targets: [PatchPackage.Target]
+    /// Signed payload inventory.
     public var payloads: [PatchPackage.PayloadDescriptor]
+    /// Deterministic installation rollout rules.
     public var rollout: PatchPackage.Rollout
+    /// Parent lineage and conflict rules.
     public var rollback: PatchPackage.RollbackPlan
+    /// Signer identity and anti-rollback counters.
     public var security: PatchPackage.Security
 
+    /// Creates a manifest value. Call ``validateStructure()`` before signing.
     public init(
         schemaVersion: UInt16 = Self.currentSchemaVersion,
         packageID: String,
@@ -210,6 +280,10 @@ public struct Manifest: Codable, Hashable, Sendable {
         self.security = security
     }
 
+    /// Validates canonical ordering, uniqueness, bounds, paths, and policy fields.
+    ///
+    /// Cryptographic trust and process target matching are performed later by
+    /// ``PatchPackage/Verifier``.
     public func validateStructure() throws {
         guard schemaVersion == Self.currentSchemaVersion else {
             throw PatchPackage.Error.unsupportedSchema(schemaVersion)
@@ -289,40 +363,74 @@ public struct Manifest: Codable, Hashable, Sendable {
     }
 }
 
+/// Fail-closed package decoding, trust, policy, and activation errors.
 public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
+    /// The manifest or container schema is not supported by this Runtime.
     case unsupportedSchema(UInt16)
+    /// A manifest invariant failed.
     case invalidManifest(String)
+    /// A payload path is absolute, traversing, malformed, or duplicated.
     case unsafePayloadPath(String)
+    /// The binary container framing is malformed.
     case malformedContainer(String)
+    /// A configured decode or allocation ceiling was exceeded.
     case limitExceeded(String)
+    /// The container encodes the same payload path more than once.
     case duplicatePayload(String)
+    /// A manifest descriptor has no corresponding payload bytes.
     case missingPayload(String)
+    /// Payload bytes do not have the signed length.
     case payloadLengthMismatch(String)
+    /// Payload bytes do not have the signed SHA-256.
     case payloadHashMismatch(String)
+    /// Manifest JSON is valid but not canonically encoded.
     case nonCanonicalManifest
+    /// Signature envelope JSON is valid but not canonically encoded.
     case nonCanonicalSignatureEnvelope
+    /// The declared signature algorithm is unknown or disabled.
     case unsupportedSignatureAlgorithm(String)
+    /// A leaf certificate names a root absent from the trust store.
     case unknownSigningRoot(String)
+    /// A signing certificate is malformed, expired, or has an invalid signature.
     case invalidSigningCertificate(String)
+    /// A snapshot names an authority absent from the trust store.
     case unknownRevocationAuthority(String)
+    /// A revocation snapshot is malformed, expired, or has an invalid signature.
     case invalidRevocationSnapshot(String)
+    /// A revocation snapshot attempts to move to an older epoch.
     case revocationEpochRollback(highestSeen: UInt64, received: UInt64)
+    /// The package was signed by a revoked root or leaf key.
     case signingKeyRevoked(String)
+    /// The complete package hash appears in trusted revocation state.
     case packageRevoked(Core.Digest)
+    /// The package hash was blocked locally after an activation failure.
     case packageLocallyBlocked(Core.Digest)
+    /// The leaf signature does not match canonical package material.
     case invalidPackageSignature
+    /// The certificate scope does not authorize this package.
     case signerScopeDenied(String)
+    /// No manifest target exactly matches the running App and Shell.
     case targetMismatch
+    /// The package validity window has not opened.
     case notYetValid
+    /// The package validity window has closed.
     case expired
+    /// The application policy rejects the package's distribution channel.
     case distributionPolicyDenied(Core.DistributionPolicy)
+    /// The application does not recognize the declared approval policy.
     case distributionApprovalMissing(String)
+    /// The current installation is outside the rollout cohort.
     case rolloutExcluded
+    /// The campaign revision would move backwards or fork an accepted revision.
     case rollbackRevision(highestSeen: UInt64, received: UInt64)
+    /// The emergency policy epoch would move backwards.
     case emergencyPolicyRollback(highestSeen: UInt64, received: UInt64)
+    /// The selected target has no applicable payload.
     case noPayloadForTarget
+    /// Runtime activation succeeded or failed but durable state could not commit.
     case activationPersistence(String)
 
+    /// A diagnostic suitable for logs and package rejection telemetry.
     public var description: String {
         switch self {
         case let .unsupportedSchema(value): "unsupported patch schema \(value)"
@@ -369,6 +477,7 @@ extension PatchPackage.PayloadDescriptor {
         case changedFunctionKeys, entryIndices, capabilities, quotas
     }
 
+    /// Decodes a payload descriptor while rejecting duplicate set members.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         backend = try container.decode(PatchPackage.Backend.self, forKey: .backend)
@@ -390,6 +499,7 @@ extension PatchPackage.PayloadDescriptor {
         quotas = try container.decode(Core.ResourceLimits.self, forKey: .quotas)
     }
 
+    /// Encodes function, entry, and capability collections deterministically.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(backend, forKey: .backend)
@@ -409,6 +519,7 @@ extension PatchPackage.Rollout {
         case cohortSalt, percentageBasisPoints, installationAllowlist, installationDenylist
     }
 
+    /// Decodes rollout membership while rejecting duplicate installation IDs.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         cohortSalt = try container.decode(Data.self, forKey: .cohortSalt)
@@ -426,6 +537,7 @@ extension PatchPackage.Rollout {
         installationDenylist = Set(denylist)
     }
 
+    /// Encodes rollout allowlists and denylists in deterministic order.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(cohortSalt, forKey: .cohortSalt)
@@ -440,6 +552,7 @@ extension PatchPackage.RollbackPlan {
         case parentGenerationPackageHash, mutuallyExclusivePackageIDs
     }
 
+    /// Decodes rollback constraints while rejecting duplicate package IDs.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         parentGenerationPackageHash = try container.decodeIfPresent(
@@ -457,6 +570,7 @@ extension PatchPackage.RollbackPlan {
         mutuallyExclusivePackageIDs = Set(packageIDs)
     }
 
+    /// Encodes mutually exclusive package IDs in deterministic order.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(parentGenerationPackageHash, forKey: .parentGenerationPackageHash)

@@ -2,19 +2,36 @@ import Foundation
 import HelixCore
 
 extension PatchPackage {
+/// Exact App and Shell identity used when selecting a package target.
+///
+/// ``PatchRuntime/ApplicationSession`` constructs this automatically. Custom
+/// control planes may log it for diagnostics but must not replace measured
+/// fields with server-provided values.
 public struct TargetContext: Sendable, Hashable {
+    /// Running App bundle identifier.
     public var bundleID: String
+    /// Running App marketing version.
     public var marketingVersion: String
+    /// Audited App build number.
     public var buildNumber: String
+    /// Stable namespace of the audited Shell.
     public var shellNamespaceID: Core.ShellNamespaceID
+    /// Mach-O UUID of the running App executable.
     public var machOUUID: UUID
+    /// Exact callable interface hash of the linked Shell.
     public var shellInterfaceHash: Core.Digest
+    /// Running process architecture.
     public var architecture: String
+    /// Running Apple platform.
     public var platform: PatchPackage.Platform
+    /// Current operating-system version.
     public var operatingSystemVersion: Core.SemanticVersion
+    /// Runtime and bytecode compatibility requirements.
     public var compatibility: Core.Compatibility
+    /// Stable installation identity used for deterministic rollout selection.
     public var installationID: String
 
+    /// Creates an explicit target context.
     public init(
         bundleID: String,
         marketingVersion: String,
@@ -42,13 +59,31 @@ public struct TargetContext: Sendable, Hashable {
     }
 }
 
+/// Product-owned policy applied after cryptographic package verification.
+///
+/// A package must satisfy every field in addition to signature, target,
+/// anti-rollback, and rollout checks.
+///
+/// ```swift
+/// let policy = PatchPackage.AcceptancePolicy(
+///     acceptedDistributionPolicies: [.internalHLBC],
+///     approvedDistributionPolicyIDs: ["incident-response-v1"]
+/// )
+/// ```
 public struct AcceptancePolicy: Sendable, Hashable {
+    /// Distribution channels this App build is willing to accept.
     public var acceptedDistributionPolicies: Set<Core.DistributionPolicy>
+    /// Approval policy identifiers recognized by the application.
     public var approvedDistributionPolicyIDs: Set<String>
+    /// Whether the App explicitly enables an App Store HLBC production channel.
     public var productionChannelEnabled: Bool
+    /// Whether OS versions above a manifest's tested maximum may proceed.
     public var allowOperatingSystemsNewerThanTested: Bool
+    /// Allowed wall-clock skew around package validity boundaries.
     public var clockSkewAllowanceSeconds: Int64
 
+    /// Creates an acceptance policy. Defaults remain conservative and do not
+    /// enable a production channel.
     public init(
         acceptedDistributionPolicies: Set<Core.DistributionPolicy> = [.internalHLBC],
         approvedDistributionPolicyIDs: Set<String> = [],
@@ -64,15 +99,24 @@ public struct AcceptancePolicy: Sendable, Hashable {
     }
 }
 
+/// Persisted monotonic state that prevents installing older package revisions.
 public struct AntiRollbackState: Codable, Hashable, Sendable {
+    /// Campaign whose revisions this state tracks.
     public var campaignID: String
+    /// Shell interface to which the state is bound.
     public var shellInterfaceHash: Core.Digest
+    /// Highest accepted manifest revision.
     public var highestSeenRevision: UInt64
+    /// Highest accepted signer anti-rollback counter.
     public var highestSeenCounter: UInt64
+    /// Hash accepted at `highestSeenRevision`, if any.
     public var highestSeenPackageHash: Core.Digest?
+    /// Highest accepted emergency policy epoch.
     public var emergencyPolicyEpoch: UInt64
+    /// Package hashes blocked by durable revocation state.
     public var revokedPackageHashes: Set<Core.Digest>
 
+    /// Creates anti-rollback state for one campaign and Shell.
     public init(
         campaignID: String,
         shellInterfaceHash: Core.Digest,
@@ -92,14 +136,22 @@ public struct AntiRollbackState: Codable, Hashable, Sendable {
     }
 }
 
+/// A package that passed signature, policy, target, rollout, and revision checks.
 public struct VerifiedPackage: Sendable {
+    /// Decoded canonical package container.
     public var package: PatchPackage.Container
+    /// Original encoded bytes whose digest was verified.
     public var encodedBytes: Data
+    /// SHA-256 of ``encodedBytes``.
     public var packageHash: Core.Digest
+    /// Index of the target selected for this process.
     public var selectedTargetIndex: UInt32
+    /// Target selected for this process.
     public var selectedTarget: PatchPackage.Target
+    /// Payload descriptors applicable to the selected target.
     public var selectedPayloads: [PatchPackage.PayloadDescriptor]
 
+    /// Returns verified payload bytes for a selected descriptor.
     public func payload(for descriptor: PatchPackage.PayloadDescriptor) throws -> Data {
         guard let payload = package.payloads[descriptor.path] else {
             throw PatchPackage.Error.missingPayload(descriptor.path)
@@ -108,13 +160,24 @@ public struct VerifiedPackage: Sendable {
     }
 }
 
+/// Performs fail-closed verification of a complete `.hlxp` package.
+///
+/// Most applications use ``PatchRuntime/ApplicationSession/install(packageBytes:nowUnixSeconds:)``.
+/// Use this type directly only when building a custom activation pipeline.
 public struct Verifier: Sendable {
+    /// Decode and allocation ceilings applied before trusting package metadata.
     public var decodingLimits: PatchPackage.DecodingLimits
 
+    /// Creates a verifier with bounded container limits.
     public init(decodingLimits: PatchPackage.DecodingLimits = .init()) {
         self.decodingLimits = decodingLimits
     }
 
+    /// Verifies a package without activating it.
+    ///
+    /// - Returns: A package narrowed to the target and payloads for this process.
+    /// - Throws: ``PatchPackage/Error`` for any cryptographic, structural,
+    ///   compatibility, rollout, time, or anti-rollback failure.
     public func verify(
         bytes: Data,
         trustStore: PatchPackage.TrustStore,
@@ -302,6 +365,7 @@ extension PatchPackage.AntiRollbackState {
         case emergencyPolicyEpoch, revokedPackageHashes
     }
 
+    /// Decodes anti-rollback state while rejecting duplicate revoked hashes.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         campaignID = try container.decode(String.self, forKey: .campaignID)
@@ -324,6 +388,7 @@ extension PatchPackage.AntiRollbackState {
         revokedPackageHashes = Set(hashes)
     }
 
+    /// Encodes revoked package hashes in deterministic order.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(campaignID, forKey: .campaignID)

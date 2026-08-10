@@ -6,13 +6,20 @@ import HelixDevProtocol
 import HelixLiveReloadAPI
 
 extension DevConnection {
+/// Bounded exponential-backoff behavior for transient connection failures.
 public struct ReconnectPolicy: Hashable, Sendable {
+    /// Maximum number of reconnects after the initial attempt.
     public var maximumAttempts: Int
+    /// Delay before the first reconnect, in nanoseconds.
     public var initialDelayNanoseconds: UInt64
+    /// Upper bound for the doubled reconnect delay, in nanoseconds.
     public var maximumDelayNanoseconds: UInt64
+    /// Bonjour discovery deadline for each attempt, in nanoseconds.
     public var discoveryTimeoutNanoseconds: UInt64
+    /// Network connection readiness deadline for each attempt, in nanoseconds.
     public var connectionTimeoutNanoseconds: UInt64
 
+    /// Creates a reconnect policy.
     public init(
         maximumAttempts: Int = 20,
         initialDelayNanoseconds: UInt64 = 250_000_000,
@@ -27,6 +34,7 @@ public struct ReconnectPolicy: Hashable, Sendable {
         self.connectionTimeoutNanoseconds = connectionTimeoutNanoseconds
     }
 
+    /// Validates attempt bounds, positive deadlines, and backoff ordering.
     public func validate() throws {
         let maximumTimeout: UInt64 = 5 * 60 * 1_000_000_000
         guard (0...10_000).contains(maximumAttempts),
@@ -41,10 +49,15 @@ public struct ReconnectPolicy: Hashable, Sendable {
     }
 }
 
+/// Lifecycle event emitted by ``Client`` for status UI and diagnostics.
 public enum ClientEvent: Sendable {
+    /// A discovery or transport attempt is starting. Attempts are one-based.
     case connecting(attempt: Int)
+    /// Event emitted by an authenticated protocol session.
     case session(DevRuntimeSession.Event)
+    /// A transient failure will be retried after the supplied delay.
     case reconnectScheduled(attempt: Int, delayNanoseconds: UInt64, reason: String)
+    /// The client was intentionally stopped.
     case stopped
 }
 
@@ -52,11 +65,16 @@ public enum ClientEvent: Sendable {
 /// and HLBC generations live in DevActivation, so a transport reconnect never
 /// rolls back already active code.
 public actor Client {
+    /// Async lifecycle callback. Keep handlers lightweight and non-blocking.
     public typealias EventHandler = @Sendable (DevConnection.ClientEvent) async -> Void
 
+    /// Validated endpoint and ephemeral launch credentials.
     public let configuration: DevConnection.Configuration
+    /// App process identity authenticated to the paired daemon.
     public let identity: DevProtocol.SessionIdentity
+    /// Retry and backoff limits used by ``run()``.
     public let reconnectPolicy: DevConnection.ReconnectPolicy
+    /// Heartbeat, inactivity, and clock-skew limits for authenticated messages.
     public let liveness: DevProtocol.LivenessConfiguration
 
     private let activation: DevActivation.Controller
@@ -68,6 +86,10 @@ public actor Client {
     private var isRunning = false
     private var isStopping = false
 
+    /// Creates a client around an existing activation controller.
+    ///
+    /// `configuration` and `identity` must refer to the same session and protocol
+    /// version. TLS pinning and frame authentication are mandatory.
     public init(
         configuration: DevConnection.Configuration,
         identity: DevProtocol.SessionIdentity,
@@ -95,6 +117,11 @@ public actor Client {
         self.manualReloadHandler = manualReloadHandler
     }
 
+    /// Runs discovery, pinned TLS, authentication, and message processing.
+    ///
+    /// The call remains suspended until the peer closes, the client is stopped,
+    /// or a terminal error occurs. Reconnectable transport failures use the
+    /// configured exponential backoff; active code is not rolled back.
     public func run() async throws {
         guard !isRunning else { throw DevConnection.Error.alreadyRunning }
         isRunning = true
@@ -180,6 +207,7 @@ public actor Client {
         }
     }
 
+    /// Idempotently cancels discovery, backoff, and the active transport.
     public func stop() async {
         guard isRunning, !isStopping else { return }
         isStopping = true

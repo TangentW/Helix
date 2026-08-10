@@ -5,19 +5,38 @@ import HelixLiveReloadAPI
 import ObjectiveC
 import UIKit
 
+/// Discovery and refresh support for displayed UIKit objects during Live Reload.
 public enum UIKitReload {}
 
 extension UIKitReload {
+/// Controls which application windows and loaded controllers participate in reload.
 public enum ResolutionScope: Sendable {
+    /// Searches only visible windows and controllers attached to a window.
     case visibleOnly
+    /// Searches every foreground-scene window and every loaded controller below it.
     case allLoaded
 }
 
+/// Type-erased factory used to recreate a view controller after code activation.
+///
+/// The closure receives the displayed instance so it can transfer constructor
+/// inputs that are not represented by ``LiveReload/StateProviding``.
 @MainActor
 public struct AnyFactory {
+    /// Stable identity referenced by the compiler-produced reload hint.
     public var id: LiveReload.FactoryID
+    /// Closure that creates a replacement for the supplied displayed controller.
     public var make: (UIViewController) throws -> UIViewController
 
+    /// Creates a type-erased recreation factory.
+    ///
+    /// ```swift
+    /// let factory = UIKitReload.AnyFactory(
+    ///     id: .init(rawValue: "profile")
+    /// ) { old in
+    ///     ProfileViewController(userID: (old as! ProfileViewController).userID)
+    /// }
+    /// ```
     public init(
         id: LiveReload.FactoryID,
         make: @escaping (UIViewController) throws -> UIViewController
@@ -27,17 +46,27 @@ public struct AnyFactory {
     }
 }
 
+/// Stores opt-in controller factories and custom container adapters.
+///
+/// Registration is needed only for `.recreate` policies or custom view-controller
+/// containers. Normal invalidate and hook-based reloads require no registry.
 @MainActor
 public final class FactoryRegistry {
     private var factories: [LiveReload.FactoryID: UIKitReload.AnyFactory] = [:]
     private var containerAdapters: [ObjectIdentifier: any LiveReload.ContainerAdapter] = [:]
 
+    /// Creates an empty registry.
     public init() {}
 
+    /// Adds or replaces a recreation factory with the same ID.
     public func register(_ factory: UIKitReload.AnyFactory) {
         factories[factory.id] = factory
     }
 
+    /// Registers replacement behavior for a custom controller container class.
+    ///
+    /// Adapters are resolved through the container's superclass chain, so one
+    /// registration can cover a family of custom containers.
     public func registerContainerAdapter(
         _ adapter: any LiveReload.ContainerAdapter,
         for containerType: UIViewController.Type
@@ -59,10 +88,13 @@ public final class FactoryRegistry {
     }
 }
 
+/// Resolves UIKit windows, controllers, and views without retaining them.
 @MainActor
 public struct InstanceResolver {
+    /// Creates a stateless resolver.
     public init() {}
 
+    /// Returns foreground-scene windows admitted by `scope`.
     public func windows(
         scope: UIKitReload.ResolutionScope
     ) -> [UIWindow] {
@@ -82,12 +114,17 @@ public struct InstanceResolver {
         }
     }
 
+    /// Returns loaded controllers reachable from foreground-scene windows.
     public func controllers(
         scope: UIKitReload.ResolutionScope
     ) -> [UIViewController] {
         controllers(in: windows(scope: scope), scope: scope)
     }
 
+    /// Returns loaded controllers reachable from the supplied windows.
+    ///
+    /// Presented controllers, standard UIKit containers, and child-controller
+    /// relationships are traversed once by object identity.
     public func controllers(
         in windows: [UIWindow],
         scope: UIKitReload.ResolutionScope
@@ -109,6 +146,10 @@ public struct InstanceResolver {
         }
     }
 
+    /// Returns a de-duplicated depth-first traversal of relevant view trees.
+    ///
+    /// Supplying `windows` also finds window-owned views that are not below a
+    /// discovered view controller.
     public func views(
         in controllers: [UIViewController],
         windows: [UIWindow] = []
@@ -156,15 +197,24 @@ public struct InstanceResolver {
     }
 }
 
+/// Outcome of resolving and refreshing UIKit instances for one generation.
 public struct Report: Sendable {
+    /// Protocol-level refresh outcome.
     public var status: DevProtocol.UIReloadStatus
+    /// Number of displayed instances matched by nominal type identity.
     public var matchedInstanceCount: Int
+    /// Number of matched instances on which an action was applied successfully.
     public var refreshedInstanceCount: Int
+    /// Type identities for which at least one displayed instance was found.
     public var matchedNominalTypeIDs: Set<LiveReload.NominalTypeID>
+    /// Planned type identities for which no displayed instance was found.
     public var unmatchedNominalTypeIDs: Set<LiveReload.NominalTypeID>
+    /// Non-fatal conditions such as disabled broad data reload.
     public var warnings: [String]
+    /// Planning, factory, state-transfer, or hook failures.
     public var errors: [String]
 
+    /// Creates a UIKit refresh report.
     public init(
         status: DevProtocol.UIReloadStatus,
         matchedInstanceCount: Int,
@@ -184,24 +234,41 @@ public struct Report: Sendable {
     }
 }
 
+/// Result of translating abstract invalidation hints into UIKit operations.
 public struct InvalidationResult: Sendable {
+    /// Whether at least one invalidation or reload operation was requested.
     public var didApply: Bool
+    /// Operations that were intentionally skipped or found no matching subview.
     public var warnings: [String]
 
+    /// Creates an invalidation result.
     public init(didApply: Bool = false, warnings: [String] = []) {
         self.didApply = didApply
         self.warnings = warnings
     }
 }
 
+/// Applies safe layout, display, constraint, and optional data invalidation.
 @MainActor
 public struct Invalidator {
+    /// Whether table and collection hints may walk descendants and call `reloadData()`.
+    ///
+    /// This is off by default because broad data-source callbacks may have side
+    /// effects. Prefer ``LiveReload/Reloadable`` for explicit refresh behavior.
     public var broadDataReloadEnabled: Bool
 
+    /// Creates an invalidator.
     public init(broadDataReloadEnabled: Bool = false) {
         self.broadDataReloadEnabled = broadDataReloadEnabled
     }
 
+    /// Applies the supplied hints to a root view.
+    ///
+    /// - Parameters:
+    ///   - view: Root of the affected view tree.
+    ///   - hints: Compiler-produced invalidation operations.
+    ///   - allowsImmediateLayout: Whether `layoutIfNeeded()` is safe now. Pass
+    ///     `false` during a view-controller transition.
     public func invalidate(
         _ view: UIView,
         hints: LiveReload.InvalidationHints,
@@ -265,16 +332,38 @@ public struct Invalidator {
     }
 }
 
+/// Finds displayed UIKit instances and applies compiler-selected reload policies.
+///
+/// Type matching uses Swift metadata rather than an application-maintained type
+/// registry. Most applications use the coordinator created by
+/// ``DevRuntime/ApplicationSession``. A direct integration can opt into broader
+/// data invalidation or register the rare factories required by `.recreate`:
+///
+/// ```swift
+/// let factories = UIKitReload.FactoryRegistry()
+/// factories.register(.init(id: .init(rawValue: "settings")) { _ in
+///     SettingsViewController()
+/// })
+/// let coordinator = UIKitReload.Coordinator(factoryRegistry: factories)
+/// ```
 @MainActor
 public final class Coordinator {
+    /// Factories and custom-container adapters used by `.recreate` actions.
     public let factoryRegistry: UIKitReload.FactoryRegistry
+    /// UIKit object graph scope searched after each activation.
     public var resolutionScope: UIKitReload.ResolutionScope
+    /// Whether table and collection hints may invoke broad `reloadData()` calls.
     public var broadDataReloadEnabled: Bool
+    /// Guard that postpones UI mutation while application-critical work is active.
     public var guardrail: LiveReload.Guard
 
     private let resolver = UIKitReload.InstanceResolver()
     private let actionResolver = UIKitReload.InstanceActionResolver()
 
+    /// Creates a UIKit reload coordinator.
+    ///
+    /// The conservative defaults inspect visible UI only and avoid broad data
+    /// source callbacks.
     public init(
         factoryRegistry: UIKitReload.FactoryRegistry = .init(),
         resolutionScope: UIKitReload.ResolutionScope = .visibleOnly,
@@ -287,6 +376,16 @@ public final class Coordinator {
         self.guardrail = guardrail
     }
 
+    /// Resolves and refreshes UIKit targets for an activated generation.
+    ///
+    /// The method waits for ``guardrail`` to become unblocked, validates and
+    /// merges hints, discovers matching controller or view instances, and then
+    /// performs `.invalidate`, `.invokeHook`, or `.recreate` actions. It never
+    /// treats an unmatched target as a successful refresh.
+    ///
+    /// - Parameters:
+    ///   - context: Metadata for code that is already active.
+    ///   - hints: Compiler-produced target identities and refresh policies.
     public func reload(
         context: LiveReload.Context,
         hints: [DevProtocol.ReloadHint]
@@ -425,6 +524,10 @@ public final class Coordinator {
         )
     }
 
+    /// Invokes ``LiveReload/Reloadable/applyLiveReload(_:)`` on visible controllers.
+    ///
+    /// Manual reload deliberately avoids inferred invalidation and controller
+    /// recreation because no compiler hint identifies a safe operation.
     public func manualReload(
         context: LiveReload.Context
     ) async -> UIKitReload.Report {
@@ -550,8 +653,11 @@ public final class Coordinator {
     }
 }
 
+/// Failures specific to UIKit controller recreation.
 public enum Error: Swift.Error, Equatable, Sendable {
+    /// Replacement was rejected while UIKit was performing a transition.
     case transitionInProgress
+    /// A custom parent container has no registered replacement adapter.
     case containerAdapterMissing
 }
 }

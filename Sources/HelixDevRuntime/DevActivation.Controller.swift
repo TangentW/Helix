@@ -7,16 +7,27 @@ import HelixLiveReloadAPI
 import HelixRuntime
 import HelixVerifier
 
+/// Validation, transfer, and activation primitives for development generations.
 public enum DevActivation {}
 
 extension DevActivation {
+/// Resource ceilings for a single development-session activation controller.
+///
+/// Native images cannot be safely unloaded from a running Swift process, so both
+/// their count and cumulative mapped bytes are bounded for the App lifetime.
 public struct Limits: Hashable, Sendable {
+    /// Maximum accepted byte length for one Native Dynamic Replacement image.
     public var maximumNativePayloadBytes: Int
+    /// Maximum accepted byte length for one HLBC payload.
     public var maximumHLBCPayloadBytes: Int
+    /// Hard limit for native images mapped during this process lifetime.
     public var maximumNativeImageCount: Int
+    /// Image count at which diagnostics recommend restarting the Dev App.
     public var nativeImageSoftWarningCount: Int
+    /// Hard limit for cumulative mapped native-image bytes.
     public var maximumNativeMappedBytes: Int
 
+    /// Creates resource ceilings with conservative development defaults.
     public init(
         maximumNativePayloadBytes: Int = 64 * 1_024 * 1_024,
         maximumHLBCPayloadBytes: Int = 16 * 1_024 * 1_024,
@@ -31,6 +42,7 @@ public struct Limits: Hashable, Sendable {
         self.maximumNativeMappedBytes = maximumNativeMappedBytes
     }
 
+    /// Validates that limits are positive and internally consistent.
     public func validate() throws {
         guard maximumNativePayloadBytes > 0,
               maximumHLBCPayloadBytes > 0,
@@ -44,10 +56,14 @@ public struct Limits: Hashable, Sendable {
     }
 }
 
+/// Invalid setup detected before a development activation session starts.
 public enum ConfigurationError: Swift.Error, Equatable, Sendable, CustomStringConvertible {
+    /// A payload, count, warning, or cumulative byte limit is inconsistent.
     case invalidLimits
+    /// The native image cache is not a non-empty local file URL.
     case invalidCacheDirectory
 
+    /// Human-readable configuration failure detail.
     public var description: String {
         switch self {
         case .invalidLimits: "Dev activation limits are inconsistent or nonpositive"
@@ -56,20 +72,37 @@ public enum ConfigurationError: Swift.Error, Equatable, Sendable, CustomStringCo
     }
 }
 
+/// Point-in-time activation and native-image resource state.
 public struct Snapshot: Hashable, Sendable {
+    /// Highest source revision accepted for transfer in this process.
     public var highestOfferedRevision: DevProtocol.SourceRevision
+    /// Highest source revision activated successfully.
     public var highestAppliedRevision: DevProtocol.SourceRevision
+    /// Generation that currently supplies active development routes.
     public var activeGenerationID: DevProtocol.GenerationID?
+    /// Total native image count, including images loaded before a reconnect.
     public var loadedNativeImageCount: Int
+    /// Total mapped native image bytes, including images loaded before reconnect.
     public var loadedNativeBytes: Int
+    /// Whether the configured soft image-count threshold has been reached.
     public var nativeImageSoftLimitReached: Bool
+    /// Whether a partially registered native image makes further injection unsafe.
     public var nativeStateUncertain: Bool
+    /// Whether an accepted payload transfer is currently open.
     public var hasPendingTransfer: Bool
+    /// Generation associated with the open transfer, if any.
     public var pendingGenerationID: DevProtocol.GenerationID?
+    /// Current backend selection for every function with an active override.
     public var activeFunctionRoutes: [DevProtocol.ActiveFunctionRoute]
 }
 
+/// Serializes development payload transfer and activation inside the App.
+///
+/// This is an advanced integration point. `DevRuntime.ApplicationSession`
+/// creates it, connects it to the authenticated transport, and supplies the UI
+/// reload handler for normal applications.
 public actor Controller {
+    /// Callback run after code is active to refresh affected presentation targets.
     public typealias ReloadHandler = @Sendable (
         LiveReload.Context,
         [DevProtocol.ReloadHint]
@@ -84,11 +117,17 @@ public actor Controller {
         var hasher: SHA256
     }
 
+    /// Immutable App and toolchain identity negotiated for this session.
     public let identity: DevProtocol.SessionIdentity
+    /// Generated Shell interface used to verify HLBC imports and exports.
     public let shell: Verification.ShellInterface
+    /// Runtime resource and execution policy used for HLBC verification.
     public let runtimePolicy: Core.RuntimePolicy
+    /// Generation registry that atomically switches HLBC dispatch routes.
     public let registry: Runtime.GenerationRegistry
+    /// Private local directory used for incoming and mapped development artifacts.
     public let cacheDirectory: URL
+    /// Resource ceilings enforced before bytes are accepted or mapped.
     public let limits: DevActivation.Limits
 
     private let nativeLoader: any NativeImage.Loading
@@ -103,6 +142,10 @@ public actor Controller {
     private var nativeStateUncertain = false
     private var activeBackendByFunction: [Core.FunctionKey: LiveReload.Backend] = [:]
 
+    /// Creates an explicitly assembled activation controller.
+    ///
+    /// - Important: `registry` must be the registry installed on the runtime
+    ///   executing instrumented calls.
     public init(
         identity: DevProtocol.SessionIdentity,
         shell: Verification.ShellInterface,
@@ -144,6 +187,11 @@ public actor Controller {
         )
     }
 
+    /// Validates an offer and opens its bounded, contiguous payload transfer.
+    ///
+    /// A successful call reserves a temporary file and returns the token that
+    /// every subsequent chunk and commit must carry. Newer source revisions are
+    /// monotonic; stale or cross-session offers are rejected before bytes arrive.
     public func accept(_ offer: DevProtocol.PatchOffer) throws -> DevProtocol.OfferToken {
         try offer.validate()
         guard offer.sessionID == identity.sessionID else {
@@ -256,6 +304,10 @@ public actor Controller {
         return token
     }
 
+    /// Appends one contiguous chunk to the currently accepted transfer.
+    ///
+    /// Offsets must exactly equal the number of bytes already received. The
+    /// running SHA-256 is finalized by ``commit(_:)``.
     public func append(_ chunk: DevProtocol.PatchChunk) throws {
         guard var pending, pending.token == chunk.token else {
             throw DevProtocol.Diagnostic.sessionMismatch("patch chunk has an unknown offer token")
@@ -287,6 +339,13 @@ public actor Controller {
         self.pending = pending
     }
 
+    /// Verifies and activates the completed payload associated with `token`.
+    ///
+    /// HLBC activation verifies bytecode and atomically updates the generation
+    /// registry. Native activation preflights and maps a signed image, then calls
+    /// its generated registration root. UI reload runs only after code is active.
+    /// Rejections normally leave the previous generation active and are returned
+    /// as data so the transport can send a structured result.
     public func commit(_ token: DevProtocol.OfferToken) async -> DevProtocol.ActivationResult {
         guard let pending, pending.token == token else {
             return rejection(
@@ -413,6 +472,7 @@ public actor Controller {
         )
     }
 
+    /// Returns the actor's current transfer, routing, and native-resource state.
     public func snapshot() -> DevActivation.Snapshot {
         .init(
             highestOfferedRevision: highestOfferedRevision,
@@ -444,6 +504,9 @@ public actor Controller {
         return current
     }
 
+    /// Closes and deletes a pending transfer without changing active code.
+    ///
+    /// When `token` is non-`nil`, a different pending transfer is left untouched.
     public func abort(_ token: DevProtocol.OfferToken? = nil) {
         guard token == nil || pending?.token == token else { return }
         discardPending()

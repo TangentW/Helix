@@ -4,13 +4,40 @@ import HelixRuntime
 import HelixVerifier
 
 extension PatchRuntime {
+/// The application-owned entry point for production HLBC hot patching.
+///
+/// `ApplicationSession` loads the hidden Bridge linked into the App, validates
+/// the running executable against the frozen Shell contract, restores the last
+/// committed generation, and owns installation, rollback, and crash protection.
+/// Keep one instance alive for the application process lifetime.
+///
+/// ```swift
+/// let session = try PatchRuntime.ApplicationSession(
+///     installationID: installationID,
+///     storeRootURL: patchStoreURL,
+///     trustStore: trustStore,
+///     acceptancePolicy: acceptancePolicy,
+///     nowUnixSeconds: Int64(Date().timeIntervalSince1970)
+/// )
+/// ```
+///
+/// Calls that mutate activation state are serialized. Package verification is
+/// fail-closed: an invalid signature, target, policy, rollout, or revision does
+/// not replace the active generation.
 public final class ApplicationSession: @unchecked Sendable {
+    /// The frozen Shell contract embedded in the linked Bridge.
     public let build: PatchRuntime.BuildContract
+    /// Identity measured from the currently running App executable.
     public let process: PatchRuntime.ProcessIdentity
+    /// The verified HLBC execution engine.
     public let runtime: Runtime.Engine
+    /// Durable activation, rollback, and crash-protection storage.
     public let store: PatchStore.Storage
+    /// The lower-level package verification and activation controller.
     public let activation: PatchActivation.Controller
+    /// Launch recovery and health coordinator.
     public let launch: PatchLaunch.Coordinator
+    /// Recovery result produced while this session was initialized.
     public let launchResult: PatchLaunch.Result
 
     private let operationLock = NSLock()
@@ -18,6 +45,21 @@ public final class ApplicationSession: @unchecked Sendable {
     /// Creates the production runtime graph from the hidden Bridge linked by
     /// the Helix Xcode phase. Application code supplies only product policy and
     /// storage values; it never imports or references generated Swift code.
+    ///
+    /// - Parameters:
+    ///   - installationID: A stable, non-secret identifier used for rollout
+    ///     selection. Persist it across launches for one App installation.
+    ///   - storeRootURL: A private Application Support directory owned by Helix.
+    ///   - trustStore: Trusted signing roots and current revocation state.
+    ///   - acceptancePolicy: Product policy for distribution and OS qualification.
+    ///   - resourceCeiling: Maximum VM resources accepted from any package.
+    ///   - nowUnixSeconds: Current wall-clock time used for validity and recovery.
+    ///   - bridgeProvider: An explicit provider for tests. Production code should
+    ///     use the default linked provider.
+    ///   - process: An explicit process identity for tests. Production code
+    ///     should let Helix inspect the main bundle.
+    /// - Throws: ``PatchRuntime/Error`` or a package/store error when the linked
+    ///   Shell, running process, or persisted state is invalid.
     public convenience init(
         installationID: String,
         storeRootURL: URL,
@@ -50,6 +92,11 @@ public final class ApplicationSession: @unchecked Sendable {
         )
     }
 
+    /// Creates a session from explicitly assembled Runtime components.
+    ///
+    /// This initializer is intended for tests, alternate build adapters, and
+    /// Helix integration tooling. Applications using the Xcode integration
+    /// should use the linked-Bridge convenience initializer.
     public init(
         build: PatchRuntime.BuildContract,
         process: PatchRuntime.ProcessIdentity? = nil,
@@ -105,6 +152,20 @@ public final class ApplicationSession: @unchecked Sendable {
         launchResult = try launch.prepareLaunch(nowUnixSeconds: nowUnixSeconds)
     }
 
+    /// Verifies and atomically activates an in-memory `.hlxp` package.
+    ///
+    /// ```swift
+    /// let result = try session.install(
+    ///     packageBytes: downloadedBytes,
+    ///     nowUnixSeconds: now
+    /// )
+    /// print(result.activatedEntryIndices)
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - packageBytes: The complete encoded patch package.
+    ///   - nowUnixSeconds: Current wall-clock time for validity checks.
+    /// - Returns: The committed generation and activated entry inventory.
     public func install(
         packageBytes: Data,
         nowUnixSeconds: Int64
@@ -122,6 +183,16 @@ public final class ApplicationSession: @unchecked Sendable {
         }
     }
 
+    /// Streams, verifies, and atomically activates a package from a local file.
+    ///
+    /// This is suitable after an application-owned downloader has placed a
+    /// package in a private inbox. The file still passes through the same size,
+    /// digest, signature, policy, and anti-rollback verification as bytes.
+    ///
+    /// - Parameters:
+    ///   - localPackageURL: A regular file containing one complete `.hlxp`.
+    ///   - expectedSHA256: An optional transport digest checked before activation.
+    ///   - nowUnixSeconds: Current wall-clock time for validity checks.
     public func install(
         localPackageURL: URL,
         expectedSHA256: Core.Digest? = nil,
@@ -145,6 +216,12 @@ public final class ApplicationSession: @unchecked Sendable {
         }
     }
 
+    /// Rolls back the active patch to its committed parent generation.
+    ///
+    /// - Parameter nowUnixSeconds: Current wall-clock time for crash-journal
+    ///   retargeting.
+    /// - Returns: Rollback details, or `nil` when the original App body is
+    ///   already active.
     public func rollback(nowUnixSeconds: Int64) throws -> PatchActivation.RollbackResult? {
         try operationLock.withLock {
             guard let active = runtime.registry.snapshot().activeGenerationID else {
@@ -156,6 +233,13 @@ public final class ApplicationSession: @unchecked Sendable {
         }
     }
 
+    /// Marks this launch and its active generation healthy.
+    ///
+    /// Call this after the application's own startup health gate has passed.
+    /// Calling it too early weakens automatic crash-loop rollback.
+    ///
+    /// - Parameter nowUnixSeconds: Current wall-clock time recorded in the
+    ///   launch and activation journals.
     public func markHealthy(nowUnixSeconds: Int64) throws {
         try operationLock.withLock {
             try launch.markHealthy(
@@ -188,6 +272,10 @@ public final class ApplicationSession: @unchecked Sendable {
 }
 
 extension PatchRuntime.BuildContract {
+/// Creates the exact package-verification target for this running process.
+///
+/// This advanced helper is used by ``PatchRuntime/ApplicationSession`` and by
+/// custom Runtime composition roots.
 public func targetContext(
     process: PatchRuntime.ProcessIdentity,
     installationID: String

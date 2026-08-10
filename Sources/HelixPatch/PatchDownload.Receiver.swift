@@ -2,16 +2,26 @@ import CryptoKit
 import Foundation
 import HelixCore
 
+/// Bounded transports that stage package bytes in a ``PatchStore``.
 public enum PatchDownload {}
 
 extension PatchDownload {
+/// A completed incoming package ready for verification and activation.
 public struct Artifact: Sendable {
+    /// Unique identifier of the incoming transaction.
     public var downloadID: UUID
+    /// Private temporary file managed by the Patch Store.
     public var partialURL: URL
+    /// Complete package bytes read back after synchronization.
     public var packageBytes: Data
+    /// SHA-256 computed while receiving bytes and rechecked after finalize.
     public var sha256: Core.Digest
 }
 
+/// A thread-safe, single-use streaming package receiver.
+///
+/// Append chunks in order, then call ``finish()`` exactly once. On transport
+/// failure, call ``cancel()`` to remove the private partial file.
 public final class Receiver: @unchecked Sendable {
     private enum State {
         case receiving
@@ -20,11 +30,17 @@ public final class Receiver: @unchecked Sendable {
         case cancelled
     }
 
+    /// Store that owns the private incoming file.
     public let store: PatchStore.Storage
+    /// Stable identifier for this receive operation.
     public let downloadID: UUID
+    /// Hard ceiling for accumulated package bytes.
     public let maximumPackageBytes: Int
+    /// Optional exact byte count supplied by the transport.
     public let expectedByteCount: Int?
+    /// Optional expected transport digest.
     public let expectedSHA256: Core.Digest?
+    /// Private incoming path created by the store.
     public let partialURL: URL
 
     private let lock = NSLock()
@@ -33,6 +49,7 @@ public final class Receiver: @unchecked Sendable {
     private var hasher = SHA256()
     private var handle: FileHandle?
 
+    /// Opens a new private incoming transaction.
     public init(
         store: PatchStore.Storage,
         downloadID: UUID = UUID(),
@@ -55,6 +72,7 @@ public final class Receiver: @unchecked Sendable {
         handle = opened.1
     }
 
+    /// Appends the next chunk while enforcing the configured byte ceiling.
     public func append(_ bytes: Data) throws {
         try lock.withLock {
             guard state == .receiving, let handle else {
@@ -84,6 +102,7 @@ public final class Receiver: @unchecked Sendable {
         }
     }
 
+    /// Synchronizes, closes, verifies, and reads back the complete artifact.
     public func finish() throws -> PatchDownload.Artifact {
         try lock.withLock {
             guard state == .receiving, let handle else {
@@ -137,6 +156,7 @@ public final class Receiver: @unchecked Sendable {
         }
     }
 
+    /// Closes and removes an unfinished incoming transaction.
     public func cancel() throws {
         try lock.withLock {
             guard state != .finished else {

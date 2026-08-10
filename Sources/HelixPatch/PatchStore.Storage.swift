@@ -2,18 +2,28 @@ import Foundation
 import HelixCore
 import HelixRuntime
 
+/// Durable, App-private state used by production patch verification and recovery.
 public enum PatchStore {}
 
 extension PatchStore {
+/// Write-ahead record created before a generation becomes active.
 public struct PendingActivation: Codable, Hashable, Sendable {
+    /// Generation the transaction intends to activate.
     public var targetGenerationID: Runtime.GenerationID
+    /// Generation expected to be active before the transaction.
     public var parentGenerationID: Runtime.GenerationID?
+    /// Stable package identifier from the verified manifest.
     public var packageID: String
+    /// SHA-256 identity of the signed package container.
     public var packageHash: Core.Digest
+    /// Trusted signing key that authorized the package.
     public var signerKeyID: String
+    /// Transaction nonce copied into the committed active state.
     public var nonce: UUID
+    /// Wall-clock creation time, expressed as Unix seconds.
     public var createdAtUnixSeconds: Int64
 
+    /// Creates a pending activation write-ahead record.
     public init(
         targetGenerationID: Runtime.GenerationID,
         parentGenerationID: Runtime.GenerationID?,
@@ -33,15 +43,24 @@ public struct PendingActivation: Codable, Hashable, Sendable {
     }
 }
 
+/// Durable pointer to the production generation that should be restored at launch.
 public struct ActiveState: Codable, Hashable, Sendable {
+    /// Committed generation identity.
     public var generationID: Runtime.GenerationID
+    /// Previous generation available for conservative rollback.
     public var parentGenerationID: Runtime.GenerationID?
+    /// Stable package identifier from the verified manifest.
     public var packageID: String
+    /// SHA-256 identity of the activated package.
     public var packageHash: Core.Digest
+    /// Trusted signing key that authorized the package.
     public var signerKeyID: String
+    /// Nonce matching the transaction's pending activation record.
     public var activationNonce: UUID
+    /// Wall-clock commit time, expressed as Unix seconds.
     public var committedAtUnixSeconds: Int64
 
+    /// Creates a committed active-state record.
     public init(
         generationID: Runtime.GenerationID,
         parentGenerationID: Runtime.GenerationID?,
@@ -61,11 +80,16 @@ public struct ActiveState: Codable, Hashable, Sendable {
     }
 }
 
+/// Durable proof that an active generation reached the application's health mark.
 public struct ActiveHealth: Codable, Hashable, Sendable {
+    /// Generation confirmed healthy.
     public var generationID: Runtime.GenerationID
+    /// Package hash expected for that generation.
     public var packageHash: Core.Digest
+    /// Wall-clock confirmation time, expressed as Unix seconds.
     public var markedAtUnixSeconds: Int64
 
+    /// Creates an active-generation health proof.
     public init(
         generationID: Runtime.GenerationID,
         packageHash: Core.Digest,
@@ -77,12 +101,18 @@ public struct ActiveHealth: Codable, Hashable, Sendable {
     }
 }
 
+/// Conservative recovery decision for an interrupted activation transaction.
 public struct Recovery: Hashable, Sendable {
+    /// Generation whose activation did not reach a matching commit.
     public var interruptedTarget: Runtime.GenerationID
+    /// Parent generation that may be restored safely.
     public var conservativeRollbackTarget: Runtime.GenerationID?
+    /// Interrupted package identifier.
     public var packageID: String
+    /// Interrupted package hash.
     public var packageHash: Core.Digest
 
+    /// Creates an interrupted-activation recovery result.
     public init(
         interruptedTarget: Runtime.GenerationID,
         conservativeRollbackTarget: Runtime.GenerationID?,
@@ -96,12 +126,18 @@ public struct Recovery: Hashable, Sendable {
     }
 }
 
+/// Device-local containment record that durably rejects one package hash.
 public struct LocalBlock: Codable, Hashable, Sendable {
+    /// Package rejected on this installation.
     public var packageHash: Core.Digest
+    /// Stable machine-readable containment category.
     public var reasonCode: String
+    /// Bounded diagnostic detail for telemetry and recovery inspection.
     public var detail: String
+    /// Wall-clock containment time, expressed as Unix seconds.
     public var blockedAtUnixSeconds: Int64
 
+    /// Creates a local containment record.
     public init(
         packageHash: Core.Digest,
         reasonCode: String,
@@ -115,15 +151,23 @@ public struct LocalBlock: Codable, Hashable, Sendable {
     }
 }
 
+/// Monotonic revocation inventory persisted after signed snapshot verification.
 public struct RevocationState: Codable, Hashable, Sendable {
+    /// Schema version written by this framework release.
     public static let currentSchemaVersion: UInt16 = 1
 
+    /// On-disk schema version.
     public var schemaVersion: UInt16
+    /// Highest signed revocation epoch accepted by this installation.
     public var highestSeenEpoch: UInt64
+    /// Union of key IDs revoked through the highest accepted epoch.
     public var revokedKeyIDs: Set<String>
+    /// Union of package hashes revoked through the highest accepted epoch.
     public var revokedPackageHashes: Set<Core.Digest>
+    /// Hash of the latest accepted signed snapshot, when available.
     public var latestSnapshotHash: Core.Digest?
 
+    /// Creates a persisted revocation inventory.
     public init(
         schemaVersion: UInt16 = Self.currentSchemaVersion,
         highestSeenEpoch: UInt64 = 0,
@@ -139,12 +183,18 @@ public struct RevocationState: Codable, Hashable, Sendable {
     }
 }
 
+/// Forensic record explaining why a package was quarantined.
 public struct Quarantine: Codable, Hashable, Sendable {
+    /// Quarantined package hash.
     public var packageHash: Core.Digest
+    /// Stable machine-readable failure category.
     public var reasonCode: String
+    /// Bounded diagnostic detail.
     public var detail: String
+    /// Wall-clock quarantine time, expressed as Unix seconds.
     public var quarantinedAtUnixSeconds: Int64
 
+    /// Creates a package quarantine record.
     public init(
         packageHash: Core.Digest,
         reasonCode: String,
@@ -158,6 +208,24 @@ public struct Quarantine: Codable, Hashable, Sendable {
     }
 }
 
+/// File-backed transactional store for verified packages and activation state.
+///
+/// ``PatchRuntime/ApplicationSession`` owns this store in normal integrations.
+/// Advanced callers may inspect it for telemetry or assemble lower-level patch
+/// components around one shared instance:
+///
+/// ```swift
+/// let store = try PatchStore.Storage(
+///     rootURL: applicationSupport.appendingPathComponent(
+///         "Helix",
+///         isDirectory: true
+///     )
+/// )
+/// ```
+///
+/// State is written canonically with restrictive permissions, excluded from
+/// backup, checked for symbolic-link substitution, and serialized within the
+/// process per root path.
 public final class Storage: @unchecked Sendable {
     private struct Ledger: Codable {
         var records: [String: PatchPackage.AntiRollbackState] = [:]
@@ -174,11 +242,17 @@ public final class Storage: @unchecked Sendable {
         var recordedAtUnixSeconds: Int64
     }
 
+    /// Standardized root containing all patch state.
     public let rootURL: URL
+    /// Directory for bounded, incomplete downloads.
     public let incomingURL: URL
+    /// Content-addressed directory for verified immutable packages.
     public let verifiedURL: URL
+    /// Directory containing the active pointer, health proof, and ledgers.
     public let activeURL: URL
+    /// Directory containing rejected package and recovery evidence.
     public let quarantineURL: URL
+    /// Directory holding the previous healthy active-state pointer.
     public let lastKnownGoodURL: URL
 
     private let fileManager: FileManager
@@ -208,6 +282,10 @@ public final class Storage: @unchecked Sendable {
         activeURL.appendingPathComponent("active-health.json")
     }
 
+    /// Creates or opens a patch store rooted at a local directory.
+    ///
+    /// Required subdirectories are created immediately and validated as real
+    /// directories rather than symbolic links.
     public init(rootURL: URL, fileManager: FileManager = .default) throws {
         let standardizedRoot = rootURL.standardizedFileURL
         self.rootURL = standardizedRoot
@@ -227,6 +305,10 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Persists a verified package under its SHA-256 identity.
+    ///
+    /// Existing bytes at the same hash must be identical; verified storage is
+    /// immutable. The returned URL points to `package.hlxp`.
     @discardableResult
     public func persistVerifiedPackage(
         _ bytes: Data,
@@ -257,6 +339,7 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Loads an immutable verified package and rechecks its SHA-256 identity.
     public func verifiedPackageBytes(packageHash: Core.Digest) throws -> Data {
         try lock.withLock {
             let url = verifiedURL
@@ -270,6 +353,7 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Returns the private partial-file URL reserved for a download identifier.
     public func makeIncomingURL(downloadID: UUID) -> URL {
         incomingURL.appendingPathComponent("\(downloadID.uuidString.lowercased()).partial")
     }
@@ -324,6 +408,7 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Removes an incomplete download if it exists.
     public func removeIncoming(downloadID: UUID) throws {
         try lock.withLock {
             let url = makeIncomingURL(downloadID: downloadID)
@@ -334,6 +419,7 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Reads monotonic acceptance state for one campaign and Shell interface.
     public func antiRollbackState(
         campaignID: String,
         shellInterfaceHash: Core.Digest
@@ -357,6 +443,10 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Advances anti-rollback state after a package passes verification.
+    ///
+    /// Revisions, counters, and emergency-policy epochs may only move forward.
+    /// Reusing one revision for different package bytes is also rejected.
     public func recordSeen(
         manifest: PatchPackage.Manifest,
         packageHash: Core.Digest,
@@ -420,6 +510,7 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Adds a package hash to a campaign's durable local revocation set.
     public func revoke(
         packageHash: Core.Digest,
         campaignID: String,
@@ -448,6 +539,11 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Durably begins an activation transaction.
+    ///
+    /// The recorded parent must equal persistent active state and, when present,
+    /// must already have a matching health proof. Repeating the exact record is
+    /// idempotent; a different pending transaction is rejected.
     public func beginActivation(_ record: PatchStore.PendingActivation) throws {
         try lock.withLock {
             try validate(record)
@@ -489,6 +585,11 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Commits active state that exactly matches the pending transaction.
+    ///
+    /// The previous active pointer becomes last-known-good, the new generation
+    /// starts without a health proof, and the write-ahead record is cleared only
+    /// after the new pointer is durable.
     public func commitActivation(_ state: PatchStore.ActiveState) throws {
         try lock.withLock {
             try validate(state)
@@ -554,6 +655,7 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Reads and validates the durable active-generation pointer.
     public func activeState() throws -> PatchStore.ActiveState? {
         try lock.withLock {
             guard fileManager.fileExists(atPath: activeStateURL.path) else { return nil }
@@ -563,6 +665,10 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Writes a health proof for the expected active generation.
+    ///
+    /// Health cannot be marked while an activation transaction is pending or if
+    /// the active pointer changed since the caller observed it.
     public func markActiveHealthy(
         expectedActiveID: Runtime.GenerationID,
         nowUnixSeconds: Int64
@@ -648,6 +754,11 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Atomically rolls the expected active generation back to its healthy parent.
+    ///
+    /// When no previous patch generation exists, persistent active state is
+    /// cleared so launch restores original App code. The returned state is the
+    /// new active patch, or `nil` for originals.
     public func rollbackToLastKnownGood(
         expectedActiveID: Runtime.GenerationID
     ) throws -> PatchStore.ActiveState? {
@@ -760,6 +871,11 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Consumes an orphaned write-ahead record left by a terminated activation.
+    ///
+    /// A pending record whose nonce, target, and hash match committed active state
+    /// is recognized as a completed transaction. Otherwise a conservative
+    /// recovery description is returned for launch coordination and containment.
     public func recoverInterruptedActivation() throws -> PatchStore.Recovery? {
         try lock.withLock {
             guard fileManager.fileExists(atPath: pendingActivationURL.path) else { return nil }
@@ -786,12 +902,14 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Returns this installation's containment record for a package hash.
     public func localBlock(for packageHash: Core.Digest) throws -> PatchStore.LocalBlock? {
         try lock.withLock {
             try loadLocalBlocks().records[packageHash.hex]
         }
     }
 
+    /// Idempotently prevents one exact package from being accepted again locally.
     public func blockLocally(_ record: PatchStore.LocalBlock) throws {
         try lock.withLock {
             guard !record.reasonCode.isEmpty else {
@@ -809,6 +927,7 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Reads verified monotonic revocation state, or an empty initial state.
     public func revocationState() throws -> PatchStore.RevocationState {
         try lock.withLock {
             guard fileManager.fileExists(atPath: revocationStateURL.path) else { return .init() }
@@ -856,6 +975,7 @@ public final class Storage: @unchecked Sendable {
         }
     }
 
+    /// Persists a forensic reason record beneath the package's quarantine directory.
     public func quarantine(_ record: PatchStore.Quarantine) throws {
         try lock.withLock {
             let directory = quarantineURL.appendingPathComponent(
@@ -1155,6 +1275,7 @@ extension PatchStore.RevocationState {
         case revokedPackageHashes, latestSnapshotHash
     }
 
+    /// Decodes revocation state while rejecting duplicate set elements.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decode(UInt16.self, forKey: .schemaVersion)
@@ -1176,6 +1297,7 @@ extension PatchStore.RevocationState {
         )
     }
 
+    /// Encodes revocation sets in deterministic sorted order.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(schemaVersion, forKey: .schemaVersion)

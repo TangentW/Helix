@@ -6,17 +6,32 @@ import HelixRuntime
 public enum PatchRuntime {}
 
 extension PatchRuntime {
+/// Frozen build facts that bind a production Runtime to one audited Shell.
+///
+/// The Xcode integration constructs this value from the hidden Bridge. Normal
+/// applications do not create it manually; the public initializer exists for
+/// tests and alternate build-system adapters.
 public struct BuildContract: Hashable, Sendable {
+    /// Bundle identifier accepted by this Shell.
     public var bundleID: String
+    /// `CFBundleVersion` captured during the audited build.
     public var buildNumber: String
+    /// Namespace used to derive stable Shell identities.
     public var shellNamespaceID: Core.ShellNamespaceID
+    /// Hash of the exact callable Shell interface.
     public var shellInterfaceHash: Core.Digest
+    /// Minimum operating-system version used to build the Shell.
     public var minimumOSVersion: Core.SemanticVersion
+    /// Runtime, bytecode, archive, and compiler compatibility facts.
     public var compatibility: Core.Compatibility
+    /// HLBC capabilities accepted by the audited Shell.
     public var capabilities: Set<Core.Capability>
+    /// Native imports compiled and allowlisted in the Shell.
     public var nativeImportIDs: Set<Core.NativeImportID>
+    /// Runtime image ABI identity expected by this framework build.
     public var runtimeImageIdentity: Core.RuntimeImageIdentity
 
+    /// Creates and validates an explicit build contract.
     public init(
         bundleID: String,
         buildNumber: String,
@@ -40,6 +55,7 @@ public struct BuildContract: Hashable, Sendable {
         try validate()
     }
 
+    /// Creates a production contract from the linked Bridge descriptor.
     public init(bridge descriptor: Runtime.BridgeDescriptor) throws {
         try descriptor.validate()
         try self.init(
@@ -55,6 +71,7 @@ public struct BuildContract: Hashable, Sendable {
         )
     }
 
+    /// Validates required identities before a Runtime graph is assembled.
     public func validate() throws {
         guard !bundleID.isEmpty, bundleID.utf8.count <= 4_096,
               !buildNumber.isEmpty, buildNumber.utf8.count <= 256,
@@ -66,6 +83,10 @@ public struct BuildContract: Hashable, Sendable {
         }
     }
 
+    /// Builds the production VM policy enforced for every activated generation.
+    ///
+    /// - Parameter resourceCeiling: Application-wide limits that no package may
+    ///   exceed even when its own manifest requests more.
     public func runtimePolicy(
         resourceCeiling: Core.ResourceLimits = .init()
     ) -> Core.RuntimePolicy {
@@ -79,14 +100,22 @@ public struct BuildContract: Hashable, Sendable {
     }
 }
 
+/// Errors raised while assembling the production hot-patch Runtime.
 public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
+    /// The embedded build contract is malformed or incompatible.
     case invalidBuildContract
+    /// A measured process identity is absent or malformed.
     case invalidProcessIdentity(String)
+    /// A measured process field differs from the audited Shell.
     case buildMismatch(String)
+    /// Runtime Engine and Shell Interface belong to different builds.
     case runtimeShellMismatch
+    /// The generated Bridge did not install its exact ABI registrations.
     case bridgeNotInstalled
+    /// No additional monotonically increasing generation ID can be allocated.
     case generationIdentifierExhausted
 
+    /// A diagnostic suitable for logs and incident telemetry.
     public var description: String {
         switch self {
         case .invalidBuildContract: "invalid Patch Runtime build contract"

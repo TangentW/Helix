@@ -2,21 +2,39 @@ import Foundation
 import HelixCore
 import HelixDevProtocol
 
+/// Secure discovery and transport configuration for development sessions.
 public enum DevConnection {}
 
 extension DevConnection {
+/// How the App locates its paired Mac daemon.
 public enum Endpoint: Hashable, Sendable {
+    /// Connects to an explicit host and TCP port.
     case direct(host: String, port: UInt16)
+    /// Discovers `_helix-live._tcp` and selects the named Bonjour service.
     case bonjour(serviceName: String)
 }
 
+/// Launch-only credentials and endpoint information for one development session.
+///
+/// Normal applications receive these values from the Helix launch command and
+/// call ``load(environment:)`` indirectly through `DevRuntime.ApplicationSession`.
+/// The textual descriptions deliberately redact ``sessionSecret``.
 public struct Configuration: Hashable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    /// Wire protocol version expected by both peers.
     public var protocolVersion: UInt16
+    /// Ephemeral identifier shared by the daemon and this App launch.
     public var sessionID: UUID
+    /// Direct or Bonjour endpoint selection.
     public var endpoint: DevConnection.Endpoint
+    /// SHA-256 pin of the daemon certificate's Subject Public Key Info.
     public var expectedSPKIHash: Core.Digest
+    /// 32-byte secret used for handshake proof and authenticated framing.
+    ///
+    /// Treat this value as sensitive launch credential material. Do not persist
+    /// it, log it, or include it in crash diagnostics.
     public var sessionSecret: Data
 
+    /// Creates and validates an explicit connection configuration.
     public init(
         protocolVersion: UInt16,
         sessionID: UUID,
@@ -32,6 +50,7 @@ public struct Configuration: Hashable, Sendable, CustomStringConvertible, Custom
         try validate()
     }
 
+    /// Validates protocol, credential length, and endpoint bounds.
     public func validate() throws {
         guard protocolVersion == DevProtocol.SessionIdentity.currentProtocolVersion else {
             throw DevConnection.Error.protocolVersionMismatch
@@ -53,8 +72,17 @@ public struct Configuration: Hashable, Sendable, CustomStringConvertible, Custom
         }
     }
 
-    /// Returns nil only when no Helix launch variables are present. A partial
-    /// environment is an error so a misconfigured Dev build never fails open.
+    /// Loads connection values injected into the App's launch environment.
+    ///
+    /// Returns `nil` only when no Helix launch variables are present. A partial
+    /// environment throws so a misconfigured development build never fails open.
+    /// Tests can supply an isolated dictionary instead of reading process state:
+    ///
+    /// ```swift
+    /// let configuration = try DevConnection.Configuration.load(
+    ///     environment: testLaunchEnvironment
+    /// )
+    /// ```
     public static func load(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> Self? {
@@ -122,22 +150,33 @@ public struct Configuration: Hashable, Sendable, CustomStringConvertible, Custom
         return data
     }
 
+    /// Redacted diagnostic summary that never contains the session secret.
     public var description: String {
         "DevConnection.Configuration(sessionID: \(sessionID), endpoint: \(endpoint), sessionSecret: <redacted>)"
     }
 
+    /// Redacted debug summary that never contains the session secret.
     public var debugDescription: String { description }
 }
 
+/// Connection setup and lifecycle failures surfaced to development integrations.
 public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
+    /// Required launch values, endpoint fields, secrets, or limits are malformed.
     case invalidEnvironment
+    /// The App and daemon use different development protocol versions.
     case protocolVersionMismatch
+    /// Connection credentials do not describe the App session identity.
     case sessionIdentityMismatch
+    /// The named Bonjour service was not found before the configured deadline.
     case discoveryTimedOut
+    /// A discovered or direct transport did not become ready before its deadline.
     case connectionTimedOut
+    /// `run()` was called while the same client was already running.
     case alreadyRunning
+    /// The client or discovery operation was intentionally stopped.
     case stopped
 
+    /// Human-readable connection failure detail.
     public var description: String {
         switch self {
         case .invalidEnvironment: "Helix Dev launch environment is incomplete or malformed"

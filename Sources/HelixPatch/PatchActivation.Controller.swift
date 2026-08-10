@@ -4,33 +4,52 @@ import HelixCore
 import HelixRuntime
 import HelixVerifier
 
+/// Verified package activation, rollback, and revocation operations.
 public enum PatchActivation {}
 
 extension PatchActivation {
+/// Details returned after a package generation is durably activated.
 public struct Result: Sendable {
+    /// Lease keeping the activated generation and its images alive.
     public var generationLease: Runtime.GenerationLease
+    /// SHA-256 of the complete verified package.
     public var packageHash: Core.Digest
+    /// Durable store location of the verified package.
     public var verifiedPackageURL: URL
+    /// Shell entries routed to the activated generation.
     public var activatedEntryIndices: [Core.EntryIndex]
 }
 
+/// Result of applying a verified revocation snapshot.
 public struct RevocationResult: Hashable, Sendable {
+    /// Highest accepted revocation epoch.
     public var epoch: UInt64
+    /// Generation deactivated because it was revoked, if any.
     public var deactivatedGenerationID: Runtime.GenerationID?
+    /// Persistent parent state restored after deactivation.
     public var restoredPersistentState: PatchStore.ActiveState?
+    /// Runtime generation active after revocation handling.
     public var restoredRuntimeGenerationID: Runtime.GenerationID?
 }
 
+/// Details returned after an explicit active-generation rollback.
 public struct RollbackResult: Hashable, Sendable {
+    /// Generation removed from active routing.
     public var deactivatedGenerationID: Runtime.GenerationID
+    /// Durable parent state restored, or `nil` for the original App body.
     public var restoredState: PatchStore.ActiveState?
+    /// Runtime parent generation restored, or `nil` for original.
     public var restoredGenerationID: Runtime.GenerationID?
 }
 
+/// Failures specific to serialized activation and recovery.
 public enum Failure: Swift.Error, Equatable, Sendable, CustomStringConvertible {
+    /// Another install, rollback, restore, or revocation operation is active.
     case operationInProgress
+    /// Both the primary operation and its compensating recovery failed.
     case recoveryFailed(primary: String, recovery: String)
 
+    /// Human-readable serialized activation failure detail.
     public var description: String {
         switch self {
         case .operationInProgress: "another patch activation operation is in progress"
@@ -40,6 +59,10 @@ public enum Failure: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     }
 }
 
+/// Advanced package verifier and transactional Runtime activation controller.
+///
+/// Applications should normally use ``PatchRuntime/ApplicationSession``. This
+/// lower-level API exists for custom composition roots and integration tests.
 public final class Controller: @unchecked Sendable {
     private struct Prepared {
         var verifiedPackage: PatchPackage.VerifiedPackage
@@ -47,18 +70,27 @@ public final class Controller: @unchecked Sendable {
         var activatedEntries: [Core.EntryIndex]
     }
 
+    /// Runtime Engine receiving verified generations.
     public let runtime: Runtime.Engine
+    /// Durable Patch Store used for transactions and recovery.
     public let store: PatchStore.Storage
+    /// Exact interface of the running Shell.
     public let shell: Verification.ShellInterface
+    /// Capabilities, NativeImports, and resource ceilings enforced by Runtime.
     public let runtimePolicy: Core.RuntimePolicy
+    /// Signing roots and revocation state.
     public let trustStore: PatchPackage.TrustStore
+    /// Exact running target identity.
     public let targetContext: PatchPackage.TargetContext
+    /// Product-owned package acceptance policy.
     public let acceptancePolicy: PatchPackage.AcceptancePolicy
     private let operationLock = NSLock()
     private var operationInProgress = false
 
+    /// Generation registry owned by ``runtime``.
     public var registry: Runtime.GenerationRegistry { runtime.registry }
 
+    /// Creates an explicitly assembled activation controller.
     public init(
         runtime: Runtime.Engine,
         store: PatchStore.Storage,
@@ -77,6 +109,7 @@ public final class Controller: @unchecked Sendable {
         self.acceptancePolicy = acceptancePolicy
     }
 
+    /// Verifies package bytes, commits them to the store, and activates a generation.
     public func installAndActivate(
         packageBytes: Data,
         generationID: Runtime.GenerationID,
@@ -93,6 +126,7 @@ public final class Controller: @unchecked Sendable {
         }
     }
 
+    /// Activates an artifact previously completed by ``PatchDownload/Receiver``.
     public func installAndActivate(
         artifact: PatchDownload.Artifact,
         generationID: Runtime.GenerationID,
@@ -116,6 +150,7 @@ public final class Controller: @unchecked Sendable {
         )
     }
 
+    /// Restores the durable active package while preparing an App launch.
     public func restoreCommittedActive(
         nowUnixSeconds: Int64
     ) throws -> PatchActivation.Result? {
@@ -124,6 +159,7 @@ public final class Controller: @unchecked Sendable {
         }
     }
 
+    /// Persists a verified revocation snapshot and deactivates a revoked generation.
     public func applyRevocationSnapshot(
         _ snapshot: PatchPackage.RevocationSnapshot,
         nowUnixSeconds: Int64
@@ -218,6 +254,7 @@ public final class Controller: @unchecked Sendable {
         }
     }
 
+    /// Marks the active generation as healthy in durable state.
     public func markActiveHealthy(nowUnixSeconds: Int64) throws {
         guard let activeID = runtime.registry.snapshot().activeGenerationID else {
             throw PatchPackage.Error.activationPersistence("Runtime has no active generation")

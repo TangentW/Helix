@@ -2,25 +2,40 @@ import Foundation
 import HelixCore
 import HelixRuntime
 
+/// Persistent health journal and crash-loop rollback policy.
 public enum CrashProtection {}
 
 extension CrashProtection {
+/// Health state recorded for one protected App launch.
 public enum LaunchHealth: String, Codable, Hashable, Sendable {
+    /// Startup began but the application has not passed its health gate.
     case launching
+    /// The application explicitly confirmed a healthy launch.
     case healthy
 }
 
+/// Durable crash-protection journal bound to an activation generation.
 public struct Journal: Codable, Hashable, Sendable {
+    /// Journal schema version.
     public var schemaVersion: UInt16
+    /// Generation protected by this launch, if any.
     public var activeGenerationID: Runtime.GenerationID?
+    /// Parent generation used for automatic rollback.
     public var parentGenerationID: Runtime.GenerationID?
+    /// Hash of the active package.
     public var activePackageHash: Core.Digest?
+    /// Time at which the generation became active.
     public var activationTimestampUnixSeconds: Int64?
+    /// Nonce identifying this exact App launch.
     public var sessionNonce: UUID
+    /// Current launch health.
     public var health: CrashProtection.LaunchHealth
+    /// Consecutive unclean launches within the configured window.
     public var consecutiveUncleanLaunches: UInt32
+    /// Last journal update time.
     public var updatedAtUnixSeconds: Int64
 
+    /// Creates a complete crash-protection journal value.
     public init(
         schemaVersion: UInt16 = 1,
         activeGenerationID: Runtime.GenerationID?,
@@ -44,8 +59,11 @@ public struct Journal: Codable, Hashable, Sendable {
     }
 }
 
+/// Action selected while beginning a protected launch.
 public enum Decision: Equatable, Sendable {
+    /// Continue with the selected generation and later confirm `sessionNonce`.
     case continueLaunch(sessionNonce: UUID)
+    /// Roll back an interrupted generation before continuing launch.
     case rollback(
         interruptedGeneration: Runtime.GenerationID,
         targetGeneration: Runtime.GenerationID?,
@@ -53,13 +71,20 @@ public enum Decision: Equatable, Sendable {
     )
 }
 
+/// Applies crash-loop policy to the durable launch journal.
+///
+/// Applications normally use this through ``PatchRuntime/ApplicationSession``.
 public final class Guard: @unchecked Sendable {
     private static let journalName = "crash-guard.json"
 
+    /// Store containing the protected journal and activation state.
     public let store: PatchStore.Storage
+    /// Unclean launches required before automatic rollback.
     public let uncleanLaunchThreshold: UInt32
+    /// Time window in which unclean launches are considered consecutive.
     public let uncleanLaunchWindowSeconds: Int64
 
+    /// Creates a crash guard with an explicit threshold and window.
     public init(
         store: PatchStore.Storage,
         uncleanLaunchThreshold: UInt32 = 2,
@@ -72,6 +97,7 @@ public final class Guard: @unchecked Sendable {
         self.uncleanLaunchWindowSeconds = uncleanLaunchWindowSeconds
     }
 
+    /// Starts a protected launch and returns whether rollback is required.
     public func beginLaunch(
         activeGenerationID: Runtime.GenerationID?,
         parentGenerationID: Runtime.GenerationID?,
@@ -130,6 +156,7 @@ public final class Guard: @unchecked Sendable {
         }
     }
 
+    /// Confirms that the launch matching `sessionNonce` passed its health gate.
     public func markHealthy(
         sessionNonce: UUID,
         nowUnixSeconds: Int64
@@ -141,6 +168,7 @@ public final class Guard: @unchecked Sendable {
         )
     }
 
+    /// Rebinds the current launch journal after an explicit rollback.
     public func retargetAfterRollback(
         sessionNonce: UUID,
         activeState: PatchStore.ActiveState?,

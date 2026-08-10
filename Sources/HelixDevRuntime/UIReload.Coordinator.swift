@@ -4,16 +4,24 @@ import HelixLiveReloadAPI
 import SwiftUI
 import UIKit
 
+/// Coordinates UIKit and SwiftUI presentation refresh after new code activates.
 public enum UIReload {}
 
 extension UIReload {
+/// A combined UIKit and SwiftUI refresh result.
 public struct Report: Sendable {
+    /// The protocol-level outcome sent back to the development daemon.
     public var status: DevProtocol.UIReloadStatus
+    /// Number of displayed UIKit instances and active SwiftUI boundaries matched.
     public var matchedTargetCount: Int
+    /// Number of matched targets that successfully received refresh work.
     public var refreshedTargetCount: Int
+    /// Non-fatal conditions that may require a developer-initiated refresh.
     public var warnings: [String]
+    /// Validation or refresh failures encountered by either UI framework.
     public var errors: [String]
 
+    /// Creates an aggregate UI refresh report.
     public init(
         status: DevProtocol.UIReloadStatus,
         matchedTargetCount: Int,
@@ -29,19 +37,42 @@ public struct Report: Sendable {
     }
 }
 
+/// Routes one activated generation to UIKit and SwiftUI reload coordinators.
+///
+/// ``DevRuntime/ApplicationSession`` creates and wires this coordinator by
+/// default. Construct one directly only when customizing reload behavior or
+/// observing reports:
+///
+/// ```swift
+/// let reload = UIReload.Coordinator { context, report in
+///     print("generation \(context.generationID): \(report.status)")
+/// }
+/// ```
 @MainActor
 public final class Coordinator {
+    /// Callback invoked on the main actor after a report is finalized.
     public typealias ReportHandler = @MainActor (
         LiveReload.Context,
         UIReload.Report
     ) -> Void
 
+    /// Coordinator responsible for displayed UIKit instances.
     public let uiKit: UIKitReload.Coordinator
+    /// Coordinator responsible for registered SwiftUI boundaries.
     public let swiftUI: SwiftUIReload.Coordinator
+    /// Most recently finalized report, including a manual refresh report.
     public private(set) var latestReport: UIReload.Report?
+    /// Most recent valid generation context eligible for manual refresh.
     public private(set) var latestContext: LiveReload.Context?
+    /// Callback invoked whenever ``latestReport`` changes.
     public var reportHandler: ReportHandler
 
+    /// Creates a coordinator from the configured framework-specific coordinators.
+    ///
+    /// - Parameters:
+    ///   - uiKit: UIKit instance discovery and refresh behavior.
+    ///   - swiftUI: SwiftUI boundary publication behavior.
+    ///   - reportHandler: Callback invoked for every completed request.
     public init(
         uiKit: UIKitReload.Coordinator = .init(),
         swiftUI: SwiftUIReload.Coordinator = .init(),
@@ -52,6 +83,17 @@ public final class Coordinator {
         self.reportHandler = reportHandler
     }
 
+    /// Applies daemon-provided reload hints after code activation.
+    ///
+    /// Hints are routed to UIKit when a displayed instance matches and to
+    /// SwiftUI when an active boundary matches. A type may be handled by both.
+    /// Invalid hints are reported without preventing other valid targets from
+    /// refreshing.
+    ///
+    /// - Parameters:
+    ///   - context: Metadata for the generation that is already active.
+    ///   - hints: Compiler-produced presentation refresh instructions.
+    /// - Returns: The combined UIKit and SwiftUI result.
     public func reload(
         context: LiveReload.Context,
         hints: [DevProtocol.ReloadHint]
@@ -144,6 +186,10 @@ public final class Coordinator {
         return finish(report, context: context)
     }
 
+    /// Refreshes all eligible targets without relying on compiler hints.
+    ///
+    /// UIKit invokes `LiveReload.Reloadable` on visible conforming view
+    /// controllers, while SwiftUI publishes to every active boundary.
     public func manualReload(
         context: LiveReload.Context
     ) async -> UIReload.Report {
@@ -174,6 +220,9 @@ public final class Coordinator {
         return finish(report, context: manualContext)
     }
 
+    /// Manually refreshes the most recently activated generation.
+    ///
+    /// Returns `.manualRefreshRequired` when no generation has been observed.
     public func manualReloadLatest() async -> UIReload.Report {
         guard let latestContext else {
             let report = UIReload.Report(
@@ -188,6 +237,7 @@ public final class Coordinator {
         return await manualReload(context: latestContext)
     }
 
+    /// Returns the adapter used by ``DevActivation/Controller`` after activation.
     public func activationReloadHandler() -> DevActivation.Controller.ReloadHandler {
         { [weak self] context, hints in
             guard let self else { return .manualRefreshRequired }
@@ -195,6 +245,7 @@ public final class Coordinator {
         }
     }
 
+    /// Returns the adapter used for daemon or debug-overlay manual refresh requests.
     public func manualReloadHandler() -> DevRuntimeSession.Controller.ManualReloadHandler {
         { [weak self] context in
             guard let self else {

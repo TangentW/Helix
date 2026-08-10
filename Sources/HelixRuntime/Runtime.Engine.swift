@@ -4,24 +4,41 @@ import HelixCore
 import HelixVM
 
 extension Runtime {
+/// Receives Runtime activation, rollback, and trap telemetry.
 public protocol Observing: Sendable {
+    /// Called after a generation becomes active for new invocations.
     func didActivate(generation: Runtime.GenerationID)
+    /// Called after an explicit or quarantine-induced rollback.
     func didRollback(from: Runtime.GenerationID, to: Runtime.GenerationID?)
+    /// Called when patched execution traps before fallback or quarantine handling.
     func didTrap(generation: Runtime.GenerationID, entry: Core.EntryIndex, trap: VM.RuntimeTrap)
 }
 
+/// Observer implementation that intentionally discards every Runtime event.
 public struct NoopObserver: Runtime.Observing {
+    /// Creates a no-op observer.
     public init() {}
+    /// Discards activation telemetry.
     public func didActivate(generation: Runtime.GenerationID) {}
+    /// Discards rollback telemetry.
     public func didRollback(from: Runtime.GenerationID, to: Runtime.GenerationID?) {}
+    /// Discards trap telemetry.
     public func didTrap(generation: Runtime.GenerationID, entry: Core.EntryIndex, trap: VM.RuntimeTrap) {}
 }
 
+/// Decision returned to generated bridges after lazy argument encoding.
 public enum BridgeRoutingResult: Equatable, Sendable {
+    /// No active route exists, or safe encoding fallback selected original code.
     case originalRequired
+    /// Patched code executed and produced a VM-level result.
     case executed(VM.ExecutionResult)
 }
 
+/// Executes verified HLBC generations and routes instrumented App entry points.
+///
+/// A root call pins one generation for its complete nested call tree, so an
+/// activation racing with execution cannot mix implementations. Generated App
+/// code normally reaches this engine through ``Bridge``.
 public final class Engine: @unchecked Sendable {
     private enum OriginalResolution: Equatable {
         case catalog
@@ -33,15 +50,26 @@ public final class Engine: @unchecked Sendable {
         case executed(VM.ExecutionResult)
     }
 
+    /// Frozen Shell interface identity, required for generated Bridge installation.
     public let shellInterfaceHash: Core.Digest?
+    /// Registry that owns immutable generations and active routing state.
     public let registry: Runtime.GenerationRegistry
+    /// Original App implementations available for fallback and unpatched routes.
     public let originals: Runtime.OriginalCatalog
+    /// Native functions callable from verified bytecode.
     public let nativeCatalog: VM.NativeCatalog
+    /// Native Swift value types allowed to cross generated bridges.
     public let nativeTypeCatalog: VM.NativeTypeCatalog
+    /// Telemetry sink for activation, rollback, and trap events.
     public let observer: any Runtime.Observing
+    /// Host-side ceilings applied before arguments enter the VM.
     public let bridgeInputLimits: Runtime.BridgeInputLimits
     private let contexts = Runtime.ExecutionContextStorage()
 
+    /// Creates a Runtime engine from generated original and native catalogs.
+    ///
+    /// Pass a non-`nil` `shellInterfaceHash` when the generated ``Bridge`` will
+    /// install on this engine.
     public init(
         registry: Runtime.GenerationRegistry = .init(),
         originals: Runtime.OriginalCatalog,
@@ -60,6 +88,7 @@ public final class Engine: @unchecked Sendable {
         self.bridgeInputLimits = bridgeInputLimits
     }
 
+    /// Validates and activates a verified generation with stale-state protection.
     @discardableResult
     public func activate(_ generation: Runtime.Generation, expectedActiveID: Runtime.GenerationID?) throws -> Runtime.GenerationLease {
         try validateForActivation(generation)
@@ -68,11 +97,17 @@ public final class Engine: @unchecked Sendable {
         return lease
     }
 
+    /// Rolls new invocations back to an ancestor generation or original code.
     public func rollback(expectedActiveID: Runtime.GenerationID, to targetID: Runtime.GenerationID?) throws {
         _ = try registry.rollback(expectedActiveID: expectedActiveID, to: targetID)
         observer.didRollback(from: expectedActiveID, to: targetID)
     }
 
+    /// Invokes a Shell entry from already encoded VM values.
+    ///
+    /// This low-level API is primarily for tests and nested VM entry calls.
+    /// Generated Swift bridges use lazy encoding so original calls avoid bridge
+    /// allocation when no patch route exists.
     public func invoke(entry: Core.EntryIndex, arguments: [VM.Value]) -> VM.ExecutionResult {
         executionResult(
             invoke(entry: entry, arguments: arguments, originalResolution: .catalog)
@@ -106,6 +141,10 @@ public final class Engine: @unchecked Sendable {
         }
     }
 
+    /// Whether generated bridges must consult Runtime routing for this call context.
+    ///
+    /// The value stays true after the first activation so older thread-pinned
+    /// generations can finish safely even if the active pointer rolls back.
     public var requiresRouting: Bool {
         guard registry.hasEverActivated else { return false }
         return contexts.current != nil || registry.activeLease() != nil

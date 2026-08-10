@@ -8,6 +8,7 @@ extension Runtime.BridgeValueCodec {
 /// complete container shape before allocating the VM-side copy and encodes
 /// collection elements incrementally.
 public final class Encoder {
+    /// Effective host-side limits for this one dispatch.
     public let limits: Runtime.BridgeInputLimits
 
     private struct Footprint: Equatable {
@@ -31,26 +32,31 @@ public final class Encoder {
         self.checkDeadline = checkDeadline
     }
 
+    /// Encodes one Boolean leaf and charges it to the argument graph.
     public func encode(_ value: Bool) throws -> VM.Value {
         try reserveLeaf()
         return .bool(value)
     }
 
+    /// Encodes one supported fixed-width integer leaf and charges it to the graph.
     public func encode<Integer: FixedWidthInteger>(_ value: Integer) throws -> VM.Value {
         try reserveLeaf()
         return try Runtime.BridgeValueCodec.encode(value)
     }
 
+    /// Encodes one 32-bit floating-point leaf and charges it to the graph.
     public func encode(_ value: Float) throws -> VM.Value {
         try reserveLeaf()
         return .float(Double(value), bitWidth: 32)
     }
 
+    /// Encodes one 64-bit floating-point leaf and charges it to the graph.
     public func encode(_ value: Double) throws -> VM.Value {
         try reserveLeaf()
         return .float(value, bitWidth: 64)
     }
 
+    /// Encodes a string after reserving its UTF-8 storage and polling the deadline.
     public func encode(_ value: String) throws -> VM.Value {
         try requireActive()
         try pollDeadline(force: true)
@@ -60,6 +66,7 @@ public final class Encoder {
         return .string(value)
     }
 
+    /// Boxes an approved native value and charges its estimated owned bytes.
     public func encodeNative<Value>(
         _ value: Value,
         as typeID: Core.TypeID,
@@ -73,6 +80,7 @@ public final class Encoder {
         return .native(native)
     }
 
+    /// Reserves and encodes an optional container with zero or one child.
     public func encodeOptional<Wrapped>(
         _ value: Wrapped?,
         encodeWrapped: (Wrapped) throws -> VM.Value
@@ -87,6 +95,7 @@ public final class Encoder {
         }
     }
 
+    /// Encodes a root argument list whose produced arity must equal `expectedCount`.
     public func encodeArguments(
         count expectedCount: Int,
         elements: () throws -> [VM.Value]
@@ -101,6 +110,7 @@ public final class Encoder {
         return values
     }
 
+    /// Reserves and encodes a tuple whose produced arity must equal `expectedCount`.
     public func encodeTuple(
         count expectedCount: Int,
         elements: () throws -> [VM.Value]
@@ -114,6 +124,7 @@ public final class Encoder {
         }
     }
 
+    /// Reserves the complete array shape before encoding and type-checking elements.
     public func encodeArray<Element>(
         _ value: [Element],
         elementType: Bytecode.ValueType,
@@ -131,6 +142,7 @@ public final class Encoder {
         }
     }
 
+    /// Reserves key/value nodes before encoding and type-checking dictionary entries.
     public func encodeDictionary<Key: Hashable, Value>(
         _ value: [Key: Value],
         keyType: Bytecode.ValueType,

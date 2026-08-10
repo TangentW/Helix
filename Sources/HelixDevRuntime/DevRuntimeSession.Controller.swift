@@ -3,27 +3,40 @@ import HelixCore
 import HelixDevProtocol
 import HelixLiveReloadAPI
 
+/// Authenticated App-side state machine for the Helix development protocol.
 public enum DevRuntimeSession {}
 
 extension DevRuntimeSession {
+/// Event emitted while one authenticated daemon connection is active.
 public enum Event: Hashable, Sendable {
+    /// Mutual session authentication completed successfully.
     case authenticated
+    /// The daemon started compiling a source revision.
     case compileStarted(DevProtocol.SourceRevision)
+    /// The daemon reported compiler or compatibility diagnostics.
     case diagnostics([DevProtocol.Diagnostic])
+    /// The App accepted a payload offer and is ready for chunks.
     case transferAccepted(DevProtocol.SourceRevision, DevProtocol.GenerationID)
+    /// Code activation and any requested UI refresh finished.
     case activationCompleted(DevProtocol.ActivationResult)
+    /// The peer or local state machine closed with a human-readable reason.
     case closed(String)
 }
 
 /// App-side owner of one outbound, authenticated Dev connection.
 public actor Controller {
+    /// Async observer for authenticated session events.
     public typealias EventHandler = @Sendable (DevRuntimeSession.Event) async -> Void
+    /// Callback that performs an explicit UI refresh for an active generation.
     public typealias ManualReloadHandler = @Sendable (
         LiveReload.Context
     ) async -> (DevProtocol.UIReloadStatus, String?)
 
+    /// Immutable App process identity expected by the peer.
     public let identity: DevProtocol.SessionIdentity
+    /// TLS exporter digest bound into the application-layer handshake proof.
     public let tlsTranscriptHash: Core.Digest
+    /// Message liveness and timing constraints.
     public let liveness: DevProtocol.LivenessConfiguration
 
     private let sessionSecret: Data
@@ -31,6 +44,10 @@ public actor Controller {
     private let eventHandler: EventHandler
     private let manualReloadHandler: ManualReloadHandler
 
+    /// Creates an authenticated-session state machine.
+    ///
+    /// The secret remains private to the instance and is never exposed by status
+    /// events. Normal integrations use ``DevConnection/Client`` instead.
     public init(
         identity: DevProtocol.SessionIdentity,
         sessionSecret: Data,
@@ -54,6 +71,10 @@ public actor Controller {
         self.manualReloadHandler = manualReloadHandler
     }
 
+    /// Authenticates the peer and serves messages until the session closes.
+    ///
+    /// On any error, a pending transfer is aborted, a `.closed` event is emitted,
+    /// and the channel is closed before the error is rethrown.
     public func run(channel: any DevProtocol.MessageChannel) async throws {
         do {
             try await authenticate(channel: channel)

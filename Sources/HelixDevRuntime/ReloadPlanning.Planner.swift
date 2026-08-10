@@ -1,15 +1,22 @@
 import HelixDevProtocol
 import HelixLiveReloadAPI
 
+/// Conversion of compiler reload hints into deterministic per-type UI actions.
 public enum ReloadPlanning {}
 
 extension ReloadPlanning {
+/// One merged UI action for a nominal Swift type.
 public struct Action: Hashable, Sendable {
+    /// Stable identity of the affected view or view-controller type.
     public var nominalTypeID: LiveReload.NominalTypeID
+    /// Strongest safe reload policy selected for the type.
     public var policy: LiveReload.Policy
+    /// Union of invalidation operations when the selected policy is `.invalidate`.
     public var invalidationHints: LiveReload.InvalidationHints
+    /// Factory required when the selected policy is `.recreate`.
     public var factoryID: LiveReload.FactoryID?
 
+    /// Creates an explicit reload action.
     public init(
         nominalTypeID: LiveReload.NominalTypeID,
         policy: LiveReload.Policy,
@@ -23,14 +30,24 @@ public struct Action: Hashable, Sendable {
     }
 }
 
+/// Deterministic plan plus validation or merge warnings.
 public struct Result: Hashable, Sendable {
+    /// Valid, non-conflicting actions sorted by nominal type description.
     public var actions: [ReloadPlanning.Action]
+    /// Invalid hints or conflicts omitted from ``actions``.
     public var warnings: [String]
 }
 
+/// Validates, groups, and merges compiler-produced reload hints.
+///
+/// Policies escalate from `.observeOnly` through `.invalidate` and `.invokeHook`
+/// to `.recreate`. Conflicting recreation factories remove the unsafe target
+/// rather than selecting one arbitrarily.
 public struct Planner: Sendable {
+    /// Creates a stateless planner.
     public init() {}
 
+    /// Produces one deterministic action per valid nominal type identity.
     public func plan(_ hints: [DevProtocol.ReloadHint]) -> ReloadPlanning.Result {
         var actions: [LiveReload.NominalTypeID: ReloadPlanning.Action] = [:]
         var conflicts = Set<LiveReload.NominalTypeID>()
@@ -71,6 +88,10 @@ public struct Planner: Sendable {
         )
     }
 
+    /// Merges two actions for the same nominal type using policy escalation.
+    ///
+    /// - Throws: ``Error/differentTypes`` or
+    ///   ``Error/conflictingFactories(_:)`` when no safe merge exists.
     public func merge(
         _ lhs: ReloadPlanning.Action,
         _ rhs: ReloadPlanning.Action
@@ -118,10 +139,14 @@ public struct Planner: Sendable {
     }
 }
 
+/// Reload-hint merge conflicts that make automatic refresh unsafe.
 public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
+    /// Actions for distinct nominal types were passed to ``Planner/merge(_:_:)``.
     case differentTypes
+    /// The same type requires two different controller recreation factories.
     case conflictingFactories(LiveReload.NominalTypeID)
 
+    /// Human-readable reload planning failure detail.
     public var description: String {
         switch self {
         case .differentTypes: "cannot merge UI reload actions for different nominal types"

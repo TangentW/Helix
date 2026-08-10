@@ -3,12 +3,18 @@ import Foundation
 import HelixCore
 
 extension PatchPackage {
+/// Public authority permitted to sign monotonic revocation snapshots.
 public struct RevocationAuthority: Codable, Hashable, Sendable {
+    /// Stable authority key identifier.
     public var keyID: String
+    /// Ed25519 public-key bytes.
     public var publicKey: Data
+    /// First Unix second at which the authority is valid.
     public var validFromUnixSeconds: Int64
+    /// Last Unix second at which the authority is valid.
     public var validUntilUnixSeconds: Int64
 
+    /// Creates a revocation authority.
     public init(
         keyID: String,
         publicKey: Data,
@@ -33,19 +39,32 @@ public struct RevocationAuthority: Codable, Hashable, Sendable {
     }
 }
 
+/// Canonical, authority-signed key and package revocations.
 public struct RevocationSnapshot: Codable, Hashable, Sendable {
+    /// Snapshot schema emitted by this framework version.
     public static let currentSchemaVersion: UInt16 = 1
 
+    /// Encoded snapshot schema.
     public var schemaVersion: UInt16
+    /// Signature algorithm, currently `ed25519`.
     public var algorithm: String
+    /// Authority expected to verify this snapshot.
     public var authorityKeyID: String
+    /// Monotonically increasing revocation epoch.
     public var epoch: UInt64
+    /// Snapshot issue time.
     public var issuedAtUnixSeconds: Int64
+    /// Snapshot expiration time.
     public var expiresAtUnixSeconds: Int64
+    /// Root or leaf key identifiers revoked by the snapshot.
     public var revokedKeyIDs: Set<String>
+    /// Complete package hashes revoked by the snapshot.
     public var revokedPackageHashes: Set<Core.Digest>
+    /// Authority signature over the canonical unsigned snapshot.
     public var signature: Data
 
+    /// Creates a snapshot value. Prefer the static `issue` method when
+    /// producing a usable signed snapshot.
     public init(
         schemaVersion: UInt16 = Self.currentSchemaVersion,
         algorithm: String = "ed25519",
@@ -68,6 +87,7 @@ public struct RevocationSnapshot: Codable, Hashable, Sendable {
         self.signature = signature
     }
 
+    /// Issues a signed snapshot on trusted control-plane infrastructure.
     public static func issue(
         authorityKeyID: String,
         authorityPrivateKey: PatchPackage.PrivateKey,
@@ -90,11 +110,13 @@ public struct RevocationSnapshot: Codable, Hashable, Sendable {
         return snapshot
     }
 
+    /// Encodes this snapshot as canonical JSON after structural validation.
     public func encoded() throws -> Data {
         try validateStructure()
         return try Core.CanonicalJSON.encode(self)
     }
 
+    /// Decodes bounded canonical JSON without yet establishing authority trust.
     public static func decode(
         _ bytes: Data,
         maximumBytes: Int = 256 * 1_024
@@ -155,6 +177,9 @@ public struct RevocationSnapshot: Codable, Hashable, Sendable {
 }
 
 extension PatchPackage.TrustStore {
+    /// Verifies and applies a monotonic revocation snapshot.
+    ///
+    /// The returned store contains the union of all accepted revocations.
     public func applying(
         _ snapshot: PatchPackage.RevocationSnapshot,
         nowUnixSeconds: Int64,
@@ -208,6 +233,7 @@ extension PatchPackage.TrustStore {
         return updated
     }
 
+    /// Merges revocation state previously verified and persisted by Helix.
     public func mergingPersistedRevocations(
         epoch: UInt64,
         revokedKeyIDs: Set<String>,
@@ -228,6 +254,7 @@ extension PatchPackage.RevocationSnapshot {
         case revokedKeyIDs, revokedPackageHashes, signature
     }
 
+    /// Decodes a snapshot while rejecting duplicate key and package revocations.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decode(UInt16.self, forKey: .schemaVersion)
@@ -252,6 +279,7 @@ extension PatchPackage.RevocationSnapshot {
         signature = try container.decode(Data.self, forKey: .signature)
     }
 
+    /// Encodes revoked keys and package hashes in deterministic order.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(schemaVersion, forKey: .schemaVersion)
