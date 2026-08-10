@@ -32,9 +32,10 @@ public final class HostViewController: UIViewController {
         ])
     }
 
-    /// This lifecycle body is the save-to-reload acceptance root. Avoid adding
-    /// setup work here: the LiveReload hook intentionally invokes it again.
-    public override func viewDidAppear(_ animated: Bool) {
+    /// Saving this body exercises inferred UIKit invalidation. The App neither
+    /// registers this type nor owns a manual reload hook.
+    public override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
         titleLabel.text = "HELIX BASELINE"
     }
 }

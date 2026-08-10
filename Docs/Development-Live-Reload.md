@@ -10,6 +10,12 @@ Simulator, activate it in the same process, and refresh the affected UI.
 This is a development feature. It is isolated from production packages, keys,
 storage, and lifecycle.
 
+The App does not compile or import generated Swift. The Feature target keeps
+its original sources; an App build phase compiles Helix's generated Bridge into
+a validated object under DerivedData and links it into the executable. A stable
+C provider symbol lets `DevRuntime.ApplicationSession` discover the Build
+Contract, Shell interface, Runtime factory, and Bridge installer automatically.
+
 ## Xcode Run session handoff
 
 The shared Live Reload Scheme starts one authenticated daemon in its Run
@@ -190,8 +196,27 @@ Replacing a function changes future calls. It does not make UIKit call
 `viewDidLoad`, `loadView`, or a previously completed initializer again. Helix
 therefore treats UI update as a second, explicit phase.
 
-`ReloadIndex` records changed source/type identities and hints. The unified UI
-coordinator resolves live targets and applies one of four policies:
+`ReloadIndex` records changed source/type identities and hints. UIKit target
+discovery is automatic; application code does not maintain a `typeRegistry`.
+For each action, the coordinator reconstructs the compiler's stable nominal ID
+from `String(reflecting:)`/Objective-C runtime class names, walks the concrete
+class's superclass chain, and compares those IDs with the changed type IDs.
+
+The instance search starts from foreground-active or foreground-inactive
+`UIWindowScene` windows. It traverses root, presented, navigation, tab, split,
+and child controller graphs, filters to visible loaded controllers by default,
+and de-duplicates object identities. It matches controllers first. Only types
+still unmatched cause a scan of the loaded UIView trees, which avoids paying a
+full view-walk cost for the common controller case. A base-class edit therefore
+refreshes a displayed subclass instance without registration.
+
+Actions for all matching levels of one inheritance chain are merged once per
+instance. Conflicting recreation factories fail explicitly instead of applying
+an arbitrary rule. The unified coordinator also distinguishes “no displayed
+UIKit instance” from an active matching SwiftUI boundary and emits one useful
+warning rather than duplicate UIKit/SwiftUI warnings.
+
+The four policies are:
 
 - `observeOnly`: activate code without forcing UI work;
 - `invalidate`: request constraints, layout, display, or explicitly permitted
@@ -201,11 +226,16 @@ coordinator resolves live targets and applies one of four policies:
 - `recreate`: build a replacement controller through a registered factory and
   restore explicitly captured route and UI state.
 
-UIKit resolution understands foreground scenes, presented controllers,
-navigation, tab, split, child controllers, and loaded view trees. Broad
-`UITableView`/`UICollectionView` reload is disabled by default; a page should
-provide a hook when data ownership or side effects require application logic.
-The coordinator never directly replays arbitrary UIKit lifecycle methods.
+Layout and drawing callbacks normally infer `invalidate`, so changing a
+displayed UIViewController or UIView requires neither registration nor an App
+hook. Constraint, layout, and display invalidation operate on the same object,
+preserving navigation position and in-memory state. Immediate layout is skipped
+while a controller transition is active. Broad `UITableView`/
+`UICollectionView.reloadData()` remains disabled by default; a page should use
+an explicit hook when data ownership or side effects require application logic.
+Initialization callbacks may infer `invokeHook` or `recreate` because Helix
+never directly replays arbitrary lifecycle methods. Factory registration is
+therefore an advanced reconstruction mechanism, not normal setup.
 
 For SwiftUI, wrap an injection boundary:
 

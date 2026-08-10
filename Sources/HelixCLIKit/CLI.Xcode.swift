@@ -3,6 +3,7 @@ import Darwin
 import HelixBuildTools
 import HelixCompiler
 import HelixCore
+import HelixDevProtocol
 import HelixDevTools
 import HelixInterface
 import HelixPatch
@@ -394,6 +395,8 @@ private func executeXcodePhase(_ arguments: [String]) throws -> CLI.Result {
     switch phase {
     case .prepare:
         return try prepareXcodeShell(context)
+    case .bridge:
+        return try compileXcodeBridge(context)
     case .finalize:
         let product = try resolveXcodeProduct(context)
         let archive = try finalizeXcodeShell(context, product: product)
@@ -821,16 +824,10 @@ private func startXcodeLiveSession(
                 ).map { ($0.0, $0.1) }
             ),
             compiledSourceMappings: Dictionary(
-                uniqueKeysWithValues: context.feature.sourceFiles.map { logicalPath in
-                    (
-                        logicalPath,
-                        context.environment.shellOutputURL
-                            .appendingPathComponent("DerivedSources", isDirectory: true)
-                            .appendingPathComponent(
-                                SourceTransform.transformedFilePath(for: logicalPath)
-                            )
-                    )
-                }
+                uniqueKeysWithValues: zip(
+                    context.feature.sourceFiles,
+                    context.sourceURLs
+                ).map { ($0.0, $0.1) }
             ),
             expandedCodeSignIdentity: product.expandedCodeSignIdentity,
             teamIdentifier: product.teamIdentifier,
@@ -1042,31 +1039,217 @@ private func prepareXcodeShell(
         to: context.environment.shellOutputURL,
         force: true
     )
-    if context.profile.workflow == .liveReload {
-        try files.write(
-            try XcodeIntegration.CompilerCapture.proxyScript(
-                realCompilerURL: context.environment.compilerURL
-            ),
-            to: context.environment.compilerProxyURL
-        )
-        do {
-            try manager.setAttributes(
-                [.posixPermissions: NSNumber(value: UInt16(0o755))],
-                ofItemAtPath: context.environment.compilerProxyURL.path
-            )
-        } catch {
-            throw CLI.Error.input(
-                "cannot make the Helix Swift compiler proxy executable: "
-                    + error.localizedDescription
-            )
-        }
-    }
+    try prepareXcodeCompilerProxy(context)
     return .init(
         exitCode: 0,
         standardOutput: "Prepared \(context.profile.id) Helix Shell at "
             + "\(context.environment.shellOutputURL.path)\n"
             + "Functions: \(materialized.report.eligibleFunctionCount) eligible, "
             + "\(materialized.report.rejectedFunctionCount) rejected\n"
+    )
+}
+
+private func prepareXcodeCompilerProxy(
+    _ context: XcodeIntegration.BuildContext
+) throws {
+    let manager = FileManager.default
+    let proxy = try XcodeIntegration.CompilerCapture.proxyScript(
+        realCompilerURL: context.environment.compilerURL
+    )
+    do {
+        let proxyURL = context.environment.compilerProxyURL
+        try manager.createDirectory(
+            at: proxyURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        // Keep the last successful capture for incremental builds where Xcode
+        // does not need to recompile the Feature target. Bridge compilation
+        // validates it against the active compiler, SDK, and target triple.
+        try files.write(proxy, to: proxyURL)
+        try manager.setAttributes(
+            [.posixPermissions: NSNumber(value: UInt16(0o755))],
+            ofItemAtPath: proxyURL.path
+        )
+    } catch {
+        throw CLI.Error.input(
+            "cannot prepare the Helix Swift compiler proxy: "
+                + error.localizedDescription
+        )
+    }
+}
+
+private func compileXcodeBridge(
+    _ context: XcodeIntegration.BuildContext
+) throws -> CLI.Result {
+    let reportURL = context.environment.shellOutputURL.appendingPathComponent(
+        "ShellBuildReport.json"
+    )
+    let reportBytes = try readRegularFile(
+        reportURL,
+        maximumBytes: 16 * 1_024 * 1_024,
+        label: "Shell build report"
+    )
+    let report: ShellBuild.Report
+    do {
+        report = try JSONDecoder().decode(ShellBuild.Report.self, from: reportBytes)
+        guard try Core.CanonicalJSON.encode(report) == reportBytes else {
+            throw CLI.Error.input("Shell build report is noncanonical")
+        }
+    } catch let error as CLI.Error {
+        throw error
+    } catch {
+        throw CLI.Error.input(
+            "cannot decode the Shell build report: \(error.localizedDescription)"
+        )
+    }
+    let sourceArtifacts = report.generatedSources.filter {
+        $0.path.hasPrefix("Generated/") && $0.path.hasSuffix(".swift")
+    }.sorted { $0.path < $1.path }
+    guard !sourceArtifacts.isEmpty,
+          Set(sourceArtifacts.map(\.path)).count == sourceArtifacts.count
+    else {
+        throw CLI.Error.input("Shell build report contains no unique Bridge sources")
+    }
+    let shellRoot = context.environment.shellOutputURL.standardizedFileURL
+        .resolvingSymlinksInPath()
+    let sourceURLs = try sourceArtifacts.map { artifact -> URL in
+        let source = context.environment.shellOutputURL
+            .appendingPathComponent(artifact.path).standardizedFileURL
+        let resolved = source.resolvingSymlinksInPath()
+        guard Self.contains(resolved, in: shellRoot) else {
+            throw CLI.Error.input("Bridge source escapes the Shell output: \(artifact.path)")
+        }
+        let bytes = try readRegularFile(
+            resolved,
+            maximumBytes: 64 * 1_024 * 1_024,
+            label: "generated Bridge source"
+        )
+        guard UInt64(bytes.count) == artifact.byteCount,
+              Core.Digest.sha256(bytes) == artifact.contentHash
+        else {
+            throw CLI.Error.input("generated Bridge source drifted: \(artifact.path)")
+        }
+        return resolved
+    }
+    let captured = try BuildCapture.SwiftInvocationReader().readFrontendJob(
+        at: context.environment.frontendInvocationURL
+    )
+    var moduleMapNames = ["HelixRuntimeSupport"]
+    if context.profile.workflow == .liveReload {
+        moduleMapNames.append("HelixDevRuntimeProbe")
+    }
+    let runtimeModuleMaps = try moduleMapNames.map { name -> URL in
+        let url = context.environment.generatedModuleMapDirectoryURL
+            .appendingPathComponent("\(name).modulemap")
+        _ = try readRegularFile(
+            url,
+            maximumBytes: 1 * 1_024 * 1_024,
+            label: "\(name) module map"
+        )
+        return url
+    }
+    let manager = FileManager.default
+    do {
+        try manager.createDirectory(
+            at: context.environment.bridgeOutputURL,
+            withIntermediateDirectories: true
+        )
+    } catch {
+        throw CLI.Error.input(
+            "cannot create hidden Bridge output: \(error.localizedDescription)"
+        )
+    }
+    let resolvedProfileOutput = context.environment.profileOutputURL
+        .resolvingSymlinksInPath()
+    let resolvedBridgeOutput = context.environment.bridgeOutputURL
+        .resolvingSymlinksInPath()
+    guard Self.contains(resolvedBridgeOutput, in: resolvedProfileOutput),
+          let bridgeAttributes = try? manager.attributesOfItem(
+              atPath: context.environment.bridgeOutputURL.path
+          ),
+          (bridgeAttributes[.type] as? FileAttributeType) == .typeDirectory
+    else {
+        throw CLI.Error.input("hidden Bridge output is not a safe directory")
+    }
+    let temporary = context.environment.bridgeOutputURL.appendingPathComponent(
+        ".HelixBridge.\(UUID().uuidString).o"
+    )
+    defer { try? manager.removeItem(at: temporary) }
+    let moduleSuffix = Core.Digest.sha256(context.profile.id).hex.prefix(16)
+    let plan: XcodeIntegration.BridgeCompilationPlan
+    do {
+        plan = try XcodeIntegration.BridgeCompilationPlanner().plan(
+            compilerPath: captured.executable,
+            capturedArguments: captured.arguments,
+            expectedCompilerPath: context.environment.compilerURL.path,
+            expectedCapturedModuleName: context.feature.moduleName,
+            expectedTargetTriple: context.environment.targetTriple,
+            expectedSDKPath: context.environment.sdkRootURL.path,
+            expectedOptimization: context.environment.optimization,
+            clangModuleMapURLs: runtimeModuleMaps,
+            generatedSourceURLs: sourceURLs,
+            outputURL: temporary,
+            moduleName: "HelixBridge_\(moduleSuffix)"
+        )
+    } catch let error as XcodeIntegration.BridgeCompilationError {
+        throw CLI.Error.input(error.description)
+    }
+    let compilation = try ProcessExecution.Runner().run(
+        executable: plan.compilerURL,
+        arguments: plan.arguments,
+        environment: environment,
+        workingDirectory: context.environment.bridgeOutputURL
+    )
+    guard compilation.status == 0 else {
+        let diagnostics = String(compilation.standardError.prefix(512 * 1_024))
+        throw CLI.Error.input(
+            diagnostics.isEmpty
+                ? "hidden Bridge compiler exited with status \(compilation.status)"
+                : diagnostics
+        )
+    }
+    guard let attributes = try? manager.attributesOfItem(atPath: temporary.path),
+          (attributes[.type] as? FileAttributeType) == .typeRegular,
+          let byteCount = (attributes[.size] as? NSNumber)?.uint64Value,
+          byteCount > 0,
+          byteCount <= 512 * 1_024 * 1_024
+    else {
+        throw CLI.Error.input("hidden Bridge compiler produced an invalid object file")
+    }
+    let objectBytes = try readRegularFile(
+        temporary,
+        maximumBytes: 512 * 1_024 * 1_024,
+        label: "hidden Bridge object"
+    )
+    let descriptor: MachO.Descriptor
+    do {
+        descriptor = try MachO.Inspector().inspect(objectBytes)
+    } catch {
+        throw CLI.Error.input("hidden Bridge compiler produced malformed Mach-O: \(error)")
+    }
+    let expectedArchitecture = MachO.Architecture(rawValue: context.environment.architecture)
+    let expectedPlatform: MachO.Platform = context.environment.platformName == "iphonesimulator"
+        ? .iOSSimulator
+        : .iOS
+    guard descriptor.fileType == 1,
+          descriptor.architecture == expectedArchitecture,
+          descriptor.platform == expectedPlatform
+    else {
+        throw CLI.Error.input(
+            "hidden Bridge compiler produced an incompatible Mach-O object"
+        )
+    }
+    guard Darwin.rename(temporary.path, context.environment.bridgeObjectURL.path) == 0 else {
+        throw CLI.Error.input(
+            "cannot atomically publish the hidden Bridge object: "
+                + String(cString: strerror(errno))
+        )
+    }
+    return .init(
+        exitCode: 0,
+        standardOutput: "Compiled hidden Helix Bridge at "
+            + "\(context.environment.bridgeObjectURL.path)\n"
+            + (compilation.standardError.isEmpty ? "" : compilation.standardError)
     )
 }
 
@@ -1355,7 +1538,7 @@ configuration inputs, source containment, and every declared Swift file.
 static let xcodePhaseHelp = """
 Usage: helix xcode phase --plan HelixXcode.json --profile ID --phase PHASE
 
-Phases: prepare, finalize, audit, patch, live-start, live-stop. This command is
+Phases: prepare, bridge, finalize, audit, patch, live-start, live-stop. This command is
 designed for generated Xcode scripts and reads volatile build facts only from
 the active Xcode environment.
 """ + "\n"

@@ -6,6 +6,8 @@ Helix Live Reload 用于缩短正在运行的 Debug App 的修改循环。完成
 
 这是开发功能，与生产补丁的产物、密钥、存储和生命周期完全隔离。
 
+App 不会编译或 import 生成 Swift。Feature target 始终保留原始源码；App build phase 只在 DerivedData 中把 Helix Bridge 编译成经过校验的 object，再链接进 executable。`DevRuntime.ApplicationSession` 通过稳定 C provider 符号自动取得 Build Contract、Shell interface、Runtime factory 与 Bridge installer。
+
 ## Xcode Run 会话交接
 
 共享 Live Reload Scheme 会在 Run pre-action 中启动一次认证 daemon，并写出权限为 `0600` 的自定义 LLDB init；文件只包含本次会话的临时材料。init 先用 `target.env-vars` 覆盖由 LLDB 负责 launch 的快路径，同时启动一个有界的 LLDB Python installer。之所以需要后者，是因为 Xcode 可能在真实 App target 创建前加载 init，并丢弃挂在临时 target 上的状态。
@@ -110,14 +112,20 @@ Simulator Native Dynamic Replacement 是目前已验证的主路径。Native 不
 
 替换函数只会改变之后的调用，不会让 UIKit 再次调用已经完成的 `viewDidLoad`、`loadView` 或 initializer。因此 Helix 把 UI 更新作为第二个明确阶段。
 
-`ReloadIndex` 记录变化的源码/类型身份和 hint。统一 UI Coordinator 会解析存活目标，并采用四种策略之一：
+`ReloadIndex` 记录变化的源码/类型身份和 hint。UIKit target discovery 现在完全自动化，业务代码不再维护 `typeRegistry`。Coordinator 会从 `String(reflecting:)` 与 Objective-C runtime class name 还原编译器使用的稳定 nominal ID，并沿具体类的 superclass 链与变化类型匹配。
+
+实例搜索从 foreground active/inactive 的 `UIWindowScene` 开始，遍历 root、presented、navigation、tab、split 与 child controller 图；默认只保留已经加载且可见的 controller，并按对象 identity 去重。它会先匹配 controller，只有仍未命中的类型才扫描这些 controller 已加载的 UIView tree，从而避免普通页面修改每次都付出完整 view walk。修改基类也能直接命中当前展示的子类实例。
+
+同一实例若同时命中继承链上的多个 action，会先按统一升级规则合并。互相冲突的 recreation factory 会明确失败，不会随机选择。统一 Coordinator 还会区分“当前没有 UIKit 实例”和“存在匹配的 SwiftUI boundary”，避免两套系统各报一次无意义 warning。
+
+四种策略是：
 
 - `observeOnly`：只激活代码，不强制 UI 操作；
 - `invalidate`：请求 constraint、layout、display 或明确允许的数据源 invalidation；
 - `invokeHook`：调用页面或 View 实现的幂等 `LiveReload.Reloadable` hook；
 - `recreate`：通过注册 Factory 构建新的 Controller，并恢复显式捕获的路由和 UI 状态。
 
-UIKit 解析覆盖前台 scene、presented controller、navigation、tab、split、child controller 和已经加载的 View 树。广泛调用 `UITableView`/`UICollectionView.reloadData()` 默认关闭；当数据所有权或副作用需要业务逻辑时，页面应实现 hook。Coordinator 不会直接重放任意 UIKit 生命周期方法。
+常见 layout、drawing callback 会推导为 `invalidate`，所以修改正在展示的 UIViewController 或 UIView 时既不需要注册，也不需要 App hook。Constraint、layout 和 display invalidation 都作用于原实例，可以保留导航位置与内存状态；controller 正在 transition 时会跳过 immediate layout。广泛调用 `UITableView`/`UICollectionView.reloadData()` 仍默认关闭；数据所有权或副作用确实需要业务逻辑时再使用显式 hook。初始化 callback 可能推导为 `invokeHook` 或 `recreate`，因为 Helix 不会直接重放任意 lifecycle method。Factory registration 因此是高级页面重建机制，不是普通接入步骤。
 
 SwiftUI 可以包一层注入边界：
 

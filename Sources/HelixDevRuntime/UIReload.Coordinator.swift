@@ -70,8 +70,9 @@ public final class Coordinator {
                 remembersContext: false
             )
         }
-        var uiKitHints: [DevProtocol.ReloadHint] = []
+        var nominalHints: [DevProtocol.ReloadHint] = []
         var swiftUIHints: [DevProtocol.ReloadHint] = []
+        var swiftUITargetIDs = Set<LiveReload.NominalTypeID>()
         var warnings: [String] = []
         var errors: [String] = []
 
@@ -83,18 +84,17 @@ public final class Coordinator {
                 continue
             }
             guard let id = hint.nominalTypeID else { continue }
-            let hasUIKitTarget = uiKit.typeRegistry.contains(id)
+            nominalHints.append(hint)
             let hasSwiftUITarget = swiftUI.pulse.containsBoundary(for: id)
-            if hasUIKitTarget { uiKitHints.append(hint) }
-            if hasSwiftUITarget { swiftUIHints.append(hint) }
-            if !hasUIKitTarget, !hasSwiftUITarget, hint.policy != .observeOnly {
-                warnings.append("no visible UIKit or SwiftUI target is registered for \(id)")
+            if hasSwiftUITarget {
+                swiftUIHints.append(hint)
+                swiftUITargetIDs.insert(id)
             }
         }
 
-        let uiKitReport = uiKitHints.isEmpty
+        let uiKitReport = nominalHints.isEmpty
             ? nil
-            : await uiKit.reload(context: context, hints: uiKitHints)
+            : await uiKit.reload(context: context, hints: nominalHints)
         let swiftUIReport = swiftUIHints.isEmpty
             ? nil
             : swiftUI.reload(context: context, hints: swiftUIHints)
@@ -105,6 +105,19 @@ public final class Coordinator {
         if let swiftUIReport {
             warnings.append(contentsOf: swiftUIReport.warnings)
             errors.append(contentsOf: swiftUIReport.errors)
+        }
+        let matchedUIKitTypeIDs = uiKitReport?.matchedNominalTypeIDs ?? []
+        var warnedTypeIDs = Set<LiveReload.NominalTypeID>()
+        for hint in nominalHints {
+            guard let id = hint.nominalTypeID,
+                  hint.policy != .observeOnly,
+                  !matchedUIKitTypeIDs.contains(id),
+                  !swiftUITargetIDs.contains(id),
+                  warnedTypeIDs.insert(id).inserted
+            else { continue }
+            warnings.append(
+                "no displayed UIKit instance or active SwiftUI boundary matches \(id)"
+            )
         }
 
         let statuses = [uiKitReport?.status, swiftUIReport?.status].compactMap { $0 }

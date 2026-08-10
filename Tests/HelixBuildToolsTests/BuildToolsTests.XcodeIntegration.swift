@@ -1,5 +1,4 @@
 import Foundation
-import HelixCompiler
 import HelixCore
 import Testing
 @testable import HelixBuildTools
@@ -80,14 +79,22 @@ struct XcodeIntegrationContract {
         #expect(liveFeature.contains("-enable-dynamic-replacement-chaining"))
         #expect(liveFeature.contains("HELIX_REAL_SWIFT_EXEC"))
         #expect(liveFeature.contains(
-            "SWIFT_EXEC = $(HELIX_PROFILE_OUTPUT_DIR)/swiftc"
+            "SWIFT_EXEC = $(HELIX_PROFILE_OUTPUT_DIR)/Compiler/Feature/swiftc"
         ))
         #expect(liveFeature.contains("SWIFT_USE_INTEGRATED_DRIVER = NO"))
         #expect(liveFeature.contains("LD_DYLIB_INSTALL_NAME = @rpath/$(EXECUTABLE_PATH)"))
         #expect(patchFeature.contains("LD_DYLIB_INSTALL_NAME = @rpath/$(EXECUTABLE_PATH)"))
-        #expect(!patchFeature.contains("-enable-implicit-dynamic"))
-        #expect(!patchFeature.contains("HELIX_REAL_SWIFT_EXEC"))
-        #expect(!patchFeature.contains("SWIFT_USE_INTEGRATED_DRIVER"))
+        #expect(patchFeature.contains("-enable-implicit-dynamic"))
+        #expect(patchFeature.contains("-enable-dynamic-replacement-chaining"))
+        #expect(patchFeature.contains("HELIX_REAL_SWIFT_EXEC"))
+        #expect(patchFeature.contains("SWIFT_USE_INTEGRATED_DRIVER = NO"))
+        let liveApplication = text(
+            try #require(first.artifacts[live.applicationConfiguration])
+        )
+        #expect(!liveApplication.contains("SWIFT_EXEC"))
+        #expect(liveApplication.contains(
+            "\"$(HELIX_BRIDGE_OBJECT)\" -Xlinker -u -Xlinker _hlx_bridge_provider_v1"
+        ))
         let patchProfile = text(
             try #require(first.artifacts[patch.commonConfiguration])
         )
@@ -106,15 +113,11 @@ struct XcodeIntegrationContract {
         #expect(liveProfile.contains("EMIT_FRONTEND_COMMAND_LINES = YES"))
         #expect(!patchProfile.contains("EMIT_FRONTEND_COMMAND_LINES = YES"))
 
-        let source = "Sources/Live Feature.swift"
-        let bridgeList = text(try #require(first.artifacts[live.bridgeSourceList]))
-        #expect(bridgeList.contains(
-            BridgeGeneration.Generator.entrySourcePath(for: source)
-        ))
-        #expect(bridgeList.contains(
-            BridgeGeneration.Generator.nativeImportSourcePath(for: source)
-        ))
-        #expect(bridgeList.contains("Generated/LiveFeatureBridge.DevBuildContract.swift"))
+        #expect(first.artifacts[live.bridgePhaseScript] != nil)
+        #expect(!first.artifacts.keys.contains { $0.hasSuffix("Sources.xcfilelist") })
+        #expect(!first.artifacts.keys.contains { $0.hasSuffix("Bridge.xcconfig") })
+        #expect(guide.contains("never add Helix"))
+        #expect(guide.contains("DerivedData output to the project"))
         let dispatcher = text(
             try #require(first.artifacts["Scripts/helix-phase.sh"])
         )
@@ -134,7 +137,76 @@ struct XcodeIntegrationContract {
         #expect(proxyText.contains("FrontendInvocation.hlxswiftc"))
         #expect(proxyText.contains("has_module=false"))
         #expect(proxyText.contains("[ \"$has_sdk\" = true ]"))
-        #expect(proxyText.contains("exec \"$real_compiler\" \"$@\""))
+        let invocation = try #require(proxyText.range(of: "\"$real_compiler\" \"$@\""))
+        let capture = try #require(proxyText.range(of: "mv -f \"$temporary\" \"$capture_file\""))
+        #expect(invocation.lowerBound < capture.lowerBound)
+        #expect(proxyText.contains("compiler_status=$?"))
+    }
+
+    @Test("Hidden Bridge compilation preserves semantics but rejects Feature build outputs")
+    func plansHiddenBridgeCompilation() throws {
+        let root = URL(fileURLWithPath: "/tmp/Helix Bridge")
+        let output = root.appendingPathComponent("Bridge.o")
+        let sources = [
+            root.appendingPathComponent("Generated/Entry.swift"),
+            root.appendingPathComponent("Generated/Provider.swift"),
+        ]
+        let plan = try XcodeIntegration.BridgeCompilationPlanner().plan(
+            compilerPath: "/Toolchain/usr/bin/swiftc",
+            capturedArguments: [
+                "-module-name", "DemoApp",
+                "-target", "arm64-apple-ios15.0-simulator",
+                "-sdk", "/SDK/iPhoneSimulator.sdk",
+                "-I", "/Build/Products/Debug-iphonesimulator",
+                "-F", "/Build/Products/Debug-iphonesimulator",
+                "-D", "DEBUG",
+                "-Xcc", "-fmodule-map-file=/tmp/module.modulemap",
+                "-output-file-map", "/tmp/AppOutputs.json",
+                "-emit-module-path", "/tmp/DemoApp.swiftmodule",
+                "/Sources/App.swift",
+                "-Onone",
+            ],
+            expectedCompilerPath: "/Toolchain/usr/bin/swiftc",
+            expectedCapturedModuleName: "DemoApp",
+            expectedTargetTriple: "arm64-apple-ios15.0-simulator",
+            expectedSDKPath: "/SDK/iPhoneSimulator.sdk",
+            expectedOptimization: "-Onone",
+            clangModuleMapURLs: [URL(fileURLWithPath: "/Modules/Runtime.modulemap")],
+            generatedSourceURLs: sources,
+            outputURL: output,
+            moduleName: "HelixBridge_fixture"
+        )
+        #expect(plan.compilerURL.path == "/Toolchain/usr/bin/swiftc")
+        #expect(plan.arguments.contains("-whole-module-optimization"))
+        #expect(plan.arguments.contains("-enable-private-imports"))
+        #expect(plan.arguments.contains("-enable-dynamic-replacement-chaining"))
+        #expect(plan.arguments.contains("DEBUG"))
+        #expect(plan.arguments.contains("-fmodule-map-file=/Modules/Runtime.modulemap"))
+        #expect(plan.arguments.contains("/Build/Products/Debug-iphonesimulator"))
+        #expect(!plan.arguments.contains("/Sources/App.swift"))
+        #expect(!plan.arguments.contains("/tmp/AppOutputs.json"))
+        #expect(!plan.arguments.contains("/tmp/DemoApp.swiftmodule"))
+        #expect(plan.arguments.suffix(2) == ["-o", output.path])
+
+        #expect(throws: XcodeIntegration.BridgeCompilationError.captureMismatch) {
+            try XcodeIntegration.BridgeCompilationPlanner().plan(
+                compilerPath: "/Toolchain/usr/bin/swiftc",
+                capturedArguments: [
+                    "-module-name", "DemoApp",
+                    "-target", "x86_64-apple-ios15.0-simulator",
+                    "-sdk", "/SDK/iPhoneSimulator.sdk",
+                ],
+                expectedCompilerPath: "/Toolchain/usr/bin/swiftc",
+                expectedCapturedModuleName: "DemoApp",
+                expectedTargetTriple: "arm64-apple-ios15.0-simulator",
+                expectedSDKPath: "/SDK/iPhoneSimulator.sdk",
+                expectedOptimization: "-Onone",
+                clangModuleMapURLs: [],
+                generatedSourceURLs: sources,
+                outputURL: output,
+                moduleName: "HelixBridge_fixture"
+            )
+        }
     }
 
     @Test("Host Plan fails closed on unknown fields, duplicate sources, and path expansion")
@@ -159,9 +231,7 @@ struct XcodeIntegrationContract {
         }
 
         var colliding = makePlan()
-        colliding.features[1].moduleName = colliding.features[0].bridgeModuleName
-        colliding.features[1].bridgeModuleName =
-            "\(colliding.features[1].moduleName)HelixBridge"
+        colliding.features[1].moduleName = colliding.features[0].moduleName
         #expect(throws: XcodeIntegration.Error.self) {
             try colliding.validate()
         }
@@ -203,6 +273,8 @@ struct XcodeIntegrationContract {
             "BUILD_DIR": root.appendingPathComponent("DerivedData/Build/Products").path,
             "CONFIGURATION": "Debug",
             "PLATFORM_NAME": "iphonesimulator",
+            "SDKROOT": root.appendingPathComponent("iPhoneSimulator.sdk").path,
+            "GENERATED_MODULEMAP_DIR": root.appendingPathComponent("ModuleMaps").path,
             "ARCHS": "arm64",
             "CURRENT_ARCH": "arm64e",
             "IPHONEOS_DEPLOYMENT_TARGET": "15.0",
@@ -342,6 +414,8 @@ struct XcodeIntegrationContract {
             "BUILD_DIR": buildDirectory.path,
             "CONFIGURATION": "Release",
             "PLATFORM_NAME": "iphonesimulator",
+            "SDKROOT": root.appendingPathComponent("iPhoneSimulator.sdk").path,
+            "GENERATED_MODULEMAP_DIR": root.appendingPathComponent("ModuleMaps").path,
             "CURRENT_ARCH": "arm64",
             "IPHONEOS_DEPLOYMENT_TARGET": "15.0",
             "SDK_PRODUCT_BUILD_VERSION": "24A1",

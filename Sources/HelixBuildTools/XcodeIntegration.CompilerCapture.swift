@@ -29,7 +29,7 @@ public enum CompilerCapture {
         return Data(
             """
             #!/bin/sh
-            set -eu
+            set -u
             umask 077
 
             real_compiler=\(compiler)
@@ -54,6 +54,12 @@ public enum CompilerCapture {
                     -sdk) has_sdk=true ;;
                 esac
             done
+            "$real_compiler" "$@"
+            compiler_status=$?
+            if [ "$compiler_status" -ne 0 ]; then
+                exit "$compiler_status"
+            fi
+
             if [ "$has_module" = true ] && [ "$has_target" = true ] && [ "$has_sdk" = true ]; then
                 temporary=$(/usr/bin/mktemp "$proxy_directory/.FrontendInvocation.XXXXXX")
                 {
@@ -66,8 +72,7 @@ public enum CompilerCapture {
             fi
             temporary=
             trap - 0 1 2 15
-
-            exec "$real_compiler" "$@"
+            exit 0
 
             """.utf8
         )

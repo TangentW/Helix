@@ -31,7 +31,7 @@ flowchart TB
     ROUTE --> DHLBC["开发期 HLBC"]
     NATIVE --> DR["HelixDevAppRuntime"]
     DHLBC --> DR
-    DR --> UI["UIKit invalidation / hook / recreate 或 SwiftUI pulse"]
+    DR --> UI["自动 UIKit 实例 invalidation 或 SwiftUI pulse"]
 ```
 
 ## 共享合同
@@ -59,11 +59,13 @@ flowchart TB
 
 ## 开发期架构
 
+Xcode 工程只包含原始 Feature 源码和稳定 App Runtime import。Build pre-action 在 DerivedData 中 materialize Shell；App phase 根据捕获的 Feature 调用重建编译参数，把全部生成 Bridge 源码私下编译成一个经过校验的 relocatable object。App 链接时保留稳定 C provider 符号，`ApplicationSession` 因此无需 Bridge framework、生成源码 target 或生成 Swift import 就能取得合同。
+
 Xcode 集成会从一次真实 Debug Build 中捕获 frontend、link、SDK、module、源码和签名事实。源码监控器把编辑器写入与原子 rename 整理成稳定、单调递增编号的快照。开发编译器在原 module 上下文中重新检查整个 transaction，并把所有变化 root 路由到同一个安全后端。
 
 在已经验证的 Simulator Native 路径上，Helix 只提取已有 replacement root，使用 typed AST 的声明身份保持普通递归语义，生成 `@_dynamicReplacement` 源码，编译并签名一个唯一 dylib，然后把其字节传给 App。每个成功 generation 都是一个新 image，并不是持续向同一个动态库追加 Swift 文件。
 
-Debug App 先激活代码，再刷新 UI。`ReloadIndex` 把变化 root 映射到存活的 UIKit 或 SwiftUI 边界。没有安全刷新策略时，Helix 会明确报告“代码已激活，但需要手动刷新”，不会猜测并重放任意生命周期方法。
+Debug App 先激活代码，再刷新 UI。`ReloadIndex` 把变化 root 映射为稳定 nominal type ID。UIKit 会从已展示 controller/view class（包括 superclass 链）还原这些 ID，无需业务注册表即可执行推导出的 invalidation；SwiftUI 使用显式 pulse boundary。没有安全刷新策略或存活目标时，Helix 会明确报告“代码已激活，但需要手动刷新”，不会猜测并重放任意生命周期方法。
 
 从保存到页面变化的完整过程见[开发期热重载](Development-Live-Reload.zh-CN.md)。
 

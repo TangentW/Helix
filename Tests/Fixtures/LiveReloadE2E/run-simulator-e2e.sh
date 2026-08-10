@@ -12,6 +12,7 @@ script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/../../.." && pwd -P)"
 generated_directory="$script_directory/.helix-e2e"
 derived_data="$generated_directory/DerivedData"
+profile_output="$derived_data/Build/Products/HelixGenerated/live"
 source_file="$script_directory/Sources/LiveReloadE2E.Feature.swift"
 project="$script_directory/LiveReloadE2EHost.xcodeproj"
 scheme="LiveReloadE2EHost"
@@ -105,40 +106,8 @@ value_from_log() {
 mkdir -p "$generated_directory"
 cd "$repository_root"
 swift build --product helix
-
-xcode_build="$(xcodebuild -version | awk '/Build version/ { print $3; exit }')"
-sdk_build="$(xcrun --sdk iphonesimulator --show-sdk-build-version)"
-compiler="$(xcrun --find swiftc)"
-
-"$helix" shell metadata \
-    --bundle-id "$bundle_id" \
-    --build-number 1 \
-    --namespace-seed live-reload-e2e \
-    --module LiveReloadE2E \
-    --target arm64-apple-ios15.0-simulator \
-    --minimum-os 15.0.0 \
-    --xcode-build "$xcode_build" \
-    --sdk-name iphonesimulator \
-    --sdk-build "$sdk_build" \
-    --optimization=-Onone \
-    --semantic-argument=-parse-as-library \
-    --semantic-argument=-Xfrontend \
-    --semantic-argument=-enable-implicit-dynamic \
-    --output "$generated_directory/ReleaseMetadata.json" \
-    --force
-
-"$helix" shell index \
-    --metadata "$generated_directory/ReleaseMetadata.json" \
-    --configuration "$script_directory/Helix.yml" \
-    --source-map "Sources/LiveReloadE2E.Feature.swift=$source_file" \
-    --compiler "$compiler" \
-    --output "$generated_directory/ShellBuildReceipt.json" \
-    --force
-
-"$helix" shell build \
-    --receipt "$generated_directory/ShellBuildReceipt.json" \
-    --source-root "$script_directory" \
-    --output "$generated_directory/ShellDerived" \
+"$helix" xcode generate \
+    --plan "$script_directory/HelixXcode.json" \
     --force
 
 xcodebuild \
@@ -152,9 +121,9 @@ xcodebuild \
 echo "Built LiveReloadE2EHost."
 
 "$helix" shell finalize \
-    --archive "$generated_directory/ShellDerived/Shell.provisional.hlxi" \
+    --archive "$profile_output/Shell/Shell.provisional.hlxi" \
     --executable "$executable" \
-    --output "$generated_directory/Shell.final.hlxi" \
+    --output "$profile_output/Shell.final.hlxi" \
     --force
 
 "$helix" dev prepare \
@@ -166,8 +135,8 @@ echo "Built LiveReloadE2EHost."
     --bundle-id "$bundle_id" \
     --module LiveReloadE2E \
     --executable "$executable" \
-    --reload-index "$generated_directory/ShellDerived/ReloadIndex.json" \
-    --archive "$generated_directory/Shell.final.hlxi" \
+    --reload-index "$profile_output/Shell/ReloadIndex.json" \
+    --archive "$profile_output/Shell.final.hlxi" \
     --manifest-output "$generated_directory/DevBuildManifest.json" \
     --native-output-directory "$generated_directory/Native" \
     --output "$generated_directory/HelixDev.json" \

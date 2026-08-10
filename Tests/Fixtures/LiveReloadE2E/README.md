@@ -16,19 +16,25 @@ Tests/Fixtures/LiveReloadE2E/run-simulator-e2e.sh \
   AF763A53-66CF-405B-AE92-F5A9CDECE0CE
 ```
 
-The script rebuilds all generated fixture artifacts under `.helix-e2e`, starts
-an ephemeral authenticated Dev session, restores the Swift source byte-for-byte
-on every exit path, and leaves build/daemon logs for diagnosis. It requires
-Xcode, an arm64 Mac, and an installed iOS Simulator runtime. The script waits
-for the requested device to finish booting. No third-party test driver is
-required.
+The script regenerates the hidden Xcode Integration Kit, builds the Feature and
+App, starts an ephemeral authenticated Dev session, restores the Swift source
+byte-for-byte on every exit path, and leaves build/daemon logs under
+`.helix-e2e` for diagnosis. Generated Bridge Swift is compiled only into
+DerivedData; it is not referenced by the project. The host imports only
+`HelixDevRuntime`, creates one `ApplicationSession`, and has no `typeRegistry`
+or `LiveReload.Reloadable` hook. This makes the fixture an acceptance test for
+both low-cost integration and automatic UIKit instance discovery.
 
-The host and Bridge must link only the `HelixDevAppRuntime` Swift package product.
-Adding overlapping leaf products can load the same Swift metadata more than
-once; Helix now rejects that topology at bootstrap through the generated
-`RuntimeImageIdentity` contract. A Release target instead links only
-`HelixAppRuntime`, which excludes Dev transport, dynamic loading, and overlay
-code.
+The fixture requires Xcode, an arm64 Mac, and an installed iOS Simulator
+runtime. It waits for the requested device to finish booting. No third-party
+test driver is required.
+
+The host links only the `HelixDevAppRuntime` Swift package product; the hidden
+Bridge object uses that same runtime image. Adding overlapping leaf products
+can load the same Swift metadata more than once, so Helix rejects that topology
+through the generated `RuntimeImageIdentity` contract. A Release target instead
+links only `HelixAppRuntime`, which excludes Dev transport, dynamic loading, and
+overlay code.
 
 Run the independent production-graph check from the repository root:
 

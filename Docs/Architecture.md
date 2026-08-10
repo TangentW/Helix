@@ -40,7 +40,7 @@ flowchart TB
     ROUTE --> DHLBC["Development HLBC"]
     NATIVE --> DR["HelixDevAppRuntime"]
     DHLBC --> DR
-    DR --> UI["UIKit invalidation / hook / recreate or SwiftUI pulse"]
+    DR --> UI["Automatic UIKit instance invalidation or SwiftUI pulse"]
 ```
 
 ## Shared contracts
@@ -86,6 +86,14 @@ See [Production Hot Patching](Production-Hot-Patching.md) for the full flow.
 
 ## Development architecture
 
+The Xcode project contains only the original Feature sources and stable App
+runtime imports. A Build pre-action materializes the Shell under DerivedData;
+an App phase reconstructs the captured Feature invocation and compiles all
+generated Bridge sources into one validated relocatable object. App linking
+retains its stable C provider symbol, so `ApplicationSession` discovers the
+generated contract without a Bridge framework, generated source target, or
+generated Swift import.
+
 The Xcode integration captures the frontend, link, SDK, module, source, and
 signing facts from a real Debug build. A source monitor turns editor writes and
 atomic renames into a stable, monotonically numbered snapshot. The development
@@ -99,9 +107,12 @@ dylib, then transfers its bytes to the App. It creates a new image per accepted
 generation; it does not keep appending files to one mutable dylib.
 
 The Debug App activates code first and refreshes UI second. `ReloadIndex`
-metadata maps changed roots to live UIKit or SwiftUI boundaries. If no safe
-refresh policy exists, Helix reports that code is active but manual refresh is
-required; it does not guess by replaying arbitrary lifecycle methods.
+metadata maps changed roots to stable nominal type IDs. UIKit reconstructs those
+IDs from the displayed controller/view classes, including superclass chains,
+and applies inferred invalidation without an application registry. SwiftUI uses
+explicit pulse boundaries. If no safe refresh policy or live target exists,
+Helix reports that code is active but manual refresh is required; it does not
+guess by replaying arbitrary lifecycle methods.
 
 See [Development Live Reload](Development-Live-Reload.md) for the save-to-screen
 sequence and replacement semantics.

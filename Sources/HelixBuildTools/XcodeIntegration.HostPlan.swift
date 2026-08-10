@@ -17,7 +17,6 @@ public enum Workflow: String, Codable, CaseIterable, Hashable, Sendable {
 public struct Feature: Codable, Hashable, Sendable {
     public var id: String
     public var moduleName: String
-    public var bridgeModuleName: String
     public var sourceRoot: String
     public var patchConfigurationPath: String
     public var nativeImportCatalogPath: String?
@@ -26,7 +25,6 @@ public struct Feature: Codable, Hashable, Sendable {
     public init(
         id: String,
         moduleName: String,
-        bridgeModuleName: String? = nil,
         sourceRoot: String,
         patchConfigurationPath: String,
         nativeImportCatalogPath: String? = nil,
@@ -34,7 +32,6 @@ public struct Feature: Codable, Hashable, Sendable {
     ) {
         self.id = id
         self.moduleName = moduleName
-        self.bridgeModuleName = bridgeModuleName ?? "\(moduleName)HelixBridge"
         self.sourceRoot = sourceRoot
         self.patchConfigurationPath = patchConfigurationPath
         self.nativeImportCatalogPath = nativeImportCatalogPath
@@ -118,7 +115,7 @@ public struct Profile: Codable, Hashable, Sendable {
 /// stable project facts; volatile DerivedData paths and compiler identities are
 /// measured from the active Xcode build environment.
 public struct HostPlan: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 2
+    public static let currentSchemaVersion: UInt16 = 3
     public static let defaultFileName = "HelixXcode.json"
 
     public var schemaVersion: UInt16
@@ -167,10 +164,7 @@ public struct HostPlan: Codable, Hashable, Sendable {
         guard (1...128).contains(features.count),
               features == features.sorted(by: { $0.id < $1.id }),
               Set(features.map(\.id)).count == features.count,
-              Set(features.map(\.moduleName)).count == features.count,
-              Set(features.map(\.bridgeModuleName)).count == features.count,
-              Set(features.flatMap { [$0.moduleName, $0.bridgeModuleName] }).count
-                == features.count * 2
+              Set(features.map(\.moduleName)).count == features.count
         else {
             throw XcodeIntegration.Error.invalidHostPlan(
                 "features must be nonempty, sorted, and uniquely named"
@@ -189,9 +183,9 @@ public struct HostPlan: Codable, Hashable, Sendable {
         }
         let featureIDs = Set(features.map(\.id))
         var allSchemeNames = Set(profiles.map(\.schemeName))
-        let occupiedTargetNames = Set(features.flatMap {
-            [$0.moduleName, $0.bridgeModuleName]
-        } + profiles.map(\.applicationTargetName))
+        let occupiedTargetNames = Set(
+            features.map(\.moduleName) + profiles.map(\.applicationTargetName)
+        )
         var patchActionTargetNames = Set<String>()
         for profile in profiles {
             try Self.validate(profile)
@@ -247,8 +241,6 @@ public struct HostPlan: Codable, Hashable, Sendable {
     private static func validate(_ feature: XcodeIntegration.Feature) throws {
         guard isFileComponent(feature.id),
               isSwiftIdentifier(feature.moduleName),
-              isSwiftIdentifier(feature.bridgeModuleName),
-              feature.bridgeModuleName == "\(feature.moduleName)HelixBridge",
               isSafeRelativePath(feature.sourceRoot),
               isSafeRelativePath(feature.patchConfigurationPath),
               ["yml", "yaml"].contains(

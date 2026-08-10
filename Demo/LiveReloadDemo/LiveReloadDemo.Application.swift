@@ -1,16 +1,6 @@
 import HelixDevRuntime
-import HelixLiveReloadAPI
-import HelixRuntime
-import HelixVerifier
 import LiveReloadFeature
-import LiveReloadFeatureHelixBridge
 import UIKit
-
-extension LiveReloadFeature.ScreenViewController: @retroactive LiveReload.Reloadable {
-    public func applyLiveReload(_ context: LiveReload.Context) throws {
-        refreshAfterReload()
-    }
-}
 
 enum LiveReloadDemo {}
 
@@ -25,21 +15,8 @@ final class RuntimeOwner {
             overlayConfiguration: .init(startsExpanded: false)
         )
         self.environment = environment
-        let typeID = LiveReload.NominalTypeID.derive(
-            module: "LiveReloadFeature",
-            canonicalName: "LiveReloadFeature.ScreenViewController"
-        )
-        environment.reload.uiKit.typeRegistry.register(
-            LiveReloadFeature.ScreenViewController.self,
-            for: typeID
-        )
-        let runtime = try LiveReloadFeatureBridge.makeRuntime()
         session = try DevRuntime.ApplicationSession(
-            build: LiveReloadFeatureBridge.makeDevBuildContract(),
-            runtime: runtime,
-            shell: LiveReloadFeatureBridge.makeShellInterface(),
             environment: environment,
-            installBridge: LiveReloadFeatureBridge.bootstrap,
             options: .init(
                 supportedBackends: [.nativeDynamicReplacement, .hlbc],
                 nativeChainingProbePassed: true

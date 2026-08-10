@@ -2,4 +2,4 @@ schema: 1
 modules:
   LiveReloadE2E:
     include:
-      - Sources/**/*.swift
+      - "*.swift"

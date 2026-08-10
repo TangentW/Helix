@@ -45,11 +45,11 @@ flowchart LR
    swift run helix xcode validate --plan HelixXcode.json
    ```
 
-5. 按生成的 `.helix/xcode/Integration.md` 接线 Feature、生成 Bridge、聚合 Runtime、xcconfig、source list 与 Scheme Action，再对每个 Profile 运行 `helix xcode doctor`。
-6. 在 App 生命周期内保持生成的 Application Session 存活；要让当前页面立即刷新，还需要注册 UIKit reloadable type 或 SwiftUI boundary。
+5. 按 `.helix/xcode/Integration.md` 接线 Feature 与聚合 Runtime，设置 Feature/App xcconfig、隐藏 Bridge phase 和 Scheme Action。Xcode 工程中不会出现生成 Swift 文件或 Bridge target。随后对每个 Profile 运行 `helix xcode doctor`。
+6. 在 App 生命周期内保持一个稳定的 `ApplicationSession`；UIKit 会自动发现已展示的 controller/view 实例，SwiftUI 仍需要 pulse boundary。
 7. Live Reload 只需 Run 一次 Scheme 后保存已有 Swift body；Hot Patch 则先冻结 Release Shell，再通过只包含 Patch Target 的 Scheme 构建签名 `.hlxp`。
 
-迁移生产工程前，建议先完整运行仓库中的 [UIKit Demo](Demo/README.md)。它的 Host Plan、7 Target Xcode 图、Runtime 启动、共享 Scheme、本地 Mock 下载和保存到页面变化都是可执行示例，而不是伪代码。需要留存真实 GUI 验收记录时，按根目录的 [Xcode Run 端到端测试用例](Xcode-Run-E2E-Test-Cases.md)执行。
+迁移生产工程前，建议先完整运行仓库中的 [UIKit Demo](Demo/README.md)。它的 Host Plan、5 Target Xcode 图、Runtime 启动、共享 Scheme、本地 Mock 下载和保存到页面变化都是可执行示例，而不是伪代码。需要留存真实 GUI 验收记录时，按根目录的 [Xcode Run 端到端测试用例](Xcode-Run-E2E-Test-Cases.md)执行。
 
 ## 已实现内容
 
@@ -69,7 +69,7 @@ flowchart LR
 - 生产补丁只能调用同 image 函数、eligible Shell entry 与已发布 App 中已经生成的精确 NativeImport。
 - Live Reload 当前面向 Dev Shell 中已经存在的声明 body；新增任意文件级声明或 Swift 文件需要正常构建。
 - Stored layout、函数签名、superclass、conformance、enum case、isolation、source membership、链接依赖与 Build Settings 变化都需要正常构建。
-- 代码激活不等于 UI 已刷新。UIKit 使用显式 invalidation、reload hook 或 factory，SwiftUI 使用 pulse boundary。Helix 不会盲目重放生命周期方法。
+- 代码激活不等于 UI 已刷新。UIKit 会自动匹配已展示 controller/view 类型并执行推导出的 invalidation；初始化或重建所需的自定义 hook/factory 仍保持显式。SwiftUI 使用 pulse boundary。Helix 不会盲目重放生命周期方法。
 - Simulator Native 是当前通过验证的 Live Reload 路径。真实 iPhone Native 在精确签名与系统矩阵通过前仍是 experimental。
 - Release Builder 只接受 internal 与 enterprise HLBC policy，会拒绝 App Store HLBC 和 controlled native Release 包。
 
@@ -104,7 +104,7 @@ swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
 ```
 
-当前完整 SwiftPM 基线包含 381 个测试、63 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。可使用 Simulator UDID 运行平台 fixture：
+当前完整 SwiftPM 基线包含 384 个测试、64 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。可使用 Simulator UDID 运行平台 fixture：
 
 ```bash
 Tests/Fixtures/LiveReloadE2E/run-ios-runtime-tests.sh SIMULATOR_UDID
@@ -112,7 +112,7 @@ Tests/Fixtures/LiveReloadE2E/run-simulator-e2e.sh SIMULATOR_UDID
 Tests/Fixtures/LiveReloadE2E/run-release-audit.sh
 ```
 
-iOS target 当前包含 8 个 Runtime/UI 用例。Native Live Reload fixture 会保持同一个 App PID；仓库 Xcode Demo 会应用两次修改，再用第三个 generation 恢复 baseline。Release Audit 会构建一个只链接 `HelixAppRuntime` 的独立 iOS 15 target。
+iOS target 当前包含 9 个 Runtime/UI 用例。Native Live Reload fixture 会保持同一个 App PID；仓库 Xcode Demo 会应用两次修改，再用第三个 generation 恢复 baseline。Release Audit 会构建一个只链接 `HelixAppRuntime` 的独立 iOS 15 target。
 
 使用 Release 模式运行 microbenchmark：
 

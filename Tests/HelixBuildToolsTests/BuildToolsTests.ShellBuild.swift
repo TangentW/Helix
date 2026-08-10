@@ -71,6 +71,19 @@ struct ShellBuildPipeline {
         #expect(devContract.contains("platform: .iOS"))
         #expect(devContract.contains("runtimeImageIdentity: .current"))
         #expect(devContract.contains(output.report.reloadIndexHash.hex))
+        let provider = String(
+            decoding: try #require(
+                artifacts["Generated/FixtureBridge.Provider.swift"]
+            ),
+            as: UTF8.self
+        )
+        #expect(provider.contains("@_cdecl(\"hlx_bridge_provider_v1\")"))
+        #expect(provider.contains("Runtime.BridgeProvider"))
+        #expect(provider.contains(output.report.reloadIndexHash.hex))
+        #expect(provider.contains("makeShellInterface: {"))
+        #expect(provider.contains("try FixtureBridge.makeShellInterface()"))
+        #expect(provider.contains("install: { runtime in"))
+        #expect(provider.contains("try FixtureBridge.bootstrap(using: runtime)"))
         let planBytes = try #require(artifacts["Xcode/IntegrationPlan.json"])
         let plan = try JSONDecoder().decode(XcodeIntegration.Plan.self, from: planBytes)
         try plan.validate()
@@ -330,6 +343,13 @@ struct ShellBuildPipeline {
             FileManager.default.fileExists(
                 atPath: outputURL.appendingPathComponent(
                     "Generated/FixtureBridge.DevBuildContract.swift"
+                ).path
+            )
+        )
+        #expect(
+            FileManager.default.fileExists(
+                atPath: outputURL.appendingPathComponent(
+                    "Generated/FixtureBridge.Provider.swift"
                 ).path
             )
         )

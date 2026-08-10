@@ -1,0 +1,1 @@
+{"applicationConfiguration":"Profiles/live/Application.xcconfig","bridgePhaseScript":"Profiles/live/bridge.sh","commonConfiguration":"Profiles/live/Profile.xcconfig","featureConfiguration":"Profiles/live/Feature.xcconfig","featureModuleName":"LiveReloadE2E","profileID":"live","runtimePackageProduct":"HelixDevAppRuntime","schemaVersion":2,"workflow":"liveReload"}

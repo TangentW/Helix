@@ -250,6 +250,10 @@ struct Application {
         try XcodeIntegration.HostPlanCodec.encode(plan).write(to: planURL)
         let application = CLI.Application(currentDirectoryURL: directory)
 
+        let phaseHelp = application.run(["xcode", "phase", "--help"])
+        #expect(phaseHelp.exitCode == 0)
+        #expect(phaseHelp.standardOutput.contains("prepare, bridge, finalize"))
+
         let validation = application.run([
             "xcode", "validate", "--plan", planURL.path, "--json",
         ])
@@ -273,6 +277,9 @@ struct Application {
         ))
         #expect(FileManager.default.fileExists(
             atPath: output.appendingPathComponent("Profiles/live/live-start.sh").path
+        ))
+        #expect(FileManager.default.fileExists(
+            atPath: output.appendingPathComponent("Profiles/live/bridge.sh").path
         ))
         let scriptAttributes = try FileManager.default.attributesOfItem(
             atPath: output.appendingPathComponent("Profiles/live/live-start.sh").path
@@ -375,11 +382,17 @@ struct Application {
             executable: "/usr/bin/xcrun",
             arguments: ["--sdk", "iphonesimulator", "--show-sdk-build-version"]
         )
+        let sdkRoot = try toolOutput(
+            executable: "/usr/bin/xcrun",
+            arguments: ["--sdk", "iphonesimulator", "--show-sdk-path"]
+        )
         let environment = [
             "SRCROOT": directory.path,
             "BUILD_DIR": buildDirectory.path,
             "CONFIGURATION": "Release",
             "PLATFORM_NAME": "iphonesimulator",
+            "SDKROOT": sdkRoot,
+            "GENERATED_MODULEMAP_DIR": directory.appendingPathComponent("ModuleMaps").path,
             "CURRENT_ARCH": "arm64",
             "IPHONEOS_DEPLOYMENT_TARGET": "15.0",
             "SDK_PRODUCT_BUILD_VERSION": sdkBuild,
@@ -388,7 +401,9 @@ struct Application {
             "SWIFT_OPTIMIZATION_LEVEL": "-Onone",
             "SWIFT_EXEC": compiler,
             "SWIFT_VERSION": "6.0",
-            "OTHER_SWIFT_FLAGS": "-Xfrontend -enable-private-imports",
+            "OTHER_SWIFT_FLAGS": "-Xfrontend -enable-private-imports "
+                + "-Xfrontend -enable-implicit-dynamic "
+                + "-Xfrontend -enable-dynamic-replacement-chaining",
             "HELIX_PROFILE_ID": "patch",
             "HELIX_WORKFLOW": "hotPatch",
             "HELIX_RUNTIME_PRODUCT": "HelixAppRuntime",
@@ -415,11 +430,21 @@ struct Application {
             "ReloadIndex.json",
             "Generated/FeatureBridge.swift",
             "Generated/FeatureBridge.DevBuildContract.swift",
+            "Generated/FeatureBridge.Provider.swift",
         ] {
             #expect(FileManager.default.fileExists(
                 atPath: shell.appendingPathComponent(path).path
             ))
         }
+        for path in ["Compiler/Feature/swiftc"] {
+            let proxy = buildDirectory.appendingPathComponent(
+                "HelixGenerated/patch/\(path)"
+            )
+            #expect(FileManager.default.isExecutableFile(atPath: proxy.path))
+        }
+        #expect(!FileManager.default.fileExists(atPath: buildDirectory
+            .appendingPathComponent("HelixGenerated/patch/Compiler/Application/swiftc")
+            .path))
     }
 
     private func temporaryDirectory() throws -> URL {

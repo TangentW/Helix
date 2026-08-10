@@ -16,7 +16,10 @@ The checked-in Xcode integration under `.helix/xcode` is generated from
 `HelixXcode.json`. Local signing material, build products, sessions, and patch
 outputs are ignored. The shared schemes bootstrap the local `helix` executable
 and demo-only signing identity when required, so ordinary use stays inside
-Xcode.
+Xcode. Neither App imports generated Swift, and the project contains no Bridge
+target or generated source reference. Live Reload also has no UIKit type
+registry or page-owned reload hook; Helix finds the displayed controller from
+the compiler-emitted nominal type identity and invalidates it in place.
 
 See [Getting Started](../Docs/Getting-Started.md) for the complete existing-App
 integration, target/Scheme wiring, runtime bootstrap, and first-run checklist.

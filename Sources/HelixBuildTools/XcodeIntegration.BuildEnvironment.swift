@@ -11,6 +11,8 @@ public struct BuildEnvironment: Hashable, Sendable {
     public var architecture: String
     public var platformName: String
     public var sdkName: String
+    public var sdkRootURL: URL
+    public var generatedModuleMapDirectoryURL: URL
     public var sdkBuild: String
     public var xcodeBuild: String
     public var minimumOS: String
@@ -31,16 +33,28 @@ public struct BuildEnvironment: Hashable, Sendable {
         profileOutputURL.appendingPathComponent("HelixDev.json")
     }
 
+    public var featureCompilerDirectoryURL: URL {
+        profileOutputURL.appendingPathComponent("Compiler/Feature", isDirectory: true)
+    }
+
     public var compilerProxyURL: URL {
-        profileOutputURL.appendingPathComponent(
+        featureCompilerDirectoryURL.appendingPathComponent(
             XcodeIntegration.CompilerCapture.proxyFileName
         )
     }
 
     public var frontendInvocationURL: URL {
-        profileOutputURL.appendingPathComponent(
+        featureCompilerDirectoryURL.appendingPathComponent(
             XcodeIntegration.CompilerCapture.invocationFileName
         )
+    }
+
+    public var bridgeOutputURL: URL {
+        profileOutputURL.appendingPathComponent("Bridge", isDirectory: true)
+    }
+
+    public var bridgeObjectURL: URL {
+        bridgeOutputURL.appendingPathComponent("HelixBridge.o")
     }
 
     public var targetTriple: String {
@@ -157,7 +171,12 @@ public struct EnvironmentResolver: Sendable {
         } else {
             profileOutput = expectedProfileOutput
         }
-        guard Self.contains(profileOutput, in: buildDirectory) else {
+        guard Self.contains(profileOutput, in: buildDirectory),
+              Self.contains(
+                  profileOutput.resolvingSymlinksInPath(),
+                  in: buildDirectory.resolvingSymlinksInPath()
+              )
+        else {
             throw XcodeIntegration.EnvironmentError.unsafePath(profileOutput.path)
         }
 
@@ -172,6 +191,13 @@ public struct EnvironmentResolver: Sendable {
                 value: platform
             )
         }
+        // Scheme pre-actions expose SDKROOT as a logical name such as
+        // `iphonesimulator26.5`; target phases also provide the resolved SDK_DIR.
+        let sdkRoot = try path(
+            nonempty("SDK_DIR", in: variables) == nil ? "SDKROOT" : "SDK_DIR",
+            in: variables
+        )
+        let generatedModuleMaps = try path("GENERATED_MODULEMAP_DIR", in: variables)
         let architecture = try architecture(in: variables)
         let minimumOS = try required("IPHONEOS_DEPLOYMENT_TARGET", in: variables)
         _ = try Core.SemanticVersion(parsing: minimumOS)
@@ -187,7 +213,7 @@ public struct EnvironmentResolver: Sendable {
         }
         let compiler = try compilerURL(in: variables)
         let semanticArguments = try requireFeatureCompilerSettings
-            ? semanticArguments(workflow: profile.workflow, variables: variables)
+            ? semanticArguments(variables: variables)
             : []
         let invocation = InterfaceArchive.FrontendInvocation(
             moduleName: feature.moduleName,
@@ -208,6 +234,8 @@ public struct EnvironmentResolver: Sendable {
             architecture: architecture,
             platformName: platform,
             sdkName: sdkName,
+            sdkRootURL: sdkRoot,
+            generatedModuleMapDirectoryURL: generatedModuleMaps,
             sdkBuild: sdkBuild,
             xcodeBuild: xcodeBuild,
             minimumOS: minimumOS,
@@ -243,7 +271,6 @@ public struct EnvironmentResolver: Sendable {
     }
 
     private func semanticArguments(
-        workflow: XcodeIntegration.Workflow,
         variables: [String: String]
     ) throws -> [String] {
         var result = ["-parse-as-library"]
@@ -289,17 +316,15 @@ public struct EnvironmentResolver: Sendable {
                 actual: variables["OTHER_SWIFT_FLAGS"] ?? ""
             )
         }
-        if workflow == .liveReload {
-            for requiredFlag in [
-                "-enable-implicit-dynamic",
-                "-enable-dynamic-replacement-chaining",
-            ] where !result.contains(requiredFlag) {
-                throw XcodeIntegration.EnvironmentError.mismatch(
-                    name: "OTHER_SWIFT_FLAGS",
-                    expected: requiredFlag,
-                    actual: variables["OTHER_SWIFT_FLAGS"] ?? ""
-                )
-            }
+        for requiredFlag in [
+            "-enable-implicit-dynamic",
+            "-enable-dynamic-replacement-chaining",
+        ] where !result.contains(requiredFlag) {
+            throw XcodeIntegration.EnvironmentError.mismatch(
+                name: "OTHER_SWIFT_FLAGS",
+                expected: requiredFlag,
+                actual: variables["OTHER_SWIFT_FLAGS"] ?? ""
+            )
         }
         guard !result.contains(where: { $0.contains("$" ) }) else {
             throw XcodeIntegration.EnvironmentError.malformedArguments(
@@ -350,7 +375,7 @@ public struct EnvironmentResolver: Sendable {
 
     private func compilerURL(in variables: [String: String]) throws -> URL {
         var pathValues: [String] = []
-        // Live Reload's SWIFT_EXEC is a transparent capture proxy. Keep the
+        // Helix's SWIFT_EXEC is a transparent capture proxy. Keep the
         // active toolchain compiler explicit so Shell generation and replay do
         // not accidentally identify the proxy as the Swift toolchain.
         if let swift = nonempty("HELIX_REAL_SWIFT_EXEC", in: variables) {

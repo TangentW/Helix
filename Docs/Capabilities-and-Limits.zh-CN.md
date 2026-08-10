@@ -14,7 +14,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | 开发期 HLBC | 后端路由和会话绑定的验证后 HLBC artifact | 与 Native 编译器相同的源码覆盖；不支持的 root 仍需完整构建 |
 | 控制面 | 客户端包与 policy 合同 | 生产 Registry、HSM 运维、审批、灰度、遥测和设备群协调服务 |
 
-当前 SwiftPM 基线包含 381 个测试、63 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。iOS Simulator target 覆盖 8 个 Runtime 与 UI 用例。这些数字代表仓库证据，不代表真机或分发认证。
+当前 SwiftPM 基线包含 384 个测试、64 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。iOS Simulator target 覆盖 9 个 Runtime 与 UI 用例。这些数字代表仓库证据，不代表真机或分发认证。
 
 ## 生产 HLBC 1.9 的 Swift 子集
 
@@ -68,14 +68,15 @@ Simulator Native 是当前已经验证的路径。真实 iPhone Native 在每个
 
 代码替换决定下一次函数调用的行为；UI invalidation 决定用户是否立即看到结果。
 
-- 简单 render 与 layout 修改可以使用显式 constraint、layout 和 display hint。
-- 有状态 UIKit 页面应实现幂等 `LiveReload.Reloadable` hook。
+- Helix 会从已展示实例的运行时 class 自动还原 controller/view identity，并支持沿 superclass 匹配；UIKit 不需要 type registry。
+- 常见 render 与 layout callback 会自动推导 constraint、layout 和 display invalidation，并保留原页面实例与内存状态。
+- 初始化或业务自有刷新逻辑可以使用幂等 `LiveReload.Reloadable` hook；它不是普通接入前置条件。
 - 重建 Controller 需要注册 Factory、route context、state capture/restore 和容器支持。
 - SwiftUI 需要 `liveReloadBoundary`；`invalidateBody` 尽量保留 identity，`recreateSubtree` 会重置该 boundary 的局部状态。
 - Helix 不会自动重放 `viewDidLoad`、`loadView`、initializer、observer 注册、subscription 或任意生命周期 callback。
 - 没有安全目标或规则时，代码可以保持激活，但结果会是 `manualRefreshRequired`。
 
-仓库 fixture 已证明基础 UIKit 目标解析、invalidation、状态保持、SwiftUI pulse 路由和 Debug Overlay 行为；它们不能认证所有 custom container、navigation/sheet 交互、observation graph 或长期副作用模式。
+仓库 fixture 已证明无需注册的 UIKit controller/view 与 superclass 自动匹配、invalidation、状态保持、SwiftUI pulse 路由和 Debug Overlay 行为；它们不能认证所有 custom container、navigation/sheet 交互、observation graph 或长期副作用模式。
 
 ## 安全与资源边界
 

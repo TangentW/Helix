@@ -15,6 +15,35 @@ public final class ApplicationSession {
 
     private var debuggerHandoffTask: Task<Void, Never>?
 
+    /// Creates a Dev session from the hidden Bridge linked by the Helix Xcode
+    /// phase. The optional provider exists for tests and advanced composition;
+    /// ordinary App code uses the linked provider automatically.
+    public convenience init(
+        environment: DevRuntime.LiveReloadEnvironment = .init(),
+        options: DevRuntime.Bootstrap.Options = .init(),
+        debuggerHandoffEnabled: Bool = true,
+        launchEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        bridgeProvider: Runtime.BridgeProvider? = nil
+    ) throws {
+        let provider: Runtime.BridgeProvider
+        if let bridgeProvider {
+            provider = bridgeProvider
+        } else {
+            provider = try Runtime.LinkedBridge.load()
+        }
+        let runtime = try provider.makeRuntime()
+        try self.init(
+            build: DevRuntime.BuildContract(bridge: provider.descriptor),
+            runtime: runtime,
+            shell: provider.makeShellInterface(),
+            environment: environment,
+            installBridge: provider.install(on:),
+            options: options,
+            debuggerHandoffEnabled: debuggerHandoffEnabled,
+            launchEnvironment: launchEnvironment
+        )
+    }
+
     public init(
         build: DevRuntime.BuildContract,
         runtime: Runtime.Engine,

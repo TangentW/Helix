@@ -1,5 +1,6 @@
 import Foundation
 import HelixCore
+import HelixRuntime
 
 /// App-side assembly helpers for the production-safe HLBC runtime graph.
 public enum PatchRuntime {}
@@ -37,6 +38,21 @@ public struct BuildContract: Hashable, Sendable {
         self.nativeImportIDs = nativeImportIDs
         self.runtimeImageIdentity = runtimeImageIdentity
         try validate()
+    }
+
+    public init(bridge descriptor: Runtime.BridgeDescriptor) throws {
+        try descriptor.validate()
+        try self.init(
+            bundleID: descriptor.bundleID,
+            buildNumber: descriptor.buildNumber,
+            shellNamespaceID: descriptor.shellNamespaceID,
+            shellInterfaceHash: descriptor.shellInterfaceHash,
+            minimumOSVersion: descriptor.minimumOSVersion,
+            compatibility: descriptor.compatibility,
+            capabilities: descriptor.capabilities,
+            nativeImportIDs: descriptor.nativeImportIDs,
+            runtimeImageIdentity: descriptor.runtimeImageIdentity
+        )
     }
 
     public func validate() throws {

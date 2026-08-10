@@ -11,6 +11,15 @@ enum DevRuntimeIOSTests {}
 
 extension DevRuntimeIOSTests {
 @MainActor
+class IdentityController: UIViewController {}
+
+@MainActor
+final class IdentityChildController: IdentityController {}
+
+@MainActor
+final class IdentityView: UIView {}
+
+@MainActor
 @Suite("UIKit Live Reload integration")
 struct UIKitIntegration {
     private final class FixtureController: UIViewController {}
@@ -55,20 +64,82 @@ struct UIKitIntegration {
         }
     }
 
-    @Test("A nominal identity maps to exactly one UIKit target kind")
-    func registryTargetKindIsExclusive() {
-        let id = LiveReload.NominalTypeID.derive(
-            module: "Fixture",
-            canonicalName: "FixtureController"
+    @Test("Runtime type names reproduce compiler nominal identities")
+    func derivesRuntimeTypeIdentities() {
+        let resolver = UIKitReload.TypeIdentityResolver()
+        let nested = resolver.nominalTypeID(
+            reflectedName: "FeatureModule.FeatureNamespace.ScreenController"
         )
-        let registry = UIKitReload.TypeRegistry()
-        registry.register(FixtureController.self, for: id)
-        #expect(registry.controllerType(for: id) == FixtureController.self)
-        #expect(registry.viewType(for: id) == nil)
+        #expect(nested == LiveReload.NominalTypeID.derive(
+            module: "FeatureModule",
+            canonicalName: "FeatureNamespace.ScreenController"
+        ))
+        #expect(resolver.nominalTypeID(reflectedName: "UnqualifiedType") == nil)
+        #expect(resolver.nominalTypeID(reflectedName: "Module.") == nil)
 
-        registry.register(FixtureView.self, for: id)
-        #expect(registry.controllerType(for: id) == nil)
-        #expect(registry.viewType(for: id) == FixtureView.self)
+        let baseID = LiveReload.NominalTypeID.derive(
+            module: "LiveReloadUIKitTests",
+            canonicalName: "DevRuntimeIOSTests.IdentityController"
+        )
+        let childID = LiveReload.NominalTypeID.derive(
+            module: "LiveReloadUIKitTests",
+            canonicalName: "DevRuntimeIOSTests.IdentityChildController"
+        )
+        let childIDs = resolver.nominalTypeIDs(
+            for: DevRuntimeIOSTests.IdentityChildController.self
+        )
+        #expect(childIDs.contains(childID))
+        #expect(childIDs.contains(baseID))
+    }
+
+    @Test("Displayed subclass and view instances match actions without registration")
+    func resolvesActionsWithoutRegistry() throws {
+        let baseID = LiveReload.NominalTypeID.derive(
+            module: "LiveReloadUIKitTests",
+            canonicalName: "DevRuntimeIOSTests.IdentityController"
+        )
+        let childID = LiveReload.NominalTypeID.derive(
+            module: "LiveReloadUIKitTests",
+            canonicalName: "DevRuntimeIOSTests.IdentityChildController"
+        )
+        let viewID = LiveReload.NominalTypeID.derive(
+            module: "LiveReloadUIKitTests",
+            canonicalName: "DevRuntimeIOSTests.IdentityView"
+        )
+        let resolver = UIKitReload.InstanceActionResolver()
+        let controllerResult = resolver.resolve(
+            [
+                .init(
+                    nominalTypeID: baseID,
+                    policy: .invalidate,
+                    invalidationHints: [.layout]
+                ),
+                .init(
+                    nominalTypeID: childID,
+                    policy: .invalidate,
+                    invalidationHints: [.display]
+                ),
+            ],
+            in: [DevRuntimeIOSTests.IdentityChildController()]
+        )
+        #expect(controllerResult.matches.count == 1)
+        #expect(controllerResult.matches.first?.action.invalidationHints == [.layout, .display])
+        #expect(controllerResult.matchedNominalTypeIDs == [baseID, childID])
+        #expect(controllerResult.errors.isEmpty)
+
+        let viewResult = resolver.resolve(
+            [
+                .init(
+                    nominalTypeID: viewID,
+                    policy: .invalidate,
+                    invalidationHints: [.display]
+                ),
+            ],
+            in: [DevRuntimeIOSTests.IdentityView()]
+        )
+        #expect(viewResult.matches.count == 1)
+        #expect(viewResult.matchedNominalTypeIDs == [viewID])
+        #expect(viewResult.errors.isEmpty)
     }
 
     @Test("Transparent overlay space does not consume application touches")
@@ -93,21 +164,26 @@ struct UIKitIntegration {
         #expect(invoker.effects.requiresMainActor)
     }
 
-    @Test("Subview resolution finds nested registered views once")
+    @Test("Subview resolution covers controller and direct window trees once")
     func resolvesNestedViews() {
         let controller = FixtureController()
         controller.loadViewIfNeeded()
         let outer = FixtureView()
         let inner = FixtureView()
+        let directWindowView = FixtureView()
+        let window = UIWindow()
         outer.addSubview(inner)
         controller.view.addSubview(outer)
+        window.addSubview(directWindowView)
 
         let resolved = UIKitReload.InstanceResolver().views(
-            matching: FixtureView.self,
-            in: [controller, controller]
+            in: [controller, controller],
+            windows: [window, window]
         )
-        #expect(resolved.count == 2)
-        #expect(Set(resolved.map(ObjectIdentifier.init)).count == 2)
+        let fixtures = resolved.compactMap { $0 as? FixtureView }
+        #expect(fixtures.count == 3)
+        #expect(fixtures.contains { $0 === directWindowView })
+        #expect(Set(resolved.map(ObjectIdentifier.init)).count == resolved.count)
     }
 
     @Test("Data invalidation is not reported as applied when broad reload is disabled")
@@ -188,6 +264,7 @@ struct UIKitIntegration {
         )
         #expect(status == .refreshed)
         #expect(environment.reload.latestReport?.refreshedTargetCount == 1)
+        #expect(environment.reload.latestReport?.warnings.isEmpty == true)
         #expect(pulse.refreshSequence(for: id) == 1)
 
         environment.status.handle(

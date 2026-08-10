@@ -18,9 +18,9 @@ practical boundary.
 | Development HLBC | Backend routing and session-bound verified HLBC artifacts | The same source coverage as the native compiler; unsupported roots still require a build |
 | Control plane | Client-side package and policy contracts | Production Registry, HSM operations, approval, rollout, telemetry, and fleet coordination services |
 
-The checked-in SwiftPM baseline contains 381 tests in 63 suites. Debug,
+The checked-in SwiftPM baseline contains 384 tests in 64 suites. Debug,
 warnings-as-errors, and optimized Release runs are recorded as passing. An iOS
-Simulator target covers 8 runtime and UI cases. Those counts describe repository
+Simulator target covers 9 runtime and UI cases. Those counts describe repository
 evidence, not device or distribution certification.
 
 ## Production HLBC 1.9 Swift subset
@@ -106,9 +106,13 @@ provisioning, Team ID, and dependency combination passes the device matrix.
 Code replacement affects the next function call; UI invalidation determines
 whether a user sees that behavior immediately.
 
-- Simple rendering and layout edits can use explicit constraint, layout, and
-  display invalidation hints.
-- Stateful UIKit pages should use an idempotent `LiveReload.Reloadable` hook.
+- Helix derives controller/view identities from displayed runtime classes and
+  automatically matches changed types, including superclass changes; no UIKit
+  type registry is required.
+- Common rendering and layout callbacks infer constraint, layout, and display
+  invalidation and preserve the existing page instance and in-memory state.
+- Initialization or application-owned refresh work may use an idempotent
+  `LiveReload.Reloadable` hook; it is not routine setup.
 - Controller reconstruction requires a registered factory, route context, state
   capture/restore, and container support.
 - SwiftUI requires a `liveReloadBoundary`; `invalidateBody` attempts to preserve
@@ -118,10 +122,11 @@ whether a user sees that behavior immediately.
 - If there is no safe target or rule, code can remain active while the result is
   `manualRefreshRequired`.
 
-The checked-in fixtures prove basic UIKit target resolution, invalidation,
-state preservation, SwiftUI pulse routing, and Debug Overlay behavior. They do
-not qualify every custom container, navigation/sheet interaction, observation
-graph, or long-running side effect pattern.
+The checked-in fixtures prove automatic UIKit controller/view and superclass
+matching without registration, invalidation, state preservation, SwiftUI pulse
+routing, and Debug Overlay behavior. They do not qualify every custom
+container, navigation/sheet interaction, observation graph, or long-running
+side effect pattern.
 
 ## Security and resource boundaries
 

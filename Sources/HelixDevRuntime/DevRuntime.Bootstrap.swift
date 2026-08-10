@@ -40,6 +40,25 @@ public struct BuildContract: Hashable, Sendable {
         try validate()
     }
 
+    public init(bridge descriptor: Runtime.BridgeDescriptor) throws {
+        try descriptor.validate()
+        let platform: DevProtocol.ApplePlatform
+        switch descriptor.platform {
+        case .iOS: platform = .iOS
+        case .iOSSimulator: platform = .iOSSimulator
+        case .macOS: platform = .macOS
+        }
+        try self.init(
+            bundleID: descriptor.bundleID,
+            platform: platform,
+            architecture: descriptor.architecture,
+            xcodeBuild: descriptor.xcodeBuild,
+            swiftCompilerFingerprint: descriptor.compatibility.compilerFingerprint,
+            liveReloadIndexHash: descriptor.liveReloadIndexHash,
+            runtimeImageIdentity: descriptor.runtimeImageIdentity
+        )
+    }
+
     public func validate() throws {
         guard [bundleID, architecture, xcodeBuild, swiftCompilerFingerprint].allSatisfy({
                   !$0.isEmpty && $0.utf8.count <= 4_096

@@ -238,6 +238,16 @@ public struct Materializer: Sendable {
         ) == nil else {
             throw ShellBuild.Error.outputCollision(devContract.path)
         }
+        let provider = try ShellBuild.BridgeProviderGenerator().generate(
+            archive: indexed.archive,
+            reloadIndexHash: reloadIndexHash
+        )
+        guard bridge.sourceFiles.updateValue(
+            provider.contents,
+            forKey: provider.path
+        ) == nil else {
+            throw ShellBuild.Error.outputCollision(provider.path)
+        }
         let archiveBytes = try InterfaceArchive.Codec.encode(indexed.archive)
         let reloadIndexBytes = try Core.CanonicalJSON.encode(reloadIndex)
         let xcodeIntegration = try XcodeIntegration.Generator().generate(

@@ -64,16 +64,17 @@ troubleshooting. The shortest path is:
    swift run helix xcode validate --plan HelixXcode.json
    ```
 
-5. Follow the generated `.helix/xcode/Integration.md` to connect the Feature,
-   generated Bridge, aggregate runtime, xcconfig files, source lists, and Scheme
-   actions. Then run `helix xcode doctor` for each profile.
-6. Keep the generated application session alive. Register UIKit reloadable types
-   or SwiftUI boundaries before expecting the current page to refresh.
+5. Follow `.helix/xcode/Integration.md` to connect the Feature and aggregate
+   runtime, apply the Feature/App xcconfig files, add the hidden Bridge phase,
+   and wire Scheme actions. No generated Swift file or Bridge target enters the
+   Xcode project. Then run `helix xcode doctor` for each profile.
+6. Keep one stable `ApplicationSession` alive. UIKit automatically discovers
+   displayed controller/view instances; SwiftUI still needs a pulse boundary.
 7. Run the Live Reload Scheme once and save an existing Swift body, or freeze a
    Release Shell and use the Patch-only Scheme to build a signed `.hlxp`.
 
 Before migrating a production project, run the checked-in
-[UIKit demo](Demo/README.md) end to end. Its Host Plan, seven-target Xcode graph,
+[UIKit demo](Demo/README.md) end to end. Its Host Plan, five-target Xcode graph,
 runtime bootstrap, shared Schemes, local mock download, and save-to-screen flow
 are executable examples rather than pseudocode. Use the
 [Xcode Run E2E cases](Xcode-Run-E2E-Test-Cases.md) when recording the GUI-only
@@ -120,9 +121,10 @@ Live Reload acceptance run.
 - Stored-layout, function-signature, superclass, conformance, enum-case,
   isolation, source-membership, linked-dependency, and build-setting changes
   require a normal build.
-- Code activation does not imply UI refresh. UIKit uses explicit invalidation,
-  reload hooks, or factories; SwiftUI uses a pulse boundary. Helix does not
-  blindly replay lifecycle methods.
+- Code activation does not imply UI refresh. UIKit automatically matches
+  displayed controller/view classes and applies inferred invalidation; custom
+  hooks or factories remain explicit for initialization/recreation. SwiftUI
+  uses a pulse boundary. Helix does not blindly replay lifecycle methods.
 - Simulator Native is the validated Live Reload route. Physical-iPhone Native
   loading remains experimental until an exact signing and OS matrix passes.
 - The Release builder accepts internal and enterprise HLBC policies. It rejects
@@ -167,7 +169,7 @@ swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
 ```
 
-The current full SwiftPM baseline contains 381 tests in 63 suites. The recorded
+The current full SwiftPM baseline contains 384 tests in 64 suites. The recorded
 Debug, warnings-as-errors, and optimized Release runs pass. Platform-specific
 fixtures can be run with an available Simulator UDID:
 
@@ -177,7 +179,7 @@ Tests/Fixtures/LiveReloadE2E/run-simulator-e2e.sh SIMULATOR_UDID
 Tests/Fixtures/LiveReloadE2E/run-release-audit.sh
 ```
 
-The iOS target contains 8 runtime/UI cases. Native Live Reload fixtures preserve
+The iOS target contains 9 runtime/UI cases. Native Live Reload fixtures preserve
 one App PID; the checked-in Xcode demo applies two edits and then a third
 generation that restores the baseline. The Release audit builds a separate iOS
 15 target linked only to `HelixAppRuntime`.

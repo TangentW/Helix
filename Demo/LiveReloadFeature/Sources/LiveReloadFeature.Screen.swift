@@ -27,19 +27,12 @@ public final class ScreenViewController: UIViewController {
         badgeLabel.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
         badgeLabel.text = "NATIVE DYNAMIC REPLACEMENT"
         badgeLabel.textColor = .systemBlue
-        titleLabel.text = "SAVE TO RELOAD" // HELIX_LIVE_BASELINE
+        titleLabel.text = "Hello World" // HELIX_LIVE_BASELINE
         detailLabel.text = "Edit this callback in Xcode. No rebuild. No reinstall."
         titleLabel.font = .systemFont(ofSize: 34, weight: .black)
         detailLabel.font = .systemFont(ofSize: 16)
         detailLabel.textColor = .secondaryLabel
         countLabel.font = .monospacedDigitSystemFont(ofSize: 20, weight: .bold)
-    }
-
-    /// The host uses this only for the explicit Reloadable fallback. Normal
-    /// edits to the layout callback take the inferred invalidation path.
-    public func refreshAfterReload() {
-        view.setNeedsLayout()
-        view.layoutIfNeeded()
     }
 
     private func installHierarchy() {

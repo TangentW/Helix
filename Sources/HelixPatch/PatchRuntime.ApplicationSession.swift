@@ -15,6 +15,41 @@ public final class ApplicationSession: @unchecked Sendable {
 
     private let operationLock = NSLock()
 
+    /// Creates the production runtime graph from the hidden Bridge linked by
+    /// the Helix Xcode phase. Application code supplies only product policy and
+    /// storage values; it never imports or references generated Swift code.
+    public convenience init(
+        installationID: String,
+        storeRootURL: URL,
+        trustStore: PatchPackage.TrustStore,
+        acceptancePolicy: PatchPackage.AcceptancePolicy,
+        resourceCeiling: Core.ResourceLimits = .init(),
+        nowUnixSeconds: Int64,
+        bridgeProvider: Runtime.BridgeProvider? = nil,
+        process: PatchRuntime.ProcessIdentity? = nil
+    ) throws {
+        let provider: Runtime.BridgeProvider
+        if let bridgeProvider {
+            provider = bridgeProvider
+        } else {
+            provider = try Runtime.LinkedBridge.load()
+        }
+        let runtime = try provider.makeRuntime()
+        try self.init(
+            build: PatchRuntime.BuildContract(bridge: provider.descriptor),
+            process: process,
+            installationID: installationID,
+            runtime: runtime,
+            shell: provider.makeShellInterface(),
+            installBridge: provider.install(on:),
+            storeRootURL: storeRootURL,
+            trustStore: trustStore,
+            acceptancePolicy: acceptancePolicy,
+            resourceCeiling: resourceCeiling,
+            nowUnixSeconds: nowUnixSeconds
+        )
+    }
+
     public init(
         build: PatchRuntime.BuildContract,
         process: PatchRuntime.ProcessIdentity? = nil,

@@ -9,11 +9,15 @@ scheme; no Helix command needs to be typed during ordinary work.
 
 ## `hot` (`hotPatch`)
 
-- Link only `HelixAppRuntime` into the App and generated Bridge.
+- Link `HelixAppRuntime` and the Feature framework into the App.
 - Use `Profiles/hot/Feature.xcconfig` as the Feature target base configuration.
-- Use `Profiles/hot/Bridge.xcconfig` as the Bridge target base configuration.
-- Add every generated path in `Profiles/hot/FeatureSources.xcfilelist` and
-  `Profiles/hot/BridgeSources.xcfilelist` to the corresponding Sources phase once.
+  Keep the Feature's ordinary Swift files in its Sources phase; never add Helix
+  DerivedData output to the project.
+- Use `Profiles/hot/Application.xcconfig` as the App target base configuration.
+- Add one Run Script phase before the App's Sources phase:
+  `/bin/sh "$(HELIX_INTEGRATION_ROOT)/Profiles/hot/bridge.sh"`.
+  Declare `$(HELIX_BRIDGE_OBJECT)` as its output. The script compiles the generated
+  Bridge privately in DerivedData before the App links.
 - Run `Profiles/hot/prepare.sh` as the first Scheme Build
   pre-action, with build settings supplied by the Feature target.
 - Run `Profiles/hot/audit.sh` as the last Scheme Build
@@ -30,19 +34,23 @@ scheme; no Helix command needs to be typed during ordinary work.
 
 ## `live` (`liveReload`)
 
-- Link only `HelixDevAppRuntime` into the App and generated Bridge.
+- Link `HelixDevAppRuntime` and the Feature framework into the App.
 - Use `Profiles/live/Feature.xcconfig` as the Feature target base configuration.
-- Use `Profiles/live/Bridge.xcconfig` as the Bridge target base configuration.
-- Add every generated path in `Profiles/live/FeatureSources.xcfilelist` and
-  `Profiles/live/BridgeSources.xcfilelist` to the corresponding Sources phase once.
+  Keep the Feature's ordinary Swift files in its Sources phase; never add Helix
+  DerivedData output to the project.
+- Use `Profiles/live/Application.xcconfig` as the App target base configuration.
+- Add one Run Script phase before the App's Sources phase:
+  `/bin/sh "$(HELIX_INTEGRATION_ROOT)/Profiles/live/bridge.sh"`.
+  Declare `$(HELIX_BRIDGE_OBJECT)` as its output. The script compiles the generated
+  Bridge privately in DerivedData before the App links.
 - Run `Profiles/live/prepare.sh` as the first Scheme Build
   pre-action, with build settings supplied by the Feature target.
 - Run `Profiles/live/live-start.sh` as a Scheme Run
   pre-action, with build settings supplied by the App target. At that point the
   Feature target's transparent compiler proxy has atomically captured the exact
   successful `swiftc` invocation and the debugger has not launched the App yet.
-  The external-driver setting is scoped only to this Dev Feature target; the App,
-  packages, and Release profiles retain Xcode's default driver mode.
+  The transparent external-driver proxy is scoped to the Feature target;
+  the App, packages, and unrelated targets retain Xcode's default driver mode.
 - Set the Run action's custom LLDB init file to
   `$(HELIX_LLDB_INIT_FILE)` so the authenticated one-run credential reaches the
   App process without entering the checked-in scheme. The generated init uses

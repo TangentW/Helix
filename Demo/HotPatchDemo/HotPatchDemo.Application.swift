@@ -1,9 +1,6 @@
 import HelixCore
 import HelixPatch
-import HelixRuntime
-import HelixVerifier
 import HotPatchFeature
-import HotPatchFeatureHelixBridge
 import UIKit
 
 enum HotPatchDemo {}
@@ -28,13 +25,8 @@ final class RuntimeOwner {
             appropriateFor: nil,
             create: true
         )
-        let runtime = try HotPatchFeatureBridge.makeRuntime()
         session = try PatchRuntime.ApplicationSession(
-            build: HotPatchFeatureBridge.makePatchBuildContract(),
             installationID: Self.installationID(),
-            runtime: runtime,
-            shell: HotPatchFeatureBridge.makeShellInterface(),
-            installBridge: HotPatchFeatureBridge.bootstrap,
             storeRootURL: applicationSupport.appendingPathComponent(
                 "HelixPatchStore",
                 isDirectory: true

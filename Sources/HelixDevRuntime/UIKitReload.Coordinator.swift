@@ -14,46 +14,6 @@ public enum ResolutionScope: Sendable {
 }
 
 @MainActor
-public final class TypeRegistry {
-    private var controllerTypes: [LiveReload.NominalTypeID: UIViewController.Type] = [:]
-    private var viewTypes: [LiveReload.NominalTypeID: UIView.Type] = [:]
-
-    public init() {}
-
-    public func register(
-        _ type: UIViewController.Type,
-        for id: LiveReload.NominalTypeID
-    ) {
-        controllerTypes[id] = type
-        viewTypes.removeValue(forKey: id)
-    }
-
-    public func register(
-        _ type: UIView.Type,
-        for id: LiveReload.NominalTypeID
-    ) {
-        viewTypes[id] = type
-        controllerTypes.removeValue(forKey: id)
-    }
-
-    public func controllerType(for id: LiveReload.NominalTypeID) -> UIViewController.Type? {
-        controllerTypes[id]
-    }
-
-    public func viewType(for id: LiveReload.NominalTypeID) -> UIView.Type? {
-        viewTypes[id]
-    }
-
-    public var registeredTypeIDs: Set<LiveReload.NominalTypeID> {
-        Set(controllerTypes.keys).union(viewTypes.keys)
-    }
-
-    public func contains(_ id: LiveReload.NominalTypeID) -> Bool {
-        controllerTypes[id] != nil || viewTypes[id] != nil
-    }
-}
-
-@MainActor
 public struct AnyFactory {
     public var id: LiveReload.FactoryID
     public var make: (UIViewController) throws -> UIViewController
@@ -103,23 +63,43 @@ public final class FactoryRegistry {
 public struct InstanceResolver {
     public init() {}
 
+    public func windows(
+        scope: UIKitReload.ResolutionScope
+    ) -> [UIWindow] {
+        let scenes = UIApplication.shared.connectedScenes.compactMap {
+            $0 as? UIWindowScene
+        }
+            .filter {
+                $0.activationState == .foregroundActive
+                    || $0.activationState == .foregroundInactive
+            }
+        let windows = scenes.flatMap(\.windows)
+        switch scope {
+        case .visibleOnly:
+            return windows.filter { !$0.isHidden && $0.alpha > 0 }
+        case .allLoaded:
+            return windows
+        }
+    }
+
     public func controllers(
-        matching type: UIViewController.Type?,
+        scope: UIKitReload.ResolutionScope
+    ) -> [UIViewController] {
+        controllers(in: windows(scope: scope), scope: scope)
+    }
+
+    public func controllers(
+        in windows: [UIWindow],
         scope: UIKitReload.ResolutionScope
     ) -> [UIViewController] {
         var result: [UIViewController] = []
         var seen = Set<ObjectIdentifier>()
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-            .filter { $0.activationState == .foregroundActive || $0.activationState == .foregroundInactive }
-        for scene in scenes {
-            for window in scene.windows {
-                guard let root = window.rootViewController else { continue }
-                traverse(root, result: &result, seen: &seen)
-            }
+        for window in windows {
+            guard let root = window.rootViewController else { continue }
+            traverse(root, result: &result, seen: &seen)
         }
         return result.filter { controller in
             guard controller.isViewLoaded else { return false }
-            if let type, !controller.isKind(of: type) { return false }
             switch scope {
             case .visibleOnly:
                 return controller.viewIfLoaded?.window != nil
@@ -130,16 +110,17 @@ public struct InstanceResolver {
     }
 
     public func views(
-        matching type: UIView.Type,
-        in controllers: [UIViewController]
+        in controllers: [UIViewController],
+        windows: [UIWindow] = []
     ) -> [UIView] {
         var result: [UIView] = []
         var seen = Set<ObjectIdentifier>()
         func walk(_ view: UIView) {
             guard seen.insert(ObjectIdentifier(view)).inserted else { return }
-            if view.isKind(of: type) { result.append(view) }
+            result.append(view)
             view.subviews.forEach(walk)
         }
+        windows.forEach(walk)
         controllers.compactMap(\.viewIfLoaded).forEach(walk)
         return result
     }
@@ -179,6 +160,8 @@ public struct Report: Sendable {
     public var status: DevProtocol.UIReloadStatus
     public var matchedInstanceCount: Int
     public var refreshedInstanceCount: Int
+    public var matchedNominalTypeIDs: Set<LiveReload.NominalTypeID>
+    public var unmatchedNominalTypeIDs: Set<LiveReload.NominalTypeID>
     public var warnings: [String]
     public var errors: [String]
 
@@ -186,12 +169,16 @@ public struct Report: Sendable {
         status: DevProtocol.UIReloadStatus,
         matchedInstanceCount: Int,
         refreshedInstanceCount: Int,
+        matchedNominalTypeIDs: Set<LiveReload.NominalTypeID> = [],
+        unmatchedNominalTypeIDs: Set<LiveReload.NominalTypeID> = [],
         warnings: [String] = [],
         errors: [String] = []
     ) {
         self.status = status
         self.matchedInstanceCount = matchedInstanceCount
         self.refreshedInstanceCount = refreshedInstanceCount
+        self.matchedNominalTypeIDs = matchedNominalTypeIDs
+        self.unmatchedNominalTypeIDs = unmatchedNominalTypeIDs
         self.warnings = warnings
         self.errors = errors
     }
@@ -280,22 +267,20 @@ public struct Invalidator {
 
 @MainActor
 public final class Coordinator {
-    public let typeRegistry: UIKitReload.TypeRegistry
     public let factoryRegistry: UIKitReload.FactoryRegistry
     public var resolutionScope: UIKitReload.ResolutionScope
     public var broadDataReloadEnabled: Bool
     public var guardrail: LiveReload.Guard
 
     private let resolver = UIKitReload.InstanceResolver()
+    private let actionResolver = UIKitReload.InstanceActionResolver()
 
     public init(
-        typeRegistry: UIKitReload.TypeRegistry = .init(),
         factoryRegistry: UIKitReload.FactoryRegistry = .init(),
         resolutionScope: UIKitReload.ResolutionScope = .visibleOnly,
         broadDataReloadEnabled: Bool = false,
         guardrail: LiveReload.Guard = .shared
     ) {
-        self.typeRegistry = typeRegistry
         self.factoryRegistry = factoryRegistry
         self.resolutionScope = resolutionScope
         self.broadDataReloadEnabled = broadDataReloadEnabled
@@ -329,83 +314,36 @@ public final class Coordinator {
                 errors: plan.warnings
             )
         }
-        typealias ControllerAction = (UIViewController, ReloadPlanning.Action)
-        typealias ViewAction = (UIView, ReloadPlanning.Action)
-        var controllerActions: [ObjectIdentifier: ControllerAction] = [:]
-        var viewActions: [ObjectIdentifier: ViewAction] = [:]
-        var conflictedControllers = Set<ObjectIdentifier>()
-        var conflictedViews = Set<ObjectIdentifier>()
-        var allControllers: [UIViewController]?
+        let windows = resolver.windows(scope: resolutionScope)
+        let controllers = resolver.controllers(in: windows, scope: resolutionScope)
+        let controllerResolution = actionResolver.resolve(
+            plan.actions,
+            in: controllers
+        )
+        let remainingActions = plan.actions.filter {
+            !controllerResolution.matchedNominalTypeIDs.contains($0.nominalTypeID)
+        }
+        var viewActions: [UIKitReload.InstanceActionResolver.ViewMatch] = []
+        var matchedTypeIDs = controllerResolution.matchedNominalTypeIDs
         var warnings: [String] = []
-        var errors = plan.warnings
-
-        for action in plan.actions {
-            if let controllerType = typeRegistry.controllerType(for: action.nominalTypeID) {
-                let controllers = resolver.controllers(
-                    matching: controllerType,
-                    scope: resolutionScope
-                )
-                for controller in controllers {
-                    let id = ObjectIdentifier(controller)
-                    guard !conflictedControllers.contains(id) else { continue }
-                    if let existing = controllerActions[id] {
-                        do {
-                            controllerActions[id] = (
-                                controller,
-                                try ReloadPlanning.Planner().mergeForInstance(
-                                    existing.1,
-                                    action
-                                )
-                            )
-                        } catch {
-                            controllerActions.removeValue(forKey: id)
-                            conflictedControllers.insert(id)
-                            errors.append("\(type(of: controller)): \(error)")
-                        }
-                    } else {
-                        controllerActions[id] = (controller, action)
-                    }
-                }
-                continue
-            }
-            if let viewType = typeRegistry.viewType(for: action.nominalTypeID) {
-                let controllers: [UIViewController]
-                if let cached = allControllers {
-                    controllers = cached
-                } else {
-                    let resolved = resolver.controllers(matching: nil, scope: resolutionScope)
-                    allControllers = resolved
-                    controllers = resolved
-                }
-                for view in resolver.views(matching: viewType, in: controllers) {
-                    let id = ObjectIdentifier(view)
-                    guard !conflictedViews.contains(id) else { continue }
-                    if let existing = viewActions[id] {
-                        do {
-                            viewActions[id] = (
-                                view,
-                                try ReloadPlanning.Planner().mergeForInstance(
-                                    existing.1,
-                                    action
-                                )
-                            )
-                        } catch {
-                            viewActions.removeValue(forKey: id)
-                            conflictedViews.insert(id)
-                            errors.append("\(type(of: view)): \(error)")
-                        }
-                    } else {
-                        viewActions[id] = (view, action)
-                    }
-                }
-                continue
-            }
-            warnings.append("no UIKit type is registered for \(action.nominalTypeID)")
+        var errors = plan.warnings + controllerResolution.errors
+        if !remainingActions.isEmpty {
+            let viewResolution = actionResolver.resolve(
+                remainingActions,
+                in: resolver.views(in: controllers, windows: windows)
+            )
+            viewActions = viewResolution.matches
+            matchedTypeIDs.formUnion(viewResolution.matchedNominalTypeIDs)
+            errors.append(contentsOf: viewResolution.errors)
         }
 
-        let matched = controllerActions.count + viewActions.count
+        let allTypeIDs = Set(plan.actions.map(\.nominalTypeID))
+        let unmatchedTypeIDs = allTypeIDs.subtracting(matchedTypeIDs)
+        let matched = controllerResolution.matches.count + viewActions.count
         var refreshed = 0
-        for (controller, action) in controllerActions.values {
+        for match in controllerResolution.matches {
+            let controller = match.instance
+            let action = match.action
             do {
                 switch action.policy {
                 case .observeOnly:
@@ -435,7 +373,9 @@ public final class Coordinator {
                 errors.append("\(type(of: controller)): \(error)")
             }
         }
-        for (view, action) in viewActions.values {
+        for match in viewActions {
+            let view = match.instance
+            let action = match.action
             do {
                 switch action.policy {
                 case .observeOnly:
@@ -478,6 +418,8 @@ public final class Coordinator {
             status: status,
             matchedInstanceCount: matched,
             refreshedInstanceCount: refreshed,
+            matchedNominalTypeIDs: matchedTypeIDs,
+            unmatchedNominalTypeIDs: unmatchedTypeIDs,
             warnings: warnings,
             errors: errors
         )
@@ -497,7 +439,7 @@ public final class Coordinator {
                 errors: [String(describing: error)]
             )
         }
-        let controllers = resolver.controllers(matching: nil, scope: .visibleOnly)
+        let controllers = resolver.controllers(scope: .visibleOnly)
         var matched = 0
         var refreshed = 0
         var errors: [String] = []
