@@ -38,7 +38,7 @@ struct StandardLibraryImports {
                   values.count == 2,
                   case let .any(label) = values[0],
                   label.concreteType == .string,
-                  label.payload == .string("value:"),
+                  label.payload == .string("value: 4"),
                   case let .any(number) = values[1],
                   number.concreteType == .int64,
                   case let .integer(integer) = number.payload,
@@ -62,7 +62,7 @@ struct StandardLibraryImports {
         try Data(
             """
             public func transform(_ value: Int) -> Int {
-                print("value:", value)
+                print("value: \\(value)", value)
                 return value + 1
             }
             """.utf8

@@ -4179,15 +4179,24 @@ public struct Lowerer: Sendable {
                     continue
                 }
                 if pendingStringInterpolationAddresses.contains(address) {
-                    guard mode == "take",
-                          let accumulator = stringInterpolationAddressValues.removeValue(
-                              forKey: address
-                          )
-                    else {
+                    guard let accumulator = stringInterpolationAddressValues[address] else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "String interpolation storage requires a taking load"
+                            "String interpolation load references uninitialized storage"
                         )
                     }
+                    switch mode {
+                    case "take":
+                        stringInterpolationAddressValues.removeValue(forKey: address)
+                    case "", "copy":
+                        // Unoptimized SIL spells the same ownership transfer as
+                        // load + retain_value + destroy_addr instead of load [take].
+                        break
+                    default:
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "String interpolation storage has an invalid load convention"
+                        )
+                    }
+                    values[load[0]] = accumulator
                     stringInterpolationValues[load[0]] = accumulator
                     continue
                 }
@@ -4268,6 +4277,14 @@ public struct Lowerer: Sendable {
 
             if let destroy = match(line, pattern: #"^destroy_addr (%[0-9]+)$"#) {
                 let address = addressBase(destroy[0])
+                if pendingStringInterpolationAddresses.contains(address) {
+                    guard stringInterpolationAddressValues.removeValue(forKey: address) != nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "destroy_addr references uninitialized String interpolation storage"
+                        )
+                    }
+                    continue
+                }
                 if catchScratchAddresses.contains(address) { continue }
                 if let iterator = arrayIteratorStates.removeValue(forKey: address) {
                     appendInstruction(.destroyStack(iterator.indexSlot))

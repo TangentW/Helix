@@ -2205,6 +2205,29 @@ struct Pipeline {
         }
     }
 
+    @Test("Unoptimized String interpolation accepts copy-then-destroy SIL ownership")
+    func compilesUnoptimizedStringInterpolation() throws {
+        let fixture = try compileFixture(
+            source: "public func interpolate(_ value: Int) -> String { \"value: \\(value)\" }",
+            functionName: "interpolate",
+            signature: .init(parameters: ["Swift.Int"], result: "Swift.String"),
+            parameterTypes: [.int64],
+            resultType: .string,
+            purpose: .semanticLowering,
+            optimization: "-Onone"
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: fixture.image,
+                arguments: [
+                    .integer(try VM.Integer(signed: 42, bitWidth: 64, isSigned: true)),
+                ]
+            ) == .returned(.string("value: 42"))
+        )
+    }
+
     @Test("Custom String interpolation overloads remain a stable rejection")
     func rejectsCustomStringInterpolation() throws {
         let source = """
@@ -4207,6 +4230,7 @@ struct Pipeline {
         resultType: Bytecode.ValueType,
         effects: Core.Effects = .init(),
         purpose: SwiftFrontend.CanonicalSILPurpose = .implementationIdentity,
+        optimization: String = "-O",
         additionalFrontendArguments: [String] = []
     ) throws -> CompiledFixture {
         let directory = FileManager.default.temporaryDirectory
@@ -4218,6 +4242,7 @@ struct Pipeline {
         let canonicalSIL = try SwiftFrontend.Driver().emitCanonicalSIL(
             sourceFiles: [sourceURL],
             moduleName: "HelixLanguageFixture",
+            optimization: optimization,
             additionalArguments: additionalFrontendArguments,
             purpose: purpose
         )

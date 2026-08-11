@@ -127,7 +127,7 @@ native implementation must run outside HLVM.
 
 Every new Dev Shell automatically includes the exact NativeImport for
 `Swift.print(_:separator:terminator:)`, so adding
-`print("value:", value)` to a supported body needs no App catalog setup. The
+`print("value: \(value)", value)` to a supported body needs no App catalog setup. The
 compiler lowers the variadic arguments into a VM-owned `Array<Any>` and links
 the omitted separator/terminator as ordinary default-argument generators in
 the same image. Fully concrete defaults on other functions use the same
