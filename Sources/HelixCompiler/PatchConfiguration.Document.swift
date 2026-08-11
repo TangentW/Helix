@@ -7,6 +7,18 @@ extension PatchConfiguration {
 public enum EntrypointVisibility: String, Codable, Hashable, Sendable {
     case publicOnly = "public"
     case publicAndInternal = "public-and-internal"
+    case all
+
+    public func allows(accessLevel: String) -> Bool {
+        switch self {
+        case .publicOnly:
+            accessLevel == "public" || accessLevel == "open"
+        case .publicAndInternal:
+            ["public", "open", "internal", "package"].contains(accessLevel)
+        case .all:
+            !accessLevel.isEmpty
+        }
+    }
 }
 
 public enum NativeImportCandidateIndex: String, Codable, Hashable, Sendable {
@@ -60,14 +72,7 @@ public struct NativeImportSourceScope: Codable, Hashable, Sendable {
         include.contains { Glob($0).matches(logicalPath) }
             && !exclude.contains { Glob($0).matches(logicalPath) }
             && declarations.contains { Glob($0).matches(canonicalCallee) }
-            && {
-                switch visibility {
-                case .publicOnly:
-                    return accessLevel == "public" || accessLevel == "open"
-                case .publicAndInternal:
-                    return ["public", "open", "internal", "package"].contains(accessLevel)
-                }
-            }()
+            && visibility.allows(accessLevel: accessLevel)
     }
 
     fileprivate func validate(moduleName: String) throws {

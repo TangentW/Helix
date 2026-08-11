@@ -2,32 +2,33 @@
 
 [English](Capabilities-and-Limits.md)
 
-Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”不等于“生产字节码后端支持这个语法”，“理论上 dylib 能装下这个声明”也不等于“当前 Live Reload 生成器已经会收集它”。本文给出当前实际边界。
+Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”不等于“字节码后端支持这个语法”，“编译器能为声明生成 SIL”也不等于“当前 HLBC Lowerer 与 Shell capability surface 支持它”。本文给出当前实际边界。
 
 ## 产品状态概览
 
 | 范围 | 已实现 | 尚未认证或实现 |
 | --- | --- | --- |
 | Release Shell | 精确 frontend 索引、Derived Sources、Interface Archive、永久 Bridge、NativeImport 发现、Xcode 集成、bundle 泄漏审计 | 大型真实业务迁移和长期 CI 矩阵 |
-| 生产 HLBC | HLBC 1.9 / HLXI 2.4 编译链、Verifier、HLVM、签名包、安全安装、不可变激活、回滚与吊销 | App Store 分发批准、top-200 业务 corpus、长时间 fuzz/sanitizer、真机 macro 性能 |
-| Native Live Reload | 精确构建捕获、稳定快照、typed AST body 重建、递归/previous 处理、签名 dylib、认证传输、`dlopen`、UIKit/SwiftUI 刷新 | 真实 iPhone 矩阵、连续 100 代 soak、LLDB 自动符号加载、大型工程延迟资格 |
-| 开发期 HLBC | 后端路由和会话绑定的验证后 HLBC artifact | 与 Native 编译器相同的源码覆盖；不支持的 root 仍需完整构建 |
+| 生产 HLBC | HLBC 1.9 / HLXI 2.4 编译链、Verifier、HLVM、签名包、安全安装、不可变激活、回滚与吊销；仓库内业务 corpus | App Store 分发批准、外部 top-200 corpus、长时间 fuzz/sanitizer、真机 macro 性能 |
+| 开发期 Live Reload | 精确构建捕获、稳定快照、body 差分、会话绑定的验证后 HLBC、认证传输、原子激活、UIKit/SwiftUI 刷新、逻辑源码映射与 128 代进程内 soak | 真实 iPhone 矩阵、真机长时间 soak、交互式字节码单步调试、大型工程延迟资格 |
+| Native 实验 | 仅显式选择的 Dynamic Replacement builder、递归/previous 测试、签名 dylib 与 loader probe | 产品支持；自动路由有意不选择它 |
 | 控制面 | 客户端包与 policy 合同 | 生产 Registry、HSM 运维、审批、灰度、遥测和设备群协调服务 |
 
-当前 SwiftPM 基线包含 384 个测试、64 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。iOS Simulator target 覆盖 9 个 Runtime 与 UI 用例。这些数字代表仓库证据，不代表真机或分发认证。
+当前 SwiftPM 基线包含 411 个测试、65 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。iOS Simulator target 覆盖 9 个 Runtime 与 UI 用例。这些数字代表仓库证据，不代表真机或分发认证。
 
 ## 生产 HLBC 1.9 的 Swift 子集
 
 ### 已实现
 
 - `Bool`、有/无符号定宽整数、`Float` 与 `Double`，包括已声明的算术、位运算、比较、移位和数值转换规则。
-- `String` 字面量、拼接、支持标量的插值、count/empty、比较以及常见 prefix/suffix/contains 判断。
-- Tuple、`Void` 与 `Optional`，包括 `if let`、`guard let`、`??` 和 `try?` 产生的普通控制流。
+- `String` 字面量、拼接、支持标量的插值、count/empty、比较以及常见 prefix/suffix/contains 判断。常见的 `String.contains(Character)` 可以使用单 grapheme 的 `Character` 字面量，而不暴露 Swift 私有 Character 布局。
+- Tuple、`Void` 与 `Optional`，包括 `if let`、`guard let`、`??` 和 `try?` 产生的普通控制流，也包括 Dictionary semantic SIL 产生的地址型 Optional projection。
 - Array 值语义、append、迭代、安全下标和返回新值的更新；支持键值类型下的 Dictionary 构建、查找、更新与迭代。
 - 结构化分支、循环、switch、调用、递归、显式业务错误边和带 payload 的局部 Error 值。
-- 补丁内非递归 stored struct/enum、具体 `Result`、字段读取、enum switch 与支持的 mutating helper。它们是 VM 值，不是新加载的 Swift metadata。
+- `Range<Int>` 半开区间 `for` 循环；Lowerer 会把它变成 HLBC 的强类型 cursor 控制流，不依赖 Swift 标准库 Range/Iterator ABI 对象。
+- 文件或 module scope 的补丁内非递归 stored struct/enum、具体 `Result`、字段读取、enum switch 与支持的 mutating helper。它们是 VM 值，不是新加载的 Swift metadata。
 - 同步补丁内 `inout` 与 `mutating` helper，并受 Address、access、alias、ownership、同 frame/同 block 规则验证。
-- 捕获 copyable VM-managed 值的同步非逃逸补丁内 closure，以及不再包含 archetype、metadata 或 witness 依赖的编译器完全具体化 specialization。
+- 捕获 copyable VM-managed 值的同步补丁内 closure。它包括同 image helper 的 `@escaping` 参数、从同 image 函数把 closure 返回给调用者，以及 closure 再捕获另一个 closure；该值必须在同一次固定 generation 的 HLVM invocation 内用完。返回与嵌套捕获语义由 `escaping-closure-values-1` 独立门禁，不能因为旧 closure capability 存在就默认放行。另支持不再包含 archetype、metadata 或 witness 依赖的编译器完全具体化 specialization。
 - 顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` entry。生成的精确 Swift wrapper 保留 ABI，HLVM 只执行已经证明不会挂起的 body。
 - 调用同 image helper、eligible Shell entry 与目标 Shell 已经生成的精确 allowlisted NativeImport。
 
@@ -36,23 +37,29 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - generic root，以及仍需要运行时 generic metadata、witness table、reabstraction 或动态 specialization 的执行。
 - 真正 suspension：`await`、continuation、Task、async callee、async closure、cancellation，以及跨 suspension ownership 或 generation lease。
 - actor-isolated instance root、custom global actor 和任意 executor hop；上面的受限 `@MainActor async` leaf 是不同能力。
-- escaping、throwing、async、nested-capture 或跨 Native 边界的 closure。
+- 穿过 Shell Entry 或 NativeImport 边界、持久化到 native/global/property 状态，或者存活时间超过当前 HLVM invocation/generation 的 closure。throwing、async、`@Sendable`，以及 closure 自身参数或返回值仍是 closure 的高阶签名也暂不支持。
+- 上述受限字面量判断以外的一般 `Character` 值/API；`ClosedRange`、非 `Int` Range、`stride`，以及函数局部 nominal type 声明。补丁内 struct/enum 应移到文件 scope，并在 Shell 正常构建后再修改其使用逻辑。
 - 新原生 class、跨补丁边界可见的新 Swift metadata、retroactive conformance、layout、superclass 与 enum case 变化。
 - Generic 或 `inout` Shell entry、noncopyable root、任意 borrowing/consuming ABI、typed-throws root、`rethrows` 与通用 unwind cleanup。
 - 不受限 pointer、`unsafeBitCast`、任意 Objective-C selector/IMP、`dlopen`/`dlsym`、Mirror 字段修改与未知 builtin。
 - 已发布 Shell 中没有精确 `NativeImportID` 的原生调用，即使 App 中存在名字相似的 Swift 函数。
 
-## Native Live Reload 边界
+## 开发期 Live Reload 边界
 
-Native Live Reload 由精确 Swift 编译器生成普通机器码与 metadata，因此能保留更多 Swift 语义；但当前生成器仍只面向已有声明 body。
+默认 Live Reload 使用与生产相同的 canonical SIL、Verifier 与 HLVM 核心。开发路径改变的是 session、传输、生命周期与诊断策略，不会用下载的机器码兜底不受支持的字节码。
 
 | 修改 | 当前结果 |
 | --- | --- |
-| 修改已索引的 global、instance、static 或 class 函数体 | 在通过资格的 Native 目标上支持 |
-| 从函数体调用已有 private/internal/public 声明 | 能在捕获 module 中解析并链接 Dev Shell 时支持 |
-| 普通直接递归 | 通过 typed AST 精确身份重绑定到当前 generation |
-| 有意调用上一代 | 使用受限的 `LiveReload.previous { ... }` marker |
-| 在变化 body 内新增局部 helper、closure 或局部类型 | 是合法 Swift 时随 body 编译 |
+| 修改已索引的 global 函数体 | canonical SIL 位于文档子集内时支持 |
+| 修改已索引的源码 class 实例方法体 | 支持；生成 TypeOps 会把精确 `self` 引用传入 HLVM |
+| 修改 struct/enum/actor 实例方法或 static/class 方法 | 在 value writeback、executor 与 metatype ABI 实现前拒绝 |
+| 从函数体调用已有 private/internal/public 声明 | 仅在解析为同 image 函数、eligible Shell Entry 或实际生成的精确 NativeImport 时支持 |
+| 普通直接递归 | 解析到同一不可变 HLBC image 内的函数 |
+| 从源码有意调用上一代 | HLBC 不支持；应保存/激活一个恢复 generation |
+| 使用受支持的局部 closure，或调用已经索引且带 `@escaping` closure 参数的同 image helper | 降入同一 image；closure 的返回和捕获只能发生在固定的 VM invocation 内 |
+| 使用两个 `Int` 边界的 `for value in lower..<upper` | 支持，并保留 Swift 的 `lower <= upper` 前置条件；其他 Range 族需要完整构建 |
+| 在受支持的 `String.contains` 中使用单 grapheme Character 字面量 | 以编译器内部 String 表示支持，不代表一般 Character 存储/API 已支持 |
+| 声明补丁内 struct 或 enum | 文件/module scope 支持；函数局部 nominal 会用精确类型诊断拒绝 |
 | 新增任意文件级 helper/type/extension 或新 Swift 文件 | 当前生成器不收集，需要完整构建 |
 | 修改 stored property、签名、generic constraint、actor isolation、superclass、conformance 或 enum case | 拒绝，需要完整构建 |
 | 修改 default argument 行为 | 旧 call site 可能已经包含旧 generator；要可靠生效需要完整构建 |
@@ -60,9 +67,9 @@ Native Live Reload 由精确 Swift 编译器生成普通机器码与 metadata，
 | 新增 framework、package、macro/plugin 输入、bridging header 或 source membership | Dev Build Manifest 失效，需要完整构建 |
 | 修改 storyboard、XIB、asset、strings、Core Data model、plist 或 entitlement | 不属于 Swift body Live Reload 路径 |
 
-Native replacement 能访问 private 成员，是因为 Helix 使用原 source-file 身份和捕获到的 module 上下文编译它。这不代表任意进程符号都可调用，也不会绕过 linker、代码签名、Team ID、AMFI 或 Library Validation。
+捕获的编译器上下文会保留原 access control，但可见性本身不是 Runtime capability。一个操作无法表示成 HLBC、也没有精确生成的 Entry/NativeImport 时，即便普通 Swift 允许访问，编译仍会失败。
 
-Simulator Native 是当前已经验证的路径。真实 iPhone Native 在每个精确编译器、系统、架构、签名身份、provisioning、Team ID 和依赖组合通过设备矩阵前仍是 experimental。
+Simulator 与设备使用同一套 HLBC 协议和 Runtime。仓库 Simulator E2E 已在同一 App 进程中应用修改并恢复 baseline；另有 128 代进程内 soak 验证 active/rollback、失败保存、generation 高水位与压缩保持有界。真实 iPhone 运行和长时间内存压力 soak 仍需补齐，才能列为经过验证。Native Dynamic Replacement 只保留为必须显式选择的内部实验，不是产品 fallback。
 
 ## UI 刷新边界
 
@@ -78,11 +85,17 @@ Simulator Native 是当前已经验证的路径。真实 iPhone Native 在每个
 
 仓库 fixture 已证明无需注册的 UIKit controller/view 与 superclass 自动匹配、invalidation、状态保持、SwiftUI pulse 路由和 Debug Overlay 行为；它们不能认证所有 custom container、navigation/sheet 交互、observation graph 或长期副作用模式。
 
+## 诊断边界
+
+Canonical Swift debug metadata 会降低成经过 Verifier 检查的 HLBC source map，以 function、block 与 instruction offset 定位。生产 artifact 只保留无歧义的逻辑源码路径，不携带构建机绝对路径。反汇编可以标注这些位置；HLVM trap 会给出结构化 program counter，`HelixRuntime` 再补充固定的 generation、Shell entry、函数名与逻辑 Swift 位置后通知 observer。
+
+这属于源码级故障归因，不等于替代 LLDB。HLBC 的交互式 breakpoint、单步、表达式求值与 time-travel debugging 尚未实现。不支持的语法仍会在 Mac 编译阶段用原逻辑源码位置明确失败。
+
 ## 安全与资源边界
 
 生产与开发路径都会对未知版本、capability、目标、身份、重复记录、畸形容器和资源超限 fail closed。生产字节码具有 fuel、deadline、stack、register、调用深度、值形状、NativeImport 和内存计量；下载与 live transfer 会在分配和执行前进行有界检查。
 
-Native Live Reload 会保留已加载 image，因此有明确的 image 与字节上限。同步 Swift NativeImport 无法被硬抢占；只有具备 deadline 与 checkpoint 的 bounded/cooperative import 才适合进入生产 Catalog。真实设备尾延迟和内存压力仍是 Gate。
+开发期 Live Reload 会限制 artifact 字节与保留 generation。同步 Swift NativeImport 无法被硬抢占；只有具备 deadline 与 checkpoint 的 bounded/cooperative import 才适合进入生产 Catalog。真实设备尾延迟和内存压力仍是 Gate。
 
 ## 兼容性与分发
 

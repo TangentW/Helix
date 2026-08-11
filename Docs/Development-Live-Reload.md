@@ -4,8 +4,9 @@
 
 Helix Live Reload shortens the edit–run loop for an already running Debug App.
 After the one-time Xcode integration and Dev Shell build, saving the body of an
-eligible Swift declaration can compile a new generation, transfer it to the
-Simulator, activate it in the same process, and refresh the affected UI.
+eligible Swift declaration can compile a new generation, transfer it to a
+Simulator or development device, activate it in the same process, and refresh
+the affected UI.
 
 This is a development feature. It is isolated from production packages, keys,
 storage, and lifecycle.
@@ -68,7 +69,7 @@ sequenceDiagram
     M->>M: "Debounce and capture a stable snapshot"
     M->>C: "Monotonic sourceRevision"
     C->>C: "Exact module type-check and body-only diff"
-    C->>C: "Build one Native or HLBC generation"
+    C->>C: "Lower supported SIL and build one HLBC generation"
     C->>D: "Offer, hash, metadata, payload"
     D->>A: "Authenticated chunked transfer"
     A->>A: "Verify and activate code"
@@ -82,113 +83,115 @@ requires two matching inode, size, modification-time, and content-hash reads.
 Every transaction has a monotonically increasing `sourceRevision`; a slower old
 compile or transfer cannot overwrite a newer accepted save.
 
-Compilation failure, signature failure, load failure, or UI refresh failure
+Compilation failure, artifact verification failure, activation failure, or UI refresh failure
 does not discard the last successful code generation. Code activation and UI
 refresh are reported separately.
 
-## How the native replacement is compiled
+## How the HLBC generation is compiled
 
 The first Debug build captures the real Swift frontend job, SDK, target,
-module/source set, link inputs, and signing identity. `helix dev prepare`
-replays that job in isolated outputs and compiles fresh capability probes for
-implicit dynamic declarations, private source-file import, canonical SIL, and
-replacement chaining. It does not merely recognize flag names, and it does not
-run a two-generation dylib experiment on every App launch.
+module/source set, compiler arguments, and link context. `helix dev prepare`
+replays compiler probes in isolated outputs and verifies that the captured job
+can produce the canonical SIL facts required by the bytecode compiler. It does
+not approximate the project's build settings.
 
-For an accepted body-only change, Helix:
+For an accepted save transaction, Helix:
 
-1. Re-type-checks the complete module context and compares interface and
-   transitive implementation fingerprints.
-2. Uses the Reload Index to locate existing replacement roots.
-3. Extracts only those function bodies.
-4. Asks the exact compiler for a typed AST, identifies the declaration and its
-   self references by USR, and edits only the compiler-reported UTF-8 identifier
-   ranges.
-5. Generates `@_dynamicReplacement` declarations, compiles them through normal
-   SILGen, IRGen, and LLVM, then links and signs a uniquely named dylib.
-6. Generates a matching dSYM and Swift module and validates the DWARF UUID.
+1. Captures one stable revision of every source in the frozen module context.
+2. Re-type-checks that complete module and rejects interface, stored-layout,
+   source-membership, dependency, or build-setting changes.
+3. Uses declaration identities and implementation fingerprints to determine
+   the changed eligible roots, then asks the captured Swift compiler for SIL.
+4. Builds a closed call table. Patch-local functions take precedence, followed
+   by eligible Shell `EntryIndex` routes and exact `NativeImportID` capabilities
+   that the Dev Shell emitted at build time.
+5. Lowers only the supported canonical SIL into typed HLIR and HLBC, then runs
+   the independent structural and semantic verifier on the Mac.
+6. Sends one immutable, session-bound live artifact. The App rechecks session,
+   revision, target, Shell identity, hash, size, capabilities, and bytecode
+   validity before atomically activating it.
 
-This is controlled source reconstruction backed by typed-AST identity and SIL
-checks; it is not LLVM instrumentation, raw symbol rebinding, or implemented
-SIL function cloning.
+No Swift compiler, linker, JIT, dylib, or source file is sent to or executed on
+the iOS process. Release and development reuse the compiler/verifier/HLVM core,
+but development artifacts are ephemeral and authenticated by a one-run Dev
+Session rather than by the production package trust chain.
 
-The private source-file import lets a replacement body resolve private,
-internal, and public declarations that were already available in the original
-module. It does not grant access to a framework the App never linked.
+## Native calls, instance `self`, and recursion
 
-## Recursion and previous generations
+HLBC cannot call an arbitrary Swift symbol merely because it exists in the
+process. A call is accepted only when it resolves to a function in the same
+bytecode image, an eligible Shell entry, or an exact NativeImport generated into
+that Shell. Entry routes are preferred, so ordinary calls between patchable App
+functions remain generation-aware; NativeImport is for a bounded API whose
+native implementation must run outside HLVM.
 
-Swift gives a call to the replaced declaration inside a dynamic replacement a
-special “previous implementation” meaning. Copying an ordinary recursive body
-unchanged would therefore recurse into the old generation. Helix corrects this
-by rebinding exact self references to the current replacement identity.
+For a supported source `class` instance method, the hidden Bridge carries
+`self` as a frozen reference `TypeID`. Generated `NativeTypeOperations` retain,
+identify, and validate the object without exposing a process pointer in HLBC.
+This establishes the receiver path for class methods; individual property and
+method operations still need a supported Shell entry or exact NativeImport.
+Struct/enum writeback, actor executors, and static/class metatype ABI are not
+silently approximated and currently require a normal build.
 
-Normal Swift remains normal recursion:
+Swift commonly spells a class receiver as `@guaranteed self` in SIL, while an
+Entry/NativeImport Bridge owns each value that crosses the device boundary.
+Helix preserves the physical SIL convention for call validation, then inserts a
+typed VM copy only for that borrowed-to-owned boundary. Local same-image calls
+still require an exact ownership ABI. This prevents a harmless borrow
+convention from rejecting private instance helpers without weakening type,
+effect, address, or capability checks.
 
-```swift
-func factorial(_ value: Int) -> Int {
-    value < 2 ? 1 : value * factorial(value - 1)
-}
-```
+Direct recursion resolves to the function in the same immutable HLBC image, so
+an ordinary recursive Swift body remains ordinary recursion. A call chain pins
+one runtime generation, preventing a concurrent save from mixing generations
+halfway through the call. `LiveReload.previous` belongs to the explicit Native
+Dynamic Replacement experiment and is not accepted by the default HLBC path;
+restoring older behavior is done by another save or an explicit generation
+rollback/tombstone, not by a hidden source-level call convention.
 
-The recursive edge above stays in the current generation. A deliberate call to
-the previous generation must be explicit:
+## Generations, transfer, and lifetime
 
-```swift
-func adjustedPrice(_ input: Int) -> Int {
-    LiveReload.previous {
-        adjustedPrice(input)
-    } + 1
-}
-```
+Each successful transaction is one immutable bytecode generation. Helix does
+not maintain a mutable dylib or append Swift files to an image. The daemon sends
+an offer manifest and bounded HLBC bytes over the authenticated Dev Session;
+the App verifies the complete artifact before activation. A baseline restore
+may legitimately carry no bytecode and only remove inherited routes.
 
-`LiveReload.previous` is a compiler marker, not a general runtime dispatcher.
-The current marker accepts one expression, may be `async throws`, and cannot be
-nested inside another user closure. Untransformed execution traps rather than
-silently calling the wrong implementation.
+The default live HLBC payload limit is 16 MiB. Activation flattens inherited
+routes into one immutable snapshot, so a lookup does not depend on keeping an
+unbounded ancestry chain. By default the registry strongly retains the active
+snapshot and its direct rollback predecessor. An older snapshot remains alive
+only while an already-running call or an explicit diagnostic lease pins it; the
+lease carries the resolved routes and verified images needed to finish safely.
 
-Static SIL tests distinguish current-generation `function_ref` edges from
-explicit `prev_dynamic_function_ref` edges. A macOS runtime E2E has loaded two
-generations for global, instance, static, class, and concrete-generic recursion
-and verified that explicit previous from generation two reaches generation one.
+Count and unique-artifact byte ceilings include these in-flight snapshots. If
+all eviction candidates are pinned, activation fails transactionally and the
+previous generation remains active; it does not evict a running call. Once the
+lease is released, the next registry operation compacts that snapshot. A
+separate process-wide high-water mark prevents a compacted generation ID from
+being reused. Development generations are never installed in production patch
+storage, and restarting the App returns to the Dev Shell baseline.
 
-## Generations, transfer, and image lifetime
+The checked-in soak activates 128 real verified HLBC generations, exercises a
+failed save without changing the active generation, validates rollback and
+invocation, and proves that only the active/direct-predecessor snapshots remain
+strongly retained after compaction. This is deterministic in-process evidence;
+long-duration real-device memory pressure and foreground/background cycling are
+still qualification gates.
 
-Helix builds a separate immutable image for each successful native transaction.
-It does not maintain one dylib and append saved Swift files to it. A native live
-artifact consists of an offer manifest plus the dylib bytes; it is transferred
-over the authenticated Dev Session and written to a bounded temporary file in
-the App before hash, Mach-O, architecture, dependency, session, and generation
-checks.
+## Backend policy
 
-The App calls `dlopen` with local, immediate binding. Successfully loaded images
-remain mapped until process exit because active frames, closures, metadata, or
-replacement descriptors may still refer to them. Helix does not call `dlclose`.
-Default runtime limits are:
+`.automatic` and the public default select HLBC on both Simulator and device.
+The router does not silently fall back to Native when bytecode lowering rejects
+a transaction: it reports the exact unsupported construct and requires either a
+supported edit or a normal build. This keeps behavior and source coverage
+consistent across targets.
 
-- 64 MiB for one native payload and 16 MiB for one HLBC live payload;
-- a warning after 50 native images;
-- a hard stop at 80 native images or 256 MiB of accumulated native image bytes.
-
-Reaching a hard limit requests an App restart. Restarting returns to the Dev
-Shell baseline because live generations are not production-persisted.
-
-## Backend selection
-
-Simulator Native Dynamic Replacement is the validated primary route. The
-development router may choose HLBC when Native is unavailable, but only if one
-HLBC transaction can cover every changed root. A function with an active
-generation keeps its backend affinity until restart, so one atomic transaction
-cannot mix Native and HLBC implementations.
-
-There is no implemented `-interposable` fallback. If neither backend can safely
-compile the transaction, Helix reports that a full build is required.
-
-Native loading on a physical development iPhone is present as an experimental
-path: it uses the captured device target and expanded signing identity, but it
-must remain disabled until the exact Xcode, iOS, architecture, Team ID, signing,
-and library-validation matrix is qualified. Simulator success is not device
-qualification.
+Native Dynamic Replacement remains an explicit internal experiment for Swift
+compiler investigation and differential tests. It may still build and load a
+dylib on a qualified environment, but it is never selected automatically and is
+not the product Live Reload contract. The checked-in HLBC Simulator E2E is
+passing; physical-iPhone qualification remains an outstanding evidence gate.
 
 ## Why code activation does not automatically redraw a page
 
@@ -256,10 +259,14 @@ screen.
 
 ## Supported edits
 
-The current native workflow is designed for bodies of declarations already in
-the Dev Shell. Calls to existing private members work because the patch is
-compiled in the original source-file/module context. Local helpers, closures,
-and local types written inside the changed body can be compiled by Swift.
+The default workflow is designed for supported bodies of declarations already
+in the Dev Shell. Original Swift access control is preserved, but lexical
+visibility alone does not create a VM capability: every native operation must
+also resolve through an eligible Entry or exact NativeImport. Supported local
+closures and already indexed same-image helpers may use synchronous `@escaping`
+parameters, internal closure returns, and nested closure captures. The closure
+still cannot cross the Shell/Native boundary or survive the current pinned VM
+invocation.
 
 The current generator does not automatically collect arbitrary new file-level
 functions, types, extensions, or Swift files. It also rejects changes to stored
@@ -268,18 +275,27 @@ enum cases, source membership, build settings, macro/plugin inputs, linked
 dependencies, assets, storyboards, and generated resources. Those changes need
 a normal build and, where applicable, reinstall.
 
+Patch-local nonrecursive structs and enums are supported when their declarations
+already exist at file/module scope in the Shell. A type declared inside a
+function has no frozen declaration identity in Helix's current textual SIL
+contract and is rejected with its exact type name; move it to file scope and do
+a normal build first.
+
 See [Capabilities and Limits](Capabilities-and-Limits.md) for the comparison
 with production HLBC.
 
-## Debug symbols and diagnostics
+## Debugging and diagnostics
 
-Each native generation has a UUID-matched dSYM, Swift module, and source map.
-After the App confirms activation, the CLI prints `target symbols add`, Swift
-module search-path, and source-map commands that can be pasted into the Xcode
-LLDB console. Automatic LLDB attachment and symbol registration are not yet
-implemented.
+HLBC has no native dSYM because it is verified bytecode rather than a Mach-O
+image. Compiler debug metadata is lowered to a verified map from
+function/block/instruction coordinates to logical Swift file, line, and column.
+Host absolute paths are removed from production artifacts. The disassembler
+annotates instructions from this map; on a trap the VM emits its exact program
+counter, and Runtime adds the pinned generation, Shell entry, function name, and
+logical source location.
 
-Compiler diagnostics retain logical source locations. The terminal and Debug
-overlay report source revision, generation, backend, activation result, UI
-refresh result, whether old code remains active, and the next action. A failed
-save is not presented as a successful reload.
+The terminal and Debug overlay report source revision, generation, backend,
+activation result, UI refresh result, whether old code remains active, and the
+next action. A failed save is not presented as a successful reload. Interactive
+HLBC breakpoints, stepping, and expression evaluation remain future work; the
+explicit Native experiment retains its separate dSYM tooling.

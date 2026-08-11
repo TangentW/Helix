@@ -1,6 +1,7 @@
 import Foundation
 
 extension Benchmarks {
+@MainActor
 public struct Runner {
     private struct Scenario {
         var name: Benchmarks.ScenarioName
@@ -77,6 +78,19 @@ public struct Runner {
                 warmup: configuration.warmupIterations,
                 operation: { index in
                     UInt64(bitPattern: try fixture.invokeImage(
+                        Benchmarks.Fixture.input(for: index)
+                    ))
+                },
+                expected: Self.expectedTransform
+            ),
+            Scenario(
+                name: .uiNativeImportInvocation,
+                category: .hotPath,
+                iterations: hotIterations,
+                samples: configuration.sampleCount,
+                warmup: configuration.warmupIterations,
+                operation: { index in
+                    UInt64(bitPattern: try fixture.invokeUINativeImport(
                         Benchmarks.Fixture.input(for: index)
                     ))
                 },

@@ -835,6 +835,10 @@ public struct Engine: Verification.ImageVerifying {
         guard !function.blocks.isEmpty else {
             throw Verification.Error.invalidFunction(function: function.id, reason: "function has no blocks")
         }
+        if case .closure = function.resultType,
+           !capabilities.contains(.escapingClosureValuesV1) {
+            throw Verification.Error.capabilityDenied(.escapingClosureValuesV1)
+        }
         try verifyTypeShapes(function)
 
         var blocks: [Bytecode.BlockID: Bytecode.Block] = [:]
@@ -1030,10 +1034,10 @@ public struct Engine: Verification.ImageVerifying {
                     try verify(pointee, depth: depth + 1, isRegister: false)
                 }
             case let .closure(signature):
-                guard isRegister, depth == 0 else {
+                guard depth == 0 else {
                     throw Verification.Error.invalidFunction(
                         function: function.id,
-                        reason: "closure values must be top-level registers"
+                        reason: "closure values must be top-level registers or internal function results"
                     )
                 }
                 guard signature.parameters.count <= 64 else {
@@ -1101,12 +1105,6 @@ public struct Engine: Verification.ImageVerifying {
             throw Verification.Error.invalidFunction(
                 function: function.id,
                 reason: "address values cannot be returned"
-            )
-        }
-        if case .closure = function.resultType {
-            throw Verification.Error.invalidFunction(
-                function: function.id,
-                reason: "HLBC 1.8 closures are nonescaping and cannot be returned"
             )
         }
         try verify(function.resultType, depth: 0, isRegister: false)
@@ -1853,8 +1851,11 @@ public struct Engine: Verification.ImageVerifying {
                 if case .address = captureType {
                     throw fail("closure captures cannot contain address values")
                 }
-                if case .closure = captureType {
-                    throw fail("nested closure captures are not supported in HLBC 1.8")
+                if case .closure = captureType,
+                   !capabilities.contains(.escapingClosureValuesV1) {
+                    throw Verification.Error.capabilityDenied(
+                        .escapingClosureValuesV1
+                    )
                 }
                 guard !captureType.requiresLinearOwnership,
                       isCopyable(captureType, shell: shell)
@@ -2208,7 +2209,9 @@ public struct Engine: Verification.ImageVerifying {
             switch instruction {
             case let .copyValue(result, source):
                 if function.type(of: source)?.requiresLinearOwnership == true {
-                    guard live.contains(source) else { throw fail("copy_value uses a consumed value") }
+                    guard live.contains(source) || borrowedParameters.contains(source) else {
+                        throw fail("copy_value uses a consumed value")
+                    }
                     live.insert(result)
                 }
             case let .moveValue(result, source):

@@ -19,6 +19,7 @@ public enum Metadata {
         .addressValuesV1,
         .borrowCallsV1,
         .closureValuesV1,
+        .escapingClosureValuesV1,
         .compilerSpecializationsV1,
         .asyncLeafEntriesV1,
     ]

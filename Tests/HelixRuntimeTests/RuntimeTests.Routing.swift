@@ -481,16 +481,38 @@ struct Routing {
             runtime.registry.route(for: fixture.entry, startingAt: inherited.id) != nil
         )
 
-        let restored = try Runtime.Generation(
+        let inheritedAfterCompaction = try Runtime.Generation(
             id: .init(rawValue: 3),
             parentID: inherited.id,
+            packageID: "HLX-runtime-inherited-again",
+            packageHash: .sha256("inherited-again"),
+            images: [],
+            removedEntries: [.init(rawValue: 10_000)],
+            estimatedByteCount: 0
+        )
+        _ = try runtime.registry.activate(
+            inheritedAfterCompaction,
+            expectedActiveID: inherited.id
+        )
+        #expect(
+            runtime.registry.snapshot().loadedGenerationIDs
+                == [inherited.id, inheritedAfterCompaction.id]
+        )
+        #expect(
+            runtime.invoke(entry: fixture.entry, arguments: [.integer(try int(1))])
+                == .returned(.integer(try int(10)))
+        )
+
+        let restored = try Runtime.Generation(
+            id: .init(rawValue: 4),
+            parentID: inheritedAfterCompaction.id,
             packageID: "HLX-runtime-restored",
             packageHash: .sha256("restored"),
             images: [],
             removedEntries: [fixture.entry],
             estimatedByteCount: 0
         )
-        try runtime.activate(restored, expectedActiveID: inherited.id)
+        try runtime.activate(restored, expectedActiveID: inheritedAfterCompaction.id)
         #expect(runtime.registry.route(for: fixture.entry, startingAt: restored.id) == nil)
         #expect(
             runtime.invoke(entry: fixture.entry, arguments: [.integer(try int(1))])
@@ -530,18 +552,22 @@ struct Routing {
         )
     }
 
-    @Test("An original body pins its generation across a nested activation")
+    @Test("An in-flight call keeps its routing snapshot across nested compaction")
     func nestedInvocationKeepsGeneration() throws {
         let fixture = try RuntimeFixture()
         let box = RuntimeBox()
         let entryZero = Core.EntryIndex(rawValue: 0)
         let originals = try Runtime.OriginalCatalog([
             .init(index: entryZero, parameterTypes: [.int64], resultType: .int64) { arguments in
-                guard let runtime = box.runtime, let next = box.nextGeneration else {
+                guard let runtime = box.runtime, !box.nextGenerations.isEmpty else {
                     return .trapped(.explicit("runtime box is not initialized"))
                 }
                 do {
-                    try runtime.activate(next, expectedActiveID: .init(rawValue: 1))
+                    var expected = Runtime.GenerationID(rawValue: 1)
+                    for generation in box.nextGenerations {
+                        try runtime.activate(generation, expectedActiveID: expected)
+                        expected = generation.id
+                    }
                 } catch {
                     return .trapped(.explicit(String(describing: error)))
                 }
@@ -555,16 +581,20 @@ struct Routing {
         box.runtime = runtime
         let first = try fixture.generation(id: 1, parent: nil, constant: 11)
         let second = try fixture.generation(id: 2, parent: first.id, constant: 22)
-        box.nextGeneration = second
+        let third = try fixture.generation(id: 3, parent: second.id, constant: 33)
+        box.nextGenerations = [second, third]
         try runtime.activate(first, expectedActiveID: nil)
 
         let result = runtime.invoke(entry: entryZero, arguments: [.integer(try int(0))])
         #expect(result == .returned(.integer(try int(11))))
-        #expect(runtime.registry.snapshot().activeGenerationID == second.id)
+        let snapshot = runtime.registry.snapshot()
+        #expect(snapshot.activeGenerationID == third.id)
+        #expect(snapshot.loadedGenerationIDs == [second.id, third.id])
+        #expect(snapshot.compactedGenerationCount >= 1)
     }
 
-    @Test("Loaded generation roots remain retained until process exit")
-    func registryRetainsRolledBackRoots() throws {
+    @Test("Rollback compacts the abandoned generation when no lease pins it")
+    func rollbackCompactsAbandonedGeneration() throws {
         let fixture = try RuntimeFixture()
         let runtime = try fixture.makeRuntime(fallbackAllowed: false)
         let first = try fixture.generation(id: 1, parent: nil, constant: 10)
@@ -575,8 +605,184 @@ struct Routing {
 
         let snapshot = runtime.registry.snapshot()
         #expect(snapshot.activeGenerationID == first.id)
+        #expect(snapshot.highestActivatedGenerationID == second.id)
+        #expect(snapshot.loadedGenerationIDs == [first.id])
+        #expect(snapshot.compactedGenerationCount >= 1)
+        #expect(runtime.registry.lease(for: second.id) == nil)
+    }
+
+    @Test("Continuous replacement retains only current and previous snapshots")
+    func continuousReplacementCompactsHistory() throws {
+        let fixture = try RuntimeFixture()
+        let registry = Runtime.GenerationRegistry(
+            maximumGenerationCount: 4,
+            maximumEstimatedBytes: 4 * 1_024 * 1_024
+        )
+        let runtime = try fixture.makeRuntime(
+            fallbackAllowed: false,
+            registry: registry
+        )
+        var parent: Runtime.GenerationID?
+        var latest: [Runtime.Generation] = []
+        for rawID in UInt64(1)...40 {
+            let generation = try fixture.generation(
+                id: rawID,
+                parent: parent,
+                constant: Int64(rawID)
+            )
+            try runtime.activate(generation, expectedActiveID: parent)
+            parent = generation.id
+            latest.append(generation)
+            if latest.count > 2 { latest.removeFirst() }
+        }
+
+        let snapshot = registry.snapshot()
+        #expect(snapshot.activeGenerationID == .init(rawValue: 40))
+        #expect(snapshot.highestActivatedGenerationID == .init(rawValue: 40))
+        #expect(
+            snapshot.loadedGenerationIDs
+                == [.init(rawValue: 39), .init(rawValue: 40)]
+        )
+        #expect(snapshot.compactedGenerationCount == 38)
+        #expect(
+            snapshot.estimatedByteCount
+                <= latest.reduce(0) { $0 + $1.estimatedByteCount }
+        )
+        #expect(registry.route(for: fixture.entry, startingAt: .init(rawValue: 38)) == nil)
+        #expect(
+            runtime.invoke(entry: fixture.entry, arguments: [.integer(try int(0))])
+                == .returned(.integer(try int(40)))
+        )
+    }
+
+    @Test("A pinned old snapshot makes capacity failure transactional")
+    func pinnedSnapshotCapacityFailureIsTransactional() throws {
+        let fixture = try RuntimeFixture()
+        let registry = Runtime.GenerationRegistry(
+            maximumGenerationCount: 2,
+            maximumEstimatedBytes: 4 * 1_024 * 1_024
+        )
+        let runtime = try fixture.makeRuntime(
+            fallbackAllowed: false,
+            registry: registry
+        )
+        let first = try fixture.generation(id: 1, parent: nil, constant: 10)
+        let second = try fixture.generation(id: 2, parent: first.id, constant: 20)
+        let third = try fixture.generation(id: 3, parent: second.id, constant: 30)
+        var firstLease: Runtime.GenerationLease? = try runtime.activate(
+            first,
+            expectedActiveID: nil
+        )
+        try runtime.activate(second, expectedActiveID: first.id)
+
+        #expect(
+            throws: Runtime.ActivationError.generationLimitReached(maximum: 2)
+        ) {
+            try runtime.activate(third, expectedActiveID: second.id)
+        }
+        var snapshot = registry.snapshot()
+        #expect(snapshot.activeGenerationID == second.id)
+        #expect(snapshot.highestActivatedGenerationID == second.id)
         #expect(snapshot.loadedGenerationIDs == [first.id, second.id])
-        #expect(runtime.registry.lease(for: second.id) != nil)
+
+        firstLease = nil
+        try runtime.activate(third, expectedActiveID: second.id)
+        snapshot = registry.snapshot()
+        #expect(snapshot.activeGenerationID == third.id)
+        #expect(snapshot.loadedGenerationIDs == [second.id, third.id])
+        #expect(firstLease == nil)
+    }
+
+    @Test("Pinned snapshots participate in the unique artifact byte budget")
+    func pinnedSnapshotMemoryFailureIsTransactional() throws {
+        let fixture = try RuntimeFixture()
+        let first = try fixture.generation(id: 1, parent: nil, constant: 10)
+        let second = try fixture.generation(id: 2, parent: first.id, constant: 20)
+        let third = try fixture.generation(id: 3, parent: second.id, constant: 30)
+        let twoGenerationBudget = max(
+            first.estimatedByteCount + second.estimatedByteCount,
+            second.estimatedByteCount + third.estimatedByteCount
+        )
+        let registry = Runtime.GenerationRegistry(
+            maximumGenerationCount: 4,
+            maximumEstimatedBytes: twoGenerationBudget
+        )
+        let runtime = try fixture.makeRuntime(
+            fallbackAllowed: false,
+            registry: registry
+        )
+        var firstLease: Runtime.GenerationLease? = try runtime.activate(
+            first,
+            expectedActiveID: nil
+        )
+        try runtime.activate(second, expectedActiveID: first.id)
+
+        #expect(
+            throws: Runtime.ActivationError.memoryLimitReached(
+                maximumBytes: twoGenerationBudget
+            )
+        ) {
+            try runtime.activate(third, expectedActiveID: second.id)
+        }
+        #expect(registry.snapshot().activeGenerationID == second.id)
+
+        firstLease = nil
+        try runtime.activate(third, expectedActiveID: second.id)
+        #expect(registry.snapshot().activeGenerationID == third.id)
+        #expect(firstLease == nil)
+    }
+
+    @Test("Compaction never permits a generation identity to be reused")
+    func compactionPreservesGenerationHighWatermark() throws {
+        let fixture = try RuntimeFixture()
+        let runtime = try fixture.makeRuntime(fallbackAllowed: false)
+        let first = try fixture.generation(id: 1, parent: nil, constant: 10)
+        let second = try fixture.generation(id: 2, parent: first.id, constant: 20)
+        let third = try fixture.generation(id: 3, parent: second.id, constant: 30)
+        try runtime.activate(first, expectedActiveID: nil)
+        try runtime.activate(second, expectedActiveID: first.id)
+        try runtime.activate(third, expectedActiveID: second.id)
+        try runtime.rollback(expectedActiveID: third.id, to: second.id)
+
+        let reused = try fixture.generation(id: 3, parent: second.id, constant: 31)
+        #expect(
+            throws: Runtime.ActivationError.generationIDNotMonotonic(
+                previous: third.id,
+                attempted: reused.id
+            )
+        ) {
+            try runtime.activate(reused, expectedActiveID: second.id)
+        }
+        let fourth = try fixture.generation(id: 4, parent: second.id, constant: 40)
+        try runtime.activate(fourth, expectedActiveID: second.id)
+        #expect(runtime.registry.snapshot().activeGenerationID == fourth.id)
+    }
+
+    @Test("Durable restore may rehydrate an old identity without lowering high-water")
+    func durableRestorePreservesGenerationHighWatermark() throws {
+        let fixture = try RuntimeFixture()
+        let runtime = try fixture.makeRuntime(fallbackAllowed: false)
+        let first = try fixture.generation(id: 1, parent: nil, constant: 10)
+        let second = try fixture.generation(id: 2, parent: first.id, constant: 20)
+        try runtime.activate(first, expectedActiveID: nil)
+        try runtime.activate(second, expectedActiveID: first.id)
+        try runtime.rollback(expectedActiveID: second.id, to: nil)
+
+        let restored = try fixture.generation(id: 1, parent: nil, constant: 10)
+        try runtime.restore(restored)
+        var snapshot = runtime.registry.snapshot()
+        #expect(snapshot.activeGenerationID == restored.id)
+        #expect(snapshot.highestActivatedGenerationID == second.id)
+        #expect(
+            runtime.invoke(entry: fixture.entry, arguments: [.integer(try int(0))])
+                == .returned(.integer(try int(10)))
+        )
+
+        let third = try fixture.generation(id: 3, parent: restored.id, constant: 30)
+        try runtime.activate(third, expectedActiveID: restored.id)
+        snapshot = runtime.registry.snapshot()
+        #expect(snapshot.activeGenerationID == third.id)
+        #expect(snapshot.highestActivatedGenerationID == third.id)
     }
 
     @Test("Rollback cannot reactivate a quarantined generation")
@@ -605,7 +811,7 @@ struct Routing {
         let first = try fixture.generation(id: 1, parent: nil, constant: 10)
         let abandoned = try fixture.generation(id: 2, parent: first.id, constant: 20)
         try runtime.activate(first, expectedActiveID: nil)
-        try runtime.activate(abandoned, expectedActiveID: first.id)
+        let abandonedLease = try runtime.activate(abandoned, expectedActiveID: first.id)
         try runtime.rollback(expectedActiveID: abandoned.id, to: first.id)
         let active = try fixture.generation(id: 3, parent: first.id, constant: 30)
         try runtime.activate(active, expectedActiveID: first.id)
@@ -619,6 +825,7 @@ struct Routing {
             try runtime.rollback(expectedActiveID: active.id, to: abandoned.id)
         }
         #expect(runtime.registry.snapshot().activeGenerationID == active.id)
+        withExtendedLifetime(abandonedLease) {}
     }
 
     @Test("Runtime activation rejects an image for another Shell")
@@ -639,6 +846,47 @@ struct Routing {
             try runtime.activate(generation, expectedActiveID: nil)
         }
         #expect(runtime.registry.snapshot().activeGenerationID == nil)
+    }
+
+    @Test("Runtime trap telemetry resolves the deepest HLBC PC to logical Swift")
+    func trapTelemetryIncludesLogicalSource() throws {
+        let fixture = try RuntimeFixture(entry: .init(rawValue: 0))
+        let baseRuntime = try fixture.makeRuntime(fallbackAllowed: false)
+        let observer = TrapObserver()
+        let runtime = Runtime.Engine(
+            originals: baseRuntime.originals,
+            observer: observer
+        )
+        let generation = try fixture.generation(
+            id: 1,
+            parent: nil,
+            trap: "diagnostic fixture"
+        )
+        try runtime.activate(generation, expectedActiveID: nil)
+
+        #expect(
+            runtime.invoke(
+                entry: fixture.entry,
+                arguments: [.integer(try int(1))]
+            ) == .trapped(.explicit("diagnostic fixture"))
+        )
+        #expect(observer.legacyTraps == [.explicit("diagnostic fixture")])
+        let diagnostic = try #require(observer.diagnostics.first)
+        #expect(diagnostic.generationID == generation.id)
+        #expect(diagnostic.entry == fixture.entry)
+        #expect(diagnostic.functionName == "trap")
+        #expect(
+            diagnostic.programCounter == .init(
+                functionID: .init(rawValue: 0),
+                blockID: .init(rawValue: 0),
+                instructionOffset: 0
+            )
+        )
+        #expect(
+            diagnostic.sourceLocation
+                == .init(file: "Sources/Fixture.swift", line: 42, column: 9)
+        )
+        #expect(diagnostic.description.contains("Sources/Fixture.swift:42:9"))
     }
 
     @Test("A nested effectful Shell entry prevents replaying the outer original")
@@ -768,7 +1016,7 @@ struct Routing {
 
     private final class RuntimeBox: @unchecked Sendable {
         var runtime: Runtime.Engine?
-        var nextGeneration: Runtime.Generation?
+        var nextGenerations: [Runtime.Generation] = []
     }
 
     private final class Counter: @unchecked Sendable {
@@ -805,6 +1053,43 @@ struct Routing {
         }
     }
 
+    private final class TrapObserver: Runtime.Observing, @unchecked Sendable {
+        private let lock = NSLock()
+        private var legacyStorage: [VM.RuntimeTrap] = []
+        private var diagnosticStorage: [Runtime.TrapDiagnostic] = []
+
+        var legacyTraps: [VM.RuntimeTrap] {
+            lock.lock()
+            defer { lock.unlock() }
+            return legacyStorage
+        }
+
+        var diagnostics: [Runtime.TrapDiagnostic] {
+            lock.lock()
+            defer { lock.unlock() }
+            return diagnosticStorage
+        }
+
+        func didActivate(generation: Runtime.GenerationID) {}
+        func didRollback(from: Runtime.GenerationID, to: Runtime.GenerationID?) {}
+
+        func didTrap(
+            generation: Runtime.GenerationID,
+            entry: Core.EntryIndex,
+            trap: VM.RuntimeTrap
+        ) {
+            lock.lock()
+            legacyStorage.append(trap)
+            lock.unlock()
+        }
+
+        func didTrap(diagnostic: Runtime.TrapDiagnostic) {
+            lock.lock()
+            diagnosticStorage.append(diagnostic)
+            lock.unlock()
+        }
+    }
+
     private struct RuntimeFixture {
         let entry: Core.EntryIndex
         let shellHash = Core.Digest.sha256("runtime-shell")
@@ -833,7 +1118,10 @@ struct Routing {
             )
         }
 
-        func makeRuntime(fallbackAllowed: Bool) throws -> Runtime.Engine {
+        func makeRuntime(
+            fallbackAllowed: Bool,
+            registry: Runtime.GenerationRegistry = .init()
+        ) throws -> Runtime.Engine {
             let original = Runtime.OriginalEntry(
                 index: entry,
                 parameterTypes: [.int64],
@@ -842,7 +1130,10 @@ struct Routing {
             ) { _ in
                 .returned(.integer(try! int(3)))
             }
-            return try Runtime.Engine(originals: Runtime.OriginalCatalog([original]))
+            return try Runtime.Engine(
+                registry: registry,
+                originals: Runtime.OriginalCatalog([original])
+            )
         }
 
         func generation(
@@ -900,7 +1191,12 @@ struct Routing {
                         parameters: [.init(rawValue: 0)],
                         instructions: [.trap(.explicit(trap))]
                     ),
-                ]
+                ],
+                sourceLocation: .init(
+                    file: "Sources/Fixture.swift",
+                    line: 42,
+                    column: 9
+                )
             )
             return try makeGeneration(
                 id: id,
@@ -926,7 +1222,21 @@ struct Routing {
                 compatibility: compatibility,
                 requestedResources: requestedResources,
                 functions: [function],
-                entries: [.init(entryIndex: entry, functionKey: key, functionID: function.id)]
+                entries: [.init(entryIndex: entry, functionKey: key, functionID: function.id)],
+                sourceMap: function.sourceLocation.map { location in
+                    function.blocks.flatMap { block in
+                        block.instructions.indices.compactMap { offset in
+                            UInt32(exactly: offset).map {
+                                .init(
+                                    functionID: function.id,
+                                    blockID: block.id,
+                                    instructionOffset: $0,
+                                    location: location
+                                )
+                            }
+                        }
+                    }
+                } ?? []
             )
             let shell = try Verification.ShellInterface(
                 interfaceHash: shellHash,

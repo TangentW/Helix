@@ -22,6 +22,9 @@ extension CompilerCapabilities {
             for type in function.registerTypes + function.stackSlotTypes + [function.resultType] {
                 collect(type, into: &capabilities)
             }
+            if case .closure = function.resultType {
+                capabilities.insert(.escapingClosureValuesV1)
+            }
             if function.effects.requiresMainActor {
                 capabilities.insert(.mainActorSyncV1)
             }
@@ -62,6 +65,18 @@ extension CompilerCapabilities {
                 uniquingKeysWith: { first, _ in first }
             )
             for instruction in function.blocks.flatMap(\.instructions) {
+                if case let .makeClosure(_, _, captures) = instruction,
+                   captures.contains(where: { register in
+                       guard function.registerTypes.indices.contains(
+                           Int(register.rawValue)
+                       ) else { return false }
+                       if case .closure = function.registerTypes[Int(register.rawValue)] {
+                           return true
+                       }
+                       return false
+                   }) {
+                    capabilities.insert(.escapingClosureValuesV1)
+                }
                 let errorTarget: Bytecode.BlockID? = switch instruction {
                 case let .tryApply(_, _, _, target),
                      let .entryTryApply(_, _, _, target),

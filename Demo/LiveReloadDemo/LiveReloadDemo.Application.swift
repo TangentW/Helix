@@ -15,13 +15,7 @@ final class RuntimeOwner {
             overlayConfiguration: .init(startsExpanded: false)
         )
         self.environment = environment
-        session = try DevRuntime.ApplicationSession(
-            environment: environment,
-            options: .init(
-                supportedBackends: [.nativeDynamicReplacement, .hlbc],
-                nativeChainingProbePassed: true
-            )
-        )
+        session = try DevRuntime.ApplicationSession(environment: environment)
     }
 
     func startOverlay() {

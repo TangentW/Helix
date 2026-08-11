@@ -10,6 +10,7 @@ public struct StartRequest: Sendable {
     public var logURL: URL
     public var lldbInitURL: URL
     public var target: DevSession.LaunchTarget
+    public var deviceHost: String?
     public var startupTimeoutMilliseconds: UInt32
 
     public init(
@@ -19,6 +20,7 @@ public struct StartRequest: Sendable {
         logURL: URL,
         lldbInitURL: URL,
         target: DevSession.LaunchTarget,
+        deviceHost: String? = nil,
         startupTimeoutMilliseconds: UInt32 = 15_000
     ) {
         self.executableURL = executableURL
@@ -27,6 +29,7 @@ public struct StartRequest: Sendable {
         self.logURL = logURL
         self.lldbInitURL = lldbInitURL
         self.target = target
+        self.deviceHost = deviceHost
         self.startupTimeoutMilliseconds = startupTimeoutMilliseconds
     }
 }
@@ -62,6 +65,9 @@ public struct Supervisor: Sendable {
             "--target", request.target.rawValue,
             "--lifecycle-lock", lockURL.path,
         ]
+        if let deviceHost = request.deviceHost {
+            process.arguments?.append(contentsOf: ["--device-host", deviceHost])
+        }
         process.currentDirectoryURL = request.configurationURL.deletingLastPathComponent()
         process.standardOutput = logHandle
         process.standardError = logHandle
@@ -198,7 +204,8 @@ public struct Supervisor: Sendable {
     private func validate(_ request: DevProcess.StartRequest) throws {
         guard FileManager.default.isExecutableFile(atPath: request.executableURL.path),
               FileManager.default.isReadableFile(atPath: request.configurationURL.path),
-              (100...60_000).contains(request.startupTimeoutMilliseconds)
+              (100...60_000).contains(request.startupTimeoutMilliseconds),
+              request.deviceHost == nil || request.target == .device
         else {
             throw DevProcess.Error.invalidDocument(
                 "start request has an invalid executable, configuration, or timeout"

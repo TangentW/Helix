@@ -414,6 +414,55 @@ struct ProductionSafety {
         #expect(try store.localBlock(for: result.packageHash) != nil)
     }
 
+    @Test("Package revocation restores the durable LKG without lowering high-water")
+    func packageRevocationRestoresHistoricalLKG() throws {
+        let fixture = try PatchFixture()
+        let directory = try temporaryDirectory(prefix: "helix-revocation-lkg")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try PatchStore.Storage(rootURL: directory)
+        let runtime = try makeRuntime(fixture)
+        let controller = makeController(fixture, store: store, runtime: runtime)
+        let first = try controller.installAndActivate(
+            packageBytes: fixture.package(revision: 1).encoded(),
+            generationID: .init(rawValue: 1),
+            expectedActiveID: nil,
+            nowUnixSeconds: fixture.now
+        )
+        try controller.markActiveHealthy(nowUnixSeconds: fixture.now)
+        let second = try controller.installAndActivate(
+            packageBytes: fixture.package(
+                revision: 2,
+                rollback: .init(parentGenerationPackageHash: first.packageHash)
+            ).encoded(),
+            generationID: .init(rawValue: 2),
+            expectedActiveID: .init(rawValue: 1),
+            nowUnixSeconds: fixture.now + 1
+        )
+        let snapshot = try PatchPackage.RevocationSnapshot.issue(
+            authorityKeyID: "revocation-1",
+            authorityPrivateKey: fixture.revocationKey,
+            epoch: 1,
+            issuedAtUnixSeconds: fixture.now - 1,
+            expiresAtUnixSeconds: fixture.now + 1_000,
+            revokedPackageHashes: [second.packageHash]
+        )
+
+        let applied = try controller.applyRevocationSnapshot(
+            snapshot,
+            nowUnixSeconds: fixture.now + 2
+        )
+        #expect(applied.deactivatedGenerationID == .init(rawValue: 2))
+        #expect(applied.restoredPersistentState?.generationID == .init(rawValue: 1))
+        #expect(applied.restoredRuntimeGenerationID == .init(rawValue: 1))
+        #expect(try store.activeState()?.generationID == .init(rawValue: 1))
+        let registrySnapshot = runtime.registry.snapshot()
+        #expect(registrySnapshot.activeGenerationID == .init(rawValue: 1))
+        #expect(registrySnapshot.highestActivatedGenerationID == .init(rawValue: 2))
+        #expect(try store.localBlock(for: second.packageHash) != nil)
+
+        withExtendedLifetime((first, second)) {}
+    }
+
     @Test("Crash Guard restores the committed parent and blocks the crashing hash")
     func crashGuardRestoresLastKnownGood() throws {
         let fixture = try PatchFixture()

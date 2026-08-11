@@ -514,7 +514,7 @@ public final class Controller: @unchecked Sendable {
             parentID: nil,
             nowUnixSeconds: nowUnixSeconds
         )
-        let lease = try runtime.activate(prepared.generation, expectedActiveID: nil)
+        let lease = try runtime.restore(prepared.generation)
         let url = store.verifiedURL
             .appendingPathComponent(state.packageHash.hex, isDirectory: true)
             .appendingPathComponent("package.hlxp")

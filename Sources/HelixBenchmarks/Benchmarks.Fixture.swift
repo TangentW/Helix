@@ -18,6 +18,8 @@ struct Fixture {
     let bytes: Data
     let shell: Verification.ShellInterface
     let image: Verification.Image
+    let uiNativeImportImage: Verification.Image
+    let uiNativeCatalog: VM.NativeCatalog
     let closureImage: Verification.Image
     let originalRuntime: Runtime.Engine
     let patchedRuntime: Runtime.Engine
@@ -73,6 +75,12 @@ struct Fixture {
                 )
             )
         )
+        let uiNativeFixture = try Self.makeUINativeImportImage(
+            compatibility: compatibility,
+            namespace: namespace
+        )
+        uiNativeImportImage = uiNativeFixture.image
+        uiNativeCatalog = uiNativeFixture.catalog
         closureImage = try Self.makeClosureImage(compatibility: compatibility)
 
         originalRuntime = Runtime.Engine(
@@ -145,6 +153,17 @@ struct Fixture {
                 arguments: [.integer(integer(input))]
             ),
             scenario: .closureImageInvocation
+        )
+    }
+
+    func invokeUINativeImport(_ input: Int64) throws -> Int64 {
+        try decode(
+            VM.Interpreter(nativeCatalog: uiNativeCatalog).invoke(
+                entry: entry,
+                image: uiNativeImportImage,
+                arguments: [.integer(integer(input))]
+            ),
+            scenario: .uiNativeImportInvocation
         )
     }
 
@@ -401,6 +420,175 @@ struct Fixture {
                 )
             )
         )
+    }
+
+    private static func makeUINativeImportImage(
+        compatibility: Core.Compatibility,
+        namespace: Core.ShellNamespaceID
+    ) throws -> (image: Verification.Image, catalog: VM.NativeCatalog) {
+        let shellHash = Core.Digest.sha256("helix-benchmark-ui-native-shell")
+        let entry = Core.EntryIndex(rawValue: 0)
+        let importID = Core.NativeImportID(rawValue: 0)
+        let signature = Core.LoweredSignature(
+            parameters: ["Swift.Int"],
+            result: "Swift.Int"
+        )
+        let effects = Core.Effects(requiresMainActor: true)
+        let contract = Core.NativeImportContract.bounded(
+            kind: .serviceMethod,
+            domain: .uiKit,
+            access: .read,
+            maximumDurationMicroseconds: 2_000,
+            allowsMainThread: true
+        )
+        let key = try Core.NativeImportKey.derive(
+            namespace: namespace,
+            canonicalCallee: "HelixBenchmark.UIBridge.transform(_:)",
+            signature: signature,
+            effects: effects,
+            contract: contract
+        )
+        let functionKey = try Core.FunctionKey.derive(
+            namespace: namespace,
+            module: "BenchmarkFeature",
+            sourceFileLogicalID: "Sources/BenchmarkFeature.swift",
+            canonicalDeclaration: "func uiTransform(_: Int) -> Int",
+            loweredSignature: signature,
+            role: .function
+        )
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "uiTransform",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .nativeApply(
+                            result: .init(rawValue: 1),
+                            importID: importID,
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ],
+            effects: effects
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: importID,
+            key: key,
+            signature: signature,
+            effects: effects,
+            contract: contract
+        )
+        let module = Bytecode.Module(
+            name: "BenchmarkUINativeImport",
+            shellInterfaceHash: shellHash,
+            compatibility: compatibility,
+            capabilities: [.baselineV1, .nativeImportsV2, .mainActorSyncV1],
+            requestedResources: .init(
+                maxWallTimeMainThreadMilliseconds: 1_000,
+                maxWallTimeBackgroundMilliseconds: 1_000
+            ),
+            functions: [function],
+            entries: [
+                .init(
+                    entryIndex: entry,
+                    functionKey: functionKey,
+                    functionID: function.id
+                ),
+            ],
+            imports: [requirement]
+        )
+        let descriptor = Verification.ResolvedNativeImport(
+            id: importID,
+            key: key,
+            parameterTypes: [.int64],
+            resultType: .int64,
+            signature: signature,
+            effects: effects,
+            contract: contract
+        )
+        let shell = try Verification.ShellInterface(
+            interfaceHash: shellHash,
+            compatibility: compatibility,
+            capabilities: [.baselineV1, .nativeImportsV2, .mainActorSyncV1],
+            entries: [
+                .init(
+                    index: entry,
+                    key: functionKey,
+                    parameterTypes: [.int64],
+                    resultType: .int64,
+                    effects: effects
+                ),
+            ],
+            imports: [descriptor]
+        )
+        let image = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(module),
+            shell: shell,
+            policy: .init(
+                acceptedCapabilities: [
+                    .baselineV1,
+                    .nativeImportsV2,
+                    .mainActorSyncV1,
+                ],
+                resourceCeiling: .init(
+                    maxWallTimeMainThreadMilliseconds: 1_000,
+                    maxWallTimeBackgroundMilliseconds: 1_000
+                ),
+                allowedNativeImports: [importID],
+                allowMainActorSynchronousEntries: true
+            )
+        )
+        return (
+            image,
+            try VM.NativeCatalog([
+                UINativeImportInvoker(
+                    id: importID,
+                    key: key,
+                    contract: contract
+                ),
+            ])
+        )
+    }
+
+    private struct UINativeImportInvoker: VM.NativeInvoker {
+        let id: Core.NativeImportID
+        let key: Core.NativeImportKey
+        let contract: Core.NativeImportContract
+        let parameterTypes: [Bytecode.ValueType] = [.int64]
+        let resultType: Bytecode.ValueType = .int64
+        let effects = Core.Effects(requiresMainActor: true)
+
+        func invoke(
+            arguments: [VM.Value],
+            context: VM.NativeInvocationContext
+        ) -> VM.NativeInvocationResult {
+            guard case let .integer(input) = arguments.first else {
+                return .businessError("UI NativeImport benchmark received a non-integer")
+            }
+            let (value, overflow) = input.signedValue.addingReportingOverflow(27)
+            guard !overflow else { return .businessError("UI NativeImport benchmark overflow") }
+            do {
+                return .returned(
+                    .integer(
+                        try VM.Integer(
+                            signed: value,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    )
+                )
+            } catch {
+                return .businessError(String(describing: error))
+            }
+        }
     }
 }
 }

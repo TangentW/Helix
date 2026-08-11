@@ -68,6 +68,7 @@ public enum DevBackendSelection {}
 
 extension DevBackendSelection {
 public enum Reason: String, Codable, Hashable, Sendable {
+    case hlbcUnifiedDefault
     case simulatorNativePreferred
     case deviceNativeQualified
     case forcedNative
@@ -83,8 +84,12 @@ public enum Reason: String, Codable, Hashable, Sendable {
 }
 
 public enum Preference: String, Codable, Hashable, Sendable {
+    /// Selects the verified HLBC backend. Automatic selection has the same
+    /// behavior and never falls through to executable-image injection.
     case automatic
+    /// Selects the internal Native Dynamic Replacement experiment explicitly.
     case native
+    /// Selects the verified HLBC backend explicitly.
     case hlbc
 }
 
@@ -146,6 +151,8 @@ public struct Selector: Sendable {
             return .init(backend: active, reason: .activeBackendRequired)
         }
 
+        // Native code loading is retained only as an explicit research mode.
+        // Product-default routing must remain identical on Simulator and device.
         let nativeAvailable = input.identity.supportedBackends.contains(.nativeDynamicReplacement)
             && input.identity.nativeChainingProbePassed
             && !input.identity.nativeImageSoftLimitReached
@@ -168,25 +175,8 @@ public struct Selector: Sendable {
         case .automatic:
             break
         }
-        if nativeAvailable {
-            return .init(
-                backend: .nativeDynamicReplacement,
-                reason: input.identity.platform == .iOSSimulator
-                    ? .simulatorNativePreferred : .deviceNativeQualified
-            )
-        }
         if hlbcAvailable {
-            let reason: DevBackendSelection.Reason
-            if input.identity.nativeStateUncertain {
-                reason = .nativeStateUncertain
-            } else if input.identity.nativeImageSoftLimitReached {
-                reason = .nativeBudgetReached
-            } else if !input.candidateFunctions.isSubset(of: input.nativeEligibleFunctions) {
-                reason = .nativeMetadataUnavailable
-            } else {
-                reason = .nativeProbeFailed
-            }
-            return .init(backend: .hlbc, reason: reason)
+            return .init(backend: .hlbc, reason: .hlbcUnifiedDefault)
         }
         return .init(backend: nil, reason: .unsupported)
     }

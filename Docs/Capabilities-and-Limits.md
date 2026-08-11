@@ -3,22 +3,22 @@
 [简体中文](Capabilities-and-Limits.zh-CN.md)
 
 Helix is intentionally fail-closed. “The Swift compiler accepts this file” is
-not the same as “the production bytecode backend supports this construct,” and
-“a dylib could theoretically contain this declaration” is not the same as “the
-current Live Reload generator collects it.” This document states the current
-practical boundary.
+not the same as “the bytecode backend supports this construct,” and “the
+compiler can emit SIL for this declaration” is not the same as “the current
+HLBC lowerer and Shell capability surface support it.” This document states the
+current practical boundary.
 
 ## Product status at a glance
 
 | Area | Implemented | Not yet qualified or implemented |
 | --- | --- | --- |
 | Release Shell | Exact frontend indexing, Derived Sources, interface archive, permanent bridge, NativeImport discovery, Xcode integration, bundle leakage audit | Broad real-application migration and long-running CI matrix |
-| Production HLBC | HLBC 1.9 / HLXI 2.4 compiler path, verifier, HLVM, signed package, safe installation, immutable activation, rollback and revocation | App Store distribution approval, top-200 business corpus, long fuzz/sanitizer campaigns, real-device macro performance |
-| Native Live Reload | Exact build capture, stable snapshots, typed-AST body reconstruction, recursion/previous handling, signed dylib, authenticated transfer, `dlopen`, UIKit/SwiftUI refresh | Real-iPhone matrix, 100-generation soak, automatic LLDB symbol loading, large-project latency qualification |
-| Development HLBC | Backend routing and session-bound verified HLBC artifacts | The same source coverage as the native compiler; unsupported roots still require a build |
+| Production HLBC | HLBC 1.9 / HLXI 2.4 compiler path, verifier, HLVM, signed package, safe installation, immutable activation, rollback and revocation; checked-in business corpus | App Store distribution approval, external top-200 corpus, long fuzz/sanitizer campaigns, real-device macro performance |
+| Development Live Reload | Exact build capture, stable snapshots, body diff, session-bound verified HLBC, authenticated transfer, atomic activation, UIKit/SwiftUI refresh, logical source maps and a 128-generation in-process soak | Physical-iPhone matrix, long-duration device soak, interactive bytecode stepping, large-project latency qualification |
+| Native experiment | Explicit-only Dynamic Replacement builder, recursion/previous tests, signed dylib and loader probes | Product support; it is intentionally absent from automatic routing |
 | Control plane | Client-side package and policy contracts | Production Registry, HSM operations, approval, rollout, telemetry, and fleet coordination services |
 
-The checked-in SwiftPM baseline contains 384 tests in 64 suites. Debug,
+The checked-in SwiftPM baseline contains 411 tests in 65 suites. Debug,
 warnings-as-errors, and optimized Release runs are recorded as passing. An iOS
 Simulator target covers 9 runtime and UI cases. Those counts describe repository
 evidence, not device or distribution certification.
@@ -32,21 +32,33 @@ evidence, not device or distribution certification.
   conversion rules.
 - `String` literals, concatenation, interpolation for supported scalar values,
   count/empty checks, comparisons, and common prefix/suffix/contains predicates.
+  A one-grapheme `Character` literal is supported for the common
+  `String.contains(Character)` form without exposing Swift's private Character
+  layout.
 - Tuple, `Void`, and `Optional`, including the ordinary control flow produced by
-  `if let`, `guard let`, `??`, and `try?`.
+  `if let`, `guard let`, `??`, and `try?`, including address-based Optional
+  projection emitted by semantic Dictionary lookup SIL.
 - Array value semantics, append, iteration, checked subscript access, and
   value-returning updates; Dictionary construction, lookup, update, and
   iteration for supported key and value types.
 - Structured branches, loops, switches, calls, recursion, checked business
   error edges, and local payload-carrying Error values.
-- Patch-local nonrecursive stored struct and enum values, concrete `Result`,
-  field extraction, enum switch, and supported mutating helpers. These are VM
+- Half-open `Range<Int>` `for` loops, lowered to typed HLBC cursor control flow
+  rather than a Swift standard-library Range/Iterator ABI object.
+- File- or module-scope patch-local nonrecursive stored struct and enum values,
+  concrete `Result`, field extraction, enum switch, and supported mutating
+  helpers. These are VM
   values, not newly loaded Swift metadata.
 - Synchronous patch-local `inout` and `mutating` helpers under verified address,
   access, aliasing, ownership, and same-frame/same-block restrictions.
-- Synchronous nonescaping patch-local closures with copyable VM-managed
-  captures, plus compiler-emitted fully concrete specializations that contain
-  no remaining archetype, metadata, or witness dependency.
+- Synchronous patch-local closure values with copyable VM-managed captures.
+  This includes `@escaping` parameters on same-image helpers, returning a
+  closure from one same-image function to its caller, and a closure capturing
+  another closure. The value must be consumed inside the same pinned HLVM
+  invocation; `escaping-closure-values-1` gates the return and nested-capture
+  semantics independently from the older closure capability. Compiler-emitted
+  fully concrete specializations are also supported when no archetype,
+  metadata, or witness dependency remains.
 - Top-level non-suspending `async`, `async throws`, and `@MainActor async`
   entries. Exact generated Swift wrappers preserve their ABI while HLVM runs a
   body proven not to suspend.
@@ -61,7 +73,14 @@ evidence, not device or distribution certification.
   cancellation, and cross-suspension ownership or generation leases.
 - Actor-isolated instance roots, custom global actors, and arbitrary executor
   hops. The limited `@MainActor async` leaf case above is distinct.
-- Escaping, throwing, async, nested-capture, or native-boundary closures.
+- A closure crossing a Shell Entry or NativeImport boundary, being persisted in
+  native/global/property state, or outliving its pinned HLVM invocation or
+  generation. Throwing, async, `@Sendable`, and closure signatures whose own
+  parameter or result is another closure also remain unsupported.
+- General `Character` values/APIs beyond the bounded literal predicate above;
+  `ClosedRange`, non-`Int` ranges, `stride`, and function-local nominal type
+  declarations. Move a patch-local struct or enum to file scope and rebuild the
+  Shell before patching it.
 - New native classes, new Swift metadata visible across the patch boundary,
   retroactive conformances, layout changes, superclass changes, and enum-case
   changes.
@@ -72,19 +91,25 @@ evidence, not device or distribution certification.
 - A native call that does not have an exact `NativeImportID` in the released
   Shell, even if a similarly named Swift function exists.
 
-## Native Live Reload boundary
+## Development Live Reload boundary
 
-Native Live Reload preserves more Swift semantics because the exact Swift
-compiler produces ordinary machine code and metadata. The current generator is
-nevertheless scoped to existing declaration bodies.
+The default Live Reload path uses the same canonical SIL, verifier, and HLVM
+core as production. Development changes the session, transport, lifetime, and
+diagnostic policy; it does not replace unsupported bytecode with downloaded
+machine code.
 
 | Edit | Current result |
 | --- | --- |
-| Change an indexed global, instance, static, or class function body | Supported on a qualified Native target |
-| Call an existing private/internal/public declaration from that body | Supported when it resolves in the captured module and links against the Dev Shell |
-| Ordinary direct recursion | Rebound to the current generation by exact typed-AST identity |
-| Deliberately call the previous generation | Use the constrained `LiveReload.previous { ... }` marker |
-| Add a local helper, closure, or local type inside the changed body | Compiled with that body when valid Swift |
+| Change an indexed global function body | Supported when its canonical SIL is in the documented subset |
+| Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM |
+| Change a struct/enum/actor instance method or a static/class method | Rejected until value writeback, executor, and metatype ABI are implemented |
+| Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
+| Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
+| Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |
+| Use a supported local closure or an already indexed same-image helper with an `@escaping` closure parameter | Lowered into the same image; closure return/capture is allowed only inside the pinned VM invocation |
+| Use `for value in lower..<upper` where both bounds are `Int` | Supported with Swift's precondition that `lower <= upper`; other range families require a full build |
+| Use a one-grapheme Character literal in supported `String.contains` | Supported as a compiler-only String representation; general Character storage/API is not implied |
+| Declare a patch-local struct or enum | Supported at file/module scope; a function-local nominal is rejected with an exact type diagnostic |
 | Add an arbitrary file-level helper/type/extension or a new Swift file | Not collected by the current generator; full build required |
 | Change a stored property, signature, generic constraint, actor isolation, superclass, conformance, or enum case | Rejected; full build required |
 | Change default-argument behavior | Existing call sites may already contain the old generator; full build is required for a reliable result |
@@ -92,14 +117,19 @@ nevertheless scoped to existing declaration bodies.
 | Add a framework, package, macro/plugin input, bridging header, or source membership | Dev Build Manifest becomes stale; full build required |
 | Edit storyboard, XIB, assets, strings, Core Data model, plist, or entitlements | Outside the Swift-body Live Reload path |
 
-Native replacements can access private members because Helix compiles them with
-the original source-file identity using the captured module context. This does
-not make arbitrary process symbols callable, and it does not bypass linker,
-code-signing, Team ID, AMFI, or library-validation decisions.
+Original access control remains part of the captured compiler context, but
+visibility is not itself a runtime capability. An operation that cannot be
+represented in HLBC and has no exact generated Entry/NativeImport fails at
+compile time even when ordinary Swift would allow it.
 
-Simulator Native is the validated path. Physical-iPhone Native support remains
-experimental until each exact compiler, OS, architecture, code-sign identity,
-provisioning, Team ID, and dependency combination passes the device matrix.
+Simulator and device use the same HLBC protocol and runtime. The checked-in
+Simulator E2E has applied a changed body and restored the baseline in one App
+process. A separate 128-generation in-process soak proves bounded active,
+rollback, failed-save, high-water, and compaction behavior. A physical-iPhone
+run and long-duration memory-pressure soak are still required before device
+behavior is listed as qualified. Native Dynamic Replacement remains an
+explicitly selected internal experiment and is not an alternate product
+fallback.
 
 ## UI refresh boundary
 
@@ -128,6 +158,21 @@ routing, and Debug Overlay behavior. They do not qualify every custom
 container, navigation/sheet interaction, observation graph, or long-running
 side effect pattern.
 
+## Diagnostics boundary
+
+Canonical Swift debug metadata is lowered into a verified HLBC source map keyed
+by function, block, and instruction offset. Production artifacts retain only
+unambiguous logical source paths; host absolute paths are removed. The
+disassembler can annotate instructions with those locations, and an HLVM trap
+reports a structured program counter. `HelixRuntime` enriches it with the pinned
+generation, Shell entry, function name, and logical Swift location before
+notifying observers.
+
+This is source-level failure attribution, not an LLDB replacement. Interactive
+HLBC breakpoints, stepping, expression evaluation, and time-travel debugging
+are not implemented. Compile-time unsupported constructs continue to fail on
+the Mac with the original logical source diagnostic.
+
 ## Security and resource boundaries
 
 Production and development fail closed on unknown versions, capabilities,
@@ -136,8 +181,8 @@ limits. Production bytecode has fuel, deadline, stack, register, call-depth,
 value-shape, native import, and memory accounting. Downloads and live transfers
 are bounded before allocation or execution.
 
-Native Live Reload keeps loaded images mapped and therefore has explicit image
-and byte limits. A synchronous Swift NativeImport cannot be forcibly preempted;
+Development Live Reload bounds artifact bytes and retained generations. A
+synchronous Swift NativeImport cannot be forcibly preempted;
 only bounded/cooperative imports with deadlines and checkpoints should enter a
 production catalog. Real-device tail latency and memory pressure remain gates.
 

@@ -48,6 +48,11 @@ struct NativeImportDiscoveryTests {
             public enum Math {
                 public static func doubled(_ value: Int) -> Int { value * 2 }
             }
+            public final class Counter {
+                public var value: Int = 0
+                public init() {}
+                public func increment(_ value: Int) -> Int { value + 1 }
+            }
             """.utf8
         ).write(to: nativeURL)
 
@@ -112,6 +117,9 @@ struct NativeImportDiscoveryTests {
 
         let output = try FrontendReceipt.Adapter().generate(request)
         #expect(output.receipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
+            "\(moduleName).Counter.increment(_:)",
+            "\(moduleName).Counter.value.get",
+            "\(moduleName).Counter.value.set",
             "\(moduleName).Math.doubled(_:)",
             "\(moduleName).adjust(_:by:)",
             "\(moduleName).checked(_:)",
@@ -122,17 +130,22 @@ struct NativeImportDiscoveryTests {
         #expect(output.receipt.nativeImportCandidates.map(\.id) == [
             .init(rawValue: 0), .init(rawValue: 1), .init(rawValue: 2),
             .init(rawValue: 3), .init(rawValue: 4), .init(rawValue: 5),
+            .init(rawValue: 6),
+            .init(rawValue: 7), .init(rawValue: 8),
         ])
-        #expect(output.receipt.nativeImportBindings.count == 6)
+        #expect(output.receipt.nativeImportBindings.count == 9)
         #expect(output.receipt.nativeImportBindings.allSatisfy {
             $0.generated != nil && $0.importedModules.isEmpty
         })
         var forgedLegacyReceipt = output.receipt
-        forgedLegacyReceipt.schemaVersion = 5
+        forgedLegacyReceipt.schemaVersion = 7
         #expect(throws: ShellBuildReceipt.Error.self) {
             try forgedLegacyReceipt.validate()
         }
         #expect(output.receipt.configuration.modules[moduleName]?.nativeImports.allow.sorted() == [
+            "\(moduleName).Counter.increment(_:)",
+            "\(moduleName).Counter.value.get",
+            "\(moduleName).Counter.value.set",
             "\(moduleName).Math.doubled(_:)",
             "\(moduleName).adjust(_:by:)",
             "\(moduleName).checked(_:)",
@@ -206,11 +219,14 @@ struct NativeImportDiscoveryTests {
             $0.contains("No NativeImport adapters were required")
         })
         let generated = try #require(generatedSources.values.first {
-            $0.contains("@_private(sourceFile: \"Native/Operations.swift\")")
+            $0.contains("@_private(sourceFile: \"Operations.swift\")")
         })
-        #expect(generated.contains("@_private(sourceFile: \"Native/Operations.swift\")"))
+        #expect(generated.contains("@_private(sourceFile: \"Operations.swift\")"))
         #expect(generated.contains("adjust(argument0, by: argument1)"))
         #expect(generated.contains("Math.doubled(argument0)"))
+        #expect(generated.contains("argument1.increment(argument0)"))
+        #expect(generated.contains("argument0.value"))
+        #expect(generated.contains("argument1.value = argument0"))
         #expect(generated.contains("keyword(argument0, repeat: argument1)"))
         #expect(generated.contains("VM.ClosureNativeInvoker("))
         #expect(generated.contains("catch let trap as VM.RuntimeTrap"))
@@ -280,25 +296,19 @@ struct NativeImportDiscoveryTests {
         moduleName: String
     ) throws {
         let output = directory.appendingPathComponent("GeneratedTypecheck", isDirectory: true)
-        let nativeDirectory = output.appendingPathComponent("Native", isDirectory: true)
-        let patchDirectory = output.appendingPathComponent("Patch", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: nativeDirectory,
-            withIntermediateDirectories: true
-        )
-        try FileManager.default.createDirectory(
-            at: patchDirectory,
-            withIntermediateDirectories: true
-        )
         for (path, contents) in shell.transformedSources {
             let url = output.appendingPathComponent(path)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
             try contents.write(to: url)
         }
+        let sourcePaths = shell.transformedSources.keys.sorted()
         let frontend = SwiftFrontend.Driver()
         try requireFrontendSuccess(
             frontend.run(
-                arguments: [
-                    "Native/Operations.swift", "Patch/Feature.swift",
+                arguments: sourcePaths + [
                     "-emit-library", "-emit-module", "-parse-as-library",
                     "-module-name", moduleName,
                     "-Xfrontend", "-enable-private-imports",
@@ -327,6 +337,287 @@ struct NativeImportDiscoveryTests {
                     "-warnings-as-errors",
                 ],
                 workingDirectory: output
+            )
+        )
+    }
+
+    @Test("Managed Debug lowers private class storage reads and writes through exact imports")
+    func lowersManagedStoredProperties() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-managed-properties-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let sourceDirectory = directory.appendingPathComponent("Sources", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: sourceDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = sourceDirectory.appendingPathComponent("Counter.swift")
+        let baseline = """
+        public final class Counter {
+            private var value: Int = 1
+            public func increment(_ amount: Int) -> Int {
+                value += amount
+                return value
+            }
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let moduleName = "ManagedPropertyFixture"
+        let target = "arm64-apple-ios15.0-simulator"
+        let configuration = try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          \(moduleName):
+            include:
+              - Sources/**
+        """)
+        let metadata = InterfaceArchive.ReleaseMetadata(
+            bundleID: "dev.helix.managed-properties",
+            buildNumber: "1",
+            shellNamespaceID: .derive(
+                bundleID: "dev.helix.managed-properties",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            machOUUIDs: [],
+            targetTriple: target,
+            minimumOS: .init(15),
+            xcodeBuild: "integration-test",
+            sdkBuild: sdk.buildVersion,
+            frontendInvocation: .init(
+                moduleName: moduleName,
+                targetTriple: target,
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: ["-parse-as-library"]
+            ),
+            transformPipelineHash: ShellBuild.transformPipelineHash,
+            sourceBaselineHash: .sha256("computed by indexer")
+        )
+        let output = try FrontendReceipt.Adapter().generate(
+            .init(
+                metadata: metadata,
+                configuration: configuration,
+                sources: [.init(logicalPath: "Sources/Counter.swift", url: sourceURL)],
+                compilerURL: compilerURL,
+                callingSurfacePolicy: .managedDebugModule
+            )
+        )
+        #expect(output.receipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
+            "\(moduleName).Counter.value.get",
+            "\(moduleName).Counter.value.set",
+        ])
+        #expect(output.receipt.roots.compactMap(\.bridge).count == 1)
+        #expect(output.receipt.nativeImportBindings.map(\.generated?.dispatch).sorted {
+            ($0?.rawValue ?? "") < ($1?.rawValue ?? "")
+        } == [.instanceGetter, .instanceSetter])
+
+        let shell = try ShellBuild.Materializer().materialize(
+            receipt: output.receipt,
+            sourceRoot: directory
+        )
+        let generated = try #require(shell.bridge.sourceFiles.values.first {
+            $0.contains("argument1.value = argument0")
+        })
+        #expect(generated.contains("argument0.value"))
+        try typeCheckGeneratedBridge(
+            shell: shell,
+            directory: directory,
+            moduleName: moduleName
+        )
+
+        let changed = baseline.replacingOccurrences(
+            of: "value += amount",
+            with: "value += amount * 2"
+        )
+        try Data(changed.utf8).write(to: sourceURL)
+        let patch = try ReleaseCompiler.Driver().build(
+            .init(
+                archive: shell.archive,
+                sourceFiles: [sourceURL],
+                compilerURL: compilerURL
+            )
+        )
+        #expect(
+            patch.disassembly.components(separatedBy: "native_apply").count - 1 >= 3
+        )
+        #expect(patch.module.imports.count == 2)
+        _ = try Verification.Engine().verify(
+            bytes: patch.bytecode,
+            shell: Verification.ShellInterface(archive: shell.archive),
+            policy: .init(
+                acceptedCapabilities: Set(shell.archive.capabilities),
+                allowedNativeImports: Set(shell.archive.nativeImports.compactMap(\.id))
+            )
+        )
+    }
+
+    @Test("Managed Debug freezes imported UIKit TypeOps and lowers a stored reference")
+    func lowersImportedUIKitStoredReference() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-managed-uikit-reference-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let sourceDirectory = directory.appendingPathComponent("Sources", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: sourceDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = sourceDirectory.appendingPathComponent("Screen.swift")
+        let baseline = """
+        import UIKit
+
+        @MainActor
+        public final class Screen: UIViewController {
+            private var label = UILabel()
+
+            public func selectedLabel(_ seed: Int) -> UILabel {
+                _ = seed + 1
+                return label
+            }
+
+            public func replaceLabel(_ next: UILabel, seed: Int) -> UILabel {
+                label = next
+                _ = seed + 3
+                return label
+            }
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let moduleName = "ManagedUIKitFixture"
+        let target = "arm64-apple-ios15.0-simulator"
+        let configuration = try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          \(moduleName):
+            include:
+              - Sources/**
+        """)
+        let metadata = InterfaceArchive.ReleaseMetadata(
+            bundleID: "dev.helix.managed-uikit",
+            buildNumber: "1",
+            shellNamespaceID: .derive(
+                bundleID: "dev.helix.managed-uikit",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            machOUUIDs: [],
+            targetTriple: target,
+            minimumOS: .init(15),
+            xcodeBuild: "integration-test",
+            sdkBuild: sdk.buildVersion,
+            frontendInvocation: .init(
+                moduleName: moduleName,
+                targetTriple: target,
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: ["-parse-as-library"]
+            ),
+            transformPipelineHash: ShellBuild.transformPipelineHash,
+            sourceBaselineHash: .sha256("computed by indexer")
+        )
+        let output = try FrontendReceipt.Adapter().generate(
+            .init(
+                metadata: metadata,
+                configuration: configuration,
+                sources: [.init(logicalPath: "Sources/Screen.swift", url: sourceURL)],
+                compilerURL: compilerURL,
+                callingSurfacePolicy: .managedDebugModule
+            )
+        )
+        let labelType = try #require(output.receipt.nativeTypes.first {
+            $0.canonicalName == "UILabel"
+        })
+        #expect(labelType.kind == .reference)
+        #expect(labelType.requiresMainActor)
+        let labelBinding = try #require(output.receipt.nativeTypeBindings.first {
+            $0.canonicalName == "UILabel"
+        })
+        #expect(labelBinding.importedModules == ["UIKit"])
+        #expect(labelBinding.generated?.swiftType == "UILabel")
+        let labelGetterBinding = try #require(output.receipt.nativeImportBindings.first {
+            $0.generated?.dispatch == .instanceGetter
+        })
+        #expect(labelGetterBinding.importedModules == ["UIKit"])
+
+        var missingTypeImport = output.receipt
+        let labelTypeBindingIndex = try #require(
+            missingTypeImport.nativeTypeBindings.firstIndex {
+                $0.canonicalName == "UILabel"
+            }
+        )
+        missingTypeImport.nativeTypeBindings[labelTypeBindingIndex].importedModules = []
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try missingTypeImport.validate()
+        }
+
+        var missingGetterImport = output.receipt
+        let labelGetterBindingIndex = try #require(
+            missingGetterImport.nativeImportBindings.firstIndex {
+                $0.generated?.dispatch == .instanceGetter
+            }
+        )
+        missingGetterImport.nativeImportBindings[labelGetterBindingIndex].importedModules = []
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try missingGetterImport.validate()
+        }
+        #expect(output.receipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
+            "\(moduleName).Screen.label.get",
+            "\(moduleName).Screen.label.set",
+        ])
+        let selected = try #require(output.receipt.declarations.first {
+            $0.interface.baseName == "selectedLabel"
+        })
+        #expect(selected.resultType == .native(labelType.id))
+        #expect(selected.parameterConventions == [.owned, .borrowed])
+        let replacement = try #require(output.receipt.declarations.first {
+            $0.interface.baseName == "replaceLabel"
+        })
+        #expect(replacement.parameterConventions == [.borrowed, .owned, .borrowed])
+
+        let shell = try ShellBuild.Materializer().materialize(
+            receipt: output.receipt,
+            sourceRoot: directory
+        )
+        let generated = try #require(shell.bridge.sourceFiles.values.first {
+            $0.contains("estimatedByteCount: { (_: UILabel)")
+        })
+        #expect(generated.contains("import UIKit"))
+        #expect(shell.bridge.sourceFiles.values.contains {
+            $0.contains("argument0.label")
+        })
+
+        let changed = baseline.replacingOccurrences(of: "seed + 3", with: "seed + 4")
+        try Data(changed.utf8).write(to: sourceURL)
+        let patch = try ReleaseCompiler.Driver().build(
+            .init(
+                archive: shell.archive,
+                sourceFiles: [sourceURL],
+                compilerURL: compilerURL
+            )
+        )
+        #expect(patch.module.imports.count == 2)
+        #expect(patch.disassembly.contains("native_apply"))
+        _ = try Verification.Engine().verify(
+            bytes: patch.bytecode,
+            shell: Verification.ShellInterface(archive: shell.archive),
+            policy: .init(
+                acceptedCapabilities: Set(shell.archive.capabilities),
+                allowedNativeImports: Set(shell.archive.nativeImports.compactMap(\.id)),
+                allowMainActorSynchronousEntries: true
             )
         )
     }
@@ -406,6 +697,22 @@ struct NativeImportDiscoveryTests {
             parameters: ["Swift.Int"],
             result: "Swift.Int"
         )
+        let counterType = Core.TypeID.derive(
+            namespace: metadata.shellNamespaceID,
+            canonicalType: "ScopeFixture.Counter"
+        )
+        var instance = declaration(
+            canonicalCallee: "ScopeFixture.Counter.increment(_:)",
+            mangledName: "$s12ScopeFixture7CounterC9incrementyS2iF",
+            dispatch: .instanceMethod,
+            ownerType: "Counter",
+            signature: .init(
+                parameters: ["Swift.Int", "ScopeFixture.Counter"],
+                result: "Swift.Int"
+            )
+        )
+        instance.parameterSwiftTypes = ["Swift.Int", "Counter"]
+        instance.parameterTypes = [.int64, .native(counterType)]
         let declarations = [
             declaration(
                 canonicalCallee: "ScopeFixture.compute(_:)",
@@ -425,9 +732,10 @@ struct NativeImportDiscoveryTests {
                 accessLevel: "internal",
                 signature: scalar
             ),
+            instance,
             declaration(
                 canonicalCallee: "ScopeFixture.Counter.increment(_:)",
-                mangledName: "$s12ScopeFixture7CounterC9incrementyS2iF",
+                mangledName: "$s12ScopeFixture7CounterC12malformedyS2iF",
                 dispatch: .instanceMethod,
                 ownerType: "Counter",
                 signature: scalar
@@ -451,6 +759,7 @@ struct NativeImportDiscoveryTests {
         )
 
         #expect(output.candidates.map(\.record.canonicalCallee).sorted() == [
+            "ScopeFixture.Counter.increment(_:)",
             "ScopeFixture.Math.double(_:)",
             "ScopeFixture.compute(_:)",
         ])
@@ -464,7 +773,7 @@ struct NativeImportDiscoveryTests {
                 && $0.record.id == nil
         })
         #expect(Set(output.candidates.map(\.record.contract.kind)) == [
-            .globalFunction, .staticMethod,
+            .globalFunction, .instanceMethod, .staticMethod,
         ])
         #expect(output.diagnostics.map(\.code) == ["HLXNID001", "HLXNID002"])
         #expect(!output.candidates.contains {
@@ -490,7 +799,7 @@ struct NativeImportDiscoveryTests {
         }
     }
 
-    @Test("Automatic discovery rejects native, address, and closure boundaries")
+    @Test("Automatic discovery accepts frozen Native values but rejects address and closure boundaries")
     func rejectsUnsupportedBoundaryTypes() throws {
         let configuration = try PatchConfiguration.Document.parse(yaml: """
         schema: 2
@@ -525,13 +834,32 @@ struct NativeImportDiscoveryTests {
         native.resultType = .void
         native.sourceFileLogicalID = "Sources/Operations.swift"
 
+        var address = native
+        address.canonicalCallee = "ScopeFixture.mutate(_:)"
+        address.mangledName = "$s12ScopeFixture6mutateyySizF"
+        address.parameterTypes = [.address(.int64)]
+        address.signature = .init(parameters: ["inout Swift.Int"], result: "Swift.Void")
+
+        var closure = native
+        closure.canonicalCallee = "ScopeFixture.invoke(_:)"
+        closure.mangledName = "$s12ScopeFixture6invokeyyS2icF"
+        closure.parameterTypes = [
+            .closure(.init(parameters: [.int64], result: .int64)),
+        ]
+        closure.signature = .init(
+            parameters: ["(Swift.Int) -> Swift.Int"],
+            result: "Swift.Void"
+        )
+
         let output = try NativeImportDiscovery.Engine().discover(
-            declarations: [native],
+            declarations: [native, address, closure],
             metadata: metadata,
             configuration: configuration
         )
-        #expect(output.candidates.isEmpty)
-        #expect(output.diagnostics.map(\.code) == ["HLXNID005"])
+        #expect(output.candidates.map(\.record.canonicalCallee) == [
+            "ScopeFixture.consume(_:)",
+        ])
+        #expect(output.diagnostics.map(\.code) == ["HLXNID005", "HLXNID005"])
     }
 
     private func declaration(

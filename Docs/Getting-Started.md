@@ -31,7 +31,7 @@ flowchart LR
     P["Build pre-action"] --> S["Shell metadata in DerivedData"]
     S --> H["Hidden Bridge object"]
     H --> A
-    D["Saved Swift body"] --> N["Dev native replacement"]
+    D["Saved Swift body"] --> N["Verified development HLBC"]
     N --> A
 ```
 
@@ -158,7 +158,7 @@ platform, then atomically publishes `HelixBridge.o` under DerivedData.
 
 The compiler proxy is scoped to the Feature target. It transparently forwards
 the real `swiftc` invocation and stores a permission-restricted, atomic capture
-for later replacements. The App, packages, and unrelated targets keep Xcode's
+for later live generations. The App, packages, and unrelated targets keep Xcode's
 normal driver.
 
 The Live Run pre-action creates a one-run authenticated session. The LLDB init
@@ -181,13 +181,7 @@ final class DevelopmentRuntimeOwner {
     let session: DevRuntime.ApplicationSession
 
     init() throws {
-        session = try DevRuntime.ApplicationSession(
-            environment: .init(),
-            options: .init(
-                supportedBackends: [.nativeDynamicReplacement, .hlbc],
-                nativeChainingProbePassed: true
-            )
-        )
+        session = try DevRuntime.ApplicationSession(environment: .init())
     }
 }
 ```
@@ -199,8 +193,9 @@ Runtime factory, and Bridge installer through a type-erased API. A missing or
 mismatched hidden object fails startup explicitly instead of silently disabling
 Helix.
 
-Set `nativeChainingProbePassed` only for a simulator/device matrix your project
-has qualified. The checked-in simulator E2E is the reference test.
+The public default accepts only authenticated HLBC live artifacts. Native
+Dynamic Replacement can be selected only through the internal experimental
+configuration and is not required for App integration.
 
 ### Release / Hot Patch
 
@@ -270,7 +265,8 @@ Then:
 2. Navigate to the UIKit page you want to edit and change some in-memory state.
 3. Edit only the body of an indexed declaration and save; do not Build.
 4. Confirm compile, transfer, `codeActive`, and `UI refreshed` separately.
-5. Save another edit to exercise Dynamic Replacement chaining.
+5. Save another edit to verify that a later HLBC generation atomically replaces
+   the first one in the same App process.
 
 Changing stored layout, signatures, inheritance, conformances, enum cases,
 actor isolation, source membership, linked dependencies, or build settings
@@ -302,7 +298,7 @@ rejects App Store and controlled-native Release configurations.
 | Source is indexed but no root is patchable | Check that the patch configuration pattern is relative to `sourceRoot` and includes the logical path |
 | Code is active but UI is unchanged | The changed function is observe-only, no displayed UIKit/SwiftUI target matches, or explicit hook/factory work is required |
 | Interface or source membership changed | This is not a body-only transaction; perform a full build |
-| Native image count reaches its limit | Stop and Run again; Swift replacement images are intentionally not `dlclose`d |
+| HLBC lowering reports an unsupported construct | Follow the precise diagnostic, simplify the edit to the supported subset, or perform a normal build |
 | Release baseline mismatch | Restore the audited sources, Xcode/SDK, target, configuration, and binary identity |
 
 Continue with [Architecture](Architecture.md),

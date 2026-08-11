@@ -101,6 +101,44 @@ public enum ExecutionResult: Equatable, Sendable {
     case trapped(VM.RuntimeTrap)
 }
 
+/// Identifies the HLBC instruction that was executing when a Runtime trap began.
+public struct ProgramCounter: Codable, Hashable, Sendable, CustomStringConvertible {
+    public var functionID: Bytecode.FunctionID
+    public var blockID: Bytecode.BlockID
+    public var instructionOffset: UInt32
+
+    public init(
+        functionID: Bytecode.FunctionID,
+        blockID: Bytecode.BlockID,
+        instructionOffset: UInt32
+    ) {
+        self.functionID = functionID
+        self.blockID = blockID
+        self.instructionOffset = instructionOffset
+    }
+
+    public var description: String {
+        "\(functionID).\(blockID)#\(instructionOffset)"
+    }
+}
+
+/// Structured VM-only trap context. Runtime enriches this coordinate with the
+/// active generation, Shell entry, function name, and logical Swift location.
+public struct TrapDiagnostic: Equatable, Sendable {
+    public var trap: VM.RuntimeTrap
+    public var programCounter: VM.ProgramCounter?
+
+    public init(
+        trap: VM.RuntimeTrap,
+        programCounter: VM.ProgramCounter?
+    ) {
+        self.trap = trap
+        self.programCounter = programCounter
+    }
+}
+
+public typealias TrapObserver = @Sendable (VM.TrapDiagnostic) -> Void
+
 /// Authorizes the executor prologue that lives in a generated Swift wrapper,
 /// outside HLVM. The async authorization is package-scoped so application code
 /// cannot manufacture it through the public interpreter API.

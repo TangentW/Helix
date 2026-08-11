@@ -2011,12 +2011,39 @@ struct Interpreter {
             parameterTypes: [],
             resultType: .string
         )
+        let diagnosticBox = TrapDiagnosticBox()
         #expect(
-            VM.Interpreter().invoke(
+            VM.Interpreter(trapObserver: { diagnosticBox.record($0) }).invoke(
                 entry: .init(rawValue: 0),
                 image: nilImage,
                 arguments: []
             ) == .trapped(.optionalUnwrapOfNil)
+        )
+        #expect(
+            diagnosticBox.value == .init(
+                trap: .optionalUnwrapOfNil,
+                programCounter: .init(
+                    functionID: .init(rawValue: 0),
+                    blockID: .init(rawValue: 0),
+                    instructionOffset: 1
+                )
+            )
+        )
+
+        let unknownEntryBox = TrapDiagnosticBox()
+        let unknownEntry = Core.EntryIndex(rawValue: 99)
+        #expect(
+            VM.Interpreter(trapObserver: { unknownEntryBox.record($0) }).invoke(
+                entry: unknownEntry,
+                image: nilImage,
+                arguments: []
+            ) == .trapped(.unknownEntry(unknownEntry))
+        )
+        #expect(
+            unknownEntryBox.value == .init(
+                trap: .unknownEntry(unknownEntry),
+                programCounter: nil
+            )
         )
 
         let throwingFunction = Bytecode.Function(
@@ -2800,6 +2827,23 @@ struct Interpreter {
             let value = values[min(index, values.count - 1)]
             index += 1
             return value
+        }
+    }
+
+    private final class TrapDiagnosticBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: VM.TrapDiagnostic?
+
+        var value: VM.TrapDiagnostic? {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+
+        func record(_ diagnostic: VM.TrapDiagnostic) {
+            lock.lock()
+            storage = diagnostic
+            lock.unlock()
         }
     }
 

@@ -226,7 +226,8 @@ struct Archive {
 
         var oldClosureBytecode = try fixture()
         oldClosureBytecode.capabilities.append(contentsOf: [
-            .closureValuesV1, .compilerSpecializationsV1,
+            .closureValuesV1, .escapingClosureValuesV1,
+            .compilerSpecializationsV1,
         ])
         oldClosureBytecode.compatibility.bytecode = .init(1, 7, 0)
         oldClosureBytecode.shellInterfaceHash = try oldClosureBytecode
@@ -241,7 +242,8 @@ struct Archive {
 
         var oldClosureArchive = try fixture()
         oldClosureArchive.capabilities.append(contentsOf: [
-            .closureValuesV1, .compilerSpecializationsV1,
+            .closureValuesV1, .escapingClosureValuesV1,
+            .compilerSpecializationsV1,
         ])
         oldClosureArchive.compatibility.interfaceArchive = .init(2, 2, 0)
         oldClosureArchive.shellInterfaceHash = try oldClosureArchive

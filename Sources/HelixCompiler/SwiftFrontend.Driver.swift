@@ -60,14 +60,23 @@ public struct Driver: Sendable {
         sourceFiles: [URL],
         moduleName: String,
         optimization: String = "-O",
-        additionalArguments: [String] = []
+        additionalArguments: [String] = [],
+        purpose: SwiftFrontend.CanonicalSILPurpose = .implementationIdentity
     ) throws -> String {
         guard FileManager.default.isExecutableFile(atPath: compilerURL.path) else {
             throw SwiftFrontend.Error.executableNotFound(compilerURL.path)
         }
-        let arguments = ["-emit-sil", optimization, "-module-name", moduleName]
-            + wholeModuleArguments(sourceCount: sourceFiles.count, existing: additionalArguments)
-            + additionalArguments
+        let semanticArguments = purpose.applying(
+            to: additionalArguments,
+            compilerURL: compilerURL
+        )
+        let arguments = [
+            "-emit-sil", optimization,
+            "-module-name", moduleName,
+            "-Xllvm", "-sil-print-debuginfo",
+        ]
+            + wholeModuleArguments(sourceCount: sourceFiles.count, existing: semanticArguments)
+            + semanticArguments
             + sourceFiles.map(\.path)
             + ["-o", "-"]
         let output = try run(arguments: arguments)
@@ -134,7 +143,8 @@ public struct Driver: Sendable {
     public func emitCanonicalSIL(
         sourceFiles: [URL],
         invocation: InterfaceArchive.FrontendInvocation,
-        additionalArguments: [String] = []
+        additionalArguments: [String] = [],
+        purpose: SwiftFrontend.CanonicalSILPurpose = .implementationIdentity
     ) throws -> String {
         try invocation.validate()
         let sdk = try sdkIdentity(name: invocation.sdkName)
@@ -144,15 +154,20 @@ public struct Driver: Sendable {
                 actual: sdk.buildVersion
             )
         }
+        let semanticArguments = purpose.applying(
+            to: invocation.semanticArguments + additionalArguments,
+            compilerURL: compilerURL
+        )
         let arguments = [
             "-emit-sil", invocation.optimization,
             "-module-name", invocation.moduleName,
             "-target", invocation.targetTriple,
             "-sdk", sdk.path,
+            "-Xllvm", "-sil-print-debuginfo",
         ] + wholeModuleArguments(
             sourceCount: sourceFiles.count,
-            existing: invocation.semanticArguments + additionalArguments
-        ) + invocation.semanticArguments + additionalArguments
+            existing: semanticArguments
+        ) + semanticArguments
             + sourceFiles.map(\.path) + ["-o", "-"]
         let output = try run(arguments: arguments)
         guard output.terminationStatus == 0 else {

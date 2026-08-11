@@ -17,7 +17,11 @@ public struct Request: Sendable {
     public var compatibility: Core.Compatibility
     public var requestedResources: Core.ResourceLimits
     public var directCalls: CanonicalSIL.DirectCallTable
+    public var nativeTypes: [String: Core.TypeID]
     public var effects: Core.Effects?
+    /// The only source path permitted in emitted HLBC diagnostics. When nil,
+    /// the compiler drops all source locations instead of retaining host paths.
+    public var sourceFileLogicalID: String?
 
     public init(
         canonicalSIL: String,
@@ -30,7 +34,9 @@ public struct Request: Sendable {
         compatibility: Core.Compatibility,
         requestedResources: Core.ResourceLimits = .init(),
         directCalls: CanonicalSIL.DirectCallTable = .empty,
-        effects: Core.Effects? = nil
+        nativeTypes: [String: Core.TypeID] = [:],
+        effects: Core.Effects? = nil,
+        sourceFileLogicalID: String? = nil
     ) {
         self.canonicalSIL = canonicalSIL
         self.mangledName = mangledName
@@ -42,7 +48,9 @@ public struct Request: Sendable {
         self.compatibility = compatibility
         self.requestedResources = requestedResources
         self.directCalls = directCalls
+        self.nativeTypes = nativeTypes
         self.effects = effects
+        self.sourceFileLogicalID = sourceFileLogicalID
     }
 }
 
@@ -58,19 +66,26 @@ public struct Driver: Sendable {
 
     public func compile(_ request: PatchCompiler.Request) throws -> PatchCompiler.Result {
         let file = try CanonicalSIL.File(text: request.canonicalSIL)
+        let typeEnvironment = try file.typeEnvironment.includingNativeTypes(
+            request.nativeTypes
+        )
         guard let silFunction = file.function(mangledName: request.mangledName) else {
             throw CanonicalSIL.LoweringError.functionSelection("function @\(request.mangledName) was not found")
         }
-        let hlir = try CanonicalSIL.Lowerer(
-            typeEnvironment: file.typeEnvironment
+        var hlir = try CanonicalSIL.Lowerer(
+            typeEnvironment: typeEnvironment
         ).lower(
             silFunction,
             displayName: request.displayName,
             directCalls: request.directCalls,
             expectedEffects: request.effects
         )
+        hlir = IntermediateRepresentation.SourceMapping.retainingLogicalPaths(
+            hlir,
+            logicalPaths: request.sourceFileLogicalID.map { [$0] } ?? []
+        )
         let imports = try request.directCalls.importRequirements(referencedBy: [hlir])
-        let localTypes = try file.typeEnvironment.definitions(referencedBy: [hlir])
+        let localTypes = try typeEnvironment.definitions(referencedBy: [hlir])
         let function = IntermediateRepresentation.ToBytecode.lower(hlir, id: request.functionID)
         let module = Bytecode.Module(
             name: request.displayName,
@@ -91,7 +106,11 @@ public struct Driver: Sendable {
                     functionID: request.functionID
                 ),
             ],
-            imports: imports
+            imports: imports,
+            sourceMap: IntermediateRepresentation.ToBytecode.sourceMap(
+                hlir,
+                id: request.functionID
+            )
         )
         let bytecode = try Bytecode.Encoder.encode(module)
         return PatchCompiler.Result(
@@ -139,7 +158,13 @@ public struct Driver: Sendable {
                 compatibility: archive.compatibility,
                 requestedResources: requestedResources,
                 directCalls: directCalls,
-                effects: record.effects
+                nativeTypes: Dictionary(
+                    uniqueKeysWithValues: archive.nativeTypes
+                        .filter(\.isEmittedToDevice)
+                        .map { ($0.canonicalName, $0.id) }
+                ),
+                effects: record.effects,
+                sourceFileLogicalID: record.sourceFileLogicalID
             )
         )
     }

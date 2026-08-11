@@ -3,20 +3,27 @@ import HelixBytecode
 import HelixCore
 import HelixVerifier
 
+private final class ExecutionTrace {
+    var programCounter: VM.ProgramCounter?
+}
+
 extension VM {
 public struct Interpreter: Sendable {
     public var nativeCatalog: VM.NativeCatalog
     public var nativeTypeCatalog: VM.NativeTypeCatalog
     public var entryInvocation: VM.EntryInvocation?
+    public var trapObserver: VM.TrapObserver?
 
     public init(
         nativeCatalog: VM.NativeCatalog = .init(),
         nativeTypeCatalog: VM.NativeTypeCatalog = .init(),
-        entryInvocation: VM.EntryInvocation? = nil
+        entryInvocation: VM.EntryInvocation? = nil,
+        trapObserver: VM.TrapObserver? = nil
     ) {
         self.nativeCatalog = nativeCatalog
         self.nativeTypeCatalog = nativeTypeCatalog
         self.entryInvocation = entryInvocation
+        self.trapObserver = trapObserver
     }
 
     public func invoke(
@@ -27,7 +34,9 @@ public struct Interpreter: Sendable {
         rootContext: VM.RootExecutionContext = .synchronous
     ) -> VM.ExecutionResult {
         guard let mapping = image.module.entries.first(where: { $0.entryIndex == entry }) else {
-            return .trapped(.unknownEntry(entry))
+            let trap = VM.RuntimeTrap.unknownEntry(entry)
+            trapObserver?(.init(trap: trap, programCounter: nil))
+            return .trapped(trap)
         }
         return invoke(
             function: mapping.functionID,
@@ -45,6 +54,7 @@ public struct Interpreter: Sendable {
         budget: VM.InvocationBudget? = nil,
         rootContext: VM.RootExecutionContext = .synchronous
     ) -> VM.ExecutionResult {
+        let trace = ExecutionTrace()
         do {
             try validate(image: image)
             let resolvedBudget = budget ?? VM.InvocationBudget(limits: image.effectiveResourceLimits)
@@ -97,15 +107,19 @@ public struct Interpreter: Sendable {
                 functions: functions,
                 arguments: arguments,
                 localTypes: localTypes,
-                budget: resolvedBudget
+                budget: resolvedBudget,
+                trace: trace
             )
             return .returned(value)
         } catch let business as VM.BusinessError {
             return .businessError(business.error.message)
         } catch let trap as VM.RuntimeTrap {
+            trapObserver?(.init(trap: trap, programCounter: trace.programCounter))
             return .trapped(trap)
         } catch {
-            return .trapped(.nativeFailure(String(describing: error)))
+            let trap = VM.RuntimeTrap.nativeFailure(String(describing: error))
+            trapObserver?(.init(trap: trap, programCounter: trace.programCounter))
+            return .trapped(trap)
         }
     }
 
@@ -193,7 +207,8 @@ public struct Interpreter: Sendable {
         functions: [Bytecode.FunctionID: Bytecode.Function],
         arguments: [VM.Value],
         localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
-        budget: VM.InvocationBudget
+        budget: VM.InvocationBudget,
+        trace: ExecutionTrace
     ) throws -> VM.Value? {
         guard let function = functions[functionID] else { throw VM.RuntimeTrap.unknownFunction(functionID) }
         guard arguments.count == function.parameterRegisters.count else {
@@ -236,7 +251,16 @@ public struct Interpreter: Sendable {
         while true {
             guard let block = blocks[currentBlock] else { throw VM.RuntimeTrap.invalidProgramCounter }
             var advancedToNextBlock = false
-            for instruction in block.instructions {
+            for (instructionIndex, instruction) in block.instructions.enumerated() {
+                guard let instructionOffset = UInt32(exactly: instructionIndex) else {
+                    throw VM.RuntimeTrap.invalidProgramCounter
+                }
+                let programCounter = VM.ProgramCounter(
+                    functionID: functionID,
+                    blockID: block.id,
+                    instructionOffset: instructionOffset
+                )
+                trace.programCounter = programCounter
                 try budget.consumeInstruction()
                 switch instruction {
                 case let .constantInteger(result, value):
@@ -1219,8 +1243,10 @@ public struct Interpreter: Sendable {
                         functions: functions,
                         arguments: values,
                         localTypes: localTypes,
-                        budget: budget
+                        budget: budget,
+                        trace: trace
                     )
+                    trace.programCounter = programCounter
                     try storeCallResult(
                         value,
                         in: result,
@@ -1356,8 +1382,10 @@ public struct Interpreter: Sendable {
                         functions: functions,
                         arguments: callValues,
                         localTypes: localTypes,
-                        budget: budget
+                        budget: budget,
+                        trace: trace
                     )
+                    trace.programCounter = programCounter
                     try storeCallResult(
                         value,
                         in: result,
@@ -1384,8 +1412,10 @@ public struct Interpreter: Sendable {
                             functions: functions,
                             arguments: values,
                             localTypes: localTypes,
-                            budget: budget
+                            budget: budget,
+                            trace: trace
                         )
+                        trace.programCounter = programCounter
                         try transferCallOutcome(
                             value,
                             to: blocks[normalTarget]!,
@@ -1396,6 +1426,7 @@ public struct Interpreter: Sendable {
                         )
                         currentBlock = normalTarget
                     } catch let error as VM.BusinessError {
+                        trace.programCounter = programCounter
                         try transferBusinessError(
                             error,
                             to: blocks[errorTarget]!,

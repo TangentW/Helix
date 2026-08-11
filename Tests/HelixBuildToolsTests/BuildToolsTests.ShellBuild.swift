@@ -144,19 +144,65 @@ struct ShellBuildPipeline {
         }
     }
 
-    @Test("Schema 5 receipts remain canonical after adding generated NativeImport metadata")
+    @Test("Schema 5 through 7 receipts remain canonical without newer generated metadata")
     func preservesLegacyReceiptCompatibility() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
-        var legacy = fixture.receipt
-        legacy.schemaVersion = 5
+        for schemaVersion: UInt16 in [5, 6, 7] {
+            var legacy = fixture.receipt
+            legacy.schemaVersion = schemaVersion
 
-        let bytes = try ShellBuildReceipt.Codec.encode(legacy)
-        let decoded = try ShellBuildReceipt.Codec.decode(bytes)
+            let bytes = try ShellBuildReceipt.Codec.encode(legacy)
+            let decoded = try ShellBuildReceipt.Codec.decode(bytes)
 
-        #expect(decoded.schemaVersion == 5)
-        #expect(decoded.nativeImportBindings.allSatisfy { $0.generated == nil })
-        #expect(try ShellBuildReceipt.Codec.encode(decoded) == bytes)
+            #expect(decoded.schemaVersion == schemaVersion)
+            #expect(decoded.nativeImportBindings.allSatisfy { $0.generated == nil })
+            #expect(decoded.nativeTypeBindings.allSatisfy { $0.generated == nil })
+            #expect(try ShellBuildReceipt.Codec.encode(decoded) == bytes)
+        }
+    }
+
+    @Test("Schema 8 rejects an Entry and NativeImport identity overlap")
+    func rejectsEntryNativeImportOverlap() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        var forged = fixture.receipt
+        let entry = try #require(forged.roots.first?.declarationMangledName)
+        let declaration = try #require(forged.declarations.first)
+        let effects = Core.Effects()
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let key = try Core.NativeImportKey.derive(
+            namespace: forged.metadata.shellNamespaceID,
+            canonicalCallee: "Fixture.forged(_:)",
+            signature: declaration.loweredSignature,
+            effects: effects,
+            contract: contract
+        )
+        forged.nativeImportCandidates = [
+            .init(
+                id: nil,
+                key: key,
+                canonicalCallee: "Fixture.forged(_:)",
+                silMangledNames: [entry],
+                parameterTypes: declaration.parameterTypes,
+                resultType: declaration.resultType,
+                signature: declaration.loweredSignature,
+                effects: effects,
+                contract: contract,
+                capability: .nativeImportsV2,
+                isEmittedToDevice: false
+            ),
+        ]
+
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try forged.validate()
+        }
     }
 
     @Test("A source mutation after typed indexing fails closed")

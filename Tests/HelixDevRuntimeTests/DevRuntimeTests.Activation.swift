@@ -131,6 +131,116 @@ struct ActivationController {
         #expect(registry.snapshot().activeGenerationID == nil)
     }
 
+    @Test("A 128-generation HLBC soak stays bounded and survives a failed save")
+    func continuousHLBCActivationIsBounded() async throws {
+        let fixture = try DevRuntimeFixture()
+        let directory = try temporaryRuntimeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let registry = Runtime.GenerationRegistry(
+            maximumGenerationCount: 4,
+            maximumEstimatedBytes: 4 * 1_024 * 1_024
+        )
+        let controller = try DevActivation.Controller(
+            identity: fixture.identity,
+            shell: fixture.shell,
+            runtimePolicy: .init(),
+            registry: registry,
+            cacheDirectory: directory
+        )
+
+        var previousPayload = fixture.bytecode
+        var activePayload = fixture.bytecode
+        for rawID in UInt64(1)...128 {
+            let payload = try fixture.payload(returning: Int64(rawID))
+            previousPayload = activePayload
+            activePayload = payload
+            let offer = fixture.offer(
+                revision: rawID,
+                generation: rawID,
+                payload: payload
+            )
+            let token = try await controller.accept(offer)
+            try await controller.append(
+                .init(token: token, offset: 0, bytes: payload)
+            )
+            #expect(await controller.commit(token).codeStatus == .codeActive)
+        }
+
+        var registrySnapshot = registry.snapshot()
+        #expect(registrySnapshot.activeGenerationID == .init(rawValue: 128))
+        #expect(
+            registrySnapshot.loadedGenerationIDs
+                == [.init(rawValue: 127), .init(rawValue: 128)]
+        )
+        #expect(registrySnapshot.compactedGenerationCount == 126)
+        #expect(
+            registrySnapshot.estimatedByteCount
+                <= previousPayload.count + activePayload.count
+        )
+        let activationSnapshot = await controller.snapshot()
+        #expect(
+            activationSnapshot.retainedHLBCGenerationIDs
+                == [.init(rawValue: 127), .init(rawValue: 128)]
+        )
+        #expect(
+            activationSnapshot.highestActivatedHLBCGenerationID
+                == .init(rawValue: 128)
+        )
+        #expect(
+            activationSnapshot.retainedHLBCBytes
+                == registrySnapshot.estimatedByteCount
+        )
+        #expect(activationSnapshot.compactedHLBCGenerationCount == 126)
+        let activeImage = try #require(registry.activeLease()?.generation.images.first)
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: activeImage,
+                arguments: [.integer(try VM.Integer(signed: 0, bitWidth: 64, isSigned: true))]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 128, bitWidth: 64, isSigned: true))
+            )
+        )
+
+        let failedPayload = try fixture.payload(returning: 129)
+        let failedOffer = fixture.offer(
+            revision: 129,
+            generation: 129,
+            payload: failedPayload
+        )
+        let failedToken = try await controller.accept(failedOffer)
+        var corrupt = failedPayload
+        corrupt[corrupt.startIndex] ^= 1
+        try await controller.append(
+            .init(token: failedToken, offset: 0, bytes: corrupt)
+        )
+        #expect(await controller.commit(failedToken).codeStatus == .rejected)
+        registrySnapshot = registry.snapshot()
+        #expect(registrySnapshot.activeGenerationID == .init(rawValue: 128))
+        #expect(
+            registrySnapshot.loadedGenerationIDs
+                == [.init(rawValue: 127), .init(rawValue: 128)]
+        )
+        #expect(registrySnapshot.highestActivatedGenerationID == .init(rawValue: 128))
+
+        let recoveredPayload = try fixture.payload(returning: 130)
+        let recoveredOffer = fixture.offer(
+            revision: 130,
+            generation: 130,
+            payload: recoveredPayload
+        )
+        let recoveredToken = try await controller.accept(recoveredOffer)
+        try await controller.append(
+            .init(token: recoveredToken, offset: 0, bytes: recoveredPayload)
+        )
+        #expect(await controller.commit(recoveredToken).codeStatus == .codeActive)
+        registrySnapshot = registry.snapshot()
+        #expect(
+            registrySnapshot.loadedGenerationIDs
+                == [.init(rawValue: 128), .init(rawValue: 130)]
+        )
+    }
+
     @Test("A zero-payload restore generation removes the prior HLBC route")
     func restoresOriginalRoute() async throws {
         let fixture = try DevRuntimeFixture()
@@ -307,9 +417,12 @@ struct ActivationController {
             sessionSecret: secret
         )
         let recorder = ReloadRecorder()
+        // This positive-path integration test runs beside compiler-heavy suites
+        // in CI. Keep the production-sized receive window; short deadlines are
+        // exercised independently by the liveness failure tests.
         let liveness = DevProtocol.LivenessConfiguration(
-            heartbeatIntervalNanoseconds: 5_000_000,
-            receiveTimeoutNanoseconds: 1_000_000_000
+            heartbeatIntervalNanoseconds: 100_000_000,
+            receiveTimeoutNanoseconds: 30_000_000_000
         )
         let activation = try DevActivation.Controller(
             identity: fixture.identity,
@@ -348,7 +461,6 @@ struct ActivationController {
         } catch {
             throw SessionStageError(stage: "first host handshake", underlying: error)
         }
-        try await Task.sleep(nanoseconds: 30_000_000)
         let offer = fixture.offer(revision: 1, generation: 1)
         let result: DevProtocol.ActivationResult
         do {
@@ -436,6 +548,7 @@ private struct DevRuntimeFixture {
     let sessionID = UUID(uuidString: "3CF22EF2-CE41-4A6F-8B6B-A56FFCA1AC86")!
     let shellHash = Core.Digest.sha256("dev-runtime-shell")
     let entry = Core.EntryIndex(rawValue: 1)
+    let compatibility: Core.Compatibility
     let functionKey: Core.FunctionKey
     let bytecode: Data
     let shell: Verification.ShellInterface
@@ -447,7 +560,7 @@ private struct DevRuntimeFixture {
             buildNumber: "1",
             seed: "dev-runtime"
         )
-        let compatibility = Core.Compatibility(
+        compatibility = Core.Compatibility(
             runtime: Core.Versions.runtime,
             bytecode: Core.Versions.bytecode,
             interfaceArchive: Core.Versions.interfaceArchive,
@@ -516,15 +629,59 @@ private struct DevRuntimeFixture {
     }
 
     func offer(revision: UInt64, generation: UInt64) -> DevProtocol.PatchOffer {
+        offer(revision: revision, generation: generation, payload: bytecode)
+    }
+
+    func offer(
+        revision: UInt64,
+        generation: UInt64,
+        payload: Data
+    ) -> DevProtocol.PatchOffer {
         .init(
             sessionID: sessionID,
             sourceRevision: .init(rawValue: revision),
             generationID: .init(rawValue: generation),
             backend: .hlbc,
-            payloadByteLength: UInt64(bytecode.count),
-            payloadSHA256: .sha256(bytecode),
+            payloadByteLength: UInt64(payload.count),
+            payloadSHA256: .sha256(payload),
             changedSources: [.derive(logicalPath: "Sources/Fixture.swift")],
             changedFunctions: [functionKey]
+        )
+    }
+
+    func payload(returning value: Int64) throws -> Data {
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "identity",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(result: .init(rawValue: 1), value: value),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        return try Bytecode.Encoder.encode(
+            .init(
+                name: "DevRuntimeFixture-\(value)",
+                shellInterfaceHash: shellHash,
+                compatibility: compatibility,
+                functions: [function],
+                entries: [
+                    .init(
+                        entryIndex: entry,
+                        functionKey: functionKey,
+                        functionID: function.id
+                    ),
+                ]
+            )
         )
     }
 }

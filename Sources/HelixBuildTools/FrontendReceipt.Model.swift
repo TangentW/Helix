@@ -8,6 +8,15 @@ import HelixInterface
 public enum FrontendReceipt {}
 
 extension FrontendReceipt {
+public enum CallingSurfacePolicy: Hashable, Sendable {
+    /// Uses only the NativeImport scopes and catalog explicitly configured by
+    /// the Release/host integration.
+    case configured
+    /// Expands one Debug feature module into exact generated operations. The
+    /// archive still contains no wildcard and eligible Entries take priority.
+    case managedDebugModule
+}
+
 public struct Source: Hashable, Sendable {
     public var logicalPath: String
     public var url: URL
@@ -24,19 +33,22 @@ public struct Request: Sendable {
     public var sources: [FrontendReceipt.Source]
     public var compilerURL: URL
     public var nativeImportCatalog: NativeImportCatalog.Document
+    public var callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy
 
     public init(
         metadata: InterfaceArchive.ReleaseMetadata,
         configuration: PatchConfiguration.Document,
         sources: [FrontendReceipt.Source],
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
-        nativeImportCatalog: NativeImportCatalog.Document = .empty
+        nativeImportCatalog: NativeImportCatalog.Document = .empty,
+        callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy = .configured
     ) {
         self.metadata = metadata
         self.configuration = configuration
         self.sources = sources
         self.compilerURL = compilerURL
         self.nativeImportCatalog = nativeImportCatalog
+        self.callingSurfacePolicy = callingSurfacePolicy
     }
 }
 

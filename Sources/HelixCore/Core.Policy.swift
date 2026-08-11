@@ -21,6 +21,7 @@ public struct Capability: RawRepresentable, Hashable, Codable, Sendable, Compara
     public static let addressValuesV1: Self = "address-values-1"
     public static let borrowCallsV1: Self = "borrow-calls-1"
     public static let closureValuesV1: Self = "closure-values-1"
+    public static let escapingClosureValuesV1: Self = "escaping-closure-values-1"
     public static let compilerSpecializationsV1: Self = "compiler-specializations-1"
     public static let mainActorSyncV1: Self = "main-actor-sync-1"
     public static let asyncLeafEntriesV1: Self = "async-leaf-entry-1"

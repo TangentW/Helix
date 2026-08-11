@@ -9,7 +9,7 @@ share compiler facts and identity contracts; they do not share a delivery
 channel.
 
 This document describes the implementation available in the repository as of
-August 10, 2026. It does not turn unfinished qualification work into a product
+August 11, 2026. It does not turn unfinished qualification work into a product
 claim.
 
 ## The two workflows
@@ -17,12 +17,12 @@ claim.
 | Workflow | Artifact | Execution | Lifetime | Intended use |
 | --- | --- | --- | --- | --- |
 | Production hot patch | Signed `.hlxp` containing HLBC | Preinstalled verifier and HLVM | Persisted, rollback-capable generations | A controlled response to a defect in a released Shell |
-| Development Live Reload | Session-bound native dylib or HLBC live artifact | Swift Dynamic Replacement or the development HLVM path | Current Debug process only | Save a function body and update the running page |
+| Development Live Reload | Session-bound authenticated HLBC live artifact | The development verifier and HLVM path | Current Debug process only | Save a supported function body and update the running page |
 
-The production path never downloads Swift source or native machine code. The
-development path may load a newly compiled, signed dylib, but only into a Dev
-Shell through an authenticated session. This distinction is structural, not a
-runtime configuration toggle.
+Neither product path downloads Swift source or native machine code into the
+App. Production accepts a persistable, policy-bound signed package; development
+accepts an ephemeral artifact bound to one authenticated Dev Session. This
+distinction is structural, not a runtime configuration toggle.
 
 ```mermaid
 flowchart TB
@@ -35,11 +35,9 @@ flowchart TB
     HLBC --> PKG["Signed Shell-bound .hlxp"]
     PKG --> PR["HelixAppRuntime"]
 
-    D --> ROUTE{"Dev backend routing"}
-    ROUTE --> NATIVE["Typed-AST replacement source → signed dylib"]
-    ROUTE --> DHLBC["Development HLBC"]
-    NATIVE --> DR["HelixDevAppRuntime"]
-    DHLBC --> DR
+    D --> DSIL["Exact-toolchain canonical SIL"]
+    DSIL --> DHLBC["HLIR → authenticated development HLBC"]
+    DHLBC --> DR["HelixDevAppRuntime verifier + HLVM"]
     DR --> UI["Automatic UIKit instance invalidation or SwiftUI pulse"]
 ```
 
@@ -56,9 +54,18 @@ Both workflows depend on stable, build-specific identities:
   edit from an ABI, layout, source-membership, or dependency change.
 - Toolchain, SDK, target triple, compiler arguments, module source set, and
   binary identity bind every artifact to the Shell for which it was built.
+- Verified debug metadata maps HLBC function/block/instruction coordinates to
+  logical Swift file, line, and column. Production artifacts redact build-host
+  absolute paths; traps add the exact VM program counter and pinned generation.
 - An immutable `Runtime.Generation` makes all routes in one activation visible
   atomically. A call chain pins one generation so it cannot observe a mixture
   during concurrent activation or rollback.
+- Activation materializes inherited routes into a self-contained snapshot. The
+  registry normally retains only the active snapshot and its direct rollback
+  predecessor; older snapshots remain alive only while a lease pins them. A
+  process-wide generation-ID high-water mark survives compaction. Ordinary
+  activation cannot reuse an old ID; verified durable recovery may rehydrate
+  the exact historical package/ID without lowering that high-water mark.
 
 These identities are intentionally build-specific. Helix does not try to make
 private Swift ABI compatible across unrelated App versions.
@@ -95,16 +102,18 @@ generated contract without a Bridge framework, generated source target, or
 generated Swift import.
 
 The Xcode integration captures the frontend, link, SDK, module, source, and
-signing facts from a real Debug build. A source monitor turns editor writes and
+target facts from a real Debug build. A source monitor turns editor writes and
 atomic renames into a stable, monotonically numbered snapshot. The development
-compiler rechecks the transaction in the original module context and routes all
-changed roots to one safe backend.
+compiler rechecks the transaction in the original module context, lowers the
+same supported canonical SIL used by the release compiler, and emits one
+immutable HLBC generation. The authenticated daemon transports those bytes;
+the Debug App verifies them before atomically activating an ephemeral runtime
+generation.
 
-On the validated Simulator-native route, Helix extracts only existing
-replacement roots, uses typed-AST declaration identities to preserve normal
-recursion, emits `@_dynamicReplacement` sources, compiles and signs a unique
-dylib, then transfers its bytes to the App. It creates a new image per accepted
-generation; it does not keep appending files to one mutable dylib.
+There is no mutable dynamic library to which source files are appended. Native
+Dynamic Replacement remains available only through an explicit internal
+backend selection for compiler experiments and differential validation. The
+automatic and default route never falls back to it.
 
 The Debug App activates code first and refreshes UI second. `ReloadIndex`
 metadata maps changed roots to stable nominal type IDs. UIKit reconstructs those
@@ -134,13 +143,17 @@ release, daemon, and CLI modules must never be linked into the Release App.
 ## Current qualification boundary
 
 The repository contains a functioning production client chain for restricted
-HLBC patches and a functioning Simulator-native Live Reload chain. The latter
-has been demonstrated across two edits and a baseline-restoring third
-generation in one App process. The production Hot Patch demo can stage a signed
+HLBC patches and a functioning Simulator HLBC Live Reload chain. The latter has
+been demonstrated with a changed implementation and a baseline-restoring
+second generation in one App process. The production Hot Patch demo can stage a signed
 package as a mock download and exercise normal verification, installation,
 activation, and rollback.
 
-This evidence does not yet qualify App Store delivery, arbitrary Swift syntax,
-real-iPhone native loading, a 100-generation native soak, a large application
-corpus, or the external Registry/HSM/approval control plane. Those boundaries
-are summarized in [Capabilities and Limits](Capabilities-and-Limits.md).
+The repository also contains a four-file application-shaped business corpus and
+a deterministic 128-generation in-process soak covering failed saves,
+activation, rollback, invocation, snapshot compaction, and generation-ID
+monotonicity. This evidence still does not qualify App Store delivery,
+arbitrary Swift syntax, physical-iPhone execution, an external top-200
+application corpus, long-duration device memory/background cycling, or the
+external Registry/HSM/approval control plane. Those boundaries are summarized
+in [Capabilities and Limits](Capabilities-and-Limits.md).

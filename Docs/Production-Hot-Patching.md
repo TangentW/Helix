@@ -132,6 +132,18 @@ or asynchronous call chain, including permitted native re-entry. Concurrent
 activation therefore affects later calls without changing the generation seen
 halfway through an existing call.
 
+Inherited routes are materialized into the published snapshot. The registry
+keeps the active snapshot and, by default, its direct rollback predecessor;
+older snapshots are compacted unless an in-flight lease still needs them. Such
+a lease is self-contained, so compaction never redirects or invalidates the
+running call. Registry count and unique-artifact byte ceilings are checked
+before publication, and a capacity failure leaves both active routing and the
+generation-ID high-water mark unchanged. Compaction never makes an old ID
+available to ordinary activation. Verified durable recovery is the narrow
+exception: it may rehydrate the exact historical package/ID after routing has
+returned to originals, while the high-water mark remains unchanged and all
+later activations must still exceed it.
+
 If no patch is active, the permanent Bridge invokes the original Swift body.
 The no-patch fast path does not construct a VM call frame; it still pays the
 cost of the dynamic entry and generation lookup, which remains part of the
@@ -141,19 +153,30 @@ device performance qualification.
 
 The current wire versions are HLBC 1.9 and HLXI 2.4. The implemented subset
 includes common integer and floating-point operations and conversions, Bool,
-String operations and interpolation, tuple/Optional, Array and Dictionary value
-semantics, structured control flow, local struct/enum and concrete `Result`
-values, payload-carrying local errors, scoped patch-local `inout`/`mutating`
-helpers, synchronous nonescaping local closures, fully concrete compiler
+String operations and interpolation, one-grapheme Character literals for the
+bounded String predicate path, tuple/Optional including address projection,
+Array and Dictionary value semantics, half-open `Range<Int>` loops, structured
+control flow, file- or module-scope patch-local struct/enum and concrete
+`Result` values, payload-carrying local errors, scoped patch-local
+`inout`/`mutating` helpers, synchronous patch-local closures including
+same-image `@escaping` return/capture flows, fully concrete compiler
 specializations, and top-level non-suspending `async`, `async throws`, and
 `@MainActor async` entries.
 
 It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch,
-new native classes, stored-layout changes, escaping/throwing/async closures,
+new native classes, function-local nominal declarations, stored-layout changes,
+closure persistence or native/Shell boundary crossing, throwing/async closures,
 true `await`/continuations, actor-isolated `self`, custom global actors,
 unrestricted pointers, reflection-based field access, and unregistered native
-APIs are rejected. See [Capabilities and Limits](Capabilities-and-Limits.md)
-for the practical matrix.
+APIs are rejected. See
+[Capabilities and Limits](Capabilities-and-Limits.md) for the practical matrix.
+
+HLBC carries a verifier-checked source map from function/block/instruction
+coordinates to logical Swift locations. Production packaging removes build-host
+absolute paths. If execution traps, HLVM reports the exact program counter and
+Runtime enriches it with the pinned generation, Shell entry, function, and
+logical file/line/column; this is diagnostic mapping, not an interactive
+breakpoint or expression-evaluation debugger.
 
 ## Building a package
 

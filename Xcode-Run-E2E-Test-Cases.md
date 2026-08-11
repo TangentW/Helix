@@ -23,7 +23,7 @@
 7. Xcode Stop 会停止 daemon 并清理本次临时 handoff 文件。
 8. 控制台没有 Helix 引入的未满足 Auto Layout 约束、无效 LLDB 命令或凭据明文。
 
-Simulator Native 通过不等于真机 Native 已通过资格测试。真机必须单独记录 Xcode、iOS、设备、Team ID、签名与 Library Validation 结果。
+Simulator HLBC 通过不等于真机已经通过资格测试。两者使用相同 artifact、协议、Verifier 与 HLVM，但真机仍必须单独记录 Xcode、iOS、设备、连接和性能结果。
 
 ## 2. 测试环境记录
 
@@ -170,7 +170,7 @@ titleLabel.text = "SAVE TO RELOAD" // HELIX_LIVE_BASELINE
 
 保存。
 
-预期：页面恢复 `SAVE TO RELOAD`，但这是新的恢复 generation，不是卸载旧 dylib；PID 与计数仍保持。确认磁盘文件也已经恢复，不能只恢复 Xcode editor buffer。
+预期：页面恢复 `SAVE TO RELOAD`，但这是新的恢复 generation，通过 route tombstone 停止继承旧实现；PID 与计数仍保持。确认磁盘文件也已经恢复，不能只恢复 Xcode editor buffer。
 
 ## 6. 生命周期与负向用例
 
@@ -205,7 +205,7 @@ lifecycle lock 安全回收旧 owner 并换成新会话，不能要求开发者�
 
 扩展验收时可修改函数签名、stored property、source membership 或 Build Setting。
 
-预期：Helix 明确返回 `rebuildRequired`，不会错误生成 Native replacement，也不会破坏上一代活动代码。测试后完整恢复工程。
+预期：Helix 明确返回 `rebuildRequired`，不会错误生成 live artifact，也不会破坏上一代活动代码。测试后完整恢复工程。
 
 ## 7. 证据与结果模板
 
@@ -241,11 +241,13 @@ lifecycle lock 安全回收旧 owner 并换成新会话，不能要求开发者�
 2. **daemon 只有 listening**：检查生成 init 的权限和命令结构，不输出其中的值；确认导出符号 `_helix_dev_runtime_handoff_probe` 存在于 Dev package framework。
 3. **installer 超时或 App停在 probe**：确认 Runtime owner 被强引用、`debuggerHandoffEnabled` 未关闭、App链接的是 `HelixDevAppRuntime`，并检查 installer是否找到了真实 target、`process.Stop()` 后的唯一command-interpreter注入是否成功且 `process.Continue()` 总能执行；不应存在 handoff breakpoint。
 4. **已连接但保存无反应**：确认编辑的是 Manifest 冻结的原始文件，source monitor 已启动，且可见值位于可重入的 reload callback，而不是只运行一次的 `viewDidLoad`/安装层级代码。
-5. **代码激活但 UI 不变**：检查 Reload Index、UIKit type registration、invalidation hint 或 `LiveReload.Reloadable` hook；代码激活与 UI refresh 是两个独立结果。
+5. **代码激活但 UI 不变**：检查 Reload Index、自动 UIKit 类型匹配、invalidation hint 或 `LiveReload.Reloadable` hook；代码激活与 UI refresh 是两个独立结果。
 6. **状态丢失或 PID 改变**：说明发生了 rebuild/relaunch，不能算 Live Reload 通过。
 7. **Stop 后残留**：先检查App连接是否真的断开、daemon是否进入五秒宽限和私有artifact目录校验，再检查Run post-action与`live-stop.sh`主动路径；不要手工删除正在被daemon使用的文件来掩盖生命周期错误。
 
-## 9. 2026-08-10 原工程实测记录
+## 9. 2026-08-10 历史 GUI 实测记录
+
+这份记录早于 HLBC 默认路由定案，仅用于保留 Xcode handoff 与 UI 刷新问题的历史证据，不再作为当前后端资格结论。当前结论以自动化 HLBC Simulator E2E 为准；完整 GUI 用例需要按本页重新执行。
 
 本轮严格使用 `/Users/tangent/Desktop/Helix/Demo/HelixDemo.xcodeproj`，没有使用
 `/tmp` 副本。环境为 Xcode 26.6（Build 17F113）、iPhone 17 Pro Simulator
@@ -260,7 +262,7 @@ lifecycle lock 安全回收旧 owner 并换成新会话，不能要求开发者�
 | XR-04 | 通过 | 点击按钮后计数为 1，再保存为 `SECOND GENERATION`，revision/generation 为 2/2 | PID 与计数均保持 |
 | XR-05 | 通过 | 保存不完整表达式后 revision/generation 3/3 编译失败，页面仍为上一成功代 | 修复语法后可继续 reload |
 | XR-06 | 通过 | 恢复 `SAVE TO RELOAD` 后 revision/generation 4/4 激活并刷新 | PID 与计数仍保持，磁盘源码逐字恢复 baseline |
-| XR-07 | 通过 | baseline 页面、源码与标记一致 | 恢复是新 generation，不是卸载 dylib |
+| XR-07 | 通过 | baseline 页面、源码与标记一致 | 恢复是新 generation |
 | XR-08 | 通过 | Xcode Stop 后 App、debugserver 与 daemon 均退出；三份 private handoff 文件消失 | Xcode 26.6 实际跳过 Launch post-action；增加已认证 App 断线五秒后的受监管 daemon 自停与安全清理 |
 | XR-09 | 通过 | 再次 Run 获得新 App PID 和新会话，随后再次 Stop 完整清理 | 旧 generation 与一次性凭据未跨进程复用 |
 | XR-10 | 自动化覆盖 | interface、source membership 与配置漂移由既有 rebuild-required/doctor 测试覆盖 | 本轮未在 GUI 中破坏 Demo 工程图 |

@@ -38,7 +38,9 @@ extension CLI.Application {
         }
         let options = try CLI.Arguments(
             arguments,
-            valueOptions: ["config", "bootstrap", "target", "lifecycle-lock"],
+            valueOptions: [
+                "config", "bootstrap", "target", "lifecycle-lock", "device-host",
+            ],
             flagOptions: []
         )
         guard options.positionals.isEmpty else {
@@ -63,6 +65,12 @@ extension CLI.Application {
             launchTarget = target
         } else {
             launchTarget = nil
+        }
+        let deviceHost = try options.value("device-host")
+        if deviceHost != nil, launchTarget != .device {
+            throw CLI.Error.usage(
+                "--device-host requires a supervised --target device launch"
+            )
         }
         let configurationURL = files.resolve(try options.require("config"))
         let bootstrapURL = bootstrapPath.map(files.resolve)
@@ -105,7 +113,10 @@ extension CLI.Application {
         }
         let bootstrap = try await daemon.start()
         if let bootstrapURL, let launchTarget {
-            guard let launchEnvironment = bootstrap.environment(for: launchTarget) else {
+            guard let launchEnvironment = bootstrap.environment(
+                for: launchTarget,
+                deviceHost: deviceHost
+            ) else {
                 await daemon.stop()
                 throw CLI.Error.input(
                     "device launch requires a Bonjour-enabled Dev configuration"
@@ -217,13 +228,15 @@ extension CLI.Application {
         }
     }
 
-    private static func describe(_ result: DevSession.PipelineResult) -> CLI.Output {
+    static func describe(_ result: DevSession.PipelineResult) -> CLI.Output {
         switch result {
         case let .activation(activation):
-            return .standardOutput(
-                "\(activation.sourceRevision)/\(activation.generationID): "
-                    + "\(activation.codeStatus.rawValue), UI \(activation.reloadStatus.rawValue).\n"
-            )
+            let summary = "\(activation.sourceRevision)/\(activation.generationID): "
+                + "\(activation.codeStatus.rawValue), UI \(activation.reloadStatus.rawValue).\n"
+            guard let diagnostic = activation.diagnostic else {
+                return .standardOutput(summary)
+            }
+            return .standardError(summary + diagnostic.description + "\n")
         case let .noSemanticChange(revision):
             return .standardOutput("\(revision): no semantic function-body change.\n")
         case let .rebuildRequired(diagnostic):

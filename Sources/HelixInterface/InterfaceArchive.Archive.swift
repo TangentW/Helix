@@ -751,6 +751,7 @@ public struct Archive: Codable, Hashable, Sendable {
             }
         }
         if capabilities.contains(.closureValuesV1)
+            || capabilities.contains(.escapingClosureValuesV1)
             || capabilities.contains(.compilerSpecializationsV1) {
             let requiredBytecode = Core.SemanticVersion(1, 8, 0)
             let requiredArchive = Core.SemanticVersion(2, 3, 0)

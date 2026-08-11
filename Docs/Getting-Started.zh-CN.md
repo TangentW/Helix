@@ -24,7 +24,7 @@ flowchart LR
     P["Build pre-action"] --> S["DerivedData 中的 Shell 元数据"]
     S --> H["隐藏 Bridge object"]
     H --> A
-    D["保存 Swift 函数体"] --> N["开发期 Native replacement"]
+    D["保存 Swift 函数体"] --> N["验证后开发期 HLBC"]
     N --> A
 ```
 
@@ -124,7 +124,7 @@ swift run helix xcode validate --plan HelixXcode.json
 | Live Reload | Run 自定义 LLDB init | `$(HELIX_LLDB_INIT_FILE)` | Scheme |
 | Patch 构建 | Patch Aggregate target Run Script | `patch.sh` | Aggregate target |
 
-透明 compiler proxy 只作用于 Feature target：它原样转发真实 `swiftc`，再以 owner-only 权限原子保存调用记录，供后续 replacement 编译复放。App、Package 与无关 target 继续使用 Xcode 默认 driver。
+透明 compiler proxy 只作用于 Feature target：它原样转发真实 `swiftc`，再以 owner-only 权限原子保存调用记录，供后续 live generation 编译复放。App、Package 与无关 target 继续使用 Xcode 默认 driver。
 
 Live Run pre-action 会创建一次性认证会话，LLDB init 在不把凭据写进 Scheme 的前提下注入环境。保留默认 debugger handoff，它用于覆盖 Xcode late-attach 的启动顺序。Run post-action 负责主动停止；若 Xcode 没执行 post-action，daemon 也会在有界断连窗口后自行清理。
 
@@ -142,20 +142,14 @@ final class DevelopmentRuntimeOwner {
     let session: DevRuntime.ApplicationSession
 
     init() throws {
-        session = try DevRuntime.ApplicationSession(
-            environment: .init(),
-            options: .init(
-                supportedBackends: [.nativeDynamicReplacement, .hlbc],
-                nativeChainingProbePassed: true
-            )
-        )
+        session = try DevRuntime.ApplicationSession(environment: .init())
     }
 }
 ```
 
 业务代码只 import 稳定 Runtime module。启动时，`Runtime.LinkedBridge` 从当前进程 image 解析 `hlx_bridge_provider_v1`。Provider 通过 type-erased API 提供精确 Build Contract、Shell interface、Runtime factory 与 Bridge installer。隐藏 object 缺失或身份不匹配时会明确启动失败，不会悄悄把 Helix 关闭。
 
-只有通过项目自身 Simulator/Device 矩阵验证后，才设置 `nativeChainingProbePassed`。仓库内 Simulator E2E 是参考验收。
+公开默认配置只接受经过认证的 HLBC live artifact。Native Dynamic Replacement 只能通过内部实验配置显式选择，不是 App 接入前置条件。
 
 ### Release / Hot Patch
 
@@ -209,7 +203,7 @@ swift run helix xcode doctor \
 2. 打开要修改的 UIKit 页面，并制造一些需要保留的内存状态。
 3. 只修改已索引声明的函数体并保存，不要 Build。
 4. 分别确认 compile、transfer、`codeActive` 与 `UI refreshed`。
-5. 再保存一次，验证 Dynamic Replacement chaining。
+5. 再保存一次，验证后一代 HLBC generation 会在同一个 App 进程中原子替换第一代。
 
 Stored layout、函数签名、继承、conformance、enum case、actor isolation、源码 membership、链接依赖或 Build Settings 变化都需要正常构建。新增文件和任意新的 file-level 声明也不属于当前 body-only 工作流。
 
@@ -233,7 +227,7 @@ Stored layout、函数签名、继承、conformance、enum case、actor isolatio
 | 源码已索引但没有 patchable root | 检查 patch 配置 pattern 是否相对 `sourceRoot`，且确实匹配 logical path |
 | `codeActive` 但 UI 没变化 | 函数是 observe-only、当前没有匹配的 UIKit/SwiftUI 实例，或确实需要显式 hook/factory |
 | Interface 或源码 membership 变化 | 已超出 body-only transaction，执行正常构建 |
-| Native image 达到上限 | Stop 后重新 Run；Swift replacement image 有意不执行 `dlclose` |
+| HLBC lowering 报告不支持的语法 | 按精确诊断调整到受支持子集，或执行一次正常构建 |
 | Release baseline 不匹配 | 恢复审计时的源码、Xcode/SDK、target、configuration 与二进制身份 |
 
 继续阅读[总体架构](Architecture.zh-CN.md)、[开发期热重载](Development-Live-Reload.zh-CN.md)、[生产热补丁](Production-Hot-Patching.zh-CN.md)和[能力与限制](Capabilities-and-Limits.zh-CN.md)。

@@ -159,6 +159,9 @@ public struct GeneratedNativeImport: Codable, Hashable, Sendable {
     public enum Dispatch: String, Codable, Hashable, Sendable {
         case globalFunction
         case staticMethod
+        case instanceMethod
+        case instanceGetter
+        case instanceSetter
     }
 
     public var declarationMangledName: String
@@ -197,19 +200,34 @@ public struct NativeTypeBinding: Codable, Hashable, Sendable {
     public var requiresMainActor: Bool
     public var operationsExpression: String
     public var importedModules: [String]
+    public var generated: ShellBuildReceipt.GeneratedNativeType?
 
     public init(
         canonicalName: String,
         layoutFingerprint: Core.Digest,
         requiresMainActor: Bool = false,
         operationsExpression: String,
-        importedModules: [String] = []
+        importedModules: [String] = [],
+        generated: ShellBuildReceipt.GeneratedNativeType? = nil
     ) {
         self.canonicalName = canonicalName
         self.layoutFingerprint = layoutFingerprint
         self.requiresMainActor = requiresMainActor
         self.operationsExpression = operationsExpression
         self.importedModules = importedModules.sorted()
+        self.generated = generated
+    }
+}
+
+/// Structured metadata for TypeOps generated beside one privately imported
+/// source file. No arbitrary Swift expression is accepted from project input.
+public struct GeneratedNativeType: Codable, Hashable, Sendable {
+    public var sourceFileLogicalID: String
+    public var swiftType: String
+
+    public init(sourceFileLogicalID: String, swiftType: String) {
+        self.sourceFileLogicalID = sourceFileLogicalID
+        self.swiftType = swiftType
     }
 }
 
@@ -266,7 +284,7 @@ public struct Factory: Codable, Hashable, Sendable {
 }
 
 public struct Document: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 6
+    public static let currentSchemaVersion: UInt16 = 8
 
     public var schemaVersion: UInt16
     public var metadata: InterfaceArchive.ReleaseMetadata
@@ -331,7 +349,7 @@ public struct Document: Codable, Hashable, Sendable {
     }
 
     public func validate() throws {
-        guard schemaVersion == 5 || schemaVersion == Self.currentSchemaVersion else {
+        guard (5...Self.currentSchemaVersion).contains(schemaVersion) else {
             throw ShellBuildReceipt.Error.unsupportedSchema(schemaVersion)
         }
         guard metadata.machOUUIDs.isEmpty else {
@@ -408,6 +426,7 @@ public struct Document: Codable, Hashable, Sendable {
                     && $0.importedModules.allSatisfy(Self.isModulePath)
                     && Self.isValidGeneratedNativeImport(
                         $0.generated,
+                        importedModules: $0.importedModules,
                         declarations: declarations,
                         sourcePaths: sourcePaths
                     )
@@ -425,6 +444,32 @@ public struct Document: Codable, Hashable, Sendable {
                 "generated NativeImport bindings require Shell receipt schema 6"
             )
         }
+        guard schemaVersion >= 8
+                || nativeImportBindings.allSatisfy({
+                    guard let dispatch = $0.generated?.dispatch else { return true }
+                    switch dispatch {
+                    case .instanceMethod, .instanceGetter, .instanceSetter:
+                        return false
+                    case .globalFunction, .staticMethod:
+                        return true
+                    }
+                })
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "generated receiver NativeImports require Shell receipt schema 8"
+            )
+        }
+        let entrySymbols = Set(roots.compactMap { root in
+            root.bridge == nil ? nil : root.declarationMangledName
+        })
+        let nativeImportSymbols = Set(
+            nativeImportCandidates.flatMap(\.silMangledNames)
+        )
+        guard schemaVersion < 8 || entrySymbols.isDisjoint(with: nativeImportSymbols) else {
+            throw ShellBuildReceipt.Error.invalid(
+                "an exact Swift symbol cannot be both an Entry and a NativeImport"
+            )
+        }
         guard nativeTypes == nativeTypes.sorted(by: { $0.id.rawValue < $1.id.rawValue }),
               Set(nativeTypes.map(\.id)).count == nativeTypes.count,
               nativeTypeBindings == nativeTypeBindings.sorted(by: {
@@ -439,6 +484,13 @@ public struct Document: Codable, Hashable, Sendable {
                       && Self.isBoundExpression($0.operationsExpression)
                       && $0.importedModules == Array(Set($0.importedModules)).sorted()
                       && $0.importedModules.allSatisfy(Self.isModulePath)
+                      && Self.isValidGeneratedNativeType(
+                          $0.generated,
+                          canonicalName: $0.canonicalName,
+                          moduleName: metadata.frontendInvocation.moduleName,
+                          importedModules: $0.importedModules,
+                          sourcePaths: sourcePaths
+                      )
               }), Set(nativeTypeBindings.map {
                   "\($0.canonicalName):\($0.layoutFingerprint.hex):\($0.requiresMainActor)"
               }) == Set(nativeTypes.filter(\.isEmittedToDevice).map {
@@ -447,6 +499,13 @@ public struct Document: Codable, Hashable, Sendable {
         else {
             throw ShellBuildReceipt.Error.invalid(
                 "native types or bindings are duplicated, unordered, or empty"
+            )
+        }
+        guard schemaVersion >= 7
+                || nativeTypeBindings.allSatisfy({ $0.generated == nil })
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "generated native type bindings require Shell receipt schema 7"
             )
         }
         guard superclassEdges == superclassEdges.sorted(by: { $0.orderKey < $1.orderKey }),
@@ -548,18 +607,23 @@ public struct Document: Codable, Hashable, Sendable {
 
     private static func isValidGeneratedNativeImport(
         _ generated: ShellBuildReceipt.GeneratedNativeImport?,
+        importedModules: [String],
         declarations: [ReleaseCompiler.DeclarationCandidate],
         sourcePaths: Set<String>
     ) -> Bool {
         guard let generated else { return true }
+        guard let declaration = declarations.first(where: {
+            $0.mangledName == generated.declarationMangledName
+                && $0.sourceFileLogicalID == generated.sourceFileLogicalID
+        }) else { return false }
+        let requiresImportedType = (
+            declaration.loweredSignature.parameters
+                + [declaration.loweredSignature.result]
+        ).contains { $0.contains("__C.") }
         guard sourcePaths.contains(generated.sourceFileLogicalID),
-              declarations.contains(where: {
-                  $0.mangledName == generated.declarationMangledName
-                      && $0.sourceFileLogicalID == generated.sourceFileLogicalID
-              }),
+              !requiresImportedType || !importedModules.isEmpty,
               isBoundText(generated.declarationMangledName),
               isSwiftIdentifier(generated.baseName),
-              generated.argumentLabels.count == generated.parameterSwiftTypes.count,
               generated.argumentLabels.allSatisfy({
                   $0 == "_" || isSwiftIdentifier($0)
               }),
@@ -569,11 +633,54 @@ public struct Document: Codable, Hashable, Sendable {
         switch generated.dispatch {
         case .globalFunction:
             return generated.ownerType == nil
+                && generated.argumentLabels.count == generated.parameterSwiftTypes.count
         case .staticMethod:
             guard let owner = generated.ownerType else { return false }
-            return owner.split(separator: ".", omittingEmptySubsequences: false)
+            return generated.argumentLabels.count == generated.parameterSwiftTypes.count
+                && owner.split(separator: ".", omittingEmptySubsequences: false)
                 .allSatisfy { isSwiftIdentifier(String($0)) }
+        case .instanceMethod:
+            guard let owner = generated.ownerType,
+                  !generated.parameterSwiftTypes.isEmpty
+            else { return false }
+            return generated.argumentLabels.count + 1 == generated.parameterSwiftTypes.count
+                && generated.parameterSwiftTypes.last == owner
+                && owner.split(separator: ".", omittingEmptySubsequences: false)
+                    .allSatisfy { isSwiftIdentifier(String($0)) }
+        case .instanceGetter:
+            guard let owner = generated.ownerType else { return false }
+            return generated.argumentLabels.isEmpty
+                && generated.parameterSwiftTypes == [owner]
+                && owner.split(separator: ".", omittingEmptySubsequences: false)
+                    .allSatisfy { isSwiftIdentifier(String($0)) }
+        case .instanceSetter:
+            guard let owner = generated.ownerType else { return false }
+            return generated.argumentLabels == ["_"]
+                && generated.parameterSwiftTypes.count == 2
+                && generated.parameterSwiftTypes.last == owner
+                && owner.split(separator: ".", omittingEmptySubsequences: false)
+                    .allSatisfy { isSwiftIdentifier(String($0)) }
         }
+    }
+
+    private static func isValidGeneratedNativeType(
+        _ generated: ShellBuildReceipt.GeneratedNativeType?,
+        canonicalName: String,
+        moduleName: String,
+        importedModules: [String],
+        sourcePaths: Set<String>
+    ) -> Bool {
+        guard let generated else { return true }
+        let modulePrefix = moduleName + "."
+        let isSourceType = canonicalName.hasPrefix(modulePrefix)
+        let expectedSwiftType = isSourceType
+            ? String(canonicalName.dropFirst(modulePrefix.count))
+            : canonicalName
+        return sourcePaths.contains(generated.sourceFileLogicalID)
+            && (isSourceType ? importedModules.isEmpty : !importedModules.isEmpty)
+            && generated.swiftType == expectedSwiftType
+            && generated.swiftType.split(separator: ".", omittingEmptySubsequences: false)
+                .allSatisfy { isSwiftIdentifier(String($0)) }
     }
 
     private static func isSafeLogicalPath(_ path: String) -> Bool {

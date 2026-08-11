@@ -1,9 +1,11 @@
 import Foundation
+import HelixCore
 
 extension Bytecode {
 public enum Disassembler {
     public static func disassemble(_ module: Bytecode.Module) -> String {
         var lines: [String] = []
+        let sourceLocations = sourceLocationIndex(module.sourceMap)
         lines.append("hlbc_module \(quoted(module.name))")
         lines.append("shell \(module.shellInterfaceHash.hex)")
         if !module.capabilities.isEmpty {
@@ -33,7 +35,8 @@ public enum Disassembler {
             lines.append("")
             let throwing = function.effects.mayThrow ? " throws" : ""
             let kind = function.kind == .ordinary ? "" : " @\(function.kind.rawValue)"
-            lines.append("func\(kind) @\(function.id)(\(parameters))\(throwing) -> \(function.resultType) { // \(function.name)")
+            let declarationLocation = function.sourceLocation.map { " @ \($0)" } ?? ""
+            lines.append("func\(kind) @\(function.id)(\(parameters))\(throwing) -> \(function.resultType) { // \(function.name)\(declarationLocation)")
             for (offset, type) in function.stackSlotTypes.enumerated() {
                 lines.append("  stack $\(offset): \(type)")
             }
@@ -42,13 +45,41 @@ public enum Disassembler {
                     "\(register): \(function.type(of: register)?.description ?? "<invalid>")"
                 }.joined(separator: ", ")
                 lines.append("  \(block.id)(\(blockParameters)):")
-                for instruction in block.instructions {
-                    lines.append("    \(format(instruction))")
+                for (offset, instruction) in block.instructions.enumerated() {
+                    let coordinate = UInt32(exactly: offset).map {
+                        SourceCoordinate(
+                            functionID: function.id,
+                            blockID: block.id,
+                            instructionOffset: $0
+                        )
+                    }
+                    let location = coordinate.flatMap { sourceLocations[$0] }
+                    let suffix = location.map { " // \($0)" } ?? ""
+                    lines.append("    \(format(instruction))\(suffix)")
                 }
             }
             lines.append("}")
         }
         return lines.joined(separator: "\n")
+    }
+
+    private struct SourceCoordinate: Hashable {
+        var functionID: Bytecode.FunctionID
+        var blockID: Bytecode.BlockID
+        var instructionOffset: UInt32
+    }
+
+    private static func sourceLocationIndex(
+        _ entries: [Bytecode.SourceMapEntry]
+    ) -> [SourceCoordinate: Core.SourceLocation] {
+        entries.reduce(into: [:]) { result, entry in
+            let coordinate = SourceCoordinate(
+                functionID: entry.functionID,
+                blockID: entry.blockID,
+                instructionOffset: entry.instructionOffset
+            )
+            result[coordinate] = result[coordinate] ?? entry.location
+        }
     }
 
     private static func format(_ instruction: Bytecode.Instruction) -> String {

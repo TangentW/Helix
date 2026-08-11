@@ -271,7 +271,11 @@ public struct Indexer: Sendable {
         }
         if request.compatibility.bytecode.major == 1,
            request.compatibility.bytecode >= .init(1, 8, 0) {
-            capabilities.formUnion([.closureValuesV1, .compilerSpecializationsV1])
+            capabilities.formUnion([
+                .closureValuesV1,
+                .escapingClosureValuesV1,
+                .compilerSpecializationsV1,
+            ])
         }
         if records.contains(where: {
             $0.patchability.isEligible && $0.effects.isAsync
@@ -354,10 +358,11 @@ public struct Indexer: Sendable {
         guard module.includes(logicalPath: candidate.sourceFileLogicalID) else {
             return .rejected("HLXIDX002", explanation: "source is outside the module include set")
         }
-        if module.entrypoints == .publicOnly,
-           candidate.interface.accessLevel != "public",
-           candidate.interface.accessLevel != "open" {
-            return .rejected("HLXIDX003", explanation: "entrypoint policy permits public declarations only")
+        if !module.entrypoints.allows(accessLevel: candidate.interface.accessLevel) {
+            return .rejected(
+                "HLXIDX003",
+                explanation: "entrypoint visibility excludes this declaration"
+            )
         }
         if candidate.role == .initializer || candidate.role == .deinitializer {
             return .rejected("HLXIDX004", explanation: "initializer/deinitializer roots are not supported in HLBC v1")

@@ -21,7 +21,7 @@ public final class ExecutionContext: @unchecked Sendable {
     func budget() -> VM.InvocationBudget {
         lock.withLock {
             if let budgetStorage { return budgetStorage }
-            let budget = VM.InvocationBudget(limits: lease.generation.resourceLimits)
+            let budget = VM.InvocationBudget(limits: lease.resourceLimits)
             budgetStorage = budget
             return budget
         }

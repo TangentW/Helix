@@ -67,6 +67,15 @@ struct DemoIntegration {
         #expect(project.contains("Hot Application.xcconfig"))
         #expect(project.contains("Live Application.xcconfig"))
         #expect(project.occurrences(
+            of: "SUPPORTED_PLATFORMS = \"iphoneos iphonesimulator\";"
+        ) == 8)
+        #expect(project.occurrences(
+            of: "\"CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]\" = NO;"
+        ) == 4)
+        #expect(project.occurrences(of: "CODE_SIGN_STYLE = Automatic;") == 4)
+        #expect(!project.contains("HELIX_DEVICE_NATIVE_QUALIFIED"))
+        #expect(project.occurrences(of: "INFOPLIST_FILE = LiveReloadDemo/Info.plist;") == 2)
+        #expect(project.occurrences(
             of: "/* Compile Hidden Helix Bridge */ = {isa = PBXShellScriptBuildPhase;"
         ) == 2)
         #expect(!project.contains("HelixGenerated"))
@@ -128,12 +137,23 @@ struct DemoIntegration {
         let bootstrap = try text(
             root.appendingPathComponent("Demo/Scripts/DemoBootstrap.sh")
         )
+        let liveInfoData = try Data(
+            contentsOf: root.appendingPathComponent("Demo/LiveReloadDemo/Info.plist")
+        )
+        let liveInfo = try #require(
+            try PropertyListSerialization.propertyList(from: liveInfoData, format: nil)
+                as? [String: Any]
+        )
         let ignore = try text(root.appendingPathComponent(".gitignore"))
 
         #expect(hot.occurrences(of: "HELIX_DEMO_BUG") == 1)
         #expect(hot.contains("return 1_999 // HELIX_DEMO_BUG"))
         #expect(live.occurrences(of: "HELIX_LIVE_BASELINE") == 1)
         #expect(live.contains("// HELIX_LIVE_BASELINE"))
+        #expect(liveInfo["NSBonjourServices"] as? [String] == ["_helix-live._tcp"])
+        #expect(
+            (liveInfo["NSLocalNetworkUsageDescription"] as? String)?.isEmpty == false
+        )
         #expect(ignore.contains("Demo/.helix/private/"))
         #expect(ignore.contains("Demo/.helix/patches/"))
 

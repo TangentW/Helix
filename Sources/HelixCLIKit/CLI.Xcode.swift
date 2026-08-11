@@ -848,7 +848,7 @@ private func startXcodeLiveSession(
         interfaceArchivePath: context.environment.finalArchiveURL.path,
         compilerPath: prepared.compilerURL.path,
         nativeOutputDirectory: nativeOutput.path,
-        backendPreference: .automatic,
+        backendPreference: .hlbc,
         deviceNativeMatrixQualified: false,
         listenPort: 0,
         advertiseBonjour: context.environment.sdkName == "iphoneos",
@@ -880,7 +880,8 @@ private func startXcodeLiveSession(
             lldbInitURL: context.environment.profileOutputURL
                 .appendingPathComponent("Helix.lldbinit"),
             target: context.environment.sdkName == "iphonesimulator"
-                ? .simulator : .device
+                ? .simulator : .device,
+            deviceHost: context.environment.deviceHost
         )
     )
     return .init(
@@ -1009,7 +1010,10 @@ private func prepareXcodeShell(
                 .init(logicalPath: $0.0, url: $0.1)
             },
             compilerURL: context.environment.compilerURL,
-            nativeImportCatalog: catalog
+            nativeImportCatalog: catalog,
+            callingSurfacePolicy: context.profile.workflow == .liveReload
+                ? .managedDebugModule
+                : .configured
         )
     )
     let materialized = try ShellBuild.Materializer().materialize(

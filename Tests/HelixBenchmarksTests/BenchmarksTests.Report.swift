@@ -6,6 +6,7 @@ import Testing
 enum BenchmarksTests {}
 
 extension BenchmarksTests {
+@MainActor
 @Suite("Performance report and harness")
 struct ReportTests {
     @Test("Nearest-rank statistics preserve batch evidence")
@@ -56,6 +57,106 @@ struct ReportTests {
         let decoded = try JSONDecoder().decode(Benchmarks.Report.self, from: encoded)
         #expect(decoded == report)
         #expect(try Core.CanonicalJSON.encode(decoded) == encoded)
+    }
+
+    @Test("Regression evaluation is deterministic and rejects incomparable runs")
+    func regressionEvaluation() throws {
+        let baseline = try quickReport()
+        #expect(
+            try Benchmarks.RegressionEvaluator.evaluate(
+                candidate: baseline,
+                against: baseline
+            ).passed
+        )
+
+        var candidate = baseline
+        let index = try #require(
+            candidate.scenarios.firstIndex { $0.name == .bridgeHLBCPatch }
+        )
+        let baselineRatio = try #require(
+            baseline.scenarios[index].p50RelativeToDirectSwift
+        )
+        candidate.scenarios[index].statistics.p50NanosecondsPerOperation *= 2
+        candidate.scenarios[index].statistics.p95NanosecondsPerOperation *= 2
+        candidate.scenarios[index].p50RelativeToDirectSwift = baselineRatio * 2
+        let policy = Benchmarks.RegressionPolicy(
+            maximumP50Regression: 0.10,
+            maximumP95Regression: 0.10,
+            maximumP50RelativeToDirectSwift: [
+                .bridgeHLBCPatch: baselineRatio * 1.5,
+            ]
+        )
+        let evaluation = try Benchmarks.RegressionEvaluator.evaluate(
+            candidate: candidate,
+            against: baseline,
+            policy: policy
+        )
+        #expect(!evaluation.passed)
+        #expect(evaluation.violations.count == 3)
+        #expect(
+            Set(evaluation.violations.map(\.metric)) == [
+                .p50NanosecondsPerOperation,
+                .p95NanosecondsPerOperation,
+                .p50RelativeToDirectSwift,
+            ]
+        )
+        let encodedPolicy = try Core.CanonicalJSON.encode(policy)
+        #expect(
+            try JSONDecoder().decode(
+                Benchmarks.RegressionPolicy.self,
+                from: encodedPolicy
+            ) == policy
+        )
+
+        var differentArchitecture = baseline
+        differentArchitecture.environment.architecture = "incomparable"
+        #expect(throws: Benchmarks.Error.incomparableReports("architectures differ")) {
+            try Benchmarks.RegressionEvaluator.evaluate(
+                candidate: differentArchitecture,
+                against: baseline
+            )
+        }
+
+        var differentConfiguration = baseline
+        differentConfiguration.configuration.iterationsPerSample += 1
+        #expect(
+            throws: Benchmarks.Error.incomparableReports(
+                "benchmark configurations differ"
+            )
+        ) {
+            try Benchmarks.RegressionEvaluator.evaluate(
+                candidate: differentConfiguration,
+                against: baseline
+            )
+        }
+
+        var incomplete = baseline
+        incomplete.scenarios.removeLast()
+        #expect(
+            throws: Benchmarks.Error.incomparableReports(
+                "report does not contain the complete schema scenario set"
+            )
+        ) {
+            try Benchmarks.RegressionEvaluator.evaluate(
+                candidate: incomplete,
+                against: baseline
+            )
+        }
+    }
+
+    private func quickReport() throws -> Benchmarks.Report {
+        try Benchmarks.Runner(
+            now: { Date(timeIntervalSince1970: 0) },
+            swiftVersionProvider: { "Swift test toolchain" }
+        ).run(
+            configuration: .init(
+                warmupIterations: 1,
+                iterationsPerSample: 8,
+                sampleCount: 2,
+                verificationIterationsPerSample: 2,
+                verificationSampleCount: 2
+            )
+        )
     }
 }
 }

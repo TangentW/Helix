@@ -7,6 +7,8 @@ extension BenchmarkCLI {
 struct Options {
     var configuration = Benchmarks.Configuration()
     var output: URL?
+    var baseline: URL?
+    var policy: URL?
 
     static func parse(_ arguments: [String]) throws -> Self? {
         if arguments.contains("--help") || arguments.contains("-h") { return nil }
@@ -38,12 +40,21 @@ struct Options {
                 )
             case "--output":
                 options.output = URL(fileURLWithPath: try value())
+            case "--baseline":
+                options.baseline = URL(fileURLWithPath: try value())
+            case "--policy":
+                options.policy = URL(fileURLWithPath: try value())
             default:
                 throw Benchmarks.Error.invalidConfiguration("unknown option \(option)")
             }
             index += 1
         }
         try options.configuration.validate()
+        guard options.policy == nil || options.baseline != nil else {
+            throw Benchmarks.Error.invalidConfiguration(
+                "--policy requires --baseline"
+            )
+        }
         return options
     }
 

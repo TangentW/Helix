@@ -94,6 +94,24 @@ struct DevProcessSupervision {
             try DevProcess.LLDBWriter().render(unsafe)
         }
 
+        var directDevice = document
+        directDevice.target = .device
+        directDevice.environment["HLX_DEV_HOST"] = "192.0.2.42"
+        let directBytes = try DevProcess.BootstrapCodec.encode(directDevice)
+        #expect(try DevProcess.BootstrapCodec.decode(directBytes) == directDevice)
+
+        var incompleteDevice = directDevice
+        incompleteDevice.environment.removeValue(forKey: "HLX_DEV_PORT")
+        #expect(throws: DevProcess.Error.self) {
+            try DevProcess.BootstrapCodec.encode(incompleteDevice)
+        }
+
+        var unsafeDevice = directDevice
+        unsafeDevice.environment["HLX_DEV_HOST"] = "192.0.2.42;invalid"
+        #expect(throws: DevProcess.Error.self) {
+            try DevProcess.BootstrapCodec.encode(unsafeDevice)
+        }
+
         let state = DevProcess.State(
             processID: 42,
             sessionID: try document.sessionID(),

@@ -78,6 +78,9 @@ public struct GeneratedNativeImport: Hashable, Sendable {
     public enum Dispatch: String, Hashable, Sendable {
         case globalFunction
         case staticMethod
+        case instanceMethod
+        case instanceGetter
+        case instanceSetter
     }
 
     public var declarationMangledName: String
@@ -137,6 +140,7 @@ public struct NativeTypeBinding: Hashable, Sendable {
     public var requiresMainActor: Bool
     public var operationsExpression: String
     public var importedModules: [String]
+    public var generated: BridgeGeneration.GeneratedNativeType?
 
     public init(
         id: Core.TypeID,
@@ -144,7 +148,8 @@ public struct NativeTypeBinding: Hashable, Sendable {
         layoutFingerprint: Core.Digest,
         requiresMainActor: Bool = false,
         operationsExpression: String,
-        importedModules: [String] = []
+        importedModules: [String] = [],
+        generated: BridgeGeneration.GeneratedNativeType? = nil
     ) {
         self.id = id
         self.canonicalName = canonicalName
@@ -152,6 +157,42 @@ public struct NativeTypeBinding: Hashable, Sendable {
         self.requiresMainActor = requiresMainActor
         self.operationsExpression = operationsExpression
         self.importedModules = importedModules.sorted()
+        self.generated = generated
+    }
+}
+
+public struct GeneratedNativeType: Hashable, Sendable {
+    public var sourceFileLogicalID: String
+    public var swiftType: String
+
+    public init(sourceFileLogicalID: String, swiftType: String) {
+        self.sourceFileLogicalID = sourceFileLogicalID
+        self.swiftType = swiftType
+    }
+
+    public static func groupName(sourceFileLogicalID: String) -> String {
+        "HelixBridgeEntries_\(Core.Digest.sha256(sourceFileLogicalID).hex.prefix(12))"
+    }
+
+    public static func factoryName(id: Core.TypeID) -> String {
+        "makeNativeType_\(id.rawValue.hex)"
+    }
+
+    public static func bindingExpression(
+        sourceFileLogicalID: String,
+        id: Core.TypeID,
+        canonicalName: String,
+        layoutFingerprint: Core.Digest,
+        requiresMainActor: Bool,
+        estimatedSize: UInt64
+    ) -> String {
+        let group = groupName(sourceFileLogicalID: sourceFileLogicalID)
+        let factory = factoryName(id: id)
+        return "\(group).\(factory)(id: Core.TypeID(rawValue: try! Core.Digest(hex: "
+            + "\(String(reflecting: id.rawValue.hex)))), canonicalName: "
+            + "\(String(reflecting: canonicalName)), layoutFingerprint: try! Core.Digest(hex: "
+            + "\(String(reflecting: layoutFingerprint.hex))), requiresMainActor: "
+            + "\(requiresMainActor), estimatedSize: \(estimatedSize))"
     }
 }
 
@@ -215,18 +256,45 @@ public struct Generator: Sendable {
         )
 
         let grouped = Dictionary(grouping: roots, by: \.sourceFileLogicalID)
+        let generatedTypes = nativeTypes.compactMap { binding -> (
+            BridgeGeneration.NativeTypeBinding,
+            BridgeGeneration.GeneratedNativeType
+        )? in
+            binding.generated.map { (binding, $0) }
+        }
+        let generatedTypeGroups = Dictionary(
+            grouping: generatedTypes,
+            by: { $0.1.sourceFileLogicalID }
+        )
+        let sourceGroups = Set(grouped.keys).union(generatedTypeGroups.keys).sorted()
+        let nativeTypesByID = Dictionary(uniqueKeysWithValues: archive.nativeTypes.map {
+            ($0.id, $0)
+        })
         var files: [String: String] = [:]
         var entryGroupNames: [String] = []
-        for (source, values) in grouped.sorted(by: { $0.key < $1.key }) {
-            guard Set(values.map(\.privateImportSourceFile)).count == 1 else {
-                throw BridgeGeneration.Error.invalidRoot(values[0].functionKey)
+        for source in sourceGroups {
+            let values = grouped[source] ?? []
+            let typeValues = generatedTypeGroups[source] ?? []
+            let privateImportSourceFile = URL(fileURLWithPath: source).lastPathComponent
+            guard values.allSatisfy({
+                $0.privateImportSourceFile == privateImportSourceFile
+            }), typeValues.allSatisfy({ $0.1.sourceFileLogicalID == source }) else {
+                if let first = values.first {
+                    throw BridgeGeneration.Error.invalidRoot(first.functionKey)
+                }
+                throw BridgeGeneration.Error.incompleteNativeTypeBindings
             }
-            let nameHash = Core.Digest.sha256(source).hex.prefix(12)
-            let groupName = "HelixBridgeEntries_\(nameHash)"
+            let groupName = BridgeGeneration.GeneratedNativeType.groupName(
+                sourceFileLogicalID: source
+            )
             entryGroupNames.append(groupName)
+            let generatedTypeImports = Array(
+                Set(typeValues.flatMap { $0.0.importedModules })
+            ).sorted().map { "import \($0)" }
             var lines = [
                 "// Generated by Helix Release Bridge Generator. Do not edit.",
-                "@_private(sourceFile: \(String(reflecting: values[0].privateImportSourceFile))) import \(moduleName)",
+                "@_private(sourceFile: \(String(reflecting: privateImportSourceFile))) import \(moduleName)",
+            ] + generatedTypeImports + [
                 "import Foundation",
                 "import HelixBytecode",
                 "import HelixCore",
@@ -248,8 +316,22 @@ public struct Generator: Sendable {
             lines.append(contentsOf: [
                 "        ]",
                 "    }",
-                "}",
             ])
+            for (binding, generated) in typeValues.sorted(by: { $0.0.id.rawValue < $1.0.id.rawValue }) {
+                guard let record = nativeTypesByID[binding.id] else {
+                    throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
+                }
+                lines.append("")
+                lines.append(indent(
+                    try renderGeneratedNativeTypeFactory(
+                        binding: binding,
+                        generated: generated,
+                        record: record
+                    ),
+                    spaces: 4
+                ))
+            }
+            lines.append("}")
             for root in sortedValues {
                 let record = byKey[root.functionKey]!
                 lines.append("")
@@ -258,7 +340,8 @@ public struct Generator: Sendable {
             lines.append("")
             files[Self.entrySourcePath(for: source)] = lines.joined(separator: "\n")
         }
-        for source in archive.sources.map(\.logicalPath) where grouped[source] == nil {
+        for source in archive.sources.map(\.logicalPath)
+        where grouped[source] == nil && generatedTypeGroups[source] == nil {
             let path = Self.entrySourcePath(for: source)
             guard files[path] == nil else { throw BridgeGeneration.Error.outputCollision(path) }
             files[path] = Self.emptyGeneratedSource(
@@ -382,6 +465,17 @@ public struct Generator: Sendable {
         record: InterfaceArchive.FunctionRecord,
         archive: InterfaceArchive.Archive
     ) throws {
+        let hasExactLogicalParameters =
+            root.parameterSwiftTypes.count == record.loweredSignature.parameters.count
+        let hasBridgedReferenceReceiver: Bool = {
+            guard record.role == .method,
+                  root.parameterSwiftTypes.count
+                    == record.loweredSignature.parameters.count + 1,
+                  let receiver = record.parameterTypes.last,
+                  case .native = receiver
+            else { return false }
+            return true
+        }()
         let strings = [
             root.privateImportSourceFile, root.originalReference, root.replacementDeclaration,
             root.resultSwiftType, root.originalInvocation,
@@ -395,8 +489,7 @@ public struct Generator: Sendable {
               !root.bridgeInvocation.isEmpty,
               root.parameterExpressions.count == record.parameterTypes.count,
               root.parameterSwiftTypes.count == record.parameterTypes.count,
-              root.parameterSwiftTypes == record.loweredSignature.parameters,
-              root.resultSwiftType == record.loweredSignature.result,
+              hasExactLogicalParameters || hasBridgedReferenceReceiver,
               root.parameterExpressions.allSatisfy({ !$0.isEmpty }),
               strings.allSatisfy({
                   $0.utf8.count <= 64 * 1_024
@@ -606,7 +699,14 @@ public struct Generator: Sendable {
             let names = width == 32 ? ["Float", "Swift.Float"] : ["Double", "Swift.Double"]
             return names.contains(name)
         case let (.named(name), .native(typeID)):
-            return archive.nativeTypes.first(where: { $0.id == typeID })?.canonicalName == name
+            guard let canonicalName = archive.nativeTypes.first(where: {
+                $0.id == typeID
+            })?.canonicalName else { return false }
+            let modulePrefix = archive.metadata.frontendInvocation.moduleName + "."
+            let moduleRelativeName = canonicalName.hasPrefix(modulePrefix)
+                ? String(canonicalName.dropFirst(modulePrefix.count))
+                : canonicalName
+            return name == canonicalName || name == moduleRelativeName
         case let (.optional(shape), .optional(type)):
             return swiftTypeMatches(shape, type: type, archive: archive)
         case let (.array(shape), .array(type)):
@@ -808,6 +908,38 @@ public struct Generator: Sendable {
         """
     }
 
+    private func renderGeneratedNativeTypeFactory(
+        binding: BridgeGeneration.NativeTypeBinding,
+        generated: BridgeGeneration.GeneratedNativeType,
+        record: InterfaceArchive.TypeRecord
+    ) throws -> String {
+        guard record.kind == .reference, record.isCopyable else {
+            throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
+        }
+        let swiftType = generated.swiftType.split(separator: ".").map {
+            escapedSwiftIdentifier(String($0))
+        }.joined(separator: ".")
+        let factory = BridgeGeneration.GeneratedNativeType.factoryName(id: binding.id)
+        return """
+        static func \(factory)(
+            id: Core.TypeID,
+            canonicalName: String,
+            layoutFingerprint: Core.Digest,
+            requiresMainActor: Bool,
+            estimatedSize: UInt64
+        ) -> VM.NativeTypeOperations {
+            VM.NativeTypeOperations.reference(
+                id: id,
+                canonicalName: canonicalName,
+                layoutFingerprint: layoutFingerprint,
+                requiresMainActor: requiresMainActor,
+                estimatedSize: estimatedSize,
+                estimatedByteCount: { (_: \(swiftType)) in estimatedSize }
+            )
+        }
+        """
+    }
+
     private func renderGeneratedNativeImportFile(
         sourceFileLogicalID: String,
         moduleName: String,
@@ -820,9 +952,13 @@ public struct Generator: Sendable {
         let groupName = BridgeGeneration.GeneratedNativeImport.groupName(
             sourceFileLogicalID: sourceFileLogicalID
         )
+        let generatedImports = Array(
+            Set(bindings.flatMap(\.importedModules))
+        ).sorted().map { "import \($0)" }
         var lines = [
             "// Generated by Helix Release Bridge Generator. Do not edit.",
-            "@_private(sourceFile: \(quoted(sourceFileLogicalID))) import \(moduleName)",
+            "@_private(sourceFile: \(quoted(URL(fileURLWithPath: sourceFileLogicalID).lastPathComponent))) import \(moduleName)",
+        ] + generatedImports + [
             "import Foundation",
             "import HelixBytecode",
             "import HelixCore",
@@ -888,7 +1024,7 @@ public struct Generator: Sendable {
                 expression: "result",
                 shape: resultShape,
                 type: record.resultType,
-                nativeCatalog: "VM.NativeTypeCatalog()"
+                nativeCatalog: "try Runtime.Bridge.shared.requireNativeTypeCatalog()"
             )
             invocation = callBody + "\nreturn .returned(\(encoded))"
         }
@@ -923,12 +1059,28 @@ public struct Generator: Sendable {
         generated: BridgeGeneration.GeneratedNativeImport,
         effects: Core.Effects
     ) -> String {
-        let owner = generated.ownerType.map { type in
-            type.split(separator: ".").map {
+        let target: String
+        switch generated.dispatch {
+        case .globalFunction:
+            target = escapedSwiftIdentifier(generated.baseName)
+        case .staticMethod:
+            let owner = generated.ownerType!.split(separator: ".").map {
                 escapedSwiftIdentifier(String($0))
-            }.joined(separator: ".") + "."
-        } ?? ""
-        let target = owner + escapedSwiftIdentifier(generated.baseName)
+            }.joined(separator: ".")
+            target = owner + "." + escapedSwiftIdentifier(generated.baseName)
+        case .instanceMethod:
+            target = "argument\(generated.parameterSwiftTypes.count - 1)."
+                + escapedSwiftIdentifier(generated.baseName)
+        case .instanceGetter:
+            let direct = "argument0." + escapedSwiftIdentifier(generated.baseName)
+            guard effects.requiresMainActor else { return direct }
+            return "try context.withMainActor { \(direct) }"
+        case .instanceSetter:
+            let direct = "argument1." + escapedSwiftIdentifier(generated.baseName)
+                + " = argument0"
+            guard effects.requiresMainActor else { return direct }
+            return "try context.withMainActor { \(direct) }"
+        }
         let arguments = generated.argumentLabels.enumerated().map { offset, label in
             label == "_"
                 ? "argument\(offset)"
@@ -1190,6 +1342,44 @@ public struct Generator: Sendable {
             else {
                 throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
             }
+            if let generated = binding.generated {
+                try validateGeneratedNativeType(
+                    generated,
+                    binding: binding,
+                    record: record,
+                    archive: archive
+                )
+            }
+        }
+    }
+
+    private func validateGeneratedNativeType(
+        _ generated: BridgeGeneration.GeneratedNativeType,
+        binding: BridgeGeneration.NativeTypeBinding,
+        record: InterfaceArchive.TypeRecord,
+        archive: InterfaceArchive.Archive
+    ) throws {
+        let expectedExpression = BridgeGeneration.GeneratedNativeType.bindingExpression(
+            sourceFileLogicalID: generated.sourceFileLogicalID,
+            id: binding.id,
+            canonicalName: record.canonicalName,
+            layoutFingerprint: record.layoutFingerprint,
+            requiresMainActor: record.requiresMainActor,
+            estimatedSize: record.estimatedSize
+        )
+        let shape = try parseSwiftType(generated.swiftType)
+        guard binding.operationsExpression == expectedExpression,
+              archive.sources.contains(where: {
+                  $0.logicalPath == generated.sourceFileLogicalID
+              }),
+              isSafeLogicalPath(generated.sourceFileLogicalID),
+              generated.swiftType.split(separator: ".", omittingEmptySubsequences: false)
+                .allSatisfy({ isValidSwiftIdentifier(String($0)) }),
+              swiftTypeMatches(shape, type: .native(record.id), archive: archive),
+              record.kind == .reference,
+              record.isCopyable
+        else {
+            throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
         }
     }
 
@@ -1204,37 +1394,80 @@ public struct Generator: Sendable {
             id: binding.id,
             key: binding.key
         )
-        guard binding.importedModules.isEmpty,
-              binding.invokerExpression == expectedExpression,
+        guard binding.invokerExpression == expectedExpression,
               record.silMangledNames.contains(generated.declarationMangledName),
               isSafeLogicalPath(generated.sourceFileLogicalID),
               isValidSwiftIdentifier(generated.baseName),
-              generated.argumentLabels.count == record.parameterTypes.count,
               generated.parameterSwiftTypes.count == record.parameterTypes.count,
+              !isReceiverDispatch(generated.dispatch) || !record.parameterTypes.isEmpty,
+              generated.argumentLabels.count == record.parameterTypes.count
+                - (isReceiverDispatch(generated.dispatch) ? 1 : 0),
               generated.argumentLabels.allSatisfy({
                   $0 == "_" || isValidSwiftIdentifier($0)
               }),
-              generated.parameterSwiftTypes == record.signature.parameters,
-              generated.resultSwiftType == record.signature.result,
               !record.effects.isAsync,
               record.capability == .nativeImportsV2,
               record.contract.domain == .application,
-              record.contract.execution.deadlineMode == .bounded,
-              record.parameterTypes.allSatisfy(isGeneratedValueType),
-              isGeneratedResultType(record.resultType)
+              record.contract.execution.deadlineMode == .bounded
         else {
             throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
         }
         switch generated.dispatch {
         case .globalFunction:
-            guard generated.ownerType == nil, record.contract.kind == .globalFunction else {
+            guard generated.ownerType == nil,
+                  record.contract.kind == .globalFunction,
+                  record.parameterTypes.allSatisfy(isGeneratedValueType),
+                  isGeneratedResultType(record.resultType)
+            else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
             }
         case .staticMethod:
             guard record.contract.kind == .staticMethod,
                   let owner = generated.ownerType,
                   owner.split(separator: ".", omittingEmptySubsequences: false)
-                    .allSatisfy({ isValidSwiftIdentifier(String($0)) })
+                    .allSatisfy({ isValidSwiftIdentifier(String($0)) }),
+                  record.parameterTypes.allSatisfy(isGeneratedValueType),
+                  isGeneratedResultType(record.resultType)
+            else {
+                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            }
+        case .instanceMethod:
+            guard record.contract.kind == .instanceMethod,
+                  let owner = generated.ownerType,
+                  owner.split(separator: ".", omittingEmptySubsequences: false)
+                    .allSatisfy({ isValidSwiftIdentifier(String($0)) }),
+                  record.parameterTypes.dropLast().allSatisfy(isGeneratedValueType),
+                  record.parameterTypes.last.map(isNativeType) == true,
+                  generated.parameterSwiftTypes.last == owner,
+                  isGeneratedResultType(record.resultType)
+            else {
+                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            }
+        case .instanceGetter:
+            guard record.contract.kind == .instanceGetter,
+                  let owner = generated.ownerType,
+                  owner.split(separator: ".", omittingEmptySubsequences: false)
+                    .allSatisfy({ isValidSwiftIdentifier(String($0)) }),
+                  generated.argumentLabels.isEmpty,
+                  record.parameterTypes.count == 1,
+                  isNativeType(record.parameterTypes[0]),
+                  generated.parameterSwiftTypes == [owner],
+                  record.resultType != .void,
+                  isGeneratedValueType(record.resultType)
+            else {
+                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            }
+        case .instanceSetter:
+            guard record.contract.kind == .instanceSetter,
+                  let owner = generated.ownerType,
+                  owner.split(separator: ".", omittingEmptySubsequences: false)
+                    .allSatisfy({ isValidSwiftIdentifier(String($0)) }),
+                  generated.argumentLabels == ["_"],
+                  record.parameterTypes.count == 2,
+                  isGeneratedValueType(record.parameterTypes[0]),
+                  isNativeType(record.parameterTypes[1]),
+                  generated.parameterSwiftTypes.last == owner,
+                  record.resultType == .void
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
             }
@@ -1253,9 +1486,18 @@ public struct Generator: Sendable {
         }
     }
 
+    private func isReceiverDispatch(
+        _ dispatch: BridgeGeneration.GeneratedNativeImport.Dispatch
+    ) -> Bool {
+        switch dispatch {
+        case .instanceMethod, .instanceGetter, .instanceSetter: true
+        case .globalFunction, .staticMethod: false
+        }
+    }
+
     private func isGeneratedValueType(_ type: Bytecode.ValueType) -> Bool {
         switch type {
-        case .bool, .integer, .float, .string:
+        case .bool, .integer, .float, .string, .native:
             true
         case let .array(element), let .optional(element):
             isGeneratedValueType(element)
@@ -1263,13 +1505,18 @@ public struct Generator: Sendable {
             isGeneratedDictionaryKey(key) && isGeneratedValueType(value)
         case let .tuple(elements):
             !elements.isEmpty && elements.allSatisfy(isGeneratedValueType)
-        case .void, .never, .native, .local, .error, .address, .closure:
+        case .void, .never, .local, .error, .address, .closure:
             false
         }
     }
 
     private func isGeneratedResultType(_ type: Bytecode.ValueType) -> Bool {
         type == .void || isGeneratedValueType(type)
+    }
+
+    private func isNativeType(_ type: Bytecode.ValueType) -> Bool {
+        if case .native = type { return true }
+        return false
     }
 
     private func isGeneratedDictionaryKey(_ type: Bytecode.ValueType) -> Bool {

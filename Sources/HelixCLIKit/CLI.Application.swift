@@ -303,7 +303,7 @@ public struct Application: Sendable {
         let prepared = try DevSession.Preparer(
             probe: BuildCapture.DefaultFrontendReplayProbe(runner: .init())
         ).prepare(request)
-        let backendValue = try options.value("backend") ?? "automatic"
+        let backendValue = try options.value("backend") ?? "hlbc"
         guard let backend = DevBackendSelection.Preference(rawValue: backendValue) else {
             throw CLI.Error.usage("--backend must be automatic, native, or hlbc")
         }
@@ -709,12 +709,12 @@ Options:
   --team-identifier VALUE       Capture the signing team identifier
   --entitlements PATH           Hash the expanded entitlements file
   --native-output-directory P   Native generation directory (default: .helix/dev-native)
-  --backend automatic|native|hlbc
+  --backend hlbc|native          HLBC is the product path; Native is experimental
   --listen-port PORT            Daemon port (default: ephemeral)
   --debounce-milliseconds N     Save debounce window (default: 120)
   --maximum-source-bytes N      Per-source safety limit
   --native-image-limit N        Native image soft limit (default: 50)
-  --device-native-qualified     Enable Native device routing after matrix qualification
+  --device-native-qualified     Qualify the explicitly selected Native experiment
   --no-bonjour                  Disable Bonjour advertisement
   --force                       Atomically replace existing outputs
 
@@ -727,7 +727,7 @@ Usage: helix dev validate --config HelixDev.json [--json]
 """ + "\n"
 
 static let devRunHelp = """
-Usage: helix dev run --config HelixDev.json
+Usage: helix dev run --config HelixDev.json [--device-host HOST]
 
 The command keeps the session secret in memory and prints launch-only App
 environment values once. Stop the daemon with Control-C.
@@ -738,6 +738,9 @@ credential to LLDB and the daemon log remains redacted. After an authenticated
 App disconnects, the supervised daemon allows a five-second reconnect window,
 then exits and removes its private handoff files. The Scheme Run post-action is
 an eager stop path, not the only cleanup guarantee.
+
+For a supervised physical-device launch, --device-host selects an explicit Mac
+address when the local network does not pass Bonjour/mDNS discovery.
 """ + "\n"
 
 private static let fingerprintHelp = """

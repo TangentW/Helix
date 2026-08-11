@@ -116,6 +116,13 @@ struct Foundation {
             canonicalCallee: "CheckoutFeature.price(_:)",
             accessLevel: "private"
         ))
+        var allVisible = scope
+        allVisible.visibility = .all
+        #expect(allVisible.includes(
+            logicalPath: "Sources/Checkout/Services/Pricing.swift",
+            canonicalCallee: "CheckoutFeature.price(_:)",
+            accessLevel: "private"
+        ))
         #expect(
             PatchConfiguration.NativeImportSourceScope(
                 include: ["Sources/**"],
@@ -175,6 +182,25 @@ struct Foundation {
           return %101
         """
         #expect(ReleaseCompiler.BodyFingerprint.compute(first) == ReleaseCompiler.BodyFingerprint.compute(second))
+    }
+
+    @Test("SIL comments are ignored without truncating string literal contents")
+    func preservesCommentMarkersInsideStringLiterals() {
+        let first = """
+        %0 = string_literal utf8 "https://one.example/path" // source noise
+        return %0
+        """
+        let equivalent = """
+        %42 = string_literal utf8 "https://one.example/path" // different source noise
+        return %42
+        """
+        let changed = """
+        %99 = string_literal utf8 "https://two.example/path" // source noise
+        return %99
+        """
+
+        #expect(ReleaseCompiler.BodyFingerprint.compute(first) == ReleaseCompiler.BodyFingerprint.compute(equivalent))
+        #expect(ReleaseCompiler.BodyFingerprint.compute(first) != ReleaseCompiler.BodyFingerprint.compute(changed))
     }
 
     @Test("Canonical numbering follows first occurrence, not reverse replacement order")
@@ -237,6 +263,37 @@ struct Foundation {
 
 @Suite("Real Swift frontend adapter")
 struct Frontend {
+    @Test("Semantic lowering arguments are explicit, executable-aware, and idempotent")
+    func semanticLoweringArguments() {
+        let profile = SwiftFrontend.CanonicalSILPurpose.semanticLowering
+        let option = SwiftFrontend.CanonicalSILPurpose.semanticPreservationOption
+
+        #expect(
+            profile.applying(
+                to: ["-parse-as-library"],
+                compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+            ) == ["-parse-as-library", "-Xfrontend", option]
+        )
+        #expect(
+            profile.applying(
+                to: [option],
+                compilerURL: URL(fileURLWithPath: "/toolchain/usr/bin/swift-frontend")
+            ) == [option]
+        )
+        #expect(
+            profile.applying(
+                to: ["-Xfrontend=\(option)"],
+                compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+            ) == ["-Xfrontend=\(option)"]
+        )
+        #expect(
+            SwiftFrontend.CanonicalSILPurpose.implementationIdentity.applying(
+                to: ["-parse-as-library"],
+                compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+            ) == ["-parse-as-library"]
+        )
+    }
+
     @Test("A normal Swift file is compiled to canonical SIL")
     func emitsCanonicalSIL() throws {
         let directory = FileManager.default.temporaryDirectory

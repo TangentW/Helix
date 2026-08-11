@@ -86,8 +86,8 @@ public enum BodyFingerprint {
 
         for rawLine in canonicalSILBody.split(separator: "\n", omittingEmptySubsequences: false) {
             var line = String(rawLine)
-            if let comment = line.range(of: "//") { line.removeSubrange(comment.lowerBound...) }
-            line = line.trimmingCharacters(in: .whitespaces)
+            line = CanonicalSIL.DebugMetadata.strippingMetadata(from: line)
+                .trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty, !line.hasPrefix("debug_value"), !line.hasPrefix("loc ") else { continue }
             line = rewriteTokens(in: line, pattern: #"%[0-9]+"#, map: &valueMap, prefix: "%v")
             line = rewriteTokens(in: line, pattern: #"bb[0-9]+"#, map: &blockMap, prefix: "bb")

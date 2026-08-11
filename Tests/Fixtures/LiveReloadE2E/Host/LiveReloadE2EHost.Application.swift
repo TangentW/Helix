@@ -11,11 +11,7 @@ final class RuntimeOwner {
 
     init() throws {
         session = try DevRuntime.ApplicationSession(
-            environment: .init(overlayConfiguration: .init(startsExpanded: false)),
-            options: .init(
-                supportedBackends: [.nativeDynamicReplacement, .hlbc],
-                nativeChainingProbePassed: true
-            )
+            environment: .init(overlayConfiguration: .init(startsExpanded: false))
         )
     }
 }

@@ -10,7 +10,8 @@ context and rejects changes it cannot apply safely.
 > **Project status:** the repository contains an executable technical baseline,
 > not a claim of unrestricted Swift support or approved App Store hot-patch
 > delivery. Production App Store distribution is explicitly policy-blocked;
-> real-device, business-corpus, soak, and control-plane gates remain.
+> physical-device qualification, an external top-200 corpus, long-duration
+> device soak, and control-plane gates remain.
 
 ## Why Helix
 
@@ -21,7 +22,7 @@ handles the two useful scenarios separately:
 | Mode | What is delivered | How it runs | Primary goal |
 | --- | --- | --- | --- |
 | Production Hot Patch | A signed `.hlxp` containing verified HLBC | A verifier and HLVM already shipped in the App | Repair an eligible released function without compiling code on the device |
-| Development Live Reload | A session-bound signed dylib, or development HLBC when eligible | Swift Dynamic Replacement or the Dev HLVM route in a Debug App | Save a Swift body and refresh the running UIKit/SwiftUI page without reinstalling |
+| Development Live Reload | A session-bound, authenticated HLBC live artifact | The verifier and HLVM in a Debug App | Save a supported Swift body and refresh the running UIKit/SwiftUI page without reinstalling |
 
 Both modes share exact Swift frontend facts, build-specific identities,
 interface/body compatibility checks, native capability contracts, and immutable
@@ -32,7 +33,7 @@ and Release/Debug runtimes remain isolated.
 flowchart LR
     S["Ordinary Swift edit"] --> C["Exact module type-check and body diff"]
     C --> P["Production: canonical SIL → HLBC → signed .hlxp"]
-    C --> D["Development: typed-AST replacement → signed dylib"]
+    C --> D["Development: canonical SIL → authenticated HLBC"]
     P --> R["HelixAppRuntime"]
     D --> DR["HelixDevAppRuntime"]
     DR --> UI["UIKit / SwiftUI refresh"]
@@ -90,10 +91,12 @@ Live Reload acceptance run.
   verification, a typed-register HLVM, exact native bridges, immutable
   generations, and pinned call-chain snapshots.
 - Exact-toolchain Swift-to-HLBC compilation for the documented subset: common
-  scalar and String operations, Array/Dictionary value semantics, local
-  struct/enum and concrete `Result`, payload-carrying local errors, scoped local
-  `inout`/`mutating`, synchronous nonescaping closures, concrete compiler
-  specializations, and non-suspending async entries.
+  scalar and String operations, bounded Character predicates, Optional
+  projection, `Range<Int>` loops, Array/Dictionary value semantics,
+  file/module-scope patch-local struct/enum and concrete `Result`,
+  payload-carrying local errors, scoped local `inout`/`mutating`, synchronous
+  patch-local closures including bounded `@escaping` return/capture flows,
+  concrete compiler specializations, and non-suspending async entries.
 - NativeImport v2 and schema 2 build-time discovery by declaration, file,
   module, or project scope. Broad scopes expand into exact generated invokers;
   they are never device-side wildcards.
@@ -101,9 +104,16 @@ Live Reload acceptance run.
   storage, anti-rollback, activation WAL, Crash Guard, last-known-good recovery,
   signed revocation, and rollback.
 - Exact Debug frontend-job capture and replay, stable save snapshots,
-  monotonic scheduling, Native/HLBC routing, signed native image generation,
-  authenticated transfer, `dlopen`, dSYM validation, UIKit refresh, SwiftUI
-  pulse boundaries, and a Debug overlay.
+  monotonic scheduling, HLBC generation, authenticated transfer,
+  verifier-backed activation, UIKit refresh, SwiftUI pulse boundaries, and a
+  Debug overlay. Verified logical source maps enrich VM traps without leaking
+  production build-host paths.
+- A checked-in application-shaped business corpus and a 128-generation
+  in-process soak covering failed saves, rollback, invocation, bounded snapshot
+  retention, and generation-ID monotonicity.
+- An explicitly selected Native Dynamic Replacement backend for internal
+  compiler experiments and differential validation. It is not selected by the
+  automatic router and is not the supported Live Reload delivery path.
 - A deterministic Xcode Integration Kit and checked-in UIKit applications for
   both Hot Patch and Live Reload workflows.
 - CLI commands for Shell construction, Xcode integration, patch compilation,
@@ -125,8 +135,9 @@ Live Reload acceptance run.
   displayed controller/view classes and applies inferred invalidation; custom
   hooks or factories remain explicit for initialization/recreation. SwiftUI
   uses a pulse boundary. Helix does not blindly replay lifecycle methods.
-- Simulator Native is the validated Live Reload route. Physical-iPhone Native
-  loading remains experimental until an exact signing and OS matrix passes.
+- Simulator and device Live Reload use the same HLBC artifact, transport,
+  verifier, and HLVM path. The checked-in Simulator E2E is passing; a physical
+  iPhone qualification matrix is still required before claiming device proof.
 - The Release builder accepts internal and enterprise HLBC policies. It rejects
   App Store HLBC and controlled native Release packages.
 
@@ -153,7 +164,7 @@ aggregate with overlapping leaf products.
 | App target | Product | Purpose |
 | --- | --- | --- |
 | Release / Production | `HelixAppRuntime` | HLBC verification, execution, package lifecycle, and no development loader |
-| Debug / Dev Shell | `HelixDevAppRuntime` | Release capabilities plus Dev protocol, native loading, and UI reload support |
+| Debug / Dev Shell | `HelixDevAppRuntime` | Release capabilities plus authenticated Dev transport, ephemeral HLBC activation, and UI reload support |
 
 Build-side modules such as `HelixCompiler`, `HelixBuildTools`,
 `HelixReleaseTools`, `HelixDevTools`, and CLI targets belong on macOS. They must
@@ -169,7 +180,7 @@ swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
 ```
 
-The current full SwiftPM baseline contains 384 tests in 64 suites. The recorded
+The current full SwiftPM baseline contains 411 tests in 65 suites. The recorded
 Debug, warnings-as-errors, and optimized Release runs pass. Platform-specific
 fixtures can be run with an available Simulator UDID:
 
@@ -179,17 +190,25 @@ Tests/Fixtures/LiveReloadE2E/run-simulator-e2e.sh SIMULATOR_UDID
 Tests/Fixtures/LiveReloadE2E/run-release-audit.sh
 ```
 
-The iOS target contains 9 runtime/UI cases. Native Live Reload fixtures preserve
-one App PID; the checked-in Xcode demo applies two edits and then a third
-generation that restores the baseline. The Release audit builds a separate iOS
-15 target linked only to `HelixAppRuntime`.
+The iOS target contains 9 runtime/UI cases. The HLBC Live Reload E2E preserves
+one App PID while applying a changed implementation and then a second generation
+that restores the baseline. The Release audit builds a separate iOS 15 target
+linked only to `HelixAppRuntime`.
 
 Run the microbenchmark in Release mode:
 
 ```bash
 swift run -c release helix-benchmark --output /tmp/helix-benchmark.json
+swift run -c release helix-benchmark \
+  --baseline /tmp/helix-benchmark.json \
+  --output /tmp/helix-benchmark-candidate.json
 ```
 
+Report schema 2 includes typed HLVM calls, bridge overhead, and a
+`@MainActor` UIKit NativeImport scenario. A comparable baseline/policy
+violation exits with status 3 so CI cannot mistake a regression for success.
+The optional `--policy PATH` flag replaces the built-in p50/p95 tolerances
+with a canonical `RegressionPolicy` JSON document.
 Mac microbenchmarks are regression evidence, not a substitute for real-iPhone
 startup, scrolling, interaction, memory-pressure, or tail-latency tests.
 
@@ -246,8 +265,8 @@ For an executable reference, open
 [Demo/HelixDemo.xcodeproj](Demo/HelixDemo.xcodeproj) and follow
 [Demo/README.md](Demo/README.md). The Hot Patch app exercises a signed package
 through a Simulator mock-download inbox. The Live Reload app exercises real
-build capture, save detection, authenticated transfer, native activation, and
-UI refresh.
+build capture, save detection, authenticated HLBC transfer, verified activation,
+and UI refresh.
 
 ## Repository map
 
@@ -260,8 +279,8 @@ UI refresh.
   Swift/SIL processing, Shell construction, Xcode integration, and release
   package building.
 - `Sources/HelixDevProtocol`, `HelixDevTools`, `HelixDevRuntime`, and
-  `HelixLiveReloadAPI`: development sessions, native generation, activation,
-  and UI reload contracts.
+  `HelixLiveReloadAPI`: development sessions, live-artifact generation,
+  activation, and UI reload contracts.
 - `Sources/HelixCLIKit`, `HelixCLI`, `HelixBenchmarks`, and
   `HelixBenchmarkCLI`: commands and performance tooling.
 - `Tests`: unit, negative, compiler fixture, integration, Simulator, release

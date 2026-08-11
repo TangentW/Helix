@@ -1,13 +1,14 @@
 # LiveReloadE2E
 
-This fixture is Helix's executable acceptance case for development-time Native
+This fixture is Helix's executable acceptance case for development-time HLBC
 Live Reload. It builds a normal Swift framework and UIKit host, captures the
 real Xcode frontend invocation, boots the requested Apple Silicon iOS Simulator
 when necessary, launches the host, and verifies two generations in one
 unchanged process:
 
-1. `HELIX BASELINE` → `HELIX PATCHED`
-2. `HELIX PATCHED` → `HELIX BASELINE`
+1. `HELIX BASELINE` → `HELIX PATCHED` through a nonempty verified HLBC image.
+2. `HELIX PATCHED` → `HELIX BASELINE` through a zero-bytecode restoring
+   generation that removes the inherited route.
 
 Run it from the repository root with an available Simulator UDID:
 

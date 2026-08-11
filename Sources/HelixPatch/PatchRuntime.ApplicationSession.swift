@@ -261,8 +261,7 @@ public final class ApplicationSession: @unchecked Sendable {
     }
 
     private func nextGenerationID() throws -> Runtime.GenerationID {
-        let highest = runtime.registry.snapshot().loadedGenerationIDs
-            .map(\.rawValue).max() ?? 0
+        let highest = runtime.registry.snapshot().highestActivatedGenerationID?.rawValue ?? 0
         guard highest < UInt64.max else {
             throw PatchRuntime.Error.generationIdentifierExhausted
         }

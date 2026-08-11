@@ -1,5 +1,6 @@
 import Foundation
 import HelixBytecode
+import HelixCore
 
 extension CanonicalSIL {
 public struct TypeEnvironment: Sendable {
@@ -27,6 +28,7 @@ public struct TypeEnvironment: Sendable {
     private var rawDefinitions: [Bytecode.LocalTypeKey: RawDefinition]
     private var trivialFactories: [String: Bytecode.LocalTypeKey]
     private var requiresTypedErrors: Bool
+    private var nativeTypes: [String: Core.TypeID]
 
     public static let empty = Self()
 
@@ -34,11 +36,13 @@ public struct TypeEnvironment: Sendable {
         rawDefinitions = [:]
         trivialFactories = [:]
         requiresTypedErrors = false
+        nativeTypes = [:]
     }
 
     init(text: String, functions: [CanonicalSIL.Function]) throws {
         rawDefinitions = try Self.extractDefinitions(text)
         trivialFactories = [:]
+        nativeTypes = [:]
         // Keep payload-free legacy Error patches on the 1.0 String error path.
         // Typed storage is enabled only when the SIL or a local declaration needs it.
         requiresTypedErrors = text.contains("checked_cast_addr_br")
@@ -49,6 +53,33 @@ public struct TypeEnvironment: Sendable {
                 trivialFactories[function.mangledName] = key
             }
         }
+    }
+
+    /// Returns an environment that resolves the exact native types frozen in
+    /// the target Shell. Both module-qualified SIL spellings and their
+    /// module-relative form are accepted; ambiguous aliases fail closed.
+    func includingNativeTypes(_ records: [String: Core.TypeID]) throws -> Self {
+        var result = self
+        for (canonicalName, id) in records.sorted(by: { $0.key < $1.key }) {
+            var aliases = [canonicalName]
+            if let separator = canonicalName.firstIndex(of: ".") {
+                aliases.append(String(canonicalName[canonicalName.index(after: separator)...]))
+            }
+            for alias in aliases {
+                guard !alias.isEmpty, result.localKey(for: alias) == nil else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "native type \(canonicalName) conflicts with local type \(alias)"
+                    )
+                }
+                if let existing = result.nativeTypes[alias], existing != id {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "native type alias \(alias) resolves to multiple TypeIDs"
+                    )
+                }
+                result.nativeTypes[alias] = id
+            }
+        }
+        return result
     }
 
     var preservesTypedErrors: Bool {
@@ -161,6 +192,7 @@ public struct TypeEnvironment: Sendable {
         case "any Error", "Swift.Error": return preservesTypedErrors ? .error : .string
         case "Never", "Swift.Never": return .never
         default:
+            if let id = nativeTypes[type] { return .native(id) }
             if let key = localKey(for: type) { return .local(key) }
             throw CanonicalSIL.LoweringError.unsupportedType(type)
         }
@@ -194,7 +226,9 @@ public struct TypeEnvironment: Sendable {
             }
         }
         guard !type.hasPrefix("@convention("),
+              !type.hasPrefix("@async "),
               !type.contains(" @async "),
+              !type.hasPrefix("@error "),
               !type.contains(" @error "),
               let arrow = type.range(of: " -> ", options: .backwards)
         else {
@@ -460,10 +494,8 @@ public struct TypeEnvironment: Sendable {
         }
 
         let semanticLines = function.body.split(separator: "\n").map { rawLine in
-            let line = String(rawLine)
-            let code = line.range(of: "//").map { String(line[..<$0.lowerBound]) }
-                ?? line
-            return code.trimmingCharacters(in: .whitespaces)
+            CanonicalSIL.DebugMetadata.strippingComment(from: String(rawLine))
+                .trimmingCharacters(in: .whitespaces)
         }.filter {
             !$0.isEmpty && !$0.hasPrefix("bb") && !$0.hasPrefix("debug_value")
         }
@@ -579,7 +611,12 @@ public struct TypeEnvironment: Sendable {
         for index in raw.indices {
             switch raw[index] {
             case "(", "<", "[": depth += 1
-            case ")", ">", "]": depth -= 1
+            case ")", "]": depth -= 1
+            case ">":
+                let previous = index > raw.startIndex
+                    ? raw[raw.index(before: index)]
+                    : nil
+                if previous != "-" { depth -= 1 }
             case ":" where depth == 0:
                 return String(raw[raw.index(after: index)...])
                     .trimmingCharacters(in: .whitespaces)
@@ -600,7 +637,12 @@ public struct TypeEnvironment: Sendable {
         for index in raw.indices {
             switch raw[index] {
             case "(", "<", "[": depth += 1
-            case ")", ">", "]": depth -= 1
+            case ")", "]": depth -= 1
+            case ">":
+                let previous = index > raw.startIndex
+                    ? raw[raw.index(before: index)]
+                    : nil
+                if previous != "-" { depth -= 1 }
             case "," where depth == 0:
                 result.append(
                     String(raw[start..<index]).trimmingCharacters(in: .whitespaces)

@@ -42,9 +42,12 @@ public struct Bootstrap: Hashable, Sendable, CustomStringConvertible, CustomDebu
     }
 
     public func environment(
-        for target: DevSession.LaunchTarget
+        for target: DevSession.LaunchTarget,
+        deviceHost: String? = nil
     ) -> [String: String]? {
-        guard target == .simulator || bonjourAdvertised else { return nil }
+        guard target == .simulator || deviceHost != nil || bonjourAdvertised else {
+            return nil
+        }
         var values = [
             "HLX_DEV_PROTOCOL_VERSION": String(protocolVersion),
             "HLX_DEV_SESSION_ID": sessionID.uuidString,
@@ -54,6 +57,9 @@ public struct Bootstrap: Hashable, Sendable, CustomStringConvertible, CustomDebu
         ]
         if target == .simulator {
             values["HLX_DEV_HOST"] = "127.0.0.1"
+            values["HLX_DEV_PORT"] = String(port)
+        } else if let deviceHost {
+            values["HLX_DEV_HOST"] = deviceHost
             values["HLX_DEV_PORT"] = String(port)
         }
         return values

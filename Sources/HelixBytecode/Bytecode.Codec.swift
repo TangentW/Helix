@@ -235,6 +235,7 @@ public enum Encoder {
         }
         if formatMinor < 8 {
             guard !module.capabilities.contains(.closureValuesV1),
+                  !module.capabilities.contains(.escapingClosureValuesV1),
                   !module.capabilities.contains(.compilerSpecializationsV1),
                   module.functions.allSatisfy({ $0.kind == .ordinary })
             else {

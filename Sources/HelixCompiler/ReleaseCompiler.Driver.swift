@@ -275,6 +275,14 @@ extension ReleaseCompiler {
                     invocation: request.archive.metadata.frontendInvocation
                 )
             let silFile = try CanonicalSIL.File(text: canonicalSIL)
+            let frozenNativeTypes = Dictionary(
+                uniqueKeysWithValues: request.archive.nativeTypes
+                    .filter(\.isEmittedToDevice)
+                    .map { ($0.canonicalName, $0.id) }
+            )
+            let silTypeEnvironment = try silFile.typeEnvironment.includingNativeTypes(
+                frozenNativeTypes
+            )
             let archivedSymbols = Set(request.archive.functions.map(\.mangledName))
 
             var directlyChanged: [(
@@ -436,12 +444,12 @@ extension ReleaseCompiler {
                     .emitCanonicalSIL(
                         sourceFiles: orderedSourceFiles,
                         invocation: request.archive.metadata.frontendInvocation,
-                        additionalArguments: semanticPreservationArguments(
-                            compilerURL: request.compilerURL
-                        )
+                        purpose: .semanticLowering
                     )
                 loweringSILFile = try CanonicalSIL.File(text: loweringSIL)
             }
+            let loweringTypeEnvironment = try loweringSILFile.typeEnvironment
+                .includingNativeTypes(frozenNativeTypes)
 
             var localFunctionIDs: [Core.FunctionKey: Bytecode.FunctionID] = [:]
             for (offset, item) in changedSIL.enumerated() {
@@ -491,14 +499,14 @@ extension ReleaseCompiler {
                 let optimizedSignature = try optimized.map {
                     try generatedSignature(
                         of: $0.function,
-                        environment: silFile.typeEnvironment,
+                        environment: silTypeEnvironment,
                         symbol: symbol
                     )
                 }
                 let semanticSignature = try semantic.map {
                     try generatedSignature(
                         of: $0.function,
-                        environment: loweringSILFile.typeEnvironment,
+                        environment: loweringTypeEnvironment,
                         symbol: symbol
                     )
                 }
@@ -556,8 +564,8 @@ extension ReleaseCompiler {
                 let lowered = try lowerProductionFunction(
                     optimized: item.function,
                     semantic: loweringFunction,
-                    optimizedTypeEnvironment: silFile.typeEnvironment,
-                    semanticTypeEnvironment: loweringSILFile.typeEnvironment,
+                    optimizedTypeEnvironment: silTypeEnvironment,
+                    semanticTypeEnvironment: loweringTypeEnvironment,
                     displayName: item.record.canonicalDeclaration,
                     directCalls: directCalls,
                     expectedEffects: item.record.effects,
@@ -594,7 +602,7 @@ extension ReleaseCompiler {
                     if let optimized = item.optimized {
                         do {
                             lowered = try CanonicalSIL.Lowerer(
-                                typeEnvironment: silFile.typeEnvironment
+                                typeEnvironment: silTypeEnvironment
                             ).lower(
                                 optimized,
                                 displayName: item.symbol,
@@ -606,7 +614,7 @@ extension ReleaseCompiler {
                                   permitsSemanticFallback(error)
                             else { throw error }
                             lowered = try CanonicalSIL.Lowerer(
-                                typeEnvironment: loweringSILFile.typeEnvironment
+                                typeEnvironment: loweringTypeEnvironment
                             ).lower(
                                 semantic,
                                 displayName: item.symbol,
@@ -616,7 +624,7 @@ extension ReleaseCompiler {
                         }
                     } else if let semantic = item.semantic {
                         lowered = try CanonicalSIL.Lowerer(
-                            typeEnvironment: loweringSILFile.typeEnvironment
+                            typeEnvironment: loweringTypeEnvironment
                         ).lower(
                             semantic,
                             displayName: item.symbol,
@@ -691,15 +699,26 @@ extension ReleaseCompiler {
                 roots: Set(entries.map(\.functionID)),
                 functions: loweredByID
             )
+            let logicalPaths = request.archive.sources.map(\.logicalPath)
             let reachable = loweredByID.filter { reachableIDs.contains($0.id) }
+                .map { item in
+                    (
+                        id: item.id,
+                        function: IntermediateRepresentation.SourceMapping
+                            .retainingLogicalPaths(
+                                item.function,
+                                logicalPaths: logicalPaths
+                            )
+                    )
+                }
                 .sorted { $0.id < $1.id }
             let reachableIR = reachable.map(\.function)
             let imports = try directCalls.importRequirements(
                 referencedBy: reachableIR
             )
             let localTypes = try mergedLocalTypeDefinitions(
-                optimized: silFile.typeEnvironment,
-                semantic: loweringSILFile.typeEnvironment,
+                optimized: silTypeEnvironment,
+                semantic: loweringTypeEnvironment,
                 referencedBy: reachableIR
             )
             let capabilities = CompilerCapabilities.infer(
@@ -710,6 +729,9 @@ extension ReleaseCompiler {
             let functions = reachable.map {
                 IntermediateRepresentation.ToBytecode.lower($0.function, id: $0.id)
             }
+            let sourceMap = reachable.flatMap {
+                IntermediateRepresentation.ToBytecode.sourceMap($0.function, id: $0.id)
+            }
             let module = Bytecode.Module(
                 name: "HelixPatch_\(moduleName)",
                 shellInterfaceHash: request.archive.shellInterfaceHash,
@@ -719,7 +741,8 @@ extension ReleaseCompiler {
                 localTypes: localTypes,
                 functions: functions,
                 entries: entries,
-                imports: imports
+                imports: imports,
+                sourceMap: sourceMap
             )
             let bytes = try Bytecode.Encoder.encode(module)
             return .init(
@@ -841,7 +864,7 @@ extension ReleaseCompiler {
 
             for rawLine in body.split(separator: "\n") {
                 let line = String(rawLine).trimmingCharacters(in: .whitespaces)
-                if let marker = line.range(of: " = function_ref @"),
+                if let marker = line.range(of: "function_ref @"),
                    let result = silResultValue(in: line) {
                     let suffix = line[marker.upperBound...]
                     let end = suffix.firstIndex { $0 == " " || $0 == ":" }
@@ -1004,13 +1027,6 @@ extension ReleaseCompiler {
                 byKey[candidate.key] = candidate
             }
             return byKey.values.sorted { $0.key < $1.key }
-        }
-
-        private func semanticPreservationArguments(compilerURL: URL) -> [String] {
-            if compilerURL.resolvingSymlinksInPath().lastPathComponent == "swift-frontend" {
-                return ["-disable-sil-perf-optzns"]
-            }
-            return ["-Xfrontend", "-disable-sil-perf-optzns"]
         }
 
         private func lowerProductionFunction(

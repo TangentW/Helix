@@ -11,8 +11,12 @@ import Testing
 extension BuildToolsTests {
 @Suite("Real Swift frontend receipt adapter")
 struct FrontendReceiptPipeline {
-    @Test("Frontend value parsing distinguishes local nonescaping closures")
+    @Test("Frontend value parsing accepts synchronous escaping closure syntax")
     func parsesClosureTypes() {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            result: .int64
+        )
         #expect(
             FrontendReceipt.ValueTypeParser.parse(
                 "(Swift.Int, String) -> Swift.Int",
@@ -33,6 +37,18 @@ struct FrontendReceiptPipeline {
         #expect(
             FrontendReceipt.ValueTypeParser.parse(
                 "@escaping (Int) -> Int",
+                allowVoid: false
+            ) == .closure(signature)
+        )
+        #expect(
+            FrontendReceipt.ValueTypeParser.parse(
+                "@escaping (Int) async -> Int",
+                allowVoid: false
+            ) == nil
+        )
+        #expect(
+            FrontendReceipt.ValueTypeParser.parse(
+                "@escaping @Sendable (Int) -> Int",
                 allowVoid: false
             ) == nil
         )
@@ -69,9 +85,13 @@ struct FrontendReceiptPipeline {
         let sourceURL = sourceDirectory.appendingPathComponent("Patch.swift")
         let source = """
         // UTF-8 offsets must be measured in bytes, not String characters. 🧪
+        func forward(_ transform: @escaping (Int) -> Int) -> (Int) -> Int {
+            transform
+        }
+
         public func transform(_ value: Int) -> Int {
             let adjust = { (input: Int) in input + 27 }
-            return adjust(value)
+            return forward(adjust)(value)
         }
 
         public func remap(_ values: [String: Int]) -> [String: Int] { values }
@@ -131,14 +151,21 @@ struct FrontendReceiptPipeline {
             )
         )
         let receipt = output.receipt
-        #expect(receipt.declarations.count == 3)
-        #expect(receipt.roots.count == 3)
-        #expect(receipt.roots.compactMap(\.bridge).count == 2)
-        #expect(receipt.roots.compactMap(\.nativeReplacement).count == 3)
-        #expect(output.diagnostics.contains { $0.code == "HLXIDX020" })
+        let forwardingSignature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            result: .int64
+        )
+        #expect(receipt.declarations.count == 4)
+        #expect(receipt.roots.count == 4)
+        #expect(receipt.roots.compactMap(\.bridge).count == 3)
+        #expect(receipt.roots.compactMap(\.nativeReplacement).count == 4)
+        #expect(!output.diagnostics.contains { $0.code == "HLXIDX020" })
 
         let function = try #require(receipt.declarations.first {
             $0.interface.baseName == "transform"
+        })
+        let forwarding = try #require(receipt.declarations.first {
+            $0.interface.baseName == "forward"
         })
         let method = try #require(receipt.declarations.first {
             $0.interface.baseName == "viewDidLoad"
@@ -148,16 +175,46 @@ struct FrontendReceiptPipeline {
         })
         #expect(function.forcedPatchability == nil)
         #expect(function.implementationFingerprint != nil)
+        #expect(forwarding.parameterTypes == [.closure(forwardingSignature)])
+        #expect(forwarding.resultType == .closure(forwardingSignature))
         #expect(
             dictionary.parameterTypes
                 == [.dictionary(key: .string, value: .int64)]
         )
         #expect(dictionary.resultType == .dictionary(key: .string, value: .int64))
-        #expect(method.forcedPatchability?.reasonCode == "HLXIDX020")
+        #expect(method.forcedPatchability == nil)
+        let screenType = try #require(receipt.nativeTypes.first {
+            $0.canonicalName == "\(moduleName).Screen"
+        })
+        #expect(method.parameterTypes == [.int64, .native(screenType.id)])
+        let screenTypeBinding = try #require(receipt.nativeTypeBindings.first {
+            $0.canonicalName == screenType.canonicalName
+        })
+        #expect(screenTypeBinding.generated?.sourceFileLogicalID == "Sources/Patch.swift")
+        #expect(screenTypeBinding.generated?.swiftType == "Screen")
+        var legacySchema = receipt
+        legacySchema.schemaVersion = 6
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try legacySchema.validate()
+        }
+        var forgedTypeSpelling = receipt
+        let bindingIndex = try #require(forgedTypeSpelling.nativeTypeBindings.firstIndex {
+            $0.canonicalName == screenType.canonicalName
+        })
+        forgedTypeSpelling.nativeTypeBindings[bindingIndex].generated?.swiftType =
+            "\(moduleName).Screen"
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try forgedTypeSpelling.validate()
+        }
         let methodRoot = try #require(receipt.roots.first {
             $0.declarationMangledName == method.mangledName
         })
-        #expect(methodRoot.bridge == nil)
+        #expect(methodRoot.bridge?.parameterExpressions == ["value", "self"])
+        #expect(
+            methodRoot.bridge?.parameterSwiftTypes
+                == ["Swift.Int", "Screen"]
+        )
+        #expect(methodRoot.bridge?.enclosingPrefix == "extension Screen {")
         #expect(methodRoot.nominalType?.canonicalName == "Screen")
         #expect(methodRoot.reloadRole == .viewLoadOrInitialization)
 
@@ -167,14 +224,20 @@ struct FrontendReceiptPipeline {
             receipt: receipt,
             sourceRoot: directory
         )
-        #expect(shell.archive.functions.count == 3)
+        #expect(shell.archive.functions.count == 4)
+        #expect(
+            shell.archive.functions.first {
+                $0.mangledName == forwarding.mangledName
+            }?.patchability.reasonCode == "HLXIDX022"
+        )
+        #expect(shell.archive.capabilities.contains(.escapingClosureValuesV1))
         #expect(
             shell.archive.functions.first { $0.mangledName == function.mangledName }?
                 .bodyFingerprint == function.implementationFingerprint
         )
-        #expect(shell.archive.bridgeRegistrationCount == 2)
-        #expect(shell.reloadIndex.roots.count == 3)
-        #expect(shell.reloadIndex.nativeReplacements.count == 3)
+        #expect(shell.archive.bridgeRegistrationCount == 3)
+        #expect(shell.reloadIndex.roots.count == 4)
+        #expect(shell.reloadIndex.nativeReplacements.count == 4)
         let transformed = String(
             decoding: try #require(shell.transformedSources["Sources/Patch.swift"]),
             as: UTF8.self

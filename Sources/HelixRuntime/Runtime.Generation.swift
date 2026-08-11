@@ -116,11 +116,120 @@ public final class Generation: @unchecked Sendable {
     }
 }
 
-/// Strong reference that pins a generation for an in-flight invocation.
+/// Strong reference that pins one immutable routing snapshot for an invocation.
+///
+/// A lease remains self-contained after its generation is superseded. The
+/// registry may therefore compact the corresponding historical record without
+/// changing route resolution halfway through a running call tree.
 public final class GenerationLease: @unchecked Sendable {
     /// Immutable generation retained by the lease.
-    public let generation: Runtime.Generation
-    init(generation: Runtime.Generation) { self.generation = generation }
+    public var generation: Runtime.Generation { snapshot.generation }
+
+    let snapshot: Runtime.GenerationSnapshot
+
+    init(snapshot: Runtime.GenerationSnapshot) {
+        self.snapshot = snapshot
+        snapshot.acquireLease()
+    }
+
+    deinit {
+        snapshot.releaseLease()
+    }
+
+    func route(for entry: Core.EntryIndex) -> Runtime.Route? {
+        snapshot.routes[entry]?.route
+    }
+
+    func entryEffects(for entry: Core.EntryIndex) -> Core.Effects? {
+        snapshot.entryEffects[entry]
+    }
+
+    var resourceLimits: Core.ResourceLimits {
+        snapshot.resourceLimits
+    }
+}
+
+/// Materialized routing state owned by the registry and active leases.
+///
+/// Route inheritance is flattened when a generation activates. Inherited
+/// routes retain their verified images directly, so neither route lookup nor an
+/// in-flight invocation depends on historical registry entries remaining live.
+final class GenerationSnapshot: @unchecked Sendable {
+    struct OwnedRoute: Sendable {
+        let route: Runtime.Route
+        let ownerID: Runtime.GenerationID
+    }
+
+    let generation: Runtime.Generation
+    let routes: [Core.EntryIndex: OwnedRoute]
+    let entryEffects: [Core.EntryIndex: Core.Effects]
+    let resourceLimits: Core.ResourceLimits
+    let artifactByteCounts: [Runtime.GenerationID: Int]
+
+    private let leaseLock = NSLock()
+    private var leaseCountStorage = 0
+
+    init(generation: Runtime.Generation, parent: Runtime.GenerationSnapshot?) {
+        var routes = parent?.routes ?? [:]
+        for entry in generation.removedEntries {
+            routes.removeValue(forKey: entry)
+        }
+        for (entry, route) in generation.routes {
+            routes[entry] = .init(route: route, ownerID: generation.id)
+        }
+
+        var effects = parent?.entryEffects ?? [:]
+        for image in generation.images {
+            for (entry, descriptor) in image.shell.entries {
+                effects[entry] = descriptor.effects
+            }
+        }
+
+        var artifactByteCounts = parent?.artifactByteCounts ?? [:]
+        let referencedOwners = Set(routes.values.map(\.ownerID))
+        artifactByteCounts = artifactByteCounts.filter {
+            referencedOwners.contains($0.key)
+        }
+        if !generation.images.isEmpty || generation.estimatedByteCount > 0 {
+            artifactByteCounts[generation.id] = generation.estimatedByteCount
+        }
+
+        var imageLimits: [Core.Digest: Core.ResourceLimits] = [:]
+        for ownedRoute in routes.values {
+            imageLimits[ownedRoute.route.image.imageHash]
+                = ownedRoute.route.image.effectiveResourceLimits
+        }
+        let limits = imageLimits.values.dropFirst().reduce(
+            imageLimits.values.first ?? .init()
+        ) { partial, next in
+            partial.constrained(by: next)
+        }
+
+        self.generation = generation
+        self.routes = routes
+        self.entryEffects = effects
+        self.resourceLimits = limits
+        self.artifactByteCounts = artifactByteCounts
+    }
+
+    var leaseCount: Int {
+        leaseLock.lock()
+        defer { leaseLock.unlock() }
+        return leaseCountStorage
+    }
+
+    func acquireLease() {
+        leaseLock.lock()
+        leaseCountStorage += 1
+        leaseLock.unlock()
+    }
+
+    func releaseLease() {
+        leaseLock.lock()
+        precondition(leaseCountStorage > 0, "unbalanced generation lease release")
+        leaseCountStorage -= 1
+        leaseLock.unlock()
+    }
 }
 
 /// Generation construction, activation, rollback, and capacity failures.
@@ -135,6 +244,11 @@ public enum ActivationError: Error, Equatable, Sendable, CustomStringConvertible
     case parentMismatch(expected: Runtime.GenerationID?, actual: Runtime.GenerationID?)
     /// The registry already contains the supplied generation ID.
     case generationAlreadyExists(Runtime.GenerationID)
+    /// A successful activation has already used this or a newer identity.
+    case generationIDNotMonotonic(
+        previous: Runtime.GenerationID,
+        attempted: Runtime.GenerationID
+    )
     /// A requested lease or rollback target does not exist.
     case unknownGeneration(Runtime.GenerationID)
     /// Rollback attempted to jump outside the active generation's ancestry.
@@ -154,6 +268,8 @@ public enum ActivationError: Error, Equatable, Sendable, CustomStringConvertible
         case let .staleActiveGeneration(expected, actual): "active generation changed: expected \(String(describing: expected)), got \(String(describing: actual))"
         case let .parentMismatch(expected, actual): "generation parent mismatch: expected \(String(describing: expected)), got \(String(describing: actual))"
         case let .generationAlreadyExists(id): "generation \(id) already exists"
+        case let .generationIDNotMonotonic(previous, attempted):
+            "generation ID is not monotonic: \(attempted) follows \(previous)"
         case let .unknownGeneration(id): "unknown generation \(id)"
         case let .rollbackTargetIsNotAncestor(target, active):
             "generation \(target) is not an ancestor of active generation \(active)"

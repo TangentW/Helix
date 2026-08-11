@@ -76,7 +76,15 @@ enum ValueTypeParser {
         allowVoid: Bool,
         nativeTypes: [String: Core.TypeID] = [:]
     ) -> Bytecode.ValueType? {
-        let value = spelling.trimmingCharacters(in: .whitespacesAndNewlines)
+        var value = spelling.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isEscapingClosure = value.hasPrefix("@escaping ")
+        if isEscapingClosure {
+            value.removeFirst("@escaping ".count)
+            value = value.trimmingCharacters(in: .whitespaces)
+        }
+        if isEscapingClosure, topLevelFunctionArrow(in: value) == nil {
+            return nil
+        }
         if ["()", "Void", "Swift.Void"].contains(value) {
             return allowVoid ? .void : nil
         }
@@ -111,6 +119,7 @@ enum ValueTypeParser {
             else { return nil }
             return .closure(.init(parameters: parameters, result: result))
         }
+        if isEscapingClosure { return nil }
         if let wrapped = optionalWrappedType(value) {
             return parse(
                 wrapped,
@@ -232,7 +241,11 @@ enum ValueTypeParser {
         while index < value.endIndex {
             switch value[index] {
             case "<": angleDepth += 1
-            case ">": angleDepth -= 1
+            case ">":
+                let previous = index > value.startIndex
+                    ? value[value.index(before: index)]
+                    : nil
+                if previous != "-" { angleDepth -= 1 }
             case "(": parenthesisDepth += 1
             case ")": parenthesisDepth -= 1
             case "[": bracketDepth += 1
@@ -262,7 +275,11 @@ enum ValueTypeParser {
         for index in value.indices {
             switch value[index] {
             case "<": angleDepth += 1
-            case ">": angleDepth -= 1
+            case ">":
+                let previous = index > value.startIndex
+                    ? value[value.index(before: index)]
+                    : nil
+                if previous != "-" { angleDepth -= 1 }
             case "(": parenthesisDepth += 1
             case ")": parenthesisDepth -= 1
             case "," where angleDepth == 0 && parenthesisDepth == 0:

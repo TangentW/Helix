@@ -91,13 +91,17 @@ sequenceDiagram
 
 激活不会逐个函数修改路由。Helix 会先构造完整不可变 generation，验证每条路由和 capability，再一次性发布快照。最外层 Bridge 调用会为整条同步或异步调用链固定该快照，包括允许的原生重入。因此，并发激活只影响后续调用，不会让一次进行中的调用执行到一半切换 generation。
 
+发布前会把继承 route 物化进 snapshot。Registry 默认保留当前 snapshot 与直接回滚前代；更旧 snapshot 会被压缩，除非仍有执行中 lease 需要它。lease 是自包含的，所以压缩不会重定向或使正在运行的调用失效。发布前会同时检查 snapshot 数量与去重后的 artifact 字节上限；容量失败不会修改活动路由或 generation ID 高水位。普通激活不能复用被压缩的旧 ID。唯一的窄例外是经过验证的持久化恢复：路由回到原始实现后，它可以重新挂载完全相同的历史 package/ID，但高水位保持不变，后续新激活仍必须超过该高水位。
+
 没有活动补丁时，永久 Bridge 会调用原始 Swift body。无补丁 fast path 不创建 VM CallFrame，但依然包含动态入口与 generation lookup 的成本，该成本仍需在真实设备性能资格中验证。
 
 ## 当前语言边界
 
-当前 wire 版本为 HLBC 1.9 与 HLXI 2.4。已实现子集包括常用整数和浮点操作与转换、Bool、String 操作和插值、Tuple/Optional、Array 与 Dictionary 值语义、结构化控制流、局部 struct/enum 与具体 `Result`、带 payload 的局部 Error、受限的补丁内 `inout`/`mutating` helper、同步非逃逸局部 closure、编译器已经完全具体化的 specialization，以及顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` 入口。
+当前 wire 版本为 HLBC 1.9 与 HLXI 2.4。已实现子集包括常用整数和浮点操作与转换、Bool、String 操作和插值、用于有界 String predicate 路径的单 grapheme Character 字面量、包含 address projection 的 Tuple/Optional、Array 与 Dictionary 值语义、半开 `Range<Int>` 循环、结构化控制流、文件或 module scope 的补丁内 struct/enum 与具体 `Result`、带 payload 的局部 Error、受限的补丁内 `inout`/`mutating` helper、包含同 image `@escaping` 返回/捕获流程的同步补丁内 closure、编译器已经完全具体化的 specialization，以及顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` 入口。
 
-它并非任意 Swift。generic root、运行时 metadata/witness 分派、新原生 class、stored layout 变化、escaping/throwing/async closure、真正的 `await`/continuation、actor-isolated `self`、custom global actor、不受限指针、基于反射的字段访问和未注册原生 API 都会被拒绝。实用矩阵见[能力与限制](Capabilities-and-Limits.zh-CN.md)。
+它并非任意 Swift。generic root、运行时 metadata/witness 分派、新原生 class、函数内部 nominal 声明、stored layout 变化、closure 持久化或跨 Native/Shell 边界、throwing/async closure、真正的 `await`/continuation、actor-isolated `self`、custom global actor、不受限指针、基于反射的字段访问和未注册原生 API 都会被拒绝。实用矩阵见[能力与限制](Capabilities-and-Limits.zh-CN.md)。
+
+HLBC 会携带经过 Verifier 检查的 function/block/instruction → 逻辑 Swift 位置映射；生产打包会移除构建机绝对路径。执行发生 trap 时，HLVM 会给出精确 program counter，Runtime 再补充固定的 generation、Shell entry、函数和逻辑文件/行/列。这是诊断映射，不是支持 breakpoint、单步或表达式求值的交互式调试器。
 
 ## 构建补丁包
 

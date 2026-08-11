@@ -547,6 +547,16 @@ struct Container {
             try Bytecode.Encoder.encode(capabilityModule, formatMinor: 7)
         }
 
+        var escapingCapabilityModule = try makeAddModule()
+        escapingCapabilityModule.capabilities.insert(.escapingClosureValuesV1)
+        #expect(
+            throws: Bytecode.CodecError.invalidHeader(
+                "closure values and compiler specializations require HLBC format 1.8"
+            )
+        ) {
+            try Bytecode.Encoder.encode(escapingCapabilityModule, formatMinor: 7)
+        }
+
         var kindModule = try makeAddModule()
         kindModule.functions[0].kind = .concreteSpecialization
         #expect(

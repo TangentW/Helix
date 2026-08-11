@@ -55,7 +55,8 @@ struct Pipeline {
                 functionKey: key,
                 entryIndex: entry,
                 shellInterfaceHash: shellHash,
-                compatibility: compatibility
+                compatibility: compatibility,
+                sourceFileLogicalID: "Patch.swift"
             )
         )
         let shell = try Verification.ShellInterface(
@@ -93,6 +94,97 @@ struct Pipeline {
 
         #expect(compiled.disassembly.contains("checked_add"))
         #expect(compiled.disassembly.contains("cond_br"))
+        #expect(!compiled.module.sourceMap.isEmpty)
+        #expect(compiled.module.sourceMap.allSatisfy { $0.location.file == "Patch.swift" })
+        #expect(compiled.module.sourceMap.allSatisfy { $0.location.line == 1 })
+        #expect(compiled.disassembly.contains("Patch.swift:1:"))
+        var trapCount = 0
+        var allTrapsMapped = true
+        for function in compiled.module.functions {
+            for block in function.blocks {
+                for (rawOffset, instruction) in block.instructions.enumerated() {
+                    guard case .trap = instruction else { continue }
+                    trapCount += 1
+                    guard let offset = UInt32(exactly: rawOffset) else {
+                        allTrapsMapped = false
+                        continue
+                    }
+                    if !compiled.module.sourceMap.contains(where: {
+                        $0.functionID == function.id
+                            && $0.blockID == block.id
+                            && $0.instructionOffset == offset
+                            && $0.location.file == "Patch.swift"
+                    }) {
+                        allTrapsMapped = false
+                    }
+                }
+            }
+        }
+        #expect(trapCount > 0)
+        #expect(allTrapsMapped)
+    }
+
+    @Test("Source maps retain only unambiguous logical paths")
+    func sourceMapLogicalPathPolicy() {
+        let absolute = Core.SourceLocation(
+            file: "/private/build/Feature/Sources/Feature.swift",
+            line: 10,
+            column: 7
+        )
+        let function = IntermediateRepresentation.Function(
+            name: "sourceMapFixture",
+            parameterRegisters: [],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [],
+                    instructions: [
+                        .constantInteger(result: .init(rawValue: 0), value: 1),
+                        .returnValue(.init(rawValue: 0)),
+                    ]
+                ),
+            ],
+            sourceLocation: absolute,
+            sourceMap: [
+                .init(
+                    blockID: .init(rawValue: 0),
+                    instructionOffset: 0,
+                    location: absolute
+                ),
+                .init(
+                    blockID: .init(rawValue: 0),
+                    instructionOffset: 1,
+                    location: absolute
+                ),
+            ]
+        )
+
+        let normalized = IntermediateRepresentation.SourceMapping.retainingLogicalPaths(
+            function,
+            logicalPaths: ["Sources/Feature.swift"]
+        )
+        #expect(
+            normalized.sourceMap.map(\.location.file)
+                == ["Sources/Feature.swift", "Sources/Feature.swift"]
+        )
+        #expect(normalized.sourceLocation?.file == "Sources/Feature.swift")
+
+        let ambiguous = IntermediateRepresentation.SourceMapping.retainingLogicalPaths(
+            function,
+            logicalPaths: ["Feature.swift", "Sources/Feature.swift"]
+        )
+        #expect(ambiguous.sourceMap.isEmpty)
+        #expect(ambiguous.sourceLocation == nil)
+
+        let redacted = IntermediateRepresentation.SourceMapping.retainingLogicalPaths(
+            function,
+            logicalPaths: []
+        )
+        #expect(redacted.sourceMap.isEmpty)
+        #expect(redacted.sourceLocation == nil)
     }
 
     @Test("Unsupported Swift constructs produce a stable lowering diagnostic")
@@ -119,6 +211,93 @@ struct Pipeline {
         #expect(throws: CanonicalSIL.LoweringError.self) {
             _ = try CanonicalSIL.Lowerer().lower(function, displayName: "transform")
         }
+    }
+
+    @Test("Dynamic function references resolve only through the frozen direct-call table")
+    func lowersDynamicFunctionReference() throws {
+        let helper = "$s14DynamicFixture6helperyS2iF"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s14DynamicFixture9transformyS2iF",
+            loweredType: "@convention(thin) (Int) -> Int",
+            body: """
+            bb0(%0 : $Int):
+              %1 = dynamic_function_ref @\(helper) : $@convention(thin) (Int) -> Int
+              %2 = apply %1(%0) : $@convention(thin) (Int) -> Int
+              return %2
+            """
+        )
+        let table = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: helper,
+                parameterTypes: [.int64],
+                resultType: .int64,
+                target: .entry(.init(rawValue: 7))
+            ),
+        ])
+
+        let lowered = try CanonicalSIL.Lowerer().lower(
+            function,
+            displayName: "transform",
+            directCalls: table
+        )
+        #expect(lowered.blocks.flatMap(\.instructions).contains { instruction in
+            guard case let .entryApply(_, entry, _) = instruction else { return false }
+            return entry.rawValue == 7
+        })
+    }
+
+    @Test("Owned device boundaries copy a guaranteed native receiver")
+    func adaptsBorrowedNativeReceiver() throws {
+        let receiverID = Core.TypeID(rawValue: .sha256("Fixture.Receiver"))
+        let helper = "$s7Fixture8ReceiverC6helperyyF"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture8ReceiverC4rootyyF",
+            loweredType: "@convention(method) (@guaranteed Fixture.Receiver) -> ()",
+            body: """
+            bb0(%0 : @guaranteed $Fixture.Receiver):
+              %1 = function_ref @\(helper) : $@convention(method) (@guaranteed Fixture.Receiver) -> ()
+              %2 = apply %1(%0) : $@convention(method) (@guaranteed Fixture.Receiver) -> ()
+              return %2
+            """
+        )
+        let table = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: helper,
+                parameterTypes: [.native(receiverID)],
+                resultType: .void,
+                target: .entry(.init(rawValue: 3))
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes([
+            "Fixture.Receiver": receiverID,
+        ])
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "Fixture.Receiver.root",
+            directCalls: table
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let copies: [(Bytecode.Register, Bytecode.Register)] = instructions.compactMap {
+            instruction in
+            guard case let .copyValue(result, source) = instruction else { return nil }
+            return (result, source)
+        }
+        let calls: [(Core.EntryIndex, [Bytecode.Register])] = instructions.compactMap {
+            instruction in
+            guard case let .entryApply(_, entry, arguments) = instruction else {
+                return nil
+            }
+            return (entry, arguments)
+        }
+        let copy = try #require(copies.first)
+        let call = try #require(calls.first)
+
+        #expect(copy.1 == lowered.parameterRegisters[0])
+        #expect(call.0.rawValue == 3)
+        #expect(call.1 == [copy.0])
     }
 
     @Test("Non-suspending async Swift entries retain their ABI and execute through an async Bridge context")
@@ -232,6 +411,52 @@ struct Pipeline {
                 displayName: "caller",
                 expectedEffects: .init(isAsync: true)
             )
+        }
+    }
+
+    @Test("A real async escaping closure is rejected before HLBC packaging")
+    func rejectsAsyncEscapingClosure() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("helix-async-closure-reject-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("Patch.swift")
+        try Data(
+            """
+            public func asyncClosureRoot(
+                _ transform: @escaping (Int) async -> Int
+            ) async -> Int {
+                await transform(1)
+            }
+            """.utf8
+        ).write(to: source)
+        let sil = try SwiftFrontend.Driver().emitCanonicalSIL(
+            sourceFiles: [source],
+            moduleName: "HelixAsyncClosureRejectFixture"
+        )
+        let file = try CanonicalSIL.File(text: sil)
+        let function = try #require(file.functions.first {
+            $0.loweredType.contains("@async @callee_guaranteed")
+        })
+
+        do {
+            _ = try CanonicalSIL.Lowerer(
+                typeEnvironment: file.typeEnvironment
+            ).lower(
+                function,
+                displayName: "asyncClosureRoot",
+                expectedEffects: .init(isAsync: true)
+            )
+            Issue.record("expected an async closure type rejection")
+        } catch let error as CanonicalSIL.LoweringError {
+            guard case let .unsupportedType(type) = error else {
+                Issue.record("unexpected lowering error: \(error)")
+                return
+            }
+            #expect(type.contains("@async"))
         }
     }
 
@@ -565,6 +790,47 @@ struct Pipeline {
                     )
                 )
             )
+        }
+    }
+
+    @Test("Function-local nominal declarations fail with an exact type diagnostic")
+    func rejectsFunctionLocalNominal() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("helix-function-local-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        try Data(
+            """
+            @inline(never)
+            public func localDecision(_ value: Int) -> Int {
+                enum Decision {
+                    case accepted(Int)
+                    case blocked
+                }
+                let decision: Decision = value >= 0 ? .accepted(value) : .blocked
+                switch decision {
+                case let .accepted(output): return output
+                case .blocked: return -1
+                }
+            }
+            """.utf8
+        ).write(to: sourceURL)
+        let sil = try SwiftFrontend.Driver().emitCanonicalSIL(
+            sourceFiles: [sourceURL],
+            moduleName: "FunctionLocalFixture",
+            purpose: .semanticLowering
+        )
+        let file = try CanonicalSIL.File(text: sil)
+        let function = try file.uniqueFunction(mangledNameContaining: "localDecision")
+
+        #expect(throws: CanonicalSIL.LoweringError.unsupportedType("Decision")) {
+            _ = try CanonicalSIL.Lowerer(
+                typeEnvironment: file.typeEnvironment
+            ).lower(function, displayName: "localDecision")
         }
     }
 
@@ -1008,11 +1274,24 @@ struct Pipeline {
             functionName: "rangeLoop",
             signature: .init(parameters: ["Swift.Int"], result: "Swift.Int"),
             parameterTypes: [.int64],
-            resultType: .int64
+            resultType: .int64,
+            purpose: .semanticLowering
         )
-        #expect(loop.compiled.disassembly.contains("bool_or"))
+        #expect(loop.compiled.disassembly.contains("load_stack.copy"))
+        #expect(loop.compiled.disassembly.contains("checked_add"))
         #expect(loop.compiled.disassembly.contains("cond_br"))
-        for (count, expected) in [(6, 13), (30, 103)] {
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: loop.image,
+                arguments: [
+                    .integer(
+                        try VM.Integer(signed: -3, bitWidth: 64, isSigned: true)
+                    ),
+                ]
+            ) == .trapped(.explicit("Range requires lowerBound <= upperBound"))
+        )
+        for (count, expected) in [(0, 0), (6, 13), (30, 103)] {
             #expect(
                 VM.Interpreter().invoke(
                     entry: .init(rawValue: 0),
@@ -1697,6 +1976,11 @@ struct Pipeline {
         public func stringContains(_ value: String, _ pattern: String) -> Bool {
             value.contains(pattern)
         }
+
+        @inline(never)
+        public func containsFamilyEmoji(_ value: String) -> Bool {
+            value.contains("👨‍👩‍👧‍👦")
+        }
         """
         let semanticSILArguments = ["-Xfrontend", "-disable-sil-perf-optzns"]
         let stringParameters = Core.LoweredSignature(
@@ -1828,6 +2112,30 @@ struct Pipeline {
                 ) == .returned(.bool(expected))
             )
         }
+
+        let character = try compileFixture(
+            source: source,
+            functionName: "containsFamilyEmoji",
+            signature: .init(parameters: ["Swift.String"], result: "Swift.Bool"),
+            parameterTypes: [.string],
+            resultType: .bool,
+            purpose: .semanticLowering
+        )
+        #expect(character.compiled.disassembly.contains("string_contains"))
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: character.image,
+                arguments: [.string("Team 👨‍👩‍👧‍👦")]
+            ) == .returned(.bool(true))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: character.image,
+                arguments: [.string("Team 👨‍👩‍👧")]
+            ) == .returned(.bool(false))
+        )
     }
 
     @Test("String interpolation supports frozen scalar payload semantics")
@@ -2882,6 +3190,7 @@ struct Pipeline {
         parameterTypes: [Bytecode.ValueType],
         resultType: Bytecode.ValueType,
         effects: Core.Effects = .init(),
+        purpose: SwiftFrontend.CanonicalSILPurpose = .implementationIdentity,
         additionalFrontendArguments: [String] = []
     ) throws -> CompiledFixture {
         let directory = FileManager.default.temporaryDirectory
@@ -2893,7 +3202,8 @@ struct Pipeline {
         let canonicalSIL = try SwiftFrontend.Driver().emitCanonicalSIL(
             sourceFiles: [sourceURL],
             moduleName: "HelixLanguageFixture",
-            additionalArguments: additionalFrontendArguments
+            additionalArguments: additionalFrontendArguments,
+            purpose: purpose
         )
         let function = try CanonicalSIL.File(text: canonicalSIL)
             .uniqueFunction(mangledNameContaining: functionName)

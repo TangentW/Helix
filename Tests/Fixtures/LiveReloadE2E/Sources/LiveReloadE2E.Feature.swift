@@ -32,11 +32,16 @@ public final class HostViewController: UIViewController {
         ])
     }
 
-    /// Saving this body exercises inferred UIKit invalidation. The App neither
-    /// registers this type nor owns a manual reload hook.
+    /// Saving this body exercises HLBC activation, a call through an unchanged
+    /// Shell Entry, and inferred UIKit invalidation. The App neither registers
+    /// this type nor owns a manual reload hook.
     public override func viewDidLayoutSubviews() {
+        applyTitle("HELIX BASELINE")
+    }
+
+    private func applyTitle(_ title: String) {
         super.viewDidLayoutSubviews()
-        titleLabel.text = "HELIX BASELINE"
+        titleLabel.text = title
     }
 }
 }

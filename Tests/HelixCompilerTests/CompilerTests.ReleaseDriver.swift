@@ -1229,6 +1229,114 @@ struct ReleaseDriver {
         )
     }
 
+    @Test("Production sync escaping closures can return and capture VM closures")
+    func buildsEscapingClosurePatch() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-release-escaping-closure-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        @inline(never)
+        func helper(
+            _ transform: @escaping (Int) -> Int,
+            offset: Int
+        ) -> (Int) -> Int {
+            { input in transform(input) + offset }
+        }
+        @inline(never)
+        public func transform(_ value: Int) -> Int {
+            let escaped = helper({ $0 * 2 }, offset: 1)
+            return escaped(value)
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+        let driver = ReleaseCompiler.Driver()
+        let closureType = Bytecode.ValueType.closure(
+            .init(parameters: [.int64], result: .int64)
+        )
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            helperSignature: .init(
+                parameters: ["(Swift.Int) -> Swift.Int", "Swift.Int"],
+                result: "(Swift.Int) -> Swift.Int"
+            ),
+            helperParameterTypes: [closureType, .int64],
+            helperResultType: closureType,
+            helperEffects: .init(),
+            helperCanonicalDeclaration:
+                "func helper(_: @escaping (Int) -> Int, offset: Int) -> (Int) -> Int",
+            helperFormalType:
+                "(@escaping (Swift.Int) -> Swift.Int, Swift.Int) -> (Swift.Int) -> Swift.Int",
+            optimization: "-Onone"
+        )
+        let root = try #require(archive.functions.first {
+            $0.canonicalDeclaration.contains("transform")
+        })
+        let helper = try #require(archive.functions.first {
+            $0.canonicalDeclaration.contains("helper")
+        })
+        let entry = try #require(root.entryIndex)
+        #expect(helper.patchability.reasonCode == "HLXIDX022")
+        #expect(archive.capabilities.contains(.escapingClosureValuesV1))
+
+        let changed = """
+        @inline(never)
+        func helper(
+            _ transform: @escaping (Int) -> Int,
+            offset: Int
+        ) -> (Int) -> Int {
+            { input in transform(input) + offset }
+        }
+        @inline(never)
+        public func transform(_ value: Int) -> Int {
+            let escaped = helper({ $0 * 2 }, offset: 3)
+            return escaped(value)
+        }
+        """
+        try Data(changed.utf8).write(to: sourceURL)
+        let result = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+
+        #expect(result.module.capabilities.contains(.closureValuesV1))
+        #expect(result.module.capabilities.contains(.escapingClosureValuesV1))
+        #expect(result.module.functions.contains { function in
+            function.resultType == closureType
+        })
+        #expect(result.module.functions.contains { function in
+            function.kind == .closureBody
+                && function.parameterRegisters.contains { register in
+                    function.type(of: register) == closureType
+                }
+        })
+
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: entry,
+                image: image,
+                arguments: [
+                    .integer(try VM.Integer(signed: 4, bitWidth: 64, isSigned: true)),
+                ]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 11, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
     @Test("Production closures preserve borrowed nontrivial Swift values")
     func buildsBorrowedStringClosurePatch() throws {
         let directory = FileManager.default.temporaryDirectory

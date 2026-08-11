@@ -12,12 +12,15 @@ extension NativeImportDiscovery {
         case globalFunction
         case staticMethod
         case instanceMethod
+        case instanceGetter
+        case instanceSetter
     }
 
     struct Declaration: Hashable, Sendable {
         var moduleName: String
         var sourceFileLogicalID: String
         var mangledName: String
+        var silSymbols: [String] = []
         var canonicalCallee: String
         var accessLevel: String
         var dispatch: NativeImportDiscovery.Dispatch
@@ -26,6 +29,7 @@ extension NativeImportDiscovery {
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
         var resultSwiftType: String
+        var importedModules: [String] = []
         var parameterTypes: [Bytecode.ValueType]
         var resultType: Bytecode.ValueType
         var signature: Core.LoweredSignature
@@ -45,6 +49,7 @@ extension NativeImportDiscovery {
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
         var resultSwiftType: String
+        var importedModules: [String]
     }
 
     struct Candidate: Hashable, Sendable {
@@ -107,17 +112,20 @@ extension NativeImportDiscovery {
                     continue
                 }
 
+                let operationAccess = access(
+                    for: profile,
+                    dispatch: declaration.dispatch
+                )
                 let effects = Core.Effects(
                     mayThrow: declaration.inferredEffects.mayThrow,
                     mayAllocate: true,
-                    hasExternalSideEffects: profile == .boundedReadWrite,
+                    hasExternalSideEffects: operationAccess.hasExternalSideEffects,
                     requiresMainActor: declaration.inferredEffects.requiresMainActor
                 )
                 let contract = Core.NativeImportContract.bounded(
-                    kind: declaration.dispatch == .globalFunction
-                        ? .globalFunction : .staticMethod,
+                    kind: contractKind(for: declaration.dispatch),
                     domain: .application,
-                    access: access(for: profile),
+                    access: operationAccess,
                     maximumDurationMicroseconds: scope.maximumDurationMicroseconds,
                     allowsMainThread: scope.allowsMainThread
                 )
@@ -135,7 +143,9 @@ extension NativeImportDiscovery {
                             id: nil,
                             key: key,
                             canonicalCallee: declaration.canonicalCallee,
-                            silMangledNames: [declaration.mangledName],
+                            silMangledNames: declaration.silSymbols.isEmpty
+                                ? [declaration.mangledName]
+                                : declaration.silSymbols,
                             parameterTypes: declaration.parameterTypes,
                             resultType: declaration.resultType,
                             signature: declaration.signature,
@@ -152,13 +162,15 @@ extension NativeImportDiscovery {
                             baseName: declaration.baseName,
                             argumentLabels: declaration.argumentLabels,
                             parameterSwiftTypes: declaration.parameterSwiftTypes,
-                            resultSwiftType: declaration.resultSwiftType
+                            resultSwiftType: declaration.resultSwiftType,
+                            importedModules: declaration.importedModules
                         )
                     )
                 )
             }
             guard Set(candidates.map(\.record.key)).count == candidates.count,
-                  Set(candidates.flatMap(\.record.silMangledNames)).count == candidates.count
+                  Set(candidates.flatMap(\.record.silMangledNames)).count
+                    == candidates.reduce(0, { $0 + $1.record.silMangledNames.count })
             else {
                 throw FrontendReceipt.Error.invalidRequest(
                     "source NativeImport discovery produced duplicate identities"
@@ -177,11 +189,17 @@ extension NativeImportDiscovery {
             switch declaration.dispatch {
             case .globalFunction, .staticMethod:
                 break
-            case .instanceMethod:
-                return (
-                    "HLXNID001",
-                    "automatic v1 discovery does not synthesize a native receiver; use an explicit catalog factory"
-                )
+            case .instanceMethod, .instanceGetter, .instanceSetter:
+                guard declaration.ownerType != nil,
+                      declaration.parameterTypes.last.map(isNativeReference) == true,
+                      declaration.parameterSwiftTypes.count == declaration.parameterTypes.count,
+                      declaration.argumentLabels.count + 1 == declaration.parameterTypes.count
+                else {
+                    return (
+                        "HLXNID001",
+                        "instance NativeImport requires one exact source-class receiver as its final physical parameter"
+                    )
+                }
             }
             if declaration.inferredEffects.isAsync {
                 return ("HLXNID002", "async NativeImport requires a suspension-aware contract")
@@ -205,14 +223,17 @@ extension NativeImportDiscovery {
             else {
                 return ("HLXNID007", "callee name or argument label is not representable in generated Swift")
             }
-            guard declaration.argumentLabels.count == declaration.parameterTypes.count,
+            let explicitParameterTypes = isInstanceDispatch(declaration.dispatch)
+                ? Array(declaration.parameterTypes.dropLast())
+                : declaration.parameterTypes
+            guard declaration.argumentLabels.count == explicitParameterTypes.count,
                   declaration.parameterSwiftTypes.count == declaration.parameterTypes.count,
-                  declaration.parameterTypes.allSatisfy(isAutomaticallyBridgeable),
+                  explicitParameterTypes.allSatisfy(isAutomaticallyBridgeable),
                   isAutomaticallyBridgeableResult(declaration.resultType)
             else {
                 return (
                     "HLXNID005",
-                    "signature is outside the automatic value-only Bridge profile"
+                    "signature is outside the automatic frozen-value Bridge profile"
                 )
             }
             if declaration.inferredEffects.requiresMainActor && !scope.allowsMainThread {
@@ -221,7 +242,7 @@ extension NativeImportDiscovery {
                     "MainActor declaration is excluded because the sourceScope forbids main-thread execution"
                 )
             }
-            guard declaration.dispatch != .staticMethod
+            guard declaration.dispatch == .globalFunction
                     || declaration.ownerType?.split(separator: ".").allSatisfy({
                         isSwiftIdentifier(String($0))
                     }) == true
@@ -232,18 +253,48 @@ extension NativeImportDiscovery {
         }
 
         private func access(
-            for profile: PatchConfiguration.NativeImportSourceProfile
+            for profile: PatchConfiguration.NativeImportSourceProfile,
+            dispatch: NativeImportDiscovery.Dispatch
         ) -> Core.NativeImportAccess {
-            switch profile {
+            switch dispatch {
+            case .instanceGetter: return .read
+            case .instanceSetter: return .write
+            case .globalFunction, .staticMethod, .instanceMethod: break
+            }
+            return switch profile {
             case .boundedPure: .pure
             case .boundedRead: .read
             case .boundedReadWrite: .readWrite
             }
         }
 
+        private func contractKind(
+            for dispatch: NativeImportDiscovery.Dispatch
+        ) -> Core.NativeImportKind {
+            switch dispatch {
+            case .globalFunction: .globalFunction
+            case .staticMethod: .staticMethod
+            case .instanceMethod: .instanceMethod
+            case .instanceGetter: .instanceGetter
+            case .instanceSetter: .instanceSetter
+            }
+        }
+
+        private func isInstanceDispatch(_ dispatch: NativeImportDiscovery.Dispatch) -> Bool {
+            switch dispatch {
+            case .instanceMethod, .instanceGetter, .instanceSetter: true
+            case .globalFunction, .staticMethod: false
+            }
+        }
+
+        private func isNativeReference(_ type: Bytecode.ValueType) -> Bool {
+            if case .native = type { return true }
+            return false
+        }
+
         private func isAutomaticallyBridgeable(_ type: Bytecode.ValueType) -> Bool {
             switch type {
-            case .bool, .integer, .float, .string:
+            case .bool, .integer, .float, .string, .native:
                 true
             case let .array(element), let .optional(element):
                 isAutomaticallyBridgeable(element)
@@ -251,7 +302,7 @@ extension NativeImportDiscovery {
                 isDictionaryKey(key) && isAutomaticallyBridgeable(value)
             case let .tuple(elements):
                 !elements.isEmpty && elements.allSatisfy(isAutomaticallyBridgeable)
-            case .void, .never, .native, .local, .error, .address, .closure:
+            case .void, .never, .local, .error, .address, .closure:
                 false
             }
         }

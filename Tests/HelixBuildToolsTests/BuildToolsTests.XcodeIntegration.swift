@@ -315,6 +315,7 @@ struct XcodeIntegrationContract {
         #expect(context.environment.semanticArguments.contains("-swift-version"))
         #expect(context.environment.semanticArguments.contains("6"))
         #expect(context.environment.semanticArguments.contains("HELIX_DEMO"))
+        #expect(context.environment.deviceHost == nil)
         #expect(
             context.environment.profileOutputURL.path
                 == root.appendingPathComponent(
@@ -328,6 +329,49 @@ struct XcodeIntegrationContract {
         #expect(product.applicationBundleURL.lastPathComponent == "LiveDemo.app")
         #expect(product.executableURL.lastPathComponent == "LiveDemo")
         #expect(product.activityLogDirectoryURL.lastPathComponent == "Build")
+
+        var deviceVariables = variables
+        deviceVariables["PLATFORM_NAME"] = "iphoneos"
+        deviceVariables["SDKROOT"] = root.appendingPathComponent(
+            "iPhoneOS.sdk"
+        ).path
+        deviceVariables["HELIX_DEVICE_HOST"] = "192.0.2.42"
+        let deviceContext = try XcodeIntegration.EnvironmentResolver().resolve(
+            plan: plan,
+            planURL: planURL,
+            profileID: "live",
+            variables: deviceVariables
+        )
+        #expect(deviceContext.environment.targetTriple == "arm64-apple-ios15.0")
+        #expect(deviceContext.environment.deviceHost == "192.0.2.42")
+
+        var invalidDeviceHostVariables = deviceVariables
+        invalidDeviceHostVariables["HELIX_DEVICE_HOST"] = "https://192.0.2.42"
+        #expect(throws: XcodeIntegration.EnvironmentError.invalid(
+            name: "HELIX_DEVICE_HOST",
+            value: "https://192.0.2.42"
+        )) {
+            try XcodeIntegration.EnvironmentResolver().resolve(
+                plan: plan,
+                planURL: planURL,
+                profileID: "live",
+                variables: invalidDeviceHostVariables
+            )
+        }
+
+        var simulatorHostVariables = variables
+        simulatorHostVariables["HELIX_DEVICE_HOST"] = "192.0.2.42"
+        #expect(throws: XcodeIntegration.EnvironmentError.invalid(
+            name: "HELIX_DEVICE_HOST",
+            value: "192.0.2.42"
+        )) {
+            try XcodeIntegration.EnvironmentResolver().resolve(
+                plan: plan,
+                planURL: planURL,
+                profileID: "live",
+                variables: simulatorHostVariables
+            )
+        }
 
         var ambiguousArchitectures = variables
         ambiguousArchitectures["ARCHS"] = "arm64 x86_64"

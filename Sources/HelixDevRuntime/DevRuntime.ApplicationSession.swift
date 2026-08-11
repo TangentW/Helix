@@ -18,12 +18,7 @@ extension DevRuntime {
 ///     let session: DevRuntime.ApplicationSession
 ///
 ///     init() throws {
-///         session = try DevRuntime.ApplicationSession(
-///             options: .init(
-///                 supportedBackends: [.nativeDynamicReplacement, .hlbc],
-///                 nativeChainingProbePassed: true
-///             )
-///         )
+///         session = try DevRuntime.ApplicationSession()
 ///     }
 /// }
 /// ```

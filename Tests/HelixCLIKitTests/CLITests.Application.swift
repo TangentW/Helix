@@ -3,6 +3,8 @@ import Foundation
 import HelixBytecode
 import HelixBuildTools
 import HelixCore
+import HelixDevProtocol
+import HelixDevTools
 import HelixReleaseTools
 import Testing
 @testable import HelixCLIKit
@@ -46,6 +48,33 @@ struct Application {
         let daemon = await application.runAsync(["dev", "run", "--help"])
         #expect(daemon.exitCode == 0)
         #expect(daemon.standardOutput.contains("Control-C"))
+    }
+
+    @Test("Rejected live activation prints the App diagnostic")
+    func rejectedLiveActivationDiagnostic() {
+        let activation = DevProtocol.ActivationResult(
+            sourceRevision: .init(rawValue: 2),
+            generationID: .init(rawValue: 3),
+            codeStatus: .rejected,
+            reloadStatus: .notRequested,
+            diagnostic: .init(
+                code: "HLXLR404",
+                message: "dyld rejected native image: invalid signature",
+                sourceRevision: .init(rawValue: 2),
+                generationID: .init(rawValue: 3),
+                backend: .nativeDynamicReplacement,
+                nextAction: "use HLBC or fix signing/dependencies"
+            )
+        )
+
+        switch CLI.Application.describe(.activation(activation)) {
+        case let .standardError(diagnostic):
+            #expect(diagnostic.contains("r2/g3: rejected, UI notRequested."))
+            #expect(diagnostic.contains("HLXLR404"))
+            #expect(diagnostic.contains("invalid signature"))
+        case .standardOutput:
+            Issue.record("Rejected activation must be written to standard error")
+        }
     }
 
     @Test("HLBC inspection and disassembly decode the artifact")
@@ -305,7 +334,7 @@ struct Application {
         #expect(!doctorReport.checks.contains { $0.severity == .error })
     }
 
-    @Test("Xcode prepare phase indexes and materializes one real Swift feature")
+    @Test("Xcode prepare keeps Production explicit and manages the Debug calling surface")
     func xcodePreparePhase() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -319,7 +348,10 @@ struct Application {
             withIntermediateDirectories: true
         )
         try Data(
-            "public func value(_ input: Int) -> Int { input + 1 }\n".utf8
+            """
+            private func hidden(_ input: Int) -> Int { input + 1 }
+            public func value(_ input: Int) -> Int { hidden(input) }
+            """.utf8
         ).write(to: sourceRoot.appendingPathComponent("Sources/Feature.swift"))
         try FileManager.default.createDirectory(
             at: directory.appendingPathComponent("Configurations"),
@@ -355,6 +387,16 @@ struct Application {
                     configurationName: "Release",
                     bundleIdentifier: "dev.helix.patch",
                     namespaceSeed: "fixture-patch",
+                    featureID: "feature"
+                ),
+                .init(
+                    id: "live",
+                    workflow: .liveReload,
+                    schemeName: "Live",
+                    applicationTargetName: "LiveApp",
+                    configurationName: "Debug",
+                    bundleIdentifier: "dev.helix.live",
+                    namespaceSeed: "fixture-live",
                     featureID: "feature"
                 ),
             ]
@@ -445,6 +487,51 @@ struct Application {
         #expect(!FileManager.default.fileExists(atPath: buildDirectory
             .appendingPathComponent("HelixGenerated/patch/Compiler/Application/swiftc")
             .path))
+
+        let patchReceipt = try ShellBuildReceipt.Codec.decode(
+            Data(contentsOf: shell.appendingPathComponent("ShellBuildReceipt.json"))
+        )
+        #expect(patchReceipt.configuration.schema == 1)
+        #expect(patchReceipt.nativeImportCandidates.isEmpty)
+
+        var liveEnvironment = environment
+        liveEnvironment["CONFIGURATION"] = "Debug"
+        liveEnvironment["HELIX_PROFILE_ID"] = "live"
+        liveEnvironment["HELIX_WORKFLOW"] = "liveReload"
+        liveEnvironment["HELIX_RUNTIME_PRODUCT"] = "HelixDevAppRuntime"
+        let liveResult = CLI.Application(
+            currentDirectoryURL: directory,
+            environment: liveEnvironment
+        ).run([
+            "xcode", "phase",
+            "--plan", generatedPlanURL.path,
+            "--profile", "live",
+            "--phase", "prepare",
+        ])
+        #expect(liveResult.exitCode == 0, Comment(rawValue: liveResult.standardError))
+        let liveShell = buildDirectory.appendingPathComponent(
+            "HelixGenerated/live/Shell",
+            isDirectory: true
+        )
+        let liveReceipt = try ShellBuildReceipt.Codec.decode(
+            Data(contentsOf: liveShell.appendingPathComponent("ShellBuildReceipt.json"))
+        )
+        let featureConfiguration = try #require(
+            liveReceipt.configuration.modules["Feature"]
+        )
+        #expect(liveReceipt.configuration.schema == 2)
+        #expect(featureConfiguration.nativeImports.sourceScope?.visibility == .all)
+        #expect(liveReceipt.nativeImportCandidates.map(\.canonicalCallee) == [
+            "Feature.hidden(_:)",
+        ])
+        let entrySymbols = Set(liveReceipt.roots.compactMap { root in
+            root.bridge == nil ? nil : root.declarationMangledName
+        })
+        #expect(entrySymbols.count == 1)
+        let importedSymbols = Set(
+            liveReceipt.nativeImportCandidates.flatMap(\.silMangledNames)
+        )
+        #expect(entrySymbols.isDisjoint(with: importedSymbols))
     }
 
     private func temporaryDirectory() throws -> URL {

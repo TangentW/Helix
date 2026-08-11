@@ -70,9 +70,14 @@ struct DevSessionConfiguration {
             }
             let simulator = try #require(bootstrap.environment(for: .simulator))
             let device = bootstrap.environment(for: .device)
+            let directDevice = try #require(
+                bootstrap.environment(for: .device, deviceHost: "192.0.2.42")
+            )
             #expect(simulator["HLX_DEV_HOST"] == "127.0.0.1")
             #expect(simulator["HLX_DEV_PORT"] == String(bootstrap.port))
             #expect(device == nil)
+            #expect(directDevice["HLX_DEV_HOST"] == "192.0.2.42")
+            #expect(directDevice["HLX_DEV_PORT"] == String(bootstrap.port))
             #expect(simulator["HLX_DEV_SESSION_SECRET"]?.count == 64)
 
             let first = try await connectApp(

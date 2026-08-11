@@ -2,7 +2,7 @@
 
 [English](Development-Live-Reload.md)
 
-Helix Live Reload 用于缩短正在运行的 Debug App 的修改循环。完成一次性 Xcode 集成和 Dev Shell 构建后，保存一个 eligible Swift 声明的函数体，可以在同一进程中编译新 generation、传给 Simulator、激活代码并刷新受影响的 UI。
+Helix Live Reload 用于缩短正在运行的 Debug App 的修改循环。完成一次性 Xcode 集成和 Dev Shell 构建后，保存一个 eligible Swift 声明的函数体，可以在同一进程中编译新 generation、传给 Simulator 或开发设备、激活代码并刷新受影响的 UI。
 
 这是开发功能，与生产补丁的产物、密钥、存储和生命周期完全隔离。
 
@@ -33,7 +33,7 @@ sequenceDiagram
     M->>M: "Debounce 并捕获稳定快照"
     M->>C: "单调递增 sourceRevision"
     C->>C: "精确 module type-check 与 body-only 差分"
-    C->>C: "构建一个 Native 或 HLBC generation"
+    C->>C: "降低受支持 SIL，构建一个 HLBC generation"
     C->>D: "Offer、hash、metadata 与 payload"
     D->>A: "认证分块传输"
     A->>A: "验证并激活代码"
@@ -43,70 +43,48 @@ sequenceDiagram
 
 监控器只观察 Dev Build Manifest 冻结的源文件。编辑器 safe-save rename 与原地写入会先 debounce；Snapshotter 要求连续两次读取的 inode、大小、修改时间和内容 hash 全部一致。每个 transaction 都有单调递增的 `sourceRevision`，较慢的旧编译或传输无法覆盖后来已接受的保存。
 
-编译、签名、加载或 UI 刷新失败都不会丢掉上一个成功代码 generation。代码是否激活与 UI 是否刷新会分开报告。
+编译、artifact 验证、激活或 UI 刷新失败都不会丢掉上一个成功代码 generation。代码是否激活与 UI 是否刷新会分开报告。
 
-## 原生 Replacement 如何编译
+## HLBC generation 如何编译
 
-第一次 Debug Build 会捕获真实 Swift frontend job、SDK、target、module/源码集合、链接输入和签名身份。`helix dev prepare` 在隔离输出中复放该 job，并用 fresh source 编译 capability probe，验证 implicit dynamic、private source-file import、canonical SIL 与 replacement chaining。它不会只看参数名字，也不会在每次 App 启动时执行两代 dylib 运行实验。
+第一次 Debug Build 会捕获真实 Swift frontend job、SDK、target、module/源码集合、编译参数和链接上下文。`helix dev prepare` 在隔离输出中复放编译器 probe，确认捕获的 job 能产生字节码编译器所需的 canonical SIL 事实；它不会近似猜测工程 Build Settings。
 
-对于通过检查的 body-only 修改，Helix 会：
+对于通过检查的一次保存，Helix 会：
 
-1. 在完整 module 上下文中重新 type-check，比较 interface 与传递 implementation fingerprint。
-2. 通过 Reload Index 定位已有 replacement root。
-3. 只提取这些函数体。
-4. 请求精确编译器生成 typed AST，按 USR 识别声明及其 self reference，只修改编译器报告的 UTF-8 标识符范围。
-5. 生成 `@_dynamicReplacement` 声明，经过正常 SILGen、IRGen 和 LLVM，再链接、签名唯一命名的 dylib。
-6. 生成匹配的 dSYM 与 Swift module，并验证 DWARF UUID。
+1. 为冻结 module 上下文中的全部源码捕获同一个稳定 revision。
+2. 重新 type-check 完整 module，并拒绝 interface、stored layout、source membership、依赖或 Build Settings 变化。
+3. 通过声明身份与 implementation fingerprint 确定变化的 eligible root，再让捕获的 Swift 编译器产出 SIL。
+4. 构造闭合调用表：patch-local 函数优先，其次是 eligible Shell `EntryIndex`，最后是 Dev Shell 在构建期实际生成的精确 `NativeImportID` 能力。
+5. 只把受支持的 canonical SIL 降成强类型 HLIR 与 HLBC，并在 Mac 端运行独立结构和语义 Verifier。
+6. 发送一个不可变、绑定本次会话的 live artifact。App 在原子激活前重新检查 session、revision、target、Shell identity、hash、大小、capability 与字节码合法性。
 
-这是由 typed AST 身份与 SIL 检查约束的源码重建，不是 LLVM 插桩、原始符号 rebinding，也不是已经实现的 SIL function cloning。
+iOS 进程不会接收或执行 Swift 编译器、linker、JIT、dylib 或源文件。Release 与开发路径复用编译器、Verifier 与 HLVM 核心，但开发 artifact 是临时的，并由一次性 Dev Session 认证，而不是使用生产包信任链。
 
-private source-file import 让 replacement body 能解析原 module 中原本可用的 private、internal 与 public 声明，但不会让补丁访问 App 从未链接的 framework。
+## 原生调用、实例 `self` 与递归
 
-## 递归与上一代实现
+一个 Swift 符号仅仅存在于进程中，并不代表 HLBC 可以随意调用它。调用必须精确解析到同一 bytecode image 中的函数、eligible Shell Entry，或者已生成进 Shell 的精确 NativeImport。Entry 路由优先，因此可补丁 App 函数之间的普通调用仍然感知 generation；NativeImport 用来承载必须离开 HLVM 执行的有界原生 API。
 
-在 Swift Dynamic Replacement 中，replacement 内部调用被替换声明时具有“上一代实现”的特殊含义。如果原样复制普通递归函数体，它会错误地递归进旧 generation。Helix 会把精确 self reference 重绑定到当前 replacement identity，修正这一语义。
+对于受支持的源码 `class` 实例方法，隐藏 Bridge 会把 `self` 作为冻结的引用 `TypeID` 传入。生成的 `NativeTypeOperations` 负责 retain、identity 与类型验证，不把进程指针写进 HLBC。这条路径解决了 class method receiver；具体属性或方法操作仍必须拥有受支持的 Shell Entry 或精确 NativeImport。struct/enum writeback、actor executor 与 static/class metatype ABI 不会被猜测模拟，当前需要正常构建。
 
-普通 Swift 仍然表示普通递归：
+Swift SIL 通常把 class receiver 写成 `@guaranteed self`，而 Entry/NativeImport Bridge 会拥有每一个跨设备边界的值。Helix 用物理 SIL convention 验证调用，再只对 borrowed→owned 的边界插入强类型 VM copy；同 image 的局部调用仍要求 ownership ABI 完全一致。这样既不会因无害的 borrow spelling 错误拒绝 private 实例 helper，也没有放宽类型、effect、address 或 capability 检查。
 
-```swift
-func factorial(_ value: Int) -> Int {
-    value < 2 ? 1 : value * factorial(value - 1)
-}
-```
+直接递归会解析到同一个不可变 HLBC image 内的函数，因此普通递归 Swift 语义保持不变。一次调用链会固定一个 Runtime generation，并发保存不会让它在中途混用两代实现。`LiveReload.previous` 只属于显式 Native Dynamic Replacement 实验，默认 HLBC 路径不接受它；恢复旧行为应通过再次保存或显式 generation rollback/tombstone 完成，而不是依赖隐藏的源码调用约定。
 
-上面的递归边保持在当前 generation。确实要调用上一代时必须显式说明：
+## Generation、传输与生命周期
 
-```swift
-func adjustedPrice(_ input: Int) -> Int {
-    LiveReload.previous {
-        adjustedPrice(input)
-    } + 1
-}
-```
+每个成功 transaction 都是一个不可变 bytecode generation。Helix 不维护可变 dylib，也不会往 image 中持续追加 Swift 文件。Daemon 通过认证 Dev Session 发送 offer manifest 与有界 HLBC 字节，App 验证完整 artifact 后才激活。恢复 baseline 时可以没有 bytecode，只携带停止继承旧 route 的信息。
 
-`LiveReload.previous` 是编译器 marker，不是通用运行时分发器。当前 marker 只接受一个表达式，可以是 `async throws`，并且不能嵌套在另一个用户 closure 内。没有经过 Helix 变换时会主动 trap，避免静默调用错误实现。
+默认单个 live HLBC payload 上限为 16 MiB。激活会把继承 route 展平成一个不可变、自包含 snapshot，因此路由查询不依赖一条无限增长的祖先链。Registry 默认强保留当前 snapshot 与直接回滚前代；更旧 snapshot 只有在已开始调用或显式诊断 lease 仍固定它时才继续存活。lease 自身携带完成调用所需的已解析 route 与已验证 image。
 
-静态 SIL 测试会区分当前代的 `function_ref` 与显式上一代的 `prev_dynamic_function_ref`。macOS 运行时 E2E 已经连续装载两代全局、实例、static、class 和具体泛型递归 replacement，并验证第二代的 explicit previous 能到达第一代。
+数量上限与去重后的 artifact 字节预算会把这些执行中 snapshot 一并计算。如果所有可淘汰项都被固定，新 generation 会以 transaction 方式失败，旧 generation 保持活动，不会为了接收新代码而破坏执行中的调用。lease 释放后，下一次 Registry 操作会压缩旧 snapshot。独立的全进程 generation ID 高水位保证已压缩 ID 不能复用。开发 generation 不进入生产补丁存储；重启 App 后回到 Dev Shell baseline。
 
-## Generation、传输与 Image 生命周期
+仓库内 soak 会激活 128 个真实验证后 HLBC generation，验证一次失败保存不会改变 active generation，并覆盖 rollback、调用结果以及压缩后只强保留 active/直接前代 snapshot。这是确定性的进程内证据；真机长时间内存压力和前后台循环仍属于资格 Gate。
 
-Helix 为每个成功 Native transaction 构建一个独立不可变 image，并不是维护一个 dylib 后不断往里面追加保存的 Swift 文件。Native live artifact 由 offer manifest 与 dylib 字节构成，通过认证 Dev Session 传输；App 先将其写入有界临时文件，再检查 hash、Mach-O、架构、依赖、会话和 generation 身份。
+## 后端策略
 
-App 使用 local、immediate binding 调用 `dlopen`。已经成功加载的 image 会保留到进程退出，因为在途 frame、closure、metadata 或 replacement descriptor 仍可能引用它们。Helix 不调用 `dlclose`。默认限制为：
+`.automatic` 与公开默认配置在 Simulator 和设备上都选择 HLBC。字节码 lowering 拒绝 transaction 时，路由器不会偷偷回退到 Native；它会报告精确的不支持语法，要求调整为受支持修改或正常构建。这样两个目标上的行为和源码覆盖保持一致。
 
-- 单个 Native payload 64 MiB，单个 HLBC live payload 16 MiB；
-- 50 个 Native image 时给出软提醒；
-- 80 个 Native image 或累计 256 MiB image 字节时硬停止。
-
-达到硬上限后要求重启 App。Live generation 不会像生产补丁那样持久化，所以重启后回到 Dev Shell baseline。
-
-## 后端选择
-
-Simulator Native Dynamic Replacement 是目前已验证的主路径。Native 不可用时，开发路由器可以选择 HLBC，但前提是一个 HLBC transaction 能覆盖全部变化 root。某个函数一旦存在活动 generation，在重启前会保持 backend affinity，因此同一次原子 transaction 不会混合 Native 与 HLBC 实现。
-
-当前没有已经实现的 `-interposable` 回退。如果两个后端都无法安全编译，Helix 会明确要求完整构建。
-
-真实开发 iPhone 的 Native 加载作为实验路径存在：它会使用捕获到的 device target 与 expanded signing identity，但在精确 Xcode、iOS、架构、Team ID、签名和 Library Validation 矩阵完成资格前必须保持禁用。Simulator 成功不能代替真机资格。
+Native Dynamic Replacement 只保留为必须显式选择的内部 Swift 编译器实验与差分测试。它仍可在经过资格验证的环境中构建、加载 dylib，但不会自动选中，也不属于产品 Live Reload 合同。仓库 HLBC Simulator E2E 已通过，真实 iPhone 资格验证仍是待补证据。
 
 ## 为什么代码激活后页面不会天然重绘
 
@@ -142,14 +120,16 @@ struct ProfileScreen: View {
 
 ## 支持哪些修改
 
-当前 Native 工作流面向 Dev Shell 中已经存在的声明 body。补丁在原 source-file/module 上下文中编译，因此可以调用已有 private 成员。写在变化 body 内的局部 helper、closure 和局部类型可以由 Swift 一并编译。
+默认工作流面向 Dev Shell 中已经存在、且字节码后端支持的声明 body。原 Swift access control 会保留，但源码可见并不自动创造 VM capability；每个原生操作还必须通过 eligible Entry 或精确 NativeImport 解析。受支持的局部 closure 与已经索引的同 image helper 可以使用同步 `@escaping` 参数、内部 closure 返回和嵌套 closure 捕获；closure 仍不能跨 Shell/Native 边界，也不能活过当前固定的 VM invocation。
 
 当前生成器不会自动收集任意新增的文件级函数、类型、extension 或 Swift 文件，也会拒绝 stored layout、函数签名、泛型约束、isolation、superclass、conformance、enum case、source membership、Build Settings、macro/plugin 输入、链接依赖、asset、storyboard 和生成资源变化。这些修改需要正常构建，必要时重新安装。
 
+补丁内非递归 struct/enum 在声明已经随 Shell 存在于文件/module scope 时受支持。函数内部声明的 nominal type 在当前 textual SIL 合同中没有冻结的声明身份，因此会用精确类型名拒绝；应先移到文件 scope 并正常构建一次。
+
 与生产 HLBC 的对比见[能力与限制](Capabilities-and-Limits.zh-CN.md)。
 
-## 调试符号与诊断
+## 调试与诊断
 
-每个 Native generation 都有 UUID 匹配的 dSYM、Swift module 和 source map。App 确认激活后，CLI 会输出可粘贴到 Xcode LLDB 控制台的 `target symbols add`、Swift module search path 和 source-map 命令。自动 LLDB attachment 与自动符号注册尚未实现。
+HLBC 是验证后字节码而不是 Mach-O image，因此没有原生 dSYM。编译器 debug metadata 会降低成经过 Verifier 检查的 function/block/instruction → 逻辑 Swift 文件、行、列映射；生产 artifact 会移除构建机绝对路径。反汇编使用该映射标注指令；发生 trap 时 VM 给出精确 program counter，Runtime 再补充固定的 generation、Shell entry、函数名与逻辑源码位置。
 
-编译诊断保留逻辑源码位置。终端与 Debug Overlay 会报告 source revision、generation、backend、激活结果、UI 刷新结果、旧代码是否仍然有效以及下一步动作。失败的保存不会被展示成成功热重载。
+终端与 Debug Overlay 会报告 source revision、generation、backend、激活结果、UI 刷新结果、旧代码是否仍然有效以及下一步动作。失败的保存不会被展示成成功热重载。HLBC 的交互式 breakpoint、单步和表达式求值仍是后续工作；显式 Native 实验保留自己独立的 dSYM 工具。

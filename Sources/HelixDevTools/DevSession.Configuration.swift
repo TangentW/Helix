@@ -29,7 +29,7 @@ public struct Configuration: Codable, Hashable, Sendable {
         interfaceArchivePath: String,
         compilerPath: String = "/usr/bin/swiftc",
         nativeOutputDirectory: String = ".helix/dev-native",
-        backendPreference: DevBackendSelection.Preference = .automatic,
+        backendPreference: DevBackendSelection.Preference = .hlbc,
         deviceNativeMatrixQualified: Bool = false,
         listenPort: UInt16 = 0,
         advertiseBonjour: Bool = true,

@@ -8,15 +8,24 @@ import Testing
 extension DevToolsTests {
 @Suite("Development backend routing")
 struct BackendRouting {
-    @Test("Automatic selection honors capability, budget, and explicit preference")
+    @Test("Automatic selection is Bytecode-only while Native remains explicit")
     func automaticSelection() throws {
         let fixture = try RoutingFixture()
         let selector = DevBackendSelection.Selector()
-        let native = selector.select(
+        let automatic = selector.select(
             fixture.input(candidateFunctions: [fixture.first])
         )
-        #expect(native.backend == .nativeDynamicReplacement)
-        #expect(native.reason == .simulatorNativePreferred)
+        #expect(automatic.backend == .hlbc)
+        #expect(automatic.reason == .hlbcUnifiedDefault)
+
+        let explicitNative = selector.select(
+            fixture.input(
+                candidateFunctions: [fixture.first],
+                preference: .native
+            )
+        )
+        #expect(explicitNative.backend == .nativeDynamicReplacement)
+        #expect(explicitNative.reason == .forcedNative)
 
         var budgetIdentity = fixture.identity
         budgetIdentity.nativeImageSoftLimitReached = true
@@ -24,7 +33,7 @@ struct BackendRouting {
             fixture.input(identity: budgetIdentity, candidateFunctions: [fixture.first])
         )
         #expect(budget.backend == .hlbc)
-        #expect(budget.reason == .nativeBudgetReached)
+        #expect(budget.reason == .hlbcUnifiedDefault)
 
         let forced = selector.select(
             fixture.input(
@@ -35,6 +44,11 @@ struct BackendRouting {
         )
         #expect(forced.backend == nil)
         #expect(forced.reason == .forcedBackendUnavailable)
+
+        var nativeOnly = fixture.input(candidateFunctions: [fixture.first])
+        nativeOnly.hlbcEligibleFunctions = []
+        #expect(selector.select(nativeOnly).backend == nil)
+        #expect(selector.select(nativeOnly).reason == .unsupported)
     }
 
     @Test("Reconnect affinity overrides preference and mixed transactions are rejected")
@@ -76,6 +90,7 @@ struct BackendRouting {
         let router = try DevCompilation.Router(
             identity: fixture.identity,
             reloadIndex: fixture.index,
+            preference: .native,
             nativeImageSoftLimit: 1,
             compilers: compilers
         )
@@ -118,8 +133,8 @@ struct BackendRouting {
         #expect(await router.activeFunctionRoutes.isEmpty)
 
         let afterBudget = await router.selection(for: [fixture.second])
-        #expect(afterBudget.backend == .hlbc)
-        #expect(afterBudget.reason == .nativeBudgetReached)
+        #expect(afterBudget.backend == nil)
+        #expect(afterBudget.reason == .forcedBackendUnavailable)
     }
 
     @Test("Uncertain Native activation disables future Native selection")
@@ -128,6 +143,7 @@ struct BackendRouting {
         let router = try DevCompilation.Router(
             identity: fixture.identity,
             reloadIndex: fixture.index,
+            preference: .native,
             compilers: fixture.fakeCompilers()
         )
         let offer = fixture.offer(
@@ -154,8 +170,8 @@ struct BackendRouting {
         let recorded = await router.didReceiveActivation(offer: offer, result: result)
         #expect(!recorded)
         let decision = await router.selection(for: [fixture.second])
-        #expect(decision.backend == .hlbc)
-        #expect(decision.reason == .nativeStateUncertain)
+        #expect(decision.backend == nil)
+        #expect(decision.reason == .forcedBackendUnavailable)
         #expect(await router.activeFunctionRoutes.isEmpty)
     }
 }

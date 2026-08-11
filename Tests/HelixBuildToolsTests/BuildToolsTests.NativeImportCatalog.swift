@@ -157,8 +157,8 @@ struct NativeImportCatalogPipeline {
 
         let sourceURL = sourceDirectory.appendingPathComponent("Patch.swift")
         let source = """
-        public func increment(_ value: Int) -> Int { value + 1 }
-        public func dormant(_ value: Int) -> Int { value - 1 }
+        func increment(_ value: Int) -> Int { value + 1 }
+        func dormant(_ value: Int) -> Int { value - 1 }
         public func transform(_ value: Int) -> Int {
             increment(value) + dormant(value)
         }
@@ -210,6 +210,7 @@ struct NativeImportCatalogPipeline {
           \(moduleName):
             include:
               - Sources/**/*.swift
+            entrypoints: public
             nativeImports:
               candidateIndex: explicit-catalog
               emit: allowlisted

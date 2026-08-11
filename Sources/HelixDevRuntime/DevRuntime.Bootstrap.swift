@@ -352,14 +352,11 @@ public final class Bootstrap: @unchecked Sendable {
         /// Creates development-session options.
         ///
         /// ```swift
-        /// let options = DevRuntime.Bootstrap.Options(
-        ///     supportedBackends: [.nativeDynamicReplacement, .hlbc],
-        ///     nativeChainingProbePassed: true
-        /// )
+        /// let options = DevRuntime.Bootstrap.Options()
         /// ```
         ///
-        /// Native Dynamic Replacement is rejected unless
-        /// `nativeChainingProbePassed` is explicitly true.
+        /// The default enables only the unified HLBC product backend. Internal
+        /// Native experiments must opt in and pass their chaining probe.
         public init(
             isEnabled: Bool = _isDebugAssertConfiguration(),
             supportedBackends: [LiveReload.Backend] = [.hlbc],

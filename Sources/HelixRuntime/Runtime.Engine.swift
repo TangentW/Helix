@@ -12,6 +12,8 @@ public protocol Observing: Sendable {
     func didRollback(from: Runtime.GenerationID, to: Runtime.GenerationID?)
     /// Called when patched execution traps before fallback or quarantine handling.
     func didTrap(generation: Runtime.GenerationID, entry: Core.EntryIndex, trap: VM.RuntimeTrap)
+    /// Called with the deepest known HLBC and logical Swift trap coordinate.
+    func didTrap(diagnostic: Runtime.TrapDiagnostic)
 }
 
 /// Observer implementation that intentionally discards every Runtime event.
@@ -93,6 +95,16 @@ public final class Engine: @unchecked Sendable {
     public func activate(_ generation: Runtime.Generation, expectedActiveID: Runtime.GenerationID?) throws -> Runtime.GenerationLease {
         try validateForActivation(generation)
         let lease = try registry.activate(generation, expectedActiveID: expectedActiveID)
+        observer.didActivate(generation: generation.id)
+        return lease
+    }
+
+    /// Restores a verified durable generation after Runtime routing returned to
+    /// original code, without weakening ordinary generation-ID monotonicity.
+    @discardableResult
+    public func restore(_ generation: Runtime.Generation) throws -> Runtime.GenerationLease {
+        try validateForActivation(generation)
+        let lease = try registry.restore(generation)
         observer.didActivate(generation: generation.id)
         return lease
     }
@@ -187,10 +199,7 @@ public final class Engine: @unchecked Sendable {
         context: Runtime.ExecutionContext,
         originalResolution: OriginalResolution
     ) -> InvocationOutcome {
-        let route = registry.route(
-            for: entry,
-            startingAt: context.lease.generation.id
-        )
+        let route = context.lease.route(for: entry)
         markNestedEntrySideEffectsIfNeeded(entry: entry, context: context)
         guard let route else {
             let budget = context.isExecutingPatch ? context.budget() : nil
@@ -225,6 +234,9 @@ public final class Engine: @unchecked Sendable {
         defer { context.leave(entry: entry) }
 
         let budget = context.budget()
+        let generationID = context.lease.generation.id
+        let image = route.image
+        let telemetryObserver = observer
         let interpreter = VM.Interpreter(
             nativeCatalog: nativeCatalog,
             nativeTypeCatalog: nativeTypeCatalog,
@@ -241,6 +253,28 @@ public final class Engine: @unchecked Sendable {
                         arguments: nestedArguments,
                         context: context,
                         originalResolution: .catalog
+                    )
+                )
+            },
+            trapObserver: { diagnostic in
+                let function = diagnostic.programCounter.flatMap { programCounter in
+                    image.module.functions.first { $0.id == programCounter.functionID }
+                }
+                let sourceLocation = diagnostic.programCounter.flatMap { programCounter in
+                    image.module.sourceLocation(
+                        functionID: programCounter.functionID,
+                        blockID: programCounter.blockID,
+                        instructionOffset: programCounter.instructionOffset
+                    )
+                } ?? function?.sourceLocation
+                telemetryObserver.didTrap(
+                    diagnostic: .init(
+                        generationID: generationID,
+                        entry: entry,
+                        trap: diagnostic.trap,
+                        programCounter: diagnostic.programCounter,
+                        functionName: function?.name,
+                        sourceLocation: sourceLocation
                     )
                 )
             }
@@ -284,10 +318,7 @@ public final class Engine: @unchecked Sendable {
         guard originals[entry] != nil else {
             return .executed(.trapped(.unknownEntry(entry)))
         }
-        guard let route = registry.route(
-            for: entry,
-            startingAt: context.lease.generation.id
-        ) else {
+        guard let route = context.lease.route(for: entry) else {
             markNestedEntrySideEffectsIfNeeded(entry: entry, context: context)
             return .originalRequired
         }
@@ -295,7 +326,7 @@ public final class Engine: @unchecked Sendable {
         let budget = context.budget()
         let encoder = Runtime.BridgeValueCodec.Encoder(
             limits: bridgeInputLimits.constrained(
-                by: context.lease.generation.resourceLimits
+                by: context.lease.resourceLimits
             ),
             checkDeadline: { try budget.checkDeadline() }
         )
@@ -333,10 +364,7 @@ public final class Engine: @unchecked Sendable {
         context: Runtime.ExecutionContext
     ) {
         guard context.isExecutingPatch,
-              registry.entryEffects(
-                  for: entry,
-                  startingAt: context.lease.generation.id
-              )?.hasExternalSideEffects == true
+              context.lease.entryEffects(for: entry)?.hasExternalSideEffects == true
         else {
             return
         }

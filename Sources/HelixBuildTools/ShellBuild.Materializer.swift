@@ -418,9 +418,7 @@ public struct Materializer: Sendable {
                 entryIndex: entryIndex,
                 sourceFileLogicalID: function.sourceFileLogicalID,
                 privateImportSourceFile: URL(
-                    fileURLWithPath: SourceTransform.transformedFilePath(
-                        for: function.sourceFileLogicalID
-                    )
+                    fileURLWithPath: function.sourceFileLogicalID
                 ).lastPathComponent,
                 originalReference: bridge.originalReference,
                 replacementDeclaration: bridge.replacementDeclaration,
@@ -458,6 +456,9 @@ public struct Materializer: Sendable {
                         switch generated.dispatch {
                         case .globalFunction: .globalFunction
                         case .staticMethod: .staticMethod
+                        case .instanceMethod: .instanceMethod
+                        case .instanceGetter: .instanceGetter
+                        case .instanceSetter: .instanceSetter
                         }
                     return BridgeGeneration.GeneratedNativeImport(
                         declarationMangledName: generated.declarationMangledName,
@@ -506,7 +507,13 @@ public struct Materializer: Sendable {
                 layoutFingerprint: type.layoutFingerprint,
                 requiresMainActor: type.requiresMainActor,
                 operationsExpression: binding.operationsExpression,
-                importedModules: binding.importedModules
+                importedModules: binding.importedModules,
+                generated: binding.generated.map {
+                    BridgeGeneration.GeneratedNativeType(
+                        sourceFileLogicalID: $0.sourceFileLogicalID,
+                        swiftType: $0.swiftType
+                    )
+                }
             )
         }
     }

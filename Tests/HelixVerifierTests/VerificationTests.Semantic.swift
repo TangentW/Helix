@@ -563,6 +563,51 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("A borrowed copyable Native reference can be copied into owned storage")
+    func acceptsCopyOfBorrowedNativeReference() throws {
+        let typeID = Core.TypeID.derive(
+            namespace: Core.ShellNamespaceID.derive(
+                bundleID: "dev.helix.verifier",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            canonicalType: "Fixture.Reference"
+        )
+        var fixture = try makeFixture { function in
+            function.parameterConventions = [.borrowed]
+            function.registerTypes = [.native(typeID), .native(typeID), .int64]
+            function.blocks[0].instructions = [
+                .copyValue(result: .init(rawValue: 1), source: .init(rawValue: 0)),
+                .destroyValue(.init(rawValue: 1)),
+                .constantInteger(result: .init(rawValue: 2), value: 7),
+                .returnValue(.init(rawValue: 2)),
+            ]
+        }
+        fixture.module.capabilities.formUnion([.borrowCallsV1, .nativeTypesV1])
+        fixture.shell.capabilities.formUnion([.borrowCallsV1, .nativeTypesV1])
+        fixture.policy.acceptedCapabilities.formUnion([.borrowCallsV1, .nativeTypesV1])
+        fixture.shell.types[typeID] = .init(
+            id: typeID,
+            canonicalName: "Fixture.Reference",
+            kind: .reference,
+            layoutFingerprint: .sha256("Fixture.Reference.layout.v1"),
+            isCopyable: true,
+            estimatedSize: 8
+        )
+        let entryIndex = Core.EntryIndex(rawValue: 0)
+        var entry = try #require(fixture.shell.entries[entryIndex])
+        entry.parameterTypes = [.native(typeID)]
+        fixture.shell.entries[entryIndex] = entry
+
+        let image = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        #expect(image.module.functions[0].parameterConventions == [.borrowed])
+    }
+
     @Test("Linear call arguments transfer ownership instead of minting an alias")
     func rejectsUseAfterLinearCallTransfer() throws {
         let typeID = Core.TypeID.derive(
@@ -1208,8 +1253,8 @@ struct SemanticVerifier {
         }
     }
 
-    @Test("Closure bodies cannot be called directly or escape as results")
-    func rejectsClosureEscapeAndDirectCall() throws {
+    @Test("Closure bodies require dynamic calls and internal closure returns require capability")
+    func validatesClosureEscapeAndDirectCall() throws {
         var directCall = try makeClosureFixture()
         directCall.module.functions[0].blocks[0].instructions = [
             .apply(
@@ -1240,30 +1285,28 @@ struct SemanticVerifier {
             .init(
                 id: .init(rawValue: 2),
                 name: "escapingClosure",
-                parameterRegisters: [],
+                parameterRegisters: [.init(rawValue: 0)],
                 resultType: .closure(signature),
-                registerTypes: [.closure(signature)],
+                registerTypes: [.int64, .closure(signature)],
                 entryBlock: .init(rawValue: 0),
                 blocks: [
                     .init(
                         id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
                         instructions: [
                             .makeClosure(
-                                result: .init(rawValue: 0),
+                                result: .init(rawValue: 1),
                                 function: .init(rawValue: 1),
-                                captures: []
+                                captures: [.init(rawValue: 0)]
                             ),
-                            .returnValue(.init(rawValue: 0)),
+                            .returnValue(.init(rawValue: 1)),
                         ]
                     ),
                 ]
             )
         )
         #expect(
-            throws: Verification.Error.invalidFunction(
-                function: .init(rawValue: 2),
-                reason: "HLBC 1.8 closures are nonescaping and cannot be returned"
-            )
+            throws: Verification.Error.capabilityDenied(.escapingClosureValuesV1)
         ) {
             try Verification.Engine().verify(
                 bytes: Bytecode.Encoder.encode(escaping.module),
@@ -1271,6 +1314,91 @@ struct SemanticVerifier {
                 policy: escaping.policy
             )
         }
+        escaping.module.capabilities.insert(.escapingClosureValuesV1)
+        escaping.shell.capabilities.insert(.escapingClosureValuesV1)
+        escaping.policy.acceptedCapabilities.insert(.escapingClosureValuesV1)
+        let image = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(escaping.module),
+            shell: escaping.shell,
+            policy: escaping.policy
+        )
+        #expect(image.module.functions[2].resultType == .closure(signature))
+    }
+
+    @Test("A closure may capture another closure only with escaping capability")
+    func validatesNestedClosureCaptureCapability() throws {
+        var fixture = try makeClosureFixture()
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            result: .int64
+        )
+        fixture.module.functions[0].registerTypes.append(contentsOf: [
+            .closure(signature),
+            .int64,
+        ])
+        fixture.module.functions[0].blocks[0].instructions = [
+            .makeClosure(
+                result: .init(rawValue: 1),
+                function: .init(rawValue: 1),
+                captures: [.init(rawValue: 0)]
+            ),
+            .makeClosure(
+                result: .init(rawValue: 3),
+                function: .init(rawValue: 2),
+                captures: [.init(rawValue: 1)]
+            ),
+            .closureApply(
+                result: .init(rawValue: 4),
+                closure: .init(rawValue: 3),
+                arguments: [.init(rawValue: 0)]
+            ),
+            .returnValue(.init(rawValue: 4)),
+        ]
+        fixture.module.functions.append(
+            .init(
+                id: .init(rawValue: 2),
+                name: "nestedClosureBody",
+                kind: .closureBody,
+                parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+                resultType: .int64,
+                registerTypes: [.int64, .closure(signature), .int64],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                        instructions: [
+                            .closureApply(
+                                result: .init(rawValue: 2),
+                                closure: .init(rawValue: 1),
+                                arguments: [.init(rawValue: 0)]
+                            ),
+                            .returnValue(.init(rawValue: 2)),
+                        ]
+                    ),
+                ]
+            )
+        )
+
+        #expect(
+            throws: Verification.Error.capabilityDenied(
+                .escapingClosureValuesV1
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+        fixture.module.capabilities.insert(.escapingClosureValuesV1)
+        fixture.shell.capabilities.insert(.escapingClosureValuesV1)
+        fixture.policy.acceptedCapabilities.insert(.escapingClosureValuesV1)
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
     }
 
     @Test("Compiler-generated specializations cannot become Shell entries")

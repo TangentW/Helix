@@ -94,6 +94,14 @@ public struct Snapshot: Hashable, Sendable {
     public var pendingGenerationID: DevProtocol.GenerationID?
     /// Current backend selection for every function with an active override.
     public var activeFunctionRoutes: [DevProtocol.ActiveFunctionRoute]
+    /// HLBC generations retained for rollback or in-flight invocations.
+    public var retainedHLBCGenerationIDs: [Runtime.GenerationID]
+    /// Highest HLBC generation identity activated in this process.
+    public var highestActivatedHLBCGenerationID: Runtime.GenerationID?
+    /// Unique estimated HLBC artifact bytes retained by live snapshots.
+    public var retainedHLBCBytes: Int
+    /// Historical HLBC snapshots reclaimed during this process lifetime.
+    public var compactedHLBCGenerationCount: UInt64
 }
 
 /// Serializes development payload transfer and activation inside the App.
@@ -474,7 +482,8 @@ public actor Controller {
 
     /// Returns the actor's current transfer, routing, and native-resource state.
     public func snapshot() -> DevActivation.Snapshot {
-        .init(
+        let registrySnapshot = registry.snapshot()
+        return .init(
             highestOfferedRevision: highestOfferedRevision,
             highestAppliedRevision: highestAppliedRevision,
             activeGenerationID: activeGenerationID,
@@ -485,7 +494,13 @@ public actor Controller {
             nativeStateUncertain: nativeStateUncertain,
             hasPendingTransfer: pending != nil,
             pendingGenerationID: pending?.offer.generationID,
-            activeFunctionRoutes: activeRoutes()
+            activeFunctionRoutes: activeRoutes(),
+            retainedHLBCGenerationIDs: registrySnapshot.loadedGenerationIDs,
+            highestActivatedHLBCGenerationID:
+                registrySnapshot.highestActivatedGenerationID,
+            retainedHLBCBytes: registrySnapshot.estimatedByteCount,
+            compactedHLBCGenerationCount:
+                registrySnapshot.compactedGenerationCount
         )
     }
 

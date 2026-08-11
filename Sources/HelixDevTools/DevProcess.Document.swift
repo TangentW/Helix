@@ -33,7 +33,15 @@ public struct BootstrapDocument: Codable, Hashable, Sendable {
             "HLX_DEV_SERVICE_NAME", "HLX_DEV_SPKI_SHA256",
             "HLX_DEV_SESSION_SECRET",
         ]
-        let expected = target == .simulator
+        let hasHost = environment["HLX_DEV_HOST"] != nil
+        let hasPort = environment["HLX_DEV_PORT"] != nil
+        guard hasHost == hasPort else {
+            throw DevProcess.Error.invalidDocument(
+                "bootstrap direct endpoint is incomplete"
+            )
+        }
+        let usesDirectEndpoint = target == .simulator || hasHost
+        let expected = usesDirectEndpoint
             ? common.union(["HLX_DEV_HOST", "HLX_DEV_PORT"])
             : common
         guard Set(environment.keys) == expected,
@@ -53,13 +61,15 @@ public struct BootstrapDocument: Codable, Hashable, Sendable {
                 "bootstrap environment is incomplete or malformed"
             )
         }
-        if target == .simulator {
-            guard environment["HLX_DEV_HOST"] == "127.0.0.1",
+        if usesDirectEndpoint {
+            guard let host = environment["HLX_DEV_HOST"],
+                  !host.isEmpty, host.utf8.count <= 255,
                   let portText = environment["HLX_DEV_PORT"],
-                  let port = UInt16(portText), port > 0
+                  let port = UInt16(portText), port > 0,
+                  target != .simulator || host == "127.0.0.1"
             else {
                 throw DevProcess.Error.invalidDocument(
-                    "simulator bootstrap endpoint is invalid"
+                    "bootstrap direct endpoint is invalid"
                 )
             }
         }

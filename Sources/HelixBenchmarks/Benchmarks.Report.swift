@@ -46,6 +46,7 @@ public enum ScenarioName: String, Codable, CaseIterable, Sendable {
     case bridgeOriginalFastPath = "bridge_original_fast_path"
     case runtimeOriginalCatalog = "runtime_original_catalog"
     case verifiedImageInvocation = "hlvm_verified_image_invocation"
+    case uiNativeImportInvocation = "hlvm_ui_native_import_invocation"
     case closureImageInvocation = "hlvm_closure_invocation"
     case bridgeHLBCPatch = "bridge_hlbc_patch"
     case decodeAndVerify = "hlbc_decode_and_verify"
@@ -162,7 +163,8 @@ public struct Environment: Codable, Equatable, Sendable {
 }
 
 public struct Report: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 1
+    /// Schema 2 adds the MainActor-bound UIKit NativeImport scenario.
+    public static let currentSchemaVersion: UInt16 = 2
 
     public var schemaVersion: UInt16
     public var generatedAt: String
@@ -189,6 +191,7 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case invalidConfiguration(String)
     case unexpectedResult(scenario: Benchmarks.ScenarioName, detail: String)
     case compilerVersionUnavailable(String)
+    case incomparableReports(String)
 
     public var description: String {
         switch self {
@@ -198,6 +201,8 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
             "benchmark \(scenario.rawValue) produced an unexpected result: \(detail)"
         case let .compilerVersionUnavailable(message):
             "could not determine the Swift compiler version: \(message)"
+        case let .incomparableReports(message):
+            "benchmark reports are not comparable: \(message)"
         }
     }
 }

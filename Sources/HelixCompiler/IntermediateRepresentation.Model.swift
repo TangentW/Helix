@@ -21,6 +21,22 @@ public struct Block: Hashable, Sendable {
     }
 }
 
+public struct SourceMapEntry: Hashable, Sendable {
+    public var blockID: Bytecode.BlockID
+    public var instructionOffset: UInt32
+    public var location: Core.SourceLocation
+
+    public init(
+        blockID: Bytecode.BlockID,
+        instructionOffset: UInt32,
+        location: Core.SourceLocation
+    ) {
+        self.blockID = blockID
+        self.instructionOffset = instructionOffset
+        self.location = location
+    }
+}
+
 public struct Function: Hashable, Sendable {
     public var name: String
     public var kind: Bytecode.FunctionKind
@@ -33,6 +49,7 @@ public struct Function: Hashable, Sendable {
     public var entryBlock: Bytecode.BlockID
     public var blocks: [IntermediateRepresentation.Block]
     public var sourceLocation: Core.SourceLocation?
+    public var sourceMap: [IntermediateRepresentation.SourceMapEntry]
 
     public init(
         name: String,
@@ -45,7 +62,8 @@ public struct Function: Hashable, Sendable {
         blocks: [IntermediateRepresentation.Block],
         stackSlotTypes: [IntermediateRepresentation.ValueType] = [],
         effects: Core.Effects = .init(),
-        sourceLocation: Core.SourceLocation? = nil
+        sourceLocation: Core.SourceLocation? = nil,
+        sourceMap: [IntermediateRepresentation.SourceMapEntry] = []
     ) {
         self.name = name
         self.kind = kind
@@ -63,6 +81,7 @@ public struct Function: Hashable, Sendable {
         self.entryBlock = entryBlock
         self.blocks = blocks
         self.sourceLocation = sourceLocation
+        self.sourceMap = sourceMap
     }
 }
 
@@ -84,6 +103,20 @@ public enum ToBytecode {
             effects: function.effects,
             sourceLocation: function.sourceLocation
         )
+    }
+
+    public static func sourceMap(
+        _ function: IntermediateRepresentation.Function,
+        id: Bytecode.FunctionID
+    ) -> [Bytecode.SourceMapEntry] {
+        function.sourceMap.map {
+            .init(
+                functionID: id,
+                blockID: $0.blockID,
+                instructionOffset: $0.instructionOffset,
+                location: $0.location
+            )
+        }
     }
 }
 }
