@@ -26,7 +26,7 @@ public struct TypeEnvironment: Sendable {
     }
 
     private var rawDefinitions: [Bytecode.LocalTypeKey: RawDefinition]
-    private var trivialFactories: [String: Bytecode.LocalTypeKey]
+    private var structFactories: [String: Bytecode.LocalTypeKey]
     private var requiresTypedErrors: Bool
     private var nativeTypes: [String: Core.TypeID]
 
@@ -34,14 +34,14 @@ public struct TypeEnvironment: Sendable {
 
     public init() {
         rawDefinitions = [:]
-        trivialFactories = [:]
+        structFactories = [:]
         requiresTypedErrors = false
         nativeTypes = [:]
     }
 
     init(text: String, functions: [CanonicalSIL.Function]) throws {
         rawDefinitions = try Self.extractDefinitions(text)
-        trivialFactories = [:]
+        structFactories = [:]
         nativeTypes = [:]
         // Keep payload-free legacy Error patches on the 1.0 String error path.
         // Typed storage is enabled only when the SIL or a local declaration needs it.
@@ -49,8 +49,8 @@ public struct TypeEnvironment: Sendable {
             || text.contains("Result<")
             || rawDefinitions.values.contains(where: Self.hasStoredErrorPayload)
         for function in functions {
-            if let key = try detectTrivialStructFactory(function) {
-                trivialFactories[function.mangledName] = key
+            if let key = try detectStructFactory(function) {
+                structFactories[function.mangledName] = key
             }
         }
     }
@@ -116,6 +116,9 @@ public struct TypeEnvironment: Sendable {
                 "@guaranteed ",
                 "@unowned ",
                 "@closureCapture ",
+                "@in ",
+                "@in_guaranteed ",
+                "@out ",
             ]
             where type.hasPrefix(ownership) {
                 type.removeFirst(ownership.count)
@@ -189,6 +192,7 @@ public struct TypeEnvironment: Sendable {
         case "Float", "Swift.Float", "Builtin.FPIEEE32": return .float(bitWidth: 32)
         case "Double", "Swift.Double", "Builtin.FPIEEE64": return .float(bitWidth: 64)
         case "String", "Swift.String": return .string
+        case "Any", "Swift.Any": return .any
         case "any Error", "Swift.Error": return preservesTypedErrors ? .error : .string
         case "Never", "Swift.Never": return .never
         default:
@@ -252,8 +256,8 @@ public struct TypeEnvironment: Sendable {
         return .init(parameters: parameters, result: result)
     }
 
-    func trivialStructFactory(_ mangledName: String) -> Bytecode.LocalTypeKey? {
-        trivialFactories[mangledName]
+    func structFactory(_ mangledName: String) -> Bytecode.LocalTypeKey? {
+        structFactories[mangledName]
     }
 
     func definition(for key: Bytecode.LocalTypeKey) throws -> Bytecode.LocalTypeDefinition {
@@ -331,7 +335,8 @@ public struct TypeEnvironment: Sendable {
                 elements.forEach(collect)
             case let .closure(signature):
                 (signature.parameters + [signature.result]).forEach(collect)
-            case .void, .never, .bool, .integer, .float, .string, .native, .error:
+            case .void, .never, .bool, .integer, .float, .string, .any, .native,
+                 .error:
                 break
             }
         }
@@ -415,7 +420,7 @@ public struct TypeEnvironment: Sendable {
                 throw CanonicalSIL.LoweringError.unsupportedType(
                     "Error existential stored in a local nominal type"
                 )
-            case .void, .never, .bool, .integer, .float, .string, .native:
+            case .void, .never, .bool, .integer, .float, .string, .any, .native:
                 0
             }
         }
@@ -468,7 +473,7 @@ public struct TypeEnvironment: Sendable {
         return index
     }
 
-    private func detectTrivialStructFactory(
+    private func detectStructFactory(
         _ function: CanonicalSIL.Function
     ) throws -> Bytecode.LocalTypeKey? {
         guard let arrow = function.loweredType.range(of: " -> ", options: .backwards) else {
@@ -499,20 +504,52 @@ public struct TypeEnvironment: Sendable {
         }.filter {
             !$0.isEmpty && !$0.hasPrefix("bb") && !$0.hasPrefix("debug_value")
         }
-        guard semanticLines.count == 2,
-              let construction = captures(
-                semanticLines[0],
-                pattern: #"^(%[0-9]+) = struct \$([^ ]+) \((.*)\)$"#
-              ),
-              construction[1] == key.rawValue,
-              let returned = captures(
-                semanticLines[1],
-                pattern: #"^return (%[0-9]+)$"#
-              ),
-              returned[0] == construction[0]
+        if semanticLines.count == 2,
+           let construction = captures(
+            semanticLines[0],
+            pattern: #"^(%[0-9]+) = struct \$([^ ]+) \((.*)\)$"#
+           ), construction[1] == key.rawValue,
+           let returned = captures(
+            semanticLines[1],
+            pattern: #"^return (%[0-9]+)$"#
+           ), returned[0] == construction[0],
+           splitTopLevel(construction[2]) == fields.indices.map({ "%\($0)" }) {
+            return key
+        }
+
+        guard rawResult.hasPrefix("@out "),
+              semanticLines.count == fields.count * 2 + 2
         else { return nil }
-        let operands = splitTopLevel(construction[2])
-        guard operands == fields.indices.map({ "%\($0)" }) else { return nil }
+        var lineIndex = 0
+        for (fieldIndex, field) in fields.enumerated() {
+            guard let projection = captures(
+                semanticLines[lineIndex],
+                pattern: #"^(%[0-9]+) = struct_element_addr %0, #(.+)\.([^.]+)$"#
+            ), projection[1] == key.rawValue,
+               projection[2] == field.name
+            else { return nil }
+            let source = "%\(fieldIndex + 1)"
+            let destination = projection[0]
+            let initialization = semanticLines[lineIndex + 1]
+            let copiesAddress = captures(
+                initialization,
+                pattern: #"^copy_addr(?: \[take\])? (%[0-9]+) to \[init\] (%[0-9]+)$"#
+            ).map { $0 == [source, destination] } ?? false
+            let storesValue = captures(
+                initialization,
+                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init)\] )?(%[0-9]+)$"#
+            ).map { $0 == [source, destination] } ?? false
+            guard copiesAddress || storesValue else { return nil }
+            lineIndex += 2
+        }
+        guard let emptyTuple = captures(
+            semanticLines[lineIndex],
+            pattern: #"^(%[0-9]+) = tuple \(\)$"#
+        ), let returned = captures(
+            semanticLines[lineIndex + 1],
+            pattern: #"^return (%[0-9]+)$"#
+        ), returned[0] == emptyTuple[0]
+        else { return nil }
         return key
     }
 

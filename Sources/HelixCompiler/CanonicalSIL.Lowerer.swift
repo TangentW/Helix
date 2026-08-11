@@ -143,6 +143,11 @@ public struct Lowerer: Sendable {
         var component: Int
     }
 
+    private struct TupleComponentAddress {
+        var base: String
+        var index: Int
+    }
+
     private struct NativePropertyAddress {
         var receiver: Bytecode.Register
         var valueType: Bytecode.ValueType
@@ -158,6 +163,23 @@ public struct Lowerer: Sendable {
     private struct ResolvedFunctionReference {
         var binding: CanonicalSIL.DirectCallBinding
         var physicalParameterConventions: [Bytecode.ParameterConvention]
+        var hasIndirectResult: Bool
+    }
+
+    private struct ExistentialProjection {
+        var destination: String
+        var concreteType: Bytecode.ValueType
+        var components: [Int: Bytecode.Register] = [:]
+    }
+
+    private struct ExistentialComponentAddress {
+        var projection: String
+        var index: Int
+    }
+
+    private struct OptionalAddressInitialization {
+        var wrappedType: Bytecode.ValueType
+        var payload: Bytecode.Register?
     }
 
     public init(typeEnvironment: CanonicalSIL.TypeEnvironment = .empty) {
@@ -190,6 +212,23 @@ public struct Lowerer: Sendable {
             separator: "\n",
             omittingEmptySubsequences: false
         ).map(String.init)
+        // Reject a forbidden existential payload before incidental SIL such
+        // as a closure reabstraction thunk obscures the actionable cause.
+        for rawLine in rawLines {
+            let instruction = CanonicalSIL.DebugMetadata.strippingComment(
+                from: rawLine
+            ).trimmingCharacters(in: .whitespaces)
+            guard let projection = match(
+                instruction,
+                pattern: #"^%[0-9]+ = init_existential_addr %[0-9]+, \$(.+)$"#
+            ) else { continue }
+            let concreteType = try parseType(projection[0])
+            guard concreteType.isAnyPayloadOrExistentialV1 else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "Any payload \(concreteType)"
+                )
+            }
+        }
         let maximumOriginalBlock = rawLines.compactMap(parseBlockNumber).max() ?? 0
         var nextSyntheticBlock: UInt32? = maximumOriginalBlock == UInt32.max
             ? nil
@@ -246,6 +285,7 @@ public struct Lowerer: Sendable {
         var arrayLiteralStorageTokens: [String: String] = [:]
         var arrayLiteralAddresses: [String: ArrayLiteralAddress] = [:]
         var arrayLiteralComponentAddresses: [String: ArrayLiteralComponentAddress] = [:]
+        var tupleComponentAddresses: [String: TupleComponentAddress] = [:]
         var tupleValues: [String: (Bytecode.Register, Bytecode.Register)] = [:]
         var unpackedTuples: [String: [Bytecode.Register]] = [:]
         var onStackClosureValues = Set<String>()
@@ -258,6 +298,12 @@ public struct Lowerer: Sendable {
         var reconstructedNoneValues: [Bytecode.BlockID: [String: Bytecode.Register]] = [:]
         var errorEnumMessages: [String: String] = [:]
         var existentialBoxes = Set<String>()
+        var existentialProjections: [String: ExistentialProjection] = [:]
+        var existentialComponentAddresses: [String: ExistentialComponentAddress] = [:]
+        var optionalAddressInitializations: [String: OptionalAddressInitialization] = [:]
+        var optionalPayloadAddressRoots: [String: String] = [:]
+        var indirectResultAddress: String?
+        var indirectResultSlot: Bytecode.StackSlot?
         var typedErrorBoxTypes: [String: Bytecode.LocalTypeKey] = [:]
         var projectedBoxByAddress: [String: String] = [:]
         var errorMessageByBox: [String: String] = [:]
@@ -265,6 +311,13 @@ public struct Lowerer: Sendable {
         var implicitStackValues: [
             Bytecode.BlockID: [(address: String, register: Bytecode.Register)]
         ] = [:]
+        var compilerAddressWrites: [
+            Bytecode.BlockID: [String: Bytecode.Register]
+        ] = [:]
+        var compilerAddressMergeRegisters: [
+            Bytecode.BlockID: [String: Bytecode.Register]
+        ] = [:]
+        var indirectTryNormalBlocks = Set<Bytecode.BlockID>()
         var blocks: [IntermediateRepresentation.Block] = []
         var current: IntermediateRepresentation.Block?
         var currentSourceLocation: Core.SourceLocation?
@@ -369,6 +422,60 @@ public struct Lowerer: Sendable {
             stackAddressValues[addressBase(token)] = value
         }
 
+        func storeVMValue(
+            _ value: Bytecode.Register,
+            at token: String
+        ) throws {
+            guard let addressType = stackType(at: token),
+                  registerTypes[Int(value.rawValue)] == addressType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "store value does not match its stack address"
+                )
+            }
+            if let addressRegister = runtimeAddress(at: token) {
+                let root = addressBase(token)
+                if isScopedRuntimeAddress(token) {
+                    appendInstruction(
+                        .storeAddress(
+                            address: addressRegister,
+                            source: value,
+                            mode: .assign
+                        )
+                    )
+                } else if let slot = runtimeStackSlots[root], token == root {
+                    let mode: Bytecode.StackStoreMode = stackAddressValues[root] == nil
+                        ? .initialize
+                        : .assign
+                    appendInstruction(
+                        .storeStack(slot: slot, source: value, mode: mode)
+                    )
+                } else {
+                    let access = try allocate(type: .address(addressType))
+                    appendInstruction(
+                        .beginAccess(
+                            result: access,
+                            address: addressRegister,
+                            kind: .modify
+                        )
+                    )
+                    appendInstruction(
+                        .storeAddress(
+                            address: access,
+                            source: value,
+                            mode: .assign
+                        )
+                    )
+                    appendInstruction(.endAccess(access))
+                }
+                stackAddressValues[root] = value
+                return
+            }
+            assignStackValue(value, at: token)
+            values[token] = value
+            values[addressBase(token)] = value
+        }
+
         func resolve(_ token: String, line: Int) throws -> Bytecode.Register {
             if let blockID = current?.id,
                optionalSourceByNoneBlock[blockID] == token {
@@ -396,12 +503,11 @@ public struct Lowerer: Sendable {
         }
 
         func prepareDirectCallArguments(
-            _ text: String,
+            _ tokens: [String],
             conventions: [Bytecode.ParameterConvention],
             line: Int,
             allowsSynthesizedAccess: Bool
         ) throws -> (arguments: [Bytecode.Register], accesses: [Bytecode.Register]) {
-            let tokens = try parseApplyValueTokens(text, line: line)
             guard tokens.count == conventions.count else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "direct call argument and convention counts disagree"
@@ -475,6 +581,34 @@ public struct Lowerer: Sendable {
                         ? try copyOwnedCallArgument(argument)
                         : argument
                 }
+            }
+        }
+
+        func appendCompilerAddressMergeArguments(
+            target: Bytecode.BlockID,
+            arguments: inout [Bytecode.Register]
+        ) throws {
+            guard let sourceBlock = current?.id,
+                  let writes = compilerAddressWrites[sourceBlock]
+            else { return }
+            for (address, value) in writes.sorted(by: { $0.key < $1.key }) {
+                let type = registerTypes[Int(value.rawValue)]
+                let merge: Bytecode.Register
+                if let existing = compilerAddressMergeRegisters[target]?[address] {
+                    guard registerTypes[Int(existing.rawValue)] == type else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "compiler address merge has inconsistent value types"
+                        )
+                    }
+                    merge = existing
+                } else {
+                    merge = try allocate(type: type)
+                    compilerAddressMergeRegisters[target, default: [:]][address] = merge
+                    implicitStackValues[target, default: []].append(
+                        (address, merge)
+                    )
+                }
+                arguments.append(value)
             }
         }
 
@@ -575,6 +709,170 @@ public struct Lowerer: Sendable {
                 result.append(tuple)
             }
             return result
+        }
+
+        func compilerAddressType(_ token: String) -> Bytecode.ValueType? {
+            if token == indirectResultAddress { return signature.result }
+            if let component = tupleComponentAddresses[token],
+               case let .tuple(types) = stackType(at: component.base),
+               types.indices.contains(component.index) {
+                return types[component.index]
+            }
+            if let root = optionalPayloadAddressRoots[token],
+               let initialization = optionalAddressInitializations[root] {
+                return initialization.wrappedType
+            }
+            if let projection = existentialProjections[token] {
+                return projection.concreteType
+            }
+            if let component = existentialComponentAddresses[token],
+               let projection = existentialProjections[component.projection],
+               case let .tuple(types) = projection.concreteType,
+               types.indices.contains(component.index) {
+                return types[component.index]
+            }
+            if let address = arrayLiteralAddresses[token],
+               let pending = pendingArrayLiterals[address.allocation] {
+                return pending.elementType
+            }
+            if let address = arrayLiteralComponentAddresses[token],
+               let pending = pendingArrayLiterals[address.allocation],
+               case let .tuple(types) = pending.elementType,
+               types.indices.contains(address.component) {
+                return types[address.component]
+            }
+            return stackType(at: token)
+        }
+
+        func storeConstructedValue(
+            _ value: Bytecode.Register,
+            at token: String
+        ) throws {
+            let type = registerTypes[Int(value.rawValue)]
+            guard compilerAddressType(token) == type else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "constructed value does not match its SIL address"
+                )
+            }
+            if token == indirectResultAddress {
+                guard let slot = indirectResultSlot else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "indirect result has no VM result slot"
+                    )
+                }
+                appendInstruction(
+                    .storeStack(slot: slot, source: value, mode: .initialize)
+                )
+                return
+            }
+            if let root = optionalPayloadAddressRoots[token],
+               var initialization = optionalAddressInitializations[root] {
+                guard initialization.wrappedType == type,
+                      initialization.payload == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional payload address is invalid or initialized twice"
+                    )
+                }
+                initialization.payload = value
+                optionalAddressInitializations[root] = initialization
+                return
+            }
+            try storeVMValue(value, at: token)
+        }
+
+        func materializeTupleComponents(
+            at base: String,
+            tuple: Bytecode.Register
+        ) throws {
+            guard case let .tuple(types) = registerTypes[Int(tuple.rawValue)] else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "tuple address does not contain a tuple VM value"
+                )
+            }
+            let elements: [Bytecode.Register]
+            if let existing = unpackedTuples[base] {
+                elements = existing
+            } else {
+                elements = try types.map { try allocate(type: $0) }
+                unpackedTuples[base] = elements
+                appendInstruction(.unpackTuple(results: elements, tuple: tuple))
+            }
+            for (token, component) in tupleComponentAddresses
+            where addressBase(component.base) == addressBase(base) {
+                guard types.indices.contains(component.index) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "tuple component address is out of bounds"
+                    )
+                }
+                stackAddressTypes[token] = types[component.index]
+                stackAddressValues[token] = elements[component.index]
+            }
+        }
+
+        func storeExistential(
+            _ value: Bytecode.Register,
+            at token: String
+        ) throws {
+            guard registerTypes[Int(value.rawValue)] == .any else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "existential projection did not produce Any"
+                )
+            }
+            if let address = arrayLiteralAddresses[token],
+               var pending = pendingArrayLiterals[address.allocation] {
+                guard pending.elementType == .any,
+                      address.index >= 0,
+                      address.index < pending.count,
+                      pending.elements[address.index] == nil,
+                      pending.elementComponents[address.index] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Any array literal store is invalid or duplicated"
+                    )
+                }
+                pending.elements[address.index] = value
+                pendingArrayLiterals[address.allocation] = pending
+                return
+            }
+            if let address = arrayLiteralComponentAddresses[token],
+               var pending = pendingArrayLiterals[address.allocation],
+               case let .tuple(types) = pending.elementType {
+                guard address.index >= 0,
+                      address.index < pending.count,
+                      types.indices.contains(address.component),
+                      types[address.component] == .any,
+                      pending.elements[address.index] == nil,
+                      pending.elementComponents[address.index]?[address.component] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Any tuple component store is invalid or duplicated"
+                    )
+                }
+                pending.elementComponents[address.index, default: [:]][address.component] = value
+                pendingArrayLiterals[address.allocation] = pending
+                return
+            }
+            try storeConstructedValue(value, at: token)
+        }
+
+        func finishExistentialProjection(
+            _ token: String,
+            payload: Bytecode.Register
+        ) throws {
+            guard let projection = existentialProjections.removeValue(forKey: token),
+                  registerTypes[Int(payload.rawValue)] == projection.concreteType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Any payload does not match its concrete SIL type"
+                )
+            }
+            existentialComponentAddresses = existentialComponentAddresses.filter {
+                $0.value.projection != token
+            }
+            let erased = try allocate(type: .any)
+            appendInstruction(.eraseToAny(result: erased, value: payload))
+            try storeExistential(erased, at: projection.destination)
         }
 
         func lowerSwiftCoreIntrinsic(
@@ -1371,9 +1669,36 @@ public struct Lowerer: Sendable {
                   !line.hasPrefix("fix_lifetime")
             else { continue }
 
-            if let block = try parseBlockHeader(line, allocate: allocate) {
+            if let block = try parseBlockHeader(
+                line,
+                entryParameterTypes: entryBlock == nil
+                    ? signature.parameters
+                    : nil,
+                indirectResultType: entryBlock == nil && signature.hasIndirectResult
+                    ? signature.result
+                    : nil,
+                suppressVoidParameter: parseBlockNumber(line).map {
+                    indirectTryNormalBlocks.contains(.init(rawValue: $0))
+                } ?? false,
+                allocate: allocate
+            ) {
                 finishCurrent()
                 var loweredBlock = block.block
+                let explicitParameters = block.parameters
+                if indirectTryNormalBlocks.remove(block.block.id) != nil {
+                    guard explicitParameters.isEmpty,
+                          let parameter = block.suppressedVoidParameter
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect try_apply normal block does not carry its Void SIL token"
+                        )
+                    }
+                    voidValues.insert(parameter)
+                } else if block.suppressedVoidParameter != nil {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "block unexpectedly suppresses a Void SIL parameter"
+                    )
+                }
                 if let implicit = implicitStackValues[block.block.id] {
                     loweredBlock.parameters.append(contentsOf: implicit.map(\.register))
                     for item in implicit {
@@ -1382,9 +1707,54 @@ public struct Lowerer: Sendable {
                     }
                 }
                 current = loweredBlock
-                for (silValue, register) in block.parameters { values[silValue] = register }
+                for (silValue, register) in explicitParameters {
+                    values[silValue] = register
+                }
+                if let implicit = implicitStackValues[block.block.id] {
+                    for item in implicit {
+                        if optionalPayloadAddressRoots[item.address] != nil {
+                            try storeConstructedValue(
+                                item.register,
+                                at: item.address
+                            )
+                        }
+                        guard case .tuple = registerTypes[Int(item.register.rawValue)] else {
+                            continue
+                        }
+                        try materializeTupleComponents(
+                            at: item.address,
+                            tuple: item.register
+                        )
+                    }
+                }
+                for (token, type) in block.indirectValueParameters {
+                    guard let register = values[token] else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect value parameter has no VM register"
+                        )
+                    }
+                    stackAddressTypes[token] = type
+                    stackAddressValues[token] = register
+                }
                 if entryBlock == nil {
                     entryBlock = loweredBlock.id
+                    if signature.hasIndirectResult {
+                        guard signature.result.isAnyPayloadOrExistentialV1,
+                              let address = block.indirectResultAddress
+                        else {
+                            throw CanonicalSIL.LoweringError.unsupportedType(
+                                "indirect result \(signature.result)"
+                            )
+                        }
+                        indirectResultAddress = address
+                        indirectResultSlot = try allocateStackSlot(
+                            type: signature.result
+                        )
+                    } else if block.indirectResultAddress != nil {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "entry block contains an unexpected indirect result"
+                        )
+                    }
                     parameterRegisters = loweredBlock.parameters
                     guard parameterRegisters.count == signature.parameters.count else {
                         throw CanonicalSIL.LoweringError.malformedSIL("entry parameter count does not match function type")
@@ -1394,7 +1764,7 @@ public struct Lowerer: Sendable {
                         throw CanonicalSIL.LoweringError.malformedSIL("entry parameter type does not match function type")
                     }
                     for ((parameter, convention), type) in zip(
-                        zip(block.parameters, signature.parameterConventions),
+                        zip(explicitParameters, signature.parameterConventions),
                         signature.parameters
                     ) where convention == .inout {
                         guard case let .address(pointee) = type else {
@@ -1520,6 +1890,36 @@ public struct Lowerer: Sendable {
                     runtimeAddressPointees[stack[0]] = type
                     values[stack[0]] = address
                     appendInstruction(.stackAddress(result: address, slot: slot))
+                }
+                continue
+            }
+
+            if let copy = match(
+                line,
+                pattern: #"^copy_addr(?: \[(take)\])? (%[0-9]+) to (?:\[(init|assign)\] )?(%[0-9]+)$"#
+            ) {
+                guard let source = stackValue(at: copy[1]),
+                      stackType(at: copy[1]) == compilerAddressType(copy[3])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "copy_addr source and destination do not have one VM value type"
+                    )
+                }
+                let value: Bytecode.Register
+                let type = registerTypes[Int(source.rawValue)]
+                if type.isTrivial || copy[0] == "take" {
+                    value = source
+                } else {
+                    value = try allocate(type: type)
+                    appendInstruction(.copyValue(result: value, source: source))
+                }
+                if type == .any {
+                    try storeExistential(value, at: copy[3])
+                } else {
+                    try storeConstructedValue(value, at: copy[3])
+                }
+                if copy[0] == "take" {
+                    stackAddressValues.removeValue(forKey: addressBase(copy[1]))
                 }
                 continue
             }
@@ -2163,6 +2563,31 @@ public struct Lowerer: Sendable {
                     addressAliases[projection[0]] = addressBase(projection[1])
                     continue
                 }
+                if let structure = stackValue(at: projection[1]),
+                   case let .local(key) = stackType(at: projection[1]),
+                   typeEnvironment.localKey(for: projection[2]) == key {
+                    let index = try typeEnvironment.structFieldIndex(
+                        type: key,
+                        name: projection[3]
+                    )
+                    let fields = try typeEnvironment.structFields(for: key)
+                    guard let fieldIndex = UInt32(exactly: index) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "local struct field index exceeds UInt32"
+                        )
+                    }
+                    let result = try allocate(type: fields[index].type)
+                    appendInstruction(
+                        .structExtract(
+                            result: result,
+                            structure: structure,
+                            fieldIndex: fieldIndex
+                        )
+                    )
+                    stackAddressTypes[projection[0]] = fields[index].type
+                    stackAddressValues[projection[0]] = result
+                    continue
+                }
                 guard let base = runtimeAddress(at: projection[1]),
                       let basePointee = stackType(at: projection[1])
                 else {
@@ -2393,7 +2818,7 @@ public struct Lowerer: Sendable {
                     swiftCoreReferences[reference[0]] = intrinsic
                     continue
                 }
-                if let key = typeEnvironment.trivialStructFactory(reference[1]) {
+                if let key = typeEnvironment.structFactory(reference[1]) {
                     localFactoryReferences[reference[0]] = key
                     continue
                 }
@@ -2432,7 +2857,8 @@ public struct Lowerer: Sendable {
                 }
                 functionReferences[reference[0]] = .init(
                     binding: binding,
-                    physicalParameterConventions: callee.parameterConventions
+                    physicalParameterConventions: callee.parameterConventions,
+                    hasIndirectResult: callee.hasIndirectResult
                 )
                 continue
             }
@@ -2498,6 +2924,7 @@ public struct Lowerer: Sendable {
                       physicalType.parameterConventions
                         == reference.physicalParameterConventions,
                       physicalType.result == binding.resultType,
+                      physicalType.hasIndirectResult == reference.hasIndirectResult,
                       physicalType.effects.mayThrow == binding.effects.mayThrow,
                       physicalType.effects.isAsync == binding.effects.isAsync
                 else {
@@ -2686,6 +3113,7 @@ public struct Lowerer: Sendable {
                       appliedType.parameterConventions
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
+                      appliedType.hasIndirectResult == reference.hasIndirectResult,
                       appliedType.effects.mayThrow,
                       !appliedType.effects.isAsync,
                       call[1].isEmpty
@@ -2695,8 +3123,38 @@ public struct Lowerer: Sendable {
                         mangledName: binding.mangledName
                     )
                 }
-                let prepared = try prepareDirectCallArguments(
+                let normalTarget = try parseBlockID(call[4])
+                let errorTarget = try parseBlockID(call[5])
+                var argumentTokens = try parseApplyValueTokens(
                     call[2],
+                    line: sourceLine
+                )
+                if reference.hasIndirectResult {
+                    guard binding.resultType.isAnyPayloadOrExistentialV1,
+                          argumentTokens.count
+                            == reference.physicalParameterConventions.count + 1
+                    else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "indirect throwing call result \(binding.resultType)"
+                        )
+                    }
+                    let destination = argumentTokens.removeFirst()
+                    guard compilerAddressType(destination) == binding.resultType,
+                          runtimeAddress(at: destination) == nil,
+                          implicitStackValues[normalTarget] == nil,
+                          indirectTryNormalBlocks.insert(normalTarget).inserted
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect try_apply result or normal block is invalid"
+                        )
+                    }
+                    let result = try allocate(type: binding.resultType)
+                    implicitStackValues[normalTarget] = [
+                        (destination, result),
+                    ]
+                }
+                let prepared = try prepareDirectCallArguments(
+                    argumentTokens,
                     conventions: reference.physicalParameterConventions,
                     line: sourceLine,
                     allowsSynthesizedAccess: false
@@ -2712,8 +3170,6 @@ public struct Lowerer: Sendable {
                         mangledName: binding.mangledName
                     )
                 }
-                let normalTarget = try parseBlockID(call[4])
-                let errorTarget = try parseBlockID(call[5])
                 let instruction: Bytecode.Instruction = switch binding.target {
                 case let .function(id):
                     .tryApply(
@@ -2765,10 +3221,29 @@ public struct Lowerer: Sendable {
                             mangledName: "<closure>"
                         )
                     }
-                    let argumentTokens = try parseApplyValueTokens(
+                    var argumentTokens = try parseApplyValueTokens(
                         call[3],
                         line: sourceLine
                     )
+                    let indirectResultDestination: String?
+                    if appliedType.hasIndirectResult {
+                        guard signature.result.isAnyPayloadOrExistentialV1,
+                              argumentTokens.count == signature.parameters.count + 1
+                        else {
+                            throw CanonicalSIL.LoweringError.unsupportedType(
+                                "indirect closure result \(signature.result)"
+                            )
+                        }
+                        let destination = argumentTokens.removeFirst()
+                        guard compilerAddressType(destination) == signature.result else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "indirect closure result address does not match its result type"
+                            )
+                        }
+                        indirectResultDestination = destination
+                    } else {
+                        indirectResultDestination = nil
+                    }
                     let arguments = try argumentTokens.map {
                         try resolve($0, line: sourceLine)
                     }
@@ -2781,7 +3256,15 @@ public struct Lowerer: Sendable {
                         )
                     }
                     let result: Bytecode.Register?
-                    if signature.result == .void {
+                    if indirectResultDestination != nil {
+                        guard !call[0].isEmpty else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "indirect closure apply does not define its Void SIL result"
+                            )
+                        }
+                        result = try allocate(type: signature.result)
+                        voidValues.insert(call[0])
+                    } else if signature.result == .void {
                         result = nil
                         if !call[0].isEmpty { voidValues.insert(call[0]) }
                     } else {
@@ -2801,6 +3284,16 @@ public struct Lowerer: Sendable {
                             arguments: arguments
                         )
                     )
+                    if let indirectResultDestination, let result {
+                        if signature.result == .any {
+                            try storeExistential(result, at: indirectResultDestination)
+                        } else {
+                            try storeConstructedValue(
+                                result,
+                                at: indirectResultDestination
+                            )
+                        }
+                    }
                     continue
                 }
                 if let key = localFactoryReferences[call[1]] {
@@ -2810,10 +3303,22 @@ public struct Lowerer: Sendable {
                         )
                     }
                     let fields = try typeEnvironment.structFields(for: key)
-                    let argumentTokens = try parseApplyValueTokens(
+                    var argumentTokens = try parseApplyValueTokens(
                         call[3],
                         line: sourceLine
                     )
+                    let indirectDestination: String?
+                    if argumentTokens.count == fields.count + 2 {
+                        let destination = argumentTokens.removeFirst()
+                        guard compilerAddressType(destination) == .local(key) else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "local struct initializer result address does not match \(key)"
+                            )
+                        }
+                        indirectDestination = destination
+                    } else {
+                        indirectDestination = nil
+                    }
                     guard argumentTokens.count == fields.count + 1,
                           let metatypeToken = argumentTokens.last,
                           localMetatypeValues[metatypeToken] == key
@@ -2834,10 +3339,25 @@ public struct Lowerer: Sendable {
                         )
                     }
                     let result = try allocate(type: .local(key))
-                    values[call[0]] = result
                     appendInstruction(
                         .makeStruct(result: result, fields: Array(fieldRegisters))
                     )
+                    if let indirectDestination {
+                        voidValues.insert(call[0])
+                        if existentialProjections[indirectDestination] != nil {
+                            try finishExistentialProjection(
+                                indirectDestination,
+                                payload: result
+                            )
+                        } else {
+                            try storeConstructedValue(
+                                result,
+                                at: indirectDestination
+                            )
+                        }
+                    } else {
+                        values[call[0]] = result
+                    }
                     continue
                 }
                 if let intrinsic = swiftCoreReferences[call[1]] {
@@ -2862,6 +3382,7 @@ public struct Lowerer: Sendable {
                       appliedType.parameterConventions
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
+                      appliedType.hasIndirectResult == reference.hasIndirectResult,
                       appliedType.effects.mayThrow == binding.effects.mayThrow,
                       appliedType.effects.isAsync == binding.effects.isAsync,
                       !binding.effects.isAsync
@@ -2871,8 +3392,32 @@ public struct Lowerer: Sendable {
                         mangledName: binding.mangledName
                     )
                 }
-                let prepared = try prepareDirectCallArguments(
+                var argumentTokens = try parseApplyValueTokens(
                     call[3],
+                    line: sourceLine
+                )
+                let indirectResultDestination: String?
+                if reference.hasIndirectResult {
+                    guard binding.resultType.isAnyPayloadOrExistentialV1,
+                          argumentTokens.count
+                            == reference.physicalParameterConventions.count + 1
+                    else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "indirect call result \(binding.resultType)"
+                        )
+                    }
+                    let destination = argumentTokens.removeFirst()
+                    guard compilerAddressType(destination) == binding.resultType else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect call result address does not match its result type"
+                        )
+                    }
+                    indirectResultDestination = destination
+                } else {
+                    indirectResultDestination = nil
+                }
+                let prepared = try prepareDirectCallArguments(
+                    argumentTokens,
                     conventions: reference.physicalParameterConventions,
                     line: sourceLine,
                     allowsSynthesizedAccess: true
@@ -2889,7 +3434,18 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let result: Bytecode.Register?
-                if binding.resultType == .void {
+                if indirectResultDestination != nil {
+                    guard !call[0].isEmpty else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect apply does not define its Void SIL result"
+                        )
+                    }
+                    let register = try allocate(type: binding.resultType)
+                    result = register
+                    voidValues.insert(call[0])
+                    // The VM call is value-based. Re-materialize Swift's
+                    // address-only existential convention after the call.
+                } else if binding.resultType == .void {
                     result = nil
                     if !call[0].isEmpty { voidValues.insert(call[0]) }
                 } else {
@@ -2911,6 +3467,16 @@ public struct Lowerer: Sendable {
                     .nativeApply(result: result, importID: requirement.id, arguments: arguments)
                 }
                 appendInstruction(instruction)
+                if let indirectResultDestination, let result {
+                    if binding.resultType == .any {
+                        try storeExistential(result, at: indirectResultDestination)
+                    } else {
+                        try storeConstructedValue(
+                            result,
+                            at: indirectResultDestination
+                        )
+                    }
+                }
                 for access in prepared.accesses.reversed() {
                     appendInstruction(.endAccess(access))
                 }
@@ -2923,6 +3489,23 @@ public struct Lowerer: Sendable {
             ), pendingArrayLiterals[tuple[2]] != nil {
                 arrayLiteralAllocationByValue[tuple[0]] = tuple[2]
                 arrayLiteralStorageTokens[tuple[1]] = tuple[2]
+                continue
+            }
+
+            if let tuple = match(
+                line,
+                pattern: #"^(%[0-9]+) = tuple_extract (%[0-9]+), ([0-9]+)$"#
+            ), pendingArrayLiterals[tuple[1]] != nil {
+                switch tuple[2] {
+                case "0":
+                    arrayLiteralAllocationByValue[tuple[0]] = tuple[1]
+                case "1":
+                    arrayLiteralStorageTokens[tuple[0]] = tuple[1]
+                default:
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array literal allocation tuple has only two elements"
+                    )
+                }
                 continue
             }
 
@@ -3003,6 +3586,20 @@ public struct Lowerer: Sendable {
             if let component = match(
                 line,
                 pattern: #"^(%[0-9]+) = tuple_element_addr (%[0-9]+), ([0-9]+)$"#
+            ), let projection = existentialProjections[component[1]],
+               case let .tuple(types) = projection.concreteType,
+               let index = Int(component[2]),
+               types.indices.contains(index) {
+                existentialComponentAddresses[component[0]] = .init(
+                    projection: component[1],
+                    index: index
+                )
+                continue
+            }
+
+            if let component = match(
+                line,
+                pattern: #"^(%[0-9]+) = tuple_element_addr (%[0-9]+), ([0-9]+)$"#
             ), let base = arrayLiteralAddresses[component[1]],
                let pending = pendingArrayLiterals[base.allocation],
                case let .tuple(types) = pending.elementType,
@@ -3013,6 +3610,26 @@ public struct Lowerer: Sendable {
                     index: base.index,
                     component: index
                 )
+                continue
+            }
+
+            if let component = match(
+                line,
+                pattern: #"^(%[0-9]+) = tuple_element_addr (%[0-9]+), ([0-9]+)$"#
+            ), case let .tuple(types) = stackType(at: component[1]),
+               let index = Int(component[2]),
+               types.indices.contains(index) {
+                tupleComponentAddresses[component[0]] = .init(
+                    base: component[1],
+                    index: index
+                )
+                stackAddressTypes[component[0]] = types[index]
+                if let tuple = stackValue(at: component[1]) {
+                    try materializeTupleComponents(
+                        at: component[1],
+                        tuple: tuple
+                    )
+                }
                 continue
             }
 
@@ -3135,6 +3752,94 @@ public struct Lowerer: Sendable {
                 continue
             }
 
+            if let initialization = match(
+                line,
+                pattern: #"^(%[0-9]+) = init_enum_data_addr (%[0-9]+), #Optional\.some!enumelt$"#
+            ) {
+                guard case let .optional(wrapped) = compilerAddressType(
+                    initialization[1]
+                ),
+                optionalAddressInitializations[initialization[1]] == nil,
+                optionalPayloadAddressRoots[initialization[0]] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional address initialization is invalid or duplicated"
+                    )
+                }
+                optionalAddressInitializations[initialization[1]] = .init(
+                    wrappedType: wrapped
+                )
+                optionalPayloadAddressRoots[initialization[0]] = initialization[1]
+                continue
+            }
+
+            if let injection = match(
+                line,
+                pattern: #"^inject_enum_addr (%[0-9]+), #Optional\.(some|none)!enumelt$"#
+            ) {
+                guard case let .optional(wrapped) = compilerAddressType(injection[0]) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "inject_enum_addr destination is not Optional"
+                    )
+                }
+                let optional = try allocate(type: .optional(wrapped))
+                if injection[1] == "some" {
+                    guard let initialization = optionalAddressInitializations.removeValue(
+                        forKey: injection[0]
+                    ), initialization.wrappedType == wrapped,
+                       let payload = initialization.payload
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Optional.some address is missing its payload"
+                        )
+                    }
+                    appendInstruction(
+                        .makeOptionalSome(result: optional, value: payload)
+                    )
+                } else {
+                    guard optionalAddressInitializations.removeValue(
+                        forKey: injection[0]
+                    ) == nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Optional.none address contains pending payload storage"
+                        )
+                    }
+                    appendInstruction(.makeOptionalNone(result: optional))
+                }
+                optionalPayloadAddressRoots = optionalPayloadAddressRoots.filter {
+                    $0.value != injection[0]
+                }
+                try storeConstructedValue(optional, at: injection[0])
+                let root = addressBase(injection[0])
+                if injection[0] != indirectResultAddress,
+                   stackAddressTypes[root] != nil,
+                   runtimeAddress(at: injection[0]) == nil,
+                   let blockID = current?.id {
+                    compilerAddressWrites[blockID, default: [:]][root] = optional
+                }
+                continue
+            }
+
+            if let projection = match(
+                line,
+                pattern: #"^(%[0-9]+) = init_existential_addr (%[0-9]+), \$(.+)$"#
+            ) {
+                let concreteType = try parseType(projection[2])
+                guard compilerAddressType(projection[1]) == .any,
+                      concreteType.isAnyPayloadOrExistentialV1,
+                      existentialProjections[projection[0]] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Any payload \(concreteType)"
+                    )
+                }
+                existentialProjections[projection[0]] = .init(
+                    destination: projection[1],
+                    concreteType: concreteType
+                )
+                continue
+            }
+
             if let box = match(
                 line,
                 pattern: #"^(%[0-9]+) = alloc_existential_box \$any Error, \$(.+)$"#
@@ -3162,6 +3867,58 @@ public struct Lowerer: Sendable {
                     )
                 }
                 projectedBoxByAddress[projection[0]] = projection[1]
+                continue
+            }
+
+            if let store = match(
+                line,
+                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
+            ), let component = existentialComponentAddresses[store[1]],
+               var projection = existentialProjections[component.projection],
+               case let .tuple(types) = projection.concreteType {
+                let payload = try resolve(store[0], line: sourceLine)
+                guard types.indices.contains(component.index),
+                      registerTypes[Int(payload.rawValue)] == types[component.index],
+                      projection.components.updateValue(
+                          payload,
+                          forKey: component.index
+                      ) == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Any tuple payload component is invalid or duplicated"
+                    )
+                }
+                existentialProjections[component.projection] = projection
+                if projection.components.count == types.count {
+                    let elements = try types.indices.map { index in
+                        guard let element = projection.components[index] else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "Any tuple payload is incomplete"
+                            )
+                        }
+                        return element
+                    }
+                    let tuple = try allocate(type: projection.concreteType)
+                    appendInstruction(.makeTuple(result: tuple, elements: elements))
+                    try finishExistentialProjection(
+                        component.projection,
+                        payload: tuple
+                    )
+                }
+                continue
+            }
+
+            if let store = match(
+                line,
+                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
+            ), let projection = existentialProjections[store[1]] {
+                let payload = try resolve(store[0], line: sourceLine)
+                guard projection.components.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Any payload mixes direct and component stores"
+                    )
+                }
+                try finishExistentialProjection(store[1], payload: payload)
                 continue
             }
 
@@ -3373,39 +4130,7 @@ public struct Lowerer: Sendable {
                         "store value does not match its stack address"
                     )
                 }
-                if let addressRegister = runtimeAddress(at: store[1]) {
-                    let root = addressBase(store[1])
-                    if isScopedRuntimeAddress(store[1]) {
-                        appendInstruction(
-                            .storeAddress(address: addressRegister, source: value, mode: .assign)
-                        )
-                    } else if let slot = runtimeStackSlots[root], store[1] == root {
-                        let mode: Bytecode.StackStoreMode = stackAddressValues[root] == nil
-                            ? .initialize
-                            : .assign
-                        appendInstruction(
-                            .storeStack(slot: slot, source: value, mode: mode)
-                        )
-                    } else {
-                        let access = try allocate(type: .address(addressType))
-                        appendInstruction(
-                            .beginAccess(
-                                result: access,
-                                address: addressRegister,
-                                kind: .modify
-                            )
-                        )
-                        appendInstruction(
-                            .storeAddress(address: access, source: value, mode: .assign)
-                        )
-                        appendInstruction(.endAccess(access))
-                    }
-                    stackAddressValues[root] = value
-                    continue
-                }
-                assignStackValue(value, at: store[1])
-                values[store[1]] = value
-                values[addressBase(store[1])] = value
+                try storeVMValue(value, at: store[1])
                 continue
             }
 
@@ -3573,6 +4298,66 @@ public struct Lowerer: Sendable {
                 // avoids creating a non-dominating destroy when SIL emits the
                 // same lexical cleanup in mutually exclusive blocks.
                 stackAddressValues.removeValue(forKey: address)
+                continue
+            }
+
+            if let cast = match(
+                line,
+                pattern: #"^checked_cast_addr_br (?:take_always|copy_on_success) Any in (%[0-9]+) to (.+) in (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
+            ) {
+                let targetType = try parseType(cast[1])
+                guard stackType(at: cast[0]) == .any,
+                      let source = stackValue(at: cast[0]),
+                      registerTypes[Int(source.rawValue)] == .any,
+                      compilerAddressType(cast[2]) == targetType,
+                      targetType.isAnyCastTargetV1,
+                      runtimeAddress(at: cast[2]) == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "checked Any cast source or destination type does not match"
+                    )
+                }
+                let successTarget = try parseBlockID(cast[3])
+                let failureTarget = try parseBlockID(cast[4])
+                guard implicitStackValues[successTarget] == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "multiple checked Any casts share a success block"
+                    )
+                }
+                let optional = try allocate(type: .optional(targetType))
+                let projected = try allocate(type: targetType)
+                appendInstruction(
+                    .checkedCastAny(result: optional, value: source)
+                )
+                appendInstruction(
+                    .switchOptional(
+                        optional: optional,
+                        someTarget: successTarget,
+                        noneTarget: failureTarget
+                    )
+                )
+                implicitStackValues[successTarget] = [(cast[2], projected)]
+                continue
+            }
+
+            if let cast = match(
+                line,
+                pattern: #"^unconditional_checked_cast_addr Any in (%[0-9]+) to (.+) in (%[0-9]+)$"#
+            ) {
+                let targetType = try parseType(cast[1])
+                guard stackType(at: cast[0]) == .any,
+                      let source = stackValue(at: cast[0]),
+                      registerTypes[Int(source.rawValue)] == .any,
+                      compilerAddressType(cast[2]) == targetType,
+                      targetType.isAnyCastTargetV1
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "forced Any cast source or destination type does not match"
+                    )
+                }
+                let result = try allocate(type: targetType)
+                appendInstruction(.forceCastAny(result: result, value: source))
+                try storeVMValue(result, at: cast[2])
                 continue
             }
 
@@ -4069,9 +4854,18 @@ public struct Lowerer: Sendable {
             }
 
             if let branch = match(line, pattern: #"^br bb([0-9]+)(?:\((.*)\))?$"#) {
-                let arguments = try parseBranchArguments(branch.count > 1 ? branch[1] : "", line: sourceLine, resolve: resolve)
+                let target = try parseBlockID(branch[0])
+                var arguments = try parseBranchArguments(
+                    branch.count > 1 ? branch[1] : "",
+                    line: sourceLine,
+                    resolve: resolve
+                )
+                try appendCompilerAddressMergeArguments(
+                    target: target,
+                    arguments: &arguments
+                )
                 appendInstruction(
-                    .branch(target: try parseBlockID(branch[0]), arguments: arguments)
+                    .branch(target: target, arguments: arguments)
                 )
                 continue
             }
@@ -4079,13 +4873,33 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^cond_br (%[0-9]+), bb([0-9]+)(?:\(([^)]*)\))?, bb([0-9]+)(?:\(([^)]*)\))?$"#
             ) {
+                let trueTarget = try parseBlockID(branch[1])
+                let falseTarget = try parseBlockID(branch[3])
+                var trueArguments = try parseBranchArguments(
+                    branch[2],
+                    line: sourceLine,
+                    resolve: resolve
+                )
+                var falseArguments = try parseBranchArguments(
+                    branch[4],
+                    line: sourceLine,
+                    resolve: resolve
+                )
+                try appendCompilerAddressMergeArguments(
+                    target: trueTarget,
+                    arguments: &trueArguments
+                )
+                try appendCompilerAddressMergeArguments(
+                    target: falseTarget,
+                    arguments: &falseArguments
+                )
                 appendInstruction(
                     .conditionalBranch(
                         condition: try resolve(branch[0], line: sourceLine),
-                        trueTarget: try parseBlockID(branch[1]),
-                        trueArguments: try parseBranchArguments(branch[2], line: sourceLine, resolve: resolve),
-                        falseTarget: try parseBlockID(branch[3]),
-                        falseArguments: try parseBranchArguments(branch[4], line: sourceLine, resolve: resolve)
+                        trueTarget: trueTarget,
+                        trueArguments: trueArguments,
+                        falseTarget: falseTarget,
+                        falseArguments: falseArguments
                     )
                 )
                 continue
@@ -4114,6 +4928,19 @@ public struct Lowerer: Sendable {
             }
             if let returned = match(line, pattern: #"^return (%[0-9]+)$"#) {
                 if voidValues.contains(returned[0]) {
+                    if signature.hasIndirectResult {
+                        guard let slot = indirectResultSlot else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "indirect result returns before initialization"
+                            )
+                        }
+                        let result = try allocate(type: signature.result)
+                        appendInstruction(
+                            .loadStack(result: result, slot: slot, mode: .take)
+                        )
+                        appendInstruction(.returnValue(result))
+                        continue
+                    }
                     guard signature.result == .void else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "non-Void function returns an empty tuple"
@@ -4147,6 +4974,20 @@ public struct Lowerer: Sendable {
         guard pendingArrayLiterals.isEmpty else {
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "Array literal allocation is not finalized on every supported path"
+            )
+        }
+        guard existentialProjections.isEmpty,
+              existentialComponentAddresses.isEmpty
+        else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "Any existential projection is not initialized"
+            )
+        }
+        guard optionalAddressInitializations.isEmpty,
+              optionalPayloadAddressRoots.isEmpty
+        else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "Optional address initialization is incomplete"
             )
         }
         guard pendingArrayIteratorTypes.isEmpty,
@@ -4226,6 +5067,7 @@ public struct Lowerer: Sendable {
         parameters: [Bytecode.ValueType],
         parameterConventions: [Bytecode.ParameterConvention],
         result: Bytecode.ValueType,
+        hasIndirectResult: Bool,
         effects: Core.Effects
     ) {
         guard let arrow = outerFunctionArrow(in: text) else {
@@ -4253,19 +5095,36 @@ public struct Lowerer: Sendable {
         let resultComponents = splitTopLevelTuple(resultText)
         if resultComponents.count == 2,
            resultComponents[1].trimmingCharacters(in: .whitespaces).hasPrefix("@error ") {
+            let result = try parseFunctionResult(resultComponents[0])
             return (
                 parameters,
                 parameterConventions,
-                try parseType(resultComponents[0]),
+                result.type,
+                result.isIndirect,
                 .init(mayThrow: true, isAsync: isAsync)
             )
         }
+        let result = try parseFunctionResult(resultText)
         return (
             parameters,
             parameterConventions,
-            try parseType(resultText),
+            result.type,
+            result.isIndirect,
             .init(isAsync: isAsync)
         )
+    }
+
+    private func parseFunctionResult(
+        _ raw: String
+    ) throws -> (type: Bytecode.ValueType, isIndirect: Bool) {
+        let value = raw.trimmingCharacters(in: .whitespaces)
+        if value.hasPrefix("@out ") {
+            return (
+                try parseType(String(value.dropFirst("@out ".count))),
+                true
+            )
+        }
+        return (try parseType(value), false)
     }
 
     private func parameterConventions(
@@ -4458,23 +5317,73 @@ public struct Lowerer: Sendable {
 
     private func parseBlockHeader(
         _ line: String,
+        entryParameterTypes: [Bytecode.ValueType]?,
+        indirectResultType: Bytecode.ValueType?,
+        suppressVoidParameter: Bool,
         allocate: (Bytecode.ValueType) throws -> Bytecode.Register
-    ) throws -> (block: IntermediateRepresentation.Block, parameters: [(String, Bytecode.Register)])? {
+    ) throws -> (
+        block: IntermediateRepresentation.Block,
+        parameters: [(String, Bytecode.Register)],
+        indirectResultAddress: String?,
+        indirectValueParameters: [String: Bytecode.ValueType],
+        suppressedVoidParameter: String?
+    )? {
         guard let match = match(line, pattern: #"^bb([0-9]+)(?:\((.*)\))?:$"#) else { return nil }
         let id = try parseBlockID(match[0])
         let parameterText = match.count > 1 ? match[1] : ""
         var parameters: [(String, Bytecode.Register)] = []
+        var indirectResultAddress: String?
+        var indirectValueParameters: [String: Bytecode.ValueType] = [:]
+        var suppressedVoidParameter: String?
         if !parameterText.isEmpty {
-            for component in splitTopLevel(parameterText) {
+            let components = splitTopLevel(parameterText)
+            if suppressVoidParameter, components.count != 1 {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "indirect try_apply normal block has unexpected SIL parameters"
+                )
+            }
+            for (physicalIndex, component) in components.enumerated() {
                 guard let value = self.match(component, pattern: #"^(%[0-9]+)\s*:\s*(.+)$"#) else {
                     throw CanonicalSIL.LoweringError.malformedSIL("invalid block parameter \(component)")
                 }
-                parameters.append((value[0], try allocate(parseType(value[1]))))
+                let physicalType = try parseType(value[1])
+                if suppressVoidParameter {
+                    guard physicalIndex == 0, physicalType == .void else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect try_apply normal block parameter is not Void"
+                        )
+                    }
+                    suppressedVoidParameter = value[0]
+                    continue
+                }
+                if physicalIndex == 0, let indirectResultType {
+                    guard physicalType == .address(indirectResultType) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect result address does not match the function result"
+                        )
+                    }
+                    indirectResultAddress = value[0]
+                    continue
+                }
+                let logicalIndex = parameters.count
+                let loweredType: Bytecode.ValueType
+                if let entryParameterTypes,
+                   entryParameterTypes.indices.contains(logicalIndex),
+                   physicalType == .address(entryParameterTypes[logicalIndex]) {
+                    loweredType = entryParameterTypes[logicalIndex]
+                    indirectValueParameters[value[0]] = loweredType
+                } else {
+                    loweredType = physicalType
+                }
+                parameters.append((value[0], try allocate(loweredType)))
             }
         }
         return (
             IntermediateRepresentation.Block(id: id, parameters: parameters.map(\.1), instructions: []),
-            parameters
+            parameters,
+            indirectResultAddress,
+            indirectValueParameters,
+            suppressedVoidParameter
         )
     }
 

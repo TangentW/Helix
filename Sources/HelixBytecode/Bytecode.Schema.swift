@@ -75,6 +75,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
     case integer(bitWidth: UInt16, signed: Bool)
     case float(bitWidth: UInt16)
     case string
+    case any
     case array(Bytecode.ValueType)
     case dictionary(key: Bytecode.ValueType, value: Bytecode.ValueType)
     case native(Core.TypeID)
@@ -95,7 +96,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
             elements.allSatisfy(\.isTrivial)
         case let .optional(wrapped):
             wrapped.isTrivial
-        case .string, .array, .dictionary, .native, .local, .error, .address,
+        case .string, .any, .array, .dictionary, .native, .local, .error, .address,
              .closure:
             false
         }
@@ -115,7 +116,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
             element.requiresLinearOwnership
         case let .dictionary(key, value):
             key.requiresLinearOwnership || value.requiresLinearOwnership
-        case .void, .never, .bool, .integer, .float, .string, .local, .error,
+        case .void, .never, .bool, .integer, .float, .string, .any, .local, .error,
              .address, .closure:
             false
         }
@@ -129,6 +130,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case let .integer(width, signed): "\(signed ? "Int" : "UInt")\(width)"
         case let .float(width): "Float\(width)"
         case .string: "String"
+        case .any: "Any"
         case let .array(element): "Array<\(element)>"
         case let .dictionary(key, value): "Dictionary<\(key), \(value)>"
         case let .native(type): "Native<\(type)>"
@@ -259,6 +261,9 @@ public enum Instruction: Codable, Hashable, Sendable {
         error: Bytecode.Register,
         expectedType: Bytecode.LocalTypeKey
     )
+    case eraseToAny(result: Bytecode.Register, value: Bytecode.Register)
+    case checkedCastAny(result: Bytecode.Register, value: Bytecode.Register)
+    case forceCastAny(result: Bytecode.Register, value: Bytecode.Register)
     case makeOptionalSome(result: Bytecode.Register, value: Bytecode.Register)
     case makeOptionalNone(result: Bytecode.Register)
     case optionalIsSome(result: Bytecode.Register, optional: Bytecode.Register)
@@ -473,6 +478,9 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .makeEnum(result, _, _),
              let .makeError(result, _),
              let .castError(result, _, _),
+             let .eraseToAny(result, _),
+             let .checkedCastAny(result, _),
+             let .forceCastAny(result, _),
              let .makeOptionalSome(result, _),
              let .makeOptionalNone(result),
              let .optionalIsSome(result, _),
@@ -550,6 +558,10 @@ public enum Instruction: Codable, Hashable, Sendable {
             [payload]
         case let .castError(_, error, _):
             [error]
+        case let .eraseToAny(_, value),
+             let .checkedCastAny(_, value),
+             let .forceCastAny(_, value):
+            [value]
         case let .makeOptionalSome(_, value):
             [value]
         case let .optionalIsSome(_, optional), let .unwrapOptional(_, optional):

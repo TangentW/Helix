@@ -277,6 +277,12 @@ public struct Indexer: Sendable {
                 .compilerSpecializationsV1,
             ])
         }
+        if request.compatibility.bytecode.major == 1,
+           request.compatibility.bytecode >= .init(1, 10, 0) {
+            // Any may be introduced only by a later patch body, so it cannot be
+            // inferred solely from the frozen Shell entry signatures.
+            capabilities.insert(.anyValuesV1)
+        }
         if records.contains(where: {
             $0.patchability.isEligible && $0.effects.isAsync
         }) {
@@ -447,7 +453,8 @@ public struct Indexer: Sendable {
             (signature.parameters + [signature.result]).contains {
                 containsNativeType($0, ids: ids)
             }
-        case .void, .never, .bool, .integer, .float, .string, .local, .error:
+        case .void, .never, .bool, .integer, .float, .string, .any, .local,
+             .error:
             false
         }
     }
@@ -457,7 +464,7 @@ public struct Indexer: Sendable {
         case .void: allowVoid
         case .never: false
         case .address, .closure: false
-        case .bool, .integer, .float, .string, .native: true
+        case .bool, .integer, .float, .string, .any, .native: true
         case .local, .error: false
         case let .tuple(elements):
             elements.count <= 64 && elements.allSatisfy { isSupportedType($0, allowVoid: false) }

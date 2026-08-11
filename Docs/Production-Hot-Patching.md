@@ -43,7 +43,7 @@ flowchart LR
     T --> D["Interface and transitive body diff"]
     D --> S["Canonical OSSA SIL"]
     S --> L["HLIR lowering"]
-    L --> B["HLBC 1.9 encoder"]
+    L --> B["HLBC 1.10 encoder"]
     B --> V["Independent verifier"]
     V --> P["Signed .hlxp"]
 ```
@@ -151,17 +151,19 @@ device performance qualification.
 
 ## Current language boundary
 
-The current wire versions are HLBC 1.9 and HLXI 2.4. The implemented subset
+The current wire versions are HLBC 1.10 and HLXI 2.5. The implemented subset
 includes common integer and floating-point operations and conversions, Bool,
 String operations and interpolation, one-grapheme Character literals for the
 bounded String predicate path, tuple/Optional including address projection,
-Array and Dictionary value semantics, half-open `Range<Int>` loops, structured
+Array and Dictionary value semantics, VM-owned `Any` and common dynamic casts,
+half-open `Range<Int>` loops, structured
 control flow, file- or module-scope patch-local struct/enum and concrete
 `Result` values, payload-carrying local errors, scoped patch-local
 `inout`/`mutating` helpers, synchronous patch-local closures including
 same-image `@escaping` return/capture flows, fully concrete compiler
-specializations, and top-level non-suspending `async`, `async throws`, and
-`@MainActor async` entries.
+specializations and default-argument generators, an automatically frozen
+`Swift.print` NativeImport, and top-level non-suspending `async`, `async throws`,
+and `@MainActor async` entries.
 
 It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch,
 new native classes, function-local nominal declarations, stored-layout changes,

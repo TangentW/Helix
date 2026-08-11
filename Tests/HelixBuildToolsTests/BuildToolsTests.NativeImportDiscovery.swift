@@ -44,6 +44,7 @@ struct NativeImportDiscoveryTests {
             }
             @MainActor public func mainValue(_ value: Int) -> Int { value + 10 }
             public func copy(_ values: [String: Int]?) -> [String: Int]? { values }
+            public func echo(_ value: Any) -> Any { value }
             public func keyword(_ value: Int, `repeat` count: Int) -> Int { value + count }
             public enum Math {
                 public static func doubled(_ value: Int) -> Int { value * 2 }
@@ -124,18 +125,25 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).adjust(_:by:)",
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
+            "\(moduleName).echo(_:)",
             "\(moduleName).keyword(_:repeat:)",
             "\(moduleName).mainValue(_:)",
+            "Swift.print(_:separator:terminator:)",
         ])
-        #expect(output.receipt.nativeImportCandidates.map(\.id) == [
-            .init(rawValue: 0), .init(rawValue: 1), .init(rawValue: 2),
-            .init(rawValue: 3), .init(rawValue: 4), .init(rawValue: 5),
-            .init(rawValue: 6),
-            .init(rawValue: 7), .init(rawValue: 8),
-        ])
-        #expect(output.receipt.nativeImportBindings.count == 9)
-        #expect(output.receipt.nativeImportBindings.allSatisfy {
+        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...10).map {
+            Core.NativeImportID(rawValue: UInt32($0))
+        })
+        #expect(output.receipt.nativeImportBindings.count == 11)
+        #expect(output.receipt.nativeImportBindings.filter {
+            $0.generated != nil
+        }.allSatisfy {
             $0.generated != nil && $0.importedModules.isEmpty
+        })
+        #expect(output.receipt.nativeImportBindings.filter {
+            $0.generated != nil
+        }.count == 10)
+        #expect(output.receipt.nativeImportBindings.contains {
+            $0.generated == nil && $0.importedModules == ["HelixRuntime"]
         })
         var forgedLegacyReceipt = output.receipt
         forgedLegacyReceipt.schemaVersion = 7
@@ -150,8 +158,10 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).adjust(_:by:)",
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
+            "\(moduleName).echo(_:)",
             "\(moduleName).keyword(_:repeat:)",
             "\(moduleName).mainValue(_:)",
+            "Swift.print(_:separator:terminator:)",
         ])
 
         let adjustDeclaration = try #require(output.receipt.declarations.first {
@@ -232,6 +242,8 @@ struct NativeImportDiscoveryTests {
         #expect(generated.contains("catch let trap as VM.RuntimeTrap"))
         #expect(generated.contains("try context.withMainActor"))
         #expect(generated.contains("BridgeValueCodec.decodeDictionary"))
+        #expect(generated.contains("BridgeValueCodec.decodeAny"))
+        #expect(generated.contains("BridgeValueCodec.encodeAny"))
         let bridge = try #require(
             shell.bridge.sourceFiles["Generated/\(moduleName)Bridge.swift"]
         )
@@ -413,10 +425,11 @@ struct NativeImportDiscoveryTests {
         #expect(output.receipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
             "\(moduleName).Counter.value.get",
             "\(moduleName).Counter.value.set",
+            "Swift.print(_:separator:terminator:)",
         ])
         #expect(output.receipt.roots.compactMap(\.bridge).count == 1)
-        #expect(output.receipt.nativeImportBindings.map(\.generated?.dispatch).sorted {
-            ($0?.rawValue ?? "") < ($1?.rawValue ?? "")
+        #expect(output.receipt.nativeImportBindings.compactMap(\.generated?.dispatch).sorted {
+            $0.rawValue < $1.rawValue
         } == [.instanceGetter, .instanceSetter])
 
         let shell = try ShellBuild.Materializer().materialize(
@@ -577,6 +590,7 @@ struct NativeImportDiscoveryTests {
         #expect(output.receipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
             "\(moduleName).Screen.label.get",
             "\(moduleName).Screen.label.set",
+            "Swift.print(_:separator:terminator:)",
         ])
         let selected = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "selectedLabel"

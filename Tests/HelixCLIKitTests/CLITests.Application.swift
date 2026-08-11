@@ -492,7 +492,9 @@ struct Application {
             Data(contentsOf: shell.appendingPathComponent("ShellBuildReceipt.json"))
         )
         #expect(patchReceipt.configuration.schema == 1)
-        #expect(patchReceipt.nativeImportCandidates.isEmpty)
+        #expect(patchReceipt.nativeImportCandidates.map(\.canonicalCallee) == [
+            "Swift.print(_:separator:terminator:)",
+        ])
 
         var liveEnvironment = environment
         liveEnvironment["CONFIGURATION"] = "Debug"
@@ -523,6 +525,7 @@ struct Application {
         #expect(featureConfiguration.nativeImports.sourceScope?.visibility == .all)
         #expect(liveReceipt.nativeImportCandidates.map(\.canonicalCallee) == [
             "Feature.hidden(_:)",
+            "Swift.print(_:separator:terminator:)",
         ])
         let entrySymbols = Set(liveReceipt.roots.compactMap { root in
             root.bridge == nil ? nil : root.declarationMangledName

@@ -450,7 +450,7 @@ public struct Generator: Sendable {
 
         var rendered: String {
             switch self {
-            case let .named(name): name
+            case let .named(name): name == "Swift.Any" ? "Any" : name
             case let .array(element): "Swift.Array<\(element.rendered)>"
             case let .dictionary(key, value):
                 "Swift.Dictionary<\(key.rendered), \(value.rendered)>"
@@ -722,6 +722,8 @@ public struct Generator: Sendable {
             return ["Bool", "Swift.Bool"].contains(name)
         case let (.named(name), .string):
             return ["String", "Swift.String"].contains(name)
+        case let (.named(name), .any):
+            return ["Any", "Swift.Any"].contains(name)
         case let (.named(name), .void):
             return ["Void", "Swift.Void", "()"].contains(name)
         default:
@@ -1135,6 +1137,11 @@ public struct Generator: Sendable {
         inputEncoder: String? = nil
     ) -> String {
         switch (shape, type) {
+        case (.named, .any):
+            if let inputEncoder {
+                return "try \(inputEncoder).encodeAny(\(expression))"
+            }
+            return "try Runtime.BridgeValueCodec.encodeAny(\(expression))"
         case (.named, .bool), (.named, .integer), (.named, .float), (.named, .string):
             if let inputEncoder {
                 return "try \(inputEncoder).encode(\(expression))"
@@ -1228,6 +1235,8 @@ public struct Generator: Sendable {
         type: Bytecode.ValueType
     ) -> String {
         switch (shape, type) {
+        case (.named, .any):
+            return "try Runtime.BridgeValueCodec.decodeAny(\(expression))"
         case let (.named(name), .bool), let (.named(name), .integer),
              let (.named(name), .float), let (.named(name), .string):
             return "try Runtime.BridgeValueCodec.decode(\(expression), as: \(name).self)"
@@ -1497,7 +1506,7 @@ public struct Generator: Sendable {
 
     private func isGeneratedValueType(_ type: Bytecode.ValueType) -> Bool {
         switch type {
-        case .bool, .integer, .float, .string, .native:
+        case .bool, .integer, .float, .string, .any, .native:
             true
         case let .array(element), let .optional(element):
             isGeneratedValueType(element)
@@ -1733,6 +1742,7 @@ public struct Generator: Sendable {
             ".integer(bitWidth: \(bitWidth), signed: \(signed))"
         case let .float(bitWidth): ".float(bitWidth: \(bitWidth))"
         case .string: ".string"
+        case .any: ".any"
         case let .array(element): ".array(\(render(element)))"
         case let .dictionary(key, value):
             ".dictionary(key: \(render(key)), value: \(render(value)))"

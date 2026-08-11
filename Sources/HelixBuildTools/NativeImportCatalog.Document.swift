@@ -225,7 +225,7 @@ public struct Document: Codable, Hashable, Sendable {
         case .void: allowVoid
         case .never: false
         case .address, .closure: false
-        case .bool, .integer, .float, .string, .native: true
+        case .bool, .integer, .float, .string, .any, .native: true
         case .local, .error: false
         case let .array(element): isSupported(element, allowVoid: false)
         case let .dictionary(key, value):
@@ -259,7 +259,8 @@ public struct Document: Codable, Hashable, Sendable {
             (signature.parameters + [signature.result]).contains {
                 containsNativeType($0, ids: ids)
             }
-        case .void, .never, .bool, .integer, .float, .string, .local, .error:
+        case .void, .never, .bool, .integer, .float, .string, .any, .local,
+             .error:
             false
         }
     }

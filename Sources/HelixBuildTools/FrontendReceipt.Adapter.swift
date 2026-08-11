@@ -31,12 +31,18 @@ public struct Adapter: Sendable {
         )
         let silFile = try CanonicalSIL.File(text: canonicalSIL)
         let moduleName = request.metadata.frontendInvocation.moduleName
-        let effectiveConfiguration = try callingSurfaceConfiguration(
+        let configuredCallingSurface = try callingSurfaceConfiguration(
             request.configuration,
             policy: request.callingSurfacePolicy,
             moduleName: moduleName,
             sources: orderedSources
         )
+        let effectiveConfiguration = configuration(
+            configuredCallingSurface,
+            allowing: Array(NativeImportCatalog.Builtins.automaticCallees),
+            moduleName: moduleName
+        )
+        try effectiveConfiguration.validate()
         let sourceByPhysicalPath = Dictionary(
             uniqueKeysWithValues: sourceStates.map {
                 ($0.url.resolvingSymlinksInPath().standardizedFileURL.path, $0)
@@ -132,11 +138,23 @@ public struct Adapter: Sendable {
             )
         }
 
-        var explicitNativeImports = try makeNativeImportCandidates(
-            request.nativeImportCatalog,
-            metadata: request.metadata,
+        let builtinNativeImports = try NativeImportCatalog.Builtins.records(
+            metadata: request.metadata
+        )
+        applyNativeImportEffectEnvelope(
+            builtinNativeImports,
+            to: &drafts,
             configuration: effectiveConfiguration,
-            nativeTypes: nativeTypeIDs
+            moduleName: moduleName
+        )
+        var explicitNativeImports = try NativeImportCatalog.Builtins.merging(
+            makeNativeImportCandidates(
+                request.nativeImportCatalog,
+                metadata: request.metadata,
+                configuration: effectiveConfiguration,
+                nativeTypes: nativeTypeIDs
+            ),
+            metadata: request.metadata
         )
         let sourceRecords = sourceStates.map {
             InterfaceArchive.SourceRecord(
@@ -190,7 +208,7 @@ public struct Adapter: Sendable {
             !scopedNativeImportSymbols.isDisjoint(with: $0.silMangledNames)
         }
         let scopedNativeImportCallees = scopedNativeImportRecords.map(\.canonicalCallee)
-        applyScopedNativeImportEffectEnvelope(
+        applyNativeImportEffectEnvelope(
             scopedNativeImportRecords,
             to: &drafts,
             configuration: effectiveConfiguration,
@@ -221,13 +239,15 @@ public struct Adapter: Sendable {
                 "Entry eligibility changed while resolving the managed NativeImport surface"
             )
         }
-        let nativeImportBindings = try makeNativeImportBindings(
-            catalog: request.nativeImportCatalog,
-            archive: indexed.archive
-        ) + makeDiscoveredNativeImportBindings(
-            discovery.candidates,
-            archive: indexed.archive
-        )
+        let nativeImportBindings = try (
+            makeNativeImportBindings(
+                catalog: request.nativeImportCatalog,
+                archive: indexed.archive
+            ) + makeDiscoveredNativeImportBindings(
+                discovery.candidates,
+                archive: indexed.archive
+            ) + NativeImportCatalog.Builtins.bindings(archive: indexed.archive)
+        ).sorted { $0.key.rawValue < $1.key.rawValue }
         let nativeTypeBindings = try makeNativeTypeBindings(
             catalog: request.nativeImportCatalog,
             archive: indexed.archive,
@@ -556,6 +576,7 @@ extension FrontendReceipt.Adapter {
             }
         }
         let allowed = Set(module.nativeImports.allow)
+            .subtracting(NativeImportCatalog.Builtins.automaticCallees)
         let catalogNames = Set(catalog.candidates.map(\.canonicalCallee))
         guard allowed.isSubset(of: catalogNames) else {
             let missing = allowed.subtracting(catalogNames).sorted().joined(separator: ", ")
@@ -658,7 +679,7 @@ extension FrontendReceipt.Adapter {
         return records.sorted { $0.key.rawValue < $1.key.rawValue }
     }
 
-    func applyScopedNativeImportEffectEnvelope(
+    func applyNativeImportEffectEnvelope(
         _ records: [InterfaceArchive.NativeImportRecord],
         to drafts: inout [Draft],
         configuration: PatchConfiguration.Document,

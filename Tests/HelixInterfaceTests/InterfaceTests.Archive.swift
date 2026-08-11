@@ -319,6 +319,38 @@ struct Archive {
             try mismatchedAsync.validate()
         }
 
+        let anyArchive = try featureArchive(
+            parameterType: .any,
+            canonicalParameter: "Swift.Any",
+            capabilities: [.anyValuesV1],
+            bytecode: .init(1, 10, 0)
+        )
+        try anyArchive.validate()
+
+        var oldAnyBytecode = anyArchive
+        oldAnyBytecode.compatibility.bytecode = .init(1, 9, 0)
+        oldAnyBytecode.shellInterfaceHash = try oldAnyBytecode
+            .computeShellInterfaceHash()
+        #expect(
+            throws: InterfaceArchive.Error.invalidArchive(
+                "Any values require HLBC 1.10 and HLXI 2.5 compatibility"
+            )
+        ) {
+            try oldAnyBytecode.validate()
+        }
+
+        var oldAnyArchive = anyArchive
+        oldAnyArchive.compatibility.interfaceArchive = .init(2, 4, 0)
+        oldAnyArchive.shellInterfaceHash = try oldAnyArchive
+            .computeShellInterfaceHash()
+        #expect(
+            throws: InterfaceArchive.Error.invalidArchive(
+                "Any values require HLBC 1.10 and HLXI 2.5 compatibility"
+            )
+        ) {
+            try oldAnyArchive.validate()
+        }
+
         var inoutEntry = try fixture()
         inoutEntry.capabilities.append(.addressValuesV1)
         inoutEntry.functions[0].parameterConventions = [.inout]

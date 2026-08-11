@@ -261,6 +261,18 @@ public enum Encoder {
                 )
             }
         }
+        if formatMinor < 10 {
+            guard !module.capabilities.contains(.anyValuesV1) else {
+                throw Bytecode.CodecError.invalidHeader(
+                    "swift-any-1 requires HLBC format 1.10"
+                )
+            }
+            guard !containsAnyType(in: module) else {
+                throw Bytecode.CodecError.invalidHeader(
+                    "Any value types require HLBC format 1.10"
+                )
+            }
+        }
         for function in module.functions {
             for block in function.blocks {
                 for instruction in block.instructions {
@@ -349,8 +361,54 @@ public enum Encoder {
                             break
                         }
                     }
+                    if formatMinor < 10 {
+                        switch instruction {
+                        case .eraseToAny, .checkedCastAny, .forceCastAny:
+                            throw Bytecode.CodecError.invalidHeader(
+                                "Any instructions require HLBC format 1.10"
+                            )
+                        default:
+                            break
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    private static func containsAnyType(in module: Bytecode.Module) -> Bool {
+        if module.functions.contains(where: { function in
+            (function.registerTypes + function.stackSlotTypes + [function.resultType])
+                .contains(where: containsAny)
+        }) {
+            return true
+        }
+        return module.localTypes.contains { definition in
+            switch definition.kind {
+            case let .structure(fields):
+                fields.contains { containsAny($0.type) }
+            case let .enumeration(cases):
+                cases.contains { $0.payloadType.map(containsAny) == true }
+            }
+        }
+    }
+
+    private static func containsAny(_ type: Bytecode.ValueType) -> Bool {
+        switch type {
+        case .any:
+            true
+        case let .array(element), let .optional(element), let .address(element):
+            containsAny(element)
+        case let .dictionary(key, value):
+            containsAny(key) || containsAny(value)
+        case let .tuple(elements):
+            elements.contains(where: containsAny)
+        case let .closure(signature):
+            signature.parameters.contains(where: containsAny)
+                || containsAny(signature.result)
+        case .void, .never, .bool, .integer, .float, .string, .native, .local,
+             .error:
+            false
         }
     }
 
@@ -373,7 +431,7 @@ public enum Encoder {
         case let .closure(signature):
             signature.parameters.contains(where: containsFloatOrString)
                 || containsFloatOrString(signature.result)
-        case .void, .never, .bool, .integer, .native, .local, .error:
+        case .void, .never, .bool, .integer, .any, .native, .local, .error:
             false
         }
     }
@@ -395,7 +453,7 @@ public enum Encoder {
         case let .closure(signature):
             signature.parameters.contains(where: containsLocalNominalOrError)
                 || containsLocalNominalOrError(signature.result)
-        case .void, .never, .bool, .integer, .float, .string, .native:
+        case .void, .never, .bool, .integer, .float, .string, .any, .native:
             false
         }
     }

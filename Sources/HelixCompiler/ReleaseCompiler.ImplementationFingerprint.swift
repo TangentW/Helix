@@ -2,9 +2,9 @@ import HelixCore
 
 extension ReleaseCompiler {
 public enum ImplementationFingerprint {
-    /// Computes the HLXI 2.3 fingerprint for a root with no compiler-generated
-    /// implementation dependencies. Indexer uses this for typed clients that
-    /// provide one declaration at a time.
+    /// Computes the versioned implementation fingerprint for a root with no
+    /// compiler-generated dependencies. Indexer uses this for typed clients
+    /// that provide one declaration at a time.
     public static func compute(
         symbol: String,
         loweredType: String,
@@ -62,6 +62,19 @@ public enum ImplementationFingerprint {
     static func isCompilerGeneratedSymbol(_ symbol: String) -> Bool {
         symbol.contains("cfU") || symbol.contains("fU")
             || symbol.contains("_Tg") || symbol.contains("Tf")
+            || isDefaultArgumentGenerator(symbol)
+    }
+
+    /// Swift emits one directly callable helper for every default argument.
+    /// The stable mangling tail is `fA_` for argument zero and `fA<n>_` for
+    /// later arguments, including methods and initializers.
+    static func isDefaultArgumentGenerator(_ symbol: String) -> Bool {
+        guard symbol.last == "_" else { return false }
+        let body = symbol.dropLast()
+        guard let marker = body.range(of: "fA", options: .backwards) else {
+            return false
+        }
+        return body[marker.upperBound...].allSatisfy(\.isNumber)
     }
 }
 }

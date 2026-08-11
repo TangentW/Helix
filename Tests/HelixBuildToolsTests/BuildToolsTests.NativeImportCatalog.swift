@@ -59,6 +59,28 @@ struct NativeImportCatalogPipeline {
         }
     }
 
+    @Test("Catalog admits Swift Any as an explicitly bounded bridge type")
+    func admitsAnySignature() throws {
+        var candidate = makeCandidate(
+            canonicalCallee: "Fixture.echo(_:)",
+            symbol: "$s7Fixture4echoyypypF",
+            factoryType: "FixtureSupport.EchoFactory",
+            module: "FixtureSupport"
+        )
+        candidate.signature = .init(
+            parameters: ["Swift.Any"],
+            result: "Swift.Any"
+        )
+
+        let document = NativeImportCatalog.Document(candidates: [candidate])
+        try document.validate()
+        #expect(
+            try NativeImportCatalog.Codec.decode(
+                NativeImportCatalog.Codec.encode(document)
+            ) == document
+        )
+    }
+
     @Test("Catalog models UIKit types, getters, setters, and execution effects explicitly")
     func validatesFrameworkContractsAndNativeTypes() throws {
         let viewType = NativeImportCatalog.NativeType(
@@ -123,23 +145,21 @@ struct NativeImportCatalogPipeline {
             ) == document
         )
 
-        var unsafeIO = getter
-        unsafeIO.canonicalCallee = "UIKit.UIView.loadRemoteState()"
-        unsafeIO.silMangledNames = ["$s5UIKit6UIViewC15loadRemoteStateyyF"]
-        unsafeIO.effects.hasExternalSideEffects = true
-        unsafeIO.contract = .cooperative(
+        var synchronousIO = getter
+        synchronousIO.canonicalCallee = "UIKit.UIView.loadRemoteState()"
+        synchronousIO.silMangledNames = ["$s5UIKit6UIViewC15loadRemoteStateyyF"]
+        synchronousIO.effects.hasExternalSideEffects = true
+        synchronousIO.contract = .cooperative(
             kind: .instanceMethod,
             domain: .uiKit,
             access: .io,
             maximumDurationMicroseconds: 10_000,
             allowsMainThread: true
         )
-        #expect(throws: NativeImportCatalog.Error.self) {
-            try NativeImportCatalog.Document(
-                nativeTypes: [viewType],
-                candidates: [unsafeIO]
-            ).validate()
-        }
+        try NativeImportCatalog.Document(
+            nativeTypes: [viewType],
+            candidates: [synchronousIO]
+        ).validate()
     }
 
     @Test("Real Swift indexing freezes allowlisted factories and CLI emits the same receipt")
@@ -248,30 +268,37 @@ struct NativeImportCatalogPipeline {
             )
         )
         let receipt = output.receipt
-        #expect(receipt.nativeImportCandidates.count == 2)
-        #expect(receipt.nativeImportCandidates.filter(\.isEmittedToDevice).count == 1)
+        #expect(receipt.nativeImportCandidates.count == 3)
+        #expect(receipt.nativeImportCandidates.filter(\.isEmittedToDevice).count == 2)
         #expect(receipt.nativeImportCandidates.first {
             $0.canonicalCallee == incrementCallee
         }?.id == .init(rawValue: 0))
         #expect(receipt.nativeImportCandidates.first {
             $0.canonicalCallee == dormantCallee
         }?.id == nil)
-        #expect(receipt.nativeImportBindings.count == 1)
-        #expect(receipt.nativeImportBindings[0].importedModules == ["NativeSupport"])
+        #expect(receipt.nativeImportBindings.count == 2)
+        #expect(receipt.nativeImportBindings.contains {
+            $0.importedModules == ["NativeSupport"]
+        })
+        #expect(receipt.nativeImportBindings.contains {
+            $0.importedModules == ["HelixRuntime"]
+        })
         #expect(receipt.capabilities.contains(.nativeImportsV2))
 
         let shell = try ShellBuild.Materializer().materialize(
             receipt: receipt,
             sourceRoot: directory
         )
-        #expect(shell.archive.nativeImports.count == 2)
-        #expect(shell.report.emittedNativeImportCount == 1)
+        #expect(shell.archive.nativeImports.count == 3)
+        #expect(shell.report.emittedNativeImportCount == 2)
         let bridge = try #require(shell.bridge.sourceFiles[
             "Generated/\(moduleName)Bridge.swift"
         ])
         #expect(bridge.contains("import NativeSupport"))
+        #expect(bridge.contains("import HelixRuntime"))
         #expect(!bridge.contains("import DormantSupport"))
         #expect(bridge.contains("NativeSupport.IncrementFactory.make("))
+        #expect(bridge.contains("Runtime.StandardLibraryImports.makePrint("))
         #expect(!bridge.contains("DormantSupport.DormantFactory.make("))
 
         let metadataURL = directory.appendingPathComponent("ReleaseMetadata.json")

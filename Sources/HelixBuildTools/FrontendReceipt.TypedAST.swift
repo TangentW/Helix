@@ -199,6 +199,7 @@ enum ValueTypeParser {
         case "Float": return .float(bitWidth: 32)
         case "Double": return .float(bitWidth: 64)
         case "String": return .string
+        case "Any": return .any
         default: return nil
         }
     }

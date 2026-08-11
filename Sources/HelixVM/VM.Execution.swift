@@ -21,6 +21,8 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
     case addressWriteRequiresModifyAccess
     case exclusivityViolation
     case optionalUnwrapOfNil
+    case dynamicCastFailure(actual: Bytecode.ValueType, expected: Bytecode.ValueType)
+    case valueNestingDepthExceeded(maximum: Int)
     case arrayIndexOutOfBounds(index: Int64, count: Int)
     case unknownFunction(Bytecode.FunctionID)
     case unknownEntry(Core.EntryIndex)
@@ -63,6 +65,10 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
         case .addressWriteRequiresModifyAccess: "address write requires modify access"
         case .exclusivityViolation: "overlapping address access violates exclusivity"
         case .optionalUnwrapOfNil: "attempted to unwrap a nil Optional"
+        case let .dynamicCastFailure(actual, expected):
+            "could not cast value of type \(actual) to \(expected)"
+        case let .valueNestingDepthExceeded(maximum):
+            "VM value nesting exceeds \(maximum) levels"
         case let .arrayIndexOutOfBounds(index, count):
             "Array index \(index) is outside 0..<\(count)"
         case let .unknownFunction(function): "unknown HLBC function \(function)"
@@ -396,6 +402,15 @@ public final class InvocationBudget: @unchecked Sendable {
     /// Charges values created by a trusted Shell boundary before they become
     /// owned by the VM. HLBC-internal values are charged where they allocate.
     public func consumeBoundaryValue(_ value: VM.Value) throws {
+        try consumeBoundaryValue(value, depth: 0)
+    }
+
+    private func consumeBoundaryValue(_ value: VM.Value, depth: Int) throws {
+        guard depth <= VM.ValueLimits.maximumNestingDepth else {
+            throw VM.RuntimeTrap.valueNestingDepthExceeded(
+                maximum: VM.ValueLimits.maximumNestingDepth
+            )
+        }
         try consumeWork(units: 1)
         switch value {
         case let .string(string):
@@ -403,36 +418,43 @@ public final class InvocationBudget: @unchecked Sendable {
             try consumeVMHeap(bytes: UInt64(string.utf8.count))
         case let .array(values, _):
             try consumeAggregateStorage(elementCount: values.count)
-            for value in values { try consumeBoundaryValue(value) }
+            for value in values { try consumeBoundaryValue(value, depth: depth + 1) }
         case let .dictionary(entries, _, _):
             let elementCount = entries.count.multipliedReportingOverflow(by: 2)
             guard !elementCount.overflow else { throw VM.RuntimeTrap.vmHeapLimitExceeded }
             try consumeAggregateStorage(elementCount: elementCount.partialValue)
             for entry in entries {
-                try consumeBoundaryValue(entry.key)
-                try consumeBoundaryValue(entry.value)
+                try consumeBoundaryValue(entry.key, depth: depth + 1)
+                try consumeBoundaryValue(entry.value, depth: depth + 1)
             }
         case let .native(native):
             try consumeNativeOwned(bytes: native.estimatedByteCount)
         case let .tuple(elements):
             try consumeAggregateStorage(elementCount: elements.count)
-            for element in elements { try consumeBoundaryValue(element) }
+            for element in elements {
+                try consumeBoundaryValue(element, depth: depth + 1)
+            }
         case let .optional(.some(wrapped)):
             try consumeAggregateStorage(elementCount: 1)
-            try consumeBoundaryValue(wrapped)
+            try consumeBoundaryValue(wrapped, depth: depth + 1)
         case .optional(nil):
             try consumeAggregateStorage(elementCount: 0)
         case let .structure(_, fields):
             try consumeAggregateStorage(elementCount: fields.count)
-            for field in fields { try consumeBoundaryValue(field) }
+            for field in fields { try consumeBoundaryValue(field, depth: depth + 1) }
         case let .enumeration(_, _, payload):
             try consumeAggregateStorage(elementCount: payload == nil ? 0 : 1)
-            if let payload { try consumeBoundaryValue(payload) }
+            if let payload { try consumeBoundaryValue(payload, depth: depth + 1) }
         case let .error(error):
             try consumeAggregateStorage(elementCount: error.payload == nil ? 0 : 1)
             try consumeUTF8Work(byteCount: error.message.utf8.count)
             try consumeVMHeap(bytes: UInt64(error.message.utf8.count))
-            if let payload = error.payload { try consumeBoundaryValue(payload) }
+            if let payload = error.payload {
+                try consumeBoundaryValue(payload, depth: depth + 1)
+            }
+        case let .any(erased):
+            try consumeAggregateStorage(elementCount: 1)
+            try consumeBoundaryValue(erased.payload, depth: depth + 1)
         case .address:
             throw VM.RuntimeTrap.explicit("address values cannot cross a VM boundary")
         case .closure:

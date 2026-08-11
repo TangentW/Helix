@@ -46,7 +46,7 @@ struct Container {
         #expect(try Bytecode.Encoder.encode(module) == Bytecode.Encoder.encode(module))
     }
 
-    @Test("HLBC 1.9 decodes older canonical images and gates new contracts")
+    @Test("HLBC 1.10 decodes older canonical images and gates new contracts")
     func minorVersionCompatibility() throws {
         var legacyModule = try makeAddModule()
         legacyModule.compatibility.bytecode = .init(1, 0, 0)
@@ -81,7 +81,7 @@ struct Container {
             ).header.formatMinor == 1
         )
         newModule.compatibility.bytecode = Core.Versions.bytecode
-        #expect(try Bytecode.Decoder.decode(Bytecode.Encoder.encode(newModule)).header.formatMinor == 9)
+        #expect(try Bytecode.Decoder.decode(Bytecode.Encoder.encode(newModule)).header.formatMinor == 10)
 
         var stringModule = legacyModule
         stringModule.functions[0].registerTypes.append(.string)
@@ -140,7 +140,7 @@ struct Container {
             try Bytecode.Encoder.encode(tryModule, formatMinor: 1)
         }
         tryModule.compatibility.bytecode = Core.Versions.bytecode
-        #expect(try Bytecode.Decoder.decode(Bytecode.Encoder.encode(tryModule)).header.formatMinor == 9)
+        #expect(try Bytecode.Decoder.decode(Bytecode.Encoder.encode(tryModule)).header.formatMinor == 10)
 
         var throwModule = legacyModule
         throwModule.compatibility.bytecode = .init(1, 1, 0)
@@ -258,7 +258,7 @@ struct Container {
         #expect(
             try Bytecode.Decoder.decode(
                 Bytecode.Encoder.encode(nativeImportModule)
-            ).header.formatMinor == 9
+            ).header.formatMinor == 10
         )
 
         var languageExpansionModule = legacyModule
@@ -288,7 +288,7 @@ struct Container {
         dishonestCompatibility.compatibility.bytecode = .init(1, 2, 0)
         #expect(
             throws: Bytecode.CodecError.invalidHeader(
-                "HLBC format 1.9 exceeds declared bytecode compatibility 1.2.0"
+                "HLBC format 1.10 exceeds declared bytecode compatibility 1.2.0"
             )
         ) {
             try Bytecode.Encoder.encode(dishonestCompatibility)
@@ -337,7 +337,7 @@ struct Container {
         let decoded = try Bytecode.Decoder.decode(bytes)
         var canonicalModule = module
         canonicalModule.localTypes.sort { $0.key < $1.key }
-        #expect(decoded.header.formatMinor == 9)
+        #expect(decoded.header.formatMinor == 10)
         #expect(decoded.module == canonicalModule)
         #expect(try Bytecode.Encoder.encode(module) == Bytecode.Encoder.encode(canonicalModule))
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
@@ -401,7 +401,7 @@ struct Container {
         let bytes = try Bytecode.Encoder.encode(module)
         let decoded = try Bytecode.Decoder.decode(bytes)
 
-        #expect(decoded.header.formatMinor == 9)
+        #expect(decoded.header.formatMinor == 10)
         #expect(decoded.module == module)
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
     }
@@ -601,11 +601,13 @@ struct Container {
         module.capabilities.insert(.asyncLeafEntriesV1)
         module.functions[0].effects.isAsync = true
 
-        let bytes = try Bytecode.Encoder.encode(module)
+        let bytes = try Bytecode.Encoder.encode(module, formatMinor: 9)
         let decoded = try Bytecode.Decoder.decode(bytes)
         #expect(decoded.header.formatMinor == 9)
         #expect(decoded.module == module)
-        #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
+        #expect(
+            try Bytecode.Encoder.encode(decoded.module, formatMinor: 9) == bytes
+        )
 
         #expect(
             throws: Bytecode.CodecError.invalidHeader(

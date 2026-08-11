@@ -294,7 +294,7 @@ extension NativeImportDiscovery {
 
         private func isAutomaticallyBridgeable(_ type: Bytecode.ValueType) -> Bool {
             switch type {
-            case .bool, .integer, .float, .string, .native:
+            case .bool, .integer, .float, .string, .any, .native:
                 true
             case let .array(element), let .optional(element):
                 isAutomaticallyBridgeable(element)

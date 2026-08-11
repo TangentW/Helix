@@ -185,7 +185,8 @@ public struct Interpreter: Sendable {
                 visit(value)
             case let .closure(signature):
                 (signature.parameters + [signature.result]).forEach(visit)
-            case .void, .never, .bool, .integer, .float, .string, .local, .error:
+            case .void, .never, .bool, .integer, .float, .string, .any, .local,
+                 .error:
                 break
             }
         }
@@ -436,6 +437,75 @@ public struct Interpreter: Sendable {
                         : nil
                     try chargeAggregate(elementCount: projected == nil ? 0 : 1, budget: budget)
                     try initialize(.optional(projected), register: result, registers: &registers)
+                case let .eraseToAny(result, source):
+                    let sourceType = function.type(of: source)!
+                    let value = try read(source, registers: registers)
+                    let erased: VM.Value
+                    if sourceType == .any {
+                        guard case .any = value else {
+                            throw VM.RuntimeTrap.typeMismatch(
+                                expected: .any,
+                                actual: value.type
+                            )
+                        }
+                        erased = value
+                    } else {
+                        guard sourceType.isAnyPayloadV1 else {
+                            throw VM.RuntimeTrap.typeMismatch(
+                                expected: .any,
+                                actual: sourceType
+                            )
+                        }
+                        try chargeAggregate(elementCount: 1, budget: budget)
+                        erased = .any(
+                            .init(concreteType: sourceType, payload: value)
+                        )
+                    }
+                    try initialize(erased, register: result, registers: &registers)
+                case let .checkedCastAny(result, source):
+                    let value = try read(source, registers: registers)
+                    guard case let .any(erased) = value,
+                          case let .optional(targetType) = function.type(of: result)
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .any,
+                            actual: value.type
+                        )
+                    }
+                    let converted = try VM.DynamicCaster(budget: budget).cast(
+                        erased.payload,
+                        from: erased.concreteType,
+                        to: targetType
+                    )
+                    try chargeAggregate(
+                        elementCount: converted == nil ? 0 : 1,
+                        budget: budget
+                    )
+                    try initialize(
+                        .optional(converted),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .forceCastAny(result, source):
+                    let value = try read(source, registers: registers)
+                    guard case let .any(erased) = value else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .any,
+                            actual: value.type
+                        )
+                    }
+                    let targetType = function.type(of: result)!
+                    guard let converted = try VM.DynamicCaster(budget: budget).cast(
+                        erased.payload,
+                        from: erased.concreteType,
+                        to: targetType
+                    ) else {
+                        throw VM.RuntimeTrap.dynamicCastFailure(
+                            actual: erased.concreteType,
+                            expected: targetType
+                        )
+                    }
+                    try initialize(converted, register: result, registers: &registers)
                 case let .makeOptionalSome(result, value):
                     try chargeAggregate(elementCount: 1, budget: budget)
                     let payload = try consume(
@@ -1592,11 +1662,28 @@ public struct Interpreter: Sendable {
         _ value: VM.Value,
         expected: Bytecode.ValueType,
         localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition] = [:],
-        budget: VM.InvocationBudget? = nil
+        budget: VM.InvocationBudget? = nil,
+        depth: Int = 0
     ) throws {
+        guard depth <= VM.ValueLimits.maximumNestingDepth else {
+            throw VM.RuntimeTrap.valueNestingDepthExceeded(
+                maximum: VM.ValueLimits.maximumNestingDepth
+            )
+        }
         switch (value, expected) {
         case (.bool, .bool), (.string, .string):
             break
+        case let (.any(erased), .any):
+            guard erased.concreteType.isAnyPayloadV1 else {
+                throw VM.RuntimeTrap.typeMismatch(expected: .any, actual: .any)
+            }
+            try validateRuntimeValue(
+                erased.payload,
+                expected: erased.concreteType,
+                localTypes: localTypes,
+                budget: budget,
+                depth: depth + 1
+            )
         case let (.address(address), .address(pointee)):
             guard address.pointee == pointee, address.isScoped else {
                 throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
@@ -1638,7 +1725,8 @@ public struct Interpreter: Sendable {
                     value,
                     expected: field.type,
                     localTypes: localTypes,
-                    budget: budget
+                    budget: budget,
+                    depth: depth + 1
                 )
             }
         case let (.enumeration(actualKey, caseIndex, payload), .local(expectedKey)):
@@ -1658,7 +1746,8 @@ public struct Interpreter: Sendable {
                     value,
                     expected: type,
                     localTypes: localTypes,
-                    budget: budget
+                    budget: budget,
+                    depth: depth + 1
                 )
             default:
                 throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
@@ -1675,7 +1764,8 @@ public struct Interpreter: Sendable {
                     payload,
                     expected: .local(key),
                     localTypes: localTypes,
-                    budget: budget
+                    budget: budget,
+                    depth: depth + 1
                 )
             default:
                 throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
@@ -1689,7 +1779,8 @@ public struct Interpreter: Sendable {
                     element,
                     expected: type,
                     localTypes: localTypes,
-                    budget: budget
+                    budget: budget,
+                    depth: depth + 1
                 )
             }
         case let (.array(values, actualElement), .array(expectedElement)):
@@ -1701,7 +1792,8 @@ public struct Interpreter: Sendable {
                     element,
                     expected: expectedElement,
                     localTypes: localTypes,
-                    budget: budget
+                    budget: budget,
+                    depth: depth + 1
                 )
             }
         case let (
@@ -1719,30 +1811,33 @@ public struct Interpreter: Sendable {
             var keys = Set<VM.Value>()
             keys.reserveCapacity(entries.count)
             for entry in entries {
-                guard keys.insert(entry.key).inserted else {
-                    throw VM.RuntimeTrap.nativeFailure(
-                        "Dictionary boundary value contains a duplicate key"
-                    )
-                }
                 try validateRuntimeValue(
                     entry.key,
                     expected: expectedKey,
                     localTypes: localTypes,
-                    budget: budget
+                    budget: budget,
+                    depth: depth + 1
                 )
                 try validateRuntimeValue(
                     entry.value,
                     expected: expectedValue,
                     localTypes: localTypes,
-                    budget: budget
+                    budget: budget,
+                    depth: depth + 1
                 )
+                guard keys.insert(entry.key).inserted else {
+                    throw VM.RuntimeTrap.nativeFailure(
+                        "Dictionary boundary value contains a duplicate key"
+                    )
+                }
             }
         case let (.optional(.some(wrapped)), .optional(type)):
             try validateRuntimeValue(
                 wrapped,
                 expected: type,
                 localTypes: localTypes,
-                budget: budget
+                budget: budget,
+                depth: depth + 1
             )
         case (.optional(nil), .optional):
             break
@@ -1837,6 +1932,13 @@ public struct Interpreter: Sendable {
         switch value {
         case let .native(native):
             .native(try nativeTypeCatalog.copy(native))
+        case let .any(erased):
+            .any(
+                .init(
+                    concreteType: erased.concreteType,
+                    payload: try copy(erased.payload)
+                )
+            )
         case let .tuple(elements):
             .tuple(try elements.map(copy))
         case let .array(elements, elementType):
@@ -1901,43 +2003,67 @@ public struct Interpreter: Sendable {
         return result
     }
 
-    private func chargeCopiedValue(_ value: VM.Value, budget: VM.InvocationBudget) throws {
+    private func chargeCopiedValue(
+        _ value: VM.Value,
+        budget: VM.InvocationBudget,
+        depth: Int = 0
+    ) throws {
+        guard depth <= VM.ValueLimits.maximumNestingDepth else {
+            throw VM.RuntimeTrap.valueNestingDepthExceeded(
+                maximum: VM.ValueLimits.maximumNestingDepth
+            )
+        }
         try budget.consumeWork(units: 1)
         switch value {
         case let .native(native):
             try budget.consumeNativeOwned(bytes: native.estimatedByteCount)
+        case let .any(erased):
+            try budget.consumeAggregateStorage(elementCount: 1)
+            try chargeCopiedValue(
+                erased.payload,
+                budget: budget,
+                depth: depth + 1
+            )
         case let .tuple(elements):
             try budget.consumeAggregateStorage(elementCount: elements.count)
-            for element in elements { try chargeCopiedValue(element, budget: budget) }
+            for element in elements {
+                try chargeCopiedValue(element, budget: budget, depth: depth + 1)
+            }
         case let .array(elements, _):
             try budget.consumeAggregateStorage(elementCount: elements.count)
-            for element in elements { try chargeCopiedValue(element, budget: budget) }
+            for element in elements {
+                try chargeCopiedValue(element, budget: budget, depth: depth + 1)
+            }
         case let .dictionary(entries, _, _):
             try chargeDictionaryStorage(entryCount: entries.count, budget: budget)
             for entry in entries {
-                try chargeCopiedValue(entry.key, budget: budget)
-                try chargeCopiedValue(entry.value, budget: budget)
+                try chargeCopiedValue(entry.key, budget: budget, depth: depth + 1)
+                try chargeCopiedValue(entry.value, budget: budget, depth: depth + 1)
             }
         case let .optional(.some(wrapped)):
             try budget.consumeAggregateStorage(elementCount: 1)
-            try chargeCopiedValue(wrapped, budget: budget)
+            try chargeCopiedValue(wrapped, budget: budget, depth: depth + 1)
         case .optional(nil):
             try budget.consumeAggregateStorage(elementCount: 0)
         case let .structure(_, fields):
             try budget.consumeAggregateStorage(elementCount: fields.count)
-            for field in fields { try chargeCopiedValue(field, budget: budget) }
+            for field in fields {
+                try chargeCopiedValue(field, budget: budget, depth: depth + 1)
+            }
         case let .enumeration(_, _, payload):
             try budget.consumeAggregateStorage(elementCount: payload == nil ? 0 : 1)
-            if let payload { try chargeCopiedValue(payload, budget: budget) }
+            if let payload {
+                try chargeCopiedValue(payload, budget: budget, depth: depth + 1)
+            }
         case let .error(error):
             try budget.consumeAggregateStorage(elementCount: error.payload == nil ? 0 : 1)
             if let payload = error.payload {
-                try chargeCopiedValue(payload, budget: budget)
+                try chargeCopiedValue(payload, budget: budget, depth: depth + 1)
             }
         case let .closure(closure):
             try budget.consumeAggregateStorage(elementCount: closure.captures.count)
             for capture in closure.captures {
-                try chargeCopiedValue(capture, budget: budget)
+                try chargeCopiedValue(capture, budget: budget, depth: depth + 1)
             }
         case .bool, .integer, .float, .string, .address:
             break
@@ -1946,35 +2072,51 @@ public struct Interpreter: Sendable {
 
     private func chargeValueTraversal(
         _ value: VM.Value,
-        budget: VM.InvocationBudget
+        budget: VM.InvocationBudget,
+        depth: Int = 0
     ) throws {
+        guard depth <= VM.ValueLimits.maximumNestingDepth else {
+            throw VM.RuntimeTrap.valueNestingDepthExceeded(
+                maximum: VM.ValueLimits.maximumNestingDepth
+            )
+        }
         try budget.consumeWork(units: 1)
         switch value {
         case let .string(string):
             try budget.consumeUTF8Work(byteCount: string.utf8.count)
+        case let .any(erased):
+            try chargeValueTraversal(
+                erased.payload,
+                budget: budget,
+                depth: depth + 1
+            )
         case let .tuple(elements), let .array(elements, _):
             for element in elements {
-                try chargeValueTraversal(element, budget: budget)
+                try chargeValueTraversal(element, budget: budget, depth: depth + 1)
             }
         case let .dictionary(entries, _, _):
             for entry in entries {
-                try chargeValueTraversal(entry.key, budget: budget)
-                try chargeValueTraversal(entry.value, budget: budget)
+                try chargeValueTraversal(entry.key, budget: budget, depth: depth + 1)
+                try chargeValueTraversal(entry.value, budget: budget, depth: depth + 1)
             }
         case let .optional(.some(wrapped)):
-            try chargeValueTraversal(wrapped, budget: budget)
+            try chargeValueTraversal(wrapped, budget: budget, depth: depth + 1)
         case let .structure(_, fields):
-            for field in fields { try chargeValueTraversal(field, budget: budget) }
+            for field in fields {
+                try chargeValueTraversal(field, budget: budget, depth: depth + 1)
+            }
         case let .enumeration(_, _, payload):
-            if let payload { try chargeValueTraversal(payload, budget: budget) }
+            if let payload {
+                try chargeValueTraversal(payload, budget: budget, depth: depth + 1)
+            }
         case let .error(error):
             try budget.consumeUTF8Work(byteCount: error.message.utf8.count)
             if let payload = error.payload {
-                try chargeValueTraversal(payload, budget: budget)
+                try chargeValueTraversal(payload, budget: budget, depth: depth + 1)
             }
         case let .closure(closure):
             for capture in closure.captures {
-                try chargeValueTraversal(capture, budget: budget)
+                try chargeValueTraversal(capture, budget: budget, depth: depth + 1)
             }
         case .optional(nil), .native, .bool, .integer, .float, .address:
             break
@@ -1995,32 +2137,48 @@ public struct Interpreter: Sendable {
 
     private func chargeShapeValidation(
         _ value: VM.Value,
-        budget: VM.InvocationBudget
+        budget: VM.InvocationBudget,
+        depth: Int = 0
     ) throws {
+        guard depth <= VM.ValueLimits.maximumNestingDepth else {
+            throw VM.RuntimeTrap.valueNestingDepthExceeded(
+                maximum: VM.ValueLimits.maximumNestingDepth
+            )
+        }
         try budget.consumeWork(units: 1)
         switch value {
+        case let .any(erased):
+            try chargeShapeValidation(
+                erased.payload,
+                budget: budget,
+                depth: depth + 1
+            )
         case let .tuple(elements), let .array(elements, _):
             for element in elements {
-                try chargeShapeValidation(element, budget: budget)
+                try chargeShapeValidation(element, budget: budget, depth: depth + 1)
             }
         case let .dictionary(entries, _, _):
             for entry in entries {
-                try chargeShapeValidation(entry.key, budget: budget)
-                try chargeShapeValidation(entry.value, budget: budget)
+                try chargeShapeValidation(entry.key, budget: budget, depth: depth + 1)
+                try chargeShapeValidation(entry.value, budget: budget, depth: depth + 1)
             }
         case let .optional(.some(wrapped)):
-            try chargeShapeValidation(wrapped, budget: budget)
+            try chargeShapeValidation(wrapped, budget: budget, depth: depth + 1)
         case let .structure(_, fields):
-            for field in fields { try chargeShapeValidation(field, budget: budget) }
+            for field in fields {
+                try chargeShapeValidation(field, budget: budget, depth: depth + 1)
+            }
         case let .enumeration(_, _, payload):
-            if let payload { try chargeShapeValidation(payload, budget: budget) }
+            if let payload {
+                try chargeShapeValidation(payload, budget: budget, depth: depth + 1)
+            }
         case let .error(error):
             if let payload = error.payload {
-                try chargeShapeValidation(payload, budget: budget)
+                try chargeShapeValidation(payload, budget: budget, depth: depth + 1)
             }
         case let .closure(closure):
             for capture in closure.captures {
-                try chargeShapeValidation(capture, budget: budget)
+                try chargeShapeValidation(capture, budget: budget, depth: depth + 1)
             }
         case .optional(nil), .native, .bool, .integer, .float, .string, .address:
             break

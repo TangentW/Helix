@@ -4,8 +4,9 @@ import HelixCore
 import HelixVM
 
 extension Runtime {
-/// Strongly typed primitives used by generated Shell bridges. Aggregate shape
-/// remains compiler-generated; this codec never infers a Swift ABI from `Any`.
+/// Value codecs used by generated Shell bridges. Statically typed aggregates
+/// remain compiler-generated; dynamic `Any` uses a closed standard-library
+/// subset and never interprets native object layout or Swift ABI metadata.
 public enum BridgeValueCodec {
     /// Encodes a Swift Boolean as a VM Boolean value.
     public static func encode(_ value: Bool) throws -> VM.Value {

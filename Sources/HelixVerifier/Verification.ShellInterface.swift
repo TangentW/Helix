@@ -122,7 +122,11 @@ public struct ShellInterface: Sendable {
         for index in entries.keys.sorted() {
             guard let entry = entries[index] else { continue }
             for type in entry.parameterTypes + [entry.resultType] {
-                try Self.validateBoundaryType(type, owner: "entry \(entry.index)")
+                try Self.validateBoundaryType(
+                    type,
+                    owner: "entry \(entry.index)",
+                    capabilities: capabilities
+                )
             }
         }
         for id in imports.keys.sorted() {
@@ -130,7 +134,8 @@ public struct ShellInterface: Sendable {
             for type in descriptor.parameterTypes + [descriptor.resultType] {
                 try Self.validateBoundaryType(
                     type,
-                    owner: "native import \(descriptor.id)"
+                    owner: "native import \(descriptor.id)",
+                    capabilities: capabilities
                 )
             }
         }
@@ -138,9 +143,16 @@ public struct ShellInterface: Sendable {
 
     private static func validateBoundaryType(
         _ type: Bytecode.ValueType,
-        owner: String
+        owner: String,
+        capabilities: Set<Core.Capability>
     ) throws {
         switch type {
+        case .any:
+            guard capabilities.contains(.anyValuesV1) else {
+                throw Verification.Error.invalidShellInterface(
+                    "Any in \(owner) signature requires \(Core.Capability.anyValuesV1)"
+                )
+            }
         case .local, .error, .address, .closure:
             // Local nominal identities exist only inside one verified image and
             // therefore cannot be frozen into a Shell ABI or NativeImport catalog.
@@ -148,12 +160,22 @@ public struct ShellInterface: Sendable {
                 "patch-local nominal, Error, address, and closure values cannot appear in \(owner) signature"
             )
         case let .array(element), let .optional(element):
-            try validateBoundaryType(element, owner: owner)
+            try validateBoundaryType(
+                element,
+                owner: owner,
+                capabilities: capabilities
+            )
         case let .dictionary(key, value):
-            try validateBoundaryType(key, owner: owner)
-            try validateBoundaryType(value, owner: owner)
+            try validateBoundaryType(key, owner: owner, capabilities: capabilities)
+            try validateBoundaryType(value, owner: owner, capabilities: capabilities)
         case let .tuple(elements):
-            for element in elements { try validateBoundaryType(element, owner: owner) }
+            for element in elements {
+                try validateBoundaryType(
+                    element,
+                    owner: owner,
+                    capabilities: capabilities
+                )
+            }
         case .void, .never, .bool, .integer, .float, .string, .native:
             break
         }

@@ -66,6 +66,32 @@ public final class Encoder {
         return .string(value)
     }
 
+    func encodeDynamicLeaf(_ value: VM.Value) throws -> VM.Value {
+        switch value {
+        case let .string(string):
+            try requireActive()
+            try pollDeadline(force: true)
+            let byteCount = try count(string.utf8.count)
+            try reserveLeaf(estimatedVMBytes: byteCount)
+            try pollDeadline(force: true)
+        case .bool, .integer, .float:
+            try reserveLeaf()
+        default:
+            throw Runtime.BridgeInputError.encodedTypeMismatch(
+                expected: "a scalar Swift Any payload",
+                actual: value.type.description
+            )
+        }
+        return value
+    }
+
+    func encodeDynamicContainer(
+        childValueCount: Int,
+        body: () throws -> VM.Value
+    ) throws -> VM.Value {
+        try withContainer(childValueCount: childValueCount, body: body)
+    }
+
     /// Boxes an approved native value and charges its estimated owned bytes.
     public func encodeNative<Value>(
         _ value: Value,
@@ -362,6 +388,9 @@ public final class Encoder {
                 try add(UInt64(string.utf8.count), toVMBytesOf: &result, limits: limits)
             case let .native(native):
                 try add(native.estimatedByteCount, toNativeBytesOf: &result, limits: limits)
+            case let .any(erased):
+                try addAggregate(1, to: &result, limits: limits)
+                try append([erased.payload], below: depth, to: &pending, limits: limits)
             case let .array(elements, _):
                 try validate(elements.count, limits: limits)
                 try addAggregate(elements.count, to: &result, limits: limits)

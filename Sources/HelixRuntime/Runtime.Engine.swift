@@ -480,6 +480,7 @@ public final class Engine: @unchecked Sendable {
              .exclusivityViolation:
             true
         case .integerOverflow, .divisionByZero, .optionalUnwrapOfNil,
+             .dynamicCastFailure, .valueNestingDepthExceeded,
              .arrayIndexOutOfBounds, .unknownEntry,
              .instructionFuelExhausted, .callDepthExceeded, .nativeCallLimitExceeded,
              .vmHeapLimitExceeded, .nativeOwnedMemoryLimitExceeded,

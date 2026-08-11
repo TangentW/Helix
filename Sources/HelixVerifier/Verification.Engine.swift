@@ -239,6 +239,8 @@ public struct Engine: Verification.ImageVerifying {
                 )
             }
             switch type {
+            case .any:
+                break
             case .void, .never:
                 throw Verification.Error.invalidModule(
                     "local type members cannot be Void or Never"
@@ -371,8 +373,8 @@ public struct Engine: Verification.ImageVerifying {
                 try max(typeDepth(key), typeDepth(value)) + 1
             case let .tuple(elements):
                 try (elements.map(typeDepth).max() ?? 0) + 1
-            case .void, .never, .bool, .integer, .float, .string, .native, .error,
-                 .address, .closure:
+            case .void, .never, .bool, .integer, .float, .string, .any, .native,
+                 .error, .address, .closure:
                 0
             }
         }
@@ -417,7 +419,8 @@ public struct Engine: Verification.ImageVerifying {
                 try visit(value)
             case let .tuple(elements):
                 for element in elements { try visit(element) }
-            case .void, .never, .bool, .integer, .float, .string, .native, .error:
+            case .void, .never, .bool, .integer, .float, .string, .any, .native,
+                 .error:
                 break
             }
         }
@@ -653,7 +656,8 @@ public struct Engine: Verification.ImageVerifying {
             (signature.parameters + [signature.result]).contains {
                 usesMainActorNativeType($0, shell: shell)
             }
-        case .void, .never, .bool, .integer, .float, .string, .local, .error:
+        case .void, .never, .bool, .integer, .float, .string, .any, .local,
+             .error:
             false
         }
     }
@@ -675,7 +679,8 @@ public struct Engine: Verification.ImageVerifying {
             for component in signature.parameters + [signature.result] {
                 try verifyNativeTypes(component, shell: shell)
             }
-        case .void, .never, .bool, .integer, .float, .string, .local, .error:
+        case .void, .never, .bool, .integer, .float, .string, .any, .local,
+             .error:
             break
         }
     }
@@ -690,6 +695,10 @@ public struct Engine: Verification.ImageVerifying {
             case .string:
                 guard capabilities.contains(.stringsV1) else {
                     throw Verification.Error.capabilityDenied(.stringsV1)
+                }
+            case .any:
+                guard capabilities.contains(.anyValuesV1) else {
+                    throw Verification.Error.capabilityDenied(.anyValuesV1)
                 }
             case .native:
                 guard capabilities.contains(.nativeTypesV1) else {
@@ -1079,7 +1088,7 @@ public struct Engine: Verification.ImageVerifying {
                         reason: "Void/Never cannot be stored in a register"
                     )
                 }
-            case .bool, .string, .native, .local, .error:
+            case .bool, .string, .any, .native, .local, .error:
                 break
             }
         }
@@ -1366,6 +1375,32 @@ public struct Engine: Verification.ImageVerifying {
                   localTypes[expectedType]?.conformsToError == true
             else {
                 throw fail("cast_error requires Error and Optional<local Error> types")
+            }
+        case let .eraseToAny(result, value):
+            guard capabilities.contains(.anyValuesV1) else {
+                throw fail("erase_to_any requires \(Core.Capability.anyValuesV1)")
+            }
+            guard type(result) == .any,
+                  type(value).isAnyPayloadOrExistentialV1
+            else {
+                throw fail("erase_to_any requires a supported VM value and Any result")
+            }
+        case let .checkedCastAny(result, value):
+            guard capabilities.contains(.anyValuesV1) else {
+                throw fail("checked_cast_any requires \(Core.Capability.anyValuesV1)")
+            }
+            guard type(value) == .any,
+                  case let .optional(target) = type(result),
+                  target.isAnyCastTargetV1
+            else {
+                throw fail("checked_cast_any requires Any and Optional<supported target>")
+            }
+        case let .forceCastAny(result, value):
+            guard capabilities.contains(.anyValuesV1) else {
+                throw fail("force_cast_any requires \(Core.Capability.anyValuesV1)")
+            }
+            guard type(value) == .any, type(result).isAnyCastTargetV1 else {
+                throw fail("force_cast_any requires Any and a supported target")
             }
         case let .makeOptionalSome(result, value):
             guard case let .optional(wrapped) = type(result), wrapped == type(value) else {
@@ -2033,7 +2068,7 @@ public struct Engine: Verification.ImageVerifying {
             isCopyable(key, shell: shell) && isCopyable(value, shell: shell)
         case .void, .never, .address:
             false
-        case .bool, .integer, .float, .string, .local, .error:
+        case .bool, .integer, .float, .string, .any, .local, .error:
             true
         }
     }
@@ -2242,7 +2277,8 @@ public struct Engine: Verification.ImageVerifying {
                     live.insert(result)
                 }
             case .makeStruct, .structExtract, .makeEnum, .makeError, .castError,
-                 .stackAddress, .projectStructAddress, .beginAccess, .endAccess:
+                 .eraseToAny, .checkedCastAny, .forceCastAny, .stackAddress,
+                 .projectStructAddress, .beginAccess, .endAccess:
                 // HLBC 1.6 rejects native handles inside local nominal values,
                 // so these fully VM-managed operations cannot change the
                 // explicit native-ownership set.

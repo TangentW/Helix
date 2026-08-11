@@ -212,6 +212,71 @@ struct ReleaseDriver {
         )
     }
 
+    @Test("Changing a default value links its compiler-generated thunk into the patch")
+    func linksChangedDefaultArgumentGenerator() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("helix-release-default-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        @inline(never) public func helper(_ value: Int = 2) -> Int { value }
+        @inline(never) public func transform(_ value: Int) -> Int { value + helper() }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            optimization: "-Onone"
+        )
+        let helper = try #require(
+            archive.functions.first { $0.canonicalDeclaration.contains("helper") }
+        )
+        let transform = try #require(
+            archive.functions.first { $0.canonicalDeclaration.contains("transform") }
+        )
+        let helperEntry = try #require(helper.entryIndex)
+        let transformEntry = try #require(transform.entryIndex)
+
+        try Data(
+            """
+            @inline(never) public func helper(_ value: Int = 5) -> Int { value }
+            @inline(never) public func transform(_ value: Int) -> Int { value + helper() }
+            """.utf8
+        ).write(to: sourceURL)
+        let result = try driver.build(.init(archive: archive, sourceFiles: [sourceURL]))
+
+        #expect(result.changedFunctions.map(\.key) == [transform.key])
+        #expect(result.module.functions.contains {
+            $0.kind == .concreteSpecialization && $0.name.contains("fA")
+        })
+        #expect(result.disassembly.contains("entry_apply #\(helperEntry.rawValue)"))
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        let interpreter = VM.Interpreter(entryInvocation: { entry, arguments, _ in
+            guard entry == helperEntry, arguments.count == 1 else {
+                return .trapped(.unknownEntry(entry))
+            }
+            return .returned(arguments[0])
+        })
+        #expect(
+            interpreter.invoke(
+                entry: transformEntry,
+                image: image,
+                arguments: [
+                    .integer(try VM.Integer(signed: 3, bitWidth: 64, isSigned: true)),
+                ]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 8, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
     @Test("Changed Swift callees are linked inside one atomic HLBC image")
     func lowersCallsToLocalPatchFunctions() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -1881,6 +1946,8 @@ struct ReleaseDriver {
                 && !$0.mangledName.contains("fU")
                 && !$0.mangledName.contains("_Tg")
                 && !$0.mangledName.contains("Tf")
+                && !ReleaseCompiler.ImplementationFingerprint
+                    .isDefaultArgumentGenerator($0.mangledName)
         })
         let helperMatches = parsed.functions.filter {
             $0.mangledName.contains("helper")
@@ -1888,6 +1955,8 @@ struct ReleaseDriver {
                 && !$0.mangledName.contains("fU")
                 && !$0.mangledName.contains("_Tg")
                 && !$0.mangledName.contains("Tf")
+                && !ReleaseCompiler.ImplementationFingerprint
+                    .isDefaultArgumentGenerator($0.mangledName)
         }
         let helper = helperMatches.count == 1 ? helperMatches[0] : nil
         let lockedMatches = parsed.functions.filter { $0.mangledName.contains("locked") }

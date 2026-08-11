@@ -109,6 +109,7 @@ struct ReleasePipeline {
         #expect(report.eligibleCount == 1)
         #expect(report.rejectedCount == 1)
         #expect(report.archive.capabilities.contains(.asyncLeafEntriesV1))
+        #expect(report.archive.capabilities.contains(.anyValuesV1))
         #expect(report.archive.functions.first(where: {
             $0.mangledName == leaf.mangledName
         })?.patchability.isEligible == true)
@@ -122,6 +123,7 @@ struct ReleasePipeline {
         let legacyReport = try ReleaseCompiler.Indexer().index(legacy)
         #expect(legacyReport.eligibleCount == 0)
         #expect(!legacyReport.archive.capabilities.contains(.asyncLeafEntriesV1))
+        #expect(!legacyReport.archive.capabilities.contains(.anyValuesV1))
     }
 
     @Test("HLXI 2.3 derives leaf fingerprints and requires generated dependency fingerprints")
@@ -581,6 +583,8 @@ struct ReleasePipeline {
         public func select(_ values: [Int]) -> [Int] { values }
 
         public func remap(_ values: [String: Int]) -> [String: Int] { values }
+
+        public func echo(_ value: Any) -> Any { value }
         """
         try Data(source.utf8).write(to: sourceURL, options: .atomic)
 
@@ -634,6 +638,10 @@ struct ReleasePipeline {
         dictionaryInterface.baseName = "remap"
         dictionaryInterface.canonicalFormalType = "(Swift.Dictionary<Swift.String, Swift.Int>) -> Swift.Dictionary<Swift.String, Swift.Int>"
         dictionaryInterface.loweredSILType = "@convention(thin) (@guaranteed Dictionary<String, Int>) -> @owned Dictionary<String, Int>"
+        var anyInterface = commonInterface
+        anyInterface.baseName = "echo"
+        anyInterface.canonicalFormalType = "(Swift.Any) -> Swift.Any"
+        anyInterface.loweredSILType = "@convention(thin) (@in_guaranteed Any) -> @out Any"
         let report = try ReleaseCompiler.Indexer().index(
             .init(
                 metadata: metadata,
@@ -712,18 +720,49 @@ struct ReleasePipeline {
                         interface: dictionaryInterface,
                         canonicalSILBody: "return %0"
                     ),
+                    .init(
+                        moduleName: "Fixture",
+                        sourceFileLogicalID: "Sources/BridgeFeatures.swift",
+                        canonicalDeclaration: "func echo(_: Any) -> Any",
+                        mangledName: "$s7Fixture4echoyypypF",
+                        role: .function,
+                        loweredSignature: .init(
+                            parameters: ["Swift.Any"],
+                            result: "Swift.Any"
+                        ),
+                        parameterTypes: [.any],
+                        resultType: .any,
+                        interface: anyInterface,
+                        canonicalSILBody: "return %0"
+                    ),
                 ]
             )
         )
-        #expect(report.eligibleCount == 4)
+        #expect(report.eligibleCount == 5)
         #expect(report.archive.capabilities.contains(.untypedThrowsV1))
         #expect(report.archive.capabilities.contains(.mainActorSyncV1))
         #expect(report.archive.capabilities.contains(.collectionsV1))
         #expect(report.archive.capabilities.contains(.localNominalsV1))
         #expect(report.archive.capabilities.contains(.structuredErrorsV1))
+        #expect(report.archive.capabilities.contains(.anyValuesV1))
 
         let roots = try report.archive.functions.map { record -> BridgeGeneration.Root in
             let entry = try #require(record.entryIndex)
+            if record.canonicalDeclaration.contains("echo") {
+                return .init(
+                    functionKey: record.key,
+                    entryIndex: entry,
+                    sourceFileLogicalID: record.sourceFileLogicalID,
+                    privateImportSourceFile: "BridgeFeatures.swift",
+                    originalReference: "echo(_:)",
+                    replacementDeclaration: "public func helixBridge_echo(_ value: Any) -> Any",
+                    parameterExpressions: ["value"],
+                    parameterSwiftTypes: ["Swift.Any"],
+                    resultSwiftType: "Swift.Any",
+                    originalInvocation: "echo(value)",
+                    bridgeInvocation: "helixBridge_echo(argument0)"
+                )
+            }
             if record.canonicalDeclaration.contains("remap") {
                 return .init(
                     functionKey: record.key,
@@ -801,6 +840,9 @@ struct ReleasePipeline {
         #expect(entrySource.contains("BridgeValueCodec.decodeArray"))
         #expect(entrySource.contains("BridgeValueCodec.encodeDictionary"))
         #expect(entrySource.contains("BridgeValueCodec.decodeDictionary"))
+        #expect(entrySource.contains("encoder.encodeAny"))
+        #expect(entrySource.contains("BridgeValueCodec.encodeAny"))
+        #expect(entrySource.contains("BridgeValueCodec.decodeAny"))
         try typeCheckGeneratedBridge(
             bridge,
             baseSourceURL: sourceURL,

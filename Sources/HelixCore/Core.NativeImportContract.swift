@@ -150,13 +150,13 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
                 "state access disagrees with external side-effect metadata"
             )
         }
-        guard access != .io else {
-            throw Core.NativeImportContractError.invalid(
-                "synchronous native imports cannot perform I/O"
-            )
-        }
         guard execution.maximumDurationMicroseconds > 0 else {
             throw Core.NativeImportContractError.invalid("maximum duration must be positive")
+        }
+        if access == .io, execution.deadlineMode != .cooperative {
+            throw Core.NativeImportContractError.invalid(
+                "synchronous I/O native imports must use cooperative deadlines"
+            )
         }
         switch execution.deadlineMode {
         case .bounded:

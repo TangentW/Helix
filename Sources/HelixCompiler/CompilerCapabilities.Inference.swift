@@ -123,6 +123,8 @@ extension CompilerCapabilities {
         switch type {
         case .string:
             capabilities.insert(.stringsV1)
+        case .any:
+            capabilities.insert(.anyValuesV1)
         case .native:
             capabilities.insert(.nativeTypesV1)
         case .local:

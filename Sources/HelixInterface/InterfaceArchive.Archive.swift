@@ -578,6 +578,10 @@ public struct Archive: Codable, Hashable, Sendable {
                 guard capabilities.contains(.stringsV1) else {
                     throw InterfaceArchive.Error.invalidArchive("String capability is absent")
                 }
+            case .any:
+                guard capabilities.contains(.anyValuesV1) else {
+                    throw InterfaceArchive.Error.invalidArchive("Any capability is absent")
+                }
             case let .native(id):
                 guard capabilities.contains(.nativeTypesV1), emittedTypeIDs.contains(id) else {
                     throw InterfaceArchive.Error.invalidArchive("device signature references an un-emitted native type")
@@ -642,8 +646,8 @@ public struct Archive: Codable, Hashable, Sendable {
                 elements.contains(where: usesMainActorType)
             case let .closure(signature):
                 (signature.parameters + [signature.result]).contains(where: usesMainActorType)
-            case .void, .never, .bool, .integer, .float, .string, .local, .error,
-                 .address:
+            case .void, .never, .bool, .integer, .float, .string, .any, .local,
+                 .error, .address:
                 false
             }
         }
@@ -775,6 +779,19 @@ public struct Archive: Codable, Hashable, Sendable {
             else {
                 throw InterfaceArchive.Error.invalidArchive(
                     "async leaf entries require HLBC 1.9 and HLXI 2.4 compatibility"
+                )
+            }
+        }
+        if capabilities.contains(.anyValuesV1) {
+            let requiredBytecode = Core.SemanticVersion(1, 10, 0)
+            let requiredArchive = Core.SemanticVersion(2, 5, 0)
+            guard compatibility.bytecode.major == requiredBytecode.major,
+                  compatibility.bytecode >= requiredBytecode,
+                  compatibility.interfaceArchive.major == requiredArchive.major,
+                  compatibility.interfaceArchive >= requiredArchive
+            else {
+                throw InterfaceArchive.Error.invalidArchive(
+                    "Any values require HLBC 1.10 and HLXI 2.5 compatibility"
                 )
             }
         }

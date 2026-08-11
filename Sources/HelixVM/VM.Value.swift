@@ -64,6 +64,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
     case integer(VM.Integer)
     case float(Double, bitWidth: UInt16)
     case string(String)
+    case any(VM.AnyValue)
     case array([VM.Value], elementType: Bytecode.ValueType)
     case dictionary(
         [VM.DictionaryEntry],
@@ -89,6 +90,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .integer(value): .integer(bitWidth: value.bitWidth, signed: value.isSigned)
         case let .float(_, bitWidth): .float(bitWidth: bitWidth)
         case .string: .string
+        case .any: .any
         case let .array(_, elementType): .array(elementType)
         case let .dictionary(_, keyType, valueType):
             .dictionary(key: keyType, value: valueType)
@@ -108,6 +110,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .integer(value): value.description
         case let .float(value, _): String(value)
         case let .string(value): String(reflecting: value)
+        case let .any(value): value.payload.description
         case let .array(values, _): "[\(values.map(\.description).joined(separator: ", "))]"
         case let .dictionary(entries, _, _):
             "[\(entries.map { "\($0.key.description): \($0.value.description)" }.joined(separator: ", "))]"
@@ -194,11 +197,21 @@ public struct DictionaryEntry: Hashable, Sendable {
 
 extension VM.Value {
     public func matches(_ expected: Bytecode.ValueType) -> Bool {
-        switch (self, expected) {
+        matches(expected, depth: 0)
+    }
+
+    private func matches(_ expected: Bytecode.ValueType, depth: Int) -> Bool {
+        guard depth <= VM.ValueLimits.maximumNestingDepth else { return false }
+        return switch (self, expected) {
         case (.bool, .bool), (.string, .string): true
+        case let (.any(value), .any):
+            value.concreteType.isAnyPayloadV1
+                && value.payload.matches(value.concreteType, depth: depth + 1)
         case let (.array(values, actualElement), .array(expectedElement)):
             actualElement == expectedElement
-                && values.allSatisfy { $0.matches(expectedElement) }
+                && values.allSatisfy {
+                    $0.matches(expectedElement, depth: depth + 1)
+                }
         case let (
             .dictionary(entries, actualKey, actualValue),
             .dictionary(expectedKey, expectedValue)
@@ -206,7 +219,8 @@ extension VM.Value {
             actualKey == expectedKey
                 && actualValue == expectedValue
                 && entries.allSatisfy {
-                    $0.key.matches(expectedKey) && $0.value.matches(expectedValue)
+                    $0.key.matches(expectedKey, depth: depth + 1)
+                        && $0.value.matches(expectedValue, depth: depth + 1)
                 }
         case let (.native(value), .native(typeID)):
             value.typeID == typeID
@@ -224,11 +238,14 @@ extension VM.Value {
         case let (.float(_, actual), .float(expected)):
             actual == expected
         case let (.tuple(values), .tuple(types)):
-            values.count == types.count && zip(values, types).allSatisfy { $0.matches($1) }
+            values.count == types.count
+                && zip(values, types).allSatisfy {
+                    $0.matches($1, depth: depth + 1)
+                }
         case (.optional(nil), .optional):
             true
         case let (.optional(.some(value)), .optional(wrapped)):
-            value.matches(wrapped)
+            value.matches(wrapped, depth: depth + 1)
         default:
             false
         }

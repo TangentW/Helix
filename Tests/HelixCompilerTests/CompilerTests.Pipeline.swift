@@ -2559,6 +2559,1022 @@ struct Pipeline {
         )
     }
 
+    @Test("Swift Any erasure, dynamic casts, and type tests lower to verified HLBC")
+    func compilesCommonAnySyntax() throws {
+        let source = """
+        @inline(never)
+        public func eraseInt(_ value: Int) -> Any { value }
+
+        @inline(never)
+        public func eraseOptional(_ value: Int?) -> Any { value as Any }
+
+        @inline(never)
+        public func roundTripAny(_ value: Any) -> Any {
+            let copy: Any = value
+            return copy
+        }
+
+        @inline(never)
+        public func someErased(_ value: Int) -> Any? { value }
+
+        @inline(never)
+        public func noErased() -> Any? { nil }
+
+        @inline(never)
+        public func copyErasedOptional(_ value: Any?) -> Any? { value }
+
+        @inline(never)
+        public func unwrapErasedOptional(_ value: Any?) -> Int? {
+            guard let value else { return nil }
+            return value as? Int
+        }
+
+        public enum FixtureFailure: Error { case rejected }
+
+        public struct Payload {
+            public let value: Int
+        }
+
+        public struct Envelope {
+            public let payload: Any
+        }
+
+        @inline(never)
+        public func maybeBox(_ value: Int) throws -> Any {
+            if value < 0 { throw FixtureFailure.rejected }
+            return value
+        }
+
+        @inline(never)
+        public func checkedInt(_ value: Any) -> Int? { value as? Int }
+
+        @inline(never)
+        public func checkedOptional(_ value: Any) -> Int?? { value as? Int? }
+
+        @inline(never)
+        public func forcedInt(_ value: Any) -> Int { value as! Int }
+
+        @inline(never)
+        public func isInt(_ value: Any) -> Bool { value is Int }
+
+        @inline(never)
+        public func checkedArray(_ value: Any) -> [Int]? { value as? [Int] }
+
+        @inline(never)
+        public func boxTuple(_ value: Int, _ text: String) -> Any {
+            (value, text)
+        }
+
+        @inline(never)
+        public func checkedTuple(_ value: Any) -> (Int, String)? {
+            value as? (Int, String)
+        }
+
+        @inline(never)
+        public func boxPayload(_ value: Int) -> Any {
+            Payload(value: value)
+        }
+
+        @inline(never)
+        public func payloadValue(_ value: Any) -> Int? {
+            (value as? Payload)?.value
+        }
+
+        @inline(never)
+        public func envelopeValue(_ value: Int) -> Int {
+            let envelope = Envelope(payload: value)
+            return envelope.payload as! Int
+        }
+
+        @inline(never)
+        public func boxEnvelope(_ value: Int) -> Any {
+            Envelope(payload: value)
+        }
+
+        @inline(never)
+        public func envelopePayload(_ value: Any) -> Int? {
+            guard let envelope = value as? Envelope else { return nil }
+            return envelope.payload as? Int
+        }
+
+        @inline(never)
+        public func dictionaryValue(
+            _ values: [String: Any],
+            _ key: String
+        ) -> Int? {
+            guard let value = values[key] else { return nil }
+            return value as? Int
+        }
+
+        @inline(never)
+        public func conditionalInt(_ value: Any) -> Int {
+            if let integer = value as? Int { return integer }
+            return 0
+        }
+
+        @inline(never)
+        public func firstInt(_ values: [Any]) -> Int { values[0] as! Int }
+
+        @inline(never)
+        public func makeAnyArray(_ integer: Int, _ string: String) -> [Any] {
+            [integer, string]
+        }
+
+        @inline(never)
+        public func makeAnyDictionary(
+            _ integer: Int,
+            _ string: String
+        ) -> [String: Any] {
+            ["integer": integer, "string": string]
+        }
+        """
+        let arguments = ["-Xfrontend", "-disable-sil-perf-optzns"]
+        let int = VM.Value.integer(
+            try VM.Integer(signed: 7, bitWidth: 64, isSigned: true)
+        )
+        let boxedInt = VM.Value.any(
+            .init(concreteType: .int64, payload: int)
+        )
+        let boxedString = VM.Value.any(
+            .init(concreteType: .string, payload: .string("seven"))
+        )
+
+        let erasure = try compileFixture(
+            source: source,
+            functionName: "eraseInt",
+            signature: .init(parameters: ["Swift.Int"], result: "Swift.Any"),
+            parameterTypes: [.int64],
+            resultType: .any,
+            additionalFrontendArguments: arguments
+        )
+        #expect(erasure.compiled.disassembly.contains("erase_to_any"))
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: erasure.image,
+                arguments: [int]
+            ) == .returned(boxedInt)
+        )
+
+        let optionalIntType = Bytecode.ValueType.optional(.int64)
+        let nilInt = VM.Value.optional(nil)
+        let erasedOptional = try compileFixture(
+            source: source,
+            functionName: "eraseOptional",
+            signature: .init(
+                parameters: ["Swift.Optional<Swift.Int>"],
+                result: "Swift.Any"
+            ),
+            parameterTypes: [optionalIntType],
+            resultType: .any,
+            additionalFrontendArguments: arguments
+        )
+        let boxedNilInt = VM.Value.any(
+            .init(concreteType: optionalIntType, payload: nilInt)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: erasedOptional.image,
+                arguments: [nilInt]
+            ) == .returned(boxedNilInt)
+        )
+
+        let roundTrip = try compileFixture(
+            source: source,
+            functionName: "roundTripAny",
+            signature: .init(parameters: ["Swift.Any"], result: "Swift.Any"),
+            parameterTypes: [.any],
+            resultType: .any,
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: roundTrip.image,
+                arguments: [boxedString]
+            ) == .returned(boxedString)
+        )
+
+        let optionalAnyType = Bytecode.ValueType.optional(.any)
+        let someErased = try compileFixture(
+            source: source,
+            functionName: "someErased",
+            signature: .init(parameters: ["Swift.Int"], result: "Swift.Any?"),
+            parameterTypes: [.int64],
+            resultType: optionalAnyType,
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: someErased.image,
+                arguments: [int]
+            ) == .returned(.optional(boxedInt))
+        )
+        let noErased = try compileFixture(
+            source: source,
+            functionName: "noErased",
+            signature: .init(parameters: [], result: "Swift.Any?"),
+            parameterTypes: [],
+            resultType: optionalAnyType,
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: noErased.image,
+                arguments: []
+            ) == .returned(.optional(nil))
+        )
+        let copiedErased = try compileFixture(
+            source: source,
+            functionName: "copyErasedOptional",
+            signature: .init(parameters: ["Swift.Any?"], result: "Swift.Any?"),
+            parameterTypes: [optionalAnyType],
+            resultType: optionalAnyType,
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: copiedErased.image,
+                arguments: [.optional(boxedString)]
+            ) == .returned(.optional(boxedString))
+        )
+        let unwrappedErased = try compileFixture(
+            source: source,
+            functionName: "unwrapErasedOptional",
+            signature: .init(
+                parameters: ["Swift.Any?"],
+                result: "Swift.Optional<Swift.Int>"
+            ),
+            parameterTypes: [optionalAnyType],
+            resultType: .optional(.int64),
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: unwrappedErased.image,
+                arguments: [.optional(boxedInt)]
+            ) == .returned(.optional(int))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: unwrappedErased.image,
+                arguments: [.optional(nil)]
+            ) == .returned(.optional(nil))
+        )
+
+        let throwingErasure = try compileFixture(
+            source: source,
+            functionName: "maybeBox",
+            signature: .init(
+                parameters: ["Swift.Int"],
+                result: "Swift.Any",
+                isThrowing: true
+            ),
+            parameterTypes: [.int64],
+            resultType: .any,
+            effects: .init(mayThrow: true),
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: throwingErasure.image,
+                arguments: [int]
+            ) == .returned(boxedInt)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: throwingErasure.image,
+                arguments: [
+                    .integer(
+                        try VM.Integer(signed: -1, bitWidth: 64, isSigned: true)
+                    ),
+                ]
+            ) == .businessError("FixtureFailure.rejected")
+        )
+
+        let checked = try compileFixture(
+            source: source,
+            functionName: "checkedInt",
+            signature: .init(
+                parameters: ["Swift.Any"],
+                result: "Swift.Optional<Swift.Int>"
+            ),
+            parameterTypes: [.any],
+            resultType: .optional(.int64),
+            additionalFrontendArguments: arguments
+        )
+        #expect(checked.compiled.disassembly.contains("checked_cast_any"))
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: checked.image,
+                arguments: [boxedInt]
+            ) == .returned(.optional(int))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: checked.image,
+                arguments: [boxedString]
+            ) == .returned(.optional(nil))
+        )
+
+        let checkedOptional = try compileFixture(
+            source: source,
+            functionName: "checkedOptional",
+            signature: .init(
+                parameters: ["Swift.Any"],
+                result: "Swift.Optional<Swift.Optional<Swift.Int>>"
+            ),
+            parameterTypes: [.any],
+            resultType: .optional(optionalIntType),
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: checkedOptional.image,
+                arguments: [boxedNilInt]
+            ) == .returned(.optional(nilInt))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: checkedOptional.image,
+                arguments: [boxedString]
+            ) == .returned(.optional(nil))
+        )
+
+        let forced = try compileFixture(
+            source: source,
+            functionName: "forcedInt",
+            signature: .init(parameters: ["Swift.Any"], result: "Swift.Int"),
+            parameterTypes: [.any],
+            resultType: .int64,
+            additionalFrontendArguments: arguments
+        )
+        #expect(forced.compiled.disassembly.contains("force_cast_any"))
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: forced.image,
+                arguments: [boxedInt]
+            ) == .returned(int)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: forced.image,
+                arguments: [boxedString]
+            ) == .trapped(
+                .dynamicCastFailure(actual: .string, expected: .int64)
+            )
+        )
+
+        let typeTest = try compileFixture(
+            source: source,
+            functionName: "isInt",
+            signature: .init(parameters: ["Swift.Any"], result: "Swift.Bool"),
+            parameterTypes: [.any],
+            resultType: .bool,
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: typeTest.image,
+                arguments: [boxedInt]
+            ) == .returned(.bool(true))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: typeTest.image,
+                arguments: [boxedString]
+            ) == .returned(.bool(false))
+        )
+
+        let unwrapped = try compileFixture(
+            source: source,
+            functionName: "conditionalInt",
+            signature: .init(parameters: ["Swift.Any"], result: "Swift.Int"),
+            parameterTypes: [.any],
+            resultType: .int64,
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: unwrapped.image,
+                arguments: [boxedInt]
+            ) == .returned(int)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: unwrapped.image,
+                arguments: [boxedString]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 0, bitWidth: 64, isSigned: true))
+            )
+        )
+
+        let firstInt = try compileFixture(
+            source: source,
+            functionName: "firstInt",
+            signature: .init(
+                parameters: ["Swift.Array<Swift.Any>"],
+                result: "Swift.Int"
+            ),
+            parameterTypes: [.array(.any)],
+            resultType: .int64,
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: firstInt.image,
+                arguments: [.array([boxedInt], elementType: .any)]
+            ) == .returned(int)
+        )
+
+        let checkedArray = try compileFixture(
+            source: source,
+            functionName: "checkedArray",
+            signature: .init(
+                parameters: ["Swift.Any"],
+                result: "Swift.Optional<Swift.Array<Swift.Int>>"
+            ),
+            parameterTypes: [.any],
+            resultType: .optional(.array(.int64)),
+            additionalFrontendArguments: arguments
+        )
+        let boxedArray = VM.Value.any(
+            .init(
+                concreteType: .array(.any),
+                payload: .array([boxedInt], elementType: .any)
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: checkedArray.image,
+                arguments: [boxedArray]
+            ) == .returned(
+                .optional(.array([int], elementType: .int64))
+            )
+        )
+
+        let tupleType = Bytecode.ValueType.tuple([.int64, .string])
+        let tuple = VM.Value.tuple([int, .string("seven")])
+        let boxedTuple = VM.Value.any(
+            .init(concreteType: tupleType, payload: tuple)
+        )
+        let tupleErasure = try compileFixture(
+            source: source,
+            functionName: "boxTuple",
+            signature: .init(
+                parameters: ["Swift.Int", "Swift.String"],
+                result: "Swift.Any"
+            ),
+            parameterTypes: [.int64, .string],
+            resultType: .any,
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: tupleErasure.image,
+                arguments: [int, .string("seven")]
+            ) == .returned(boxedTuple)
+        )
+        let tupleCast = try compileFixture(
+            source: source,
+            functionName: "checkedTuple",
+            signature: .init(
+                parameters: ["Swift.Any"],
+                result: "Swift.Optional<(Swift.Int, Swift.String)>"
+            ),
+            parameterTypes: [.any],
+            resultType: .optional(tupleType),
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: tupleCast.image,
+                arguments: [boxedTuple]
+            ) == .returned(.optional(tuple))
+        )
+
+        let payloadErasure = try compileFixture(
+            source: source,
+            functionName: "boxPayload",
+            signature: .init(parameters: ["Swift.Int"], result: "Swift.Any"),
+            parameterTypes: [.int64],
+            resultType: .any,
+            additionalFrontendArguments: arguments
+        )
+        let payloadExecution = VM.Interpreter().invoke(
+            entry: .init(rawValue: 0),
+            image: payloadErasure.image,
+            arguments: [int]
+        )
+        guard case let .returned(boxedPayload?) = payloadExecution else {
+            Issue.record("local nominal Any erasure did not return a value")
+            return
+        }
+        let payloadCast = try compileFixture(
+            source: source,
+            functionName: "payloadValue",
+            signature: .init(
+                parameters: ["Swift.Any"],
+                result: "Swift.Optional<Swift.Int>"
+            ),
+            parameterTypes: [.any],
+            resultType: .optional(.int64),
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: payloadCast.image,
+                arguments: [boxedPayload]
+            ) == .returned(.optional(int))
+        )
+
+        let envelopeValue = try compileFixture(
+            source: source,
+            functionName: "envelopeValue",
+            signature: .init(parameters: ["Swift.Int"], result: "Swift.Int"),
+            parameterTypes: [.int64],
+            resultType: .int64,
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: envelopeValue.image,
+                arguments: [int]
+            ) == .returned(int)
+        )
+        let envelopeErasure = try compileFixture(
+            source: source,
+            functionName: "boxEnvelope",
+            signature: .init(parameters: ["Swift.Int"], result: "Swift.Any"),
+            parameterTypes: [.int64],
+            resultType: .any,
+            additionalFrontendArguments: arguments
+        )
+        let envelopeExecution = VM.Interpreter().invoke(
+            entry: .init(rawValue: 0),
+            image: envelopeErasure.image,
+            arguments: [int]
+        )
+        guard case let .returned(boxedEnvelope?) = envelopeExecution else {
+            Issue.record("Any-bearing local nominal did not erase to Any")
+            return
+        }
+        let envelopePayload = try compileFixture(
+            source: source,
+            functionName: "envelopePayload",
+            signature: .init(
+                parameters: ["Swift.Any"],
+                result: "Swift.Optional<Swift.Int>"
+            ),
+            parameterTypes: [.any],
+            resultType: .optional(.int64),
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: envelopePayload.image,
+                arguments: [boxedEnvelope]
+            ) == .returned(.optional(int))
+        )
+
+        let anyArrayType = Bytecode.ValueType.array(.any)
+        let arrayLiteral = try compileFixture(
+            source: source,
+            functionName: "makeAnyArray",
+            signature: .init(
+                parameters: ["Swift.Int", "Swift.String"],
+                result: "Swift.Array<Swift.Any>"
+            ),
+            parameterTypes: [.int64, .string],
+            resultType: anyArrayType,
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: arrayLiteral.image,
+                arguments: [int, .string("seven")]
+            ) == .returned(
+                .array([boxedInt, boxedString], elementType: .any)
+            )
+        )
+
+        let anyDictionaryType = Bytecode.ValueType.dictionary(
+            key: .string,
+            value: .any
+        )
+        let dictionaryLiteral = try compileFixture(
+            source: source,
+            functionName: "makeAnyDictionary",
+            signature: .init(
+                parameters: ["Swift.Int", "Swift.String"],
+                result: "Swift.Dictionary<Swift.String, Swift.Any>"
+            ),
+            parameterTypes: [.int64, .string],
+            resultType: anyDictionaryType,
+            additionalFrontendArguments: arguments
+        )
+        let anyDictionary = VM.Value.dictionary(
+            [
+                .init(key: .string("integer"), value: boxedInt),
+                .init(key: .string("string"), value: boxedString),
+            ],
+            keyType: .string,
+            valueType: .any
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: dictionaryLiteral.image,
+                arguments: [int, .string("seven")]
+            ) == .returned(anyDictionary)
+        )
+
+        let dictionaryValue = try compileFixture(
+            source: source,
+            functionName: "dictionaryValue",
+            signature: .init(
+                parameters: [
+                    "Swift.Dictionary<Swift.String, Swift.Any>",
+                    "Swift.String",
+                ],
+                result: "Swift.Optional<Swift.Int>"
+            ),
+            parameterTypes: [anyDictionaryType, .string],
+            resultType: .optional(.int64),
+            additionalFrontendArguments: arguments
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: dictionaryValue.image,
+                arguments: [anyDictionary, .string("integer")]
+            ) == .returned(.optional(int))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: dictionaryValue.image,
+                arguments: [anyDictionary, .string("string")]
+            ) == .returned(.optional(nil))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: dictionaryValue.image,
+                arguments: [anyDictionary, .string("missing")]
+            ) == .returned(.optional(nil))
+        )
+    }
+
+    @Test("Unsupported Any payloads fail with a focused type diagnostic")
+    func rejectsClosureErasedToAny() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-any-rejection-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        try Data(
+            """
+            @inline(never)
+            public func boxClosure(
+                _ transform: @escaping (Int) -> Int
+            ) -> Any {
+                transform
+            }
+            """.utf8
+        ).write(to: sourceURL)
+        let sil = try SwiftFrontend.Driver().emitCanonicalSIL(
+            sourceFiles: [sourceURL],
+            moduleName: "HelixAnyRejectionFixture",
+            additionalArguments: ["-Xfrontend", "-disable-sil-perf-optzns"]
+        )
+        let file = try CanonicalSIL.File(text: sil)
+        let function = try file.uniqueFunction(
+            mangledNameContaining: "boxClosure"
+        )
+
+        do {
+            _ = try CanonicalSIL.Lowerer(
+                typeEnvironment: file.typeEnvironment
+            ).lower(function, displayName: "boxClosure")
+            Issue.record("closure erased to Any unexpectedly lowered")
+        } catch let error as CanonicalSIL.LoweringError {
+            guard case let .unsupportedType(detail) = error else {
+                Issue.record("unexpected Any rejection: \(error)")
+                return
+            }
+            #expect(detail.contains("Any payload"))
+            #expect(detail.contains("closure"))
+        }
+    }
+
+    @Test("Same-image functions pass and return Any through Swift's indirect ABI")
+    func lowersAnyAcrossDirectCalls() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-any-call-sil-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        try Data(
+            """
+            @inline(never)
+            func makeAny(_ value: Int) -> Any { value }
+
+            @inline(never)
+            func echoAny(_ value: Any) -> Any { value }
+
+            enum CallFailure: Error { case rejected }
+
+            @inline(never)
+            func maybeAny(_ value: Int) throws -> Any {
+                if value < 0 { throw CallFailure.rejected }
+                return value
+            }
+
+            @inline(never)
+            func optionalErased(_ value: Int) -> Any? {
+                value == 0 ? nil : value
+            }
+
+            @inline(never)
+            public func callAny(_ value: Int) -> Int {
+                let first: Any = makeAny(value)
+                let second: Any = echoAny(first)
+                guard let optional = optionalErased(value) else { return -2 }
+                do {
+                    let third: Any = try maybeAny(value)
+                    return (second as! Int)
+                        + (third as! Int)
+                        + (optional as! Int)
+                } catch {
+                    return -1
+                }
+            }
+            """.utf8
+        ).write(to: sourceURL)
+        let sil = try SwiftFrontend.Driver().emitCanonicalSIL(
+            sourceFiles: [sourceURL],
+            moduleName: "HelixAnyCallFixture",
+            optimization: "-Onone",
+            additionalArguments: ["-Xfrontend", "-disable-sil-perf-optzns"]
+        )
+        let file = try CanonicalSIL.File(text: sil)
+        let root = try file.uniqueFunction(mangledNameContaining: "callB0")
+        let makeAny = try file.uniqueFunction(mangledNameContaining: "makeB0")
+        let echoAny = try file.uniqueFunction(mangledNameContaining: "echoB0")
+        let maybeAny = try file.uniqueFunction(mangledNameContaining: "maybeB0")
+        let optionalErased = try file.uniqueFunction(
+            mangledNameContaining: "optionalErased"
+        )
+        let directCalls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: makeAny.mangledName,
+                parameterTypes: [.int64],
+                resultType: .any,
+                target: .function(.init(rawValue: 1))
+            ),
+            .init(
+                mangledName: echoAny.mangledName,
+                parameterTypes: [.any],
+                resultType: .any,
+                target: .function(.init(rawValue: 2))
+            ),
+            .init(
+                mangledName: maybeAny.mangledName,
+                parameterTypes: [.int64],
+                resultType: .any,
+                effects: .init(mayThrow: true),
+                target: .function(.init(rawValue: 3))
+            ),
+            .init(
+                mangledName: optionalErased.mangledName,
+                parameterTypes: [.int64],
+                resultType: .optional(.any),
+                target: .function(.init(rawValue: 4))
+            ),
+        ])
+        let lowerer = CanonicalSIL.Lowerer(typeEnvironment: file.typeEnvironment)
+        let lowered = [
+            try lowerer.lower(
+                root,
+                displayName: "callAny",
+                directCalls: directCalls
+            ),
+            try lowerer.lower(
+                makeAny,
+                displayName: "makeAny",
+                directCalls: directCalls
+            ),
+            try lowerer.lower(
+                echoAny,
+                displayName: "echoAny",
+                directCalls: directCalls
+            ),
+            try lowerer.lower(
+                maybeAny,
+                displayName: "maybeAny",
+                directCalls: directCalls
+            ),
+            try lowerer.lower(
+                optionalErased,
+                displayName: "optionalErased",
+                directCalls: directCalls
+            ),
+        ]
+        let shellHash = Core.Digest.sha256("helix-any-call-sil-shell")
+        let compatibility = Core.Compatibility(
+            runtime: Core.Versions.runtime,
+            bytecode: Core.Versions.bytecode,
+            interfaceArchive: Core.Versions.interfaceArchive,
+            compilerFingerprint: "swift-any-call-sil-fixture"
+        )
+        let functionKey = try Core.FunctionKey.derive(
+            namespace: .derive(
+                bundleID: "dev.helix.any-call",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            module: "HelixAnyCallFixture",
+            sourceFileLogicalID: "Patch.swift",
+            canonicalDeclaration: "func callAny(_: Int) -> Int",
+            loweredSignature: .init(
+                parameters: ["Swift.Int"],
+                result: "Swift.Int"
+            ),
+            role: .function
+        )
+        let capabilities = CompilerCapabilities.infer(for: lowered)
+        let module = Bytecode.Module(
+            name: "HelixAnyCallFixture",
+            shellInterfaceHash: shellHash,
+            compatibility: compatibility,
+            capabilities: capabilities,
+            functions: lowered.enumerated().map { index, function in
+                IntermediateRepresentation.ToBytecode.lower(
+                    function,
+                    id: .init(rawValue: UInt32(index))
+                )
+            },
+            entries: [
+                .init(
+                    entryIndex: .init(rawValue: 0),
+                    functionKey: functionKey,
+                    functionID: .init(rawValue: 0)
+                ),
+            ]
+        )
+        let shell = try Verification.ShellInterface(
+            interfaceHash: shellHash,
+            compatibility: compatibility,
+            capabilities: capabilities,
+            entries: [
+                .init(
+                    index: .init(rawValue: 0),
+                    key: functionKey,
+                    parameterTypes: [.int64],
+                    resultType: .int64
+                ),
+            ]
+        )
+        let image = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(module),
+            shell: shell,
+            policy: .init(acceptedCapabilities: capabilities)
+        )
+        let input = VM.Value.integer(
+            try VM.Integer(signed: 42, bitWidth: 64, isSigned: true)
+        )
+        let tripled = VM.Value.integer(
+            try VM.Integer(signed: 126, bitWidth: 64, isSigned: true)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [input]
+            ) == .returned(tripled)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    .integer(
+                        try VM.Integer(signed: -2, bitWidth: 64, isSigned: true)
+                    ),
+                ]
+            ) == .returned(
+                .integer(try VM.Integer(signed: -1, bitWidth: 64, isSigned: true))
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    .integer(try VM.Integer(signed: 0, bitWidth: 64, isSigned: true)),
+                ]
+            ) == .returned(
+                .integer(try VM.Integer(signed: -2, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
+    @Test("Escaping synchronous closures return Any through Swift's indirect ABI")
+    func lowersAnyReturnedFromEscapingClosure() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-any-closure-sil-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        try Data(
+            """
+            @inline(never)
+            public func invokeAny(_ body: @escaping () -> Any) -> Any {
+                body()
+            }
+            """.utf8
+        ).write(to: sourceURL)
+        let sil = try SwiftFrontend.Driver().emitCanonicalSIL(
+            sourceFiles: [sourceURL],
+            moduleName: "HelixAnyClosureFixture",
+            additionalArguments: [
+                "-Xfrontend",
+                "-disable-sil-perf-optzns",
+            ]
+        )
+        let file = try CanonicalSIL.File(text: sil)
+        let function = try file.uniqueFunction(mangledNameContaining: "invokeB0")
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: file.typeEnvironment
+        ).lower(function, displayName: "invokeAny")
+
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let results = instructions.compactMap { instruction -> Bytecode.Register? in
+            guard case let .closureApply(result, _, _) = instruction else {
+                return nil
+            }
+            return result
+        }
+        #expect(lowered.resultType == .any)
+        #expect(results.count == 1)
+        if let result = results.first {
+            #expect(lowered.registerTypes[Int(result.rawValue)] == .any)
+        }
+        #expect(instructions.contains { instruction in
+            if case .storeStack = instruction { return true }
+            return false
+        })
+        #expect(instructions.contains { instruction in
+            if case .loadStack = instruction { return true }
+            return false
+        })
+    }
+
     @Test("Dictionary literals, lookup, mutation, properties, and iteration preserve value semantics")
     func compilesCommonDictionarySyntax() throws {
         let source = """

@@ -87,7 +87,7 @@ extension ReleaseCompiler {
                 "function \(key) changed its lowered Swift/SIL signature"
             case .noSemanticChanges: "no selected function body differs from the HLXI baseline"
             case let .generatedFunctionUnsupported(symbol, reason):
-                "compiler-generated function \(symbol) is outside the HLBC 1.8 profile: \(reason)"
+                "compiler-generated function \(symbol) is outside the current HLBC profile: \(reason)"
             case let .toolchainMismatch(expected, actual):
                 "exact Swift toolchain mismatch; HLXI requires \(expected), current compiler is \(actual)"
             case let .compilerIdentityFailed(reason): "cannot fingerprint Swift compiler: \(reason)"
@@ -334,7 +334,8 @@ extension ReleaseCompiler {
                         if let exact = recordsBySymbol[symbol] { return exact.key }
                         return specializationSources.first {
                             symbol.hasPrefix($0.mangledName)
-                                && isCompilerGeneratedSymbol(symbol)
+                                && ReleaseCompiler.ImplementationFingerprint
+                                    .isCompilerGeneratedSymbol(symbol)
                         }?.key
                     })
                 )
@@ -755,10 +756,8 @@ extension ReleaseCompiler {
             )
         }
 
-        private struct DiscoveredGeneratedFunction {
-            var function: CanonicalSIL.Function
-            var kind: Bytecode.FunctionKind
-        }
+        private typealias DiscoveredGeneratedFunction =
+            CanonicalSIL.GeneratedFunctions.Discovered
 
         private struct GeneratedFunction {
             var symbol: String
@@ -769,12 +768,7 @@ extension ReleaseCompiler {
             var semantic: CanonicalSIL.Function?
         }
 
-        private struct GeneratedSignature: Equatable {
-            var parameters: [Bytecode.ValueType]
-            var parameterConventions: [Bytecode.ParameterConvention]
-            var result: Bytecode.ValueType
-            var effects: Core.Effects
-        }
+        private typealias GeneratedSignature = CanonicalSIL.GeneratedFunctions.Signature
 
         private func isLocalArchivedHelper(
             _ record: InterfaceArchive.FunctionRecord
@@ -817,121 +811,21 @@ extension ReleaseCompiler {
             startingAt archivedSymbols: Set<String>,
             archive: InterfaceArchive.Archive
         ) throws -> [String: DiscoveredGeneratedFunction] {
-            let archived = Set(archive.functions.map(\.mangledName))
-            var pending = try archivedSymbols.sorted().flatMap { symbol in
-                try file.function(mangledName: symbol)
-                    .map { try generatedReferences(in: $0.body, archive: archive) }
-                    ?? []
-            }
-            var visited = Set<String>()
-            var kindBySymbol: [String: Bytecode.FunctionKind] = [:]
-            var result: [String: DiscoveredGeneratedFunction] = [:]
-            while let reference = pending.popLast() {
-                let symbol = reference.symbol
-                if let existingKind = kindBySymbol[symbol], existingKind != reference.kind {
-                    throw DriverError.generatedFunctionUnsupported(
-                        symbol,
-                        reason: "different callers use the same generated function as incompatible roles"
-                    )
-                }
-                kindBySymbol[symbol] = reference.kind
-                guard visited.insert(symbol).inserted, !archived.contains(symbol) else {
-                    continue
-                }
-                guard let function = file.function(mangledName: symbol) else { continue }
-                result[symbol] = .init(function: function, kind: reference.kind)
-                pending.append(
-                    contentsOf: try generatedReferences(
-                        in: function.body,
-                        archive: archive
-                    )
+            do {
+                return try CanonicalSIL.GeneratedFunctions.discover(
+                    in: file,
+                    startingAt: archivedSymbols,
+                    excluding: Set(archive.functions.map(\.mangledName)),
+                    kindForSymbol: { symbol in
+                        generatedFunctionKind(symbol, archive: archive)
+                    }
                 )
-            }
-            return result
-        }
-
-        private enum GeneratedReferenceUsage: Hashable {
-            case closureConstruction
-            case directCall
-        }
-
-        private func generatedReferences(
-            in body: String,
-            archive: InterfaceArchive.Archive
-        ) throws -> [(symbol: String, kind: Bytecode.FunctionKind)] {
-            var symbolByValue: [String: String] = [:]
-            var usageBySymbol: [String: Set<GeneratedReferenceUsage>] = [:]
-
-            for rawLine in body.split(separator: "\n") {
-                let line = String(rawLine).trimmingCharacters(in: .whitespaces)
-                if let marker = line.range(of: "function_ref @"),
-                   let result = silResultValue(in: line) {
-                    let suffix = line[marker.upperBound...]
-                    let end = suffix.firstIndex { $0 == " " || $0 == ":" }
-                        ?? suffix.endIndex
-                    let symbol = String(suffix[..<end])
-                    if !symbol.isEmpty { symbolByValue[result] = symbol }
-                    continue
-                }
-                for marker in [" = begin_borrow ", " = copy_value ", " = move_value "] {
-                    guard line.contains(marker),
-                          let result = silResultValue(in: line),
-                          let source = silValue(after: marker, in: line),
-                          let symbol = symbolByValue[source]
-                    else { continue }
-                    symbolByValue[result] = symbol
-                }
-                if let source = silValue(after: "partial_apply", in: line)
-                    ?? silValue(after: "thin_to_thick_function", in: line),
-                   let symbol = symbolByValue[source] {
-                    usageBySymbol[symbol, default: []].insert(.closureConstruction)
-                    continue
-                }
-                if let source = silValue(after: "apply", in: line),
-                   let symbol = symbolByValue[source] {
-                    usageBySymbol[symbol, default: []].insert(.directCall)
+            } catch let error as CanonicalSIL.GeneratedFunctions.DiscoveryError {
+                switch error {
+                case let .unsupported(symbol, reason):
+                    throw DriverError.generatedFunctionUnsupported(symbol, reason: reason)
                 }
             }
-
-            return try ReleaseCompiler.ImplementationFingerprint
-                .referencedSymbols(in: body).sorted().compactMap { symbol in
-                    guard isCompilerGeneratedSymbol(symbol),
-                          let fallback = generatedFunctionKind(
-                            symbol,
-                            archive: archive
-                          )
-                    else { return nil }
-                    let usages = usageBySymbol[symbol, default: []]
-                    guard usages.count <= 1 else {
-                        throw DriverError.generatedFunctionUnsupported(
-                            symbol,
-                            reason: "the same generated function is both directly called and used as a closure body"
-                        )
-                    }
-                    let kind: Bytecode.FunctionKind = switch usages.first {
-                    case .closureConstruction: .closureBody
-                    case .directCall: .concreteSpecialization
-                    case nil: fallback
-                    }
-                    return (symbol, kind)
-                }
-        }
-
-        private func silResultValue(in line: String) -> String? {
-            guard let equals = line.range(of: " =") else { return nil }
-            let value = line[..<equals.lowerBound]
-                .trimmingCharacters(in: .whitespaces)
-            return value.first == "%" ? value : nil
-        }
-
-        private func silValue(after marker: String, in line: String) -> String? {
-            guard let range = line.range(of: marker) else { return nil }
-            let suffix = line[range.upperBound...]
-            guard let percent = suffix.firstIndex(of: "%") else { return nil }
-            let tail = suffix[percent...]
-            let end = tail.dropFirst().firstIndex { !$0.isNumber } ?? tail.endIndex
-            let value = String(tail[..<end])
-            return value.count > 1 ? value : nil
         }
 
         private func generatedSignature(
@@ -940,26 +834,16 @@ extension ReleaseCompiler {
             symbol: String
         ) throws -> GeneratedSignature {
             do {
-                let parsed = try CanonicalSIL.Lowerer(
-                    typeEnvironment: environment
-                ).parseFunctionType(function.loweredType)
-                guard !parsed.effects.isAsync else {
-                    throw DriverError.generatedFunctionUnsupported(
-                        symbol,
-                        reason: "async generated helpers require a suspension-aware call contract"
-                    )
+                return try CanonicalSIL.GeneratedFunctions.signature(
+                    of: function,
+                    environment: environment,
+                    symbol: symbol
+                )
+            } catch let error as CanonicalSIL.GeneratedFunctions.DiscoveryError {
+                switch error {
+                case let .unsupported(symbol, reason):
+                    throw DriverError.generatedFunctionUnsupported(symbol, reason: reason)
                 }
-                return .init(
-                    parameters: parsed.parameters,
-                    parameterConventions: parsed.parameterConventions,
-                    result: parsed.result,
-                    effects: parsed.effects
-                )
-            } catch {
-                throw DriverError.generatedFunctionUnsupported(
-                    symbol,
-                    reason: "its lowered signature is not fully concrete: \(error)"
-                )
             }
         }
 
@@ -967,6 +851,15 @@ extension ReleaseCompiler {
             _ symbol: String,
             archive: InterfaceArchive.Archive
         ) -> Bytecode.FunctionKind? {
+            if ReleaseCompiler.ImplementationFingerprint
+                .isDefaultArgumentGenerator(symbol) {
+                return .concreteSpecialization
+            }
+            // A closure used by a default expression is rooted in the default
+            // argument helper rather than in an archived App declaration.
+            if symbol.contains("fA"), symbol.contains("cfU") || symbol.contains("fU") {
+                return .closureBody
+            }
             guard archive.functions.contains(where: {
                 symbol != $0.mangledName && symbol.hasPrefix($0.mangledName)
             }) else { return nil }
@@ -977,11 +870,6 @@ extension ReleaseCompiler {
                 return .closureBody
             }
             return nil
-        }
-
-        private func isCompilerGeneratedSymbol(_ symbol: String) -> Bool {
-            ReleaseCompiler.ImplementationFingerprint
-                .isCompilerGeneratedSymbol(symbol)
         }
 
         private func reachableFunctions(

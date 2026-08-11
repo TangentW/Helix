@@ -158,8 +158,8 @@ struct Identities {
         }
     }
 
-    @Test("Unsafe synchronous native contracts are rejected centrally")
-    func rejectsUnsafeNativeImportContracts() {
+    @Test("Synchronous native contracts enforce declared effects and deadlines")
+    func validatesNativeImportContracts() throws {
         let io = Core.NativeImportContract.cooperative(
             kind: .serviceMethod,
             domain: .application,
@@ -167,8 +167,21 @@ struct Identities {
             maximumDurationMicroseconds: 10_000,
             allowsMainThread: false
         )
+        try io.validate(effects: .init(hasExternalSideEffects: true))
         #expect(throws: Core.NativeImportContractError.self) {
-            try io.validate(effects: .init(hasExternalSideEffects: true))
+            try io.validate(effects: .init(hasExternalSideEffects: false))
+        }
+        let nonCooperativeIO = Core.NativeImportContract.bounded(
+            kind: .serviceMethod,
+            domain: .application,
+            access: .io,
+            maximumDurationMicroseconds: 1_000,
+            allowsMainThread: false
+        )
+        #expect(throws: Core.NativeImportContractError.self) {
+            try nonCooperativeIO.validate(
+                effects: .init(hasExternalSideEffects: true)
+            )
         }
 
         let dishonestGetter = Core.NativeImportContract.bounded(

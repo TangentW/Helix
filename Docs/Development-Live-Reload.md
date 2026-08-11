@@ -125,6 +125,17 @@ that Shell. Entry routes are preferred, so ordinary calls between patchable App
 functions remain generation-aware; NativeImport is for a bounded API whose
 native implementation must run outside HLVM.
 
+Every new Dev Shell automatically includes the exact NativeImport for
+`Swift.print(_:separator:terminator:)`, so adding
+`print("value:", value)` to a supported body needs no App catalog setup. The
+compiler lowers the variadic arguments into a VM-owned `Array<Any>` and links
+the omitted separator/terminator as ordinary default-argument generators in
+the same image. Fully concrete defaults on other functions use the same
+mechanism; an ineligible affected caller or remaining generic metadata fails
+the save transaction with a full-build diagnostic. Cross-module public/package
+default changes also require a normal build because one module receipt cannot
+prove that every precompiled caller was replaced.
+
 For a supported source `class` instance method, the hidden Bridge carries
 `self` as a frozen reference `TypeID`. Generated `NativeTypeOperations` retain,
 identify, and validate the object without exposing a process pointer in HLBC.

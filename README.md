@@ -87,7 +87,7 @@ Live Reload acceptance run.
   capabilities, quotas, diagnostics, and interface archives.
 - Release Derived Sources and permanent Swift bridges without modifying
   handwritten source files.
-- Canonical HLBC 1.9 encoding/decoding, independent structural and semantic
+- Canonical HLBC 1.10 encoding/decoding, independent structural and semantic
   verification, a typed-register HLVM, exact native bridges, immutable
   generations, and pinned call-chain snapshots.
 - Exact-toolchain Swift-to-HLBC compilation for the documented subset: common
@@ -96,7 +96,9 @@ Live Reload acceptance run.
   file/module-scope patch-local struct/enum and concrete `Result`,
   payload-carrying local errors, scoped local `inout`/`mutating`, synchronous
   patch-local closures including bounded `@escaping` return/capture flows,
-  concrete compiler specializations, and non-suspending async entries.
+  concrete compiler specializations and default-argument generators,
+  VM-owned `Any` with common dynamic casts, automatically frozen `Swift.print`,
+  and non-suspending async entries.
 - NativeImport v2 and schema 2 build-time discovery by declaration, file,
   module, or project scope. Broad scopes expand into exact generated invokers;
   they are never device-side wildcards.
@@ -180,7 +182,7 @@ swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
 ```
 
-The current full SwiftPM baseline contains 411 tests in 65 suites. The recorded
+The current full SwiftPM baseline contains 441 tests in 72 suites. The recorded
 Debug, warnings-as-errors, and optimized Release runs pass. Platform-specific
 fixtures can be run with an available Simulator UDID:
 

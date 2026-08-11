@@ -22,6 +22,7 @@ public enum Metadata {
         .escapingClosureValuesV1,
         .compilerSpecializationsV1,
         .asyncLeafEntriesV1,
+        .anyValuesV1,
     ]
 }
 }

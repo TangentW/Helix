@@ -100,6 +100,26 @@ public struct DirectCallTable: Sendable {
         bindings[mangledName]
     }
 
+    var boundSymbols: Set<String> {
+        Set(bindings.keys)
+    }
+
+    var functionIDs: Set<Bytecode.FunctionID> {
+        Set(bindings.values.compactMap { binding in
+            guard case let .function(id) = binding.target else { return nil }
+            return id
+        })
+    }
+
+    func adding(
+        _ additionalBindings: [CanonicalSIL.DirectCallBinding]
+    ) throws -> CanonicalSIL.DirectCallTable {
+        try CanonicalSIL.DirectCallTable(
+            Array(bindings.values) + additionalBindings,
+            unavailable: Array(unavailableCalls.values)
+        )
+    }
+
     func referencesInoutCallee(in body: String) -> Bool {
         bindings.values.contains { binding in
             binding.parameterConventions.contains(.inout)

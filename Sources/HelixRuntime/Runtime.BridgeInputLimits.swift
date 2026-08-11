@@ -79,6 +79,8 @@ public enum BridgeInputError: Error, Equatable, Sendable, CustomStringConvertibl
     case estimatedNativeByteLimitExceeded(maximum: UInt64)
     /// Generated code encoded an element with the wrong VM value type.
     case encodedTypeMismatch(expected: String, actual: String)
+    /// A dynamic Swift value cannot be represented by the bounded Any bridge.
+    case unsupportedAnyType(String)
     /// Final arguments contain a value not created by the scoped encoder.
     case untrackedEncodedValue
 
@@ -101,6 +103,8 @@ public enum BridgeInputError: Error, Equatable, Sendable, CustomStringConvertibl
             "Bridge input exceeds the \(maximum)-byte native-value limit"
         case let .encodedTypeMismatch(expected, actual):
             "Bridge input encoder expected \(expected), got \(actual)"
+        case let .unsupportedAnyType(type):
+            "Swift Any boundary does not support \(type)"
         case .untrackedEncodedValue:
             "Bridge input contains a value not produced by its scoped encoder"
         }

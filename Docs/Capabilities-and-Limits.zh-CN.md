@@ -9,14 +9,14 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | 范围 | 已实现 | 尚未认证或实现 |
 | --- | --- | --- |
 | Release Shell | 精确 frontend 索引、Derived Sources、Interface Archive、永久 Bridge、NativeImport 发现、Xcode 集成、bundle 泄漏审计 | 大型真实业务迁移和长期 CI 矩阵 |
-| 生产 HLBC | HLBC 1.9 / HLXI 2.4 编译链、Verifier、HLVM、签名包、安全安装、不可变激活、回滚与吊销；仓库内业务 corpus | App Store 分发批准、外部 top-200 corpus、长时间 fuzz/sanitizer、真机 macro 性能 |
+| 生产 HLBC | HLBC 1.10 / HLXI 2.5 编译链、Verifier、HLVM、签名包、安全安装、不可变激活、回滚与吊销；仓库内业务 corpus | App Store 分发批准、外部 top-200 corpus、长时间 fuzz/sanitizer、真机 macro 性能 |
 | 开发期 Live Reload | 精确构建捕获、稳定快照、body 差分、会话绑定的验证后 HLBC、认证传输、原子激活、UIKit/SwiftUI 刷新、逻辑源码映射与 128 代进程内 soak | 真实 iPhone 矩阵、真机长时间 soak、交互式字节码单步调试、大型工程延迟资格 |
 | Native 实验 | 仅显式选择的 Dynamic Replacement builder、递归/previous 测试、签名 dylib 与 loader probe | 产品支持；自动路由有意不选择它 |
 | 控制面 | 客户端包与 policy 合同 | 生产 Registry、HSM 运维、审批、灰度、遥测和设备群协调服务 |
 
-当前 SwiftPM 基线包含 411 个测试、65 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。iOS Simulator target 覆盖 9 个 Runtime 与 UI 用例。这些数字代表仓库证据，不代表真机或分发认证。
+当前 SwiftPM 基线包含 441 个测试、72 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。iOS Simulator target 覆盖 9 个 Runtime 与 UI 用例。这些数字代表仓库证据，不代表真机或分发认证。
 
-## 生产 HLBC 1.9 的 Swift 子集
+## 生产 HLBC 1.10 的 Swift 子集
 
 ### 已实现
 
@@ -30,6 +30,9 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - 同步补丁内 `inout` 与 `mutating` helper，并受 Address、access、alias、ownership、同 frame/同 block 规则验证。
 - 捕获 copyable VM-managed 值的同步补丁内 closure。它包括同 image helper 的 `@escaping` 参数、从同 image 函数把 closure 返回给调用者，以及 closure 再捕获另一个 closure；该值必须在同一次固定 generation 的 HLVM invocation 内用完。返回与嵌套捕获语义由 `escaping-closure-values-1` 独立门禁，不能因为旧 closure capability 存在就默认放行。另支持不再包含 archetype、metadata 或 witness 依赖的编译器完全具体化 specialization。
 - 顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` entry。生成的精确 Swift wrapper 保留 ABI，HLVM 只执行已经证明不会挂起的 body。
+- VM-owned `Any`、`is`、`as?`、`as!`，以及受支持 Optional/Array/Dictionary 的递归动态转换；Swift existential metadata、native object 和线性生命周期不会进入下载字节码。
+- 完全具体的默认参数 generator。生产与开发编译器会把可达 `fA...` thunk 一起链接并纳入传递实现指纹；当前只承诺一个完整 module source set 内的 eligible 调用点。跨 module 的 public/package 默认值、非 eligible 调用点或仍需泛型 metadata 时要求完整构建。
+- 普通 `Swift.print`，由所有新 Shell 自动冻结的同步 NativeImport 承载。支持常见 Bridge-compatible `Any` 值、separator/terminator 和 64 KiB 输出上限，不要求 App 手工配置 Catalog。
 - 调用同 image helper、eligible Shell entry 与目标 Shell 已经生成的精确 allowlisted NativeImport。
 
 ### 拒绝或有意未完成
@@ -62,7 +65,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | 声明补丁内 struct 或 enum | 文件/module scope 支持；函数局部 nominal 会用精确类型诊断拒绝 |
 | 新增任意文件级 helper/type/extension 或新 Swift 文件 | 当前生成器不收集，需要完整构建 |
 | 修改 stored property、签名、generic constraint、actor isolation、superclass、conformance 或 enum case | 拒绝，需要完整构建 |
-| 修改 default argument 行为 | 旧 call site 可能已经包含旧 generator；要可靠生效需要完整构建 |
+| 修改 default argument 行为 | 完全具体的 generator 会与同一完整 module 内 eligible、已归档的调用点一起进入补丁；跨 module public/package 默认值、非 eligible 调用点或泛型 ABI 要求完整构建 |
 | 修改 static/global initializer | 已经初始化的状态不会自动重放 |
 | 新增 framework、package、macro/plugin 输入、bridging header 或 source membership | Dev Build Manifest 失效，需要完整构建 |
 | 修改 storyboard、XIB、asset、strings、Core Data model、plist 或 entitlement | 不属于 Swift body Live Reload 路径 |

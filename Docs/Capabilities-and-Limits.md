@@ -13,17 +13,17 @@ current practical boundary.
 | Area | Implemented | Not yet qualified or implemented |
 | --- | --- | --- |
 | Release Shell | Exact frontend indexing, Derived Sources, interface archive, permanent bridge, NativeImport discovery, Xcode integration, bundle leakage audit | Broad real-application migration and long-running CI matrix |
-| Production HLBC | HLBC 1.9 / HLXI 2.4 compiler path, verifier, HLVM, signed package, safe installation, immutable activation, rollback and revocation; checked-in business corpus | App Store distribution approval, external top-200 corpus, long fuzz/sanitizer campaigns, real-device macro performance |
+| Production HLBC | HLBC 1.10 / HLXI 2.5 compiler path, verifier, HLVM, signed package, safe installation, immutable activation, rollback and revocation; checked-in business corpus | App Store distribution approval, external top-200 corpus, long fuzz/sanitizer campaigns, real-device macro performance |
 | Development Live Reload | Exact build capture, stable snapshots, body diff, session-bound verified HLBC, authenticated transfer, atomic activation, UIKit/SwiftUI refresh, logical source maps and a 128-generation in-process soak | Physical-iPhone matrix, long-duration device soak, interactive bytecode stepping, large-project latency qualification |
 | Native experiment | Explicit-only Dynamic Replacement builder, recursion/previous tests, signed dylib and loader probes | Product support; it is intentionally absent from automatic routing |
 | Control plane | Client-side package and policy contracts | Production Registry, HSM operations, approval, rollout, telemetry, and fleet coordination services |
 
-The checked-in SwiftPM baseline contains 411 tests in 65 suites. Debug,
+The checked-in SwiftPM baseline contains 441 tests in 72 suites. Debug,
 warnings-as-errors, and optimized Release runs are recorded as passing. An iOS
 Simulator target covers 9 runtime and UI cases. Those counts describe repository
 evidence, not device or distribution certification.
 
-## Production HLBC 1.9 Swift subset
+## Production HLBC 1.10 Swift subset
 
 ### Implemented
 
@@ -62,6 +62,18 @@ evidence, not device or distribution certification.
 - Top-level non-suspending `async`, `async throws`, and `@MainActor async`
   entries. Exact generated Swift wrappers preserve their ABI while HLVM runs a
   body proven not to suspend.
+- VM-owned `Any`, `is`, `as?`, and `as!`, including recursive conversions of
+  supported Optional, Array, and Dictionary values. Swift existential metadata,
+  native objects, and linear lifetimes never enter downloaded bytecode.
+- Fully concrete default-argument generators. Production and development
+  compilers link reachable `fA...` thunks and include them in transitive
+  implementation fingerprints. This covers eligible callers in one complete
+  module source set; cross-module public/package defaults, an ineligible caller,
+  or a remaining generic ABI require a full build.
+- Ordinary `Swift.print` through a synchronous NativeImport frozen into every
+  new Shell. It supports common Bridge-compatible `Any` values,
+  separator/terminator semantics, and a 64 KiB output bound without App catalog
+  configuration.
 - Calls to same-image helpers, eligible Shell entries, and exact allowlisted
   NativeImports already emitted in the target Shell.
 
@@ -112,7 +124,7 @@ machine code.
 | Declare a patch-local struct or enum | Supported at file/module scope; a function-local nominal is rejected with an exact type diagnostic |
 | Add an arbitrary file-level helper/type/extension or a new Swift file | Not collected by the current generator; full build required |
 | Change a stored property, signature, generic constraint, actor isolation, superclass, conformance, or enum case | Rejected; full build required |
-| Change default-argument behavior | Existing call sites may already contain the old generator; full build is required for a reliable result |
+| Change default-argument behavior | A fully concrete generator is patched with eligible archived callers in one complete module; cross-module public/package defaults, an ineligible caller, or a generic ABI require a full build |
 | Change a static/global initializer | Existing initialized state is not replayed automatically |
 | Add a framework, package, macro/plugin input, bridging header, or source membership | Dev Build Manifest becomes stale; full build required |
 | Edit storyboard, XIB, assets, strings, Core Data model, plist, or entitlements | Outside the Swift-body Live Reload path |

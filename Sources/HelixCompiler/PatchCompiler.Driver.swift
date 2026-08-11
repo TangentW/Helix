@@ -72,33 +72,82 @@ public struct Driver: Sendable {
         guard let silFunction = file.function(mangledName: request.mangledName) else {
             throw CanonicalSIL.LoweringError.functionSelection("function @\(request.mangledName) was not found")
         }
-        var hlir = try CanonicalSIL.Lowerer(
+        let generatedPlan = try PatchCompiler.GeneratedFunctions.makePlan(
+            file: file,
+            root: silFunction,
+            rootID: request.functionID,
+            typeEnvironment: typeEnvironment,
+            directCalls: request.directCalls
+        )
+        var root = try CanonicalSIL.Lowerer(
             typeEnvironment: typeEnvironment
         ).lower(
             silFunction,
             displayName: request.displayName,
-            directCalls: request.directCalls,
+            directCalls: generatedPlan.directCalls,
             expectedEffects: request.effects
         )
-        hlir = IntermediateRepresentation.SourceMapping.retainingLogicalPaths(
-            hlir,
+        root = IntermediateRepresentation.SourceMapping.retainingLogicalPaths(
+            root,
             logicalPaths: request.sourceFileLogicalID.map { [$0] } ?? []
         )
-        let imports = try request.directCalls.importRequirements(referencedBy: [hlir])
-        let localTypes = try typeEnvironment.definitions(referencedBy: [hlir])
-        let function = IntermediateRepresentation.ToBytecode.lower(hlir, id: request.functionID)
+        var loweredByID: [(
+            id: Bytecode.FunctionID,
+            function: IntermediateRepresentation.Function
+        )] = [(request.functionID, root)]
+        for item in generatedPlan.functions {
+            var lowered = try CanonicalSIL.Lowerer(
+                typeEnvironment: typeEnvironment
+            ).lower(
+                item.function,
+                displayName: item.symbol,
+                kind: item.kind,
+                directCalls: generatedPlan.directCalls,
+                expectedEffects: item.signature.effects
+            )
+            let actualParameters = lowered.parameterRegisters.compactMap { register in
+                lowered.registerTypes.indices.contains(Int(register.rawValue))
+                    ? lowered.registerTypes[Int(register.rawValue)]
+                    : nil
+            }
+            guard actualParameters.count == lowered.parameterRegisters.count,
+                  actualParameters == item.signature.parameters,
+                  lowered.parameterConventions == item.signature.parameterConventions,
+                  lowered.resultType == item.signature.result,
+                  lowered.effects == item.signature.effects
+            else {
+                throw PatchCompiler.CompilationError.generatedFunctionUnsupported(
+                    item.symbol,
+                    reason: "lowering changed its discovered concrete signature"
+                )
+            }
+            lowered = IntermediateRepresentation.SourceMapping.retainingLogicalPaths(
+                lowered,
+                logicalPaths: request.sourceFileLogicalID.map { [$0] } ?? []
+            )
+            loweredByID.append((item.id, lowered))
+        }
+        loweredByID.sort { $0.id < $1.id }
+        let loweredFunctions = loweredByID.map(\.function)
+        let imports = try generatedPlan.directCalls.importRequirements(
+            referencedBy: loweredFunctions
+        )
+        let localTypes = try typeEnvironment.definitions(referencedBy: loweredFunctions)
+        let functions = loweredByID.map {
+            IntermediateRepresentation.ToBytecode.lower($0.function, id: $0.id)
+        }
         let module = Bytecode.Module(
             name: request.displayName,
             shellInterfaceHash: request.shellInterfaceHash,
             compatibility: request.compatibility,
             capabilities: CompilerCapabilities.infer(
-                for: [hlir],
+                for: loweredFunctions,
                 imports: imports,
                 localTypes: localTypes
             ),
             requestedResources: request.requestedResources,
             localTypes: localTypes,
-            functions: [function],
+            functions: functions,
             entries: [
                 .init(
                     entryIndex: request.entryIndex,
@@ -107,17 +156,20 @@ public struct Driver: Sendable {
                 ),
             ],
             imports: imports,
-            sourceMap: IntermediateRepresentation.ToBytecode.sourceMap(
-                hlir,
-                id: request.functionID
-            )
+            sourceMap: loweredByID.flatMap {
+                IntermediateRepresentation.ToBytecode.sourceMap($0.function, id: $0.id)
+            }
         )
         let bytecode = try Bytecode.Encoder.encode(module)
         return PatchCompiler.Result(
             module: module,
             bytecode: bytecode,
             disassembly: Bytecode.Disassembler.disassemble(module),
-            bodyFingerprint: ReleaseCompiler.BodyFingerprint.compute(silFunction.body)
+            bodyFingerprint: ReleaseCompiler.ImplementationFingerprint.compute(
+                root: silFunction,
+                in: file,
+                archivedSymbols: [silFunction.mangledName]
+            )
         )
     }
 
