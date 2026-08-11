@@ -33,16 +33,53 @@ public final class ScreenViewController: UIViewController {
     /// function reaches it through the generation-aware Shell Entry table.
     private func applyPresentation(badge: String, title: String, detail: String) {
         super.viewDidLayoutSubviews()
+
+        var intrinsicContentChanged = false
+        if badgeLabel.text != badge {
+            badgeLabel.text = badge
+            intrinsicContentChanged = true
+        }
+        if titleLabel.text != title {
+            titleLabel.text = title
+            intrinsicContentChanged = true
+        }
+        if detailLabel.text != detail {
+            detailLabel.text = detail
+            intrinsicContentChanged = true
+        }
+
+        let badgeFont = UIFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
+        let titleFont = UIFont.systemFont(ofSize: 34, weight: .black)
+        let detailFont = UIFont.systemFont(ofSize: 16)
+        let countFont = UIFont.monospacedDigitSystemFont(ofSize: 20, weight: .bold)
+        if badgeLabel.font != badgeFont {
+            badgeLabel.font = badgeFont
+            intrinsicContentChanged = true
+        }
+        if titleLabel.font != titleFont {
+            titleLabel.font = titleFont
+            intrinsicContentChanged = true
+        }
+        if detailLabel.font != detailFont {
+            detailLabel.font = detailFont
+            intrinsicContentChanged = true
+        }
+        if countLabel.font != countFont {
+            countLabel.font = countFont
+            intrinsicContentChanged = true
+        }
+
         view.backgroundColor = UIColor(red: 0.96, green: 0.98, blue: 1, alpha: 1)
-        badgeLabel.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
-        badgeLabel.text = badge
         badgeLabel.textColor = .systemBlue
-        titleLabel.text = title
-        detailLabel.text = detail
-        titleLabel.font = .systemFont(ofSize: 34, weight: .black)
-        detailLabel.font = .systemFont(ofSize: 16)
         detailLabel.textColor = .secondaryLabel
-        countLabel.font = .monospacedDigitSystemFont(ofSize: 20, weight: .bold)
+
+        if intrinsicContentChanged {
+            // The callback runs after the current Auto Layout pass. Schedule a
+            // fresh outer pass when text or fonts change so hit testing uses
+            // the updated stack bounds as well as its visible subview frames.
+            view.setNeedsUpdateConstraints()
+            view.setNeedsLayout()
+        }
     }
 
     private func installHierarchy() {

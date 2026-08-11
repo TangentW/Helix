@@ -134,6 +134,9 @@ struct DemoIntegration {
                 "Demo/LiveReloadFeature/Sources/LiveReloadFeature.Screen.swift"
             )
         )
+        let liveConfiguration = try text(
+            root.appendingPathComponent("Demo/Configurations/LiveReload.yml")
+        )
         let bootstrap = try text(
             root.appendingPathComponent("Demo/Scripts/DemoBootstrap.sh")
         )
@@ -150,6 +153,7 @@ struct DemoIntegration {
         #expect(hot.contains("return 1_999 // HELIX_DEMO_BUG"))
         #expect(live.occurrences(of: "HELIX_LIVE_BASELINE") == 1)
         #expect(live.contains("// HELIX_LIVE_BASELINE"))
+        #expect(liveConfiguration.contains("entrypoints: all"))
         #expect(liveInfo["NSBonjourServices"] as? [String] == ["_helix-live._tcp"])
         #expect(
             (liveInfo["NSLocalNetworkUsageDescription"] as? String)?.isEmpty == false
