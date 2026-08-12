@@ -445,6 +445,10 @@ public final class InvocationBudget: @unchecked Sendable {
         case let .enumeration(_, _, payload):
             try consumeAggregateStorage(elementCount: payload == nil ? 0 : 1)
             if let payload { try consumeBoundaryValue(payload, depth: depth + 1) }
+        case .object:
+            throw VM.RuntimeTrap.explicit(
+                "patch-local class values cannot cross a VM boundary"
+            )
         case let .error(error):
             try consumeAggregateStorage(elementCount: error.payload == nil ? 0 : 1)
             try consumeUTF8Work(byteCount: error.message.utf8.count)

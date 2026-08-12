@@ -283,6 +283,16 @@ public struct Indexer: Sendable {
             // inferred solely from the frozen Shell entry signatures.
             capabilities.insert(.anyValuesV1)
         }
+        if request.compatibility.bytecode.major == 1,
+           request.compatibility.bytecode >= .init(1, 11, 0) {
+            // New classes may appear only in a later source revision. A new
+            // Shell therefore advertises both VM-local reference semantics and
+            // the precompiled Objective-C hosting bridge up front.
+            capabilities.formUnion([
+                .localClassesV1,
+                .hostedObjectiveCClassesV1,
+            ])
+        }
         if records.contains(where: {
             $0.patchability.isEligible && $0.effects.isAsync
         }) {

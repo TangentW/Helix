@@ -326,6 +326,7 @@ public struct Lowerer: Sendable {
         var runtimeAddressValues: [String: Bytecode.Register] = [:]
         var runtimeAddressPointees: [String: Bytecode.ValueType] = [:]
         var scopedRuntimeAddresses = Set<String>()
+        var initializingRuntimeAccesses = Set<String>()
         var inoutParameterAddressBases = Set<String>()
         var passthroughRuntimeAccesses = Set<String>()
         var borrowedAddressValues: [String: Bytecode.Register] = [:]
@@ -646,7 +647,8 @@ public struct Lowerer: Sendable {
 
         func storeVMValue(
             _ value: Bytecode.Register,
-            at token: String
+            at token: String,
+            requestedMode: Bytecode.StackStoreMode? = nil
         ) throws {
             guard let addressType = stackType(at: token),
                   registerTypes[Int(value.rawValue)] == addressType
@@ -662,7 +664,9 @@ public struct Lowerer: Sendable {
                         .storeAddress(
                             address: addressRegister,
                             source: value,
-                            mode: .assign
+                            mode: requestedMode
+                                ?? (initializingRuntimeAccesses.contains(token)
+                                    ? .initialize : .assign)
                         )
                     )
                 } else if let slot = runtimeStackSlots[root], token == root {
@@ -685,7 +689,7 @@ public struct Lowerer: Sendable {
                         .storeAddress(
                             address: access,
                             source: value,
-                            mode: .assign
+                            mode: requestedMode ?? .assign
                         )
                     )
                     appendInstruction(.endAccess(access))
@@ -2537,7 +2541,7 @@ public struct Lowerer: Sendable {
 
             if let metatype = match(
                 line,
-                pattern: #"^(%[0-9]+) = metatype \$@thin (.+)\.Type$"#
+                pattern: #"^(%[0-9]+) = metatype \$@(?:thin|thick|objc_metatype) (.+)\.Type$"#
             ), let key = typeEnvironment.localKey(for: metatype[1]) {
                 localMetatypeValues[metatype[0]] = key
                 continue
@@ -2549,6 +2553,33 @@ public struct Lowerer: Sendable {
             ), let type = try? parseType(metatype[1]),
                case let .native(typeID) = type {
                 nativeMetatypeValues[metatype[0]] = typeID
+                continue
+            }
+
+            if let allocation = match(
+                line,
+                pattern: #"^(%[0-9]+) = alloc_ref \$(.+)$"#
+            ), let key = typeEnvironment.localKey(for: allocation[1]),
+               typeEnvironment.isClass(key) {
+                let result = try allocate(type: .local(key))
+                values[allocation[0]] = result
+                appendInstruction(.allocateObject(result: result))
+                continue
+            }
+
+            if let allocation = match(
+                line,
+                pattern: #"^(%[0-9]+) = alloc_ref_dynamic(?: \[objc\])? (%[0-9]+), \$(.+)$"#
+            ), let key = typeEnvironment.localKey(for: allocation[2]),
+               typeEnvironment.isClass(key) {
+                guard localMetatypeValues[allocation[1]] == key else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "dynamic local class allocation uses the wrong metatype"
+                    )
+                }
+                let result = try allocate(type: .local(key))
+                values[allocation[0]] = result
+                appendInstruction(.allocateObject(result: result))
                 continue
             }
 
@@ -2702,7 +2733,7 @@ public struct Lowerer: Sendable {
 
             if let access = match(
                 line,
-                pattern: #"^(%[0-9]+) = begin_access \[(read|modify)\] \[(?:static|dynamic)\] (%[0-9]+)$"#
+                pattern: #"^(%[0-9]+) = begin_access \[(read|modify|init)\] \[(?:static|dynamic)\] (%[0-9]+)$"#
             ) {
                 let source = access[2]
                 let base = addressBase(source)
@@ -2721,7 +2752,7 @@ public struct Lowerer: Sendable {
                         continue
                     }
                     let result = try allocate(type: .address(pointee))
-                    let kind: Bytecode.AccessKind = access[1] == "modify" ? .modify : .read
+                    let kind: Bytecode.AccessKind = access[1] == "read" ? .read : .modify
                     appendInstruction(
                         .beginAccess(result: result, address: sourceAddress, kind: kind)
                     )
@@ -2729,6 +2760,9 @@ public struct Lowerer: Sendable {
                     runtimeAddressValues[access[0]] = result
                     runtimeAddressPointees[access[0]] = pointee
                     scopedRuntimeAddresses.insert(access[0])
+                    if access[1] == "init" {
+                        initializingRuntimeAccesses.insert(access[0])
+                    }
                     values[access[0]] = result
                     continue
                 }
@@ -2749,6 +2783,7 @@ public struct Lowerer: Sendable {
 
             if let access = match(line, pattern: #"^end_access (%[0-9]+)$"#) {
                 if passthroughRuntimeAccesses.remove(access[0]) != nil {
+                    initializingRuntimeAccesses.remove(access[0])
                     scopedRuntimeAddresses.remove(access[0])
                     runtimeAddressValues.removeValue(forKey: access[0])
                     runtimeAddressPointees.removeValue(forKey: access[0])
@@ -2758,6 +2793,7 @@ public struct Lowerer: Sendable {
                 }
                 if scopedRuntimeAddresses.remove(access[0]) != nil,
                    let register = runtimeAddressValues.removeValue(forKey: access[0]) {
+                    initializingRuntimeAccesses.remove(access[0])
                     appendInstruction(.endAccess(register))
                     runtimeAddressPointees.removeValue(forKey: access[0])
                     values.removeValue(forKey: access[0])
@@ -3237,6 +3273,39 @@ public struct Lowerer: Sendable {
             ) {
                 let ownerType = projection[2]
                 let property = projection[3]
+                if let key = typeEnvironment.localKey(for: ownerType),
+                   typeEnvironment.isClass(key) {
+                    let object = try resolve(projection[1], line: sourceLine)
+                    guard registerTypes[Int(object.rawValue)] == .local(key) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "class field receiver does not match \(key)"
+                        )
+                    }
+                    let fields = try typeEnvironment.classFields(for: key)
+                    let index = try typeEnvironment.storedFieldIndex(
+                        type: key,
+                        name: property
+                    )
+                    guard let fieldIndex = UInt32(exactly: index) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "local class field index exceeds UInt32"
+                        )
+                    }
+                    let pointee = fields[index].type
+                    let result = try allocate(type: .address(pointee))
+                    appendInstruction(
+                        .projectObjectAddress(
+                            result: result,
+                            object: object,
+                            fieldIndex: fieldIndex
+                        )
+                    )
+                    runtimeAddressValues[projection[0]] = result
+                    runtimeAddressPointees[projection[0]] = pointee
+                    addressAliases[projection[0]] = projection[0]
+                    values[projection[0]] = result
+                    continue
+                }
                 let getterSymbol = CanonicalSIL.NativePropertySymbol.getter(
                     ownerType: ownerType,
                     property: property
@@ -4779,6 +4848,38 @@ public struct Lowerer: Sendable {
                 continue
             }
 
+            if let initialization = match(
+                line,
+                pattern: #"^(%[0-9]+) = end_init_let_ref (%[0-9]+)$"#
+            ) {
+                let object = try resolve(initialization[1], line: sourceLine)
+                guard case let .local(key) = registerTypes[Int(object.rawValue)],
+                      typeEnvironment.isClass(key)
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: line
+                    )
+                }
+                values[initialization[0]] = object
+                continue
+            }
+
+            if let cast = match(
+                line,
+                pattern: #"^(%[0-9]+) = unchecked_ref_cast (%[0-9]+) to \$(.+)$"#
+            ), let target = typeEnvironment.localKey(for: cast[2]),
+               typeEnvironment.isClass(target) {
+                let object = try resolve(cast[1], line: sourceLine)
+                guard registerTypes[Int(object.rawValue)] == .local(target) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "local class reference cast changes its logical type"
+                    )
+                }
+                values[cast[0]] = object
+                continue
+            }
+
             if let cast = match(
                 line,
                 pattern: #"^(%[0-9]+) = unchecked_ref_cast (%[0-9]+) to \$__ContiguousArrayStorageBase$"#
@@ -6035,6 +6136,11 @@ public struct Lowerer: Sendable {
                 let value = try resolve(ownership[1], line: sourceLine)
                 let type = registerTypes[Int(value.rawValue)]
                 if case .closure = type { continue }
+                if case let .local(key) = type, typeEnvironment.isClass(key) {
+                    // VM.Value retains one shared object identity; Swift ARC
+                    // traffic does not become explicit HLBC instructions.
+                    continue
+                }
                 guard type == .string || type == .error
                         || type.requiresLinearOwnership
                 else {
@@ -6049,6 +6155,22 @@ public struct Lowerer: Sendable {
                         resolved: value
                     )
                     appendInstruction(.destroyValue(value))
+                }
+                continue
+            }
+
+            if let deallocation = match(
+                line,
+                pattern: #"^dealloc_ref (%[0-9]+)$"#
+            ) {
+                let value = try resolve(deallocation[0], line: sourceLine)
+                guard case let .local(key) = registerTypes[Int(value.rawValue)],
+                      typeEnvironment.isClass(key)
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: line
+                    )
                 }
                 continue
             }

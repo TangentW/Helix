@@ -273,6 +273,19 @@ public enum Encoder {
                 )
             }
         }
+        if formatMinor < 11 {
+            guard !module.capabilities.contains(.localClassesV1),
+                  !module.capabilities.contains(.hostedObjectiveCClassesV1),
+                  !module.localTypes.contains(where: {
+                      if case .class = $0.kind { return true }
+                      return false
+                  })
+            else {
+                throw Bytecode.CodecError.invalidHeader(
+                    "local and hosted classes require HLBC format 1.11"
+                )
+            }
+        }
         for function in module.functions {
             for block in function.blocks {
                 for instruction in block.instructions {
@@ -371,6 +384,16 @@ public enum Encoder {
                             break
                         }
                     }
+                    if formatMinor < 11 {
+                        switch instruction {
+                        case .allocateObject, .projectObjectAddress:
+                            throw Bytecode.CodecError.invalidHeader(
+                                "class instructions require HLBC format 1.11"
+                            )
+                        default:
+                            break
+                        }
+                    }
                 }
             }
         }
@@ -389,6 +412,8 @@ public enum Encoder {
                 fields.contains { containsAny($0.type) }
             case let .enumeration(cases):
                 cases.contains { $0.payloadType.map(containsAny) == true }
+            case let .class(fields, _, _):
+                fields.contains { containsAny($0.type) }
             }
         }
     }

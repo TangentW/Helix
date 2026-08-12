@@ -11,7 +11,7 @@ struct AnyWireContract {
         let bytes = try Bytecode.Encoder.encode(module)
         let decoded = try Bytecode.Decoder.decode(bytes)
 
-        #expect(decoded.header.formatMinor == 10)
+        #expect(decoded.header.formatMinor == Bytecode.Format.minorVersion)
         #expect(decoded.module == module)
         #expect(decoded.module.capabilities.contains(.anyValuesV1))
 

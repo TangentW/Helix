@@ -85,10 +85,31 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
         }
     }
 
-    func store(_ value: VM.Value, path: [UInt32], token: UUID) throws {
+    func store(
+        _ value: VM.Value,
+        path: [UInt32],
+        token: UUID,
+        mode: Bytecode.StackStoreMode
+    ) throws {
         try lock.withLock {
             _ = try activeAccess(token: token, path: path, requiresModify: true)
-            guard var storage else { throw VM.RuntimeTrap.uninitializedAddress }
+            if path.isEmpty {
+                switch mode {
+                case .initialize:
+                    guard storage == nil else {
+                        throw VM.RuntimeTrap.addressAlreadyInitialized
+                    }
+                case .assign:
+                    guard storage != nil else {
+                        throw VM.RuntimeTrap.uninitializedAddress
+                    }
+                }
+                storage = value
+                return
+            }
+            guard mode == .assign, var storage else {
+                throw VM.RuntimeTrap.uninitializedAddress
+            }
             try Self.assign(value, into: &storage, path: path[...])
             self.storage = storage
         }
@@ -217,9 +238,9 @@ public struct Address: Hashable, @unchecked Sendable, CustomStringConvertible {
         return try cell.read(path: path, token: token)
     }
 
-    func store(_ value: VM.Value) throws {
+    func store(_ value: VM.Value, mode: Bytecode.StackStoreMode) throws {
         guard let token else { throw VM.RuntimeTrap.inactiveAddressAccess }
-        try cell.store(value, path: path, token: token)
+        try cell.store(value, path: path, token: token, mode: mode)
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {

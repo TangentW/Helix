@@ -290,6 +290,12 @@ public enum Instruction: Codable, Hashable, Sendable {
         base: Bytecode.Register,
         fieldIndex: UInt32
     )
+    case allocateObject(result: Bytecode.Register)
+    case projectObjectAddress(
+        result: Bytecode.Register,
+        object: Bytecode.Register,
+        fieldIndex: UInt32
+    )
     case beginAccess(
         result: Bytecode.Register,
         address: Bytecode.Register,
@@ -488,6 +494,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .loadStack(result, _, _),
              let .stackAddress(result, _),
              let .projectStructAddress(result, _, _),
+             let .allocateObject(result),
+             let .projectObjectAddress(result, _, _),
              let .beginAccess(result, _, _),
              let .loadAddress(result, _, _),
              let .floatingBinary(result, _, _, _),
@@ -538,7 +546,8 @@ public enum Instruction: Codable, Hashable, Sendable {
     public var operandRegisters: [Bytecode.Register] {
         switch self {
         case .constantInteger, .constantBool, .constantFloat, .constantString,
-             .makeOptionalNone, .loadStack, .destroyStack, .stackAddress, .trap:
+             .makeOptionalNone, .loadStack, .destroyStack, .stackAddress,
+             .allocateObject, .trap:
             []
         case let .copyValue(_, source), let .moveValue(_, source), let .destroyValue(source):
             [source]
@@ -572,6 +581,8 @@ public enum Instruction: Codable, Hashable, Sendable {
             [source]
         case let .projectStructAddress(_, base, _):
             [base]
+        case let .projectObjectAddress(_, object, _):
+            [object]
         case let .beginAccess(_, address, _),
              let .endAccess(address),
              let .loadAddress(_, address, _):

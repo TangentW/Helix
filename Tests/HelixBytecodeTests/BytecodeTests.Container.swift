@@ -46,7 +46,7 @@ struct Container {
         #expect(try Bytecode.Encoder.encode(module) == Bytecode.Encoder.encode(module))
     }
 
-    @Test("HLBC 1.10 decodes older canonical images and gates new contracts")
+    @Test("HLBC 1.11 decodes older canonical images and gates new contracts")
     func minorVersionCompatibility() throws {
         var legacyModule = try makeAddModule()
         legacyModule.compatibility.bytecode = .init(1, 0, 0)
@@ -81,7 +81,10 @@ struct Container {
             ).header.formatMinor == 1
         )
         newModule.compatibility.bytecode = Core.Versions.bytecode
-        #expect(try Bytecode.Decoder.decode(Bytecode.Encoder.encode(newModule)).header.formatMinor == 10)
+        #expect(
+            try Bytecode.Decoder.decode(Bytecode.Encoder.encode(newModule)).header.formatMinor
+                == Bytecode.Format.minorVersion
+        )
 
         var stringModule = legacyModule
         stringModule.functions[0].registerTypes.append(.string)
@@ -140,7 +143,10 @@ struct Container {
             try Bytecode.Encoder.encode(tryModule, formatMinor: 1)
         }
         tryModule.compatibility.bytecode = Core.Versions.bytecode
-        #expect(try Bytecode.Decoder.decode(Bytecode.Encoder.encode(tryModule)).header.formatMinor == 10)
+        #expect(
+            try Bytecode.Decoder.decode(Bytecode.Encoder.encode(tryModule)).header.formatMinor
+                == Bytecode.Format.minorVersion
+        )
 
         var throwModule = legacyModule
         throwModule.compatibility.bytecode = .init(1, 1, 0)
@@ -258,7 +264,7 @@ struct Container {
         #expect(
             try Bytecode.Decoder.decode(
                 Bytecode.Encoder.encode(nativeImportModule)
-            ).header.formatMinor == 10
+            ).header.formatMinor == Bytecode.Format.minorVersion
         )
 
         var languageExpansionModule = legacyModule
@@ -288,7 +294,7 @@ struct Container {
         dishonestCompatibility.compatibility.bytecode = .init(1, 2, 0)
         #expect(
             throws: Bytecode.CodecError.invalidHeader(
-                "HLBC format 1.10 exceeds declared bytecode compatibility 1.2.0"
+                "HLBC format 1.11 exceeds declared bytecode compatibility 1.2.0"
             )
         ) {
             try Bytecode.Encoder.encode(dishonestCompatibility)
@@ -337,9 +343,74 @@ struct Container {
         let decoded = try Bytecode.Decoder.decode(bytes)
         var canonicalModule = module
         canonicalModule.localTypes.sort { $0.key < $1.key }
-        #expect(decoded.header.formatMinor == 10)
+        #expect(decoded.header.formatMinor == Bytecode.Format.minorVersion)
         #expect(decoded.module == canonicalModule)
         #expect(try Bytecode.Encoder.encode(module) == Bytecode.Encoder.encode(canonicalModule))
+        #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
+    }
+
+    @Test("HLBC 1.11 canonically carries local classes and bounded host descriptors")
+    func localClassWireFormat() throws {
+        let key = Bytecode.LocalTypeKey(rawValue: "Fixture.Controller")
+        let superclass = Core.TypeID.derive(
+            namespace: .derive(
+                bundleID: "dev.helix.fixture",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            canonicalType: "UIKit.UIViewController"
+        )
+        var module = try makeAddModule()
+        module.capabilities.formUnion([
+            .localNominalsV1,
+            .addressValuesV1,
+            .localClassesV1,
+            .hostedObjectiveCClassesV1,
+        ])
+        module.localTypes = [
+            .init(
+                key: key,
+                kind: .class(
+                    fields: [
+                        .init(name: "count", type: .int64),
+                        .init(name: "next", type: .optional(.local(key))),
+                    ],
+                    hostedSuperclass: .init(typeID: superclass),
+                    hostedMethods: [
+                        .init(
+                            selector: "viewDidLoad",
+                            functionID: .init(rawValue: 0),
+                            abi: .voidNoArguments
+                        ),
+                    ]
+                )
+            ),
+        ]
+        module.functions[0].registerTypes.append(contentsOf: [
+            .local(key),
+            .address(.int64),
+        ])
+        module.functions[0].blocks[0].instructions.insert(contentsOf: [
+            .allocateObject(result: .init(rawValue: 5)),
+            .projectObjectAddress(
+                result: .init(rawValue: 6),
+                object: .init(rawValue: 5),
+                fieldIndex: 0
+            ),
+        ], at: 0)
+
+        #expect(
+            throws: Bytecode.CodecError.invalidHeader(
+                "local and hosted classes require HLBC format 1.11"
+            )
+        ) {
+            try Bytecode.Encoder.encode(module, formatMinor: 10)
+        }
+        let bytes = try Bytecode.Encoder.encode(module)
+        let decoded = try Bytecode.Decoder.decode(bytes)
+
+        #expect(decoded.header.formatMinor == Bytecode.Format.minorVersion)
+        #expect(decoded.module == module)
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
     }
 
@@ -401,7 +472,7 @@ struct Container {
         let bytes = try Bytecode.Encoder.encode(module)
         let decoded = try Bytecode.Decoder.decode(bytes)
 
-        #expect(decoded.header.formatMinor == 10)
+        #expect(decoded.header.formatMinor == Bytecode.Format.minorVersion)
         #expect(decoded.module == module)
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
     }

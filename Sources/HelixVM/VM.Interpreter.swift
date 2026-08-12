@@ -545,6 +545,48 @@ public struct Interpreter: Sendable {
                         )
                     }
                     try initialize(fields[index], register: result, registers: &registers)
+                case let .allocateObject(result):
+                    guard case let .local(key) = function.type(of: result),
+                          let definition = localTypes[key],
+                          case let .class(fields, hostedSuperclass, _) = definition.kind
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result)!,
+                            actual: nil
+                        )
+                    }
+                    guard hostedSuperclass == nil else {
+                        throw VM.RuntimeTrap.explicit(
+                            "hosted class allocation requires a Runtime object host"
+                        )
+                    }
+                    try budget.consumeLinearWork(elementCount: fields.count)
+                    try chargeAggregate(elementCount: fields.count, budget: budget)
+                    try initialize(
+                        .object(.init(typeKey: key, fieldCount: fields.count)),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .projectObjectAddress(result, object, fieldIndex):
+                    let value = try read(object, registers: registers)
+                    guard case let .object(reference) = value,
+                          case let .address(pointee) = function.type(of: result)
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: object)!,
+                            actual: value.type
+                        )
+                    }
+                    try initialize(
+                        .address(
+                            try reference.address(
+                                field: fieldIndex,
+                                pointee: pointee
+                            )
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .makeEnum(result, caseIndex, payload):
                     guard case let .local(key) = function.type(of: result),
                           let definition = localTypes[key],
@@ -828,7 +870,7 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
-                case let .storeAddress(register, source, _):
+                case let .storeAddress(register, source, mode):
                     guard case let .address(address) = try read(register, registers: registers) else {
                         throw VM.RuntimeTrap.typeMismatch(
                             expected: function.type(of: register)!,
@@ -840,7 +882,7 @@ public struct Interpreter: Sendable {
                         type: function.type(of: source)!,
                         registers: &registers
                     )
-                    try address.store(value)
+                    try address.store(value, mode: mode)
                 case let .checkedBinary(result, overflow, operation, lhs, rhs):
                     let lhsValue = try integer(lhs, registers: registers)
                     let rhsValue = try integer(rhs, registers: registers)
@@ -1955,6 +1997,14 @@ public struct Interpreter: Sendable {
             default:
                 throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
             }
+        case let (.object(object), .local(expectedKey)):
+            guard object.typeKey == expectedKey,
+                  let definition = localTypes[expectedKey],
+                  case let .class(fields, _, _) = definition.kind,
+                  object.storage.fieldCount == fields.count
+            else {
+                throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
+            }
         case let (.error(error), .error):
             switch (error.concreteType, error.payload) {
             case (nil, nil):
@@ -2166,6 +2216,8 @@ public struct Interpreter: Sendable {
                 caseIndex: caseIndex,
                 payload: try payload.map(copy)
             )
+        case .object:
+            value
         case let .error(error):
             .error(
                 VM.ErrorValue(
@@ -2258,6 +2310,8 @@ public struct Interpreter: Sendable {
             if let payload {
                 try chargeCopiedValue(payload, budget: budget, depth: depth + 1)
             }
+        case .object:
+            break
         case let .error(error):
             try budget.consumeAggregateStorage(elementCount: error.payload == nil ? 0 : 1)
             if let payload = error.payload {
@@ -2312,6 +2366,8 @@ public struct Interpreter: Sendable {
             if let payload {
                 try chargeValueTraversal(payload, budget: budget, depth: depth + 1)
             }
+        case .object:
+            break
         case let .error(error):
             try budget.consumeUTF8Work(byteCount: error.message.utf8.count)
             if let payload = error.payload {
@@ -2375,6 +2431,8 @@ public struct Interpreter: Sendable {
             if let payload {
                 try chargeShapeValidation(payload, budget: budget, depth: depth + 1)
             }
+        case .object:
+            break
         case let .error(error):
             if let payload = error.payload {
                 try chargeShapeValidation(payload, budget: budget, depth: depth + 1)

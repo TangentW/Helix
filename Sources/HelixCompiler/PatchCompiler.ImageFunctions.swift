@@ -100,6 +100,7 @@ enum ImageFunctions {
                   typeEnvironment.hasStructFactorySignature
               ) != true,
               file.function(mangledName: symbol)?.hasNominalValueConstructorABI != true
+                || typeEnvironment.isClassAllocator(symbol)
         else { return nil }
         let isRooted = roots.contains { symbol != $0 && symbol.hasPrefix($0) }
         let isModuleLocal = moduleName.map {

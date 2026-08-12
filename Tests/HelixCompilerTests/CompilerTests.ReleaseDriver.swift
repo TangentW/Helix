@@ -614,6 +614,92 @@ struct ReleaseDriver {
         }
     }
 
+    @Test("New final classes preserve reference identity and mutable storage inside HLVM")
+    func linksNewPatchLocalClasses() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-new-local-classes-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = "@inline(never) public func transform(_ x: Int) -> Int { x }\n"
+        try Data(baseline.utf8).write(to: sourceURL)
+
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            optimization: "-Onone"
+        )
+        let transform = try #require(archive.functions.first)
+        let entry = try #require(transform.entryIndex)
+
+        try Data(
+            """
+            private final class CounterBox {
+                var raw: Int
+
+                init(_ raw: Int) {
+                    self.raw = raw
+                }
+
+                @inline(never)
+                func increment() {
+                    raw += 1
+                }
+
+                var doubled: Int {
+                    @inline(never) get { raw * 2 }
+                }
+            }
+
+            @inline(never)
+            public func transform(_ x: Int) -> Int {
+                let box = CounterBox(x)
+                let alias = box
+                alias.increment()
+                return box.doubled
+            }
+            """.utf8
+        ).write(to: sourceURL)
+        let result = try driver.build(.init(archive: archive, sourceFiles: [sourceURL]))
+        #expect(result.changedFunctions.map(\.key) == [transform.key])
+        #expect(result.module.localTypes.count == 1)
+        let definition = try #require(result.module.localTypes.first)
+        #expect(definition.key.rawValue == "CounterBox")
+        guard case let .class(fields, hostedSuperclass, hostedMethods) = definition.kind else {
+            Issue.record("expected one patch-local class definition")
+            return
+        }
+        #expect(fields == [.init(name: "raw", type: .int64)])
+        #expect(hostedSuperclass == nil)
+        #expect(hostedMethods.isEmpty)
+        #expect(result.module.capabilities.contains(.localClassesV1))
+        #expect(result.disassembly.contains("allocate_object"))
+        #expect(result.disassembly.contains("project_object_addr"))
+
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        let outcome = VM.Interpreter().invoke(
+            entry: entry,
+            image: image,
+            arguments: [
+                .integer(try VM.Integer(signed: 4, bitWidth: 64, isSigned: true)),
+            ]
+        )
+        #expect(
+            outcome == .returned(
+                .integer(try VM.Integer(signed: 10, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
     @Test("An allowlisted Swift callee becomes a typed native import")
     func lowersCallsToNativeImports() throws {
         let directory = FileManager.default.temporaryDirectory

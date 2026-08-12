@@ -80,6 +80,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         caseIndex: UInt32,
         payload: VM.Value?
     )
+    case object(VM.ObjectReference)
     case error(VM.ErrorValue)
     case address(VM.Address)
     case closure(VM.Closure)
@@ -98,6 +99,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .tuple(elements): .tuple(elements.map(\.type))
         case let .optional(value): .optional(value?.type ?? .never)
         case let .structure(type, _), let .enumeration(type, _, _): .local(type)
+        case let .object(object): .local(object.typeKey)
         case .error: .error
         case let .address(address): .address(address.pointee)
         case let .closure(closure): .closure(closure.signature)
@@ -121,6 +123,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
             "\(type)(\(fields.map(\.description).joined(separator: ", ")))"
         case let .enumeration(type, caseIndex, payload):
             "\(type).#\(caseIndex)" + (payload.map { "(\($0))" } ?? "")
+        case let .object(object): object.description
         case let .error(error): error.description
         case let .address(address): address.description
         case let .closure(closure): closure.description
@@ -227,6 +230,8 @@ extension VM.Value {
         case let (.structure(actual, _), .local(expected)),
              let (.enumeration(actual, _, _), .local(expected)):
             actual == expected
+        case let (.object(object), .local(expected)):
+            object.typeKey == expected
         case (.error, .error):
             true
         case let (.address(address), .address(pointee)):

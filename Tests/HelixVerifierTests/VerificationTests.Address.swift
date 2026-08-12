@@ -6,6 +6,35 @@ import Testing
 extension VerificationTests {
 @Suite("HLBC address and exclusivity verifier")
 struct AddressSemantics {
+    @Test("Local class references are recursive leaves, but cannot impersonate Error values")
+    func validatesLocalClassDefinitions() throws {
+        let node = Bytecode.LocalTypeKey(rawValue: "Fixture.Node")
+        let definition = Bytecode.LocalTypeDefinition(
+            key: node,
+            kind: .class(
+                fields: [
+                    .init(name: "value", type: .int64),
+                    .init(name: "next", type: .optional(.local(node))),
+                ],
+                hostedSuperclass: nil,
+                hostedMethods: []
+            )
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1,
+            .localNominalsV1,
+            .localClassesV1,
+        ]
+
+        _ = try verify(localTypes: [definition], capabilities: capabilities)
+
+        var invalid = definition
+        invalid.conformsToError = true
+        #expect(throws: Verification.Error.self) {
+            try verify(localTypes: [invalid], capabilities: capabilities)
+        }
+    }
+
     @Test("A projected local-struct address can be mutated by an inout helper")
     func acceptsProjectedInoutCall() throws {
         let counter = Bytecode.LocalTypeKey(rawValue: "Fixture.Counter")
@@ -230,12 +259,79 @@ struct AddressSemantics {
                     address: .init(rawValue: 1),
                     kind: .modify
                 ),
-                .trap(.explicit("fixture")),
+                .returnValue(nil),
             ]
         )
         #expect(throws: Verification.Error.self) {
             try verify(additionalFunctions: [missingEnd])
         }
+    }
+
+    @Test("An access scope may cross a checked branch and terminate on its trap edge")
+    func acceptsAccessAcrossCheckedBranch() throws {
+        let function = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "checkedMutation",
+            parameterRegisters: [],
+            resultType: .void,
+            registerTypes: [
+                .int64,
+                .address(.int64),
+                .address(.int64),
+                .bool,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    instructions: [
+                        .constantInteger(result: .init(rawValue: 0), value: 1),
+                        .storeStack(
+                            slot: .init(rawValue: 0),
+                            source: .init(rawValue: 0),
+                            mode: .initialize
+                        ),
+                        .stackAddress(
+                            result: .init(rawValue: 1),
+                            slot: .init(rawValue: 0)
+                        ),
+                        .beginAccess(
+                            result: .init(rawValue: 2),
+                            address: .init(rawValue: 1),
+                            kind: .modify
+                        ),
+                        .constantBool(result: .init(rawValue: 3), value: false),
+                        .conditionalBranch(
+                            condition: .init(rawValue: 3),
+                            trueTarget: .init(rawValue: 1),
+                            trueArguments: [],
+                            falseTarget: .init(rawValue: 2),
+                            falseArguments: []
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    instructions: [.trap(.integerOverflow)]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    instructions: [
+                        .storeAddress(
+                            address: .init(rawValue: 2),
+                            source: .init(rawValue: 0),
+                            mode: .assign
+                        ),
+                        .endAccess(.init(rawValue: 2)),
+                        .destroyStack(.init(rawValue: 0)),
+                        .returnValue(nil),
+                    ]
+                ),
+            ],
+            stackSlotTypes: [.int64]
+        )
+
+        _ = try verify(additionalFunctions: [function])
     }
 
     @Test("Exclusive accesses reject overlap and aliased inout arguments")

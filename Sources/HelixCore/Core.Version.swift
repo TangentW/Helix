@@ -99,8 +99,8 @@ public struct ReleaseIdentity: Codable, Hashable, Sendable {
 
 public enum Versions {
     public static let runtime = Core.SemanticVersion(0, 1, 0)
-    public static let bytecode = Core.SemanticVersion(1, 10, 0)
-    public static let interfaceArchive = Core.SemanticVersion(2, 5, 0)
+    public static let bytecode = Core.SemanticVersion(1, 11, 0)
+    public static let interfaceArchive = Core.SemanticVersion(2, 6, 0)
     public static let package = Core.SemanticVersion(1, 0, 0)
 }
 }

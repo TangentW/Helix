@@ -23,6 +23,8 @@ public enum Metadata {
         .compilerSpecializationsV1,
         .asyncLeafEntriesV1,
         .anyValuesV1,
+        .localClassesV1,
+        .hostedObjectiveCClassesV1,
     ]
 }
 }

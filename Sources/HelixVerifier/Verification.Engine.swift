@@ -61,6 +61,12 @@ public struct Engine: Verification.ImageVerifying {
 
         let effectiveLimits = module.requestedResources.constrained(by: policy.resourceCeiling)
         let functionMap = try verifyUniqueFunctions(module.functions)
+        try verifyLocalClassDescriptors(
+            localTypes,
+            functions: functionMap,
+            shell: shell,
+            capabilities: module.capabilities
+        )
         let entryFunctionIDs = Set(module.entries.map(\.functionID))
         try verifyLocalTypeReferences(module.functions, localTypes: localTypes)
         try verifySourceMap(module.sourceMap, functions: functionMap)
@@ -78,6 +84,20 @@ public struct Engine: Verification.ImageVerifying {
             capabilities: module.capabilities
         )
         try verifyNativeTypes(module.functions, shell: shell)
+        for definition in module.localTypes {
+            switch definition.kind {
+            case let .structure(fields), let .class(fields, _, _):
+                for field in fields {
+                    try verifyNativeTypes(field.type, shell: shell)
+                }
+            case let .enumeration(cases):
+                for item in cases {
+                    if let payload = item.payloadType {
+                        try verifyNativeTypes(payload, shell: shell)
+                    }
+                }
+            }
+        }
         try verifyTypeCapabilities(
             module.functions,
             localTypes: module.localTypes,
@@ -214,6 +234,43 @@ public struct Engine: Verification.ImageVerifying {
                 for item in cases {
                     try verifyIdentifier(item.name, label: "local enum case")
                 }
+            case let .class(fields, hostedSuperclass, hostedMethods):
+                guard capabilities.contains(.localClassesV1) else {
+                    throw Verification.Error.capabilityDenied(.localClassesV1)
+                }
+                if hostedSuperclass != nil {
+                    guard capabilities.contains(.hostedObjectiveCClassesV1) else {
+                        throw Verification.Error.capabilityDenied(
+                            .hostedObjectiveCClassesV1
+                        )
+                    }
+                } else if !hostedMethods.isEmpty {
+                    throw Verification.Error.invalidModule(
+                        "VM-only class \(definition.key) declares native callbacks"
+                    )
+                }
+                guard !definition.conformsToError else {
+                    throw Verification.Error.invalidModule(
+                        "local class \(definition.key) cannot conform to Error"
+                    )
+                }
+                members = fields.count + hostedMethods.count
+                guard Set(fields.map(\.name)).count == fields.count else {
+                    throw Verification.Error.invalidModule(
+                        "local class \(definition.key) has duplicate fields"
+                    )
+                }
+                for field in fields {
+                    try verifyIdentifier(field.name, label: "local class field")
+                }
+                guard Set(hostedMethods.map(\.selector)).count == hostedMethods.count else {
+                    throw Verification.Error.invalidModule(
+                        "hosted class \(definition.key) has duplicate selectors"
+                    )
+                }
+                for method in hostedMethods {
+                    try verifyObjectiveCSelector(method.selector)
+                }
             }
             guard members <= structuralLimits.maximumLocalTypeMembers else {
                 throw Verification.Error.invalidModule(
@@ -231,7 +288,11 @@ public struct Engine: Verification.ImageVerifying {
             totalMembers = addition.partialValue
         }
 
-        func verifyMemberType(_ type: Bytecode.ValueType, depth: Int) throws {
+        func verifyMemberType(
+            _ type: Bytecode.ValueType,
+            depth: Int,
+            permitsNative: Bool
+        ) throws {
             guard depth <= structuralLimits.maximumLocalTypeNestingDepth else {
                 throw Verification.Error.invalidModule(
                     "local type member nesting exceeds "
@@ -246,12 +307,11 @@ public struct Engine: Verification.ImageVerifying {
                     "local type members cannot be Void or Never"
                 )
             case .native:
-                // HLBC 1.6 local values are fully VM-managed. Native-handle
-                // ownership inside recursive aggregates is deferred until the
-                // address/exclusivity model can prove destruction paths.
-                throw Verification.Error.invalidModule(
-                    "HLBC 1.6 local types cannot contain native values"
-                )
+                guard permitsNative else {
+                    throw Verification.Error.invalidModule(
+                        "HLBC 1.6 local types cannot contain native values"
+                    )
+                }
             case .address:
                 throw Verification.Error.invalidModule(
                     "local type members cannot contain address values"
@@ -285,15 +345,19 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 }
             case let .array(element), let .optional(element):
-                try verifyMemberType(element, depth: depth + 1)
+                try verifyMemberType(
+                    element,
+                    depth: depth + 1,
+                    permitsNative: permitsNative
+                )
             case let .dictionary(key, value):
                 guard isSupportedDictionaryKey(key) else {
                     throw Verification.Error.invalidModule(
                         "local type Dictionary key must be Bool, integer, or String"
                     )
                 }
-                try verifyMemberType(key, depth: depth + 1)
-                try verifyMemberType(value, depth: depth + 1)
+                try verifyMemberType(key, depth: depth + 1, permitsNative: permitsNative)
+                try verifyMemberType(value, depth: depth + 1, permitsNative: permitsNative)
             case let .tuple(elements):
                 guard elements.count <= 64 else {
                     throw Verification.Error.invalidModule(
@@ -301,7 +365,11 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 }
                 for element in elements {
-                    try verifyMemberType(element, depth: depth + 1)
+                    try verifyMemberType(
+                        element,
+                        depth: depth + 1,
+                        permitsNative: permitsNative
+                    )
                 }
             case .bool, .string:
                 break
@@ -310,12 +378,18 @@ public struct Engine: Verification.ImageVerifying {
         for definition in definitions {
             switch definition.kind {
             case let .structure(fields):
-                for field in fields { try verifyMemberType(field.type, depth: 0) }
+                for field in fields {
+                    try verifyMemberType(field.type, depth: 0, permitsNative: false)
+                }
             case let .enumeration(cases):
                 for item in cases {
                     if let payload = item.payloadType {
-                        try verifyMemberType(payload, depth: 0)
+                        try verifyMemberType(payload, depth: 0, permitsNative: false)
                     }
+                }
+            case let .class(fields, _, _):
+                for field in fields {
+                    try verifyMemberType(field.type, depth: 0, permitsNative: true)
                 }
             }
         }
@@ -361,12 +435,16 @@ public struct Engine: Verification.ImageVerifying {
         func typeDepth(_ type: Bytecode.ValueType) throws -> Int {
             switch type {
             case let .local(dependency):
-                try localTypeExpansionDepth(
-                    dependency,
-                    definitions: definitions,
-                    visiting: &visiting,
-                    depths: &depths
-                )
+                if case .class = definitions[dependency]?.kind {
+                    0
+                } else {
+                    try localTypeExpansionDepth(
+                        dependency,
+                        definitions: definitions,
+                        visiting: &visiting,
+                        depths: &depths
+                    )
+                }
             case let .array(element), let .optional(element):
                 try typeDepth(element) + 1
             case let .dictionary(key, value):
@@ -382,6 +460,7 @@ public struct Engine: Verification.ImageVerifying {
         let memberTypes: [Bytecode.ValueType] = switch definition.kind {
         case let .structure(fields): fields.map(\.type)
         case let .enumeration(cases): cases.compactMap(\.payloadType)
+        case let .class(fields, _, _): fields.map(\.type)
         }
         let depth = try (memberTypes.map(typeDepth).max() ?? 0) + 1
         guard depth <= structuralLimits.maximumLocalTypeNestingDepth else {
@@ -437,6 +516,74 @@ public struct Engine: Verification.ImageVerifying {
               !value.utf8.contains(0)
         else {
             throw Verification.Error.invalidModule("\(label) is empty, oversized, or contains NUL")
+        }
+    }
+
+    private func verifyObjectiveCSelector(_ selector: String) throws {
+        try verifyIdentifier(selector, label: "Objective-C selector")
+        let components = selector.split(separator: ":", omittingEmptySubsequences: false)
+        guard components.first?.isEmpty == false,
+              components.dropLast().allSatisfy({ component in
+                  component.unicodeScalars.allSatisfy {
+                      $0 == "_" || CharacterSet.alphanumerics.contains($0)
+                  }
+              }),
+              !selector.unicodeScalars.contains(where: {
+                  $0 != ":" && $0 != "_" && !CharacterSet.alphanumerics.contains($0)
+              })
+        else {
+            throw Verification.Error.invalidModule(
+                "hosted method selector \(selector) is malformed"
+            )
+        }
+    }
+
+    private func verifyLocalClassDescriptors(
+        _ localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        functions: [Bytecode.FunctionID: Bytecode.Function],
+        shell: Verification.ShellInterface,
+        capabilities: Set<Core.Capability>
+    ) throws {
+        for definition in localTypes.values {
+            guard case let .class(_, hostedSuperclass, methods) = definition.kind else {
+                continue
+            }
+            guard capabilities.contains(.localClassesV1) else {
+                throw Verification.Error.capabilityDenied(.localClassesV1)
+            }
+            if let hostedSuperclass {
+                guard capabilities.contains(.hostedObjectiveCClassesV1),
+                      let native = shell.types[hostedSuperclass.typeID],
+                      native.kind == .reference,
+                      native.isCopyable
+                else {
+                    throw Verification.Error.invalidModule(
+                        "hosted class \(definition.key) has no frozen reference superclass"
+                    )
+                }
+            }
+            for method in methods {
+                guard let function = functions[method.functionID] else {
+                    throw Verification.Error.invalidModule(
+                        "hosted class \(definition.key) references unknown function \(method.functionID)"
+                    )
+                }
+                let parameters = function.parameterRegisters.compactMap(function.type(of:))
+                let expected: [Bytecode.ValueType] = switch method.abi {
+                case .voidNoArguments: [.local(definition.key)]
+                case .voidBool: [.bool, .local(definition.key)]
+                }
+                guard parameters.count == function.parameterRegisters.count,
+                      parameters == expected,
+                      function.resultType == .void,
+                      !function.effects.mayThrow,
+                      !function.effects.isAsync
+                else {
+                    throw Verification.Error.invalidModule(
+                        "hosted selector \(method.selector) has an incompatible HLBC function"
+                    )
+                }
+            }
         }
     }
 
@@ -756,6 +903,17 @@ public struct Engine: Verification.ImageVerifying {
                 for item in cases {
                     if let payload = item.payloadType { try visit(payload) }
                 }
+            case let .class(fields, hostedSuperclass, _):
+                guard capabilities.contains(.localClassesV1) else {
+                    throw Verification.Error.capabilityDenied(.localClassesV1)
+                }
+                if hostedSuperclass != nil,
+                   !capabilities.contains(.hostedObjectiveCClassesV1) {
+                    throw Verification.Error.capabilityDenied(
+                        .hostedObjectiveCClassesV1
+                    )
+                }
+                for field in fields { try visit(field.type) }
             }
         }
     }
@@ -1463,6 +1621,26 @@ public struct Engine: Verification.ImageVerifying {
             else {
                 throw fail("project_struct_address must reference a valid local struct field")
             }
+        case let .allocateObject(result):
+            guard capabilities.contains(.localClassesV1),
+                  case let .local(key) = type(result),
+                  let definition = localTypes[key],
+                  case .class = definition.kind
+            else {
+                throw fail("allocate_object result must be a declared local class")
+            }
+        case let .projectObjectAddress(result, object, fieldIndex):
+            guard capabilities.contains(.localClassesV1),
+                  capabilities.contains(.addressValuesV1),
+                  case let .local(key) = type(object),
+                  let definition = localTypes[key],
+                  case let .class(fields, _, _) = definition.kind,
+                  let index = Int(exactly: fieldIndex),
+                  fields.indices.contains(index),
+                  type(result) == .address(fields[index].type)
+            else {
+                throw fail("project_object_address must reference a valid local class field")
+            }
         case let .beginAccess(result, address, _):
             guard capabilities.contains(.addressValuesV1),
                   case .address = type(address),
@@ -1491,8 +1669,8 @@ public struct Engine: Verification.ImageVerifying {
             else {
                 throw fail("store_address source must match its address pointee")
             }
-            guard mode == .assign else {
-                throw fail("HLBC 1.7 store_address requires assign mode")
+            guard mode == .assign || mode == .initialize else {
+                throw fail("store_address requires assign or initialize mode")
             }
         case let .checkedBinary(result, overflow, operation, lhs, rhs):
             guard type(result) == type(lhs), type(lhs) == type(rhs), case .integer = type(lhs) else {
@@ -2315,10 +2493,11 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 case .makeStruct, .structExtract, .makeEnum, .makeError, .castError,
                      .eraseToAny, .checkedCastAny, .forceCastAny, .stackAddress,
-                     .projectStructAddress, .beginAccess, .endAccess:
-                    // HLBC 1.6 rejects native handles inside local nominal values,
-                    // so these fully VM-managed operations cannot change the
-                    // explicit native-ownership set.
+                     .projectStructAddress, .allocateObject, .projectObjectAddress,
+                     .beginAccess, .endAccess:
+                    // Allocation and address projection do not transfer a
+                    // native handle. A local class field load/store is tracked
+                    // by the corresponding address instruction instead.
                     break
                 case let .switchEnum(_, cases, defaultTarget):
                     let targets = cases.map(\.target) + (defaultTarget.map { [$0] } ?? [])
@@ -2611,6 +2790,7 @@ public struct Engine: Verification.ImageVerifying {
     private enum AddressRoot: Hashable {
         case stack(Bytecode.StackSlot)
         case parameter(Bytecode.Register)
+        case object(Bytecode.Register)
     }
 
     private enum AddressScope: Hashable {
@@ -2628,6 +2808,11 @@ public struct Engine: Verification.ImageVerifying {
             let shared = min(path.count, other.path.count)
             return Array(path.prefix(shared)) == Array(other.path.prefix(shared))
         }
+    }
+
+    private struct ActiveAddressAccess: Hashable {
+        var provenance: AddressProvenance
+        var kind: Bytecode.AccessKind
     }
 
     private func addressProvenance(
@@ -2677,6 +2862,12 @@ public struct Engine: Verification.ImageVerifying {
                 var base = try resolve(base)
                 base.path.append(fieldIndex)
                 provenance = base
+            case let .projectObjectAddress(_, object, fieldIndex):
+                provenance = .init(
+                    root: .object(object),
+                    path: [fieldIndex],
+                    scope: nil
+                )
             case let .beginAccess(result, address, _):
                 var base = try resolve(address)
                 guard base.scope == nil else {
@@ -2708,9 +2899,10 @@ public struct Engine: Verification.ImageVerifying {
         return result
     }
 
-    /// HLBC 1.7 keeps local access scopes within one basic block. This makes
-    /// exclusivity decidable before execution while still covering canonical
-    /// SIL's common nonthrowing `inout` and mutating-method shapes.
+    /// Tracks access scopes across the CFG. Canonical SIL may keep a modify
+    /// access open across an overflow check, so every incoming edge must carry
+    /// one identical active-scope set. Terminal traps may abandon scopes;
+    /// ordinary returns and throws must close them explicitly.
     private func verifyAddressLifecycle(
         function: Bytecode.Function,
         functions: [Bytecode.FunctionID: Bytecode.Function]
@@ -2720,10 +2912,19 @@ public struct Engine: Verification.ImageVerifying {
             return false
         }) else { return }
         let provenance = try addressProvenance(function: function)
+        let blocks = Dictionary(uniqueKeysWithValues: function.blocks.map { ($0.id, $0) })
+        var incoming: [Bytecode.BlockID: [Bytecode.Register: ActiveAddressAccess]] = [
+            function.entryBlock: [:],
+        ]
+        var pending = [function.entryBlock]
+        var processed = Set<Bytecode.BlockID>()
 
-        for block in function.blocks {
-            var active: [Bytecode.Register: (AddressProvenance, Bytecode.AccessKind)] = [:]
-            var ended = Set<Bytecode.Register>()
+        while !pending.isEmpty {
+            let blockID = pending.removeFirst()
+            guard processed.insert(blockID).inserted,
+                  let block = blocks[blockID],
+                  var active = incoming[blockID]
+            else { continue }
             for (offset, instruction) in block.instructions.enumerated() {
                 func fail(_ reason: String) -> Verification.Error {
                     .invalidInstruction(
@@ -2737,9 +2938,6 @@ public struct Engine: Verification.ImageVerifying {
                     guard let value = provenance[register] else {
                         throw fail("address operand has no verified provenance")
                     }
-                    if case let .local(scope)? = value.scope, ended.contains(scope) {
-                        throw fail("address is used after end_access")
-                    }
                     return value
                 }
                 func requireScoped(
@@ -2751,10 +2949,10 @@ public struct Engine: Verification.ImageVerifying {
                         throw fail("address operation requires an active access scope")
                     }
                     if case let .local(scopeRegister) = scope {
-                        guard let (_, kind) = active[scopeRegister] else {
-                            throw fail("address access scope is not active in this block")
+                        guard let access = active[scopeRegister] else {
+                            throw fail("address access scope is not active on this path")
                         }
-                        if modify, kind != .modify {
+                        if modify, access.kind != .modify {
                             throw fail("write requires a modify access")
                         }
                     }
@@ -2767,15 +2965,16 @@ public struct Engine: Verification.ImageVerifying {
                     guard base.scope == nil else {
                         throw fail("begin_access cannot nest an active address")
                     }
-                    guard active.values.allSatisfy({ existing, existingKind in
-                        !base.overlaps(existing) || (kind == .read && existingKind == .read)
+                    guard active.values.allSatisfy({ existing in
+                        !base.overlaps(existing.provenance)
+                            || (kind == .read && existing.kind == .read)
                     }) else {
                         throw fail("begin_access violates exclusive access")
                     }
                     guard let resultProvenance = provenance[result] else {
                         throw fail("begin_access result has no verified provenance")
                     }
-                    active[result] = (resultProvenance, kind)
+                    active[result] = .init(provenance: resultProvenance, kind: kind)
                 case let .endAccess(address):
                     guard case let .local(scope)? = try checked(address).scope,
                           scope == address,
@@ -2783,13 +2982,24 @@ public struct Engine: Verification.ImageVerifying {
                     else {
                         throw fail("end_access must close its matching begin_access result")
                     }
-                    ended.insert(scope)
                 case let .loadAddress(_, address, _):
                     _ = try requireScoped(address)
-                case let .storeAddress(address, _, _):
-                    _ = try requireScoped(address, modify: true)
+                case let .storeAddress(address, _, mode):
+                    let destination = try requireScoped(address, modify: true)
+                    if mode == .initialize,
+                       case .object = destination.root {
+                        break
+                    }
+                    guard mode == .assign else {
+                        throw fail("initialize store requires local object field storage")
+                    }
                 case let .projectStructAddress(_, base, _):
-                    _ = try checked(base)
+                    let baseProvenance = try checked(base)
+                    if baseProvenance.scope != nil {
+                        _ = try requireScoped(base)
+                    }
+                case .projectObjectAddress:
+                    break
                 case let .apply(_, calleeID, arguments):
                     guard let callee = functions[calleeID] else { break }
                     var inoutValues: [AddressProvenance] = []
@@ -2814,7 +3024,7 @@ public struct Engine: Verification.ImageVerifying {
                 case let .storeStack(slot, _, _), let .loadStack(_, slot, _),
                      let .destroyStack(slot):
                     let root = AddressProvenance(root: .stack(slot), path: [], scope: nil)
-                    guard active.values.allSatisfy({ !$0.0.overlaps(root) }) else {
+                    guard active.values.allSatisfy({ !$0.provenance.overlaps(root) }) else {
                         throw fail("direct stack access overlaps an active address access")
                     }
                 case .entryApply, .nativeApply, .entryTryApply, .nativeTryApply:
@@ -2835,12 +3045,36 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 }
             }
-            guard active.isEmpty else {
-                throw Verification.Error.invalidBlock(
-                    function: function.id,
-                    block: block.id,
-                    reason: "begin_access scope is not ended in the same block"
-                )
+
+            let targets = block.instructions.last.map(successors) ?? []
+            if targets.isEmpty {
+                let abandonsScopes: Bool = if case .trap? = block.instructions.last {
+                    true
+                } else {
+                    false
+                }
+                guard active.isEmpty || abandonsScopes else {
+                    throw Verification.Error.invalidBlock(
+                        function: function.id,
+                        block: block.id,
+                        reason: "active begin_access scope escapes a non-trapping exit"
+                    )
+                }
+                continue
+            }
+            for target in targets {
+                if let existing = incoming[target] {
+                    guard existing == active else {
+                        throw Verification.Error.invalidBlock(
+                            function: function.id,
+                            block: target,
+                            reason: "incoming edges disagree on active begin_access scopes"
+                        )
+                    }
+                } else {
+                    incoming[target] = active
+                    pending.append(target)
+                }
             }
         }
     }

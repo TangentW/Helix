@@ -18,6 +18,7 @@ public struct TypeEnvironment: Sendable {
     private enum RawKind: Sendable {
         case structure([RawField])
         case enumeration([RawEnumCase])
+        case `class`(fields: [RawField], superclass: String?, isFinal: Bool)
     }
 
     private struct RawDefinition: Sendable {
@@ -90,7 +91,7 @@ public struct TypeEnvironment: Sendable {
             _ header: [String],
             parentScope: String?
         ) throws {
-            let shortName = header[1]
+            let shortName = header[2]
             guard !shortName.contains("<") else {
                 try skipBracedDeclaration()
                 return
@@ -108,15 +109,38 @@ public struct TypeEnvironment: Sendable {
                 let member = lines[index].trimmingCharacters(in: .whitespaces)
                 if member == "}" {
                     index += 1
-                    let conformances = header[2]
+                    let conformances = header[3]
                         .split(separator: ",")
                         .map { $0.trimmingCharacters(in: .whitespaces) }
+                    // Existing non-final classes belong to the frozen Shell. A
+                    // downloaded image can add only final logical classes, so
+                    // do not accidentally reinterpret an ordinary app class as
+                    // patch-local while the Shell is still being indexed.
+                    if header[1] == "class", header[0].isEmpty {
+                        return
+                    }
+                    let kind: RawKind
+                    switch header[1] {
+                    case "struct":
+                        kind = .structure(fields)
+                    case "enum":
+                        kind = .enumeration(cases)
+                    case "class":
+                        let inherited = conformances.first
+                        kind = .class(
+                            fields: fields,
+                            superclass: inherited,
+                            isFinal: !header[0].isEmpty
+                        )
+                    default:
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "unknown nominal declaration kind \(header[1])"
+                        )
+                    }
                     let definition = RawDefinition(
                         key: key,
                         parentScope: TypeEnvironment.parentScope(of: name),
-                        kind: header[0] == "struct"
-                            ? .structure(fields)
-                            : .enumeration(cases),
+                        kind: kind,
                         conformsToError: conformances.contains("Error")
                             || conformances.contains("Swift.Error")
                     )
@@ -134,13 +158,13 @@ public struct TypeEnvironment: Sendable {
                     try parseNominal(nested, parentScope: name)
                     continue
                 }
-                if header[0] == "struct",
+                if header[1] == "struct" || header[1] == "class",
                    let field = TypeEnvironment.captures(
                     member,
                     pattern: TypeEnvironment.storedFieldPattern
                    ) {
                     fields.append(.init(name: field[0], type: field[1]))
-                } else if header[0] == "enum",
+                } else if header[1] == "enum",
                           let item = TypeEnvironment.captures(
                     member,
                     pattern: TypeEnvironment.enumCasePattern
@@ -181,6 +205,7 @@ public struct TypeEnvironment: Sendable {
 
     private var rawDefinitions: [Bytecode.LocalTypeKey: RawDefinition]
     private var structFactories: [String: Bytecode.LocalTypeKey]
+    private var classAllocators: [String: Bytecode.LocalTypeKey]
     private var requiresTypedErrors: Bool
     private var nativeTypes: [String: Core.TypeID]
     private var nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind]
@@ -190,6 +215,7 @@ public struct TypeEnvironment: Sendable {
     public init() {
         rawDefinitions = [:]
         structFactories = [:]
+        classAllocators = [:]
         requiresTypedErrors = false
         nativeTypes = [:]
         nativeTypeKinds = [:]
@@ -198,6 +224,7 @@ public struct TypeEnvironment: Sendable {
     init(text: String, functions: [CanonicalSIL.Function]) throws {
         rawDefinitions = try Self.extractDefinitions(text)
         structFactories = [:]
+        classAllocators = [:]
         nativeTypes = [:]
         nativeTypeKinds = [:]
         // Keep payload-free legacy Error patches on the 1.0 String error path.
@@ -208,6 +235,9 @@ public struct TypeEnvironment: Sendable {
         for function in functions {
             if let key = try detectStructFactory(function) {
                 structFactories[function.mangledName] = key
+            }
+            if let key = try detectClassAllocator(function) {
+                classAllocators[function.mangledName] = key
             }
         }
     }
@@ -235,6 +265,17 @@ public struct TypeEnvironment: Sendable {
             result.nativeTypeKinds[id] = kind
         }
         for (canonicalName, id) in records.sorted(by: { $0.key < $1.key }) {
+            let localMatches = result.localKeys(matchingNativeName: canonicalName)
+            guard localMatches.count <= 1 else {
+                throw CanonicalSIL.LoweringError.invalidCallTable(
+                    "native type \(canonicalName) ambiguously matches local declarations"
+                )
+            }
+            if let local = localMatches.first {
+                result.rawDefinitions.removeValue(forKey: local)
+                result.structFactories = result.structFactories.filter { $0.value != local }
+                result.classAllocators = result.classAllocators.filter { $0.value != local }
+            }
             var aliases = [canonicalName]
             if let separator = canonicalName.firstIndex(of: ".") {
                 aliases.append(String(canonicalName[canonicalName.index(after: separator)...]))
@@ -317,6 +358,8 @@ public struct TypeEnvironment: Sendable {
             return !fields.isEmpty
         case let .enumeration(cases):
             return cases.contains { !$0.associatedTypes.isEmpty }
+        case let .class(fields, _, _):
+            return !fields.isEmpty
         }
     }
 
@@ -493,6 +536,16 @@ public struct TypeEnvironment: Sendable {
         return matches.count == 1 ? matches[0] : nil
     }
 
+    private func localKeys(
+        matchingNativeName canonicalName: String
+    ) -> [Bytecode.LocalTypeKey] {
+        var spellings = Set([canonicalName])
+        if let separator = canonicalName.firstIndex(of: ".") {
+            spellings.insert(String(canonicalName[canonicalName.index(after: separator)...]))
+        }
+        return rawDefinitions.keys.filter { spellings.contains($0.rawValue) }.sorted()
+    }
+
     private func resolveClosureSignature(
         _ raw: String,
         relativeTo parentScope: String?
@@ -546,6 +599,14 @@ public struct TypeEnvironment: Sendable {
         structFactories[mangledName]
     }
 
+    func classAllocator(_ mangledName: String) -> Bytecode.LocalTypeKey? {
+        classAllocators[mangledName]
+    }
+
+    func isClassAllocator(_ mangledName: String) -> Bool {
+        classAllocators[mangledName] != nil
+    }
+
     func isStructFactory(_ mangledName: String) -> Bool {
         structFactories[mangledName] != nil
     }
@@ -594,6 +655,45 @@ public struct TypeEnvironment: Sendable {
                         }
                         return .init(name: item.name, payloadType: payload)
                     }
+                )
+            case let .class(fields, superclass, isFinal):
+                guard isFinal else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "non-final patch-local class \(key)"
+                    )
+                }
+                let hostedSuperclass: Bytecode.HostedSuperclass?
+                if let superclass {
+                    switch try? resolve(superclass, relativeTo: raw.parentScope) {
+                    case let .native(typeID):
+                        hostedSuperclass = .init(typeID: typeID)
+                    case let .local(parentKey):
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "patch-local class inheritance \(key): \(parentKey)"
+                        )
+                    case nil:
+                        // Protocol-only inheritance does not affect object layout.
+                        hostedSuperclass = nil
+                    default:
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "class superclass \(superclass)"
+                        )
+                    }
+                } else {
+                    hostedSuperclass = nil
+                }
+                kind = .class(
+                    fields: try fields.map {
+                        .init(
+                            name: $0.name,
+                            type: try resolve(
+                                $0.type,
+                                relativeTo: raw.parentScope
+                            )
+                        )
+                    },
+                    hostedSuperclass: hostedSuperclass,
+                    hostedMethods: []
                 )
             }
             return .init(
@@ -660,6 +760,8 @@ public struct TypeEnvironment: Sendable {
                 fields.forEach { collect($0.type) }
             case let .enumeration(cases):
                 cases.compactMap(\.payloadType).forEach(collect)
+            case let .class(fields, _, _):
+                fields.forEach { collect($0.type) }
             }
         }
         let definitions = result.sorted { $0.key < $1.key }
@@ -706,12 +808,16 @@ public struct TypeEnvironment: Sendable {
         func typeDepth(_ type: Bytecode.ValueType) throws -> Int {
             switch type {
             case let .local(dependency):
-                try localTypeExpansionDepth(
-                    dependency,
-                    definitions: definitions,
-                    visiting: &visiting,
-                    depths: &depths
-                )
+                if case .class = definitions[dependency]?.kind {
+                    0
+                } else {
+                    try localTypeExpansionDepth(
+                        dependency,
+                        definitions: definitions,
+                        visiting: &visiting,
+                        depths: &depths
+                    )
+                }
             case let .array(element), let .optional(element), let .address(element):
                 try typeDepth(element) + 1
             case let .dictionary(key, value):
@@ -734,6 +840,7 @@ public struct TypeEnvironment: Sendable {
         let memberTypes: [Bytecode.ValueType] = switch definition.kind {
         case let .structure(fields): fields.map(\.type)
         case let .enumeration(cases): cases.compactMap(\.payloadType)
+        case let .class(fields, _, _): fields.map(\.type)
         }
         let depth = try (memberTypes.map(typeDepth).max() ?? 0) + 1
         guard depth <= 32 else {
@@ -750,6 +857,40 @@ public struct TypeEnvironment: Sendable {
             throw CanonicalSIL.LoweringError.malformedSIL("\(key) is not a struct")
         }
         return fields
+    }
+
+    func classFields(for key: Bytecode.LocalTypeKey) throws -> [Bytecode.LocalStructField] {
+        guard case let .class(fields, _, _) = try definition(for: key).kind else {
+            throw CanonicalSIL.LoweringError.malformedSIL("\(key) is not a class")
+        }
+        return fields
+    }
+
+    func isClass(_ key: Bytecode.LocalTypeKey) -> Bool {
+        guard let raw = rawDefinitions[key] else { return false }
+        if case .class = raw.kind { return true }
+        return false
+    }
+
+    func storedFieldIndex(
+        type key: Bytecode.LocalTypeKey,
+        name: String
+    ) throws -> Int {
+        let fields: [Bytecode.LocalStructField]
+        switch try definition(for: key).kind {
+        case let .structure(values), let .class(values, _, _):
+            fields = values
+        case .enumeration:
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "local enum \(key) has no stored field \(name)"
+            )
+        }
+        guard let index = fields.firstIndex(where: { $0.name == name }) else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "local type \(key) has no field \(name)"
+            )
+        }
+        return index
     }
 
     func structFieldIndex(
@@ -842,6 +983,24 @@ public struct TypeEnvironment: Sendable {
         return key
     }
 
+    private func detectClassAllocator(
+        _ function: CanonicalSIL.Function
+    ) throws -> Bytecode.LocalTypeKey? {
+        guard let arrow = function.loweredType.range(of: " -> ", options: .backwards) else {
+            return nil
+        }
+        var rawResult = function.loweredType[arrow.upperBound...]
+            .trimmingCharacters(in: .whitespaces)
+        if rawResult.hasPrefix("@owned ") {
+            rawResult.removeFirst("@owned ".count)
+        }
+        guard case let .local(key) = try? resolve(rawResult), isClass(key) else {
+            return nil
+        }
+        let parameters = function.loweredType[..<arrow.lowerBound]
+        return parameters.contains("@thick \(key.rawValue).Type") ? key : nil
+    }
+
     private func structFactoryShape(
         _ function: CanonicalSIL.Function
     ) throws -> (key: Bytecode.LocalTypeKey, fields: [Bytecode.LocalStructField], rawResult: String)? {
@@ -885,11 +1044,11 @@ public struct TypeEnvironment: Sendable {
     }
 
     private static let nominalHeaderPattern =
-        #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate)\s+)*(?:indirect )?(struct|enum)\s+([^\s:{]+)(?:\s*:\s*([^\{]+))?\s*\{$"#
+        #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate)\s+)*(?:(final)\s+)?(?:indirect )?(struct|enum|class)\s+([^\s:{]+)(?:\s*:\s*([^\{]+))?\s*\{$"#
     private static let extensionHeaderPattern =
         #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate)\s+)*extension\s+([^\s:{]+)(?:\s*:\s*[^\{]+)?(?:\s+where\s+[^\{]+)?\s*\{$"#
     private static let storedFieldPattern =
-        #"^(?:@[^\s]+\s+)*@_hasStorage\s+(?:(?:public|internal|package|private|fileprivate)\s+)?(?:var|let)\s+([^:]+):\s*(.+?)(?:\s*\{.*)?$"#
+        #"^(?:@[^\s]+\s+)*@_hasStorage\s+(?:(?:public|internal|package|private|fileprivate)\s+)?(?:final\s+)?(?:var|let)\s+([^:]+):\s*(.+?)(?:\s*\{.*)?$"#
     private static let enumCasePattern =
         #"^(?:indirect )?case\s+([^\s(]+)(?:\((.*)\))?$"#
 

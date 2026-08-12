@@ -833,6 +833,22 @@ public struct Archive: Codable, Hashable, Sendable {
                 )
             }
         }
+        if capabilities.contains(.localClassesV1)
+            || capabilities.contains(.hostedObjectiveCClassesV1) {
+            let requiredBytecode = Core.SemanticVersion(1, 11, 0)
+            let requiredArchive = Core.SemanticVersion(2, 6, 0)
+            guard compatibility.bytecode.major == requiredBytecode.major,
+                  compatibility.bytecode >= requiredBytecode,
+                  compatibility.interfaceArchive.major == requiredArchive.major,
+                  compatibility.interfaceArchive >= requiredArchive,
+                  !capabilities.contains(.hostedObjectiveCClassesV1)
+                    || capabilities.contains(.localClassesV1)
+            else {
+                throw InterfaceArchive.Error.invalidArchive(
+                    "local and hosted classes require HLBC 1.11 and HLXI 2.6 compatibility"
+                )
+            }
+        }
         guard UInt32(exactly: eligible.count) == bridgeRegistrationCount else {
             throw InterfaceArchive.Error.invalidArchive("bridge registration count does not equal eligible entries")
         }

@@ -22,6 +22,19 @@ public enum Disassembler {
                 }.joined(separator: ", ")
                 let error = definition.conformsToError ? " : Error" : ""
                 lines.append("local_enum \(definition.key)\(error) { \(body) }")
+            case let .class(fields, hostedSuperclass, methods):
+                let body = fields.map { "\($0.name): \($0.type)" }
+                    .joined(separator: ", ")
+                let superclass = hostedSuperclass.map {
+                    " : Native<\($0.typeID)>"
+                } ?? ""
+                lines.append("local_class \(definition.key)\(superclass) { \(body) }")
+                for method in methods {
+                    lines.append(
+                        "  hosted_method \(quoted(method.selector)) "
+                            + "@\(method.functionID) [\(method.abi.rawValue)]"
+                    )
+                }
             }
         }
         for function in module.functions.sorted(by: { $0.id < $1.id }) {
@@ -136,6 +149,10 @@ public enum Disassembler {
             "\(result) = stack_address \(slot)"
         case let .projectStructAddress(result, base, fieldIndex):
             "\(result) = project_struct_address \(base), #\(fieldIndex)"
+        case let .allocateObject(result):
+            "\(result) = allocate_object"
+        case let .projectObjectAddress(result, object, fieldIndex):
+            "\(result) = project_object_address \(object), #\(fieldIndex)"
         case let .beginAccess(result, address, kind):
             "\(result) = begin_access.\(kind.rawValue) \(address)"
         case let .endAccess(address):

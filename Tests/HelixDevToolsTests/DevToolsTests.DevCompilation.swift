@@ -182,6 +182,58 @@ struct DevCompilationTests {
         #expect(disassembly.contains("hlbc_apply"))
     }
 
+    @Test("A save may add a final class with mutable fields and computed accessors")
+    func compilesNewPatchLocalClass() async throws {
+        let fixture = try Fixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let builder = DevCompilation.BytecodeBuilder(
+            archive: fixture.archive,
+            manifest: fixture.manifest
+        )
+
+        try fixture.write(
+            """
+            private final class CounterBox {
+                var value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+
+                @inline(never)
+                func increment() {
+                    value += 1
+                }
+
+                var doubled: Int {
+                    @inline(never) get { value * 2 }
+                }
+            }
+
+            @inline(never)
+            public func transform(_ x: Int) -> Int {
+                let box = CounterBox(x)
+                let alias = box
+                alias.increment()
+                return box.doubled
+            }
+            """
+        )
+        let outcome = try await builder.build(
+            fixture.request(revision: 1, generation: 1)
+        )
+        let patch = try #require(outcome.patch)
+        let module = try Bytecode.Decoder.decode(patch.payload).module
+        let disassembly = Bytecode.Disassembler.disassemble(module)
+
+        #expect(patch.backend == .hlbc)
+        #expect(module.localTypes.map(\.key.rawValue) == ["CounterBox"])
+        #expect(module.capabilities.contains(.localClassesV1))
+        #expect(disassembly.contains("allocate_object"))
+        #expect(disassembly.contains("project_object_addr"))
+        #expect(disassembly.contains("hlbc_apply"))
+    }
+
     @Test("A Swift syntax error remains a compile diagnostic and preserves active code")
     func reportsSwiftDiagnostic() async throws {
         let fixture = try Fixture.make()

@@ -107,6 +107,13 @@ extension CompilerCapabilities {
                         collect(payload, into: &capabilities)
                     }
                 }
+            case let .class(fields, hostedSuperclass, _):
+                capabilities.insert(.localClassesV1)
+                if hostedSuperclass != nil {
+                    capabilities.insert(.hostedObjectiveCClassesV1)
+                    capabilities.insert(.nativeTypesV1)
+                }
+                for field in fields { collect(field.type, into: &capabilities) }
             }
         }
         if !imports.isEmpty { capabilities.insert(.nativeImportsV2) }

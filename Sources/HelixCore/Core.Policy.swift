@@ -26,6 +26,8 @@ public struct Capability: RawRepresentable, Hashable, Codable, Sendable, Compara
     public static let mainActorSyncV1: Self = "main-actor-sync-1"
     public static let asyncLeafEntriesV1: Self = "async-leaf-entry-1"
     public static let anyValuesV1: Self = "swift-any-1"
+    public static let localClassesV1: Self = "local-classes-1"
+    public static let hostedObjectiveCClassesV1: Self = "hosted-objc-classes-1"
 }
 
 public struct ResourceLimits: Codable, Hashable, Sendable {
