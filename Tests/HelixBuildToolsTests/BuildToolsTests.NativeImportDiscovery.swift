@@ -23,6 +23,25 @@ struct NativeImportDiscoveryTests {
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("Swift.Array<UIKit.UIView"))
     }
 
+    @Test("Objective-C mangling distinguishes classes from imported C values")
+    func distinguishesObjectiveCClassesFromCValues() {
+        #expect(
+            FrontendReceipt.Adapter.objectiveCClassNames(
+                inMangledType: "$sSo7UILabelCD"
+            ) == ["UILabel"]
+        )
+        #expect(
+            FrontendReceipt.Adapter.objectiveCClassNames(
+                inMangledType: "$sSaySo6UIViewCGD"
+            ) == ["UIView"]
+        )
+        #expect(
+            FrontendReceipt.Adapter.objectiveCClassNames(
+                inMangledType: "$sSo8_NSRangeVD"
+            ).isEmpty
+        )
+    }
+
     @Test("Real module indexing generates exact invokers for a selected source range")
     func indexesAndMaterializesGeneratedInvokers() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -523,6 +542,10 @@ struct NativeImportDiscoveryTests {
                 return date.addingTimeInterval(interval + 1)
             }
 
+            public func maxRange(_ range: NSRange) -> Int {
+                NSMaxRange(range) + 1
+            }
+
             public func currentSubviews() -> [UIView] {
                 if label.isHidden { return [] }
                 return label.subviews
@@ -644,6 +667,14 @@ struct NativeImportDiscoveryTests {
         #expect(generatedSymbols.contains { $0.hasPrefix("$hlx_native_option_set_literal_") })
         #expect(generatedSymbols.contains { $0.hasPrefix("$hlx_native_global_") })
         #expect(generatedSymbols.contains { $0.hasPrefix("$s") })
+        let globalFunction = try #require(
+            output.receipt.nativeImportBindings.first {
+                $0.generated?.baseName == "NSMaxRange"
+            }
+        )
+        #expect(globalFunction.generated?.dispatch == .globalFunction)
+        #expect(globalFunction.generated?.ownerType == nil)
+        #expect(globalFunction.importedModules.contains("Foundation"))
 
         let typeBindings = output.receipt.nativeTypeBindings.compactMap(\.generated)
         #expect(typeBindings.contains {
@@ -656,6 +687,10 @@ struct NativeImportDiscoveryTests {
         })
         #expect(typeBindings.contains {
             $0.swiftType.hasSuffix("Date")
+                && $0.effectiveRepresentation == .opaqueValue
+        })
+        #expect(typeBindings.contains {
+            $0.swiftType == "_NSRange"
                 && $0.effectiveRepresentation == .opaqueValue
         })
 
@@ -704,10 +739,15 @@ struct NativeImportDiscoveryTests {
         #expect(generatedBridge.contains(".accessibilityTraits ="))
         #expect(generatedBridge.contains("UIFont.systemFont("))
         #expect(generatedBridge.contains(".addingTimeInterval("))
+        #expect(generatedBridge.contains("NSMaxRange(argument0)"))
         #expect(generatedBridge.contains(".subviews"))
 
         let changed = baseline
             .replacingOccurrences(of: "interval + 1", with: "interval + 2")
+            .replacingOccurrences(
+                of: "NSMaxRange(range) + 1",
+                with: "NSMaxRange(range) + 2"
+            )
             .replacingOccurrences(
                 of: "if label.isHidden { return [] }",
                 with: "if !label.isHidden { return [] }"
@@ -725,6 +765,9 @@ struct NativeImportDiscoveryTests {
         })
         #expect(patch.changedFunctions.map(\.canonicalDeclaration).contains {
             $0.contains("currentSubviews")
+        })
+        #expect(patch.changedFunctions.map(\.canonicalDeclaration).contains {
+            $0.contains("maxRange")
         })
         #expect(patch.module.imports.count >= 6)
         #expect(

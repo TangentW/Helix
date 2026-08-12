@@ -102,8 +102,9 @@ Live Reload acceptance run.
 - NativeImport v2 and schema 2 build-time discovery by declaration, file,
   module, or project scope, plus dual-evidence freezing of baseline-used APIs
   from imported Apple or third-party modules. Raw enums, OptionSets, opaque
-  values, references, accessors, methods, Objective-C bridges, and ownership
-  are emitted as exact generated invokers; they are never device wildcards.
+  values, references, accessors, methods, global values/functions, simple
+  imported C values, Objective-C bridges, and ownership are emitted as exact
+  generated invokers; they are never device wildcards.
 - Signed `.hlxp` creation and verification, bounded downloads, immutable
   storage, anti-rollback, activation WAL, Crash Guard, last-known-good recovery,
   signed revocation, and rollback.
@@ -184,7 +185,7 @@ swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
 ```
 
-The current full SwiftPM baseline contains 456 tests in 73 suites. The recorded
+The current full SwiftPM baseline contains 457 tests in 73 suites. The recorded
 Debug, warnings-as-errors, and optimized Release runs pass. Platform-specific
 fixtures can be run with an available Simulator UDID:
 

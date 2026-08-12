@@ -90,14 +90,9 @@ extension FrontendReceipt.Adapter {
 
             func record(_ rawType: Any?) {
                 guard let mangled = rawType as? String else { return }
-                var runtimeNames = Set(
-                    Self.objectiveCClassRuntimeNames(
-                        in: demangled[mangled] ?? ""
-                    )
+                let runtimeNames = Self.objectiveCClassNames(
+                    inMangledType: mangled
                 )
-                if let exact = Self.objectiveCClassRuntimeName(mangled) {
-                    runtimeNames.insert(exact)
-                }
                 for runtimeName in runtimeNames.sorted() {
                     uses[runtimeName, default: []].append(
                         .init(
@@ -202,7 +197,10 @@ extension FrontendReceipt.Adapter {
                 } else if existing.kind != use.kind
                             || existing.representation != use.representation {
                     throw FrontendReceipt.Error.invalidRequest(
-                        "imported native type \(use.canonicalName) has conflicting representations"
+                        "imported native type \(use.canonicalName) has conflicting "
+                            + "representations: \(existing.kind.rawValue)/"
+                            + "\(existing.representation.rawValue) versus "
+                            + "\(use.kind.rawValue)/\(use.representation.rawValue)"
                     )
                 }
                 existing.sourceFileLogicalID = min(
@@ -236,55 +234,46 @@ extension FrontendReceipt.Adapter {
         }.sorted { $0.canonicalName < $1.canonicalName }
     }
 
-    static func objectiveCClassRuntimeName(_ mangled: String) -> String? {
-        let prefix = "$sSo"
-        guard mangled.hasPrefix(prefix), mangled.hasSuffix("D") else { return nil }
-        let bytes = Array(mangled.dropFirst(prefix.count).utf8)
-        var digitCount = 0
-        while digitCount < bytes.count,
-              bytes[digitCount] >= UInt8(ascii: "0"),
-              bytes[digitCount] <= UInt8(ascii: "9") {
-            digitCount += 1
-        }
-        guard digitCount > 0,
-              let length = Int(String(decoding: bytes[..<digitCount], as: UTF8.self)),
-              length > 0,
-              digitCount + length < bytes.count,
-              bytes[digitCount + length] == UInt8(ascii: "C")
-        else { return nil }
-        let suffix = String(
-            decoding: bytes[(digitCount + length + 1)...],
-            as: UTF8.self
-        )
-        guard suffix == "D" || suffix == "SgD" else { return nil }
-        let name = String(
-            decoding: bytes[digitCount..<(digitCount + length)],
-            as: UTF8.self
-        )
-        guard !name.isEmpty,
-              name.unicodeScalars.allSatisfy({
-                  CharacterSet.alphanumerics.contains($0) || $0 == "_"
-              })
-        else { return nil }
-        return name
-    }
-
-    private static func objectiveCClassRuntimeNames(
-        in demangledType: String
-    ) -> [String] {
-        Array(Set(
-            demangledType.components(separatedBy: "__C.").dropFirst().compactMap {
-                suffix -> String? in
-                let name = String(suffix.prefix {
-                    $0.isLetter || $0.isNumber || $0 == "_"
-                })
-                guard let first = name.first,
-                      first.isLetter || first == "_",
-                      suffix.dropFirst(name.count).first != "<"
-                else { return nil }
-                return name
+    static func objectiveCClassNames(inMangledType mangledType: String) -> [String] {
+        let bytes = Array(mangledType.utf8)
+        var names: Set<String> = []
+        var index = 0
+        while index + 3 < bytes.count {
+            guard bytes[index] == UInt8(ascii: "S"),
+                  bytes[index + 1] == UInt8(ascii: "o")
+            else {
+                index += 1
+                continue
             }
-        )).sorted()
+            var cursor = index + 2
+            let lengthStart = cursor
+            while cursor < bytes.count,
+                  bytes[cursor] >= UInt8(ascii: "0"),
+                  bytes[cursor] <= UInt8(ascii: "9") {
+                cursor += 1
+            }
+            guard cursor > lengthStart,
+                  let length = Int(String(
+                      decoding: bytes[lengthStart..<cursor],
+                      as: UTF8.self
+                  )),
+                  length > 0,
+                  cursor + length < bytes.count,
+                  bytes[cursor + length] == UInt8(ascii: "C")
+            else {
+                index += 2
+                continue
+            }
+            let name = String(
+                decoding: bytes[cursor..<(cursor + length)],
+                as: UTF8.self
+            )
+            if Self.isSwiftIdentifier(name) {
+                names.insert(name)
+            }
+            index = cursor + length + 1
+        }
+        return names.sorted()
     }
 
     func makeNativeTypeLookup(

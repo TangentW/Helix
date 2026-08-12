@@ -207,7 +207,8 @@ extension FrontendReceipt.Adapter {
                 canonicalCallee: canonicalCallee,
                 accessLevel: "internal",
                 dispatch: operation.dispatch,
-                ownerType: generatedOwnerType,
+                ownerType: operation.dispatch == .globalFunction
+                    ? nil : generatedOwnerType,
                 baseName: operation.baseName,
                 argumentLabels: operation.argumentLabels,
                 parameterSwiftTypes: generatedParameterTypes,
@@ -641,7 +642,8 @@ extension FrontendReceipt.Adapter {
                 parameterTypes.append(owner)
             }
         } else {
-            return
+            dispatch = .globalFunction
+            ownerType = importedGlobalFunctionOwner(usr: usr)
         }
 
         let call: ImportedSILCall
@@ -657,7 +659,8 @@ extension FrontendReceipt.Adapter {
                 in: function,
                 ownerType: ownerType,
                 baseName: baseName,
-                sourceLocation: expectedLocation
+                sourceLocation: expectedLocation,
+                allowsGlobalFunction: dispatch == .globalFunction
             ) else { return }
             call = foreign
             let physicalParameters = physicalParameterSpellings(
@@ -853,7 +856,8 @@ extension FrontendReceipt.Adapter {
         in function: CanonicalSIL.Function,
         ownerType: String,
         baseName: String,
-        sourceLocation: Core.SourceLocation?
+        sourceLocation: Core.SourceLocation?,
+        allowsGlobalFunction: Bool = false
     ) -> ImportedSILCall? {
         struct Candidate: Hashable {
             var call: ImportedSILCall
@@ -867,7 +871,8 @@ extension FrontendReceipt.Adapter {
             .split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
             let line = String(rawLine)
             let location = function.sourceLocation(atBodyLine: offset + 1)
-            if line.contains("_method "),
+            if !allowsGlobalFunction,
+               line.contains("_method "),
                let assignment = line.range(of: " = "),
                let hash = line.firstIndex(of: "#"),
                let separator = line[hash...].range(of: " : "),
@@ -906,8 +911,8 @@ extension FrontendReceipt.Adapter {
             let symbol = String(line[marker.upperBound..<separator.lowerBound])
             let loweredType = String(line[separator.upperBound...])
             guard symbol.hasPrefix("$s"),
-                  symbol.contains(owner),
-                  baseName == "init" || symbol.contains(baseName)
+                  baseName == "init" || symbol.contains(baseName),
+                  allowsGlobalFunction || symbol.contains(owner)
             else { continue }
             functionCandidates.append(
                 .init(call: .init(symbol: symbol, loweredType: loweredType), location: location)
@@ -982,13 +987,30 @@ extension FrontendReceipt.Adapter {
            reference["apply_level"] as? String == "single_apply" {
             return declaration
         }
-        for key in ["fn", "sub_expr"] {
+        for key in ["fn", "sub_expr", "rhs"] {
             if let child = expression[key] as? [String: Any],
                let declaration = appliedDeclaration(in: child) {
                 return declaration
             }
         }
         return nil
+    }
+
+    private func importedGlobalFunctionOwner(usr: String) -> String {
+        guard usr.hasPrefix("s:") else { return "__C" }
+        let suffix = usr.dropFirst(2)
+        let digits = suffix.prefix(while: \.isNumber)
+        guard let length = Int(digits), length > 0 else { return "Swift" }
+        let start = suffix.index(suffix.startIndex, offsetBy: digits.count)
+        guard let end = suffix.index(
+            start,
+            offsetBy: length,
+            limitedBy: suffix.endIndex
+        ), start < end else {
+            return "Swift"
+        }
+        let module = String(suffix[start..<end])
+        return Self.isSwiftIdentifier(module) ? module : "Swift"
     }
 
     private func implicitReceiver(
@@ -1469,7 +1491,7 @@ extension FrontendReceipt.Adapter {
         }
         let unavailableGenericBase = spelling.contains("<")
             ? nominalBaseName(spelling) : nil
-        for name in objectiveCClassNames(inMangledType: mangled)
+        for name in Self.objectiveCClassNames(inMangledType: mangled)
         where name != unavailableGenericBase {
             types.append(
                 importedType(
@@ -1497,36 +1519,6 @@ extension FrontendReceipt.Adapter {
                 )
             )
         }
-    }
-
-    private func objectiveCClassNames(inMangledType mangled: String) -> [String] {
-        let bytes = Array(mangled.utf8)
-        var names = Set<String>()
-        var index = 0
-        while index + 3 < bytes.count {
-            guard bytes[index] == UInt8(ascii: "S"),
-                  bytes[index + 1] == UInt8(ascii: "o")
-            else {
-                index += 1
-                continue
-            }
-            var cursor = index + 2
-            let start = cursor
-            while cursor < bytes.count, bytes[cursor] >= UInt8(ascii: "0") && bytes[cursor] <= UInt8(ascii: "9") { cursor += 1 }
-            guard cursor > start,
-                  let length = Int(String(decoding: bytes[start..<cursor], as: UTF8.self)),
-                  length > 0,
-                  cursor + length < bytes.count,
-                  bytes[cursor + length] == UInt8(ascii: "C")
-            else {
-                index += 2
-                continue
-            }
-            let name = String(decoding: bytes[cursor..<(cursor + length)], as: UTF8.self)
-            if Self.isSwiftIdentifier(name) { names.insert(name) }
-            index = cursor + length + 1
-        }
-        return names.sorted()
     }
 
     @discardableResult

@@ -1,3 +1,4 @@
+import QuartzCore
 import UIKit
 
 public enum LiveReloadE2E {}
@@ -32,11 +33,16 @@ public final class HostViewController: UIViewController {
         ])
     }
 
-    /// Saving this body exercises HLBC activation, a call through an unchanged
-    /// Shell Entry, and inferred UIKit invalidation. The App neither registers
-    /// this type nor owns a manual reload hook.
+    /// Saving this body exercises HLBC activation, an imported UIKit enum
+    /// setter, a QuartzCore C global, interpolated print, an unchanged Shell
+    /// Entry, and inferred UI invalidation. The App neither registers this type
+    /// nor owns a reload hook.
     public override func viewDidLayoutSubviews() {
-        applyTitle("HELIX BASELINE")
+        let title = "HELIX BASELINE"
+        titleLabel.textAlignment = .center
+        let timestamp = CACurrentMediaTime()
+        print("Helix Live Reload title: \(title) at \(timestamp)")
+        applyTitle(title)
     }
 
     private func applyTitle(_ title: String) {

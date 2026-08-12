@@ -24,7 +24,12 @@ byte-for-byte on every exit path, and leaves build/daemon logs under
 DerivedData; it is not referenced by the project. The host imports only
 `HelixDevRuntime`, creates one `ApplicationSession`, and has no `typeRegistry`
 or `LiveReload.Reloadable` hook. This makes the fixture an acceptance test for
-both low-cost integration and automatic UIKit instance discovery.
+both low-cost integration and automatic UIKit instance discovery. The changed
+callback also executes an imported `NSTextAlignment` setter and interpolated
+`print`. It additionally calls QuartzCore's `CACurrentMediaTime`, covering
+an imported C global function outside UIKit. The same generation therefore
+exercises NativeImport discovery, generated Bridge invocation, and unoptimized
+SIL ownership.
 
 The fixture requires Xcode, an arm64 Mac, and an installed iOS Simulator
 runtime. It waits for the requested device to finish booting. No third-party
