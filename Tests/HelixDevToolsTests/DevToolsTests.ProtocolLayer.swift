@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import HelixCore
 import HelixDevProtocol
-import HelixDevTools
+@testable import HelixDevTools
 import HelixLiveReloadAPI
 import Testing
 
@@ -105,6 +105,53 @@ struct ProtocolLayer {
         #expect(try await inbox.receive() == .diagnostics([diagnostic]))
         await inbox.stop()
         await channel.close()
+    }
+
+    @Test("Failed pipeline diagnostics are forwarded to the authenticated App")
+    func forwardsPipelineDiagnostics() async throws {
+        let diagnostic = DevProtocol.Diagnostic(
+            code: "HLXLR299",
+            message: "fixture compile failure",
+            sourceRevision: .init(rawValue: 1),
+            nextAction: "correct the source"
+        )
+        #expect(
+            DevSession.PipelineResult.failed(diagnostic)
+                .diagnosticsForApp == [diagnostic]
+        )
+        #expect(
+            DevSession.PipelineResult.rebuildRequired(diagnostic)
+                .diagnosticsForApp == [diagnostic]
+        )
+        #expect(
+            DevSession.PipelineResult.noSemanticChange(.init(rawValue: 1))
+                .diagnosticsForApp == nil
+        )
+
+        let fixture = try ProtocolFixture()
+        let secret = Data(repeating: 0x4d, count: 32)
+        let channel = ScriptedMessageChannel(
+            messages: [
+                .hello(
+                    identity: fixture.identity,
+                    clientNonce: Data(repeating: 0x21, count: 16)
+                ),
+            ]
+        )
+        let session = try DevSession.Controller(
+            expectedIdentity: fixture.identity,
+            sessionSecret: secret,
+            tlsTranscriptHash: .sha256("diagnostic-forwarding"),
+            liveness: .init(
+                heartbeatIntervalNanoseconds: 2_000_000,
+                receiveTimeoutNanoseconds: 20_000_000
+            )
+        )
+        try await session.accept(channel: channel)
+        try await session.sendDiagnostics([diagnostic])
+
+        #expect((await channel.sentMessages).contains(.diagnostics([diagnostic])))
+        await session.close(reason: "fixture complete")
     }
 
     @Test("Session close remains bounded when the peer never acknowledges")

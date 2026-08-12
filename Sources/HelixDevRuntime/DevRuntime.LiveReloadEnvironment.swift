@@ -27,7 +27,10 @@ public final class LiveReloadEnvironment {
     /// ```swift
     /// let environment = DevRuntime.LiveReloadEnvironment(
     ///     uiKit: .init(resolutionScope: .visibleOnly),
-    ///     overlayConfiguration: .init(startsExpanded: false)
+    ///     overlayConfiguration: .init(
+    ///         startsExpanded: false,
+    ///         automaticallyHides: true
+    ///     )
     /// )
     /// let session = try DevRuntime.ApplicationSession(environment: environment)
     /// ```
@@ -35,7 +38,8 @@ public final class LiveReloadEnvironment {
     /// - Parameters:
     ///   - uiKit: UIKit discovery and invalidation behavior.
     ///   - pulse: Pulse used by SwiftUI reload boundaries.
-    ///   - overlayConfiguration: Layout and initial state of the debug overlay.
+    ///   - overlayConfiguration: Layout, initial state, and automatic hiding
+    ///     behavior of the debug overlay.
     public init(
         uiKit: UIKitReload.Coordinator = .init(),
         pulse: LiveReload.Pulse = .shared,

@@ -18,9 +18,9 @@ current practical boundary.
 | Native experiment | Explicit-only Dynamic Replacement builder, recursion/previous tests, signed dylib and loader probes | Product support; it is intentionally absent from automatic routing |
 | Control plane | Client-side package and policy contracts | Production Registry, HSM operations, approval, rollout, telemetry, and fleet coordination services |
 
-The checked-in SwiftPM baseline contains 482 tests in 75 suites. Debug,
+The checked-in SwiftPM baseline contains 483 tests in 75 suites. Debug,
 warnings-as-errors, and optimized Release runs are recorded as passing. An iOS
-Simulator target covers 10 runtime and UI cases. Those counts describe repository
+Simulator target covers 13 runtime and UI cases. Those counts describe repository
 evidence, not device or distribution certification.
 
 ## Production HLBC 1.11 Swift subset

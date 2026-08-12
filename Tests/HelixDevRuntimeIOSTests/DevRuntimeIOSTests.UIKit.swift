@@ -156,6 +156,127 @@ struct UIKitIntegration {
         #expect(root.hitTest(CGPoint(x: 60, y: 60), with: nil) === button)
     }
 
+    @Test("Debug overlay keeps a readable width and expands failures")
+    func debugOverlaySizingAndFailurePresentation() throws {
+        let configuration = DebugOverlay.Configuration(
+            startsExpanded: false,
+            automaticallyHides: false
+        )
+        let panel = DebugOverlay.PanelView(
+            snapshot: .init(
+                phase: .authenticated,
+                tone: .success,
+                headline: "Connected"
+            ),
+            configuration: configuration,
+            manualReloadHandler: {}
+        )
+        let collapsed = panel.preferredOverlaySize(maximumWidth: 390)
+        #expect(collapsed.width > 80)
+        #expect(collapsed.width <= 390)
+        #expect(collapsed.height < 60)
+
+        panel.update(
+            .init(
+                sequence: 1,
+                phase: .failed,
+                tone: .error,
+                headline: "Compile failed · old code active",
+                detail: "Correct the unsupported source and save again."
+            )
+        )
+        let expanded = panel.preferredOverlaySize(maximumWidth: 390)
+        #expect(panel.isPresented)
+        #expect(panel.isExpanded)
+        #expect(expanded.width >= 340)
+        #expect(expanded.width <= 390)
+
+        let pill = try #require(
+            panel.subviews.compactMap { $0 as? UIButton }.first
+        )
+        #expect(pill.configuration?.title?.contains("Compile failed") == true)
+        #expect(pill.gestureRecognizers?.contains { $0 is UIPanGestureRecognizer } == true)
+    }
+
+    @Test("Debug overlay placement remains inside the safe area")
+    func debugOverlayPlacementIsClamped() {
+        let configuration = DebugOverlay.Configuration()
+        #expect(configuration.automaticallyHides)
+        let size = CGSize(width: 340, height: 180)
+        let safeArea = CGSize(width: 390, height: 844)
+        let initial = DebugOverlay.Placement.defaultAnchor(
+            size: size,
+            safeAreaSize: safeArea,
+            configuration: configuration
+        )
+        #expect(initial == CGPoint(x: 378, y: 12))
+        #expect(
+            DebugOverlay.Placement.origin(anchor: initial, size: size)
+                == CGPoint(x: 38, y: 12)
+        )
+
+        let upperLeft = DebugOverlay.Placement.clampedAnchor(
+            CGPoint(x: -1_000, y: -1_000),
+            size: size,
+            safeAreaSize: safeArea,
+            configuration: configuration
+        )
+        let lowerRight = DebugOverlay.Placement.clampedAnchor(
+            CGPoint(x: 1_000, y: 1_000),
+            size: size,
+            safeAreaSize: safeArea,
+            configuration: configuration
+        )
+        #expect(upperLeft == CGPoint(x: 352, y: 12))
+        #expect(lowerRight == CGPoint(x: 378, y: 652))
+    }
+
+    @Test("Debug overlay auto-hides and a later event presents it again")
+    func debugOverlayAutoHideLifecycle() {
+        var scheduledAction: (@MainActor () -> Void)?
+        var cancellationCount = 0
+        let scheduler: DebugOverlay.PanelView.AutoHideScheduler = { action in
+            scheduledAction = action
+            return { cancellationCount += 1 }
+        }
+        let panel = DebugOverlay.PanelView(
+            snapshot: .init(),
+            configuration: .init(automaticallyHides: true),
+            autoHideScheduler: scheduler,
+            manualReloadHandler: {}
+        )
+        #expect(scheduledAction != nil)
+        scheduledAction?()
+        #expect(!panel.isPresented)
+
+        panel.update(
+            .init(
+                sequence: 1,
+                phase: .compiling,
+                tone: .progress,
+                headline: "Compiling 1"
+            )
+        )
+        #expect(panel.isPresented)
+        #expect(!panel.isHidden)
+        #expect(cancellationCount == 1)
+        panel.prepareForRemoval()
+
+        var persistentScheduleCount = 0
+        let persistent = DebugOverlay.PanelView(
+            snapshot: .init(),
+            configuration: .init(automaticallyHides: false),
+            autoHideScheduler: { _ in
+                persistentScheduleCount += 1
+                return {}
+            },
+            manualReloadHandler: {}
+        )
+        #expect(persistent.isPresented)
+        #expect(persistentScheduleCount == 0)
+        persistent.prepareForRemoval()
+    }
+
     @Test("A typed UIKit NativeImport compiles through the verified MainActor context")
     func nativeImportMainActorEntryCompiles() throws {
         let invoker = IsHiddenGetterFactory.make(

@@ -192,7 +192,7 @@ swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
 ```
 
-The current full SwiftPM baseline contains 482 tests in 75 suites. The recorded
+The current full SwiftPM baseline contains 483 tests in 75 suites. The recorded
 Debug, warnings-as-errors, and optimized Release runs pass. Platform-specific
 fixtures can be run with an available Simulator UDID:
 
@@ -202,7 +202,7 @@ Tests/Fixtures/LiveReloadE2E/run-simulator-e2e.sh SIMULATOR_UDID
 Tests/Fixtures/LiveReloadE2E/run-release-audit.sh
 ```
 
-The iOS target contains 10 runtime/UI cases. The HLBC Live Reload E2E preserves
+The iOS target contains 13 runtime/UI cases. The HLBC Live Reload E2E preserves
 one App PID while applying a changed implementation and then a second generation
 that restores the baseline. The Release audit builds a separate iOS 15 target
 linked only to `HelixAppRuntime`.

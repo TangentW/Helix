@@ -347,6 +347,9 @@ public actor Daemon {
                 ) * 1_000_000,
                 maximumSourceBytes: prepared.resolved.document.maximumSourceBytes,
                 resultHandler: { [eventHandler] result in
+                    if let diagnostics = result.diagnosticsForApp {
+                        try? await controller.sendDiagnostics(diagnostics)
+                    }
                     await eventHandler(.result(result))
                 }
             )

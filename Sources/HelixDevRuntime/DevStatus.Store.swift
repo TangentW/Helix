@@ -187,7 +187,7 @@ public final class Store: ObservableObject {
                     ? "Full rebuild required"
                     : "Compile failed · old code active",
                 detail: diagnostic.map {
-                    "\($0.message) Next: \($0.nextAction)"
+                    "[\($0.code)] \($0.message) Next: \($0.nextAction)"
                 },
                 sourceRevision: diagnostic?.sourceRevision,
                 generationID: diagnostic?.generationID

@@ -139,3 +139,14 @@ struct ProfileScreen: View {
 HLBC 是验证后字节码而不是 Mach-O image，因此没有原生 dSYM。编译器 debug metadata 会降低成经过 Verifier 检查的 function/block/instruction → 逻辑 Swift 文件、行、列映射；生产 artifact 会移除构建机绝对路径。反汇编使用该映射标注指令；发生 trap 时 VM 给出精确 program counter，Runtime 再补充固定的 generation、Shell entry、函数名与逻辑源码位置。
 
 终端与 Debug Overlay 会报告 source revision、generation、backend、激活结果、UI 刷新结果、旧代码是否仍然有效以及下一步动作。失败的保存不会被展示成成功热重载。HLBC 的交互式 breakpoint、单步和表达式求值仍是后续工作；显式 Native 实验保留自己独立的 dSYM 工具。
+
+编译失败与必须完整构建的诊断会沿同一条认证 Dev 通道回到 App。因此即使 Mac 端无法生成 payload，浮层也会离开 `Compiling` 并显示失败；错误事件会自动展开详情。折叠 pill 始终保持单行，可拖动到当前 scene 安全区的其他位置，展开/折叠时保持右上锚点。默认在 5 秒没有新状态后动画隐藏，新事件到达时再动画显示。如果希望常驻，可以这样配置：
+
+```swift
+let environment = DevRuntime.LiveReloadEnvironment(
+    overlayConfiguration: .init(
+        startsExpanded: false,
+        automaticallyHides: false
+    )
+)
+```

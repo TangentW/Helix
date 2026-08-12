@@ -42,6 +42,22 @@ struct StatusTests {
         store.handle(
             .diagnostics([
                 .init(
+                    code: "HLXLR299",
+                    message: "unsupported compiler shape",
+                    sourceRevision: .init(rawValue: 1),
+                    nextAction: "correct the source and save again"
+                ),
+            ])
+        )
+        #expect(store.snapshot.phase == .failed)
+        #expect(store.snapshot.tone == .error)
+        #expect(store.snapshot.headline == "Compile failed · old code active")
+        #expect(store.snapshot.detail?.contains("HLXLR299") == true)
+        #expect(store.snapshot.detail?.contains("correct the source") == true)
+
+        store.handle(
+            .diagnostics([
+                .init(
                     code: "HLXLR301",
                     message: "stored layout changed",
                     sourceRevision: .init(rawValue: 2),

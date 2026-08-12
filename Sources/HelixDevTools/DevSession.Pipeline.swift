@@ -66,6 +66,17 @@ public enum PipelineResult: Sendable {
     case rebuildRequired(DevProtocol.Diagnostic)
     case failed(DevProtocol.Diagnostic)
     case superseded(DevProtocol.SourceRevision)
+
+    /// Diagnostics that must cross the authenticated channel so the App-side
+    /// status surface cannot remain on an earlier progress state.
+    var diagnosticsForApp: [DevProtocol.Diagnostic]? {
+        switch self {
+        case let .failed(diagnostic), let .rebuildRequired(diagnostic):
+            [diagnostic]
+        case .activation, .noSemanticChange, .superseded:
+            nil
+        }
+    }
 }
 
 public enum PipelineEvent: Sendable {

@@ -334,3 +334,20 @@ activation result, UI refresh result, whether old code remains active, and the
 next action. A failed save is not presented as a successful reload. Interactive
 HLBC breakpoints, stepping, and expression evaluation remain future work; the
 explicit Native experiment retains its separate dSYM tooling.
+
+Compiler and rebuild diagnostics cross the same authenticated Dev channel as
+the generation. The App therefore leaves `Compiling` and presents the failure
+even when no payload can be produced; error events expand the panel so the next
+action is visible. The collapsed pill stays on one line, may be dragged by its
+pill within the current scene's safe area, and keeps its top-right anchor when
+expanded or collapsed. By default it animates away after five seconds without
+a new status event and animates back on the next event. Keep it persistent with:
+
+```swift
+let environment = DevRuntime.LiveReloadEnvironment(
+    overlayConfiguration: .init(
+        startsExpanded: false,
+        automaticallyHides: false
+    )
+)
+```
