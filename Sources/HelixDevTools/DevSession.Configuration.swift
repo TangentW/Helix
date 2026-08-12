@@ -227,6 +227,27 @@ public struct PreparedConfiguration: Sendable {
         )
     }
 
+    /// Exact build facts presented before the App is allowed to pair.
+    public var peerBuildIdentity: DevProtocol.PeerBuildIdentity {
+        .init(
+            bundleID: manifest.bundleID,
+            executableUUID: manifest.executableUUID,
+            platform: manifest.platform,
+            architecture: manifest.architecture,
+            xcodeBuild: manifest.xcodeBuild,
+            swiftCompilerFingerprint: manifest.swiftCompilerFingerprint,
+            liveReloadIndexHash: manifest.liveReloadIndexHash
+        )
+    }
+
+    /// Stable identity of the fully linked Dev Shell represented by this context.
+    public var shellIdentity: DevProtocol.ShellIdentity {
+        .init(
+            shellID: .init(rawValue: manifest.sessionBuildID),
+            build: peerBuildIdentity
+        )
+    }
+
     private static func validateIdentity(
         manifest: DevBuildManifest.Document,
         index: ReloadIndex.Document,
