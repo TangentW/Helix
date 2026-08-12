@@ -133,6 +133,88 @@ struct ImportedFrameworks {
         #expect(borrowedCall.offset < cleanup.offset)
     }
 
+    @Test("Owned native upcasts preserve a source that remains live")
+    func preservesOwnedNativeUpcastSourceAcrossLaterUses() throws {
+        let stackType = Core.TypeID(rawValue: .sha256("UIKit.UIStackView"))
+        let viewType = Core.TypeID(rawValue: .sha256("UIKit.UIView"))
+        let requirement = importRequirement(id: 26)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: CanonicalSIL.NativeBridgeSymbols.upcast(
+                    from: stackType,
+                    to: viewType
+                ),
+                parameterTypes: [.native(stackType)],
+                resultType: .native(viewType),
+                target: .nativeImport(requirement)
+            ),
+            .init(
+                mangledName: "$s7Fixture11inspectViewyySo6UIViewCF",
+                parameterTypes: [.native(viewType)],
+                parameterConventions: [.borrowed],
+                resultType: .void,
+                target: .function(.init(rawValue: 1))
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            ["UIStackView": stackType, "UIView": viewType],
+            kinds: [stackType: .reference, viewType: .reference]
+        )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7inspectyySo11UIStackViewCnF",
+            loweredType: "@convention(thin) (@owned UIStackView) -> ()",
+            body: """
+            bb0(%0 : @owned $UIStackView):
+              %1 = upcast %0 to $UIView
+              %2 = function_ref @$s7Fixture11inspectViewyySo6UIViewCF : $@convention(thin) (@guaranteed UIView) -> ()
+              %3 = apply %2(%1) : $@convention(thin) (@guaranteed UIView) -> ()
+              %4 = upcast %0 to $UIView
+              %5 = apply %2(%4) : $@convention(thin) (@guaranteed UIView) -> ()
+              strong_release %0
+              %6 = tuple ()
+              return %6
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+            function,
+            displayName: "Fixture.inspect",
+            directCalls: calls
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let parameter = try #require(lowered.parameterRegisters.first)
+        let conversions = instructions.compactMap { instruction
+            -> (Bytecode.Register, Bytecode.Register)? in
+            guard case let .nativeApply(result, id, values) = instruction,
+                  let result,
+                  id == requirement.id
+            else { return nil }
+            guard let argument = values.first else { return nil }
+            return (result, argument)
+        }
+
+        #expect(conversions.count == 2)
+        #expect(conversions.allSatisfy { $0.1 != parameter })
+        for (result, argument) in conversions {
+            #expect(instructions.contains { instruction in
+                guard case let .copyValue(result, source) = instruction else {
+                    return false
+                }
+                return result == argument && source == parameter
+            })
+            #expect(instructions.count { instruction in
+                guard case let .destroyValue(value) = instruction else {
+                    return false
+                }
+                return value == result
+            } == 1)
+        }
+        #expect(instructions.count { instruction in
+            guard case let .destroyValue(value) = instruction else { return false }
+            return value == parameter
+        } == 1)
+    }
+
     @Test("Explicit SIL release closes a borrowed native upcast lifetime")
     func balancesExplicitlyReleasedBorrowedNativeUpcast() throws {
         let labelType = Core.TypeID(rawValue: .sha256("UIKit.UILabel"))
@@ -373,6 +455,84 @@ struct ImportedFrameworks {
         #expect(importIDs == [xRequirement.id, yRequirement.id])
     }
 
+    @Test("Owned indirect native arguments transfer compiler address storage")
+    func transfersOwnedIndirectNativeArgument() throws {
+        let configurationType = Core.TypeID(
+            rawValue: .sha256("UIKit.UIButton.Configuration")
+        )
+        let buttonType = Core.TypeID(rawValue: .sha256("UIKit.UIButton"))
+        let filled = importRequirement(id: 15)
+        let setter = importRequirement(id: 16)
+        let filledSymbol = "$sSo8UIButtonC5UIKitE13ConfigurationV6filledAEyFZ"
+        let setterSymbol = "$sSo8UIButtonC5UIKitE13configurationAbCE13ConfigurationVSgvs"
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: filledSymbol,
+                parameterTypes: [],
+                resultType: .native(configurationType),
+                target: .nativeImport(filled)
+            ),
+            .init(
+                mangledName: setterSymbol,
+                parameterTypes: [
+                    .optional(.native(configurationType)),
+                    .native(buttonType),
+                ],
+                resultType: .void,
+                target: .nativeImport(setter)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            [
+                "UIButton.Configuration": configurationType,
+                "UIButton": buttonType,
+            ],
+            kinds: [
+                configurationType: .value,
+                buttonType: .reference,
+            ]
+        )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture9configureyySo8UIButtonCF",
+            loweredType: "@convention(thin) (@guaranteed UIButton) -> ()",
+            body: """
+            bb0(%0 : @guaranteed $UIButton):
+              %1 = alloc_stack $Optional<UIButton.Configuration>
+              %2 = init_enum_data_addr %1, #Optional.some!enumelt
+              %3 = metatype $@thin UIButton.Configuration.Type
+              %4 = function_ref @\(filledSymbol) : $@convention(method) (@thin UIButton.Configuration.Type) -> @out UIButton.Configuration
+              %5 = apply %4(%2, %3) : $@convention(method) (@thin UIButton.Configuration.Type) -> @out UIButton.Configuration
+              inject_enum_addr %1, #Optional.some!enumelt
+              %6 = function_ref @\(setterSymbol) : $@convention(method) (@in Optional<UIButton.Configuration>, @guaranteed UIButton) -> ()
+              %7 = apply %6(%1, %0) : $@convention(method) (@in Optional<UIButton.Configuration>, @guaranteed UIButton) -> ()
+              dealloc_stack %1
+              %8 = tuple ()
+              return %8
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+            function,
+            displayName: "Fixture.configure",
+            directCalls: calls
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let setterCall = try #require(instructions.first { instruction in
+            guard case let .nativeApply(_, id, _) = instruction else { return false }
+            return id == setter.id
+        })
+        guard case let .nativeApply(_, _, arguments) = setterCall,
+              let transferred = arguments.first
+        else {
+            Issue.record("expected the configuration setter NativeImport")
+            return
+        }
+        #expect(!instructions.contains { instruction in
+            guard case let .destroyValue(value) = instruction else { return false }
+            return value == transferred
+        })
+    }
+
     @Test("Optional address state is restored independently for sibling successors")
     func preservesOptionalAddressAcrossSiblingBlocks() throws {
         let function = CanonicalSIL.Function(
@@ -411,10 +571,21 @@ struct ImportedFrameworks {
             displayName: "Fixture.consume"
         )
         #expect(Set(lowered.blocks.map(\.id.rawValue)).isSuperset(of: [0, 1, 2, 3]))
-        #expect(lowered.blocks.first { $0.id.rawValue == 3 }?.instructions.contains {
-            if case .copyValue = $0 { return true }
-            return false
-        } == true)
+        let noneInstructions = try #require(
+            lowered.blocks.first { $0.id.rawValue == 3 }?.instructions
+        )
+        let reconstruction = try #require(noneInstructions.first { instruction in
+            guard case .makeOptionalNone = instruction else { return false }
+            return true
+        })
+        guard case let .makeOptionalNone(reconstructed) = reconstruction else {
+            Issue.record("expected Optional.none reconstruction")
+            return
+        }
+        #expect(noneInstructions.contains { instruction in
+            guard case let .copyValue(_, source) = instruction else { return false }
+            return source == reconstructed
+        })
     }
 
     @Test("Frozen bridge pseudo-symbols include the exact physical ABI")

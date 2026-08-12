@@ -542,6 +542,12 @@ struct NativeImportDiscoveryTests {
                 return date.addingTimeInterval(interval + 1)
             }
 
+            public func configureButton(_ button: UIButton, seed: Int) {
+                button.configuration = .filled()
+                button.configuration?.title = "Updated"
+                _ = seed + 1
+            }
+
             public func maxRange(_ range: NSRange) -> Int {
                 NSMaxRange(range) + 1
             }
@@ -739,11 +745,14 @@ struct NativeImportDiscoveryTests {
         #expect(generatedBridge.contains(".accessibilityTraits ="))
         #expect(generatedBridge.contains("UIFont.systemFont("))
         #expect(generatedBridge.contains(".addingTimeInterval("))
+        #expect(generatedBridge.contains(".configuration ="))
+        #expect(generatedBridge.contains(".title ="))
         #expect(generatedBridge.contains("NSMaxRange(argument0)"))
         #expect(generatedBridge.contains(".subviews"))
 
         let changed = baseline
             .replacingOccurrences(of: "interval + 1", with: "interval + 2")
+            .replacingOccurrences(of: "seed + 1", with: "seed + 2")
             .replacingOccurrences(
                 of: "NSMaxRange(range) + 1",
                 with: "NSMaxRange(range) + 2"
@@ -762,6 +771,9 @@ struct NativeImportDiscoveryTests {
         )
         #expect(patch.changedFunctions.map(\.canonicalDeclaration).contains {
             $0.contains("configure")
+        })
+        #expect(patch.changedFunctions.map(\.canonicalDeclaration).contains {
+            $0.contains("configureButton")
         })
         #expect(patch.changedFunctions.map(\.canonicalDeclaration).contains {
             $0.contains("currentSubviews")

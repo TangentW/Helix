@@ -608,6 +608,164 @@ struct SemanticVerifier {
         #expect(image.module.functions[0].parameterConventions == [.borrowed])
     }
 
+    @Test("Owned native values may remain live across Optional control flow")
+    func acceptsOwnedValueCarriedAcrossOptionalSwitch() throws {
+        let typeID = Core.TypeID.derive(
+            namespace: Core.ShellNamespaceID.derive(
+                bundleID: "dev.helix.verifier",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            canonicalType: "Fixture.Reference"
+        )
+        var fixture = try makeFixture { function in
+            function.parameterRegisters = [
+                .init(rawValue: 0),
+                .init(rawValue: 1),
+            ]
+            function.parameterConventions = [.owned, .owned]
+            function.registerTypes = [
+                .native(typeID),
+                .optional(.int64),
+                .int64,
+                .int64,
+            ]
+            function.blocks = [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .switchOptional(
+                            optional: .init(rawValue: 1),
+                            someTarget: .init(rawValue: 1),
+                            noneTarget: .init(rawValue: 2)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 2)],
+                    instructions: [
+                        .destroyValue(.init(rawValue: 0)),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    instructions: [
+                        .destroyValue(.init(rawValue: 0)),
+                        .constantInteger(result: .init(rawValue: 3), value: 0),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        }
+        fixture.module.capabilities.insert(.nativeTypesV1)
+        fixture.shell.capabilities.insert(.nativeTypesV1)
+        fixture.policy.acceptedCapabilities.insert(.nativeTypesV1)
+        fixture.shell.types[typeID] = .init(
+            id: typeID,
+            canonicalName: "Fixture.Reference",
+            kind: .reference,
+            layoutFingerprint: .sha256("Fixture.Reference.layout.v1"),
+            isCopyable: true,
+            estimatedSize: 8
+        )
+        let entryIndex = Core.EntryIndex(rawValue: 0)
+        var entry = try #require(fixture.shell.entries[entryIndex])
+        entry.parameterTypes = [.native(typeID), .optional(.int64)]
+        fixture.shell.entries[entryIndex] = entry
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+    }
+
+    @Test("Owned-value states must agree at a CFG merge")
+    func rejectsMismatchedOwnershipAtMerge() throws {
+        let typeID = Core.TypeID.derive(
+            namespace: Core.ShellNamespaceID.derive(
+                bundleID: "dev.helix.verifier",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            canonicalType: "Fixture.Reference"
+        )
+        var fixture = try makeFixture { function in
+            function.parameterRegisters = [
+                .init(rawValue: 0),
+                .init(rawValue: 1),
+            ]
+            function.parameterConventions = [.owned, .owned]
+            function.registerTypes = [.native(typeID), .bool]
+            function.blocks = [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .conditionalBranch(
+                            condition: .init(rawValue: 1),
+                            trueTarget: .init(rawValue: 1),
+                            trueArguments: [],
+                            falseTarget: .init(rawValue: 2),
+                            falseArguments: []
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    instructions: [
+                        .destroyValue(.init(rawValue: 0)),
+                        .branch(target: .init(rawValue: 3), arguments: []),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    instructions: [
+                        .branch(target: .init(rawValue: 3), arguments: []),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 3),
+                    instructions: [
+                        .trap(.explicit("merge should be unreachable")),
+                    ]
+                ),
+            ]
+        }
+        fixture.module.capabilities.insert(.nativeTypesV1)
+        fixture.shell.capabilities.insert(.nativeTypesV1)
+        fixture.policy.acceptedCapabilities.insert(.nativeTypesV1)
+        fixture.shell.types[typeID] = .init(
+            id: typeID,
+            canonicalName: "Fixture.Reference",
+            kind: .reference,
+            layoutFingerprint: .sha256("Fixture.Reference.layout.v1"),
+            isCopyable: true,
+            estimatedSize: 8
+        )
+        let entryIndex = Core.EntryIndex(rawValue: 0)
+        var entry = try #require(fixture.shell.entries[entryIndex])
+        entry.parameterTypes = [.native(typeID), .bool]
+        fixture.shell.entries[entryIndex] = entry
+
+        #expect(
+            throws: Verification.Error.invalidBlock(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 3),
+                reason: "incoming owned-value states disagree"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+    }
+
     @Test("Linear call arguments transfer ownership instead of minting an alias")
     func rejectsUseAfterLinearCallTransfer() throws {
         let typeID = Core.TypeID.derive(

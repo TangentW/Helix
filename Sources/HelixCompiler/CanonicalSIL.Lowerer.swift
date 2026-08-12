@@ -325,7 +325,7 @@ public struct Lowerer: Sendable {
         var passthroughRuntimeAccesses = Set<String>()
         var borrowedAddressValues: [String: Bytecode.Register] = [:]
         var borrowedValueTokens = Set<String>()
-        var borrowedNativeConversionValues: [String: Bytecode.Register] = [:]
+        var preservedNativeConversionValues: [String: Bytecode.Register] = [:]
         var addressAliases: [String: String] = [:]
         var nativePropertyAddresses: [String: NativePropertyAddress] = [:]
         var pendingArrayIteratorTypes: [String: Bytecode.ValueType] = [:]
@@ -493,7 +493,25 @@ public struct Lowerer: Sendable {
             }
         }
 
-        func releaseBorrowedNativeConversionsAfterLastUse(
+        func prepareNativeReferenceConversion(
+            sourceToken: String,
+            source: Bytecode.Register,
+            lineIndex: Int
+        ) throws -> (argument: Bytecode.Register, tracksResultLifetime: Bool) {
+            // Native bridge calls consume their argument. Preserve a borrowed
+            // or subsequently reused SIL source and own the conversion result
+            // as a compiler-generated temporary until its final semantic use.
+            let sourceIsBorrowed = borrowedValueTokens.contains(sourceToken)
+                || isBorrowedParameter(source)
+            let preservesSource = sourceIsBorrowed
+                || hasFutureSemanticUse(of: sourceToken, after: lineIndex)
+            return (
+                preservesSource ? try copyOwnedCallArgument(source) : source,
+                preservesSource
+            )
+        }
+
+        func releasePreservedNativeConversionsAfterLastUse(
             _ tokens: some Sequence<String>,
             after lineIndex: Int
         ) {
@@ -501,44 +519,44 @@ public struct Lowerer: Sendable {
                 of: token,
                 after: lineIndex
             ) {
-                guard let value = borrowedNativeConversionValues.removeValue(
+                guard let value = preservedNativeConversionValues.removeValue(
                     forKey: token
                 ) else { continue }
                 appendInstruction(.destroyValue(value))
             }
         }
 
-        func closeBorrowedNativeConversionLifetime(
+        func closePreservedNativeConversionLifetime(
             for token: String,
             resolved value: Bytecode.Register
         ) throws {
-            guard let tracked = borrowedNativeConversionValues.removeValue(
+            guard let tracked = preservedNativeConversionValues.removeValue(
                 forKey: token
             ) else { return }
             guard tracked == value else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "borrowed native conversion ownership does not match its SIL value"
+                    "preserved native conversion ownership does not match its SIL value"
                 )
             }
         }
 
-        func transferBorrowedNativeConversionLifetime(
+        func transferPreservedNativeConversionLifetime(
             from sourceToken: String,
             resolved source: Bytecode.Register,
             to resultToken: String,
             result: Bytecode.Register
         ) throws {
-            guard let tracked = borrowedNativeConversionValues.removeValue(
+            guard let tracked = preservedNativeConversionValues.removeValue(
                 forKey: sourceToken
             ) else { return }
             guard tracked == source,
-                  borrowedNativeConversionValues[resultToken] == nil
+                  preservedNativeConversionValues[resultToken] == nil
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "borrowed native conversion cannot transfer into its owner"
+                    "preserved native conversion cannot transfer into its owner"
                 )
             }
-            borrowedNativeConversionValues[resultToken] = result
+            preservedNativeConversionValues[resultToken] = result
         }
 
         func addressBase(_ token: String) -> String {
@@ -570,6 +588,55 @@ public struct Lowerer: Sendable {
 
         func assignStackValue(_ value: Bytecode.Register, at token: String) {
             stackAddressValues[addressBase(token)] = value
+        }
+
+        func reconstructedOptionalNone(
+            for token: String,
+            line: Int
+        ) throws -> Bytecode.Register? {
+            guard let blockID = current?.id,
+                  let source = optionalSourceByNoneBlock[blockID],
+                  addressBase(source) == addressBase(token)
+            else { return nil }
+            let root = addressBase(source)
+            if let replacement = reconstructedNoneValues[blockID]?[root] {
+                return replacement
+            }
+            guard runtimeAddress(at: source) == nil else { return nil }
+            guard let original = stackAddressValues[root] ?? values[source] else {
+                throw CanonicalSIL.LoweringError.undefinedValue(
+                    line: line,
+                    value: token
+                )
+            }
+            let type = registerTypes[Int(original.rawValue)]
+            guard case .optional = type else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "switch_enum none edge does not reference an Optional"
+                )
+            }
+            let replacement = try allocate(type: type)
+            appendInstruction(.makeOptionalNone(result: replacement))
+            reconstructedNoneValues[blockID, default: [:]][root] = replacement
+            if stackAddressTypes[root] != nil {
+                stackAddressValues[root] = replacement
+                values[root] = replacement
+                values[source] = replacement
+            }
+            return replacement
+        }
+
+        func resolvedStackValue(
+            at token: String,
+            line: Int
+        ) throws -> Bytecode.Register? {
+            if let replacement = try reconstructedOptionalNone(
+                for: token,
+                line: line
+            ) {
+                return replacement
+            }
+            return stackValue(at: token)
         }
 
         func storeVMValue(
@@ -627,23 +694,10 @@ public struct Lowerer: Sendable {
         }
 
         func resolve(_ token: String, line: Int) throws -> Bytecode.Register {
-            if let blockID = current?.id,
-               optionalSourceByNoneBlock[blockID] == token {
-                if let replacement = reconstructedNoneValues[blockID]?[token] {
-                    return replacement
-                }
-                guard let original = values[token] else {
-                    throw CanonicalSIL.LoweringError.undefinedValue(line: line, value: token)
-                }
-                let type = registerTypes[Int(original.rawValue)]
-                guard case .optional = type else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "switch_enum none edge does not reference an Optional"
-                    )
-                }
-                let replacement = try allocate(type: type)
-                appendInstruction(.makeOptionalNone(result: replacement))
-                reconstructedNoneValues[blockID, default: [:]][token] = replacement
+            if let replacement = try reconstructedOptionalNone(
+                for: token,
+                line: line
+            ) {
                 return replacement
             }
             guard let register = values[token] else {
@@ -836,6 +890,41 @@ public struct Lowerer: Sendable {
                     convention == .borrowed
                         ? try copyOwnedCallArgument(argument)
                         : argument
+                }
+            }
+        }
+
+        func transferOwnedCompilerAddressArguments(
+            tokens: [String],
+            resolvedArguments: [Bytecode.Register],
+            conventions: [Bytecode.ParameterConvention]
+        ) throws {
+            guard tokens.count == resolvedArguments.count,
+                  tokens.count == conventions.count
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "owned call argument transfer has inconsistent arity"
+                )
+            }
+            for ((token, argument), convention) in zip(
+                zip(tokens, resolvedArguments),
+                conventions
+            ) where convention == .owned {
+                let root = addressBase(token)
+                guard let stored = stackAddressValues[root] else { continue }
+                guard stored == argument else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "owned call argument does not match its compiler address storage"
+                    )
+                }
+
+                // An `@in` SIL argument transfers the value stored at its
+                // compiler-only address into the callee. HLBC passes that same
+                // value directly, so the later dealloc_stack must not release
+                // it a second time.
+                stackAddressValues.removeValue(forKey: root)
+                for key in [root, token] where values[key] == argument {
+                    values.removeValue(forKey: key)
                 }
             }
         }
@@ -1146,7 +1235,11 @@ public struct Lowerer: Sendable {
                     "mutating value receiver storage has the wrong VM type"
                 )
             }
-            arguments.append(try copyOwnedCallArgument(receiver))
+            // The adapter consumes the current value and returns its mutated
+            // replacement. Passing the original register keeps the HLBC
+            // lifetime aligned with Swift's inout writeback instead of
+            // leaving the pre-mutation value live beside the replacement.
+            arguments.append(receiver)
             guard arguments.map({ registerTypes[Int($0.rawValue)] })
                     == binding.parameterTypes
             else {
@@ -1162,6 +1255,16 @@ public struct Lowerer: Sendable {
                     importID: requirement.id,
                     arguments: arguments
                 )
+            )
+            try transferOwnedCompilerAddressArguments(
+                tokens: valueTokens,
+                resolvedArguments: prepared.arguments,
+                conventions: valueConventions
+            )
+            try transferOwnedCompilerAddressArguments(
+                tokens: [receiverToken],
+                resolvedArguments: [receiver],
+                conventions: [.owned]
             )
             try storeConstructedValue(mutated, at: receiverToken)
             for access in prepared.accesses.reversed() {
@@ -2167,7 +2270,7 @@ public struct Lowerer: Sendable {
                 pattern: #"^end_borrow (%[0-9]+)$"#
             ) {
                 borrowedValueTokens.remove(borrowEnd[0])
-                if let value = borrowedNativeConversionValues.removeValue(
+                if let value = preservedNativeConversionValues.removeValue(
                     forKey: borrowEnd[0]
                 ) {
                     appendInstruction(.destroyValue(value))
@@ -2513,7 +2616,10 @@ public struct Lowerer: Sendable {
             ) {
                 let sourceType = stackType(at: copy[1])
                 let destinationType = compilerAddressType(copy[3])
-                guard let source = stackValue(at: copy[1]),
+                guard let source = try resolvedStackValue(
+                    at: copy[1],
+                    line: sourceLine
+                ),
                       sourceType == destinationType
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -3403,24 +3509,24 @@ public struct Lowerer: Sendable {
                         "AnyObject erasure has no exact frozen bridge"
                     )
                 }
-                let sourceIsBorrowed = borrowedValueTokens.contains(cast[1])
-                    || isBorrowedParameter(source)
-                let argument = sourceIsBorrowed
-                    ? try copyOwnedCallArgument(source)
-                    : source
+                let conversion = try prepareNativeReferenceConversion(
+                    sourceToken: cast[1],
+                    source: source,
+                    lineIndex: lineIndex
+                )
                 let result = try allocate(type: .native(targetType))
                 values[cast[0]] = result
-                if sourceIsBorrowed {
-                    borrowedNativeConversionValues[cast[0]] = result
+                if conversion.tracksResultLifetime {
+                    preservedNativeConversionValues[cast[0]] = result
                 }
                 appendInstruction(
                     .nativeApply(
                         result: result,
                         importID: requirement.id,
-                        arguments: [argument]
+                        arguments: [conversion.argument]
                     )
                 )
-                releaseBorrowedNativeConversionsAfterLastUse(
+                releasePreservedNativeConversionsAfterLastUse(
                     [cast[1]],
                     after: lineIndex
                 )
@@ -3456,24 +3562,24 @@ public struct Lowerer: Sendable {
                         "native upcast has no exact frozen bridge"
                     )
                 }
-                let sourceIsBorrowed = borrowedValueTokens.contains(cast[1])
-                    || isBorrowedParameter(source)
-                let argument = sourceIsBorrowed
-                    ? try copyOwnedCallArgument(source)
-                    : source
+                let conversion = try prepareNativeReferenceConversion(
+                    sourceToken: cast[1],
+                    source: source,
+                    lineIndex: lineIndex
+                )
                 let result = try allocate(type: .native(targetType))
                 values[cast[0]] = result
-                if sourceIsBorrowed {
-                    borrowedNativeConversionValues[cast[0]] = result
+                if conversion.tracksResultLifetime {
+                    preservedNativeConversionValues[cast[0]] = result
                 }
                 appendInstruction(
                     .nativeApply(
                         result: result,
                         importID: requirement.id,
-                        arguments: [argument]
+                        arguments: [conversion.argument]
                     )
                 )
-                releaseBorrowedNativeConversionsAfterLastUse(
+                releasePreservedNativeConversionsAfterLastUse(
                     [cast[1]],
                     after: lineIndex
                 )
@@ -4120,6 +4226,11 @@ public struct Lowerer: Sendable {
                     )
                 }
                 appendInstruction(instruction)
+                try transferOwnedCompilerAddressArguments(
+                    tokens: argumentTokens,
+                    resolvedArguments: prepared.arguments,
+                    conventions: reference.physicalParameterConventions
+                )
                 continue
             }
 
@@ -4518,6 +4629,11 @@ public struct Lowerer: Sendable {
                     .nativeApply(result: result, importID: requirement.id, arguments: arguments)
                 }
                 appendInstruction(instruction)
+                try transferOwnedCompilerAddressArguments(
+                    tokens: argumentTokens,
+                    resolvedArguments: prepared.arguments,
+                    conventions: reference.physicalParameterConventions
+                )
                 if let indirectResultDestination, let result {
                     if binding.resultType == .any {
                         try storeExistential(result, at: indirectResultDestination)
@@ -4531,7 +4647,7 @@ public struct Lowerer: Sendable {
                 for access in prepared.accesses.reversed() {
                     appendInstruction(.endAccess(access))
                 }
-                releaseBorrowedNativeConversionsAfterLastUse(
+                releasePreservedNativeConversionsAfterLastUse(
                     zip(
                         argumentTokens,
                         reference.physicalParameterConventions
@@ -4630,7 +4746,7 @@ public struct Lowerer: Sendable {
                 values[cast[0]] = result
                 knownOptionalSomePayloads[cast[0]] = source
                 appendInstruction(.makeOptionalSome(result: result, value: source))
-                try transferBorrowedNativeConversionLifetime(
+                try transferPreservedNativeConversionLifetime(
                     from: cast[1],
                     resolved: source,
                     to: cast[0],
@@ -4796,7 +4912,7 @@ public struct Lowerer: Sendable {
                 values[optional[0]] = result
                 knownOptionalSomePayloads[optional[0]] = payload
                 appendInstruction(.makeOptionalSome(result: result, value: payload))
-                try transferBorrowedNativeConversionLifetime(
+                try transferPreservedNativeConversionLifetime(
                     from: optional[2],
                     resolved: payload,
                     to: optional[0],
@@ -5451,7 +5567,10 @@ public struct Lowerer: Sendable {
                     values[load[0]] = result
                     continue
                 }
-                guard let value = stackValue(at: load[2]),
+                guard let value = try resolvedStackValue(
+                    at: load[2],
+                    line: sourceLine
+                ),
                       let addressType = stackType(at: load[2]),
                       registerTypes[Int(value.rawValue)] == addressType
                 else {
@@ -5789,7 +5908,7 @@ public struct Lowerer: Sendable {
                     compilerOptionalVoidValues.insert(copy[0])
                 }
                 appendInstruction(.copyValue(result: result, source: source))
-                releaseBorrowedNativeConversionsAfterLastUse(
+                releasePreservedNativeConversionsAfterLastUse(
                     [copy[1]],
                     after: lineIndex
                 )
@@ -5857,7 +5976,7 @@ public struct Lowerer: Sendable {
                 optionalAddressSelectionConditions.removeValue(forKey: destroy[0])
                 compilerOptionalVoidValues.remove(destroy[0])
                 let value = try resolve(destroy[0], line: sourceLine)
-                try closeBorrowedNativeConversionLifetime(
+                try closePreservedNativeConversionLifetime(
                     for: destroy[0],
                     resolved: value
                 )
@@ -5876,7 +5995,7 @@ public struct Lowerer: Sendable {
                     // its release remains an explicit linear consume.
                     if ownership[0] == "release_value",
                        !isBorrowedParameter(value) {
-                        try closeBorrowedNativeConversionLifetime(
+                        try closePreservedNativeConversionLifetime(
                             for: ownership[1],
                             resolved: value
                         )
@@ -5901,7 +6020,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 if ownership[0] == "release", !isBorrowedParameter(value) {
-                    try closeBorrowedNativeConversionLifetime(
+                    try closePreservedNativeConversionLifetime(
                         for: ownership[1],
                         resolved: value
                     )
@@ -6457,7 +6576,7 @@ public struct Lowerer: Sendable {
             "borrow",
             count: borrowedValueTokens.count
         )
-        let nativeConversionTokens = borrowedNativeConversionValues.keys.sorted()
+        let nativeConversionTokens = preservedNativeConversionValues.keys.sorted()
         recordIncompleteLifetime(
             "native-conversion[\(nativeConversionTokens.joined(separator: "|"))]",
             count: nativeConversionTokens.count

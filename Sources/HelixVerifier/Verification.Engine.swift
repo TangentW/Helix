@@ -974,14 +974,13 @@ public struct Engine: Verification.ImageVerifying {
                     effectiveLimits: effectiveLimits
                 )
             }
-            try verifyOwnership(
-                function: function,
-                block: block,
-                blocks: blocks,
-                functions: functions,
-                shell: shell
-            )
         }
+        try verifyOwnership(
+            function: function,
+            blocks: blocks,
+            functions: functions,
+            shell: shell
+        )
         try verifyStackLifecycle(function: function, blocks: blocks)
         try verifyAddressLifecycle(function: function, functions: functions)
     }
@@ -2216,7 +2215,6 @@ public struct Engine: Verification.ImageVerifying {
 
     private func verifyOwnership(
         function: Bytecode.Function,
-        block: Bytecode.Block,
         blocks: [Bytecode.BlockID: Bytecode.Block],
         functions: [Bytecode.FunctionID: Bytecode.Function],
         shell: Verification.ShellInterface
@@ -2227,246 +2225,346 @@ public struct Engine: Verification.ImageVerifying {
         ).compactMap { register, convention in
             convention == .borrowed ? register : nil
         })
-        var live = Set(block.parameters.filter {
-            function.type(of: $0)?.requiresLinearOwnership == true
-                && !borrowedParameters.contains($0)
+        let entryLive = Set(zip(
+            function.parameterRegisters,
+            function.parameterConventions
+        ).compactMap { register, convention in
+            convention == .owned
+                && function.type(of: register)?.requiresLinearOwnership == true
+                ? register : nil
         })
-        for (offset, instruction) in block.instructions.enumerated() {
-            func fail(_ reason: String) -> Verification.Error {
-                .invalidInstruction(function: function.id, block: block.id, offset: offset, reason: reason)
+        // VM registers survive control-flow transfers. Track linear values at
+        // function scope so dominated native handles may cross a branch while
+        // every merge still requires one exact, path-independent live set.
+        var incoming: [Bytecode.BlockID: Set<Bytecode.Register>] = [
+            function.entryBlock: entryLive,
+        ]
+        var worklist = [function.entryBlock]
+
+        while let blockID = worklist.popLast() {
+            guard let block = blocks[blockID], var live = incoming[blockID] else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "ownership dataflow references an unknown block"
+                )
             }
-            for operand in instruction.operandRegisters
-            where function.type(of: operand)?.requiresLinearOwnership == true {
-                guard live.contains(operand) || borrowedParameters.contains(operand) else {
-                    throw fail("instruction uses a consumed owned value")
+            var outgoing: [(target: Bytecode.BlockID, live: Set<Bytecode.Register>)] = []
+            func forward(
+                _ state: Set<Bytecode.Register>,
+                to target: Bytecode.BlockID
+            ) throws {
+                outgoing.append((
+                    target,
+                    try ownershipState(
+                        state,
+                        entering: target,
+                        function: function,
+                        blocks: blocks
+                    )
+                ))
+            }
+            for (offset, instruction) in block.instructions.enumerated() {
+                func fail(_ reason: String) -> Verification.Error {
+                    .invalidInstruction(
+                        function: function.id,
+                        block: block.id,
+                        offset: offset,
+                        reason: reason
+                    )
+                }
+                for operand in instruction.operandRegisters
+                where function.type(of: operand)?.requiresLinearOwnership == true {
+                    guard live.contains(operand) || borrowedParameters.contains(operand) else {
+                        throw fail("instruction uses a consumed owned value")
+                    }
+                }
+                switch instruction {
+                case let .copyValue(result, source):
+                    if function.type(of: source)?.requiresLinearOwnership == true {
+                        guard live.contains(source) || borrowedParameters.contains(source) else {
+                            throw fail("copy_value uses a consumed value")
+                        }
+                        live.insert(result)
+                    }
+                case let .moveValue(result, source):
+                    if function.type(of: source)?.requiresLinearOwnership == true {
+                        guard live.remove(source) != nil else { throw fail("move_value uses a consumed value") }
+                        live.insert(result)
+                    }
+                case let .destroyValue(register):
+                    if function.type(of: register)?.requiresLinearOwnership == true,
+                       live.remove(register) == nil {
+                        throw fail("destroy_value uses a consumed value")
+                    }
+                case let .makeTuple(result, elements):
+                    for element in elements
+                    where function.type(of: element)?.requiresLinearOwnership == true {
+                        guard live.remove(element) != nil else {
+                            throw fail("make_tuple consumes a non-live element")
+                        }
+                    }
+                    if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+                case let .unpackTuple(results, tuple):
+                    if function.type(of: tuple)?.requiresLinearOwnership == true,
+                       live.remove(tuple) == nil {
+                        throw fail("unpack_tuple consumes a non-live tuple")
+                    }
+                    for result in results
+                    where function.type(of: result)?.requiresLinearOwnership == true {
+                        live.insert(result)
+                    }
+                case .makeStruct, .structExtract, .makeEnum, .makeError, .castError,
+                     .eraseToAny, .checkedCastAny, .forceCastAny, .stackAddress,
+                     .projectStructAddress, .beginAccess, .endAccess:
+                    // HLBC 1.6 rejects native handles inside local nominal values,
+                    // so these fully VM-managed operations cannot change the
+                    // explicit native-ownership set.
+                    break
+                case let .switchEnum(_, cases, defaultTarget):
+                    let targets = cases.map(\.target) + (defaultTarget.map { [$0] } ?? [])
+                    for target in targets {
+                        try forward(live, to: target)
+                    }
+                case let .makeOptionalSome(result, value):
+                    if function.type(of: value)?.requiresLinearOwnership == true,
+                       live.remove(value) == nil {
+                        throw fail("optional_some consumes a non-live payload")
+                    }
+                    if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+                case let .makeOptionalNone(result):
+                    if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+                case .optionalIsSome:
+                    break
+                case let .unwrapOptional(result, optional):
+                    if function.type(of: optional)?.requiresLinearOwnership == true,
+                       live.remove(optional) == nil {
+                        throw fail("optional_unwrap consumes a non-live Optional")
+                    }
+                    if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+                case let .switchOptional(optional, someTarget, noneTarget):
+                    if function.type(of: optional)?.requiresLinearOwnership == true,
+                       live.remove(optional) == nil {
+                        throw fail("switch_optional consumes a non-live Optional")
+                    }
+                    try forward(live, to: someTarget)
+                    try forward(live, to: noneTarget)
+                case let .storeStack(_, source, _):
+                    if function.type(of: source)?.requiresLinearOwnership == true,
+                       live.remove(source) == nil {
+                        throw fail("store_stack consumes a non-live value")
+                    }
+                case let .loadStack(result, _, _):
+                    if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+                case .destroyStack:
+                    break
+                case let .loadAddress(result, _, _):
+                    if function.type(of: result)?.requiresLinearOwnership == true {
+                        live.insert(result)
+                    }
+                case let .storeAddress(_, source, _):
+                    if function.type(of: source)?.requiresLinearOwnership == true {
+                        guard live.remove(source) != nil else {
+                            throw fail("store_address consumes a non-live value")
+                        }
+                    }
+                case let .makeArray(result, elements):
+                    for element in elements
+                    where function.type(of: element)?.requiresLinearOwnership == true {
+                        guard live.remove(element) != nil else {
+                            throw fail("make_array consumes a non-live element")
+                        }
+                    }
+                    if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+                case let .arrayGet(result, _, _), let .arrayFirst(result, _),
+                     let .arrayAppend(result, _, _), let .arrayUpdate(result, _, _, _),
+                     let .arrayNext(result, _, _),
+                     let .makeDictionary(result, _), let .dictionaryGet(result, _, _),
+                     let .dictionaryUpdate(result, _, _, _),
+                     let .dictionaryNext(result, _, _):
+                    if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+                case .constantString:
+                    break
+                case let .apply(result, callee, arguments):
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: functions[callee]?.parameterConventions
+                            ?? Array(repeating: .owned, count: arguments.count),
+                        live: &live,
+                        function: function,
+                        fail: fail
+                    )
+                    if let result,
+                       let target = functions[callee]?.resultType,
+                       target.requiresLinearOwnership {
+                        live.insert(result)
+                    }
+                case let .entryApply(result, entry, arguments):
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: Array(repeating: .owned, count: arguments.count),
+                        live: &live,
+                        function: function,
+                        fail: fail
+                    )
+                    if let result,
+                       let type = shell.entries[entry]?.resultType,
+                       type.requiresLinearOwnership {
+                        live.insert(result)
+                    }
+                case let .nativeApply(result, importID, arguments):
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: Array(repeating: .owned, count: arguments.count),
+                        live: &live,
+                        function: function,
+                        fail: fail
+                    )
+                    if let result,
+                       let type = shell.imports[importID]?.resultType,
+                       type.requiresLinearOwnership {
+                        live.insert(result)
+                    }
+                case .makeClosure:
+                    // Captures are copied into a VM-managed closure context. The
+                    // type checker rejects addresses and explicit-linear values.
+                    break
+                case let .closureApply(result, closure, arguments):
+                    let signature: Bytecode.ClosureSignature? = if case let .closure(value)
+                        = function.type(of: closure) { value } else { nil }
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: Array(repeating: .owned, count: arguments.count),
+                        live: &live,
+                        function: function,
+                        fail: fail
+                    )
+                    if let result,
+                       signature?.result.requiresLinearOwnership == true {
+                        live.insert(result)
+                    }
+                case let .tryApply(callee, arguments, normalTarget, errorTarget):
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: functions[callee]?.parameterConventions
+                            ?? Array(repeating: .owned, count: arguments.count),
+                        live: &live,
+                        function: function,
+                        fail: fail
+                    )
+                    try forward(live, to: normalTarget)
+                    try forward(live, to: errorTarget)
+                case let .entryTryApply(_, arguments, normalTarget, errorTarget),
+                     let .nativeTryApply(_, arguments, normalTarget, errorTarget):
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: Array(repeating: .owned, count: arguments.count),
+                        live: &live,
+                        function: function,
+                        fail: fail
+                    )
+                    try forward(live, to: normalTarget)
+                    try forward(live, to: errorTarget)
+                case let .branch(target, arguments):
+                    try consumeForwarded(
+                        arguments,
+                        target: target,
+                        live: &live,
+                        function: function,
+                        blocks: blocks,
+                        fail: fail
+                    )
+                    try forward(live, to: target)
+                case let .conditionalBranch(_, trueTarget, trueArguments, falseTarget, falseArguments):
+                    var trueLive = live
+                    var falseLive = live
+                    try consumeForwarded(
+                        trueArguments,
+                        target: trueTarget,
+                        live: &trueLive,
+                        function: function,
+                        blocks: blocks,
+                        fail: fail
+                    )
+                    try consumeForwarded(
+                        falseArguments,
+                        target: falseTarget,
+                        live: &falseLive,
+                        function: function,
+                        blocks: blocks,
+                        fail: fail
+                    )
+                    try forward(trueLive, to: trueTarget)
+                    try forward(falseLive, to: falseTarget)
+                case let .returnValue(result):
+                    if let result,
+                       function.type(of: result)?.requiresLinearOwnership == true {
+                        guard live.remove(result) != nil else { throw fail("return consumes a non-live value") }
+                    }
+                    guard live.isEmpty else { throw fail("owned values remain live at return") }
+                case let .throwError(error):
+                    if function.type(of: error)?.requiresLinearOwnership == true,
+                       live.remove(error) == nil {
+                        throw fail("throw_error consumes a non-live error payload")
+                    }
+                    guard live.isEmpty else {
+                        throw fail("owned values remain live at throw")
+                    }
+                case .trap:
+                    live.removeAll()
+                case .constantInteger, .constantBool, .constantFloat, .checkedBinary,
+                     .floatingBinary, .floatingUnary, .integerConvert, .floatingConvert,
+                     .booleanBinary, .stringConcat, .stringCount, .stringIsEmpty,
+                     .stringPredicate, .stringify, .arrayCount, .arrayIsEmpty, .arrayContains,
+                     .dictionaryCount, .dictionaryIsEmpty, .compare:
+                    break
                 }
             }
-            switch instruction {
-            case let .copyValue(result, source):
-                if function.type(of: source)?.requiresLinearOwnership == true {
-                    guard live.contains(source) || borrowedParameters.contains(source) else {
-                        throw fail("copy_value uses a consumed value")
+
+            for edge in outgoing {
+                if let existing = incoming[edge.target] {
+                    guard existing == edge.live else {
+                        throw Verification.Error.invalidBlock(
+                            function: function.id,
+                            block: edge.target,
+                            reason: "incoming owned-value states disagree"
+                        )
                     }
-                    live.insert(result)
+                } else {
+                    incoming[edge.target] = edge.live
+                    worklist.append(edge.target)
                 }
-            case let .moveValue(result, source):
-                if function.type(of: source)?.requiresLinearOwnership == true {
-                    guard live.remove(source) != nil else { throw fail("move_value uses a consumed value") }
-                    live.insert(result)
-                }
-            case let .destroyValue(register):
-                if function.type(of: register)?.requiresLinearOwnership == true,
-                   live.remove(register) == nil {
-                    throw fail("destroy_value uses a consumed value")
-                }
-            case let .makeTuple(result, elements):
-                for element in elements
-                where function.type(of: element)?.requiresLinearOwnership == true {
-                    guard live.remove(element) != nil else {
-                        throw fail("make_tuple consumes a non-live element")
-                    }
-                }
-                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
-            case let .unpackTuple(results, tuple):
-                if function.type(of: tuple)?.requiresLinearOwnership == true,
-                   live.remove(tuple) == nil {
-                    throw fail("unpack_tuple consumes a non-live tuple")
-                }
-                for result in results
-                where function.type(of: result)?.requiresLinearOwnership == true {
-                    live.insert(result)
-                }
-            case .makeStruct, .structExtract, .makeEnum, .makeError, .castError,
-                 .eraseToAny, .checkedCastAny, .forceCastAny, .stackAddress,
-                 .projectStructAddress, .beginAccess, .endAccess:
-                // HLBC 1.6 rejects native handles inside local nominal values,
-                // so these fully VM-managed operations cannot change the
-                // explicit native-ownership set.
-                break
-            case .switchEnum:
-                guard live.isEmpty else {
-                    throw fail("owned values remain live across switch_enum")
-                }
-            case let .makeOptionalSome(result, value):
-                if function.type(of: value)?.requiresLinearOwnership == true,
-                   live.remove(value) == nil {
-                    throw fail("optional_some consumes a non-live payload")
-                }
-                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
-            case let .makeOptionalNone(result):
-                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
-            case .optionalIsSome:
-                break
-            case let .unwrapOptional(result, optional):
-                if function.type(of: optional)?.requiresLinearOwnership == true,
-                   live.remove(optional) == nil {
-                    throw fail("optional_unwrap consumes a non-live Optional")
-                }
-                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
-            case let .switchOptional(optional, _, _):
-                if function.type(of: optional)?.requiresLinearOwnership == true,
-                   live.remove(optional) == nil {
-                    throw fail("switch_optional consumes a non-live Optional")
-                }
-                guard live.isEmpty else {
-                    throw fail("owned values remain live across switch_optional")
-                }
-            case let .storeStack(_, source, _):
-                if function.type(of: source)?.requiresLinearOwnership == true,
-                   live.remove(source) == nil {
-                    throw fail("store_stack consumes a non-live value")
-                }
-            case let .loadStack(result, _, _):
-                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
-            case .destroyStack:
-                break
-            case let .loadAddress(result, _, _):
-                if function.type(of: result)?.requiresLinearOwnership == true {
-                    live.insert(result)
-                }
-            case let .storeAddress(_, source, _):
-                if function.type(of: source)?.requiresLinearOwnership == true {
-                    guard live.remove(source) != nil else {
-                        throw fail("store_address consumes a non-live value")
-                    }
-                }
-            case let .makeArray(result, elements):
-                for element in elements
-                where function.type(of: element)?.requiresLinearOwnership == true {
-                    guard live.remove(element) != nil else {
-                        throw fail("make_array consumes a non-live element")
-                    }
-                }
-                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
-            case let .arrayGet(result, _, _), let .arrayFirst(result, _),
-                 let .arrayAppend(result, _, _), let .arrayUpdate(result, _, _, _),
-                 let .arrayNext(result, _, _),
-                 let .makeDictionary(result, _), let .dictionaryGet(result, _, _),
-                 let .dictionaryUpdate(result, _, _, _),
-                 let .dictionaryNext(result, _, _):
-                if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
-            case .constantString:
-                break
-            case let .apply(result, callee, arguments):
-                try consumeOwnedCallArguments(
-                    arguments,
-                    conventions: functions[callee]?.parameterConventions
-                        ?? Array(repeating: .owned, count: arguments.count),
-                    live: &live,
-                    function: function,
-                    fail: fail
-                )
-                if let result,
-                   let target = functions[callee]?.resultType,
-                   target.requiresLinearOwnership {
-                    live.insert(result)
-                }
-            case let .entryApply(result, entry, arguments):
-                try consumeOwnedCallArguments(
-                    arguments,
-                    conventions: Array(repeating: .owned, count: arguments.count),
-                    live: &live,
-                    function: function,
-                    fail: fail
-                )
-                if let result,
-                   let type = shell.entries[entry]?.resultType,
-                   type.requiresLinearOwnership {
-                    live.insert(result)
-                }
-            case let .nativeApply(result, importID, arguments):
-                try consumeOwnedCallArguments(
-                    arguments,
-                    conventions: Array(repeating: .owned, count: arguments.count),
-                    live: &live,
-                    function: function,
-                    fail: fail
-                )
-                if let result,
-                   let type = shell.imports[importID]?.resultType,
-                   type.requiresLinearOwnership {
-                    live.insert(result)
-                }
-            case .makeClosure:
-                // Captures are copied into a VM-managed closure context. The
-                // type checker rejects addresses and explicit-linear values.
-                break
-            case let .closureApply(result, closure, arguments):
-                let signature: Bytecode.ClosureSignature? = if case let .closure(value)
-                    = function.type(of: closure) { value } else { nil }
-                try consumeOwnedCallArguments(
-                    arguments,
-                    conventions: Array(repeating: .owned, count: arguments.count),
-                    live: &live,
-                    function: function,
-                    fail: fail
-                )
-                if let result,
-                   signature?.result.requiresLinearOwnership == true {
-                    live.insert(result)
-                }
-            case let .tryApply(callee, arguments, _, _):
-                try consumeOwnedCallArguments(
-                    arguments,
-                    conventions: functions[callee]?.parameterConventions
-                        ?? Array(repeating: .owned, count: arguments.count),
-                    live: &live,
-                    function: function,
-                    fail: fail
-                )
-                // Linear arguments transfer into the call on both edges. Until
-                // HLBC has explicit cleanup regions, no unrelated owned value
-                // may remain live across a throwing call.
-                guard live.isEmpty else {
-                    throw fail("owned values cannot remain live across try_apply")
-                }
-            case let .entryTryApply(_, arguments, _, _),
-                 let .nativeTryApply(_, arguments, _, _):
-                try consumeOwnedCallArguments(
-                    arguments,
-                    conventions: Array(repeating: .owned, count: arguments.count),
-                    live: &live,
-                    function: function,
-                    fail: fail
-                )
-                guard live.isEmpty else {
-                    throw fail("owned values cannot remain live across try_apply")
-                }
-            case let .branch(target, arguments):
-                try consumeForwarded(arguments, target: target, live: &live, function: function, blocks: blocks, fail: fail)
-                guard live.isEmpty else { throw fail("owned values are neither forwarded nor destroyed at branch") }
-            case let .conditionalBranch(_, trueTarget, trueArguments, falseTarget, falseArguments):
-                var trueLive = live
-                var falseLive = live
-                try consumeForwarded(trueArguments, target: trueTarget, live: &trueLive, function: function, blocks: blocks, fail: fail)
-                try consumeForwarded(falseArguments, target: falseTarget, live: &falseLive, function: function, blocks: blocks, fail: fail)
-                guard trueLive.isEmpty, falseLive.isEmpty else {
-                    throw fail("owned values are not balanced on every cond_br edge")
-                }
-            case let .returnValue(result):
-                if let result,
-                   function.type(of: result)?.requiresLinearOwnership == true {
-                    guard live.remove(result) != nil else { throw fail("return consumes a non-live value") }
-                }
-                guard live.isEmpty else { throw fail("owned values remain live at return") }
-            case let .throwError(error):
-                if function.type(of: error)?.requiresLinearOwnership == true,
-                   live.remove(error) == nil {
-                    throw fail("throw_error consumes a non-live error payload")
-                }
-                guard live.isEmpty else {
-                    throw fail("owned values remain live at throw")
-                }
-            case .trap:
-                live.removeAll()
-            case .constantInteger, .constantBool, .constantFloat, .checkedBinary,
-                 .floatingBinary, .floatingUnary, .integerConvert, .floatingConvert,
-                 .booleanBinary, .stringConcat, .stringCount, .stringIsEmpty,
-                 .stringPredicate, .stringify, .arrayCount, .arrayIsEmpty, .arrayContains,
-                 .dictionaryCount, .dictionaryIsEmpty, .compare:
-                break
             }
         }
+    }
+
+    private func ownershipState(
+        _ live: Set<Bytecode.Register>,
+        entering target: Bytecode.BlockID,
+        function: Bytecode.Function,
+        blocks: [Bytecode.BlockID: Bytecode.Block]
+    ) throws -> Set<Bytecode.Register> {
+        guard let targetBlock = blocks[target] else {
+            throw Verification.Error.invalidFunction(
+                function: function.id,
+                reason: "ownership dataflow references an unknown block"
+            )
+        }
+        var result = live
+        for (index, parameter) in targetBlock.parameters.enumerated()
+        where function.type(of: parameter)?.requiresLinearOwnership == true {
+            if target == function.entryBlock,
+               function.parameterConventions[index] != .owned {
+                continue
+            }
+            guard result.insert(parameter).inserted else {
+                throw Verification.Error.invalidBlock(
+                    function: function.id,
+                    block: target,
+                    reason: "owned block parameter is already live on entry"
+                )
+            }
+        }
+        return result
     }
 
     private func consumeForwarded(
@@ -2478,8 +2576,15 @@ public struct Engine: Verification.ImageVerifying {
         fail: (String) -> Verification.Error
     ) throws {
         guard let targetBlock = blocks[target] else { return }
-        for (argument, parameter) in zip(arguments, targetBlock.parameters)
-        where function.type(of: parameter)?.requiresLinearOwnership == true {
+        for (index, pair) in zip(arguments, targetBlock.parameters).enumerated() {
+            let (argument, parameter) = pair
+            guard function.type(of: parameter)?.requiresLinearOwnership == true else {
+                continue
+            }
+            if target == function.entryBlock,
+               function.parameterConventions[index] != .owned {
+                continue
+            }
             guard live.remove(argument) != nil else { throw fail("branch forwards a consumed owned value") }
         }
     }
