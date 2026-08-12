@@ -52,6 +52,7 @@ struct DemoIntegration {
         #expect(project.occurrences(of: "isa = PBXAggregateTarget;") == 1)
         #expect(project.contains("name = HelixPatchAction;"))
         #expect(project.contains("alwaysOutOfDate = 1;"))
+        #expect(!project.contains("SUPPORTED_PLATFORMS = iphonesimulator;"))
         #expect(project.contains("SWIFT_TREAT_WARNINGS_AS_ERRORS = YES;"))
         #expect(project.contains("LD_RUNPATH_SEARCH_PATHS = \"$(inherited) @executable_path/Frameworks\";"))
 
@@ -68,7 +69,7 @@ struct DemoIntegration {
         #expect(project.contains("Live Application.xcconfig"))
         #expect(project.occurrences(
             of: "SUPPORTED_PLATFORMS = \"iphoneos iphonesimulator\";"
-        ) == 8)
+        ) == 10)
         #expect(project.occurrences(
             of: "\"CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]\" = NO;"
         ) == 4)

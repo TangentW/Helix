@@ -166,6 +166,8 @@ public final class ApplicationSession: @unchecked Sendable {
     ///   - packageBytes: The complete encoded patch package.
     ///   - nowUnixSeconds: Current wall-clock time for validity checks.
     /// - Returns: The committed generation and activated entry inventory.
+    ///   Reinstalling the exact active package returns its existing generation
+    ///   without allocating or publishing another generation.
     public func install(
         packageBytes: Data,
         nowUnixSeconds: Int64
@@ -178,7 +180,11 @@ public final class ApplicationSession: @unchecked Sendable {
                 expectedActiveID: active,
                 nowUnixSeconds: nowUnixSeconds
             )
-            try retargetCrashGuard(nowUnixSeconds: nowUnixSeconds)
+            try retargetCrashGuardAfterNewActivation(
+                result,
+                previousActiveID: active,
+                nowUnixSeconds: nowUnixSeconds
+            )
             return result
         }
     }
@@ -211,7 +217,11 @@ public final class ApplicationSession: @unchecked Sendable {
                 expectedActiveID: active,
                 nowUnixSeconds: nowUnixSeconds
             )
-            try retargetCrashGuard(nowUnixSeconds: nowUnixSeconds)
+            try retargetCrashGuardAfterNewActivation(
+                result,
+                previousActiveID: active,
+                nowUnixSeconds: nowUnixSeconds
+            )
             return result
         }
     }
@@ -250,6 +260,16 @@ public final class ApplicationSession: @unchecked Sendable {
                 try activation.markActiveHealthy(nowUnixSeconds: nowUnixSeconds)
             }
         }
+    }
+
+    private func retargetCrashGuardAfterNewActivation(
+        _ result: PatchActivation.Result,
+        previousActiveID: Runtime.GenerationID?,
+        nowUnixSeconds: Int64
+    ) throws {
+        // Replaying the exact active package is a read-only activation result.
+        guard result.generationLease.generation.id != previousActiveID else { return }
+        try retargetCrashGuard(nowUnixSeconds: nowUnixSeconds)
     }
 
     private func retargetCrashGuard(nowUnixSeconds: Int64) throws {

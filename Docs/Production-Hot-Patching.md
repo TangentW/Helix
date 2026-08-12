@@ -142,7 +142,10 @@ generation-ID high-water mark unchanged. Compaction never makes an old ID
 available to ordinary activation. Verified durable recovery is the narrow
 exception: it may rehydrate the exact historical package/ID after routing has
 returned to originals, while the high-water mark remains unchanged and all
-later activations must still exceed it.
+later activations must still exceed it. Reinstalling the exact package that is
+already active is also idempotent: Helix re-verifies current trust, target,
+policy, expiry, revocation, and anti-rollback state, then returns the existing
+lease without creating a WAL record or advancing the generation high-water mark.
 
 If no patch is active, the permanent Bridge invokes the original Swift body.
 The no-patch fast path does not construct a VM call frame; it still pays the
@@ -199,6 +202,12 @@ swift run helix patch build \
 The source list must represent the complete module required by the frozen
 archive. Production signing can be provided by an injected signing service so
 the builder does not need direct access to a long-lived private key.
+
+For Xcode integration, the Patch Aggregate Target must support both `iphoneos`
+and `iphonesimulator`. Select the same destination family used to build and
+audit the frozen Release Shell: a device archive produces an iOS/arm64 package,
+while a Simulator baseline produces an iOS Simulator package. The action never
+converts one platform's baseline into the other.
 
 ## Distribution status
 

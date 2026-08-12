@@ -106,6 +106,8 @@ struct XcodeIntegrationContract {
         ))
         #expect(guide.contains("Do not start the session from a Build post-action"))
         #expect(guide.contains("Aggregate Target `Build Patch`"))
+        #expect(guide.contains("`SUPPORTED_PLATFORMS` to `iphoneos iphonesimulator`"))
+        #expect(guide.contains("destination must match the SDK"))
         #expect(guide.contains("Scheme `Helix Patch Action`"))
         let liveProfile = text(
             try #require(first.artifacts[live.commonConfiguration])

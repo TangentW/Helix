@@ -191,14 +191,19 @@ final class ScreenViewController: UIViewController {
     @objc
     private func applyPatch() {
         do {
+            let previousGeneration = session.runtime.registry.snapshot().activeGenerationID
             let result = try session.install(
                 localPackageURL: inboxURL(),
                 nowUnixSeconds: currentUnixTime()
             )
             renderPricing()
-            renderRuntimeStatus(
-                "Verified and activated \(result.activatedEntryIndices.count) entry"
-            )
+            if result.generationLease.generation.id == previousGeneration {
+                renderRuntimeStatus("Verified; identical package was already active")
+            } else {
+                renderRuntimeStatus(
+                    "Verified and activated \(result.activatedEntryIndices.count) entry"
+                )
+            }
         } catch {
             renderRuntimeStatus("Apply failed: \(error)")
         }

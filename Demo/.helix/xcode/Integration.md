@@ -28,6 +28,8 @@ scheme; no Helix command needs to be typed during ordinary work.
 - Create Aggregate Target `HelixPatchAction`, use
   `Profiles/hot/Profile.xcconfig` as its base configuration, and run
   `Profiles/hot/patch.sh` in its only Run Script phase.
+  Set `SUPPORTED_PLATFORMS` to `iphoneos iphonesimulator`; the selected
+  destination must match the SDK of the audited Release baseline.
 - Share Scheme `Helix Build Patch` with only that Aggregate Target.
   Building this scheme compiles, signs, and optionally stages a patch; it
   does not rebuild or reinstall the App.

@@ -14,7 +14,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | Native 实验 | 仅显式选择的 Dynamic Replacement builder、递归/previous 测试、签名 dylib 与 loader probe | 产品支持；自动路由有意不选择它 |
 | 控制面 | 客户端包与 policy 合同 | 生产 Registry、HSM 运维、审批、灰度、遥测和设备群协调服务 |
 
-当前 SwiftPM 基线包含 452 个测试、73 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。iOS Simulator target 覆盖 9 个 Runtime 与 UI 用例。这些数字代表仓库证据，不代表真机或分发认证。
+当前 SwiftPM 基线包含 455 个测试、73 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。iOS Simulator target 覆盖 9 个 Runtime 与 UI 用例。这些数字代表仓库证据，不代表真机或分发认证。
 
 ## 生产 HLBC 1.10 的 Swift 子集
 

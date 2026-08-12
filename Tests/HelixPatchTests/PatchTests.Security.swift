@@ -191,32 +191,12 @@ struct Security {
         let fixture = try PatchFixture()
         let directory = try temporaryDirectory(prefix: "helix-patch-activation")
         defer { try? FileManager.default.removeItem(at: directory) }
-        let store = try PatchStore.Storage(rootURL: directory)
-        let registry = Runtime.GenerationRegistry()
-        let originals = try Runtime.OriginalCatalog([
-            .init(
-                index: fixture.entry,
-                parameterTypes: [.int64],
-                resultType: .int64,
-                invoke: { arguments in .returned(arguments.first) }
-            ),
-        ])
-        let runtime = Runtime.Engine(
-            registry: registry,
-            originals: originals,
-            shellInterfaceHash: fixture.shellHash
-        )
-        let activator = PatchActivation.Controller(
-            runtime: runtime,
-            store: store,
-            shell: fixture.shell,
-            runtimePolicy: .init(),
-            trustStore: fixture.trustStore,
-            targetContext: fixture.targetContext,
-            acceptancePolicy: fixture.acceptancePolicy
+        let harness = try makeActivationHarness(
+            fixture: fixture,
+            rootURL: directory
         )
         let bytes = try fixture.package(revision: 1).encoded()
-        let result = try activator.installAndActivate(
+        let result = try harness.controller.installAndActivate(
             packageBytes: bytes,
             generationID: .init(rawValue: 1),
             expectedActiveID: nil,
@@ -224,9 +204,9 @@ struct Security {
         )
 
         #expect(result.activatedEntryIndices == [fixture.entry])
-        #expect(registry.snapshot().activeGenerationID == .init(rawValue: 1))
+        #expect(harness.registry.snapshot().activeGenerationID == .init(rawValue: 1))
         #expect(FileManager.default.fileExists(atPath: result.verifiedPackageURL.path))
-        #expect(try store.activeState()?.generationID == .init(rawValue: 1))
+        #expect(try harness.store.activeState()?.generationID == .init(rawValue: 1))
 
         let image = try #require(result.generationLease.generation.images.first)
         let input = try VM.Integer(signed: 41, bitWidth: 64, isSigned: true)
@@ -237,6 +217,121 @@ struct Security {
                 arguments: [.integer(input)]
             ) == .returned(.integer(input))
         )
+    }
+
+    @Test("Reapplying the exact active package does not create another generation")
+    func identicalPackageActivationIsIdempotent() throws {
+        let fixture = try PatchFixture()
+        let directory = try temporaryDirectory(prefix: "helix-patch-idempotency")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let harness = try makeActivationHarness(
+            fixture: fixture,
+            rootURL: directory
+        )
+        let bytes = try fixture.package(revision: 1).encoded()
+        let first = try harness.controller.installAndActivate(
+            packageBytes: bytes,
+            generationID: .init(rawValue: 1),
+            expectedActiveID: nil,
+            nowUnixSeconds: fixture.now
+        )
+        let replay = try harness.controller.installAndActivate(
+            packageBytes: bytes,
+            generationID: .init(rawValue: 2),
+            expectedActiveID: .init(rawValue: 1),
+            nowUnixSeconds: fixture.now + 1
+        )
+        let staleReplay = try harness.controller.installAndActivate(
+            packageBytes: bytes,
+            generationID: .init(rawValue: 3),
+            expectedActiveID: nil,
+            nowUnixSeconds: fixture.now + 2
+        )
+
+        #expect(first.generationLease.generation.id == .init(rawValue: 1))
+        #expect(replay.generationLease.generation.id == .init(rawValue: 1))
+        #expect(staleReplay.generationLease.generation.id == .init(rawValue: 1))
+        #expect(replay.verifiedPackageURL == first.verifiedPackageURL)
+        #expect(replay.activatedEntryIndices == [fixture.entry])
+        let snapshot = harness.registry.snapshot()
+        #expect(snapshot.activeGenerationID == .init(rawValue: 1))
+        #expect(snapshot.highestActivatedGenerationID == .init(rawValue: 1))
+        #expect(snapshot.loadedGenerationIDs == [.init(rawValue: 1)])
+        #expect(try harness.store.activeState()?.generationID == .init(rawValue: 1))
+    }
+
+    @Test("Reapplying the active package still enforces current validity")
+    func identicalPackageReplayDoesNotBypassVerification() throws {
+        let fixture = try PatchFixture()
+        let directory = try temporaryDirectory(prefix: "helix-patch-expired-replay")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let harness = try makeActivationHarness(
+            fixture: fixture,
+            rootURL: directory
+        )
+        let bytes = try fixture.package(revision: 1).encoded()
+        _ = try harness.controller.installAndActivate(
+            packageBytes: bytes,
+            generationID: .init(rawValue: 1),
+            expectedActiveID: nil,
+            nowUnixSeconds: fixture.now
+        )
+
+        #expect(throws: PatchPackage.Error.expired) {
+            _ = try harness.controller.installAndActivate(
+                packageBytes: bytes,
+                generationID: .init(rawValue: 2),
+                expectedActiveID: .init(rawValue: 1),
+                nowUnixSeconds: fixture.now + 1_001
+                    + fixture.acceptancePolicy.clockSkewAllowanceSeconds
+            )
+        }
+
+        let snapshot = harness.registry.snapshot()
+        #expect(snapshot.activeGenerationID == .init(rawValue: 1))
+        #expect(snapshot.highestActivatedGenerationID == .init(rawValue: 1))
+        #expect(snapshot.loadedGenerationIDs == [.init(rawValue: 1)])
+        #expect(try harness.store.activeState()?.generationID == .init(rawValue: 1))
+    }
+
+    @Test("Activation rejects divergent runtime and persistent active state")
+    func rejectsDivergentActiveState() throws {
+        let fixture = try PatchFixture()
+        let directory = try temporaryDirectory(prefix: "helix-patch-state-divergence")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let harness = try makeActivationHarness(
+            fixture: fixture,
+            rootURL: directory
+        )
+        let bytes = try fixture.package(revision: 1).encoded()
+        _ = try harness.controller.installAndActivate(
+            packageBytes: bytes,
+            generationID: .init(rawValue: 1),
+            expectedActiveID: nil,
+            nowUnixSeconds: fixture.now
+        )
+        #expect(
+            try harness.store.rollbackToLastKnownGood(
+                expectedActiveID: .init(rawValue: 1)
+            ) == nil
+        )
+
+        #expect(throws: PatchPackage.Error.activationPersistence(
+            "memory and persistent active generations disagree"
+        )) {
+            _ = try harness.controller.installAndActivate(
+                packageBytes: bytes,
+                generationID: .init(rawValue: 2),
+                expectedActiveID: .init(rawValue: 1),
+                nowUnixSeconds: fixture.now + 1
+            )
+        }
+
+        let snapshot = harness.registry.snapshot()
+        #expect(snapshot.activeGenerationID == .init(rawValue: 1))
+        #expect(snapshot.highestActivatedGenerationID == .init(rawValue: 1))
+        #expect(snapshot.loadedGenerationIDs == [.init(rawValue: 1)])
+        #expect(try harness.store.activeState() == nil)
     }
 
     @Test("Interrupted activation and repeated unclean launch choose the conservative parent")
@@ -309,6 +404,44 @@ struct Security {
         #expect(interrupted == .init(rawValue: 1))
         #expect(target == nil)
         try guardrail.markHealthy(sessionNonce: nonce, nowUnixSeconds: 103)
+    }
+
+    private func makeActivationHarness(
+        fixture: PatchFixture,
+        rootURL: URL
+    ) throws -> (
+        store: PatchStore.Storage,
+        registry: Runtime.GenerationRegistry,
+        controller: PatchActivation.Controller
+    ) {
+        let store = try PatchStore.Storage(rootURL: rootURL)
+        let registry = Runtime.GenerationRegistry()
+        let originals = try Runtime.OriginalCatalog([
+            .init(
+                index: fixture.entry,
+                parameterTypes: [.int64],
+                resultType: .int64,
+                invoke: { arguments in .returned(arguments.first) }
+            ),
+        ])
+        let runtime = Runtime.Engine(
+            registry: registry,
+            originals: originals,
+            shellInterfaceHash: fixture.shellHash
+        )
+        return (
+            store,
+            registry,
+            PatchActivation.Controller(
+                runtime: runtime,
+                store: store,
+                shell: fixture.shell,
+                runtimePolicy: .init(),
+                trustStore: fixture.trustStore,
+                targetContext: fixture.targetContext,
+                acceptancePolicy: fixture.acceptancePolicy
+            )
+        )
     }
 }
 }

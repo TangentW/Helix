@@ -10,7 +10,7 @@ public enum PatchActivation {}
 extension PatchActivation {
 /// Details returned after a package generation is durably activated.
 public struct Result: Sendable {
-    /// Lease keeping the activated generation and its images alive.
+    /// Lease keeping the new or already-active generation and its images alive.
     public var generationLease: Runtime.GenerationLease
     /// SHA-256 of the complete verified package.
     public var packageHash: Core.Digest
@@ -68,6 +68,11 @@ public final class Controller: @unchecked Sendable {
         var verifiedPackage: PatchPackage.VerifiedPackage
         var generation: Runtime.Generation
         var activatedEntries: [Core.EntryIndex]
+    }
+
+    private struct ActiveGeneration {
+        var lease: Runtime.GenerationLease
+        var state: PatchStore.ActiveState
     }
 
     /// Runtime Engine receiving verified generations.
@@ -356,17 +361,35 @@ public final class Controller: @unchecked Sendable {
             antiRollbackState: antiRollback,
             nowUnixSeconds: nowUnixSeconds
         )
-        let activeLease = runtime.registry.activeLease()
+        let active = try alignedActiveGeneration()
+        if let active,
+           active.lease.generation.packageHash.constantTimeEquals(
+               verifiedPackage.packageHash
+           ) {
+            guard active.state.signerKeyID
+                    == verifiedPackage.package.manifest.security.signerKeyID
+            else {
+                throw PatchPackage.Error.activationPersistence(
+                    "active generation signer does not match its package"
+                )
+            }
+            let packageURL = try store.persistVerifiedPackage(
+                packageBytes,
+                packageHash: verifiedPackage.packageHash
+            )
+            return .init(
+                generationLease: active.lease,
+                packageHash: verifiedPackage.packageHash,
+                verifiedPackageURL: packageURL,
+                activatedEntryIndices: active.lease.generation.routes.keys.sorted()
+            )
+        }
+
+        let activeLease = active?.lease
         guard activeLease?.generation.id == expectedActiveID else {
             throw Runtime.ActivationError.staleActiveGeneration(
                 expected: expectedActiveID,
                 actual: activeLease?.generation.id
-            )
-        }
-        let persistentActiveID = try store.activeState()?.generationID
-        guard persistentActiveID == expectedActiveID else {
-            throw PatchPackage.Error.activationPersistence(
-                "memory and persistent active generations disagree"
             )
         }
         if let requiredParent = verifiedPackage.package.manifest.rollback.parentGenerationPackageHash,
@@ -524,6 +547,29 @@ public final class Controller: @unchecked Sendable {
             verifiedPackageURL: url,
             activatedEntryIndices: prepared.activatedEntries
         )
+    }
+
+    private func alignedActiveGeneration() throws -> ActiveGeneration? {
+        let lease = runtime.registry.activeLease()
+        let state = try store.activeState()
+        switch (lease, state) {
+        case (nil, nil):
+            return nil
+        case let (lease?, state?):
+            guard state.generationID == lease.generation.id,
+                  state.packageID == lease.generation.packageID,
+                  state.packageHash.constantTimeEquals(lease.generation.packageHash)
+            else {
+                throw PatchPackage.Error.activationPersistence(
+                    "memory and persistent active generations disagree"
+                )
+            }
+            return .init(lease: lease, state: state)
+        case (.some, nil), (nil, .some):
+            throw PatchPackage.Error.activationPersistence(
+                "memory and persistent active generations disagree"
+            )
+        }
     }
 
     private func prepareGeneration(

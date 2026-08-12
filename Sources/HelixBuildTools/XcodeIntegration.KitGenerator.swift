@@ -333,6 +333,8 @@ public struct KitGenerator: Sendable {
                     - Create Aggregate Target `\($0.actionTargetName)`, use
                       `\(contract.commonConfiguration)` as its base configuration, and run
                       `Profiles/\(contract.profileID)/patch.sh` in its only Run Script phase.
+                      Set `SUPPORTED_PLATFORMS` to `iphoneos iphonesimulator`; the selected
+                      destination must match the SDK of the audited Release baseline.
                     - Share Scheme `\($0.actionSchemeName)` with only that Aggregate Target.
                       Building this scheme compiles, signs, and optionally stages a patch; it
                       does not rebuild or reinstall the App.
