@@ -111,6 +111,8 @@ swift run helix xcode validate --plan HelixXcode.json
    Output 声明为 `$(HELIX_BRIDGE_OBJECT)`。不要把这个 object 或 `$(HELIX_BUILD_ROOT)` 下的任何文件加入 Project Navigator。
 4. App 只链接 Feature framework 与该 profile 的唯一聚合 Runtime。没有 Bridge target，也没有 Bridge framework 需要链接或 embed。
 
+`HelixAppRuntime` 只包含生产热补丁模块；`HelixDevAppRuntime` 才额外带入 Dev Protocol、Live Reload API、传输、激活与 UI 工具。Live Reload API 不再作为独立 package product 发布，也不会通过文档规定的 Release 聚合产品进入生产包。
+
 `Application.xcconfig` 会把隐藏 object 加入 `OTHER_LDFLAGS`，并强制保留 `_hlx_bridge_provider_v1`。Build phase 会从成功的 Feature 编译记录中还原真实参数，在隔离临时目录中编译生成 Bridge，校验 object 的架构与平台，最后原子发布到 DerivedData 的 `HelixBridge.o`。Xcode 不会看到半写入产物。
 
 ## 7. 配置 Scheme 生命周期

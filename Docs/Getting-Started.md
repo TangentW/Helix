@@ -139,6 +139,11 @@ For each profile, follow its generated `.helix/xcode/Integration.md`:
 4. Link the Feature framework and the profile's single aggregate runtime into
    the App. There is no Bridge target or Bridge framework to link or embed.
 
+`HelixAppRuntime` contains only production hot-patch modules.
+`HelixDevAppRuntime` additionally carries the Dev protocol, Live Reload API,
+transport, activation, and UI tooling. The Live Reload API is not a standalone
+package product and cannot enter Release through the documented aggregate.
+
 `Application.xcconfig` adds the hidden object to `OTHER_LDFLAGS` and forces the
 provider symbol `_hlx_bridge_provider_v1` to remain reachable. The build phase
 reconstructs the successful Feature compiler invocation, compiles the generated

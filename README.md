@@ -184,7 +184,7 @@ swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
 ```
 
-The current full SwiftPM baseline contains 455 tests in 73 suites. The recorded
+The current full SwiftPM baseline contains 456 tests in 73 suites. The recorded
 Debug, warnings-as-errors, and optimized Release runs pass. Platform-specific
 fixtures can be run with an available Simulator UDID:
 
@@ -282,9 +282,10 @@ and UI refresh.
 - `Sources/HelixCompiler`, `HelixBuildTools`, and `HelixReleaseTools`: exact
   Swift/SIL processing, Shell construction, Xcode integration, and release
   package building.
-- `Sources/HelixDevProtocol`, `HelixDevTools`, `HelixDevRuntime`, and
-  `HelixLiveReloadAPI`: development sessions, live-artifact generation,
-  activation, and UI reload contracts.
+- `Sources/HelixDevProtocol`, `HelixDevTools`, and `HelixDevRuntime`:
+  development sessions, live-artifact generation, activation, and UI reload.
+  `HelixLiveReloadAPI` is an internal Dev-only contract target shared by that
+  graph; it is neither a standalone product nor part of `HelixAppRuntime`.
 - `Sources/HelixCLIKit`, `HelixCLI`, `HelixBenchmarks`, and
   `HelixBenchmarkCLI`: commands and performance tooling.
 - `Tests`: unit, negative, compiler fixture, integration, Simulator, release

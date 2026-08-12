@@ -39,10 +39,7 @@ struct ReportTests {
             verificationIterationsPerSample: 2,
             verificationSampleCount: 2
         )
-        let report = try Benchmarks.Runner(
-            now: { Date(timeIntervalSince1970: 0) },
-            swiftVersionProvider: { "Swift test toolchain" }
-        ).run(configuration: configuration)
+        let report = try deterministicRunner().run(configuration: configuration)
 
         #expect(report.schemaVersion == Benchmarks.Report.currentSchemaVersion)
         #expect(report.generatedAt == "1970-01-01T00:00:00Z")
@@ -145,10 +142,7 @@ struct ReportTests {
     }
 
     private func quickReport() throws -> Benchmarks.Report {
-        try Benchmarks.Runner(
-            now: { Date(timeIntervalSince1970: 0) },
-            swiftVersionProvider: { "Swift test toolchain" }
-        ).run(
+        try deterministicRunner().run(
             configuration: .init(
                 warmupIterations: 1,
                 iterationsPerSample: 8,
@@ -156,6 +150,18 @@ struct ReportTests {
                 verificationIterationsPerSample: 2,
                 verificationSampleCount: 2
             )
+        )
+    }
+
+    private func deterministicRunner() -> Benchmarks.Runner {
+        var timestamp: UInt64 = 0
+        return Benchmarks.Runner(
+            now: { Date(timeIntervalSince1970: 0) },
+            swiftVersionProvider: { "Swift test toolchain" },
+            monotonicNanoseconds: {
+                defer { timestamp &+= 1_000 }
+                return timestamp
+            }
         )
     }
 }

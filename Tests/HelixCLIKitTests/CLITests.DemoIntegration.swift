@@ -43,10 +43,12 @@ struct DemoIntegration {
 
     @Test("Xcode project keeps Release and Dev runtime graphs isolated")
     func projectGraphIsWorkflowSeparated() throws {
-        let demo = repositoryRoot().appendingPathComponent("Demo", isDirectory: true)
+        let root = repositoryRoot()
+        let demo = root.appendingPathComponent("Demo", isDirectory: true)
         let project = try text(
             demo.appendingPathComponent("HelixDemo.xcodeproj/project.pbxproj")
         )
+        let package = try text(root.appendingPathComponent("Package.swift"))
 
         #expect(project.occurrences(of: "isa = PBXNativeTarget;") == 4)
         #expect(project.occurrences(of: "isa = PBXAggregateTarget;") == 1)
@@ -62,6 +64,27 @@ struct DemoIntegration {
         #expect(!hotApp.contains("HelixDevAppRuntime"))
         #expect(liveApp.contains("710000000000000000000002 /* HelixDevAppRuntime */"))
         #expect(!liveApp.contains("HelixAppRuntime */"))
+
+        let releaseProductStart = try #require(
+            package.range(of: "name: \"HelixAppRuntime\"")
+        )
+        let devProductStart = try #require(
+            package.range(of: "name: \"HelixDevAppRuntime\"")
+        )
+        let firstLeafProduct = try #require(
+            package.range(of: ".library(name: \"HelixCore\"")
+        )
+        let releaseProduct = package[
+            releaseProductStart.lowerBound..<devProductStart.lowerBound
+        ]
+        let devProduct = package[
+            devProductStart.lowerBound..<firstLeafProduct.lowerBound
+        ]
+        #expect(!releaseProduct.contains("HelixLiveReloadAPI"))
+        #expect(devProduct.contains("HelixLiveReloadAPI"))
+        #expect(!package.contains(
+            ".library(name: \"HelixLiveReloadAPI\""
+        ))
 
         #expect(project.contains("HotPatchFeature/Sources/HotPatchFeature.Pricing.swift"))
         #expect(project.contains("LiveReloadFeature/Sources/LiveReloadFeature.Screen.swift"))

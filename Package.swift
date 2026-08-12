@@ -16,7 +16,7 @@ let package = Package(
             targets: [
                 "HelixCore", "HelixBytecode", "HelixInterface", "HelixVerifier",
                 "HelixVM", "HelixRuntimeSupport", "HelixRuntime",
-                "HelixPatch", "HelixLiveReloadAPI",
+                "HelixPatch",
             ]
         ),
         // A dedicated Debug/Dev target links this product instead of combining
@@ -43,7 +43,6 @@ let package = Package(
         .library(name: "HelixDevProtocol", targets: ["HelixDevProtocol"]),
         .library(name: "HelixDevTools", targets: ["HelixDevTools"]),
         .library(name: "HelixDevRuntime", targets: ["HelixDevRuntime"]),
-        .library(name: "HelixLiveReloadAPI", targets: ["HelixLiveReloadAPI"]),
         .executable(name: "helix", targets: ["HelixCLI"]),
         .executable(name: "helix-benchmark", targets: ["HelixBenchmarkCLI"]),
     ],
@@ -74,7 +73,9 @@ let package = Package(
                 "HelixCompiler", "HelixVerifier", "HelixPatch",
             ]
         ),
-        .target(name: "HelixLiveReloadAPI", dependencies: ["HelixCore", "HelixRuntime"]),
+        // Shared only inside the Dev graph. It is intentionally not a
+        // standalone product and must never enter HelixAppRuntime.
+        .target(name: "HelixLiveReloadAPI", dependencies: ["HelixCore"]),
         .target(name: "HelixDevProtocol", dependencies: ["HelixCore", "HelixLiveReloadAPI"]),
         .target(
             name: "HelixBuildTools",

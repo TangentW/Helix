@@ -586,6 +586,20 @@ struct Tooling {
         #expect(report.findings.filter { $0.severity == .critical }.count == 3)
     }
 
+    @Test("Release leakage scanner rejects the Live Reload API module")
+    func releaseLeakageRejectsLiveReloadAPI() {
+        let report = ReleaseLeakage.Scanner().scan(
+            executable: Data("HelixLiveReloadAPI".utf8),
+            infoPlist: nil,
+            loadedImageNames: [
+                "/private/Frameworks/HelixLiveReloadAPI.framework/HelixLiveReloadAPI",
+            ]
+        )
+
+        #expect(!report.passed)
+        #expect(report.findings.map(\.code).sorted() == ["HLXREL001", "HLXREL002"])
+    }
+
     @Test("Release App audit scans every Mach-O and fails on symbolic links")
     func releaseAppBundleAudit() throws {
         let directory = try temporaryDirectory("helix-release-audit")

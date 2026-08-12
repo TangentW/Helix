@@ -14,6 +14,7 @@ public struct Runner {
     }
 
     private let now: () -> Date
+    private let monotonicNanoseconds: () -> UInt64
     private let swiftVersionProvider: () throws -> String
 
     public init(
@@ -21,7 +22,18 @@ public struct Runner {
         swiftVersionProvider: (() throws -> String)? = nil
     ) {
         self.now = now
+        self.monotonicNanoseconds = { DispatchTime.now().uptimeNanoseconds }
         self.swiftVersionProvider = swiftVersionProvider ?? Self.installedSwiftVersion
+    }
+
+    package init(
+        now: @escaping () -> Date,
+        swiftVersionProvider: @escaping () throws -> String,
+        monotonicNanoseconds: @escaping () -> UInt64
+    ) {
+        self.now = now
+        self.monotonicNanoseconds = monotonicNanoseconds
+        self.swiftVersionProvider = swiftVersionProvider
     }
 
     public func run(configuration: Benchmarks.Configuration = .init()) throws -> Benchmarks.Report {
@@ -182,12 +194,12 @@ public struct Runner {
         var reportChecksum: UInt64 = 0
         durations.reserveCapacity(scenario.samples)
         for sample in 0..<scenario.samples {
-            let start = DispatchTime.now().uptimeNanoseconds
+            let start = monotonicNanoseconds()
             let measured = try Self.checksum(
                 iterations: scenario.iterations,
                 operation: scenario.operation
             )
-            let end = DispatchTime.now().uptimeNanoseconds
+            let end = monotonicNanoseconds()
             guard measured == expected else {
                 throw Benchmarks.Error.unexpectedResult(
                     scenario: scenario.name,

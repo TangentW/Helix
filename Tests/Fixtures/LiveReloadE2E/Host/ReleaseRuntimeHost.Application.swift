@@ -1,5 +1,4 @@
 import HelixCore
-import HelixLiveReloadAPI
 import HelixPatch
 import UIKit
 
@@ -8,14 +7,12 @@ enum ReleaseRuntimeHost {}
 extension ReleaseRuntimeHost {
 struct RuntimeSentinel {
     let imageIdentity = Core.RuntimeImageIdentity.current
-    let sourceID = LiveReload.SourceFileID.derive(
-        logicalPath: "ReleaseRuntimeHost.Application.swift"
-    )
+    let sourceDigest = Core.Digest.sha256("ReleaseRuntimeHost.Application.swift")
     let packageVersion = PatchPackage.Metadata.version
 
     var summary: String {
         let identityIsShared = imageIdentity == Core.RuntimeImageIdentity.current
-        return "Helix \(packageVersion) · \(sourceID.rawValue.hex.prefix(8)) · \(identityIsShared)"
+        return "Helix \(packageVersion) · \(sourceDigest.hex.prefix(8)) · \(identityIsShared)"
     }
 }
 }

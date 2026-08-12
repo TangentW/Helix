@@ -35,7 +35,9 @@ Bridge object uses that same runtime image. Adding overlapping leaf products
 can load the same Swift metadata more than once, so Helix rejects that topology
 through the generated `RuntimeImageIdentity` contract. A Release target instead
 links only `HelixAppRuntime`, which excludes Dev transport, dynamic loading, and
-overlay code.
+overlay code. It also excludes the Live Reload API contract module; that target
+is internal to the Dev graph and is not published as a standalone package
+product.
 
 Run the independent production-graph check from the repository root:
 
@@ -45,8 +47,9 @@ Tests/Fixtures/LiveReloadE2E/run-release-audit.sh
 
 It builds `ReleaseRuntimeHost` for the iOS 15 Simulator deployment target,
 links only `HelixAppRuntime`, and runs `helix shell audit-release` across every
-Mach-O and `Info.plist` in the resulting App. The audit rejects Dev runtime or
-protocol images, launch-secret markers, and the Helix Bonjour service.
+Mach-O and `Info.plist` in the resulting App. The audit rejects Dev runtime,
+protocol, or Live Reload API images, launch-secret markers, and the Helix
+Bonjour service.
 
 UIKit-specific runtime tests execute in the Simulator rather than being skipped
 by a macOS `swift test` run:

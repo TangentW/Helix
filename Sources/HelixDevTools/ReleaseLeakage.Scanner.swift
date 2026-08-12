@@ -86,6 +86,7 @@ public struct Scanner: Sendable {
             "HelixDevRuntime",
             "HelixDevProtocol",
             "HelixDevTools",
+            "HelixLiveReloadAPI",
             "DevActivation.Controller",
             "DevProtocol.LiveArtifact",
             "HLX_DEV_",
@@ -96,6 +97,7 @@ public struct Scanner: Sendable {
             "HelixDevRuntime",
             "HelixDevProtocol",
             "HelixDevTools",
+            "HelixLiveReloadAPI",
         ],
         allowedBusinessBonjourServices: Set<String> = []
     ) {
