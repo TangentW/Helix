@@ -13,7 +13,7 @@ struct Service {
     @Test("Service configuration bounds unauthenticated resource use")
     func configurationLimits() {
         #expect(throws: DevSession.ServiceError.invalidConfiguration) {
-            try DevSession.ServiceConfiguration(maximumPendingConnections: 0).validate()
+            try DevSession.ServiceConfiguration(maximumOpenConnections: 0).validate()
         }
         #expect(throws: DevSession.ServiceError.invalidConfiguration) {
             try DevSession.ServiceConfiguration(pairingTimeoutNanoseconds: 99_999_999)
@@ -128,6 +128,111 @@ struct Service {
         await transport.close()
         await service.stop()
     }
+
+    @Test("The same pinned listener serves owner-local Xcode control")
+    func localControl() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-control-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rendezvousStore = HubControl.RendezvousStore(
+            url: directory.appendingPathComponent("Service.json")
+        )
+        let registry = try DevSession.ContextRegistry()
+        let broker = try DevSession.ConnectionBroker(
+            registry: registry,
+            authority: Pairing.Authority()
+        )
+        let sessions = RecordingSessionServer()
+        let service = try DevSession.Service(
+            configuration: .init(advertiseBonjour: false),
+            serverIdentity: NetworkTransport.IdentityFactory.makeServerIdentity(),
+            broker: broker,
+            sessionServer: sessions,
+            controlSecret: Data(repeating: 0xC7, count: 32),
+            rendezvousStore: rendezvousStore
+        )
+        let endpoint = try await service.start()
+        let client = try HubControl.Client(rendezvousStore: rendezvousStore)
+        let first = try await client.reserveAutomaticInvitation()
+        #expect(first.reservation.kind == .automaticXcode)
+        #expect(first.spkiSHA256 == endpoint.spkiSHA256)
+
+        let context = try serviceContext()
+        await #expect(throws: HubControl.Error.self) {
+            _ = try await client.registerAndActivate(
+                invitationID: .init(rawValue: UUID()),
+                context: context
+            )
+        }
+        #expect(await registry.contexts().isEmpty)
+
+        let invitation = try await client.registerAndActivate(
+            invitationID: first.reservation.invitationID,
+            context: context
+        )
+        #expect(invitation.reservation == first.reservation)
+        #expect(invitation.shellIdentity == context.shellIdentity)
+        #expect(await registry.context(shellID: context.shellIdentity.shellID) == context)
+
+        let second = try await client.reserveAutomaticInvitation()
+        var rotated = context
+        rotated.shellIdentity = .init(
+            shellID: .init(rawValue: UUID()),
+            build: context.shellIdentity.build
+        )
+        rotated.registeredAt = context.registeredAt.addingTimeInterval(1)
+        let rotatedInvitation = try await client.registerAndActivate(
+            invitationID: second.reservation.invitationID,
+            context: rotated
+        )
+        #expect(rotatedInvitation.shellIdentity == rotated.shellIdentity)
+        #expect(await registry.context(shellID: context.shellIdentity.shellID) == nil)
+        #expect(await registry.context(shellID: rotated.shellIdentity.shellID) == rotated)
+        #expect(await sessions.removedShells == [context.shellIdentity.shellID])
+
+        let attributes = try FileManager.default.attributesOfItem(
+            atPath: rendezvousStore.url.path
+        )
+        #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        #expect(try rendezvousStore.load().controlSecret == Data(repeating: 0xC7, count: 32))
+        await service.stop()
+        #expect(!FileManager.default.fileExists(atPath: rendezvousStore.url.path))
+    }
+
+    @Test("Control framing is canonical, correlated, and route-versioned")
+    func controlFraming() throws {
+        let request = HubControl.Request(
+            requestID: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
+            command: .reserveAutomaticInvitation,
+            controlSecret: Data(repeating: 0x19, count: 32)
+        )
+        let codec = HubControl.FrameCodec()
+        let frame = try codec.encode(request)
+        #expect(try codec.decodeRequest(frame) == request)
+        #expect(try request.authenticate(with: Data(repeating: 0x19, count: 32)))
+        #expect(!(try request.authenticate(with: Data(repeating: 0x20, count: 32))))
+        #expect(
+            try NetworkTransport.ConnectionRoute(
+                preamble: NetworkTransport.ConnectionRoute.pairing.preamble
+            ) == .pairing
+        )
+        #expect(
+            try NetworkTransport.ConnectionRoute(
+                preamble: NetworkTransport.ConnectionRoute.localControl.preamble
+            ) == .localControl
+        )
+        var noncanonical = frame
+        noncanonical.insert(UInt8(ascii: " "), at: noncanonical.count - 1)
+        #expect(throws: (any Swift.Error).self) {
+            try codec.decodeRequest(noncanonical)
+        }
+    }
 }
 }
 
@@ -135,6 +240,7 @@ private actor RecordingSessionServer: DevSession.SessionServing {
     private(set) var preparedShells: [DevProtocol.ShellID] = []
     private(set) var acceptedPeers: [DevProtocol.PeerID] = []
     private(set) var didStop = false
+    private(set) var removedShells: [DevProtocol.ShellID] = []
     private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
     func prepare(context: DevSession.BuildContext) {
@@ -155,7 +261,7 @@ private actor RecordingSessionServer: DevSession.SessionServing {
 
     func stopAll() { didStop = true }
 
-    func remove(shellID _: DevProtocol.ShellID) {}
+    func remove(shellID: DevProtocol.ShellID) { removedShells.append(shellID) }
 
     func waitForAcceptCount(_ count: Int) async {
         guard acceptedPeers.count < count else { return }
@@ -175,6 +281,7 @@ private func serviceClient(
         expectedSPKIHash: endpoint.spkiSHA256
     )
     try await transport.start()
+    try await transport.send(NetworkTransport.ConnectionRoute.pairing.preamble)
     return transport
 }
 

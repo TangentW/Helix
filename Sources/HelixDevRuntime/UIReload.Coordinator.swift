@@ -10,7 +10,7 @@ public enum UIReload {}
 extension UIReload {
 /// A combined UIKit and SwiftUI refresh result.
 public struct Report: Sendable {
-    /// The protocol-level outcome sent back to the development daemon.
+    /// The protocol-level outcome sent back to the Helix service.
     public var status: DevProtocol.UIReloadStatus
     /// Number of displayed UIKit instances and active SwiftUI boundaries matched.
     public var matchedTargetCount: Int
@@ -83,7 +83,7 @@ public final class Coordinator {
         self.reportHandler = reportHandler
     }
 
-    /// Applies daemon-provided reload hints after code activation.
+    /// Applies service-provided reload hints after code activation.
     ///
     /// Hints are routed to UIKit when a displayed instance matches and to
     /// SwiftUI when an active boundary matches. A type may be handled by both.
@@ -245,7 +245,7 @@ public final class Coordinator {
         }
     }
 
-    /// Returns the adapter used for daemon or debug-overlay manual refresh requests.
+    /// Returns the adapter used for service or debug-overlay manual refresh requests.
     public func manualReloadHandler() -> DevRuntimeSession.Controller.ManualReloadHandler {
         { [weak self] context in
             guard let self else {

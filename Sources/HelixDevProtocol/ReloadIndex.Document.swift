@@ -89,7 +89,7 @@ public struct FactoryDescriptor: Codable, Hashable, Sendable {
 
 /// Build-time metadata used to turn a saved function body into a native
 /// Dynamic Replacement declaration. The descriptor is emitted from the typed
-/// source index; the development daemon never guesses a declaration by name.
+/// source index; the Helix service never guesses a declaration by name.
 public struct NativeReplacement: Codable, Hashable, Sendable {
     public var functionKey: Core.FunctionKey
     public var sourceFileID: LiveReload.SourceFileID

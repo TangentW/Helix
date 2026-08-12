@@ -86,7 +86,20 @@ public actor ContextRegistry {
         }
         if let existingShell = shellByBuild[context.shellIdentity.build],
            existingShell != shellID {
-            throw DevSession.ContextError.buildIdentityCollision
+            guard let existing = contextsByShell[existingShell],
+                  existing.workspacePathHash == context.workspacePathHash,
+                  existing.workspacePath == context.workspacePath,
+                  existing.scheme == context.scheme,
+                  existing.buildConfiguration == context.buildConfiguration,
+                  existing.moduleName == context.moduleName,
+                  context.registeredAt >= existing.registeredAt
+            else {
+                throw DevSession.ContextError.buildIdentityCollision
+            }
+            // A tool upgrade may revise the deterministic Shell-ID domain.
+            // Rotating an otherwise identical exact-build context is safe and
+            // keeps the peer-build lookup single-valued.
+            contextsByShell[existingShell] = nil
         }
         contextsByShell[shellID] = context
         shellByBuild[context.shellIdentity.build] = shellID
@@ -177,6 +190,34 @@ public actor ContextRegistry {
             .map(\.shellIdentity.shellID)
         doomed.forEach { _ = remove(shellID: $0) }
         return doomed.count
+    }
+
+    /// Restores a previously validated snapshot after a larger transaction
+    /// fails. The complete index is replaced so retention evictions are also
+    /// rolled back, not only the newly inserted Shell.
+    func restoreTransactionSnapshot(
+        _ contexts: [DevSession.BuildContext],
+        persistingTo store: DevSession.ContextStore?
+    ) throws {
+        var restoredByShell: [DevProtocol.ShellID: DevSession.BuildContext] = [:]
+        var restoredByBuild: [DevProtocol.PeerBuildIdentity: DevProtocol.ShellID] = [:]
+        for context in contexts.sorted(by: Self.oldestFirst) {
+            try Self.insert(
+                context,
+                contextsByShell: &restoredByShell,
+                shellByBuild: &restoredByBuild
+            )
+        }
+        Self.enforceLimits(
+            contextsByShell: &restoredByShell,
+            shellByBuild: &restoredByBuild,
+            limits: limits
+        )
+        if let store {
+            try store.save(restoredByShell.values.sorted(by: Self.newestFirst))
+        }
+        contextsByShell = restoredByShell
+        shellByBuild = restoredByBuild
     }
 
     private static func insert(

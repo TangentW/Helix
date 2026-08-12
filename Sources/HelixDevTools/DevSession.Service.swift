@@ -11,25 +11,25 @@ public struct ServiceConfiguration: Hashable, Sendable {
     public var listenPort: UInt16
     /// Whether the single listener is advertised over Bonjour.
     public var advertiseBonjour: Bool
-    /// Maximum TLS connections allowed to wait for their first pairing frame.
-    public var maximumPendingConnections: Int
+    /// Maximum open TLS connections, including App pairing and local control.
+    public var maximumOpenConnections: Int
     /// Deadline for receiving the first pairing frame.
     public var pairingTimeoutNanoseconds: UInt64
 
     public init(
         listenPort: UInt16 = 0,
         advertiseBonjour: Bool = true,
-        maximumPendingConnections: Int = 64,
+        maximumOpenConnections: Int = 64,
         pairingTimeoutNanoseconds: UInt64 = 10_000_000_000
     ) {
         self.listenPort = listenPort
         self.advertiseBonjour = advertiseBonjour
-        self.maximumPendingConnections = maximumPendingConnections
+        self.maximumOpenConnections = maximumOpenConnections
         self.pairingTimeoutNanoseconds = pairingTimeoutNanoseconds
     }
 
     public func validate() throws {
-        guard (1...1_024).contains(maximumPendingConnections),
+        guard (1...1_024).contains(maximumOpenConnections),
               (100_000_000...60_000_000_000).contains(pairingTimeoutNanoseconds)
         else {
             throw DevSession.ServiceError.invalidConfiguration
@@ -72,6 +72,7 @@ public struct ServiceSnapshot: Hashable, Sendable {
 /// Events suitable for the CLI, Hub UI, and structured diagnostics.
 public enum ServiceEvent: Sendable {
     case listening(DevSession.ServiceEndpoint)
+    case localControlRequest
     case pairingStarted
     case paired(DevProtocol.ShellID, DevProtocol.PeerID)
     case pairingRejected(Pairing.Rejection)
@@ -107,6 +108,8 @@ public actor Service {
     private let broker: DevSession.ConnectionBroker
     private let sessionServer: any DevSession.SessionServing
     private let contextStore: DevSession.ContextStore?
+    private let controlSecret: Data?
+    private let rendezvousStore: HubControl.RendezvousStore?
     private let eventHandler: EventHandler
     private var listener: NetworkTransport.Listener?
     private var endpoint: DevSession.ServiceEndpoint?
@@ -114,6 +117,8 @@ public actor Service {
     private var connections: [UUID: NetworkTransport.ByteTransport] = [:]
     private var pendingPairings: Set<UUID> = []
     private var stopWaiters: [CheckedContinuation<Void, Never>] = []
+    private var contextMutationActive = false
+    private var contextMutationWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Creates a service from reusable core components.
     ///
@@ -124,14 +129,23 @@ public actor Service {
         broker: DevSession.ConnectionBroker,
         sessionServer: any DevSession.SessionServing,
         contextStore: DevSession.ContextStore? = nil,
+        controlSecret: Data? = nil,
+        rendezvousStore: HubControl.RendezvousStore? = nil,
         eventHandler: @escaping EventHandler = { _ in }
     ) throws {
         try configuration.validate()
+        guard (controlSecret == nil) == (rendezvousStore == nil),
+              controlSecret == nil || controlSecret?.count == 32
+        else {
+            throw DevSession.ServiceError.invalidConfiguration
+        }
         self.configuration = configuration
         self.serverIdentity = serverIdentity
         self.broker = broker
         self.sessionServer = sessionServer
         self.contextStore = contextStore
+        self.controlSecret = controlSecret
+        self.rendezvousStore = rendezvousStore
         self.eventHandler = eventHandler
     }
 
@@ -143,6 +157,7 @@ public actor Service {
     ) throws -> DevSession.Service {
         let identityStore = try NetworkTransport.HostIdentityStore.applicationSupportStore()
         let contextStore = try DevSession.ContextStore.applicationSupportStore()
+        let rendezvousStore = try HubControl.RendezvousStore.applicationSupportStore()
         let registry = try DevSession.ContextRegistry(contexts: contextStore.load())
         let authority = try Pairing.Authority(configuration: authorityConfiguration)
         let broker = DevSession.ConnectionBroker(registry: registry, authority: authority)
@@ -155,6 +170,8 @@ public actor Service {
             broker: broker,
             sessionServer: sessionServer,
             contextStore: contextStore,
+            controlSecret: try DevProtocol.SecureRandom.bytes(count: 32),
+            rendezvousStore: rendezvousStore,
             eventHandler: eventHandler
         )
     }
@@ -200,12 +217,23 @@ public actor Service {
                 bonjourAdvertised: configuration.advertiseBonjour
             )
             self.endpoint = endpoint
+            if let controlSecret, let rendezvousStore {
+                try rendezvousStore.publish(
+                    .init(
+                        processIdentifier: ProcessInfo.processInfo.processIdentifier,
+                        port: endpoint.port,
+                        spkiSHA256: endpoint.spkiSHA256,
+                        controlSecret: controlSecret
+                    )
+                )
+            }
             state = .running
             await eventHandler(.listening(endpoint))
             return endpoint
         } catch {
             listener.cancel()
             self.listener = nil
+            rendezvousStore?.release()
             endpoint = nil
             state = .stopped
             throw error
@@ -231,9 +259,16 @@ public actor Service {
     /// Stops discovery, unauthenticated sockets, and every active Shell host.
     public func stop() async {
         guard state != .stopped, state != .stopping else { return }
+        await acquireContextMutation()
+        guard state != .stopped, state != .stopping else {
+            releaseContextMutation()
+            return
+        }
         state = .stopping
+        releaseContextMutation()
         listener?.cancel()
         listener = nil
+        rendezvousStore?.release()
         endpoint = nil
         let transports = Array(connections.values)
         connections.removeAll()
@@ -253,6 +288,11 @@ public actor Service {
     public func registerBuildContext(
         _ context: DevSession.BuildContext
     ) async throws -> Bool {
+        guard state == .running else { throw DevSession.ServiceError.notRunning }
+        await acquireContextMutation()
+        defer { releaseContextMutation() }
+        guard state == .running else { throw DevSession.ServiceError.notRunning }
+        let replaced = await broker.registry.resolve(context.shellIdentity.build)
         let changed: Bool
         if let contextStore {
             changed = try await broker.registry.register(
@@ -262,7 +302,18 @@ public actor Service {
         } else {
             changed = try await broker.registry.register(context)
         }
-        if changed { await eventHandler(.contextRegistered(context)) }
+        guard await broker.registry.resolve(context.shellIdentity.build)?
+            .shellIdentity.shellID == context.shellIdentity.shellID
+        else { throw DevSession.ContextError.buildIdentityCollision }
+        if changed {
+            if let replaced,
+               replaced.shellIdentity.shellID != context.shellIdentity.shellID {
+                await broker.authority.revoke(shellID: replaced.shellIdentity.shellID)
+                await sessionServer.remove(shellID: replaced.shellIdentity.shellID)
+                await eventHandler(.contextRemoved(replaced.shellIdentity.shellID))
+            }
+            await eventHandler(.contextRegistered(context))
+        }
         return changed
     }
 
@@ -271,6 +322,10 @@ public actor Service {
     public func removeBuildContext(
         shellID: DevProtocol.ShellID
     ) async throws -> DevSession.BuildContext? {
+        guard state == .running else { throw DevSession.ServiceError.notRunning }
+        await acquireContextMutation()
+        defer { releaseContextMutation() }
+        guard state == .running else { throw DevSession.ServiceError.notRunning }
         let removed: DevSession.BuildContext?
         if let contextStore {
             removed = try await broker.registry.remove(
@@ -300,9 +355,16 @@ public actor Service {
         workspacePathHash: Core.Digest? = nil
     ) async throws -> DevSession.ManualInvitation {
         guard state == .running else { throw DevSession.ServiceError.notRunning }
-        return try await broker.createManualInvitation(
+        let invitation = try await broker.createManualInvitation(
             workspacePathHash: workspacePathHash
         )
+        guard state == .running else {
+            await broker.cancelManualInvitation(
+                invitationID: invitation.reservation.invitationID
+            )
+            throw DevSession.ServiceError.notRunning
+        }
+        return invitation
     }
 
     /// Cancels a code currently displayed by Helix Hub.
@@ -320,7 +382,14 @@ public actor Service {
     /// Reserves the one-time code embedded during an Xcode build.
     public func reserveAutomaticInvitation() async throws -> Pairing.Reservation {
         guard state == .running else { throw DevSession.ServiceError.notRunning }
-        return try await broker.reserveAutomaticInvitation()
+        let reservation = try await broker.reserveAutomaticInvitation()
+        guard state == .running else {
+            await broker.authority.invalidate(
+                invitationID: reservation.invitationID
+            )
+            throw DevSession.ServiceError.notRunning
+        }
+        return reservation
     }
 
     /// Imports a reservation made by another same-user build helper.
@@ -343,9 +412,77 @@ public actor Service {
         )
     }
 
+    /// Registers the final Shell and activates its pre-link reservation as one
+    /// control-plane operation. A failed activation rolls back the new context.
+    public func registerAndActivateAutomaticInvitation(
+        invitationID: DevProtocol.InvitationID,
+        context: DevSession.BuildContext
+    ) async throws -> Pairing.Invitation {
+        guard state == .running else { throw DevSession.ServiceError.notRunning }
+        await acquireContextMutation()
+        defer { releaseContextMutation() }
+        guard state == .running else { throw DevSession.ServiceError.notRunning }
+        let snapshot = await broker.registry.contexts()
+        let replaced = await broker.registry.resolve(context.shellIdentity.build)
+        let changed: Bool
+        if let contextStore {
+            changed = try await broker.registry.register(
+                context,
+                persistingTo: contextStore
+            )
+        } else {
+            changed = try await broker.registry.register(context)
+        }
+        do {
+            guard await broker.registry.resolve(context.shellIdentity.build)?
+                .shellIdentity.shellID == context.shellIdentity.shellID
+            else { throw DevSession.ContextError.buildIdentityCollision }
+            let invitation = try await broker.activateAutomaticInvitation(
+                invitationID: invitationID,
+                shellID: context.shellIdentity.shellID
+            )
+            if changed {
+                if let replaced,
+                   replaced.shellIdentity.shellID != context.shellIdentity.shellID {
+                    await broker.authority.revoke(shellID: replaced.shellIdentity.shellID)
+                    await sessionServer.remove(shellID: replaced.shellIdentity.shellID)
+                    await eventHandler(.contextRemoved(replaced.shellIdentity.shellID))
+                }
+                await eventHandler(.contextRegistered(context))
+            }
+            return invitation
+        } catch {
+            if changed {
+                try await broker.registry.restoreTransactionSnapshot(
+                    snapshot,
+                    persistingTo: contextStore
+                )
+            }
+            throw error
+        }
+    }
+
+    private func acquireContextMutation() async {
+        if !contextMutationActive {
+            contextMutationActive = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            contextMutationWaiters.append(continuation)
+        }
+    }
+
+    private func releaseContextMutation() {
+        if contextMutationWaiters.isEmpty {
+            contextMutationActive = false
+        } else {
+            contextMutationWaiters.removeFirst().resume()
+        }
+    }
+
     private func handle(_ transport: NetworkTransport.ByteTransport) async {
         guard state == .running,
-              pendingPairings.count < configuration.maximumPendingConnections
+              connections.count < configuration.maximumOpenConnections
         else {
             await transport.close()
             return
@@ -353,11 +490,38 @@ public actor Service {
         let connectionID = UUID()
         connections[connectionID] = transport
         pendingPairings.insert(connectionID)
-        await eventHandler(.pairingStarted)
+        defer {
+            connections[connectionID] = nil
+            pendingPairings.remove(connectionID)
+        }
+
+        do {
+            let route = try await Self.receiveConnectionRoute(
+                from: transport,
+                timeoutNanoseconds: configuration.pairingTimeoutNanoseconds
+            )
+            switch route {
+            case .pairing:
+                await eventHandler(.pairingStarted)
+                try await handlePairing(transport, connectionID: connectionID)
+            case .localControl:
+                pendingPairings.remove(connectionID)
+                try await handleLocalControl(transport)
+            }
+        } catch {
+            // Pairing reports its own bounded rejection. An invalid local
+            // control credential is intentionally closed without an oracle.
+        }
+        await transport.close()
+    }
+
+    private func handlePairing(
+        _ transport: NetworkTransport.ByteTransport,
+        connectionID: UUID
+    ) async throws {
         let channel = Pairing.Channel(transport: transport)
         var transitionedToSession = false
         var ungrantedLeaseID: DevProtocol.LeaseID?
-
         do {
             let exporter = try transport.tlsExporterHash()
             let message = try await Self.receivePairingMessage(
@@ -433,7 +597,6 @@ public actor Service {
                     detail: DevSession.ServiceError.unexpectedPairingMessage.description
                 )
             }
-
             await eventHandler(
                 .paired(
                     authorization.context.shellIdentity.shellID,
@@ -453,11 +616,102 @@ public actor Service {
                 try? await channel.send(.rejected(rejection))
                 await eventHandler(.pairingRejected(rejection))
             }
+            throw error
         }
+    }
 
-        connections[connectionID] = nil
-        pendingPairings.remove(connectionID)
-        await transport.close()
+    private func handleLocalControl(
+        _ transport: NetworkTransport.ByteTransport
+    ) async throws {
+        guard transport.isLoopbackPeer, let controlSecret else {
+            throw HubControl.Error.invalidCredential
+        }
+        let channel = HubControl.Channel(transport: transport)
+        let request = try await Self.receiveControlRequest(
+            from: channel,
+            timeoutNanoseconds: configuration.pairingTimeoutNanoseconds
+        )
+        guard try request.authenticate(with: controlSecret) else {
+            throw HubControl.Error.invalidCredential
+        }
+        await eventHandler(.localControlRequest)
+        do {
+            let value: HubControl.Success
+            switch request.command {
+            case .reserveAutomaticInvitation:
+                value = .automaticInvitationReserved(
+                    try await reserveAutomaticInvitation()
+                )
+            case let .registerAndActivate(invitationID, context):
+                value = .automaticInvitationActivated(
+                    try await registerAndActivateAutomaticInvitation(
+                        invitationID: invitationID,
+                        context: context
+                    )
+                )
+            }
+            try await channel.send(
+                .success(requestID: request.requestID, value: value)
+            )
+        } catch {
+            try await channel.send(
+                .failure(
+                    requestID: request.requestID,
+                    failure: .init(
+                        code: "HLXHUB001",
+                        detail: Self.boundedDetail(String(describing: error))
+                    )
+                )
+            )
+        }
+    }
+
+    private static func receiveConnectionRoute(
+        from transport: NetworkTransport.ByteTransport,
+        timeoutNanoseconds: UInt64
+    ) async throws -> NetworkTransport.ConnectionRoute {
+        try await withThrowingTaskGroup(
+            of: NetworkTransport.ConnectionRoute.self
+        ) { group in
+            group.addTask {
+                try .init(
+                    preamble: await transport.receiveExactly(
+                        NetworkTransport.ConnectionRoute.preambleByteCount
+                    )
+                )
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                try Task.checkCancellation()
+                await transport.close()
+                throw DevProtocol.Error.sessionTimedOut
+            }
+            defer { group.cancelAll() }
+            guard let route = try await group.next() else {
+                throw DevProtocol.Error.truncatedFrame
+            }
+            return route
+        }
+    }
+
+    private static func receiveControlRequest(
+        from channel: HubControl.Channel<NetworkTransport.ByteTransport>,
+        timeoutNanoseconds: UInt64
+    ) async throws -> HubControl.Request {
+        try await withThrowingTaskGroup(of: HubControl.Request.self) { group in
+            group.addTask { try await channel.receiveRequest() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                try Task.checkCancellation()
+                await channel.close()
+                throw DevProtocol.Error.sessionTimedOut
+            }
+            defer { group.cancelAll() }
+            guard let request = try await group.next() else {
+                throw DevProtocol.Error.truncatedFrame
+            }
+            return request
+        }
     }
 
     private static func receivePairingMessage(

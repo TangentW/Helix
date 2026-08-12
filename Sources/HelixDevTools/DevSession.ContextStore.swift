@@ -34,17 +34,20 @@ public struct ContextStore: Sendable {
 
     /// Loads and validates a snapshot, or returns an empty list when absent.
     public func load() throws -> [DevSession.BuildContext] {
-        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        guard (attributes[.type] as? FileAttributeType) == .typeRegular,
-              (attributes[.size] as? NSNumber)?.intValue ?? Int.max
-                <= Self.maximumDocumentBytes
-        else {
+        let data: Data
+        do {
+            data = try SecureStorage.OwnerFile.read(
+                from: url,
+                maximumBytes: Self.maximumDocumentBytes
+            )
+        } catch SecureStorage.OwnerFile.Error.unavailable {
+            return []
+        } catch SecureStorage.OwnerFile.Error.tooLarge {
             throw DevSession.ContextError.documentTooLarge
-        }
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        guard data.count <= Self.maximumDocumentBytes else {
-            throw DevSession.ContextError.documentTooLarge
+        } catch {
+            throw DevSession.ContextError.invalidDocument(
+                "the context store must be an owner-only regular file"
+            )
         }
         do {
             let document = try JSONDecoder().decode(Document.self, from: data)
@@ -65,17 +68,17 @@ public struct ContextStore: Sendable {
         guard data.count <= Self.maximumDocumentBytes else {
             throw DevSession.ContextError.documentTooLarge
         }
-        let directory = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try data.write(to: url, options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: url.path
-        )
+        do {
+            try SecureStorage.OwnerFile.write(
+                data,
+                to: url,
+                maximumBytes: Self.maximumDocumentBytes
+            )
+        } catch {
+            throw DevSession.ContextError.invalidDocument(
+                "cannot atomically persist the owner-only context store"
+            )
+        }
     }
 
     private struct Document: Codable, Sendable {

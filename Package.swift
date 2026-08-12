@@ -26,7 +26,7 @@ let package = Package(
             targets: [
                 "HelixCore", "HelixBytecode", "HelixInterface", "HelixVerifier",
                 "HelixVM", "HelixRuntimeSupport", "HelixRuntime", "HelixPatch",
-                "HelixLiveReloadAPI", "HelixDevProtocol", "HelixDevRuntimeProbe",
+                "HelixLiveReloadAPI", "HelixDevProtocol",
                 "HelixDevRuntime",
             ]
         ),
@@ -95,10 +95,9 @@ let package = Package(
             name: "HelixDevRuntime",
             dependencies: [
                 "HelixCore", "HelixBytecode", "HelixVerifier", "HelixVM", "HelixRuntime",
-                "HelixDevProtocol", "HelixLiveReloadAPI", "HelixDevRuntimeProbe",
+                "HelixDevProtocol", "HelixLiveReloadAPI",
             ]
         ),
-        .target(name: "HelixDevRuntimeProbe"),
         .target(
             name: "HelixBenchmarks",
             dependencies: [

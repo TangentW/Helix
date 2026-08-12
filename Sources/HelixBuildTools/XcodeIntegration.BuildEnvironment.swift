@@ -20,12 +20,6 @@ public struct BuildEnvironment: Hashable, Sendable {
     public var compilerURL: URL
     public var optimization: String
     public var semanticArguments: [String]
-    /// Optional Mac address used when Bonjour discovery is unavailable.
-    ///
-    /// The value comes from `HELIX_DEVICE_HOST` and is injected only into
-    /// physical-device launches. Leaving it unset keeps Bonjour discovery.
-    public var deviceHost: String?
-
     public var shellOutputURL: URL {
         profileOutputURL.appendingPathComponent("Shell", isDirectory: true)
     }
@@ -220,7 +214,6 @@ public struct EnvironmentResolver: Sendable {
         let semanticArguments = try requireFeatureCompilerSettings
             ? semanticArguments(variables: variables)
             : []
-        let deviceHost = try deviceHost(platform: platform, variables: variables)
         let invocation = InterfaceArchive.FrontendInvocation(
             moduleName: feature.moduleName,
             targetTriple: "\(architecture)-apple-ios\(minimumOS)"
@@ -248,8 +241,7 @@ public struct EnvironmentResolver: Sendable {
             buildNumber: buildNumber,
             compilerURL: compiler,
             optimization: optimization,
-            semanticArguments: semanticArguments,
-            deviceHost: deviceHost
+            semanticArguments: semanticArguments
         )
         let configurationURL = xcodeSourceRoot.appendingPathComponent(
             feature.patchConfigurationPath
@@ -450,30 +442,6 @@ public struct EnvironmentResolver: Sendable {
         in variables: [String: String]
     ) -> String? {
         variables[name].flatMap { $0.isEmpty ? nil : $0 }
-    }
-
-    private func deviceHost(
-        platform: String,
-        variables: [String: String]
-    ) throws -> String? {
-        guard let value = nonempty("HELIX_DEVICE_HOST", in: variables) else {
-            return nil
-        }
-        guard platform == "iphoneos",
-              value.utf8.count <= 255,
-              value.utf8.allSatisfy({ byte in
-                  (48...57).contains(byte)
-                      || (65...90).contains(byte)
-                      || (97...122).contains(byte)
-                      || [45, 46, 58, 95].contains(byte)
-              })
-        else {
-            throw XcodeIntegration.EnvironmentError.invalid(
-                name: "HELIX_DEVICE_HOST",
-                value: value
-            )
-        }
-        return value
     }
 
     private func matchIfPresent(

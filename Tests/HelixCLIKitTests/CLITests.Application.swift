@@ -26,14 +26,14 @@ struct Application {
         #expect(failure.standardError == "error: unknown command unknown\n")
     }
 
-    @Test("Dev commands expose preparation, validation, and the asynchronous daemon")
+    @Test("Dev build commands and the persistent Hub service have separate entry points")
     func devHelp() async {
         let application = CLI.Application()
         let group = application.run(["dev", "--help"])
         #expect(group.exitCode == 0)
         #expect(group.standardOutput.contains("prepare"))
         #expect(group.standardOutput.contains("validate"))
-        #expect(group.standardOutput.contains("run"))
+        #expect(!group.standardOutput.contains("run"))
 
         let preparation = application.run(["dev", "prepare", "--help"])
         #expect(preparation.exitCode == 0)
@@ -45,9 +45,13 @@ struct Application {
         #expect(validation.exitCode == 0)
         #expect(validation.standardOutput.contains("--config"))
 
-        let daemon = await application.runAsync(["dev", "run", "--help"])
-        #expect(daemon.exitCode == 0)
-        #expect(daemon.standardOutput.contains("Control-C"))
+        let hub = application.run(["hub", "--help"])
+        #expect(hub.exitCode == 0)
+        #expect(hub.standardOutput.contains("persistent authenticated Helix service"))
+
+        let service = await application.runAsync(["hub", "run", "--help"])
+        #expect(service.exitCode == 0)
+        #expect(service.standardOutput.contains("single-listener service"))
     }
 
     @Test("Rejected live activation prints the App diagnostic")
@@ -305,13 +309,13 @@ struct Application {
             atPath: output.appendingPathComponent("IntegrationManifest.json").path
         ))
         #expect(FileManager.default.fileExists(
-            atPath: output.appendingPathComponent("Profiles/live/live-start.sh").path
+            atPath: output.appendingPathComponent("Profiles/live/live-register.sh").path
         ))
         #expect(FileManager.default.fileExists(
             atPath: output.appendingPathComponent("Profiles/live/bridge.sh").path
         ))
         let scriptAttributes = try FileManager.default.attributesOfItem(
-            atPath: output.appendingPathComponent("Profiles/live/live-start.sh").path
+            atPath: output.appendingPathComponent("Profiles/live/live-register.sh").path
         )
         #expect((scriptAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o755)
 
@@ -335,7 +339,7 @@ struct Application {
     }
 
     @Test("Xcode prepare keeps Production explicit and manages the Debug calling surface")
-    func xcodePreparePhase() throws {
+    func xcodePreparePhase() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         try FileManager.default.createDirectory(
@@ -452,9 +456,10 @@ struct Application {
         ]
         let application = CLI.Application(
             currentDirectoryURL: directory,
-            environment: environment
+            environment: environment,
+            hubControlClient: StubHubControlClient()
         )
-        let result = application.run([
+        let result = await application.runAsync([
             "xcode", "phase",
             "--plan", generatedPlanURL.path,
             "--profile", "patch",
@@ -501,10 +506,11 @@ struct Application {
         liveEnvironment["HELIX_PROFILE_ID"] = "live"
         liveEnvironment["HELIX_WORKFLOW"] = "liveReload"
         liveEnvironment["HELIX_RUNTIME_PRODUCT"] = "HelixDevAppRuntime"
-        let liveResult = CLI.Application(
+        let liveResult = await CLI.Application(
             currentDirectoryURL: directory,
-            environment: liveEnvironment
-        ).run([
+            environment: liveEnvironment,
+            hubControlClient: StubHubControlClient()
+        ).runAsync([
             "xcode", "phase",
             "--plan", generatedPlanURL.path,
             "--profile", "live",
@@ -515,6 +521,24 @@ struct Application {
             "HelixGenerated/live/Shell",
             isDirectory: true
         )
+        let reservationURL = liveShell.appendingPathComponent(
+            XcodeIntegration.HubReservationDocument.relativePath
+        )
+        let reservationAttributes = try FileManager.default.attributesOfItem(
+            atPath: reservationURL.path
+        )
+        #expect(
+            (reservationAttributes[.posixPermissions] as? NSNumber)?.intValue
+                == 0o600
+        )
+        let contract = try String(
+            contentsOf: liveShell.appendingPathComponent(
+                "Generated/FeatureBridge.DevBuildContract.swift"
+            ),
+            encoding: .utf8
+        )
+        #expect(contract.contains("@_cdecl(\"hlx_dev_hub_contract_v1\")"))
+        #expect(contract.contains("\"AB23\""))
         let liveReceipt = try ShellBuildReceipt.Codec.decode(
             Data(contentsOf: liveShell.appendingPathComponent("ShellBuildReceipt.json"))
         )
@@ -592,4 +616,32 @@ struct Application {
         )
     }
 }
+}
+
+private struct StubHubControlClient: HubControl.ClientProtocol {
+    func reserveAutomaticInvitation() async throws -> (
+        reservation: Pairing.Reservation,
+        spkiSHA256: Core.Digest
+    ) {
+        (
+            .init(
+                invitationID: .init(
+                    rawValue: UUID(
+                        uuidString: "11111111-2222-3333-4444-555555555555"
+                    )!
+                ),
+                code: try Pairing.Code("AB23"),
+                kind: .automaticXcode,
+                reservedAt: Date(timeIntervalSinceReferenceDate: 1_000)
+            ),
+            .sha256("stub Hub Host Identity")
+        )
+    }
+
+    func registerAndActivate(
+        invitationID _: DevProtocol.InvitationID,
+        context _: DevSession.BuildContext
+    ) async throws -> Pairing.Invitation {
+        throw HubControl.Error.invalidMessage
+    }
 }

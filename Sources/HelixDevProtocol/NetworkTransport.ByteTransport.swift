@@ -174,6 +174,25 @@ public final class ByteTransport: DevProtocol.ByteTransport, @unchecked Sendable
         }
     }
 
+    /// Whether this connection terminates on this Mac.
+    ///
+    /// Local control credentials are accepted only from loopback. App pairing
+    /// remains available through Bonjour and peer-to-peer interfaces.
+    public var isLoopbackPeer: Bool {
+        guard case let .hostPort(host, _) = connection.endpoint else { return false }
+        switch host {
+        case let .ipv4(address):
+            return address == .loopback
+        case let .ipv6(address):
+            return address == .loopback
+        case let .name(name, _):
+            let normalized = name.lowercased().trimmingCharacters(in: .init(charactersIn: "."))
+            return normalized == "localhost"
+        @unknown default:
+            return false
+        }
+    }
+
     private func receive(maximumLength: Int) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             connection.receive(

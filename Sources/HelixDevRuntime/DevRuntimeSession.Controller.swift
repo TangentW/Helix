@@ -7,13 +7,13 @@ import HelixLiveReloadAPI
 public enum DevRuntimeSession {}
 
 extension DevRuntimeSession {
-/// Event emitted while one authenticated daemon connection is active.
+/// Event emitted while one authenticated Helix service connection is active.
 public enum Event: Hashable, Sendable {
     /// Mutual session authentication completed successfully.
     case authenticated
-    /// The daemon started compiling a source revision.
+    /// The Helix service started compiling a source revision.
     case compileStarted(DevProtocol.SourceRevision)
-    /// The daemon reported compiler or compatibility diagnostics.
+    /// The Helix service reported compiler or compatibility diagnostics.
     case diagnostics([DevProtocol.Diagnostic])
     /// The App accepted a payload offer and is ready for chunks.
     case transferAccepted(DevProtocol.SourceRevision, DevProtocol.GenerationID)

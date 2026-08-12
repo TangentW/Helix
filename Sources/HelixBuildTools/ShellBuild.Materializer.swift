@@ -127,7 +127,8 @@ public struct Materializer: Sendable {
 
     public func materialize(
         receipt: ShellBuildReceipt.Document,
-        sourceRoot: URL
+        sourceRoot: URL,
+        hubBinding: ShellBuild.HubBinding? = nil
     ) throws -> ShellBuild.Output {
         try limits.validate()
         try receipt.validate()
@@ -230,7 +231,8 @@ public struct Materializer: Sendable {
         )
         let devContract = try ShellBuild.DevContractGenerator().generate(
             archive: indexed.archive,
-            reloadIndexHash: reloadIndexHash
+            reloadIndexHash: reloadIndexHash,
+            hubBinding: hubBinding
         )
         guard bridge.sourceFiles.updateValue(
             devContract.contents,

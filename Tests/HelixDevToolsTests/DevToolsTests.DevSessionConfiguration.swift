@@ -8,12 +8,8 @@ import HelixInterface
 import HelixLiveReloadAPI
 import Testing
 
-#if canImport(Network) && canImport(Security)
-import Network
-#endif
-
 extension DevToolsTests {
-@Suite("Dev Session configuration and daemon")
+@Suite("Dev Session configuration")
 struct DevSessionConfiguration {
     @Test("Configuration rejects unknown fields and resolves paths from its own directory")
     func strictConfiguration() throws {
@@ -52,181 +48,8 @@ struct DevSessionConfiguration {
         }
     }
 
-    #if canImport(Network) && canImport(Security) && os(macOS)
-    @Test("Daemon preserves one reconnect grace for authenticated App replacement")
-    func daemonHandshake() async throws {
-        let fixture = try DaemonFixture()
-        defer { fixture.remove() }
-        let events = DaemonEventRecorder()
-        let daemon = try DevSession.Daemon(
-            configurationURL: fixture.configurationURL,
-            disconnectPolicy: .stopAfterGracePeriod(nanoseconds: 500_000_000),
-            eventHandler: { await events.record($0) }
-        )
-        do {
-            let bootstrap = try await daemon.start()
-            await #expect(throws: DevSession.DaemonError.alreadyRunning) {
-                _ = try await daemon.start()
-            }
-            let simulator = try #require(bootstrap.environment(for: .simulator))
-            let device = bootstrap.environment(for: .device)
-            let directDevice = try #require(
-                bootstrap.environment(for: .device, deviceHost: "192.0.2.42")
-            )
-            #expect(simulator["HLX_DEV_HOST"] == "127.0.0.1")
-            #expect(simulator["HLX_DEV_PORT"] == String(bootstrap.port))
-            #expect(device == nil)
-            #expect(directDevice["HLX_DEV_HOST"] == "192.0.2.42")
-            #expect(directDevice["HLX_DEV_PORT"] == String(bootstrap.port))
-            #expect(simulator["HLX_DEV_SESSION_SECRET"]?.count == 64)
-
-            let first = try await connectApp(
-                bootstrap: bootstrap,
-                identity: fixture.identity,
-                nonceByte: 0x5a
-            )
-            for _ in 0..<200 where await events.connectCount < 1 {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-            #expect(await events.connectCount == 1)
-            await first.close()
-            for _ in 0..<200 where await events.disconnectCount < 1 {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-            #expect(await events.disconnectCount == 1)
-
-            let replacement = try await connectApp(
-                bootstrap: bootstrap,
-                identity: fixture.identity,
-                nonceByte: 0xa5
-            )
-            for _ in 0..<200 where await events.connectCount < 2 {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-            #expect(await events.connectCount == 2)
-            try await Task.sleep(nanoseconds: 600_000_000)
-            #expect(!(await events.didStop))
-
-            await replacement.close()
-            for _ in 0..<200 where !(await events.didStop) {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-            #expect(await events.didStop)
-        } catch {
-            await daemon.stop()
-            throw error
-        }
-    }
-
-    @Test("A rejected authenticated replacement restores supervised ownership")
-    func rejectedReplacementRestoresOwnership() async throws {
-        let fixture = try DaemonFixture()
-        defer { fixture.remove() }
-        let events = DaemonEventRecorder()
-        let daemon = try DevSession.Daemon(
-            configurationURL: fixture.configurationURL,
-            disconnectPolicy: .stopAfterGracePeriod(nanoseconds: 300_000_000),
-            eventHandler: { await events.record($0) }
-        )
-        do {
-            let bootstrap = try await daemon.start()
-            let first = try await connectApp(
-                bootstrap: bootstrap,
-                identity: fixture.identity,
-                nonceByte: 0x11
-            )
-            for _ in 0..<200 where await events.connectCount < 1 {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-            #expect(await events.connectCount == 1)
-
-            var rejectedIdentity = fixture.identity
-            rejectedIdentity.highestAppliedSourceRevision = .init(rawValue: 1)
-            rejectedIdentity.activeGenerationID = .init(rawValue: 1)
-            rejectedIdentity.activeFunctionRoutes = [
-                .init(
-                    functionKey: .init(rawValue: .sha256("unknown-function")),
-                    backend: .hlbc
-                ),
-            ]
-            let rejected = try await connectApp(
-                bootstrap: bootstrap,
-                identity: rejectedIdentity,
-                nonceByte: 0x22
-            )
-            for _ in 0..<200 where await events.rejectionCount < 1 {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-            #expect(await events.rejectionCount == 1)
-            #expect(!(await events.didStop))
-            await rejected.close()
-
-            await first.close()
-            for _ in 0..<200 where !(await events.didStop) {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-            #expect(await events.didStop)
-        } catch {
-            await daemon.stop()
-            throw error
-        }
-    }
-    #endif
 }
 }
-
-private actor DaemonEventRecorder {
-    private(set) var connectCount = 0
-    private(set) var disconnectCount = 0
-    private(set) var rejectionCount = 0
-    private(set) var didStop = false
-
-    func record(_ event: DevSession.DaemonEvent) {
-        if case .connected = event { connectCount += 1 }
-        if case .disconnected = event { disconnectCount += 1 }
-        if case .connectionRejected = event { rejectionCount += 1 }
-        if case .stopped = event { didStop = true }
-    }
-}
-
-#if canImport(Network) && canImport(Security) && os(macOS)
-private func connectApp(
-    bootstrap: DevSession.Bootstrap,
-    identity: DevProtocol.SessionIdentity,
-    nonceByte: UInt8
-) async throws -> DevProtocol.AuthenticatedChannel<NetworkTransport.ByteTransport> {
-    let transport = NetworkTransport.ByteTransport.pinnedTLSClient(
-        host: "127.0.0.1",
-        port: try #require(NWEndpoint.Port(rawValue: bootstrap.port)),
-        expectedSPKIHash: bootstrap.spkiSHA256
-    )
-    try await transport.start()
-    let exporter = try transport.tlsExporterHash()
-    let channel = try DevProtocol.AuthenticatedChannel(
-        transport: transport,
-        sessionSecret: bootstrap.sessionSecret
-    )
-    let nonce = Data(repeating: nonceByte, count: 32)
-    try await channel.send(.hello(identity: identity, clientNonce: nonce))
-    let response = try await channel.receive()
-    guard case let .helloAck(peer, serverNonce, proof) = response else {
-        await channel.close()
-        throw DevSession.DaemonError.missingPeerIdentity
-    }
-    #expect(peer == identity)
-    #expect(
-        try DevProtocol.Handshake.verify(
-            proof: proof,
-            sessionSecret: bootstrap.sessionSecret,
-            clientNonce: nonce,
-            serverNonce: serverNonce,
-            identity: identity,
-            tlsTranscriptHash: exporter
-        )
-    )
-    return channel
-}
-#endif
 
 private struct DaemonFixture {
     let directory: URL
@@ -236,11 +59,10 @@ private struct DaemonFixture {
     let archiveURL: URL
     let configurationURL: URL
     let manifest: DevBuildManifest.Document
-    let identity: DevProtocol.SessionIdentity
 
     init() throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "helix-daemon-\(UUID().uuidString)",
+            "helix-service-\(UUID().uuidString)",
             isDirectory: true
         )
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -254,14 +76,14 @@ private struct DaemonFixture {
         try sourceBytes.write(to: sourceURL)
         let logicalPath = "Sources/Screen.swift"
         let sourceID = LiveReload.SourceFileID.derive(logicalPath: logicalPath)
-        let bundleID = "dev.helix.daemon"
+        let bundleID = "dev.helix.service"
         let module = "DaemonFixture"
         let executableUUID = UUID()
         let sessionID = UUID()
         let namespace = Core.ShellNamespaceID.derive(
             bundleID: bundleID,
             buildNumber: "1",
-            seed: "daemon-fixture"
+            seed: "service-fixture"
         )
         let signature = Core.LoweredSignature(parameters: [], result: "Swift.Int")
         let functionKey = try Core.FunctionKey.derive(
@@ -370,27 +192,12 @@ private struct DaemonFixture {
                 canonicalSIL: true
             )
         )
-        identity = .init(
-            sessionID: sessionID,
-            bundleID: bundleID,
-            executableUUID: executableUUID,
-            processID: 42,
-            platform: .iOSSimulator,
-            architecture: "arm64",
-            operatingSystemBuild: "fixture-OS",
-            xcodeBuild: xcodeBuild,
-            swiftCompilerFingerprint: compilerFingerprint,
-            liveReloadIndexHash: indexHash,
-            supportedBackends: [.hlbc],
-            nativeChainingProbePassed: false
-        )
         let configuration = DevSession.Configuration(
             manifestPath: manifestURL.lastPathComponent,
             reloadIndexPath: indexURL.lastPathComponent,
             interfaceArchivePath: archiveURL.lastPathComponent,
             nativeOutputDirectory: "Native",
-            backendPreference: .hlbc,
-            advertiseBonjour: false
+            backendPreference: .hlbc
         )
         try Core.CanonicalJSON.encode(manifest).write(to: manifestURL)
         try Core.CanonicalJSON.encode(index).write(to: indexURL)

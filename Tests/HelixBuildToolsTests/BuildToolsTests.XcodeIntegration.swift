@@ -95,6 +95,11 @@ struct XcodeIntegrationContract {
         #expect(liveApplication.contains(
             "\"$(HELIX_BRIDGE_OBJECT)\" -Xlinker -u -Xlinker _hlx_bridge_provider_v1"
         ))
+        #expect(liveApplication.contains("_hlx_dev_hub_contract_v1"))
+        let patchApplication = text(
+            try #require(first.artifacts[patch.applicationConfiguration])
+        )
+        #expect(!patchApplication.contains("_hlx_dev_hub_contract_v1"))
         let patchProfile = text(
             try #require(first.artifacts[patch.commonConfiguration])
         )
@@ -102,9 +107,11 @@ struct XcodeIntegrationContract {
         #expect(first.artifacts["Profiles/patch/patch.sh"] != nil)
         let guide = text(try #require(first.artifacts["Integration.md"]))
         #expect(guide.contains(
-            "Run `Profiles/live/live-start.sh` as a Scheme Run"
+            "Run `Profiles/live/live-register.sh` as the Scheme Run"
         ))
-        #expect(guide.contains("Do not start the session from a Build post-action"))
+        #expect(guide.contains("Disable \"Based on dependency analysis\""))
+        #expect(guide.contains("Do not configure a custom LLDB init file"))
+        #expect(guide.contains("offline until a developer enters"))
         #expect(guide.contains("Aggregate Target `Build Patch`"))
         #expect(guide.contains("`SUPPORTED_PLATFORMS` to `iphoneos iphonesimulator`"))
         #expect(guide.contains("destination must match the SDK"))
@@ -317,7 +324,6 @@ struct XcodeIntegrationContract {
         #expect(context.environment.semanticArguments.contains("-swift-version"))
         #expect(context.environment.semanticArguments.contains("6"))
         #expect(context.environment.semanticArguments.contains("HELIX_DEMO"))
-        #expect(context.environment.deviceHost == nil)
         #expect(
             context.environment.profileOutputURL.path
                 == root.appendingPathComponent(
@@ -337,7 +343,6 @@ struct XcodeIntegrationContract {
         deviceVariables["SDKROOT"] = root.appendingPathComponent(
             "iPhoneOS.sdk"
         ).path
-        deviceVariables["HELIX_DEVICE_HOST"] = "192.0.2.42"
         let deviceContext = try XcodeIntegration.EnvironmentResolver().resolve(
             plan: plan,
             planURL: planURL,
@@ -345,35 +350,6 @@ struct XcodeIntegrationContract {
             variables: deviceVariables
         )
         #expect(deviceContext.environment.targetTriple == "arm64-apple-ios15.0")
-        #expect(deviceContext.environment.deviceHost == "192.0.2.42")
-
-        var invalidDeviceHostVariables = deviceVariables
-        invalidDeviceHostVariables["HELIX_DEVICE_HOST"] = "https://192.0.2.42"
-        #expect(throws: XcodeIntegration.EnvironmentError.invalid(
-            name: "HELIX_DEVICE_HOST",
-            value: "https://192.0.2.42"
-        )) {
-            try XcodeIntegration.EnvironmentResolver().resolve(
-                plan: plan,
-                planURL: planURL,
-                profileID: "live",
-                variables: invalidDeviceHostVariables
-            )
-        }
-
-        var simulatorHostVariables = variables
-        simulatorHostVariables["HELIX_DEVICE_HOST"] = "192.0.2.42"
-        #expect(throws: XcodeIntegration.EnvironmentError.invalid(
-            name: "HELIX_DEVICE_HOST",
-            value: "192.0.2.42"
-        )) {
-            try XcodeIntegration.EnvironmentResolver().resolve(
-                plan: plan,
-                planURL: planURL,
-                profileID: "live",
-                variables: simulatorHostVariables
-            )
-        }
 
         var ambiguousArchitectures = variables
         ambiguousArchitectures["ARCHS"] = "arm64 x86_64"

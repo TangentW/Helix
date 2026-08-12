@@ -13,11 +13,11 @@ public enum Phase: String, Codable, Hashable, Sendable {
     case idle
     /// The App is intentionally offline and waiting for explicit code entry.
     case awaitingPairing
-    /// The App is discovering or connecting to its paired daemon.
+    /// The App is discovering or connecting to the paired Helix service.
     case connecting
     /// The authenticated session is ready for messages.
     case authenticated
-    /// The daemon is compiling a source revision.
+    /// The Helix service is compiling a source revision.
     case compiling
     /// The App is receiving a compiled generation.
     case transferring

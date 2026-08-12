@@ -6,7 +6,7 @@ import HelixInterface
 
 extension DevSession {
 public struct Configuration: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 1
+    public static let currentSchemaVersion: UInt16 = 2
 
     public var schemaVersion: UInt16
     public var manifestPath: String
@@ -16,8 +16,6 @@ public struct Configuration: Codable, Hashable, Sendable {
     public var nativeOutputDirectory: String
     public var backendPreference: DevBackendSelection.Preference
     public var deviceNativeMatrixQualified: Bool
-    public var listenPort: UInt16
-    public var advertiseBonjour: Bool
     public var debounceMilliseconds: UInt32
     public var maximumSourceBytes: Int
     public var nativeImageSoftLimit: UInt32
@@ -31,8 +29,6 @@ public struct Configuration: Codable, Hashable, Sendable {
         nativeOutputDirectory: String = ".helix/dev-native",
         backendPreference: DevBackendSelection.Preference = .hlbc,
         deviceNativeMatrixQualified: Bool = false,
-        listenPort: UInt16 = 0,
-        advertiseBonjour: Bool = true,
         debounceMilliseconds: UInt32 = 120,
         maximumSourceBytes: Int = 8 * 1_024 * 1_024,
         nativeImageSoftLimit: UInt32 = 50
@@ -45,8 +41,6 @@ public struct Configuration: Codable, Hashable, Sendable {
         self.nativeOutputDirectory = nativeOutputDirectory
         self.backendPreference = backendPreference
         self.deviceNativeMatrixQualified = deviceNativeMatrixQualified
-        self.listenPort = listenPort
-        self.advertiseBonjour = advertiseBonjour
         self.debounceMilliseconds = debounceMilliseconds
         self.maximumSourceBytes = maximumSourceBytes
         self.nativeImageSoftLimit = nativeImageSoftLimit
@@ -81,8 +75,8 @@ public struct Configuration: Codable, Hashable, Sendable {
             let expected: Set<String> = [
                 "schemaVersion", "manifestPath", "reloadIndexPath",
                 "interfaceArchivePath", "compilerPath", "nativeOutputDirectory",
-                "backendPreference", "deviceNativeMatrixQualified", "listenPort",
-                "advertiseBonjour", "debounceMilliseconds", "maximumSourceBytes",
+                "backendPreference", "deviceNativeMatrixQualified",
+                "debounceMilliseconds", "maximumSourceBytes",
                 "nativeImageSoftLimit",
             ]
             if let unknown = Set(root.keys).subtracting(expected).sorted().first {

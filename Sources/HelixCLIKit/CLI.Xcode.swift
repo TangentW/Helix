@@ -70,7 +70,13 @@ func executeXcode(_ arguments: [String]) throws -> CLI.Result {
     switch command {
     case "generate": return try generateXcodeIntegration(tail)
     case "validate": return try validateXcodeIntegration(tail)
-    case "phase": return try executeXcodePhase(tail)
+    case "phase":
+        guard tail == ["--help"] else {
+            throw CLI.Error.usage(
+                "xcode phase must run through the asynchronous CLI entry point"
+            )
+        }
+        return .init(exitCode: 0, standardOutput: Self.xcodePhaseHelp)
     case "doctor": return try doctorXcodeIntegration(tail)
     default:
         throw CLI.Error.usage("unknown xcode command \(command)")
@@ -352,7 +358,7 @@ private func inspectXcodeProject(
     return checks
 }
 
-private func executeXcodePhase(_ arguments: [String]) throws -> CLI.Result {
+func executeXcodePhase(_ arguments: [String]) async throws -> CLI.Result {
     if arguments == ["--help"] {
         return .init(exitCode: 0, standardOutput: Self.xcodePhaseHelp)
     }
@@ -394,7 +400,7 @@ private func executeXcodePhase(_ arguments: [String]) throws -> CLI.Result {
     defer { phaseLock.unlock() }
     switch phase {
     case .prepare:
-        return try prepareXcodeShell(context)
+        return try await prepareXcodeShell(context)
     case .bridge:
         return try compileXcodeBridge(context)
     case .finalize:
@@ -405,15 +411,8 @@ private func executeXcodePhase(_ arguments: [String]) throws -> CLI.Result {
             standardOutput: "Finalized \(context.environment.finalArchiveURL.path)\n"
                 + "Mach-O UUIDs: \(archive.metadata.machOUUIDs.map(\.uuidString).joined(separator: ", "))\n"
         )
-    case .liveStart:
-        return try startXcodeLiveSession(context)
-    case .liveStop:
-        try DevProcess.Supervisor().stop(
-            stateURL: context.environment.profileOutputURL
-                .appendingPathComponent("Session.json"),
-            allowMissing: true
-        )
-        return .init(exitCode: 0, standardOutput: "Stopped Helix Xcode Live Session.\n")
+    case .liveRegister:
+        return try await registerXcodeLiveSession(context)
     case .audit:
         let product = try resolveXcodeProduct(context)
         _ = try finalizeXcodeShell(context, product: product)
@@ -771,9 +770,9 @@ private func finalizeXcodeShell(
     return finalized
 }
 
-private func startXcodeLiveSession(
+private func registerXcodeLiveSession(
     _ context: XcodeIntegration.BuildContext
-) throws -> CLI.Result {
+) async throws -> CLI.Result {
     let product = try resolveXcodeProduct(context)
     _ = try finalizeXcodeShell(context, product: product)
     let capturedFrontendJobs: [BuildCapture.CapturedFrontendJob]?
@@ -800,7 +799,7 @@ private func startXcodeLiveSession(
             )
         }
     }
-    let prepared = try DevSession.Preparer(
+    var prepared = try DevSession.Preparer(
         probe: BuildCapture.DefaultFrontendReplayProbe(runner: .init())
     ).prepare(
         .init(
@@ -834,6 +833,11 @@ private func startXcodeLiveSession(
             entitlementsURL: product.entitlementsURL
         )
     )
+    // The service outlives a single Xcode Run. Reproducing the same exact App
+    // build must refresh its context instead of creating a conflicting Shell.
+    prepared.manifest.sessionBuildID = try DevSession.ShellIdentityFactory()
+        .make(manifest: prepared.manifest).shellID.rawValue
+    try prepared.manifest.validate()
     let manifestURL = context.environment.profileOutputURL.appendingPathComponent(
         "DevBuildManifest.json"
     )
@@ -850,8 +854,6 @@ private func startXcodeLiveSession(
         nativeOutputDirectory: nativeOutput.path,
         backendPreference: .hlbc,
         deviceNativeMatrixQualified: false,
-        listenPort: 0,
-        advertiseBonjour: context.environment.sdkName == "iphoneos",
         debounceMilliseconds: 120,
         maximumSourceBytes: 8 * 1_024 * 1_024,
         nativeImageSoftLimit: 50
@@ -869,27 +871,57 @@ private func startXcodeLiveSession(
         configurationURL: context.environment.devConfigurationURL
     )
 
-    let state = try DevProcess.Supervisor().start(
-        .init(
-            executableURL: executableURL,
-            configurationURL: context.environment.devConfigurationURL,
-            stateURL: context.environment.profileOutputURL
-                .appendingPathComponent("Session.json"),
-            logURL: context.environment.profileOutputURL
-                .appendingPathComponent("Daemon.log"),
-            lldbInitURL: context.environment.profileOutputURL
-                .appendingPathComponent("Helix.lldbinit"),
-            target: context.environment.sdkName == "iphonesimulator"
-                ? .simulator : .device,
-            deviceHost: context.environment.deviceHost
-        )
+    let reservation = try loadXcodeHubReservation(context)
+    let buildContext = try DevSession.BuildContext.load(
+        configurationURL: context.environment.devConfigurationURL,
+        workspaceURL: product.projectURL
     )
+    let invitation = try await xcodeHubControlClient()
+        .registerAndActivate(
+            invitationID: reservation.reservation.invitationID,
+            context: buildContext
+        )
+    guard invitation.shellIdentity == buildContext.shellIdentity,
+          invitation.code == reservation.reservation.code
+    else {
+        throw CLI.Error.input(
+            "Helix activated a different Xcode invitation or Shell identity"
+        )
+    }
     return .init(
         exitCode: 0,
-        standardOutput: "Started Helix Xcode Live Session \(state.sessionID.uuidString).\n"
-            + "LLDB init: \(state.lldbInitPath)\n"
-            + "Daemon log: \(state.logPath)\n"
+        standardOutput: "Registered Helix Xcode Live Session "
+            + "\(buildContext.shellIdentity.shellID.rawValue.uuidString).\n"
     )
+}
+
+private func loadXcodeHubReservation(
+    _ context: XcodeIntegration.BuildContext
+) throws -> XcodeIntegration.HubReservationDocument {
+    let url = context.environment.shellOutputURL.appendingPathComponent(
+        XcodeIntegration.HubReservationDocument.relativePath
+    )
+    let data = try readOwnerOnlyRegularFile(
+        url,
+        maximumBytes: 16 * 1_024,
+        label: "Helix Hub reservation"
+    )
+    let document: XcodeIntegration.HubReservationDocument
+    do {
+        document = try JSONDecoder().decode(
+            XcodeIntegration.HubReservationDocument.self,
+            from: data
+        )
+    } catch {
+        throw CLI.Error.input(
+            "cannot decode the Helix Hub reservation: \(error)"
+        )
+    }
+    guard try Core.CanonicalJSON.encode(document) == data else {
+        throw CLI.Error.input("Helix Hub reservation is noncanonical")
+    }
+    try document.validate()
+    return document
 }
 
 private final class XcodePhaseLock {
@@ -946,7 +978,7 @@ private final class XcodePhaseLock {
 
 private func prepareXcodeShell(
     _ context: XcodeIntegration.BuildContext
-) throws -> CLI.Result {
+) async throws -> CLI.Result {
     let manager = FileManager.default
     guard manager.isExecutableFile(atPath: context.environment.compilerURL.path) else {
         throw CLI.Error.input(
@@ -1016,9 +1048,28 @@ private func prepareXcodeShell(
                 : .configured
         )
     )
+    let hubReservation: XcodeIntegration.HubReservationDocument?
+    let hubBinding: ShellBuild.HubBinding?
+    if context.profile.workflow == .liveReload {
+        let reserved = try await xcodeHubControlClient()
+            .reserveAutomaticInvitation()
+        let document = try XcodeIntegration.HubReservationDocument(
+            reservation: reserved.reservation,
+            spkiSHA256: reserved.spkiSHA256
+        )
+        hubReservation = document
+        hubBinding = try .init(
+            reservation: document.reservation,
+            spkiSHA256: document.spkiSHA256
+        )
+    } else {
+        hubReservation = nil
+        hubBinding = nil
+    }
     let materialized = try ShellBuild.Materializer().materialize(
         receipt: indexed.receipt,
-        sourceRoot: context.sourceRootURL
+        sourceRoot: context.sourceRootURL,
+        hubBinding: hubBinding
     )
     var artifacts = try materialized.artifacts()
     artifacts["ReleaseMetadata.json"] = try Core.CanonicalJSON.encode(metadata)
@@ -1028,6 +1079,10 @@ private func prepareXcodeShell(
     artifacts["FrontendDiagnostics.json"] = try Core.CanonicalJSON.encode(
         indexed.diagnostics
     )
+    if let hubReservation {
+        artifacts[XcodeIntegration.HubReservationDocument.relativePath] =
+            try Core.CanonicalJSON.encode(hubReservation)
+    }
     do {
         try manager.createDirectory(
             at: context.environment.profileOutputURL,
@@ -1041,7 +1096,10 @@ private func prepareXcodeShell(
     try files.writeDirectory(
         artifacts,
         to: context.environment.shellOutputURL,
-        force: true
+        force: true,
+        privatePaths: hubReservation == nil ? [] : [
+            XcodeIntegration.HubReservationDocument.relativePath,
+        ]
     )
     try prepareXcodeCompilerProxy(context)
     return .init(
@@ -1051,6 +1109,11 @@ private func prepareXcodeShell(
             + "Functions: \(materialized.report.eligibleFunctionCount) eligible, "
             + "\(materialized.report.rejectedFunctionCount) rejected\n"
     )
+}
+
+private func xcodeHubControlClient() throws -> any HubControl.ClientProtocol {
+    if let hubControlClient { return hubControlClient }
+    return try HubControl.Client.applicationSupport()
 }
 
 private func prepareXcodeCompilerProxy(
@@ -1138,10 +1201,7 @@ private func compileXcodeBridge(
     let captured = try BuildCapture.SwiftInvocationReader().readFrontendJob(
         at: context.environment.frontendInvocationURL
     )
-    var moduleMapNames = ["HelixRuntimeSupport"]
-    if context.profile.workflow == .liveReload {
-        moduleMapNames.append("HelixDevRuntimeProbe")
-    }
+    let moduleMapNames = ["HelixRuntimeSupport"]
     let runtimeModuleMaps = try moduleMapNames.map { name -> URL in
         let url = context.environment.generatedModuleMapDirectoryURL
             .appendingPathComponent("\(name).modulemap")
@@ -1271,6 +1331,43 @@ private func readRegularFile(
     }
     do {
         return try Data(contentsOf: url, options: .mappedIfSafe)
+    } catch {
+        throw CLI.Error.input("cannot read \(label): \(error.localizedDescription)")
+    }
+}
+
+/// Reads a secret-bearing build handoff without following its final symlink.
+private func readOwnerOnlyRegularFile(
+    _ url: URL,
+    maximumBytes: Int,
+    label: String
+) throws -> Data {
+    let descriptor = url.path.withCString {
+        Darwin.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+    }
+    guard descriptor >= 0 else {
+        throw CLI.Error.input("\(label) is missing or unsafe: \(url.path)")
+    }
+    let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    defer { try? handle.close() }
+    var status = Darwin.stat()
+    guard fstat(descriptor, &status) == 0,
+          status.st_uid == geteuid(),
+          status.st_mode & S_IFMT == S_IFREG,
+          status.st_mode & 0o077 == 0,
+          status.st_size > 0,
+          status.st_size <= maximumBytes
+    else {
+        throw CLI.Error.input("\(label) must be an owner-only regular file")
+    }
+    do {
+        let data = try handle.readToEnd() ?? Data()
+        guard data.count == Int(status.st_size) else {
+            throw CLI.Error.input("\(label) changed while being read")
+        }
+        return data
+    } catch let error as CLI.Error {
+        throw error
     } catch {
         throw CLI.Error.input("cannot read \(label): \(error.localizedDescription)")
     }
@@ -1542,7 +1639,7 @@ configuration inputs, source containment, and every declared Swift file.
 static let xcodePhaseHelp = """
 Usage: helix xcode phase --plan HelixXcode.json --profile ID --phase PHASE
 
-Phases: prepare, bridge, finalize, audit, patch, live-start, live-stop. This command is
+Phases: prepare, bridge, finalize, audit, patch, live-register. This command is
 designed for generated Xcode scripts and reads volatile build facts only from
 the active Xcode environment.
 """ + "\n"

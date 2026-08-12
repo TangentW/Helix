@@ -60,6 +60,7 @@ public struct Application: Sendable {
     let files: CLI.FileSystem
     let environment: [String: String]
     let executableURL: URL
+    let hubControlClient: (any HubControl.ClientProtocol)?
 
     public init(
         currentDirectoryURL: URL = URL(
@@ -67,10 +68,12 @@ public struct Application: Sendable {
             isDirectory: true
         ),
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        executableURL: URL? = nil
+        executableURL: URL? = nil,
+        hubControlClient: (any HubControl.ClientProtocol)? = nil
     ) {
         files = .init(currentDirectoryURL: currentDirectoryURL)
         self.environment = environment
+        self.hubControlClient = hubControlClient
         if let executableURL {
             self.executableURL = executableURL.standardizedFileURL
         } else if let argument = CommandLine.arguments.first, argument.hasPrefix("/") {
@@ -94,12 +97,21 @@ public struct Application: Sendable {
         _ arguments: [String],
         outputHandler: @escaping @Sendable (CLI.Output) -> Void = { _ in }
     ) async -> CLI.Result {
-        guard arguments.first == "dev", arguments.dropFirst().first == "run" else {
+        #if os(macOS)
+        if arguments.first == "xcode", arguments.dropFirst().first == "phase" {
+            do {
+                return try await executeXcodePhase(
+                    Array(arguments.dropFirst(2))
+                )
+            } catch {
+                return failure(error)
+            }
+        }
+        guard arguments.first == "hub", arguments.dropFirst().first == "run" else {
             return run(arguments)
         }
-        #if os(macOS)
         do {
-            return try await runDevDaemon(
+            return try await runHubService(
                 Array(arguments.dropFirst(2)),
                 outputHandler: outputHandler
             )
@@ -107,9 +119,12 @@ public struct Application: Sendable {
             return failure(error)
         }
         #else
+        guard arguments.first == "hub", arguments.dropFirst().first == "run" else {
+            return run(arguments)
+        }
         return .init(
             exitCode: 1,
-            standardError: "error: helix dev run requires macOS\n"
+            standardError: "error: helix hub run requires macOS\n"
         )
         #endif
     }
@@ -133,6 +148,8 @@ public struct Application: Sendable {
             return try executePatch(Array(arguments.dropFirst()))
         case "dev":
             return try executeDev(Array(arguments.dropFirst()))
+        case "hub":
+            return try executeHub(Array(arguments.dropFirst()))
         default:
             throw CLI.Error.usage("unknown command \(group)")
         }
@@ -219,13 +236,23 @@ public struct Application: Sendable {
         switch command {
         case "prepare": return try prepareDevConfiguration(tail)
         case "validate": return try validateDevConfiguration(tail)
-        case "run":
-            if tail == ["--help"] {
-                return .init(exitCode: 0, standardOutput: Self.devRunHelp)
-            }
-            throw CLI.Error.usage("dev run requires the asynchronous CLI entry point")
         default: throw CLI.Error.usage("unknown dev command \(command)")
         }
+    }
+
+    private func executeHub(_ arguments: [String]) throws -> CLI.Result {
+        if arguments.isEmpty || arguments == ["help"] || arguments == ["--help"] {
+            return .init(exitCode: 0, standardOutput: Self.hubHelp)
+        }
+        let command = arguments[0]
+        let tail = Array(arguments.dropFirst())
+        guard command == "run" else {
+            throw CLI.Error.usage("unknown hub command \(command)")
+        }
+        if tail == ["--help"] {
+            return .init(exitCode: 0, standardOutput: Self.hubRunHelp)
+        }
+        throw CLI.Error.usage("hub run requires the asynchronous CLI entry point")
     }
 
     private func prepareDevConfiguration(_ arguments: [String]) throws -> CLI.Result {
@@ -240,11 +267,11 @@ public struct Application: Sendable {
                 "reload-index", "archive", "output", "manifest-output",
                 "compiler", "source-map", "link-argument", "product",
                 "code-sign-identity", "team-identifier", "entitlements",
-                "native-output-directory", "backend", "listen-port",
+                "native-output-directory", "backend",
                 "debounce-milliseconds", "maximum-source-bytes", "native-image-limit",
             ],
             flagOptions: [
-                "force", "no-bonjour", "device-native-qualified",
+                "force", "device-native-qualified",
             ]
         )
         try requireNoPositionals(options, command: "dev prepare")
@@ -332,8 +359,6 @@ public struct Application: Sendable {
             nativeOutputDirectory: nativeOutputDirectory,
             backendPreference: backend,
             deviceNativeMatrixQualified: options.hasFlag("device-native-qualified"),
-            listenPort: try unsigned("listen-port", default: UInt16(0)),
-            advertiseBonjour: !options.hasFlag("no-bonjour"),
             debounceMilliseconds: try unsigned(
                 "debounce-milliseconds",
                 default: UInt32(120)
@@ -636,9 +661,11 @@ Usage:
   helix shell <command>
   helix patch <command>
   helix dev <command>
+  helix hub <command>
 
 Run 'helix xcode --help', 'helix shell --help', 'helix patch --help', or
-'helix dev --help' for command details.
+'helix dev --help' for build commands. Run 'helix hub --help' for service
+commands.
 """ + "\n"
 
 static let xcodeHelp = """
@@ -683,7 +710,13 @@ Usage: helix dev <command>
 Commands:
   prepare       Capture and replay an exact Xcode frontend job, then write Dev config
   validate      Validate Dev Manifest, Reload Index, HLXI, and compiler identity
-  run           Run the authenticated Live Reload daemon
+""" + "\n"
+
+private static let hubHelp = """
+Usage: helix hub <command>
+
+Commands:
+  run           Run the persistent authenticated Helix service
 """ + "\n"
 
 static let devPrepareHelp = """
@@ -710,12 +743,10 @@ Options:
   --entitlements PATH           Hash the expanded entitlements file
   --native-output-directory P   Native generation directory (default: .helix/dev-native)
   --backend hlbc|native          HLBC is the product path; Native is experimental
-  --listen-port PORT            Daemon port (default: ephemeral)
   --debounce-milliseconds N     Save debounce window (default: 120)
   --maximum-source-bytes N      Per-source safety limit
   --native-image-limit N        Native image soft limit (default: 50)
   --device-native-qualified     Qualify the explicitly selected Native experiment
-  --no-bonjour                  Disable Bonjour advertisement
   --force                       Atomically replace existing outputs
 
 Use --link-argument=VALUE when VALUE begins with '--'. No build setting is
@@ -726,21 +757,13 @@ static let devValidateHelp = """
 Usage: helix dev validate --config HelixDev.json [--json]
 """ + "\n"
 
-static let devRunHelp = """
-Usage: helix dev run --config HelixDev.json [--device-host HOST]
+static let hubRunHelp = """
+Usage: helix hub run
 
-The command keeps the session secret in memory and prints launch-only App
-environment values once. Stop the daemon with Control-C.
+Runs the same persistent, single-listener service used by the Helix menu-bar
+application. Xcode build phases reach it through an owner-only loopback control
+channel; Apps discover it through Bonjour. Stop it with Control-C.
 
-Xcode supervision additionally supplies --bootstrap, --target, and
---lifecycle-lock together. In that mode the private bootstrap file carries the
-credential to LLDB and the daemon log remains redacted. After an authenticated
-App disconnects, the supervised daemon allows a five-second reconnect window,
-then exits and removes its private handoff files. The Scheme Run post-action is
-an eager stop path, not the only cleanup guarantee.
-
-For a supervised physical-device launch, --device-host selects an explicit Mac
-address when the local network does not pass Bonjour/mDNS discovery.
 """ + "\n"
 
 private static let fingerprintHelp = """

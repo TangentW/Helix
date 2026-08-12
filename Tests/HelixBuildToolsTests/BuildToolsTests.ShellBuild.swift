@@ -132,6 +132,41 @@ struct ShellBuildPipeline {
         #expect(roundTripped == finalized)
     }
 
+    @Test("A Dev Shell embeds only its pinned Hub invitation contract")
+    func embedsHubContract() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let reservation = Pairing.Reservation(
+            invitationID: .init(rawValue: UUID()),
+            code: try Pairing.Code("AB23"),
+            kind: .automaticXcode,
+            reservedAt: Date(timeIntervalSinceReferenceDate: 1_000)
+        )
+        let binding = try ShellBuild.HubBinding(
+            reservation: reservation,
+            spkiSHA256: .sha256("host identity")
+        )
+        let output = try ShellBuild.Materializer().materialize(
+            receipt: fixture.receipt,
+            sourceRoot: fixture.directory,
+            hubBinding: binding
+        )
+        let source = String(
+            decoding: try #require(
+                output.xcodeIntegration.artifacts[
+                    "Generated/FixtureBridge.DevBuildContract.swift"
+                ] ?? output.bridge.sourceFiles[
+                    "Generated/FixtureBridge.DevBuildContract.swift"
+                ].map { Data($0.utf8) }
+            ),
+            as: UTF8.self
+        )
+        #expect(source.contains("@_cdecl(\"hlx_dev_hub_contract_v1\")"))
+        #expect(source.contains(binding.spkiSHA256.hex))
+        #expect(source.contains("\"AB23\""))
+        #expect(!source.contains(reservation.invitationID.rawValue.uuidString))
+    }
+
     @Test("Receipt bytes are canonical and unknown fields cannot survive decoding")
     func rejectsNonCanonicalReceipt() throws {
         let fixture = try makeFixture()

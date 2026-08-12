@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import HelixCore
 import HelixDevProtocol
@@ -7,6 +8,37 @@ import Testing
 extension DevToolsTests {
 @Suite("Build Context registry")
 struct ContextRegistry {
+    @Test("Stable Shell identity is exact-build scoped and reproducible")
+    func stableShellIdentity() throws {
+        let first = try makeContext(index: 1, registeredAt: 100)
+        let factory = DevSession.ShellIdentityFactory()
+        let identity = try factory.make(
+            workspacePathHash: first.workspacePathHash,
+            build: first.shellIdentity.build
+        )
+        let duplicate = try factory.make(
+            workspacePathHash: first.workspacePathHash,
+            build: first.shellIdentity.build
+        )
+        #expect(identity == duplicate)
+        #expect(identity.shellID.rawValue.uuidString.split(separator: "-")[2]
+            .first == "5")
+
+        let otherWorkspace = try factory.make(
+            workspacePathHash: .sha256("another-workspace"),
+            build: first.shellIdentity.build
+        )
+        #expect(otherWorkspace.shellID != identity.shellID)
+
+        var otherBuild = first.shellIdentity.build
+        otherBuild.liveReloadIndexHash = .sha256("another-index")
+        let changed = try factory.make(
+            workspacePathHash: first.workspacePathHash,
+            build: otherBuild
+        )
+        #expect(changed.shellID != identity.shellID)
+    }
+
     @Test("Exact build lookup is idempotent and rejects stale refreshes")
     func exactLookup() async throws {
         let registry = try DevSession.ContextRegistry()
@@ -30,7 +62,7 @@ struct ContextRegistry {
         #expect(await registry.resolve(original.shellIdentity.build) == refreshed)
     }
 
-    @Test("Shell and exact-build collisions fail closed")
+    @Test("Equivalent Shell rotation succeeds while ambiguous collisions fail closed")
     func collisions() async throws {
         let registry = try DevSession.ContextRegistry()
         let first = try makeContext(index: 1, registeredAt: 100)
@@ -50,8 +82,24 @@ struct ContextRegistry {
             shellID: buildCollision.shellIdentity.shellID,
             build: first.shellIdentity.build
         )
+        #expect(try await registry.register(buildCollision))
+        #expect(await registry.context(shellID: first.shellIdentity.shellID) == nil)
+        #expect(
+            await registry.resolve(first.shellIdentity.build)?.shellIdentity.shellID
+                == buildCollision.shellIdentity.shellID
+        )
+
+        var ambiguousCollision = try makeContext(
+            index: 4,
+            registeredAt: 103,
+            workspace: "/tmp/Other.xcworkspace"
+        )
+        ambiguousCollision.shellIdentity = .init(
+            shellID: ambiguousCollision.shellIdentity.shellID,
+            build: first.shellIdentity.build
+        )
         await expectContextError(.buildIdentityCollision) {
-            _ = try await registry.register(buildCollision)
+            _ = try await registry.register(ambiguousCollision)
         }
     }
 
@@ -124,6 +172,31 @@ struct ContextRegistry {
             options: [.sortedKeys, .withoutEscapingSlashes]
         )
         #expect(data == reencoded)
+    }
+
+    @Test("Context persistence rejects broad permissions and symbolic links")
+    func persistenceSecurity() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HelixContextSecurity-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("BuildContexts.json")
+        let store = DevSession.ContextStore(url: url)
+        try store.save([try makeContext(index: 1, registeredAt: 100)])
+
+        #expect(chmod(url.path, 0o644) == 0)
+        #expect(throws: DevSession.ContextError.self) {
+            _ = try store.load()
+        }
+        #expect(chmod(url.path, 0o600) == 0)
+
+        let link = directory.appendingPathComponent("BuildContexts.link.json")
+        try FileManager.default.createSymbolicLink(
+            at: link,
+            withDestinationURL: url
+        )
+        #expect(throws: DevSession.ContextError.self) {
+            _ = try DevSession.ContextStore(url: link).load()
+        }
     }
 
     @Test("A failed persistent registration restores the complete in-memory index")

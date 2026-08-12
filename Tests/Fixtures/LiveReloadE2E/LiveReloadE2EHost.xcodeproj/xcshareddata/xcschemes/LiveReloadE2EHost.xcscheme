@@ -52,7 +52,6 @@
       buildConfiguration = "Debug"
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
-      customLLDBInitFile = "$(HELIX_LLDB_INIT_FILE)"
       launchStyle = "0"
       useCustomWorkingDirectory = "NO"
       ignoresPersistentStateOnLaunch = "NO"
@@ -63,8 +62,8 @@
          <ExecutionAction
             ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
             <ActionContent
-               title = "Start Helix Live Session"
-               scriptText = "/bin/sh &quot;$SRCROOT/.helix/xcode/Profiles/live/live-start.sh&quot;">
+               title = "Register Helix Build Context"
+               scriptText = "/bin/sh &quot;$SRCROOT/.helix/xcode/Profiles/live/live-register.sh&quot;">
                <EnvironmentBuildable>
                   <BuildableReference
                      BuildableIdentifier = "primary"
@@ -77,24 +76,6 @@
             </ActionContent>
          </ExecutionAction>
       </PreActions>
-      <PostActions>
-         <ExecutionAction
-            ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
-            <ActionContent
-               title = "Stop Helix Live Session"
-               scriptText = "/bin/sh &quot;$SRCROOT/.helix/xcode/Profiles/live/live-stop.sh&quot;">
-               <EnvironmentBuildable>
-                  <BuildableReference
-                     BuildableIdentifier = "primary"
-                     BlueprintIdentifier = "200000000000000000000003"
-                     BuildableName = "LiveReloadE2EHost.app"
-                     BlueprintName = "LiveReloadE2EHost"
-                     ReferencedContainer = "container:LiveReloadE2EHost.xcodeproj">
-                  </BuildableReference>
-               </EnvironmentBuildable>
-            </ActionContent>
-         </ExecutionAction>
-      </PostActions>
       <BuildableProductRunnable runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"

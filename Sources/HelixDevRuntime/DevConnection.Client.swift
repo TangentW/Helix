@@ -309,6 +309,9 @@ public actor Client {
                 currentTransport = transport
                 do {
                     try await start(transport)
+                    try await transport.send(
+                        NetworkTransport.ConnectionRoute.pairing.preamble
+                    )
                     return transport
                 } catch {
                     await transport.close()

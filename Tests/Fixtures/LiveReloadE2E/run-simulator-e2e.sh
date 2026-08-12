@@ -12,33 +12,39 @@ script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/../../.." && pwd -P)"
 generated_directory="$script_directory/.helix-e2e"
 derived_data="$generated_directory/DerivedData"
-profile_output="$derived_data/Build/Products/HelixGenerated/live"
 source_file="$script_directory/Sources/LiveReloadE2E.Feature.swift"
 project="$script_directory/LiveReloadE2EHost.xcodeproj"
 scheme="LiveReloadE2EHost"
 bundle_id="dev.helix.live-reload-e2e"
 app="$derived_data/Build/Products/Debug-iphonesimulator/LiveReloadE2EHost.app"
-executable="$app/LiveReloadE2EHost"
-daemon_log="$generated_directory/Daemon.log"
+hub_log="$generated_directory/Hub.log"
+debugger_log="$generated_directory/Debugger.log"
 build_log="$generated_directory/BuildConsole.log"
+build_settings="$generated_directory/BuildSettings.json"
 helix="$repository_root/.build/debug/helix"
 source_backup="$(mktemp "${TMPDIR:-/tmp}/helix-live-reload-source.XXXXXX")"
-daemon_pid=""
+hub_pid=""
+debugger_pid=""
 app_pid=""
 
 cleanup() {
     local status=$?
     if [[ $status -ne 0 ]]; then
         echo "LiveReloadE2E failed with status $status." >&2
-        tail -n 80 "$daemon_log" 2>/dev/null >&2 || true
+        tail -n 80 "$hub_log" 2>/dev/null >&2 || true
+        tail -n 80 "$debugger_log" 2>/dev/null >&2 || true
         tail -n 80 "$build_log" 2>/dev/null >&2 || true
     fi
     cp "$source_backup" "$source_file"
-    if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
-        kill -INT "$daemon_pid" 2>/dev/null || true
-        wait "$daemon_pid" 2>/dev/null || true
-    fi
     xcrun simctl terminate "$simulator_udid" "$bundle_id" >/dev/null 2>&1 || true
+    if [[ -n "$debugger_pid" ]] && kill -0 "$debugger_pid" 2>/dev/null; then
+        kill -TERM "$debugger_pid" 2>/dev/null || true
+        wait "$debugger_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$hub_pid" ]] && kill -0 "$hub_pid" 2>/dev/null; then
+        kill -TERM "$hub_pid" 2>/dev/null || true
+        wait "$hub_pid" 2>/dev/null || true
+    fi
     rm -f "$source_backup"
     exit "$status"
 }
@@ -83,24 +89,23 @@ wait_for_log() {
     local pattern="$1"
     local timeout_seconds="$2"
     local started=$SECONDS
-    while ! grep -Fq "$pattern" "$daemon_log" 2>/dev/null; do
-        if [[ -n "$daemon_pid" ]] && ! kill -0 "$daemon_pid" 2>/dev/null; then
-            echo "Helix Dev Daemon exited before: $pattern" >&2
-            tail -n 80 "$daemon_log" >&2 || true
+    while ! grep -Fq "$pattern" "$hub_log" 2>/dev/null; do
+        if [[ -n "$hub_pid" ]] && ! kill -0 "$hub_pid" 2>/dev/null; then
+            echo "Helix Hub exited before: $pattern" >&2
+            tail -n 80 "$hub_log" >&2 || true
             exit 1
         fi
         if (( SECONDS - started >= timeout_seconds )); then
             echo "Timed out waiting for: $pattern" >&2
-            tail -n 80 "$daemon_log" >&2 || true
+            tail -n 80 "$hub_log" >&2 || true
             exit 1
         fi
         sleep 0.1
     done
 }
 
-value_from_log() {
-    local key="$1"
-    awk -F= -v key="$key" '$1 ~ "^[[:space:]]*" key "$" { print $2; exit }' "$daemon_log"
+setting() {
+    /usr/bin/plutil -extract "0.buildSettings.$1" raw -o - "$build_settings"
 }
 
 mkdir -p "$generated_directory"
@@ -109,6 +114,10 @@ swift build --product helix
 "$helix" xcode generate \
     --plan "$script_directory/HelixXcode.json" \
     --force
+: > "$hub_log"
+"$helix" hub run > "$hub_log" 2>&1 &
+hub_pid=$!
+wait_for_log "Helix is running" 20
 
 xcodebuild \
     -project "$project" \
@@ -120,61 +129,50 @@ xcodebuild \
     clean build 2>&1 | tee "$build_log" >/dev/null
 echo "Built LiveReloadE2EHost."
 
-"$helix" shell finalize \
-    --archive "$profile_output/Shell/Shell.provisional.hlxi" \
-    --executable "$executable" \
-    --output "$profile_output/Shell.final.hlxi" \
-    --force
+xcodebuild \
+    -project "$project" \
+    -scheme "$scheme" \
+    -configuration Debug \
+    -sdk iphonesimulator \
+    -destination "id=$simulator_udid" \
+    -derivedDataPath "$derived_data" \
+    -showBuildSettings -json > "$build_settings"
 
-"$helix" dev prepare \
-    --activity-log "$build_log" \
-    --working-directory "$script_directory" \
-    --workspace "$project" \
-    --scheme "$scheme" \
-    --configuration Debug \
-    --bundle-id "$bundle_id" \
-    --module LiveReloadE2E \
-    --executable "$executable" \
-    --reload-index "$profile_output/Shell/ReloadIndex.json" \
-    --archive "$profile_output/Shell.final.hlxi" \
-    --manifest-output "$generated_directory/DevBuildManifest.json" \
-    --native-output-directory "$generated_directory/Native" \
-    --output "$generated_directory/HelixDev.json" \
-    --no-bonjour \
-    --force
+env \
+    SRCROOT="$(setting SRCROOT)" \
+    BUILD_DIR="$(setting BUILD_DIR)" \
+    CONFIGURATION="$(setting CONFIGURATION)" \
+    PLATFORM_NAME="$(setting PLATFORM_NAME)" \
+    SDKROOT="$(setting SDKROOT)" \
+    SDK_DIR="$(setting SDK_DIR)" \
+    GENERATED_MODULEMAP_DIR="$(setting GENERATED_MODULEMAP_DIR)" \
+    SDK_PRODUCT_BUILD_VERSION="$(setting SDK_PRODUCT_BUILD_VERSION)" \
+    XCODE_PRODUCT_BUILD_VERSION="$(setting XCODE_PRODUCT_BUILD_VERSION)" \
+    IPHONEOS_DEPLOYMENT_TARGET="$(setting IPHONEOS_DEPLOYMENT_TARGET)" \
+    CURRENT_PROJECT_VERSION="$(setting CURRENT_PROJECT_VERSION)" \
+    ARCHS="$(setting ARCHS)" \
+    TOOLCHAIN_DIR="$(setting TOOLCHAIN_DIR)" \
+    TARGET_NAME="$(setting TARGET_NAME)" \
+    PRODUCT_BUNDLE_IDENTIFIER="$(setting PRODUCT_BUNDLE_IDENTIFIER)" \
+    TARGET_BUILD_DIR="$(setting TARGET_BUILD_DIR)" \
+    WRAPPER_NAME="$(setting WRAPPER_NAME)" \
+    EXECUTABLE_PATH="$(setting EXECUTABLE_PATH)" \
+    MARKETING_VERSION="$(setting MARKETING_VERSION)" \
+    HELIX_ACTIVITY_LOG_DIR="$(setting HELIX_ACTIVITY_LOG_DIR)" \
+    HELIX_PROFILE_OUTPUT_DIR="$(setting HELIX_PROFILE_OUTPUT_DIR)" \
+    "$helix" xcode phase \
+        --plan "$script_directory/HelixXcode.json" \
+        --profile live \
+        --phase live-register
 
 xcrun simctl terminate "$simulator_udid" "$bundle_id" >/dev/null 2>&1 || true
 xcrun simctl install "$simulator_udid" "$app"
-: > "$daemon_log"
-"$helix" dev run --config "$generated_directory/HelixDev.json" \
-    > "$daemon_log" 2>&1 &
-daemon_pid=$!
-wait_for_log "HLX_DEV_SPKI_SHA256=" 20
-
-session_port="$(value_from_log HLX_DEV_PORT)"
-session_id="$(value_from_log HLX_DEV_SESSION_ID)"
-session_secret="$(value_from_log HLX_DEV_SESSION_SECRET)"
-spki_hash="$(value_from_log HLX_DEV_SPKI_SHA256)"
-service_name="$(value_from_log HLX_DEV_SERVICE_NAME)"
-protocol_version="$(value_from_log HLX_DEV_PROTOCOL_VERSION)"
-if [[ -z "$session_port" || -z "$session_id" || -z "$session_secret" \
-    || -z "$spki_hash" || -z "$service_name" || -z "$protocol_version" ]]; then
-    echo "Daemon launch environment is incomplete." >&2
-    exit 1
-fi
-
-launch_output="$(
-    SIMCTL_CHILD_HLX_DEV_HOST=127.0.0.1 \
-    SIMCTL_CHILD_HLX_DEV_PORT="$session_port" \
-    SIMCTL_CHILD_HLX_DEV_PROTOCOL_VERSION="$protocol_version" \
-    SIMCTL_CHILD_HLX_DEV_SERVICE_NAME="$service_name" \
-    SIMCTL_CHILD_HLX_DEV_SESSION_ID="$session_id" \
-    SIMCTL_CHILD_HLX_DEV_SESSION_SECRET="$session_secret" \
-    SIMCTL_CHILD_HLX_DEV_SPKI_SHA256="$spki_hash" \
-    xcrun simctl launch --terminate-running-process \
-        "$simulator_udid" "$bundle_id"
-)"
+launch_output="$(xcrun simctl launch --wait-for-debugger "$simulator_udid" "$bundle_id")"
 app_pid="${launch_output##*: }"
+xcrun lldb --batch \
+    -o "process attach --pid $app_pid" \
+    -o "continue" > "$debugger_log" 2>&1 &
+debugger_pid=$!
 wait_for_log "Connected process $app_pid on iOSSimulator/arm64." 20
 
 sed -i '' 's/"HELIX BASELINE"/"HELIX PATCHED"/' "$source_file"
@@ -186,4 +184,4 @@ wait_for_log "r2/g2: codeActive, UI refreshed." 30
 kill -0 "$app_pid"
 
 echo "LiveReloadE2E passed in process $app_pid."
-echo "Daemon log: $daemon_log"
+echo "Hub log: $hub_log"

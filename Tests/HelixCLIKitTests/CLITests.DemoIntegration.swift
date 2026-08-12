@@ -132,9 +132,10 @@ struct DemoIntegration {
 
         #expect(live.contains("buildConfiguration = \"Debug\""))
         #expect(live.occurrences(of: "Profiles/live/prepare.sh") == 1)
-        #expect(live.occurrences(of: "Profiles/live/live-start.sh") == 1)
-        #expect(live.occurrences(of: "Profiles/live/live-stop.sh") == 1)
-        #expect(live.contains("customLLDBInitFile = \"$(HELIX_LLDB_INIT_FILE)\""))
+        #expect(live.occurrences(of: "Profiles/live/live-register.sh") == 1)
+        #expect(!live.contains("live-start.sh"))
+        #expect(!live.contains("live-stop.sh"))
+        #expect(!live.contains("customLLDBInitFile"))
         #expect(live.contains("BlueprintName = \"LiveReloadDemo\""))
         #expect(!live.contains("HelixBridge"))
 

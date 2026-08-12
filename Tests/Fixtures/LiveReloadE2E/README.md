@@ -17,9 +17,10 @@ Tests/Fixtures/LiveReloadE2E/run-simulator-e2e.sh \
   AF763A53-66CF-405B-AE92-F5A9CDECE0CE
 ```
 
-The script regenerates the hidden Xcode Integration Kit, builds the Feature and
-App, starts an ephemeral authenticated Dev session, restores the Swift source
-byte-for-byte on every exit path, and leaves build/daemon logs under
+The script regenerates the hidden Xcode Integration Kit, starts the same
+persistent-service implementation used by Helix Hub, builds the Feature and
+App, performs an ordinary debugger launch without a custom LLDB init file,
+restores the Swift source byte-for-byte on every exit path, and leaves logs under
 `.helix-e2e` for diagnosis. Generated Bridge Swift is compiled only into
 DerivedData; it is not referenced by the project. The host imports only
 `HelixDevRuntime`, creates one `ApplicationSession`, and has no `typeRegistry`
