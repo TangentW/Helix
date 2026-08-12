@@ -1,170 +1,459 @@
-import CryptoKit
 import Foundation
-import Security
 import HelixCore
 
-public enum Pairing {}
-
-extension DevProtocol {
-public enum SecureRandom {
-    public static func bytes(count: Int) throws -> Data {
-        guard count > 0, count <= 4_096 else {
-            throw DevProtocol.Error.secureRandomFailed
-        }
-        var bytes = Data(count: count)
-        let status = bytes.withUnsafeMutableBytes { buffer -> OSStatus in
-            guard let address = buffer.baseAddress else { return errSecParam }
-            return SecRandomCopyBytes(kSecRandomDefault, buffer.count, address)
-        }
-        guard status == errSecSuccess else {
-            throw DevProtocol.Error.secureRandomFailed
-        }
-        return bytes
-    }
-}
-}
-
 extension Pairing {
-public struct Token: Hashable, Sendable, CustomStringConvertible {
-    public static let byteCount = 16
-    private let bytes: Data
+/// Security and lifetime policy enforced by ``Authority``.
+public struct AuthorityConfiguration: Hashable, Sendable {
+    /// Lifetime of an activated code, in seconds.
+    public var invitationLifetime: TimeInterval
+    /// Maximum delay between reserving a code and binding the final Shell.
+    public var reservationLifetime: TimeInterval
+    /// Lifetime of an authenticated reconnect lease.
+    public var leaseLifetime: TimeInterval
+    /// Failed attempts permitted per invitation and source window.
+    public var maximumFailedAttempts: Int
+    /// Rolling window used to count failures from one network source.
+    public var attemptWindow: TimeInterval
+    /// Duration for which a source remains locked after reaching the limit.
+    public var lockoutDuration: TimeInterval
 
-    public init(code: String) throws {
-        let normalized = code
-            .lowercased()
-            .filter { $0 != "-" && !$0.isWhitespace }
-        guard normalized.utf8.count == Self.byteCount * 2 else {
-            throw DevProtocol.Error.invalidPairingCode
-        }
-        var value = Data(capacity: Self.byteCount)
-        var index = normalized.startIndex
-        for _ in 0..<Self.byteCount {
-            let next = normalized.index(index, offsetBy: 2)
-            guard let byte = UInt8(normalized[index..<next], radix: 16) else {
-                throw DevProtocol.Error.invalidPairingCode
-            }
-            value.append(byte)
-            index = next
-        }
-        bytes = value
+    public init(
+        invitationLifetime: TimeInterval = 120,
+        reservationLifetime: TimeInterval = 24 * 60 * 60,
+        leaseLifetime: TimeInterval = 30 * 60,
+        maximumFailedAttempts: Int = 5,
+        attemptWindow: TimeInterval = 60,
+        lockoutDuration: TimeInterval = 30
+    ) {
+        self.invitationLifetime = invitationLifetime
+        self.reservationLifetime = reservationLifetime
+        self.leaseLifetime = leaseLifetime
+        self.maximumFailedAttempts = maximumFailedAttempts
+        self.attemptWindow = attemptWindow
+        self.lockoutDuration = lockoutDuration
     }
 
-    fileprivate init(randomBytes: Data) {
-        precondition(randomBytes.count == Self.byteCount)
-        bytes = randomBytes
-    }
-
-    public var code: String {
-        let hex = bytes.map { String(format: "%02x", $0) }.joined()
-        return stride(from: 0, to: hex.count, by: 4).map { offset in
-            let start = hex.index(hex.startIndex, offsetBy: offset)
-            let end = hex.index(start, offsetBy: min(4, hex.count - offset))
-            return String(hex[start..<end])
-        }.joined(separator: "-")
-    }
-
-    public var description: String { code }
-
-    public func deriveSessionSecret(
-        clientNonce: Data,
-        serverNonce: Data,
-        tlsTranscriptHash: Core.Digest
-    ) throws -> Data {
-        guard (16...64).contains(clientNonce.count),
-              (16...64).contains(serverNonce.count)
+    /// Rejects unsafe or nonsensical policy values.
+    public func validate() throws {
+        guard invitationLifetime.isFinite, (10...600).contains(invitationLifetime),
+              reservationLifetime.isFinite, (60...7 * 24 * 60 * 60).contains(reservationLifetime),
+              leaseLifetime.isFinite, (60...24 * 60 * 60).contains(leaseLifetime),
+              (1...20).contains(maximumFailedAttempts),
+              attemptWindow.isFinite, (1...600).contains(attemptWindow),
+              lockoutDuration.isFinite, (1...600).contains(lockoutDuration)
         else {
-            throw DevProtocol.Error.invalidNonceLength
+            throw DevProtocol.Error.malformedMessage(
+                "pairing authority configuration is invalid"
+            )
         }
-        var infoHasher = Core.StableHasher(domain: "HLX.PairingSession.v1")
-        infoHasher.append(clientNonce)
-        infoHasher.append(serverNonce)
-        let key = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: SymmetricKey(data: bytes),
-            salt: tlsTranscriptHash.data,
-            info: infoHasher.finalize().data,
-            outputByteCount: 32
-        )
-        return key.withUnsafeBytes { Data($0) }
-    }
-
-    fileprivate var digest: Core.Digest {
-        var hasher = Core.StableHasher(domain: "HLX.PairingToken.v1")
-        hasher.append(bytes)
-        return hasher.finalize()
     }
 }
 
+/// The identities and secret-bearing grant produced by first-time redemption.
+public struct EstablishedSession: Sendable {
+    public var grant: Pairing.SessionGrant
+    public var shellIdentity: DevProtocol.ShellIdentity
+    public var peerIdentity: DevProtocol.PeerIdentity
+
+    public init(
+        grant: Pairing.SessionGrant,
+        shellIdentity: DevProtocol.ShellIdentity,
+        peerIdentity: DevProtocol.PeerIdentity
+    ) {
+        self.grant = grant
+        self.shellIdentity = shellIdentity
+        self.peerIdentity = peerIdentity
+    }
+}
+
+/// The authenticated state restored from an existing reconnect lease.
+public struct ResumedSession: Sendable {
+    public var grant: Pairing.ResumeGrant
+    public var shellIdentity: DevProtocol.ShellIdentity
+    public var peerIdentity: DevProtocol.PeerIdentity
+    public var sessionSecret: Data
+
+    public init(
+        grant: Pairing.ResumeGrant,
+        shellIdentity: DevProtocol.ShellIdentity,
+        peerIdentity: DevProtocol.PeerIdentity,
+        sessionSecret: Data
+    ) {
+        self.grant = grant
+        self.shellIdentity = shellIdentity
+        self.peerIdentity = peerIdentity
+        self.sessionSecret = sessionSecret
+    }
+}
+
+/// Owns one-time invitations, online-attempt limits, and reconnect leases.
+///
+/// All mutations are actor-isolated so two peers cannot redeem the same code or
+/// resume with the same proof concurrently.
 public actor Authority {
-    private struct ActiveToken {
-        var digest: Core.Digest
-        var expiresAt: Date
+    private struct InvitationState: Sendable {
+        var invitation: Pairing.Invitation
         var failedAttempts: Int
     }
 
-    public var tokenLifetime: TimeInterval
-    public var maximumFailedAttempts: Int
-    private var active: ActiveToken?
-
-    public init(
-        tokenLifetime: TimeInterval = 120,
-        maximumFailedAttempts: Int = 5
-    ) {
-        self.tokenLifetime = tokenLifetime
-        self.maximumFailedAttempts = maximumFailedAttempts
+    private struct LeaseState: Sendable {
+        var shellIdentity: DevProtocol.ShellIdentity
+        var peerIdentity: DevProtocol.PeerIdentity
+        var sessionSecret: Data
+        var expiresAt: Date
+        var consumedResumeProofs: Set<Core.Digest>
     }
 
-    public func issue(now: Date = Date()) throws -> Pairing.Token {
-        guard tokenLifetime.isFinite, tokenLifetime > 0,
-              maximumFailedAttempts > 0
+    private struct SourceFailureState: Sendable {
+        var failedAttempts: Int
+        var lastFailureAt: Date
+        var blockedUntil: Date?
+    }
+
+    /// Immutable security policy for this authority.
+    public let configuration: Pairing.AuthorityConfiguration
+    private var reservations: [DevProtocol.InvitationID: Pairing.Reservation] = [:]
+    private var invitations: [DevProtocol.InvitationID: InvitationState] = [:]
+    private var leases: [DevProtocol.LeaseID: LeaseState] = [:]
+    private var invitationByCode: [Pairing.Code: DevProtocol.InvitationID] = [:]
+    private var sourceFailures: [Pairing.RateLimitKey: SourceFailureState] = [:]
+
+    /// Creates an empty authority after validating its policy.
+    public init(configuration: Pairing.AuthorityConfiguration = .init()) throws {
+        try configuration.validate()
+        self.configuration = configuration
+    }
+
+    /// Reserves a code before the final executable UUID is available.
+    public func reserve(
+        kind: Pairing.Kind,
+        now: Date = Date()
+    ) throws -> Pairing.Reservation {
+        purge(now: now)
+        let code = try uniqueCode()
+        let reservation = Pairing.Reservation(
+            invitationID: .init(rawValue: UUID()),
+            code: code,
+            kind: kind,
+            reservedAt: now
+        )
+        try reservation.validate()
+        reservations[reservation.invitationID] = reservation
+        invitationByCode[code] = reservation.invitationID
+        return reservation
+    }
+
+    /// Registers a reservation created by another same-user Helix process.
+    public func register(
+        _ reservation: Pairing.Reservation,
+        now: Date = Date()
+    ) throws {
+        purge(now: now)
+        try reservation.validate()
+        guard reservation.reservedAt <= now,
+              now.timeIntervalSince(reservation.reservedAt) <= configuration.reservationLifetime,
+              reservations[reservation.invitationID] == nil,
+              invitations[reservation.invitationID] == nil,
+              invitationByCode[reservation.code] == nil
         else {
-            throw DevProtocol.Error.pairingRejected
+            throw Pairing.Failure(
+                reason: .invalidInvitation,
+                detail: "invitation reservation is stale or already registered"
+            )
         }
-        let bytes = try DevProtocol.SecureRandom.bytes(count: Pairing.Token.byteCount)
-        let token = Pairing.Token(randomBytes: bytes)
-        active = .init(
-            digest: token.digest,
-            expiresAt: now.addingTimeInterval(tokenLifetime),
+        reservations[reservation.invitationID] = reservation
+        invitationByCode[reservation.code] = reservation.invitationID
+    }
+
+    /// Binds a reserved code to the exact linked Shell identity.
+    public func activate(
+        invitationID: DevProtocol.InvitationID,
+        shellIdentity: DevProtocol.ShellIdentity,
+        now: Date = Date()
+    ) throws -> Pairing.Invitation {
+        purge(now: now)
+        try shellIdentity.validate()
+        guard let reservation = reservations[invitationID],
+              reservation.reservedAt <= now,
+              now.timeIntervalSince(reservation.reservedAt) <= configuration.reservationLifetime
+        else {
+            throw Pairing.Failure(
+                reason: .invalidInvitation,
+                detail: "invitation reservation is unavailable"
+            )
+        }
+        let invitation = Pairing.Invitation(
+            reservation: reservation,
+            shellIdentity: shellIdentity,
+            expiresAt: now.addingTimeInterval(configuration.invitationLifetime)
+        )
+        try invitation.validate()
+        reservations[invitationID] = nil
+        invitations[invitationID] = .init(
+            invitation: invitation,
             failedAttempts: 0
         )
-        return token
+        return invitation
     }
 
-    public func redeem(
-        code: String,
-        clientNonce: Data,
-        serverNonce: Data,
-        tlsTranscriptHash: Core.Digest,
+    /// Creates and activates an invitation when the final Shell is already known.
+    public func issue(
+        kind: Pairing.Kind,
+        shellIdentity: DevProtocol.ShellIdentity,
         now: Date = Date()
-    ) throws -> Data {
-        guard var active else { throw DevProtocol.Error.pairingRejected }
-        guard now <= active.expiresAt else {
-            self.active = nil
-            throw DevProtocol.Error.pairingExpired
-        }
-        let submitted: Pairing.Token
-        do {
-            submitted = try .init(code: code)
-        } catch {
-            active.failedAttempts += 1
-            self.active = active.failedAttempts >= maximumFailedAttempts ? nil : active
-            throw DevProtocol.Error.pairingRejected
-        }
-        guard submitted.digest.constantTimeEquals(active.digest) else {
-            active.failedAttempts += 1
-            self.active = active.failedAttempts >= maximumFailedAttempts ? nil : active
-            throw DevProtocol.Error.pairingRejected
-        }
-        // Consume before deriving so no concurrent caller can redeem twice.
-        self.active = nil
-        return try submitted.deriveSessionSecret(
-            clientNonce: clientNonce,
-            serverNonce: serverNonce,
-            tlsTranscriptHash: tlsTranscriptHash
+    ) throws -> Pairing.Invitation {
+        let reservation = try reserve(kind: kind, now: now)
+        return try activate(
+            invitationID: reservation.invitationID,
+            shellIdentity: shellIdentity,
+            now: now
         )
     }
 
-    public func invalidate() {
-        active = nil
+    /// Consumes an invitation and creates an authenticated reconnect lease.
+    public func redeem(
+        _ request: Pairing.RedeemRequest,
+        rateLimitKey: Pairing.RateLimitKey,
+        tlsExporterHash: Core.Digest,
+        now: Date = Date()
+    ) throws -> Pairing.EstablishedSession {
+        try request.validate()
+        let candidateInvitationID = invitationByCode[request.code]
+        purge(now: now, preservingInvitationID: candidateInvitationID)
+        if let blockedUntil = sourceFailures[rateLimitKey]?.blockedUntil,
+           now < blockedUntil {
+            throw Pairing.Failure(
+                reason: .attemptLimitReached,
+                detail: "pairing attempts are temporarily rate limited"
+            )
+        }
+        guard let invitationID = invitationByCode[request.code],
+              var state = invitations[invitationID]
+        else {
+            let reachedLimit = recordFailure(rateLimitKey: rateLimitKey, now: now)
+            throw Pairing.Failure(
+                reason: reachedLimit ? .attemptLimitReached : .invalidInvitation,
+                detail: reachedLimit
+                    ? "pairing attempts are temporarily rate limited"
+                    : "pairing code is invalid or inactive"
+            )
+        }
+        if now > state.invitation.expiresAt {
+            invalidate(invitationID: invitationID)
+            throw Pairing.Failure(
+                reason: .expiredInvitation,
+                detail: "pairing invitation expired"
+            )
+        }
+        guard state.invitation.shellIdentity.matches(request.peerIdentity.build) else {
+            state.failedAttempts += 1
+            let sourceReachedLimit = recordFailure(rateLimitKey: rateLimitKey, now: now)
+            if state.failedAttempts >= configuration.maximumFailedAttempts {
+                invalidate(invitationID: invitationID)
+                throw Pairing.Failure(
+                    reason: .attemptLimitReached,
+                    detail: "pairing attempt limit reached"
+                )
+            }
+            invitations[invitationID] = state
+            if sourceReachedLimit {
+                throw Pairing.Failure(
+                    reason: .attemptLimitReached,
+                    detail: "pairing attempts are temporarily rate limited"
+                )
+            }
+            throw Pairing.Failure(
+                reason: .buildMismatch,
+                detail: "App does not match the invitation's exact Dev Shell"
+            )
+        }
+
+        let leaseID = DevProtocol.LeaseID(rawValue: UUID())
+        let secret = try DevProtocol.SecureRandom.bytes(count: 32)
+        let serverNonce = try DevProtocol.SecureRandom.bytes(count: 32)
+        let expiresAt = now.addingTimeInterval(configuration.leaseLifetime)
+        let proof = try Pairing.Proof.sessionGrant(
+            request: request,
+            shellID: state.invitation.shellIdentity.shellID,
+            leaseID: leaseID,
+            sessionSecret: secret,
+            serverNonce: serverNonce,
+            expiresAt: expiresAt,
+            tlsExporterHash: tlsExporterHash
+        )
+        let grant = Pairing.SessionGrant(
+            shellID: state.invitation.shellIdentity.shellID,
+            leaseID: leaseID,
+            sessionSecret: secret,
+            serverNonce: serverNonce,
+            expiresAt: expiresAt,
+            proof: proof
+        )
+        try grant.validate()
+        leases[leaseID] = .init(
+            shellIdentity: state.invitation.shellIdentity,
+            peerIdentity: request.peerIdentity,
+            sessionSecret: secret,
+            expiresAt: expiresAt,
+            consumedResumeProofs: []
+        )
+        invalidate(invitationID: invitationID)
+        sourceFailures[rateLimitKey] = nil
+        return .init(
+            grant: grant,
+            shellIdentity: state.invitation.shellIdentity,
+            peerIdentity: request.peerIdentity
+        )
+    }
+
+    /// Authenticates a reconnect without exposing or reusing the short code.
+    public func resume(
+        _ request: Pairing.ResumeRequest,
+        tlsExporterHash: Core.Digest,
+        now: Date = Date()
+    ) throws -> Pairing.ResumedSession {
+        purge(now: now)
+        try request.validate()
+        guard var state = leases[request.leaseID], now <= state.expiresAt,
+              state.peerIdentity.peerID == request.peerIdentity.peerID,
+              state.shellIdentity.matches(request.peerIdentity.build)
+        else {
+            throw Pairing.Failure(reason: .invalidLease, detail: "session lease is invalid")
+        }
+        let expectedRequestProof = try Pairing.Proof.resumeRequest(
+            leaseID: request.leaseID,
+            peerIdentity: request.peerIdentity,
+            clientNonce: request.clientNonce,
+            sessionSecret: state.sessionSecret,
+            tlsExporterHash: tlsExporterHash
+        )
+        guard DevProtocol.FrameCodec.constantTimeEqual(
+            request.proof,
+            expectedRequestProof
+        ) else {
+            throw Pairing.Failure(reason: .invalidLease, detail: "lease proof is invalid")
+        }
+        let requestProof = try Core.Digest(bytes: request.proof)
+        guard !state.consumedResumeProofs.contains(requestProof) else {
+            throw Pairing.Failure(reason: .invalidLease, detail: "lease proof was already consumed")
+        }
+        let serverNonce = try DevProtocol.SecureRandom.bytes(count: 32)
+        let proof = try Pairing.Proof.resumeGrant(
+            request: request,
+            shellID: state.shellIdentity.shellID,
+            serverNonce: serverNonce,
+            expiresAt: state.expiresAt,
+            sessionSecret: state.sessionSecret,
+            tlsExporterHash: tlsExporterHash
+        )
+        let grant = Pairing.ResumeGrant(
+            shellID: state.shellIdentity.shellID,
+            leaseID: request.leaseID,
+            serverNonce: serverNonce,
+            expiresAt: state.expiresAt,
+            proof: proof
+        )
+        try grant.validate()
+        state.consumedResumeProofs.insert(requestProof)
+        leases[request.leaseID] = state
+        return .init(
+            grant: grant,
+            shellIdentity: state.shellIdentity,
+            peerIdentity: request.peerIdentity,
+            sessionSecret: state.sessionSecret
+        )
+    }
+
+    /// Removes a reserved or active invitation immediately.
+    public func invalidate(invitationID: DevProtocol.InvitationID) {
+        if let reservation = reservations.removeValue(forKey: invitationID) {
+            invitationByCode[reservation.code] = nil
+        }
+        if let state = invitations.removeValue(forKey: invitationID) {
+            invitationByCode[state.invitation.code] = nil
+        }
+    }
+
+    /// Revokes an authenticated reconnect lease immediately.
+    public func revoke(leaseID: DevProtocol.LeaseID) {
+        leases[leaseID] = nil
+    }
+
+    /// Clears every invitation, lease, and rate-limit record.
+    public func invalidateAll() {
+        reservations.removeAll(keepingCapacity: false)
+        invitations.removeAll(keepingCapacity: false)
+        leases.removeAll(keepingCapacity: false)
+        invitationByCode.removeAll(keepingCapacity: false)
+        sourceFailures.removeAll(keepingCapacity: false)
+    }
+
+    /// Returns active object counts after purging expired state.
+    public func counts(now: Date = Date()) -> (
+        reservations: Int,
+        invitations: Int,
+        leases: Int
+    ) {
+        purge(now: now)
+        return (reservations.count, invitations.count, leases.count)
+    }
+
+    private func uniqueCode() throws -> Pairing.Code {
+        for _ in 0..<64 {
+            let code = try Pairing.Code.random()
+            if invitationByCode[code] == nil { return code }
+        }
+        throw DevProtocol.Error.secureRandomFailed
+    }
+
+    @discardableResult
+    private func recordFailure(
+        rateLimitKey: Pairing.RateLimitKey,
+        now: Date
+    ) -> Bool {
+        var state = sourceFailures[rateLimitKey]
+        if let previous = state,
+           now.timeIntervalSince(previous.lastFailureAt) <= configuration.attemptWindow {
+            state = previous
+            state?.failedAttempts += 1
+            state?.lastFailureAt = now
+        } else {
+            state = .init(failedAttempts: 1, lastFailureAt: now, blockedUntil: nil)
+        }
+        let reachedLimit = state?.failedAttempts ?? 0 >= configuration.maximumFailedAttempts
+        if reachedLimit {
+            state?.blockedUntil = now.addingTimeInterval(configuration.lockoutDuration)
+        }
+        sourceFailures[rateLimitKey] = state
+        return reachedLimit
+    }
+
+    private func purge(
+        now: Date,
+        preservingInvitationID: DevProtocol.InvitationID? = nil
+    ) {
+        let expiredReservations = reservations.values.filter {
+            now.timeIntervalSince($0.reservedAt) > configuration.reservationLifetime
+        }
+        for reservation in expiredReservations {
+            reservations[reservation.invitationID] = nil
+            invitationByCode[reservation.code] = nil
+        }
+        let expiredInvitations = invitations.values.filter {
+            now > $0.invitation.expiresAt
+                && $0.invitation.invitationID != preservingInvitationID
+        }
+        for state in expiredInvitations {
+            invitations[state.invitation.invitationID] = nil
+            invitationByCode[state.invitation.code] = nil
+        }
+        leases = leases.filter { now <= $0.value.expiresAt }
+        sourceFailures = sourceFailures.filter { _, state in
+            if let blockedUntil = state.blockedUntil {
+                return now < blockedUntil
+            }
+            return now.timeIntervalSince(state.lastFailureAt) <= configuration.attemptWindow
+        }
     }
 }
 }

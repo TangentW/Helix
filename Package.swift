@@ -150,6 +150,10 @@ let package = Package(
             ]
         ),
         .testTarget(
+            name: "HelixDevProtocolTests",
+            dependencies: ["HelixDevProtocol", "HelixLiveReloadAPI", "HelixCore"]
+        ),
+        .testTarget(
             name: "HelixDevToolsTests",
             dependencies: [
                 "HelixDevTools", "HelixDevProtocol", "HelixLiveReloadAPI",

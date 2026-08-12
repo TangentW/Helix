@@ -71,7 +71,7 @@ public struct BuildIdentity: Codable, Hashable, Sendable {
 }
 
 public struct SessionIdentity: Codable, Hashable, Sendable {
-    public static let currentProtocolVersion: UInt16 = 2
+    public static let currentProtocolVersion = DevProtocol.Metadata.currentProtocolVersion
 
     public var protocolVersion: UInt16
     public var sessionID: UUID
@@ -365,8 +365,6 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case malformedMessage(String)
     case invalidArtifact(String)
     case invalidPairingCode
-    case pairingRejected
-    case pairingExpired
     case secureRandomFailed
     case sessionTimedOut
 
@@ -380,9 +378,8 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
         case .nonCanonicalMessage: "Dev Protocol message is not canonical"
         case let .malformedMessage(reason): "malformed Dev Protocol message: \(reason)"
         case let .invalidArtifact(reason): "invalid .hlxlive artifact: \(reason)"
-        case .invalidPairingCode: "pair code must contain exactly 128 bits of hexadecimal data"
-        case .pairingRejected: "pair code is wrong, already consumed, or no longer active"
-        case .pairingExpired: "pair code expired"
+        case .invalidPairingCode:
+            "pair code must contain four case-insensitive Helix letters or digits"
         case .secureRandomFailed: "the operating system could not generate secure random bytes"
         case .sessionTimedOut: "Dev Session received no peer activity before its timeout"
         }
@@ -390,6 +387,7 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
 }
 
 public enum Metadata {
+    public static let currentProtocolVersion: UInt16 = 3
     public static let version = Core.SemanticVersion(1, 0, 0)
 }
 }

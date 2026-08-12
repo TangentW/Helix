@@ -192,45 +192,6 @@ struct ProtocolLayer {
         })
     }
 
-    @Test("A 128-bit pair code is single-use and derives a transcript-bound secret")
-    func oneTimePairing() async throws {
-        let authority = Pairing.Authority(tokenLifetime: 60, maximumFailedAttempts: 2)
-        let now = Date(timeIntervalSince1970: 1_000)
-        let token = try await authority.issue(now: now)
-        let clientNonce = Data(repeating: 1, count: 16)
-        let serverNonce = Data(repeating: 2, count: 16)
-        let transcript = Core.Digest.sha256("tls-transcript")
-        let expected = try token.deriveSessionSecret(
-            clientNonce: clientNonce,
-            serverNonce: serverNonce,
-            tlsTranscriptHash: transcript
-        )
-        let actual = try await authority.redeem(
-            code: token.code,
-            clientNonce: clientNonce,
-            serverNonce: serverNonce,
-            tlsTranscriptHash: transcript,
-            now: now.addingTimeInterval(1)
-        )
-        #expect(actual == expected)
-        await #expect(throws: DevProtocol.Error.pairingRejected) {
-            try await authority.redeem(
-                code: token.code,
-                clientNonce: clientNonce,
-                serverNonce: serverNonce,
-                tlsTranscriptHash: transcript,
-                now: now.addingTimeInterval(2)
-            )
-        }
-        #expect(
-            try token.deriveSessionSecret(
-                clientNonce: clientNonce,
-                serverNonce: serverNonce,
-                tlsTranscriptHash: .sha256("different-transcript")
-            ) != expected
-        )
-    }
-
     @Test("Frames and .hlxlive artifacts are canonical, authenticated, and session-bound")
     func frameAndArtifactRoundTrip() throws {
         let fixture = try ProtocolFixture()
