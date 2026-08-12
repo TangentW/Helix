@@ -10,10 +10,14 @@ enum NativeImportDiscovery {}
 extension NativeImportDiscovery {
     enum Dispatch: String, Codable, Hashable, Sendable {
         case globalFunction
+        case initializer
         case staticMethod
+        case nativeUpcast
         case instanceMethod
+        case staticGetter
         case instanceGetter
         case instanceSetter
+        case instanceValueSetter
     }
 
     struct Declaration: Hashable, Sendable {
@@ -38,6 +42,7 @@ extension NativeImportDiscovery {
         var hasInOut: Bool
         var hasTypedThrows: Bool
         var hasUnsupportedAttributes: Bool
+        var abiAdapter: InterfaceArchive.NativeImportABIAdapter = .direct
     }
 
     struct GeneratedBinding: Hashable, Sendable {
@@ -152,7 +157,9 @@ extension NativeImportDiscovery {
                             effects: effects,
                             contract: contract,
                             capability: .nativeImportsV2,
-                            isEmittedToDevice: true
+                            isEmittedToDevice: true,
+                            abiAdapter: declaration.abiAdapter == .direct
+                                ? nil : declaration.abiAdapter
                         ),
                         generatedBinding: .init(
                             declarationMangledName: declaration.mangledName,
@@ -187,17 +194,31 @@ extension NativeImportDiscovery {
             scope: PatchConfiguration.NativeImportSourceScope
         ) -> (code: String, reason: String)? {
             switch declaration.dispatch {
-            case .globalFunction, .staticMethod:
+            case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+                 .staticGetter:
                 break
             case .instanceMethod, .instanceGetter, .instanceSetter:
                 guard declaration.ownerType != nil,
-                      declaration.parameterTypes.last.map(isNativeReference) == true,
+                      declaration.parameterTypes.last.map(isNativeValue) == true,
                       declaration.parameterSwiftTypes.count == declaration.parameterTypes.count,
                       declaration.argumentLabels.count + 1 == declaration.parameterTypes.count
                 else {
                     return (
                         "HLXNID001",
                         "instance NativeImport requires one exact source-class receiver as its final physical parameter"
+                    )
+                }
+            case .instanceValueSetter:
+                guard declaration.ownerType != nil,
+                      declaration.parameterTypes.count == 2,
+                      declaration.parameterTypes.last.map(isNativeValue) == true,
+                      declaration.resultType == declaration.parameterTypes.last,
+                      declaration.argumentLabels == ["_"],
+                      declaration.abiAdapter == .mutatingValueReceiver
+                else {
+                    return (
+                        "HLXNID001",
+                        "mutating value NativeImport requires one exact value receiver"
                     )
                 }
             }
@@ -243,9 +264,7 @@ extension NativeImportDiscovery {
                 )
             }
             guard declaration.dispatch == .globalFunction
-                    || declaration.ownerType?.split(separator: ".").allSatisfy({
-                        isSwiftIdentifier(String($0))
-                    }) == true
+                    || declaration.ownerType.map(FrontendReceipt.SwiftTypeSpelling.isGeneratedType) == true
             else {
                 return ("HLXNID007", "static owner is not a representable Swift type path")
             }
@@ -257,9 +276,10 @@ extension NativeImportDiscovery {
             dispatch: NativeImportDiscovery.Dispatch
         ) -> Core.NativeImportAccess {
             switch dispatch {
-            case .instanceGetter: return .read
-            case .instanceSetter: return .write
-            case .globalFunction, .staticMethod, .instanceMethod: break
+            case .instanceGetter, .staticGetter: return .read
+            case .instanceSetter, .instanceValueSetter: return .write
+            case .nativeUpcast: return .pure
+            case .globalFunction, .initializer, .staticMethod, .instanceMethod: break
             }
             return switch profile {
             case .boundedPure: .pure
@@ -273,21 +293,25 @@ extension NativeImportDiscovery {
         ) -> Core.NativeImportKind {
             switch dispatch {
             case .globalFunction: .globalFunction
-            case .staticMethod: .staticMethod
+            case .initializer: .initializer
+            case .staticMethod, .nativeUpcast: .staticMethod
+            case .staticGetter: .staticGetter
             case .instanceMethod: .instanceMethod
             case .instanceGetter: .instanceGetter
-            case .instanceSetter: .instanceSetter
+            case .instanceSetter, .instanceValueSetter: .instanceSetter
             }
         }
 
         private func isInstanceDispatch(_ dispatch: NativeImportDiscovery.Dispatch) -> Bool {
             switch dispatch {
-            case .instanceMethod, .instanceGetter, .instanceSetter: true
-            case .globalFunction, .staticMethod: false
+            case .instanceMethod, .instanceGetter, .instanceSetter,
+                 .instanceValueSetter: true
+            case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+                 .staticGetter: false
             }
         }
 
-        private func isNativeReference(_ type: Bytecode.ValueType) -> Bool {
+        private func isNativeValue(_ type: Bytecode.ValueType) -> Bool {
             if case .native = type { return true }
             return false
         }
@@ -319,7 +343,9 @@ extension NativeImportDiscovery {
         }
 
         private func isSwiftIdentifier(_ value: String) -> Bool {
-            guard let first = value.first, first == "_" || first.isLetter else { return false }
+            guard let first = value.first, first == "_" || first.isLetter else {
+                return false
+            }
             return value.dropFirst().allSatisfy {
                 $0 == "_" || $0.isLetter || $0.isNumber
             }

@@ -63,17 +63,33 @@ public struct Adapter: Sendable {
             moduleName: moduleName,
             demangled: demangled
         )
+        let importedOperationSurface = try discoverImportedOperationSurface(
+            documents: documents,
+            sourcesByPhysicalPath: sourceByPhysicalPath,
+            moduleName: moduleName,
+            demangled: demangled,
+            silFile: silFile
+        )
+        let importedTypes = try mergeImportedNativeTypes(
+            references: importedReferences,
+            operationTypes: importedOperationSurface.types
+        )
         let provisionalNativeTypes = try makeNativeTypes(
             request.nativeImportCatalog,
             sourceNominals: sourceNominals,
-            importedReferences: importedReferences,
+            importedTypes: importedTypes,
             mainActorReferenceTypes: [],
             metadata: request.metadata
         )
         let nativeTypeIDs = try makeNativeTypeLookup(
             records: provisionalNativeTypes,
-            importedReferences: importedReferences,
+            importedTypes: importedTypes,
             sourceNominals: sourceNominals
+        )
+        let importedOperationDeclarations = try makeImportedOperationDeclarations(
+            importedOperationSurface.operations,
+            moduleName: moduleName,
+            nativeTypes: nativeTypeIDs
         )
         var drafts: [Draft] = []
         for document in documents {
@@ -128,7 +144,7 @@ public struct Adapter: Sendable {
         let nativeTypeRecords = try makeNativeTypes(
             request.nativeImportCatalog,
             sourceNominals: sourceNominals,
-            importedReferences: importedReferences,
+            importedTypes: importedTypes,
             mainActorReferenceTypes: mainActorReferenceTypes,
             metadata: request.metadata
         )
@@ -190,7 +206,7 @@ public struct Adapter: Sendable {
             declarations: drafts.compactMap { draft in
                 entrySymbols.contains(draft.candidate.mangledName)
                     ? nil : draft.nativeImportDeclaration
-            },
+            } + importedOperationDeclarations,
             metadata: request.metadata,
             configuration: effectiveConfiguration
         )
@@ -252,7 +268,7 @@ public struct Adapter: Sendable {
             catalog: request.nativeImportCatalog,
             archive: indexed.archive,
             sourceNominals: sourceNominals,
-            importedReferences: importedReferences
+            importedTypes: importedTypes
         )
         let eligibleNames = finalEntrySymbols
         var roots: [ShellBuildReceipt.Root] = []
@@ -741,10 +757,14 @@ extension FrontendReceipt.Adapter {
             )
             let dispatch: ShellBuildReceipt.GeneratedNativeImport.Dispatch = switch generated.dispatch {
             case .globalFunction: .globalFunction
+            case .initializer: .initializer
             case .staticMethod: .staticMethod
+            case .nativeUpcast: .nativeUpcast
+            case .staticGetter: .staticGetter
             case .instanceMethod: .instanceMethod
             case .instanceGetter: .instanceGetter
             case .instanceSetter: .instanceSetter
+            case .instanceValueSetter: .instanceValueSetter
             }
             return .init(
                 key: record.key,
@@ -767,7 +787,7 @@ extension FrontendReceipt.Adapter {
     func makeNativeTypes(
         _ catalog: NativeImportCatalog.Document,
         sourceNominals: [SourceNominal],
-        importedReferences: [ImportedReference],
+        importedTypes: [ImportedNativeType],
         mainActorReferenceTypes: Set<String>,
         metadata: InterfaceArchive.ReleaseMetadata
     ) throws -> [InterfaceArchive.TypeRecord] {
@@ -821,28 +841,28 @@ extension FrontendReceipt.Adapter {
                 )
             )
         }
-        for reference in importedReferences {
+        for imported in importedTypes {
             let exactCatalogMatches = catalog.nativeTypes.filter {
-                $0.canonicalName == reference.runtimeName
+                $0.canonicalName == imported.canonicalName
             }
             let qualifiedCatalogMatches = catalog.nativeTypes.filter {
                 !sourceTypeNames.contains($0.canonicalName)
                     && $0.canonicalName.split(separator: ".").last
-                        == Substring(reference.runtimeName)
+                        == Substring(imported.canonicalName)
             }
             let catalogMatches = exactCatalogMatches.isEmpty
                 ? qualifiedCatalogMatches : exactCatalogMatches
             guard catalogMatches.count <= 1 else {
                 throw FrontendReceipt.Error.invalidRequest(
-                    "Objective-C runtime class \(reference.runtimeName) has ambiguous catalog TypeOps"
+                    "imported type \(imported.canonicalName) has ambiguous catalog TypeOps"
                 )
             }
             if let catalogType = catalogMatches.first {
-                guard catalogType.kind == .reference,
-                      !reference.requiresMainActor || catalogType.requiresMainActor
+                guard catalogType.kind == imported.kind,
+                      !imported.requiresMainActor || catalogType.requiresMainActor
                 else {
                     throw FrontendReceipt.Error.invalidRequest(
-                        "cataloged Objective-C class \(reference.runtimeName) disagrees with its reference or MainActor semantics"
+                        "cataloged imported type \(imported.canonicalName) disagrees with its kind or MainActor semantics"
                     )
                 }
                 continue
@@ -851,15 +871,16 @@ extension FrontendReceipt.Adapter {
                 .init(
                     id: .derive(
                         namespace: metadata.shellNamespaceID,
-                        canonicalType: reference.runtimeName
+                        canonicalType: imported.canonicalName
                     ),
-                    canonicalName: reference.runtimeName,
-                    kind: .reference,
+                    canonicalName: imported.canonicalName,
+                    kind: imported.kind,
                     layoutFingerprint: .sha256(
-                        "HLX.ImportedObjectiveCReference.v1:\(reference.runtimeName)"
+                        "HLX.ImportedNativeType.v2:\(metadata.frontendInvocation.targetTriple):"
+                            + "\(imported.kind.rawValue):\(imported.canonicalName)"
                     ),
                     isCopyable: true,
-                    requiresMainActor: reference.requiresMainActor,
+                    requiresMainActor: imported.requiresMainActor,
                     isEmittedToDevice: true,
                     estimatedSize: 8
                 )
@@ -912,7 +933,7 @@ extension FrontendReceipt.Adapter {
         catalog: NativeImportCatalog.Document,
         archive: InterfaceArchive.Archive,
         sourceNominals: [SourceNominal],
-        importedReferences: [ImportedReference]
+        importedTypes: [ImportedNativeType]
     ) throws -> [ShellBuildReceipt.NativeTypeBinding] {
         let byName = Dictionary(uniqueKeysWithValues: catalog.nativeTypes.map {
             ($0.canonicalName, $0)
@@ -920,8 +941,8 @@ extension FrontendReceipt.Adapter {
         let sourceByName = Dictionary(uniqueKeysWithValues: sourceNominals
             .filter { $0.kind == .reference }
             .map { ($0.canonicalName, $0) })
-        let importedByName = Dictionary(uniqueKeysWithValues: importedReferences.map {
-            ($0.runtimeName, $0)
+        let importedByName = Dictionary(uniqueKeysWithValues: importedTypes.map {
+            ($0.canonicalName, $0)
         })
         return try archive.nativeTypes.compactMap { item in
             guard item.isEmittedToDevice else { return nil }
@@ -946,11 +967,17 @@ extension FrontendReceipt.Adapter {
                     importedModules: candidate.importedModules
                 )
             }
-            if let imported = importedByName[item.canonicalName],
-               item.kind == .reference {
+            if let imported = importedByName[item.canonicalName] {
+                let representation: ShellBuildReceipt.GeneratedNativeType.Representation =
+                    switch imported.representation {
+                    case .reference: .reference
+                    case .rawRepresentable: .rawRepresentable
+                    case .opaqueValue: .opaqueValue
+                    }
                 let generated = ShellBuildReceipt.GeneratedNativeType(
                     sourceFileLogicalID: imported.sourceFileLogicalID,
-                    swiftType: imported.runtimeName
+                    swiftType: imported.swiftType,
+                    representation: representation
                 )
                 let expression = BridgeGeneration.GeneratedNativeType.bindingExpression(
                     sourceFileLogicalID: generated.sourceFileLogicalID,

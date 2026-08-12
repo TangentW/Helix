@@ -34,6 +34,54 @@ struct Archive {
         }
     }
 
+    @Test("Schema 3 remains readable but cannot carry schema-4 ABI adapters")
+    func preservesSchemaThreeArchiveCompatibility() throws {
+        var legacy = try fixture()
+        legacy.schemaVersion = 3
+
+        let bytes = try InterfaceArchive.Codec.encode(legacy)
+        let decoded = try InterfaceArchive.Codec.decode(bytes)
+        #expect(decoded.archive == legacy.normalized())
+        #expect(decoded.archive.schemaVersion == 3)
+
+        let signature = Core.LoweredSignature(parameters: [], result: "Swift.Int")
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let key = try Core.NativeImportKey.derive(
+            namespace: legacy.metadata.shellNamespaceID,
+            canonicalCallee: "Fixture.schemaFourOnly()",
+            signature: signature,
+            effects: .init(),
+            contract: contract
+        )
+        legacy.nativeImports = [
+            .init(
+                id: nil,
+                key: key,
+                canonicalCallee: "Fixture.schemaFourOnly()",
+                silMangledNames: ["$s7Fixture14schemaFourOnlySiyF"],
+                parameterTypes: [],
+                resultType: .int64,
+                signature: signature,
+                effects: .init(),
+                contract: contract,
+                isEmittedToDevice: false,
+                abiAdapter: .direct
+            ),
+        ]
+
+        #expect(throws: InterfaceArchive.Error.invalidArchive(
+            "NativeImport ABI adapters require HLXI archive schema 4"
+        )) {
+            try InterfaceArchive.Codec.encode(legacy)
+        }
+    }
+
     @Test("Server-only candidates do not enter the device interface hash")
     func candidateImportIsNotDeviceAuthority() throws {
         let original = try fixture()

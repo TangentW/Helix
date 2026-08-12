@@ -56,6 +56,12 @@ public final class Encoder {
         return .float(value, bitWidth: 64)
     }
 
+    /// Encodes a 64-bit `CGFloat` leaf and charges it to the graph.
+    public func encode(_ value: CGFloat) throws -> VM.Value {
+        try reserveLeaf()
+        return .float(Double(value), bitWidth: 64)
+    }
+
     /// Encodes a string after reserving its UTF-8 storage and polling the deadline.
     public func encode(_ value: String) throws -> VM.Value {
         try requireActive()

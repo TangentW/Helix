@@ -94,6 +94,14 @@ public struct FunctionRecord: Codable, Hashable, Sendable {
     }
 }
 
+public enum NativeImportABIAdapter: String, Codable, Hashable, Sendable {
+    /// The generated invoker has the same value signature as canonical SIL.
+    case direct
+    /// Canonical SIL mutates its final value receiver through an address and
+    /// returns Void; the VM adapter accepts/returns that receiver as values.
+    case mutatingValueReceiver
+}
+
 public struct NativeImportRecord: Codable, Hashable, Sendable {
     public var id: Core.NativeImportID?
     public var key: Core.NativeImportKey
@@ -108,6 +116,12 @@ public struct NativeImportRecord: Codable, Hashable, Sendable {
     public var contract: Core.NativeImportContract
     public var capability: Core.Capability
     public var isEmittedToDevice: Bool
+    /// `nil` decodes historical archives, whose NativeImports were direct.
+    public var abiAdapter: InterfaceArchive.NativeImportABIAdapter?
+
+    public var effectiveABIAdapter: InterfaceArchive.NativeImportABIAdapter {
+        abiAdapter ?? .direct
+    }
 
     public init(
         id: Core.NativeImportID?,
@@ -120,7 +134,8 @@ public struct NativeImportRecord: Codable, Hashable, Sendable {
         effects: Core.Effects,
         contract: Core.NativeImportContract,
         capability: Core.Capability = .nativeImportsV2,
-        isEmittedToDevice: Bool
+        isEmittedToDevice: Bool,
+        abiAdapter: InterfaceArchive.NativeImportABIAdapter? = nil
     ) {
         self.id = id
         self.key = key
@@ -133,6 +148,7 @@ public struct NativeImportRecord: Codable, Hashable, Sendable {
         self.contract = contract
         self.capability = capability
         self.isEmittedToDevice = isEmittedToDevice
+        self.abiAdapter = abiAdapter
     }
 }
 
@@ -305,7 +321,8 @@ public struct ReleaseMetadata: Codable, Hashable, Sendable {
 }
 
 public struct Archive: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 3
+    public static let minimumSupportedSchemaVersion: UInt16 = 3
+    public static let currentSchemaVersion: UInt16 = 4
 
     public var schemaVersion: UInt16
     public var metadata: InterfaceArchive.ReleaseMetadata
@@ -390,8 +407,17 @@ public struct Archive: Codable, Hashable, Sendable {
     }
 
     public func validate() throws {
-        guard schemaVersion == Self.currentSchemaVersion else {
+        guard (Self.minimumSupportedSchemaVersion...Self.currentSchemaVersion)
+            .contains(schemaVersion)
+        else {
             throw InterfaceArchive.Error.unsupportedSchema(schemaVersion)
+        }
+        guard schemaVersion >= 4
+                || nativeImports.allSatisfy({ $0.abiAdapter == nil })
+        else {
+            throw InterfaceArchive.Error.invalidArchive(
+                "NativeImport ABI adapters require HLXI archive schema 4"
+            )
         }
         guard !metadata.bundleID.isEmpty, !metadata.buildNumber.isEmpty,
               !metadata.targetTriple.isEmpty, !metadata.xcodeBuild.isEmpty,
@@ -543,6 +569,18 @@ public struct Archive: Codable, Hashable, Sendable {
                 throw InterfaceArchive.Error.invalidArchive(
                     "native import does not use the v2 contract capability"
                 )
+            }
+            if item.effectiveABIAdapter == .mutatingValueReceiver {
+                guard item.parameterTypes.count >= 1,
+                      case let .native(receiver) = item.parameterTypes.last,
+                      item.resultType == .native(receiver),
+                      !item.effects.mayThrow,
+                      !item.effects.isAsync
+                else {
+                    throw InterfaceArchive.Error.invalidArchive(
+                        "mutating value-receiver NativeImport has an invalid adapter signature"
+                    )
+                }
             }
         }
         if !emittedImports.isEmpty, !capabilities.contains(.nativeImportsV2) {

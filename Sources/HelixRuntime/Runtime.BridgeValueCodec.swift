@@ -81,6 +81,19 @@ public enum BridgeValueCodec {
         return result
     }
 
+    /// Encodes the 64-bit `CGFloat` used by Helix's supported Apple targets.
+    public static func encode(_ value: CGFloat) throws -> VM.Value {
+        .float(Double(value), bitWidth: 64)
+    }
+
+    /// Decodes a 64-bit VM floating-point value as `CGFloat`.
+    public static func decode(_ value: VM.Value, as type: CGFloat.Type) throws -> CGFloat {
+        guard case let .float(result, bitWidth: 64) = value else {
+            throw VM.RuntimeTrap.typeMismatch(expected: .float(bitWidth: 64), actual: value.type)
+        }
+        return CGFloat(result)
+    }
+
     /// Encodes a Swift string as an owned VM string value.
     public static func encode(_ value: String) throws -> VM.Value {
         .string(value)

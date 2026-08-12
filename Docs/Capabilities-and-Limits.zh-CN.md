@@ -14,7 +14,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | Native 实验 | 仅显式选择的 Dynamic Replacement builder、递归/previous 测试、签名 dylib 与 loader probe | 产品支持；自动路由有意不选择它 |
 | 控制面 | 客户端包与 policy 合同 | 生产 Registry、HSM 运维、审批、灰度、遥测和设备群协调服务 |
 
-当前 SwiftPM 基线包含 441 个测试、72 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。iOS Simulator target 覆盖 9 个 Runtime 与 UI 用例。这些数字代表仓库证据，不代表真机或分发认证。
+当前 SwiftPM 基线包含 452 个测试、73 个 suite，记录的 Debug、warnings-as-errors 与优化 Release 回归均通过。iOS Simulator target 覆盖 9 个 Runtime 与 UI 用例。这些数字代表仓库证据，不代表真机或分发认证。
 
 ## 生产 HLBC 1.10 的 Swift 子集
 
@@ -33,7 +33,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - VM-owned `Any`、`is`、`as?`、`as!`，以及受支持 Optional/Array/Dictionary 的递归动态转换；Swift existential metadata、native object 和线性生命周期不会进入下载字节码。
 - 完全具体的默认参数 generator。生产与开发编译器会把可达 `fA...` thunk 一起链接并纳入传递实现指纹；当前只承诺一个完整 module source set 内的 eligible 调用点。跨 module 的 public/package 默认值、非 eligible 调用点或仍需泛型 metadata 时要求完整构建。
 - 普通 `Swift.print`，由所有新 Shell 自动冻结的同步 NativeImport 承载。支持常见 Bridge-compatible `Any` 值、separator/terminator 和 64 KiB 输出上限，不要求 App 手工配置 Catalog。
-- 调用同 image helper、eligible Shell entry 与目标 Shell 已经生成的精确 allowlisted NativeImport。
+- 调用同 image helper、eligible Shell entry 与目标 Shell 已经生成的精确 allowlisted NativeImport。发布基线已经使用、且 Typed AST 语义与 canonical SIL 物理 ABI 能够对齐的外部 API 可以自动冻结；当前覆盖 reference、raw enum、OptionSet、opaque copyable value、accessor、method、global、Selector、upcast，以及已验证的 String/Array Objective-C bridge。
 
 ### 拒绝或有意未完成
 
@@ -45,7 +45,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - 新原生 class、跨补丁边界可见的新 Swift metadata、retroactive conformance、layout、superclass 与 enum case 变化。
 - Generic 或 `inout` Shell entry、noncopyable root、任意 borrowing/consuming ABI、typed-throws root、`rethrows` 与通用 unwind cleanup。
 - 不受限 pointer、`unsafeBitCast`、任意 Objective-C selector/IMP、`dlopen`/`dlsym`、Mirror 字段修改与未知 builtin。
-- 已发布 Shell 中没有精确 `NativeImportID` 的原生调用，即使 App 中存在名字相似的 Swift 函数。
+- 已发布 Shell 中没有精确 `NativeImportID` 的原生调用，即使 App 中存在名字相似的 Swift 函数。补丁也不能给旧 Shell 新增 framework，或首次使用发布时未冻结的 SDK 操作。
 
 ## 开发期 Live Reload 边界
 

@@ -144,11 +144,11 @@ struct ShellBuildPipeline {
         }
     }
 
-    @Test("Schema 5 through 7 receipts remain canonical without newer generated metadata")
+    @Test("Schema 5 through 8 receipts remain canonical without newer generated metadata")
     func preservesLegacyReceiptCompatibility() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
-        for schemaVersion: UInt16 in [5, 6, 7] {
+        for schemaVersion: UInt16 in [5, 6, 7, 8] {
             var legacy = fixture.receipt
             legacy.schemaVersion = schemaVersion
 

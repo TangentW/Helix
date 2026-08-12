@@ -455,10 +455,14 @@ public struct Materializer: Sendable {
                     let dispatch: BridgeGeneration.GeneratedNativeImport.Dispatch =
                         switch generated.dispatch {
                         case .globalFunction: .globalFunction
+                        case .initializer: .initializer
                         case .staticMethod: .staticMethod
+                        case .nativeUpcast: .nativeUpcast
+                        case .staticGetter: .staticGetter
                         case .instanceMethod: .instanceMethod
                         case .instanceGetter: .instanceGetter
                         case .instanceSetter: .instanceSetter
+                        case .instanceValueSetter: .instanceValueSetter
                         }
                     return BridgeGeneration.GeneratedNativeImport(
                         declarationMangledName: generated.declarationMangledName,
@@ -509,9 +513,16 @@ public struct Materializer: Sendable {
                 operationsExpression: binding.operationsExpression,
                 importedModules: binding.importedModules,
                 generated: binding.generated.map {
-                    BridgeGeneration.GeneratedNativeType(
+                    let representation: BridgeGeneration.GeneratedNativeType.Representation =
+                        switch $0.effectiveRepresentation {
+                        case .reference: .reference
+                        case .rawRepresentable: .rawRepresentable
+                        case .opaqueValue: .opaqueValue
+                        }
+                    return BridgeGeneration.GeneratedNativeType(
                         sourceFileLogicalID: $0.sourceFileLogicalID,
-                        swiftType: $0.swiftType
+                        swiftType: $0.swiftType,
+                        representation: representation
                     )
                 }
             )

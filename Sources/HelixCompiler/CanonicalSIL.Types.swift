@@ -1,6 +1,7 @@
 import Foundation
 import HelixBytecode
 import HelixCore
+import HelixInterface
 
 extension CanonicalSIL {
 public struct TypeEnvironment: Sendable {
@@ -29,6 +30,7 @@ public struct TypeEnvironment: Sendable {
     private var structFactories: [String: Bytecode.LocalTypeKey]
     private var requiresTypedErrors: Bool
     private var nativeTypes: [String: Core.TypeID]
+    private var nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind]
 
     public static let empty = Self()
 
@@ -37,12 +39,14 @@ public struct TypeEnvironment: Sendable {
         structFactories = [:]
         requiresTypedErrors = false
         nativeTypes = [:]
+        nativeTypeKinds = [:]
     }
 
     init(text: String, functions: [CanonicalSIL.Function]) throws {
         rawDefinitions = try Self.extractDefinitions(text)
         structFactories = [:]
         nativeTypes = [:]
+        nativeTypeKinds = [:]
         // Keep payload-free legacy Error patches on the 1.0 String error path.
         // Typed storage is enabled only when the SIL or a local declaration needs it.
         requiresTypedErrors = text.contains("checked_cast_addr_br")
@@ -58,8 +62,25 @@ public struct TypeEnvironment: Sendable {
     /// Returns an environment that resolves the exact native types frozen in
     /// the target Shell. Both module-qualified SIL spellings and their
     /// module-relative form are accepted; ambiguous aliases fail closed.
-    func includingNativeTypes(_ records: [String: Core.TypeID]) throws -> Self {
+    func includingNativeTypes(
+        _ records: [String: Core.TypeID],
+        kinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:]
+    ) throws -> Self {
+        let frozenTypeIDs = Set(records.values)
+        guard Set(kinds.keys).isSubset(of: frozenTypeIDs) else {
+            throw CanonicalSIL.LoweringError.invalidCallTable(
+                "native type kind metadata references an unknown TypeID"
+            )
+        }
         var result = self
+        for (id, kind) in kinds {
+            if let existing = result.nativeTypeKinds[id], existing != kind {
+                throw CanonicalSIL.LoweringError.invalidCallTable(
+                    "native TypeID \(id) has conflicting kind metadata"
+                )
+            }
+            result.nativeTypeKinds[id] = kind
+        }
         for (canonicalName, id) in records.sorted(by: { $0.key < $1.key }) {
             var aliases = [canonicalName]
             if let separator = canonicalName.firstIndex(of: ".") {
@@ -80,6 +101,56 @@ public struct TypeEnvironment: Sendable {
             }
         }
         return result
+    }
+
+    func containsReferenceNativeValue(_ type: Bytecode.ValueType) -> Bool {
+        switch type {
+        case let .native(id):
+            nativeTypeKinds[id] == .reference
+        case let .optional(wrapped):
+            containsReferenceNativeValue(wrapped)
+        case let .tuple(elements):
+            elements.contains(where: containsReferenceNativeValue)
+        case .array, .dictionary:
+            // Objective-C collection parameters are reference bridges. This
+            // matters only when their element graph contains native handles.
+            true
+        case .void, .never, .bool, .integer, .float, .string, .any, .local,
+             .error, .address, .closure:
+            false
+        }
+    }
+
+    func matchesPseudogenericNativeType(
+        _ raw: String,
+        expected typeID: Core.TypeID
+    ) -> Bool {
+        var spelling = raw.trimmingCharacters(in: .whitespaces)
+        var changed = true
+        while changed {
+            changed = false
+            for prefix in [
+                "$", "@owned ", "@guaranteed ", "@unowned ",
+                "@autoreleased ", "@in_guaranteed ",
+            ] where spelling.hasPrefix(prefix) {
+                spelling.removeFirst(prefix.count)
+                spelling = spelling.trimmingCharacters(in: .whitespaces)
+                changed = true
+                break
+            }
+        }
+        guard let open = spelling.firstIndex(of: "<"),
+              spelling.hasSuffix(">"),
+              spelling[spelling.index(after: open)..<spelling.index(before: spelling.endIndex)]
+                .contains("τ_")
+        else { return false }
+        let base = String(spelling[..<open])
+        return nativeTypes.contains { alias, id in
+            guard id == typeID, let aliasOpen = alias.firstIndex(of: "<") else {
+                return false
+            }
+            return alias.hasSuffix(">") && String(alias[..<aliasOpen]) == base
+        }
     }
 
     var preservesTypedErrors: Bool {
@@ -115,6 +186,8 @@ public struct TypeEnvironment: Sendable {
                 "@owned ",
                 "@guaranteed ",
                 "@unowned ",
+                "@autoreleased ",
+                "@unowned_inner_pointer ",
                 "@closureCapture ",
                 "@in ",
                 "@in_guaranteed ",
@@ -191,6 +264,8 @@ public struct TypeEnvironment: Sendable {
         case "Bool", "Swift.Bool": return .bool
         case "Float", "Swift.Float", "Builtin.FPIEEE32": return .float(bitWidth: 32)
         case "Double", "Swift.Double", "Builtin.FPIEEE64": return .float(bitWidth: 64)
+        case "CGFloat", "CoreFoundation.CGFloat", "CoreGraphics.CGFloat":
+            return .float(bitWidth: 64)
         case "String", "Swift.String": return .string
         case "Any", "Swift.Any": return .any
         case "any Error", "Swift.Error": return preservesTypedErrors ? .error : .string

@@ -18,6 +18,7 @@ public struct Request: Sendable {
     public var requestedResources: Core.ResourceLimits
     public var directCalls: CanonicalSIL.DirectCallTable
     public var nativeTypes: [String: Core.TypeID]
+    public var nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind]
     public var effects: Core.Effects?
     /// The only source path permitted in emitted HLBC diagnostics. When nil,
     /// the compiler drops all source locations instead of retaining host paths.
@@ -35,6 +36,7 @@ public struct Request: Sendable {
         requestedResources: Core.ResourceLimits = .init(),
         directCalls: CanonicalSIL.DirectCallTable = .empty,
         nativeTypes: [String: Core.TypeID] = [:],
+        nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:],
         effects: Core.Effects? = nil,
         sourceFileLogicalID: String? = nil
     ) {
@@ -49,6 +51,7 @@ public struct Request: Sendable {
         self.requestedResources = requestedResources
         self.directCalls = directCalls
         self.nativeTypes = nativeTypes
+        self.nativeTypeKinds = nativeTypeKinds
         self.effects = effects
         self.sourceFileLogicalID = sourceFileLogicalID
     }
@@ -67,7 +70,8 @@ public struct Driver: Sendable {
     public func compile(_ request: PatchCompiler.Request) throws -> PatchCompiler.Result {
         let file = try CanonicalSIL.File(text: request.canonicalSIL)
         let typeEnvironment = try file.typeEnvironment.includingNativeTypes(
-            request.nativeTypes
+            request.nativeTypes,
+            kinds: request.nativeTypeKinds
         )
         guard let silFunction = file.function(mangledName: request.mangledName) else {
             throw CanonicalSIL.LoweringError.functionSelection("function @\(request.mangledName) was not found")
@@ -214,6 +218,11 @@ public struct Driver: Sendable {
                     uniqueKeysWithValues: archive.nativeTypes
                         .filter(\.isEmittedToDevice)
                         .map { ($0.canonicalName, $0.id) }
+                ),
+                nativeTypeKinds: Dictionary(
+                    uniqueKeysWithValues: archive.nativeTypes
+                        .filter(\.isEmittedToDevice)
+                        .map { ($0.id, $0.kind) }
                 ),
                 effects: record.effects,
                 sourceFileLogicalID: record.sourceFileLogicalID

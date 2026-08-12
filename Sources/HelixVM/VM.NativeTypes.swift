@@ -8,6 +8,18 @@ public enum NativeTypeKind: String, Hashable, Sendable {
     case enumeration
 }
 
+private final class OpaqueNativeIdentity: @unchecked Sendable {}
+
+private final class OpaqueNativeStorage<Value>: @unchecked Sendable {
+    let value: Value
+    let identity: OpaqueNativeIdentity
+
+    init(value: Value, identity: OpaqueNativeIdentity = .init()) {
+        self.value = value
+        self.identity = identity
+    }
+}
+
 /// Implemented by App code for a native type explicitly frozen into the Shell.
 /// The factory must return operations whose descriptor exactly matches its inputs.
 public protocol NativeTypeFactory {
@@ -51,7 +63,8 @@ public final class NativeValue: @unchecked Sendable, Hashable, CustomStringConve
     }
 
     public func value<Value>(as type: Value.Type = Value.self) -> Value? {
-        storage as? Value
+        if let value = storage as? Value { return value }
+        return (storage as? OpaqueNativeStorage<Value>)?.value
     }
 
     public static func == (lhs: VM.NativeValue, rhs: VM.NativeValue) -> Bool {
@@ -202,6 +215,84 @@ public struct NativeTypeOperations: Sendable {
             hash: { value, hasher in hasher.combine(ObjectIdentifier(value)) },
             describe: describe
         )
+    }
+
+    /// Creates TypeOps for a copyable Swift value whose layout and equality
+    /// semantics are intentionally opaque to HLBC. Copies preserve a stable
+    /// box identity, while a value returned from a mutating native adapter is
+    /// boxed as a new identity. The VM never reflects or serializes its fields.
+    public static func opaqueValue<Value>(
+        id: Core.TypeID,
+        canonicalName: String,
+        layoutFingerprint: Core.Digest,
+        requiresMainActor: Bool = false,
+        estimatedSize: UInt64 = UInt64(MemoryLayout<Value>.stride),
+        clone: @escaping @Sendable (Value) -> Value = { $0 },
+        estimatedByteCount: @escaping @Sendable (Value) -> UInt64 = { _ in
+            UInt64(MemoryLayout<Value>.stride)
+        },
+        describe: @escaping @Sendable (Value) -> String = { String(describing: $0) }
+    ) -> Self {
+        typealias Storage = OpaqueNativeStorage<Value>
+        return Self(
+            id: id,
+            canonicalName: canonicalName,
+            kind: .value,
+            layoutFingerprint: layoutFingerprint,
+            requiresMainActor: requiresMainActor,
+            estimatedSize: estimatedSize,
+            clone: { storage in
+                Storage(value: clone(storage.value), identity: storage.identity)
+            },
+            estimatedByteCount: { estimatedByteCount($0.value) },
+            equals: { $0.identity === $1.identity },
+            hash: { storage, hasher in
+                hasher.combine(ObjectIdentifier(storage.identity))
+            },
+            describe: { describe($0.value) }
+        ).acceptingOpaqueValues(as: Value.self)
+    }
+
+    private func acceptingOpaqueValues<Value>(as type: Value.Type) -> Self {
+        let operations = self
+        return Self(
+            id: id,
+            canonicalName: canonicalName,
+            kind: kind,
+            layoutFingerprint: layoutFingerprint,
+            isCopyable: isCopyable,
+            requiresMainActor: requiresMainActor,
+            estimatedSize: estimatedSize,
+            boxStorage: { storage in
+                guard let value = storage as? Value else {
+                    throw VM.RuntimeTrap.nativeTypeMismatch(expected: operations.id)
+                }
+                return try operations.boxStorage(OpaqueNativeStorage(value: value))
+            },
+            copyStorage: operations.copyStorage
+        )
+    }
+
+    private init(
+        id: Core.TypeID,
+        canonicalName: String,
+        kind: VM.NativeTypeKind,
+        layoutFingerprint: Core.Digest,
+        isCopyable: Bool,
+        requiresMainActor: Bool,
+        estimatedSize: UInt64,
+        boxStorage: @escaping @Sendable (Any) throws -> VM.NativeValue,
+        copyStorage: @escaping @Sendable (VM.NativeValue) throws -> VM.NativeValue
+    ) {
+        self.id = id
+        self.canonicalName = canonicalName
+        self.kind = kind
+        self.layoutFingerprint = layoutFingerprint
+        self.isCopyable = isCopyable
+        self.requiresMainActor = requiresMainActor
+        self.estimatedSize = estimatedSize
+        self.boxStorage = boxStorage
+        self.copyStorage = copyStorage
     }
 
     public func box<Value>(_ value: Value) throws -> VM.NativeValue {

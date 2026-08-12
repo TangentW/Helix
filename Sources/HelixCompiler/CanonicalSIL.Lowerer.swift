@@ -39,6 +39,7 @@ public struct Lowerer: Sendable {
         case dictionaryIteratorNext
         case allocateUninitializedArray
         case finalizeUninitializedArray
+        case assertionFailure
 
         init?(mangledName: String) {
             switch mangledName {
@@ -86,7 +87,57 @@ public struct Lowerer: Sendable {
                 self = .allocateUninitializedArray
             case "$ss27_finalizeUninitializedArrayySayxGABnlF":
                 self = .finalizeUninitializedArray
+            case "$ss17_assertionFailure__4file4line5flagss5NeverOs12StaticStringV_A2HSus6UInt32VtF":
+                self = .assertionFailure
             default: return nil
+            }
+        }
+    }
+
+    /// Swift emits these Foundation bridges around imported Objective-C APIs.
+    /// HLBC calls a generated, Swift-typed NativeImport instead, so lowering
+    /// preserves the Swift value while validating the exact compiler bridge.
+    private enum ObjectiveCBridgeIntrinsic: Equatable {
+        case stringToObjectiveC
+        case stringFromObjectiveC
+        case arrayToObjectiveC
+        case arrayFromObjectiveC
+
+        init?(mangledName: String, loweredType: String) {
+            switch mangledName {
+            case "$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF":
+                self = .stringToObjectiveC
+            case "$sSS10FoundationE36_unconditionallyBridgeFromObjectiveCySSSo8NSStringCSgFZ":
+                self = .stringFromObjectiveC
+            case "$sSa10FoundationE19_bridgeToObjectiveCSo7NSArrayCyF":
+                self = .arrayToObjectiveC
+            case "$sSa10FoundationE36_unconditionallyBridgeFromObjectiveCySayxGSo7NSArrayCSgFZ":
+                self = .arrayFromObjectiveC
+            default:
+                return nil
+            }
+            guard accepts(loweredType: loweredType) else { return nil }
+        }
+
+        func accepts(loweredType: String) -> Bool {
+            let normalized = loweredType
+                .replacingOccurrences(of: "Swift.", with: "")
+                .filter { !$0.isWhitespace }
+            return switch self {
+            case .stringToObjectiveC:
+                normalized
+                    == "@convention(method)(@guaranteedString)->@ownedNSString"
+            case .stringFromObjectiveC:
+                normalized
+                    == "@convention(method)(@guaranteedOptional<NSString>,@thinString.Type)->@ownedString"
+            case .arrayToObjectiveC:
+                normalized.hasPrefix("@convention(method)<τ_0_0>")
+                    && normalized.hasSuffix("(@guaranteedArray<τ_0_0>)->@ownedNSArray")
+            case .arrayFromObjectiveC:
+                normalized.hasPrefix("@convention(method)<τ_0_0>")
+                    && normalized.hasSuffix(
+                        "(@guaranteedOptional<NSArray>,@thinArray<τ_0_0>.Type)->@ownedArray<τ_0_0>"
+                    )
             }
         }
     }
@@ -157,13 +208,19 @@ public struct Lowerer: Sendable {
         var unavailableSetter: CanonicalSIL.UnavailableDirectCall?
     }
 
-    /// Keeps the physical SIL ownership ABI separate from the frozen device
-    /// target. Shell Entry and NativeImport boundaries consume owned values,
-    /// while a Swift instance method commonly receives `self` guaranteed.
+    struct ErasedNativeMetatype: Equatable {
+        var physicalIndex: Int
+        var typeID: Core.TypeID
+    }
+
+    /// Keeps the physical SIL ABI separate from the frozen device target.
+    /// Static metatypes and indirect results never cross the VM boundary.
     private struct ResolvedFunctionReference {
         var binding: CanonicalSIL.DirectCallBinding
         var physicalParameterConventions: [Bytecode.ParameterConvention]
         var hasIndirectResult: Bool
+        var erasedNativeMetatypes: [ErasedNativeMetatype]
+        var usesObjectiveCBridge: Bool
     }
 
     private struct ExistentialProjection {
@@ -236,14 +293,24 @@ public struct Lowerer: Sendable {
         var registerTypes: [Bytecode.ValueType] = []
         var values: [String: Bytecode.Register] = [:]
         var functionReferences: [String: ResolvedFunctionReference] = [:]
+        var deferredForeignReferences: [String: (reference: String, loweredType: String)] = [:]
         var swiftCoreReferences: [String: SwiftCoreIntrinsic] = [:]
+        var objectiveCBridgeReferences: [String: ObjectiveCBridgeIntrinsic] = [:]
+        var optionSetArrayLiteralReferences: [String: String] = [:]
         var localFactoryReferences: [String: Bytecode.LocalTypeKey] = [:]
         var stringLiterals: [String: String] = [:]
+        var selectorLiterals: [String: String] = [:]
+        var selectorOpaquePointers: [String: String] = [:]
+        var staticStringPointers: [String: String] = [:]
+        var staticStringValues: [String: String] = [:]
         var wordLiterals: [String: UInt64] = [:]
         var integerLiterals: [String: (bitWidth: UInt16, value: Int64)] = [:]
         var retypedIntegerLiterals: [String: [Bytecode.ValueType: Bytecode.Register]] = [:]
         var boolLiterals: [String: Bool] = [:]
         var metatypeValues = Set<String>()
+        var arrayMetatypeValues: [String: Bytecode.ValueType] = [:]
+        var nativeMetatypeValues: [String: Core.TypeID] = [:]
+        var nativeGlobalAddresses: [String: CanonicalSIL.DirectCallBinding] = [:]
         var characterMetatypeValues = Set<String>()
         var localMetatypeValues: [String: Bytecode.LocalTypeKey] = [:]
         var dictionaryMetatypeValues: [String: (Bytecode.ValueType, Bytecode.ValueType)] = [:]
@@ -257,6 +324,8 @@ public struct Lowerer: Sendable {
         var inoutParameterAddressBases = Set<String>()
         var passthroughRuntimeAccesses = Set<String>()
         var borrowedAddressValues: [String: Bytecode.Register] = [:]
+        var borrowedValueTokens = Set<String>()
+        var borrowedNativeConversionValues: [String: Bytecode.Register] = [:]
         var addressAliases: [String: String] = [:]
         var nativePropertyAddresses: [String: NativePropertyAddress] = [:]
         var pendingArrayIteratorTypes: [String: Bytecode.ValueType] = [:]
@@ -290,18 +359,27 @@ public struct Lowerer: Sendable {
         var unpackedTuples: [String: [Bytecode.Register]] = [:]
         var onStackClosureValues = Set<String>()
         var voidValues = Set<String>()
+        var compilerOptionalVoidValues = Set<String>()
         var optionalSourceBySomeBlock: [Bytecode.BlockID: String] = [:]
         var optionalSourceByNoneBlock: [Bytecode.BlockID: String] = [:]
         var optionalAddressPayloadByBlock: [
             Bytecode.BlockID: (address: String, payload: Bytecode.Register)
         ] = [:]
+        var optionalAddressSelectionConditions: [
+            String: (address: String, someWhenTrue: Bool)
+        ] = [:]
+        var inheritedCompilerAddressValues: [
+            Bytecode.BlockID: [String: Bytecode.Register]
+        ] = [:]
         var reconstructedNoneValues: [Bytecode.BlockID: [String: Bytecode.Register]] = [:]
+        var knownOptionalSomePayloads: [String: Bytecode.Register] = [:]
         var errorEnumMessages: [String: String] = [:]
         var existentialBoxes = Set<String>()
         var existentialProjections: [String: ExistentialProjection] = [:]
         var existentialComponentAddresses: [String: ExistentialComponentAddress] = [:]
         var optionalAddressInitializations: [String: OptionalAddressInitialization] = [:]
         var optionalPayloadAddressRoots: [String: String] = [:]
+        var takenOptionalPayloadRoots: [String: String] = [:]
         var indirectResultAddress: String?
         var indirectResultSlot: Bytecode.StackSlot?
         var typedErrorBoxTypes: [String: Bytecode.LocalTypeKey] = [:]
@@ -389,6 +467,78 @@ public struct Lowerer: Sendable {
             zip(parameterRegisters, signature.parameterConventions).contains {
                 $0.0 == register && $0.1 == .borrowed
             }
+        }
+
+        func lineContainsSILValue(_ token: String, line: String) -> Bool {
+            line.range(
+                of: "(?<![0-9])" + NSRegularExpression.escapedPattern(for: token)
+                    + "(?![0-9])",
+                options: .regularExpression
+            ) != nil
+        }
+
+        func hasFutureSemanticUse(of token: String, after lineIndex: Int) -> Bool {
+            guard lineIndex + 1 < rawLines.count else { return false }
+            return rawLines[(lineIndex + 1)...].contains { rawLine in
+                let instruction = CanonicalSIL.DebugMetadata.strippingComment(
+                    from: rawLine
+                ).trimmingCharacters(in: .whitespaces)
+                guard !instruction.isEmpty,
+                      !instruction.hasPrefix("debug_value"),
+                      !instruction.hasPrefix("debug_step"),
+                      !instruction.hasPrefix("end_borrow"),
+                      !instruction.hasPrefix("fix_lifetime")
+                else { return false }
+                return lineContainsSILValue(token, line: instruction)
+            }
+        }
+
+        func releaseBorrowedNativeConversionsAfterLastUse(
+            _ tokens: some Sequence<String>,
+            after lineIndex: Int
+        ) {
+            for token in Set(tokens) where !hasFutureSemanticUse(
+                of: token,
+                after: lineIndex
+            ) {
+                guard let value = borrowedNativeConversionValues.removeValue(
+                    forKey: token
+                ) else { continue }
+                appendInstruction(.destroyValue(value))
+            }
+        }
+
+        func closeBorrowedNativeConversionLifetime(
+            for token: String,
+            resolved value: Bytecode.Register
+        ) throws {
+            guard let tracked = borrowedNativeConversionValues.removeValue(
+                forKey: token
+            ) else { return }
+            guard tracked == value else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "borrowed native conversion ownership does not match its SIL value"
+                )
+            }
+        }
+
+        func transferBorrowedNativeConversionLifetime(
+            from sourceToken: String,
+            resolved source: Bytecode.Register,
+            to resultToken: String,
+            result: Bytecode.Register
+        ) throws {
+            guard let tracked = borrowedNativeConversionValues.removeValue(
+                forKey: sourceToken
+            ) else { return }
+            guard tracked == source,
+                  borrowedNativeConversionValues[resultToken] == nil
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "borrowed native conversion cannot transfer into its owner"
+                )
+            }
+            borrowedNativeConversionValues[resultToken] = result
         }
 
         func addressBase(_ token: String) -> String {
@@ -554,16 +704,122 @@ public struct Lowerer: Sendable {
             guard physical.count == binding.parameterConventions.count else {
                 return false
             }
-            switch binding.target {
-            case .function:
-                return physical == binding.parameterConventions
-            case .entry, .nativeImport:
-                // Device boundaries cannot carry address values and own every
-                // value passed into the generated Swift Bridge. A guaranteed
-                // physical parameter is adapted with an explicit VM copy.
-                return !physical.contains(.inout)
-                    && binding.parameterConventions.allSatisfy { $0 == .owned }
+            switch binding.abiAdapter {
+            case .direct:
+                switch binding.target {
+                case .function:
+                    return physical == binding.parameterConventions
+                case .entry, .nativeImport:
+                    // Device boundaries own values. A guaranteed physical
+                    // parameter is adapted with an explicit VM copy.
+                    return !physical.contains(.inout)
+                        && binding.parameterConventions.allSatisfy { $0 == .owned }
+                }
+            case .mutatingValueReceiver:
+                guard case .nativeImport = binding.target,
+                      physical.last == .inout,
+                      !physical.dropLast().contains(.inout)
+                else { return false }
+                return binding.parameterConventions.allSatisfy { $0 == .owned }
             }
+        }
+
+        func resolveDeferredForeignReference(
+            _ deferred: (reference: String, loweredType: String),
+            genericArguments rawArguments: String,
+            line: Int
+        ) throws -> ResolvedFunctionReference {
+            let genericArguments = splitTopLevel(rawArguments).filter { !$0.isEmpty }
+            guard !genericArguments.isEmpty else {
+                throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                    line: line,
+                    text: "pseudogeneric Objective-C call has no concrete specialization"
+                )
+            }
+            let symbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+                reference: deferred.reference,
+                loweredType: deferred.loweredType,
+                genericArguments: genericArguments
+            )
+            guard let binding = directCalls.binding(for: symbol) else {
+                if let unavailable = directCalls.unavailableCall(for: symbol) {
+                    throw CanonicalSIL.LoweringError.unavailableNativeImport(
+                        line: line,
+                        mangledName: symbol,
+                        canonicalCallee: unavailable.canonicalCallee,
+                        reason: unavailable.reason
+                    )
+                }
+                throw CanonicalSIL.LoweringError.unboundCallee(
+                    line: line,
+                    mangledName: symbol
+                )
+            }
+            let callee = try parseFunctionType(
+                deferred.loweredType,
+                bridgingTo: (binding.parameterTypes, binding.resultType),
+                abiAdapter: binding.abiAdapter
+            )
+            guard callee.parameters == binding.parameterTypes,
+                  acceptsPhysicalConventions(
+                      callee.parameterConventions,
+                      for: binding
+                  ),
+                  callee.result == binding.resultType,
+                  callee.effects.mayThrow == binding.effects.mayThrow,
+                  callee.effects.isAsync == binding.effects.isAsync
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: symbol,
+                    detail: "specialized foreign reference has \(callee.parameters) "
+                        + "\(callee.parameterConventions) -> \(callee.result) "
+                        + "\(callee.effects); expected \(binding.parameterTypes) "
+                        + "\(binding.parameterConventions) -> \(binding.resultType) "
+                        + "\(binding.effects)"
+                )
+            }
+            return .init(
+                binding: binding,
+                physicalParameterConventions: callee.parameterConventions,
+                hasIndirectResult: callee.hasIndirectResult,
+                erasedNativeMetatypes: callee.erasedNativeMetatypes,
+                usesObjectiveCBridge: true
+            )
+        }
+
+        func eraseNativeMetatypeArguments(
+            _ tokens: [String],
+            for reference: ResolvedFunctionReference,
+            line: Int
+        ) throws -> [String] {
+            guard !reference.erasedNativeMetatypes.isEmpty else { return tokens }
+            let erasedByIndex = Dictionary(
+                uniqueKeysWithValues: reference.erasedNativeMetatypes.map {
+                    ($0.physicalIndex, $0.typeID)
+                }
+            )
+            guard tokens.count
+                    == reference.physicalParameterConventions.count + erasedByIndex.count
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "direct call physical argument count does not match its frozen ABI"
+                )
+            }
+            var logical: [String] = []
+            logical.reserveCapacity(reference.physicalParameterConventions.count)
+            for (index, token) in tokens.enumerated() {
+                if let typeID = erasedByIndex[index] {
+                    guard nativeMetatypeValues[token] == typeID else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "direct call metatype argument does not match its frozen native type"
+                        )
+                    }
+                } else {
+                    logical.append(token)
+                }
+            }
+            return logical
         }
 
         func adaptBoundaryArguments(
@@ -609,6 +865,28 @@ public struct Lowerer: Sendable {
                     )
                 }
                 arguments.append(value)
+            }
+        }
+
+        func inheritCompilerAddressValue(
+            _ value: Bytecode.Register,
+            at address: String,
+            into targets: [Bytecode.BlockID]
+        ) throws {
+            let root = addressBase(address)
+            guard stackType(at: root) == registerTypes[Int(value.rawValue)] else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "inherited compiler address value has the wrong VM type"
+                )
+            }
+            for target in targets {
+                if let existing = inheritedCompilerAddressValues[target]?[root],
+                   existing != value {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "compiler address reaches one block with multiple unmerged values"
+                    )
+                }
+                inheritedCompilerAddressValues[target, default: [:]][root] = value
             }
         }
 
@@ -765,6 +1043,20 @@ public struct Lowerer: Sendable {
                 )
                 return
             }
+            if let root = takenOptionalPayloadRoots[token] {
+                guard case let .optional(wrapped) = compilerAddressType(root),
+                      wrapped == type
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "taken Optional payload no longer matches its source storage"
+                    )
+                }
+                assignStackValue(value, at: token)
+                let optional = try allocate(type: .optional(wrapped))
+                appendInstruction(.makeOptionalSome(result: optional, value: value))
+                try storeVMValue(optional, at: root)
+                return
+            }
             if let root = optionalPayloadAddressRoots[token],
                var initialization = optionalAddressInitializations[root] {
                 guard initialization.wrappedType == type,
@@ -779,6 +1071,103 @@ public struct Lowerer: Sendable {
                 return
             }
             try storeVMValue(value, at: token)
+        }
+
+        func lowerMutatingValueReceiverApply(
+            resultToken: String,
+            argumentTokens: [String],
+            reference: ResolvedFunctionReference,
+            line: Int
+        ) throws {
+            let binding = reference.binding
+            guard binding.abiAdapter == .mutatingValueReceiver,
+                  case let .nativeImport(requirement) = binding.target,
+                  !binding.effects.mayThrow,
+                  !binding.effects.isAsync,
+                  !resultToken.isEmpty,
+                  argumentTokens.count == binding.parameterTypes.count,
+                  let receiverType = binding.parameterTypes.last,
+                  binding.resultType == receiverType,
+                  reference.physicalParameterConventions.last == .inout
+            else {
+                throw CanonicalSIL.LoweringError.invalidCallTable(
+                    "mutating value-receiver call has an invalid frozen ABI"
+                )
+            }
+            let receiverToken = argumentTokens[argumentTokens.count - 1]
+            guard compilerAddressType(receiverToken) == receiverType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "mutating value receiver is not stored at its expected SIL address"
+                )
+            }
+            let valueTokens = Array(argumentTokens.dropLast())
+            let valueConventions = Array(
+                reference.physicalParameterConventions.dropLast()
+            )
+            let prepared = try prepareDirectCallArguments(
+                valueTokens,
+                conventions: valueConventions,
+                line: line,
+                allowsSynthesizedAccess: true
+            )
+            var arguments = try zip(prepared.arguments, valueConventions).map {
+                argument, convention in
+                convention == .borrowed
+                    ? try copyOwnedCallArgument(argument)
+                    : argument
+            }
+            let receiver: Bytecode.Register
+            if let stored = stackValue(at: receiverToken) {
+                receiver = stored
+            } else if let address = runtimeAddress(at: receiverToken) {
+                let loaded = try allocate(type: receiverType)
+                if isScopedRuntimeAddress(receiverToken) {
+                    appendInstruction(
+                        .loadAddress(result: loaded, address: address, mode: .copy)
+                    )
+                } else {
+                    let access = try allocate(type: .address(receiverType))
+                    appendInstruction(
+                        .beginAccess(result: access, address: address, kind: .read)
+                    )
+                    appendInstruction(
+                        .loadAddress(result: loaded, address: access, mode: .copy)
+                    )
+                    appendInstruction(.endAccess(access))
+                }
+                receiver = loaded
+            } else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "mutating value receiver references uninitialized storage"
+                )
+            }
+            guard registerTypes[Int(receiver.rawValue)] == receiverType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "mutating value receiver storage has the wrong VM type"
+                )
+            }
+            arguments.append(try copyOwnedCallArgument(receiver))
+            guard arguments.map({ registerTypes[Int($0.rawValue)] })
+                    == binding.parameterTypes
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: binding.mangledName
+                )
+            }
+            let mutated = try allocate(type: receiverType)
+            appendInstruction(
+                .nativeApply(
+                    result: mutated,
+                    importID: requirement.id,
+                    arguments: arguments
+                )
+            )
+            try storeConstructedValue(mutated, at: receiverToken)
+            for access in prepared.accesses.reversed() {
+                appendInstruction(.endAccess(access))
+            }
+            voidValues.insert(resultToken)
         }
 
         func materializeTupleComponents(
@@ -890,6 +1279,25 @@ public struct Lowerer: Sendable {
             }
 
             switch intrinsic {
+            case .assertionFailure:
+                guard genericArguments.isEmpty,
+                      arguments.count == 5,
+                      let prefix = staticStringValues[arguments[0]],
+                      let message = staticStringValues[arguments[1]],
+                      staticStringValues[arguments[2]] != nil,
+                      values[arguments[3]] != nil,
+                      values[arguments[4]] != nil,
+                      !prefix.isEmpty,
+                      !message.isEmpty
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift assertion failure has unsupported metadata"
+                    )
+                }
+                // The following `unreachable` becomes the VM trap terminator.
+                // StaticString pointer layout remains compiler-only.
+                voidValues.insert(resultToken)
+
             case .stringLiteral, .characterLiteral:
                 guard genericArguments.isEmpty else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -1608,11 +2016,6 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let element = try parseType(genericArguments)
-                guard !element.requiresLinearOwnership else {
-                    throw CanonicalSIL.LoweringError.unsupportedType(
-                        "Array literal with linearly owned element \(element)"
-                    )
-                }
                 pendingArrayLiterals[resultToken] = .init(
                     elementType: element,
                     count: count
@@ -1647,6 +2050,104 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func lowerObjectiveCBridgeIntrinsic(
+            _ intrinsic: ObjectiveCBridgeIntrinsic,
+            resultToken: String,
+            genericArguments: String,
+            argumentText: String,
+            loweredType: String,
+            line: Int
+        ) throws {
+            let arguments = try parseApplyValueTokens(argumentText, line: line)
+            guard !resultToken.isEmpty,
+                  intrinsic.accepts(loweredType: loweredType)
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Objective-C bridge has an unexpected specialization or signature"
+                )
+            }
+
+            if intrinsic == .arrayToObjectiveC || intrinsic == .arrayFromObjectiveC {
+                guard !genericArguments.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Objective-C Array bridge has no concrete element type"
+                    )
+                }
+                let element = try parseType(genericArguments)
+                let source: Bytecode.Register
+                switch intrinsic {
+                case .arrayToObjectiveC:
+                    guard arguments.count == 1,
+                          let value = values[arguments[0]]
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array-to-Objective-C bridge has unsupported arguments"
+                        )
+                    }
+                    source = value
+                case .arrayFromObjectiveC:
+                    guard arguments.count == 2,
+                          arrayMetatypeValues[arguments[1]] == element,
+                          let value = values[arguments[0]]
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Objective-C-to-Array bridge has unsupported arguments"
+                        )
+                    }
+                    source = value
+                case .stringToObjectiveC, .stringFromObjectiveC:
+                    preconditionFailure("not an Array bridge")
+                }
+                guard registerTypes[Int(source.rawValue)] == .array(element) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Objective-C Array bridge payload has the wrong Swift element type"
+                    )
+                }
+                let result = try allocate(type: .array(element))
+                values[resultToken] = result
+                appendInstruction(.copyValue(result: result, source: source))
+                return
+            }
+            guard genericArguments.isEmpty else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Objective-C String bridge has an unexpected specialization"
+                )
+            }
+
+            let source: Bytecode.Register
+            switch intrinsic {
+            case .stringToObjectiveC:
+                guard arguments.count == 1 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String-to-Objective-C bridge has unsupported arguments"
+                    )
+                }
+                source = try resolve(arguments[0], line: line)
+            case .stringFromObjectiveC:
+                guard arguments.count == 2,
+                      metatypeValues.contains(arguments[1]),
+                      let optional = values[arguments[0]],
+                      registerTypes[Int(optional.rawValue)] == .optional(.string),
+                      let payload = knownOptionalSomePayloads[arguments[0]]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Objective-C-to-String bridge is not fed by a proven Optional.some"
+                    )
+                }
+                source = payload
+            case .arrayToObjectiveC, .arrayFromObjectiveC:
+                preconditionFailure("handled before String bridge lowering")
+            }
+            guard registerTypes[Int(source.rawValue)] == .string else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Objective-C String bridge payload is not a Swift String"
+                )
+            }
+            let result = try allocate(type: .string)
+            values[resultToken] = result
+            appendInstruction(.copyValue(result: result, source: source))
+        }
+
         for (lineIndex, rawLine) in rawLines.enumerated() {
             let sourceLine = lineIndex + 1
             let parsedLine = if function.hasStrippedDebugMetadata {
@@ -1661,19 +2162,41 @@ public struct Lowerer: Sendable {
             currentSourceLocation = parsedLine.location
                 ?? debugLineLocations[sourceLine]
             let line = parsedLine.instruction
+            if let borrowEnd = match(
+                line,
+                pattern: #"^end_borrow (%[0-9]+)$"#
+            ) {
+                borrowedValueTokens.remove(borrowEnd[0])
+                if let value = borrowedNativeConversionValues.removeValue(
+                    forKey: borrowEnd[0]
+                ) {
+                    appendInstruction(.destroyValue(value))
+                }
+                continue
+            }
             guard !line.isEmpty,
                   !line.hasPrefix("["),
                   !line.hasPrefix("debug_value"),
                   !line.hasPrefix("debug_step"),
-                  !line.hasPrefix("end_borrow"),
                   !line.hasPrefix("fix_lifetime")
             else { continue }
 
+            let bridgedBlockParameterTypes: [Bytecode.ValueType]? = {
+                guard let number = parseBlockNumber(line),
+                      let sourceToken = optionalSourceBySomeBlock[
+                        .init(rawValue: number)
+                      ],
+                      let source = values[sourceToken],
+                      case let .optional(wrapped) = registerTypes[Int(source.rawValue)]
+                else { return nil }
+                return [wrapped]
+            }()
             if let block = try parseBlockHeader(
                 line,
                 entryParameterTypes: entryBlock == nil
                     ? signature.parameters
                     : nil,
+                bridgedParameterTypes: bridgedBlockParameterTypes,
                 indirectResultType: entryBlock == nil && signature.hasIndirectResult
                     ? signature.result
                     : nil,
@@ -1699,6 +2222,12 @@ public struct Lowerer: Sendable {
                         "block unexpectedly suppresses a Void SIL parameter"
                     )
                 }
+                if let inherited = inheritedCompilerAddressValues[block.block.id] {
+                    for (address, value) in inherited {
+                        stackAddressValues[address] = value
+                        values[address] = value
+                    }
+                }
                 if let implicit = implicitStackValues[block.block.id] {
                     loweredBlock.parameters.append(contentsOf: implicit.map(\.register))
                     for item in implicit {
@@ -1710,6 +2239,9 @@ public struct Lowerer: Sendable {
                 for (silValue, register) in explicitParameters {
                     values[silValue] = register
                 }
+                compilerOptionalVoidValues.formUnion(
+                    block.compilerOptionalVoidParameters
+                )
                 if let implicit = implicitStackValues[block.block.id] {
                     for item in implicit {
                         if optionalPayloadAddressRoots[item.address] != nil {
@@ -1739,7 +2271,7 @@ public struct Lowerer: Sendable {
                 if entryBlock == nil {
                     entryBlock = loweredBlock.id
                     if signature.hasIndirectResult {
-                        guard signature.result.isAnyPayloadOrExistentialV1,
+                        guard supportsIndirectResult(signature.result),
                               let address = block.indirectResultAddress
                         else {
                             throw CanonicalSIL.LoweringError.unsupportedType(
@@ -1797,6 +2329,35 @@ public struct Lowerer: Sendable {
 
             if let literal = match(
                 line,
+                pattern: #"^(%[0-9]+) = string_literal objc_selector \"(.*)\"$"#
+            ) {
+                selectorLiterals[literal[0]] = try decodeSILUTF8Literal(literal[1])
+                continue
+            }
+
+            if let conversion = match(
+                line,
+                pattern: #"^(%[0-9]+) = builtin \"ptrtoint_Word\"\((%[0-9]+)\) : \$Builtin\.Word$"#
+            ), let literal = stringLiterals[conversion[1]] {
+                staticStringPointers[conversion[0]] = literal
+                continue
+            }
+
+            if let construction = match(
+                line,
+                pattern: #"^(%[0-9]+) = struct \$StaticString \((%[0-9]+), (%[0-9]+), (%[0-9]+)\)$"#
+            ), let literal = staticStringPointers[construction[1]],
+               let expectedCount = wordLiterals[construction[2]],
+               let flag = integerLiterals[construction[3]],
+               flag.bitWidth == 8,
+               [0, 2].contains(flag.value),
+               UInt64(literal.utf8.count) == expectedCount {
+                staticStringValues[construction[0]] = literal
+                continue
+            }
+
+            if let literal = match(
+                line,
                 pattern: #"^(%[0-9]+) = integer_literal \$Builtin\.Word, ([0-9]+)$"#
             ) {
                 guard let value = UInt64(literal[1]) else {
@@ -1813,6 +2374,14 @@ public struct Lowerer: Sendable {
                 pattern: #"^(%[0-9]+) = metatype \$@thin (?:Swift\.)?String\.Type$"#
             ) {
                 metatypeValues.insert(metatype[0])
+                continue
+            }
+
+            if let metatype = match(
+                line,
+                pattern: #"^(%[0-9]+) = metatype \$@thin (?:Swift\.)?Array<(.+)>\.Type$"#
+            ) {
+                arrayMetatypeValues[metatype[0]] = try parseType(metatype[1])
                 continue
             }
 
@@ -1846,6 +2415,50 @@ public struct Lowerer: Sendable {
                 pattern: #"^(%[0-9]+) = metatype \$@thin (.+)\.Type$"#
             ), let key = typeEnvironment.localKey(for: metatype[1]) {
                 localMetatypeValues[metatype[0]] = key
+                continue
+            }
+
+            if let metatype = match(
+                line,
+                pattern: #"^(%[0-9]+) = metatype \$@(?:thin|thick|objc_metatype) (.+)\.Type$"#
+            ), let type = try? parseType(metatype[1]),
+               case let .native(typeID) = type {
+                nativeMetatypeValues[metatype[0]] = typeID
+                continue
+            }
+
+            if let global = match(
+                line,
+                pattern: #"^(%[0-9]+) = global_addr @([^\s:]+) : \$(?:\*)(.+)$"#
+            ) {
+                let symbol = CanonicalSIL.NativeBridgeSymbols.importedGlobal(
+                    symbol: global[1],
+                    loweredType: global[2]
+                )
+                guard let binding = directCalls.binding(for: symbol),
+                      binding.parameterTypes.isEmpty,
+                      binding.resultType != .void,
+                      !binding.effects.mayThrow,
+                      !binding.effects.isAsync,
+                      case .nativeImport = binding.target
+                else {
+                    throw CanonicalSIL.LoweringError.unboundCallee(
+                        line: sourceLine,
+                        mangledName: symbol
+                    )
+                }
+                let physicalType = try parsePhysicalType(
+                    global[2],
+                    bridgedTo: binding.resultType
+                )
+                guard physicalType == binding.resultType else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: sourceLine,
+                        mangledName: symbol
+                    )
+                }
+                stackAddressTypes[global[0]] = binding.resultType
+                nativeGlobalAddresses[global[0]] = binding
                 continue
             }
 
@@ -1898,11 +2511,15 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^copy_addr(?: \[(take)\])? (%[0-9]+) to (?:\[(init|assign)\] )?(%[0-9]+)$"#
             ) {
+                let sourceType = stackType(at: copy[1])
+                let destinationType = compilerAddressType(copy[3])
                 guard let source = stackValue(at: copy[1]),
-                      stackType(at: copy[1]) == compilerAddressType(copy[3])
+                      sourceType == destinationType
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "copy_addr source and destination do not have one VM value type"
+                        "copy_addr at line \(sourceLine) requires initialized matching storage; "
+                            + "source \(copy[1]) is \(String(describing: sourceType)), "
+                            + "destination \(copy[3]) is \(String(describing: destinationType))"
                     )
                 }
                 let value: Bytecode.Register
@@ -1951,6 +2568,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 values[borrow[0]] = value
+                borrowedValueTokens.insert(borrow[0])
                 continue
             }
 
@@ -2099,11 +2717,17 @@ public struct Lowerer: Sendable {
                         "dealloc_stack references an unsupported address"
                     )
                 }
-                // SIL may spell the same lexical allocation's deallocation in
-                // multiple mutually exclusive successor blocks. Keep declared
-                // type metadata while lowering the CFG; runtime execution still
-                // traverses exactly one deallocation path.
-                stackAddressValues.removeValue(forKey: address)
+                takenOptionalPayloadRoots = takenOptionalPayloadRoots.filter {
+                    addressBase($0.value) != address
+                }
+                // Swift treats some imported C values as trivial even though
+                // HLBC represents them with an owned native box. Release any
+                // compiler-only storage that SIL legitimately deallocates
+                // without a preceding destroy_addr.
+                if let value = stackAddressValues.removeValue(forKey: address),
+                   registerTypes[Int(value.rawValue)].requiresLinearOwnership {
+                    appendInstruction(.destroyValue(value))
+                }
                 continue
             }
 
@@ -2554,7 +3178,7 @@ public struct Lowerer: Sendable {
                 let scalarWrappers: Set<String> = [
                     "Int", "Int8", "Int16", "Int32", "Int64",
                     "UInt", "UInt8", "UInt16", "UInt32", "UInt64",
-                    "Bool", "Float", "Double",
+                    "Bool", "Float", "Double", "CGFloat",
                 ]
                 if scalarWrappers.contains(projection[2]),
                    projection[3] == "_value",
@@ -2635,16 +3259,56 @@ public struct Lowerer: Sendable {
                 continue
             }
 
+            if let pointer = match(
+                line,
+                pattern: #"^(%[0-9]+) = struct \$OpaquePointer \((%[0-9]+)\)$"#
+            ), let selector = selectorLiterals[pointer[1]] {
+                selectorOpaquePointers[pointer[0]] = selector
+                continue
+            }
+
+            if let construction = match(
+                line,
+                pattern: #"^(%[0-9]+) = struct \$(?:ObjectiveC\.)?Selector \((%[0-9]+)\)$"#
+            ), let selector = selectorOpaquePointers[construction[1]],
+               case let .native(typeID) = try parseType("ObjectiveC.Selector") {
+                let symbol = CanonicalSIL.NativeBridgeSymbols.selectorInitializer(for: typeID)
+                guard let binding = directCalls.binding(for: symbol),
+                      binding.parameterTypes == [.string],
+                      binding.parameterConventions == [.owned],
+                      binding.resultType == .native(typeID),
+                      !binding.effects.mayThrow,
+                      !binding.effects.isAsync,
+                      case let .nativeImport(requirement) = binding.target
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "Selector construction has no exact frozen initializer"
+                    )
+                }
+                let string = try allocate(type: .string)
+                appendInstruction(.constantString(result: string, value: selector))
+                let result = try allocate(type: .native(typeID))
+                values[construction[0]] = result
+                appendInstruction(
+                    .nativeApply(
+                        result: result,
+                        importID: requirement.id,
+                        arguments: [string]
+                    )
+                )
+                continue
+            }
+
             if let alias = match(
                 line,
-                pattern: #"^(%[0-9]+) = struct_extract (%[0-9]+), #(?:Int|Int8|Int16|Int32|Int64|UInt|UInt8|UInt16|UInt32|UInt64|Bool|Float|Double)\._value$"#
+                pattern: #"^(%[0-9]+) = struct_extract (%[0-9]+), #(?:Int|Int8|Int16|Int32|Int64|UInt|UInt8|UInt16|UInt32|UInt64|Bool|Float|Double|CGFloat)\._value$"#
             ) {
                 values[alias[0]] = try resolve(alias[1], line: sourceLine)
                 continue
             }
             if let alias = match(
                 line,
-                pattern: #"^(%[0-9]+) = struct \$(Int|Int8|Int16|Int32|Int64|UInt|UInt8|UInt16|UInt32|UInt64|Bool|Float|Double) \((%[0-9]+)\)$"#
+                pattern: #"^(%[0-9]+) = struct \$(Int|Int8|Int16|Int32|Int64|UInt|UInt8|UInt16|UInt32|UInt64|Bool|Float|Double|CGFloat) \((%[0-9]+)\)$"#
             ) {
                 let operand = try resolve(alias[2], line: sourceLine)
                 if let unsignedWidth = unsignedIntegerWidth(of: alias[1]) {
@@ -2674,6 +3338,145 @@ public struct Lowerer: Sendable {
                 } else {
                     values[alias[0]] = operand
                 }
+                continue
+            }
+
+            if let construction = match(
+                line,
+                pattern: #"^(%[0-9]+) = struct \$(.+) \((%[0-9]+)\)$"#
+            ), case let .native(typeID) = try parseType(construction[1]) {
+                let operand = try resolve(construction[2], line: sourceLine)
+                let operandType = registerTypes[Int(operand.rawValue)]
+                let symbol = CanonicalSIL.NativeBridgeSymbols.rawValueInitializer(
+                    for: typeID
+                )
+                guard let binding = directCalls.binding(for: symbol),
+                      binding.parameterTypes == [operandType],
+                      binding.parameterConventions == [.owned],
+                      binding.resultType == .native(typeID),
+                      !binding.effects.mayThrow,
+                      !binding.effects.isAsync,
+                      case let .nativeImport(requirement) = binding.target
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "native raw-value construction has no exact frozen initializer"
+                    )
+                }
+                let result = try allocate(type: .native(typeID))
+                values[construction[0]] = result
+                appendInstruction(
+                    .nativeApply(
+                        result: result,
+                        importID: requirement.id,
+                        arguments: [try copyOwnedCallArgument(operand)]
+                    )
+                )
+                continue
+            }
+
+            if let cast = match(
+                line,
+                pattern: #"^(%[0-9]+) = init_existential_ref (%[0-9]+) : \$(.+) : \$.+, \$(?:Swift\.)?AnyObject$"#
+            ) {
+                let source = try resolve(cast[1], line: sourceLine)
+                guard case let .native(sourceType) = registerTypes[Int(source.rawValue)],
+                      case let .native(targetType) = try parseType("Swift.AnyObject"),
+                      sourceType != targetType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "AnyObject erasure source is not an exact frozen reference"
+                    )
+                }
+                let symbol = CanonicalSIL.NativeBridgeSymbols.upcast(
+                    from: sourceType,
+                    to: targetType
+                )
+                guard let binding = directCalls.binding(for: symbol),
+                      binding.parameterTypes == [.native(sourceType)],
+                      binding.parameterConventions == [.owned],
+                      binding.resultType == .native(targetType),
+                      !binding.effects.mayThrow,
+                      !binding.effects.isAsync,
+                      case let .nativeImport(requirement) = binding.target
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "AnyObject erasure has no exact frozen bridge"
+                    )
+                }
+                let sourceIsBorrowed = borrowedValueTokens.contains(cast[1])
+                    || isBorrowedParameter(source)
+                let argument = sourceIsBorrowed
+                    ? try copyOwnedCallArgument(source)
+                    : source
+                let result = try allocate(type: .native(targetType))
+                values[cast[0]] = result
+                if sourceIsBorrowed {
+                    borrowedNativeConversionValues[cast[0]] = result
+                }
+                appendInstruction(
+                    .nativeApply(
+                        result: result,
+                        importID: requirement.id,
+                        arguments: [argument]
+                    )
+                )
+                releaseBorrowedNativeConversionsAfterLastUse(
+                    [cast[1]],
+                    after: lineIndex
+                )
+                continue
+            }
+
+            if let cast = match(
+                line,
+                pattern: #"^(%[0-9]+) = upcast (%[0-9]+) to \$(.+)$"#
+            ) {
+                let source = try resolve(cast[1], line: sourceLine)
+                guard case let .native(sourceType) = registerTypes[Int(source.rawValue)],
+                      case let .native(targetType) = try parseType(cast[2]),
+                      sourceType != targetType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "native upcast source or destination is not an exact frozen reference"
+                    )
+                }
+                let symbol = CanonicalSIL.NativeBridgeSymbols.upcast(
+                    from: sourceType,
+                    to: targetType
+                )
+                guard let binding = directCalls.binding(for: symbol),
+                      binding.parameterTypes == [.native(sourceType)],
+                      binding.parameterConventions == [.owned],
+                      binding.resultType == .native(targetType),
+                      !binding.effects.mayThrow,
+                      !binding.effects.isAsync,
+                      case let .nativeImport(requirement) = binding.target
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "native upcast has no exact frozen bridge"
+                    )
+                }
+                let sourceIsBorrowed = borrowedValueTokens.contains(cast[1])
+                    || isBorrowedParameter(source)
+                let argument = sourceIsBorrowed
+                    ? try copyOwnedCallArgument(source)
+                    : source
+                let result = try allocate(type: .native(targetType))
+                values[cast[0]] = result
+                if sourceIsBorrowed {
+                    borrowedNativeConversionValues[cast[0]] = result
+                }
+                appendInstruction(
+                    .nativeApply(
+                        result: result,
+                        importID: requirement.id,
+                        arguments: [argument]
+                    )
+                )
+                releaseBorrowedNativeConversionsAfterLastUse(
+                    [cast[1]],
+                    after: lineIndex
+                )
                 continue
             }
 
@@ -2812,31 +3615,49 @@ public struct Lowerer: Sendable {
 
             if let reference = match(
                 line,
-                pattern: #"^(%[0-9]+) = (?:dynamic_)?function_ref @([^\s:]+) : \$(.+)$"#
+                pattern: #"^(%[0-9]+) = (?:objc|objc_super|class)_method .*, (#[^\s:]+) : .*, \$(.+)$"#
             ) {
-                if let intrinsic = SwiftCoreIntrinsic(mangledName: reference[1]) {
-                    swiftCoreReferences[reference[0]] = intrinsic
+                let usesObjectiveCBridge = reference[1].hasSuffix("foreign")
+                if usesObjectiveCBridge,
+                   reference[2].contains("@pseudogeneric")
+                    || reference[2].contains("τ_") {
+                    deferredForeignReferences[reference[0]] = (
+                        reference: reference[1],
+                        loweredType: reference[2]
+                    )
                     continue
                 }
-                if let key = typeEnvironment.structFactory(reference[1]) {
-                    localFactoryReferences[reference[0]] = key
-                    continue
-                }
-                guard let binding = directCalls.binding(for: reference[1]) else {
-                    if let unavailable = directCalls.unavailableCall(for: reference[1]) {
+                let exactForeignSymbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+                    reference: reference[1],
+                    loweredType: reference[2]
+                )
+                let resolvedSymbol = directCalls.binding(for: reference[1]) == nil
+                    ? exactForeignSymbol : reference[1]
+                guard let binding = directCalls.binding(for: resolvedSymbol) else {
+                    if let unavailable = directCalls.unavailableCall(for: resolvedSymbol)
+                        ?? directCalls.unavailableCall(for: reference[1]) {
                         throw CanonicalSIL.LoweringError.unavailableNativeImport(
                             line: sourceLine,
-                            mangledName: reference[1],
+                            mangledName: resolvedSymbol,
                             canonicalCallee: unavailable.canonicalCallee,
                             reason: unavailable.reason
                         )
                     }
                     throw CanonicalSIL.LoweringError.unboundCallee(
                         line: sourceLine,
-                        mangledName: reference[1]
+                        mangledName: exactForeignSymbol
                     )
                 }
-                let callee = try parseFunctionType(reference[2])
+                let physicalBridge: (
+                    parameters: [Bytecode.ValueType], result: Bytecode.ValueType
+                )? = usesObjectiveCBridge
+                    ? (binding.parameterTypes, binding.resultType)
+                    : nil
+                let callee = try parseFunctionType(
+                    reference[2],
+                    bridgingTo: physicalBridge,
+                    abiAdapter: binding.abiAdapter
+                )
                 guard callee.parameters == binding.parameterTypes,
                       acceptsPhysicalConventions(
                           callee.parameterConventions,
@@ -2858,7 +3679,80 @@ public struct Lowerer: Sendable {
                 functionReferences[reference[0]] = .init(
                     binding: binding,
                     physicalParameterConventions: callee.parameterConventions,
-                    hasIndirectResult: callee.hasIndirectResult
+                    hasIndirectResult: callee.hasIndirectResult,
+                    erasedNativeMetatypes: callee.erasedNativeMetatypes,
+                    usesObjectiveCBridge: usesObjectiveCBridge
+                )
+                continue
+            }
+
+            if let reference = match(
+                line,
+                pattern: #"^(%[0-9]+) = (?:dynamic_)?function_ref @([^\s:]+) : \$(.+)$"#
+            ) {
+                if let intrinsic = SwiftCoreIntrinsic(mangledName: reference[1]) {
+                    swiftCoreReferences[reference[0]] = intrinsic
+                    continue
+                }
+                if let intrinsic = ObjectiveCBridgeIntrinsic(
+                    mangledName: reference[1],
+                    loweredType: reference[2]
+                ) {
+                    objectiveCBridgeReferences[reference[0]] = intrinsic
+                    continue
+                }
+                if reference[1]
+                    == CanonicalSIL.NativeBridgeSymbols.optionSetArrayLiteralSILSymbol {
+                    optionSetArrayLiteralReferences[reference[0]] = reference[2]
+                    continue
+                }
+                if let key = typeEnvironment.structFactory(reference[1]) {
+                    localFactoryReferences[reference[0]] = key
+                    continue
+                }
+                guard let binding = directCalls.binding(for: reference[1]) else {
+                    if let unavailable = directCalls.unavailableCall(for: reference[1]) {
+                        throw CanonicalSIL.LoweringError.unavailableNativeImport(
+                            line: sourceLine,
+                            mangledName: reference[1],
+                            canonicalCallee: unavailable.canonicalCallee,
+                            reason: unavailable.reason
+                        )
+                    }
+                    throw CanonicalSIL.LoweringError.unboundCallee(
+                        line: sourceLine,
+                        mangledName: reference[1]
+                    )
+                }
+                let callee = try parseFunctionType(
+                    reference[2],
+                    bridgingTo: (binding.parameterTypes, binding.resultType),
+                    abiAdapter: binding.abiAdapter
+                )
+                guard callee.parameters == binding.parameterTypes,
+                      acceptsPhysicalConventions(
+                          callee.parameterConventions,
+                          for: binding
+                      ),
+                      callee.result == binding.resultType,
+                      callee.effects.mayThrow == binding.effects.mayThrow,
+                      callee.effects.isAsync == binding.effects.isAsync
+                else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: sourceLine,
+                        mangledName: reference[1],
+                        detail: "actual \(callee.parameters) \(callee.parameterConventions) "
+                            + "-> \(callee.result) \(callee.effects); expected "
+                            + "\(binding.parameterTypes) \(binding.parameterConventions) "
+                            + "-> \(binding.resultType) \(binding.effects)"
+                    )
+                }
+                functionReferences[reference[0]] = .init(
+                    binding: binding,
+                    physicalParameterConventions: callee.parameterConventions,
+                    hasIndirectResult: callee.hasIndirectResult,
+                    erasedNativeMetatypes: callee.erasedNativeMetatypes,
+                    usesObjectiveCBridge: false
                 )
                 continue
             }
@@ -3015,12 +3909,20 @@ public struct Lowerer: Sendable {
                     arrayLiteralStorageTokens[borrowed[0]] = allocation
                 } else if let reference = functionReferences[borrowed[1]] {
                     functionReferences[borrowed[0]] = reference
+                } else if let reference = deferredForeignReferences[borrowed[1]] {
+                    deferredForeignReferences[borrowed[0]] = reference
                 } else if let reference = swiftCoreReferences[borrowed[1]] {
                     swiftCoreReferences[borrowed[0]] = reference
+                } else if let reference = objectiveCBridgeReferences[borrowed[1]] {
+                    objectiveCBridgeReferences[borrowed[0]] = reference
                 } else if let key = localFactoryReferences[borrowed[1]] {
                     localFactoryReferences[borrowed[0]] = key
                 } else {
                     values[borrowed[0]] = try resolve(borrowed[1], line: sourceLine)
+                    borrowedValueTokens.insert(borrowed[0])
+                    if let payload = knownOptionalSomePayloads[borrowed[1]] {
+                        knownOptionalSomePayloads[borrowed[0]] = payload
+                    }
                 }
                 continue
             }
@@ -3090,9 +3992,22 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^try_apply (%[0-9]+)(?:<(.+)>)?\((.*)\) : \$(.+), normal bb([0-9]+), error bb([0-9]+)$"#
             ) {
-                guard swiftCoreReferences[call[0]] == nil,
-                      let reference = functionReferences[call[0]]
-                else {
+                guard swiftCoreReferences[call[0]] == nil else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: line
+                    )
+                }
+                let reference: ResolvedFunctionReference
+                if let resolved = functionReferences[call[0]] {
+                    reference = resolved
+                } else if let deferred = deferredForeignReferences[call[0]] {
+                    reference = try resolveDeferredForeignReference(
+                        deferred,
+                        genericArguments: call[1],
+                        line: sourceLine
+                    )
+                } else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
                         text: line
@@ -3108,12 +4023,17 @@ public struct Lowerer: Sendable {
                         text: line
                     )
                 }
-                let appliedType = try parseFunctionType(call[3])
+                let appliedType = try parseFunctionType(
+                    call[3],
+                    bridgingTo: (binding.parameterTypes, binding.resultType),
+                    abiAdapter: binding.abiAdapter
+                )
                 guard appliedType.parameters == binding.parameterTypes,
                       appliedType.parameterConventions
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
                       appliedType.hasIndirectResult == reference.hasIndirectResult,
+                      appliedType.erasedNativeMetatypes == reference.erasedNativeMetatypes,
                       appliedType.effects.mayThrow,
                       !appliedType.effects.isAsync,
                       call[1].isEmpty
@@ -3130,9 +4050,10 @@ public struct Lowerer: Sendable {
                     line: sourceLine
                 )
                 if reference.hasIndirectResult {
-                    guard binding.resultType.isAnyPayloadOrExistentialV1,
+                    guard supportsIndirectResult(binding.resultType),
                           argumentTokens.count
-                            == reference.physicalParameterConventions.count + 1
+                            == reference.physicalParameterConventions.count
+                                + reference.erasedNativeMetatypes.count + 1
                     else {
                         throw CanonicalSIL.LoweringError.unsupportedType(
                             "indirect throwing call result \(binding.resultType)"
@@ -3153,6 +4074,11 @@ public struct Lowerer: Sendable {
                         (destination, result),
                     ]
                 }
+                argumentTokens = try eraseNativeMetatypeArguments(
+                    argumentTokens,
+                    for: reference,
+                    line: sourceLine
+                )
                 let prepared = try prepareDirectCallArguments(
                     argumentTokens,
                     conventions: reference.physicalParameterConventions,
@@ -3227,7 +4153,7 @@ public struct Lowerer: Sendable {
                     )
                     let indirectResultDestination: String?
                     if appliedType.hasIndirectResult {
-                        guard signature.result.isAnyPayloadOrExistentialV1,
+                        guard supportsIndirectResult(signature.result),
                               argumentTokens.count == signature.parameters.count + 1
                         else {
                             throw CanonicalSIL.LoweringError.unsupportedType(
@@ -3370,19 +4296,124 @@ public struct Lowerer: Sendable {
                     )
                     continue
                 }
-                guard let reference = functionReferences[call[1]] else {
+                if let intrinsic = objectiveCBridgeReferences[call[1]] {
+                    try lowerObjectiveCBridgeIntrinsic(
+                        intrinsic,
+                        resultToken: call[0],
+                        genericArguments: call[2],
+                        argumentText: call[3],
+                        loweredType: call[4],
+                        line: sourceLine
+                    )
+                    continue
+                }
+                let reference: ResolvedFunctionReference
+                let appliedLoweredType: String
+                if let resolved = functionReferences[call[1]] {
+                    reference = resolved
+                    appliedLoweredType = call[4]
+                } else if let deferred = deferredForeignReferences[call[1]] {
+                    reference = try resolveDeferredForeignReference(
+                        deferred,
+                        genericArguments: call[2],
+                        line: sourceLine
+                    )
+                    appliedLoweredType = call[4]
+                } else if let deferredType = optionSetArrayLiteralReferences[call[1]] {
+                    let substitutions = splitTopLevel(call[2]).filter { !$0.isEmpty }
+                    guard substitutions.count == 1,
+                          case let .native(typeID) = try parseType(substitutions[0])
+                    else {
+                        throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                            line: sourceLine,
+                            text: "OptionSet array literal without one frozen concrete type"
+                        )
+                    }
+                    let symbol = CanonicalSIL.NativeBridgeSymbols
+                        .optionSetArrayLiteralInitializer(for: typeID)
+                    guard let binding = directCalls.binding(for: symbol),
+                          binding.parameterTypes == [.array(.native(typeID))],
+                          binding.resultType == .native(typeID),
+                          binding.abiAdapter == .direct,
+                          !binding.effects.mayThrow,
+                          !binding.effects.isAsync,
+                          case .nativeImport = binding.target
+                    else {
+                        if let unavailable = directCalls.unavailableCall(for: symbol) {
+                            throw CanonicalSIL.LoweringError.unavailableNativeImport(
+                                line: sourceLine,
+                                mangledName: symbol,
+                                canonicalCallee: unavailable.canonicalCallee,
+                                reason: unavailable.reason
+                            )
+                        }
+                        throw CanonicalSIL.LoweringError.unboundCallee(
+                            line: sourceLine,
+                            mangledName: symbol
+                        )
+                    }
+                    func specialize(_ raw: String) -> String {
+                        raw.replacingOccurrences(
+                            of: "τ_0_0.ArrayLiteralElement",
+                            with: substitutions[0]
+                        ).replacingOccurrences(
+                            of: "τ_0_0.Element",
+                            with: substitutions[0]
+                        ).replacingOccurrences(
+                            of: "τ_0_0",
+                            with: substitutions[0]
+                        )
+                    }
+                    let specializedReferenceType = specialize(deferredType)
+                    appliedLoweredType = specialize(call[4])
+                    let callee = try parseFunctionType(
+                        specializedReferenceType,
+                        bridgingTo: (binding.parameterTypes, binding.resultType)
+                    )
+                    guard callee.parameters == binding.parameterTypes,
+                          acceptsPhysicalConventions(
+                              callee.parameterConventions,
+                              for: binding
+                          ),
+                          callee.result == binding.resultType,
+                          callee.effects.mayThrow == binding.effects.mayThrow,
+                          callee.effects.isAsync == binding.effects.isAsync
+                    else {
+                        throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                            line: sourceLine,
+                            mangledName: symbol,
+                            detail: "specialized reference has \(callee.parameters) "
+                                + "\(callee.parameterConventions) -> \(callee.result) "
+                                + "\(callee.effects); expected \(binding.parameterTypes) "
+                                + "\(binding.parameterConventions) -> \(binding.resultType) "
+                                + "\(binding.effects)"
+                        )
+                    }
+                    reference = .init(
+                        binding: binding,
+                        physicalParameterConventions: callee.parameterConventions,
+                        hasIndirectResult: callee.hasIndirectResult,
+                        erasedNativeMetatypes: callee.erasedNativeMetatypes,
+                        usesObjectiveCBridge: false
+                    )
+                } else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
                         text: line
                     )
                 }
                 let binding = reference.binding
-                let appliedType = try parseFunctionType(call[4])
+                let appliedType = try parseFunctionType(
+                    appliedLoweredType,
+                    bridgingTo: (binding.parameterTypes, binding.resultType),
+                    abiAdapter: binding.abiAdapter
+                )
                 guard appliedType.parameters == binding.parameterTypes,
                       appliedType.parameterConventions
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
                       appliedType.hasIndirectResult == reference.hasIndirectResult,
+                      appliedType.erasedNativeMetatypes == reference.erasedNativeMetatypes,
                       appliedType.effects.mayThrow == binding.effects.mayThrow,
                       appliedType.effects.isAsync == binding.effects.isAsync,
                       !binding.effects.isAsync
@@ -3398,9 +4429,10 @@ public struct Lowerer: Sendable {
                 )
                 let indirectResultDestination: String?
                 if reference.hasIndirectResult {
-                    guard binding.resultType.isAnyPayloadOrExistentialV1,
+                    guard supportsIndirectResult(binding.resultType),
                           argumentTokens.count
-                            == reference.physicalParameterConventions.count + 1
+                            == reference.physicalParameterConventions.count
+                                + reference.erasedNativeMetatypes.count + 1
                     else {
                         throw CanonicalSIL.LoweringError.unsupportedType(
                             "indirect call result \(binding.resultType)"
@@ -3415,6 +4447,25 @@ public struct Lowerer: Sendable {
                     indirectResultDestination = destination
                 } else {
                     indirectResultDestination = nil
+                }
+                argumentTokens = try eraseNativeMetatypeArguments(
+                    argumentTokens,
+                    for: reference,
+                    line: sourceLine
+                )
+                if binding.abiAdapter == .mutatingValueReceiver {
+                    guard indirectResultDestination == nil else {
+                        throw CanonicalSIL.LoweringError.invalidCallTable(
+                            "mutating value-receiver call unexpectedly has an indirect result"
+                        )
+                    }
+                    try lowerMutatingValueReceiverApply(
+                        resultToken: call[0],
+                        argumentTokens: argumentTokens,
+                        reference: reference,
+                        line: sourceLine
+                    )
+                    continue
                 }
                 let prepared = try prepareDirectCallArguments(
                     argumentTokens,
@@ -3480,25 +4531,48 @@ public struct Lowerer: Sendable {
                 for access in prepared.accesses.reversed() {
                     appendInstruction(.endAccess(access))
                 }
+                releaseBorrowedNativeConversionsAfterLastUse(
+                    zip(
+                        argumentTokens,
+                        reference.physicalParameterConventions
+                    ).compactMap { token, convention in
+                        convention == .borrowed ? token : nil
+                    },
+                    after: lineIndex
+                )
                 continue
             }
 
             if let tuple = match(
                 line,
                 pattern: #"^\((%[0-9]+), (%[0-9]+)\) = destructure_tuple (%[0-9]+)$"#
-            ), pendingArrayLiterals[tuple[2]] != nil {
-                arrayLiteralAllocationByValue[tuple[0]] = tuple[2]
-                arrayLiteralStorageTokens[tuple[1]] = tuple[2]
+            ), let pending = pendingArrayLiterals[tuple[2]] {
+                if pending.count == 0 {
+                    let result = try allocate(type: .array(pending.elementType))
+                    values[tuple[0]] = result
+                    appendInstruction(.makeArray(result: result, elements: []))
+                    pendingArrayLiterals.removeValue(forKey: tuple[2])
+                } else {
+                    arrayLiteralAllocationByValue[tuple[0]] = tuple[2]
+                    arrayLiteralStorageTokens[tuple[1]] = tuple[2]
+                }
                 continue
             }
 
             if let tuple = match(
                 line,
                 pattern: #"^(%[0-9]+) = tuple_extract (%[0-9]+), ([0-9]+)$"#
-            ), pendingArrayLiterals[tuple[1]] != nil {
+            ), let pending = pendingArrayLiterals[tuple[1]] {
                 switch tuple[2] {
                 case "0":
-                    arrayLiteralAllocationByValue[tuple[0]] = tuple[1]
+                    if pending.count == 0 {
+                        let result = try allocate(type: .array(pending.elementType))
+                        values[tuple[0]] = result
+                        appendInstruction(.makeArray(result: result, elements: []))
+                        pendingArrayLiterals.removeValue(forKey: tuple[1])
+                    } else {
+                        arrayLiteralAllocationByValue[tuple[0]] = tuple[1]
+                    }
                 case "1":
                     arrayLiteralStorageTokens[tuple[0]] = tuple[1]
                 default:
@@ -3536,6 +4610,32 @@ public struct Lowerer: Sendable {
             ), let allocation = arrayLiteralStorageTokens[projection[1]]
                 ?? arrayLiteralAllocationByValue[projection[1]] {
                 arrayLiteralStorageTokens[projection[0]] = allocation
+                continue
+            }
+
+            if let cast = match(
+                line,
+                pattern: #"^(%[0-9]+) = unchecked_ref_cast (%[0-9]+) to \$Optional<(.+)>$"#
+            ) {
+                let source = try resolve(cast[1], line: sourceLine)
+                let sourceType = registerTypes[Int(source.rawValue)]
+                guard sourceType.requiresLinearOwnership,
+                      try parsePhysicalType(cast[2], bridgedTo: sourceType) == sourceType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "unchecked reference-to-Optional cast changes its frozen VM type"
+                    )
+                }
+                let result = try allocate(type: .optional(sourceType))
+                values[cast[0]] = result
+                knownOptionalSomePayloads[cast[0]] = source
+                appendInstruction(.makeOptionalSome(result: result, value: source))
+                try transferBorrowedNativeConversionLifetime(
+                    from: cast[1],
+                    resolved: source,
+                    to: cast[0],
+                    result: result
+                )
                 continue
             }
 
@@ -3665,6 +4765,7 @@ public struct Lowerer: Sendable {
                 let wrapped = registerTypes[Int(projection.payload.rawValue)]
                 stackAddressTypes[extraction[0]] = wrapped
                 stackAddressValues[extraction[0]] = projection.payload
+                takenOptionalPayloadRoots[extraction[0]] = projection.address
                 continue
             }
 
@@ -3672,8 +4773,20 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = enum \$Optional<(.+)>, #Optional\.some!enumelt, (%[0-9]+)$"#
             ) {
+                if voidValues.contains(optional[2]),
+                   (try? parseType(optional[1])) == .void {
+                    let result = try allocate(type: .bool)
+                    values[optional[0]] = result
+                    compilerOptionalVoidValues.insert(optional[0])
+                    appendInstruction(.constantBool(result: result, value: true))
+                    continue
+                }
                 let payload = try resolve(optional[2], line: sourceLine)
-                let wrapped = try parseType(optional[1])
+                let payloadType = registerTypes[Int(payload.rawValue)]
+                let wrapped = try parsePhysicalType(
+                    optional[1],
+                    bridgedTo: payloadType
+                )
                 guard registerTypes[Int(payload.rawValue)] == wrapped else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Optional.some payload does not match its SIL type"
@@ -3681,7 +4794,14 @@ public struct Lowerer: Sendable {
                 }
                 let result = try allocate(type: .optional(wrapped))
                 values[optional[0]] = result
+                knownOptionalSomePayloads[optional[0]] = payload
                 appendInstruction(.makeOptionalSome(result: result, value: payload))
+                try transferBorrowedNativeConversionLifetime(
+                    from: optional[2],
+                    resolved: payload,
+                    to: optional[0],
+                    result: result
+                )
                 continue
             }
 
@@ -3689,9 +4809,64 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = enum \$Optional<(.+)>, #Optional\.none!enumelt$"#
             ) {
-                let result = try allocate(type: .optional(parseType(optional[1])))
+                let wrapped: Bytecode.ValueType
+                if let resolved = try? parseType(optional[1]) {
+                    wrapped = resolved
+                } else if isSupportedObjectiveCBridgeSpelling(
+                    optional[1],
+                    to: .string
+                ) {
+                    wrapped = .string
+                } else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(optional[1])
+                }
+                if wrapped == .void {
+                    let result = try allocate(type: .bool)
+                    values[optional[0]] = result
+                    compilerOptionalVoidValues.insert(optional[0])
+                    appendInstruction(.constantBool(result: result, value: false))
+                    continue
+                }
+                let result = try allocate(type: .optional(wrapped))
                 values[optional[0]] = result
                 appendInstruction(.makeOptionalNone(result: result))
+                continue
+            }
+
+            if let enumeration = match(
+                line,
+                pattern: #"^(%[0-9]+) = enum \$(.+), #([^!]+)!enumelt$"#
+            ), case let .native(typeID) = try parseType(enumeration[1]) {
+                let reference = "#\(enumeration[2])!enumelt"
+                guard let binding = directCalls.binding(for: reference),
+                      binding.parameterTypes.isEmpty,
+                      binding.resultType == .native(typeID),
+                      !binding.effects.mayThrow,
+                      !binding.effects.isAsync,
+                      case let .nativeImport(requirement) = binding.target
+                else {
+                    if let unavailable = directCalls.unavailableCall(for: reference) {
+                        throw CanonicalSIL.LoweringError.unavailableNativeImport(
+                            line: sourceLine,
+                            mangledName: reference,
+                            canonicalCallee: unavailable.canonicalCallee,
+                            reason: unavailable.reason
+                        )
+                    }
+                    throw CanonicalSIL.LoweringError.unboundCallee(
+                        line: sourceLine,
+                        mangledName: reference
+                    )
+                }
+                let result = try allocate(type: .native(typeID))
+                values[enumeration[0]] = result
+                appendInstruction(
+                    .nativeApply(
+                        result: result,
+                        importID: requirement.id,
+                        arguments: []
+                    )
+                )
                 continue
             }
 
@@ -4137,6 +5312,28 @@ public struct Lowerer: Sendable {
             if let load = match(
                 line,
                 pattern: #"^(%[0-9]+) = load(?: \[(trivial|copy|take)\])? (%[0-9]+)$"#
+            ), let binding = nativeGlobalAddresses[load[2]],
+               case let .nativeImport(requirement) = binding.target {
+                guard load[1] != "take" else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "an imported global value cannot be taken"
+                    )
+                }
+                let result = try allocate(type: binding.resultType)
+                values[load[0]] = result
+                appendInstruction(
+                    .nativeApply(
+                        result: result,
+                        importID: requirement.id,
+                        arguments: []
+                    )
+                )
+                continue
+            }
+
+            if let load = match(
+                line,
+                pattern: #"^(%[0-9]+) = load(?: \[(trivial|copy|take)\])? (%[0-9]+)$"#
             ) {
                 let mode = load[1]
                 let address = addressBase(load[2])
@@ -4310,11 +5507,13 @@ public struct Lowerer: Sendable {
                         "destroy_addr references an unsupported address"
                     )
                 }
-                // Compiler-only stack aliases are backed by SSA registers.
-                // Keeping their values until frame exit is memory-safe and
-                // avoids creating a non-dominating destroy when SIL emits the
-                // same lexical cleanup in mutually exclusive blocks.
-                stackAddressValues.removeValue(forKey: address)
+                // Compiler-only storage owns the SSA value transferred into
+                // it. Native boxes need an explicit HLBC destroy even when the
+                // physical Swift value has trivial SIL ownership.
+                if let value = stackAddressValues.removeValue(forKey: address),
+                   registerTypes[Int(value.rawValue)].requiresLinearOwnership {
+                    appendInstruction(.destroyValue(value))
+                }
                 continue
             }
 
@@ -4557,8 +5756,20 @@ public struct Lowerer: Sendable {
                     functionReferences[copy[0]] = reference
                     continue
                 }
+                if let reference = deferredForeignReferences[copy[1]] {
+                    deferredForeignReferences[copy[0]] = reference
+                    continue
+                }
                 if let reference = swiftCoreReferences[copy[1]] {
                     swiftCoreReferences[copy[0]] = reference
+                    continue
+                }
+                if let reference = objectiveCBridgeReferences[copy[1]] {
+                    objectiveCBridgeReferences[copy[0]] = reference
+                    continue
+                }
+                if let reference = optionSetArrayLiteralReferences[copy[1]] {
+                    optionSetArrayLiteralReferences[copy[0]] = reference
                     continue
                 }
                 if let key = localFactoryReferences[copy[1]] {
@@ -4568,7 +5779,20 @@ public struct Lowerer: Sendable {
                 let source = try resolve(copy[1], line: sourceLine)
                 let result = try allocate(type: registerTypes[Int(source.rawValue)])
                 values[copy[0]] = result
+                if let payload = knownOptionalSomePayloads[copy[1]] {
+                    knownOptionalSomePayloads[copy[0]] = payload
+                }
+                if let selection = optionalAddressSelectionConditions[copy[1]] {
+                    optionalAddressSelectionConditions[copy[0]] = selection
+                }
+                if compilerOptionalVoidValues.contains(copy[1]) {
+                    compilerOptionalVoidValues.insert(copy[0])
+                }
                 appendInstruction(.copyValue(result: result, source: source))
+                releaseBorrowedNativeConversionsAfterLastUse(
+                    [copy[1]],
+                    after: lineIndex
+                )
                 continue
             }
             if let move = match(
@@ -4579,8 +5803,22 @@ public struct Lowerer: Sendable {
                     functionReferences[move[0]] = reference
                     continue
                 }
+                if let reference = deferredForeignReferences.removeValue(forKey: move[1]) {
+                    deferredForeignReferences[move[0]] = reference
+                    continue
+                }
                 if let reference = swiftCoreReferences.removeValue(forKey: move[1]) {
                     swiftCoreReferences[move[0]] = reference
+                    continue
+                }
+                if let reference = objectiveCBridgeReferences.removeValue(forKey: move[1]) {
+                    objectiveCBridgeReferences[move[0]] = reference
+                    continue
+                }
+                if let reference = optionSetArrayLiteralReferences.removeValue(
+                    forKey: move[1]
+                ) {
+                    optionSetArrayLiteralReferences[move[0]] = reference
                     continue
                 }
                 if let key = localFactoryReferences.removeValue(forKey: move[1]) {
@@ -4590,14 +5828,39 @@ public struct Lowerer: Sendable {
                 let source = try resolve(move[1], line: sourceLine)
                 let result = try allocate(type: registerTypes[Int(source.rawValue)])
                 values[move[0]] = result
+                if let payload = knownOptionalSomePayloads.removeValue(forKey: move[1]) {
+                    knownOptionalSomePayloads[move[0]] = payload
+                }
+                if let selection = optionalAddressSelectionConditions.removeValue(
+                    forKey: move[1]
+                ) {
+                    optionalAddressSelectionConditions[move[0]] = selection
+                }
+                if compilerOptionalVoidValues.remove(move[1]) != nil {
+                    compilerOptionalVoidValues.insert(move[0])
+                }
                 appendInstruction(.moveValue(result: result, source: source))
                 continue
             }
             if let destroy = match(line, pattern: #"^destroy_value (%[0-9]+)$"#) {
                 if functionReferences.removeValue(forKey: destroy[0]) != nil { continue }
+                if deferredForeignReferences.removeValue(forKey: destroy[0]) != nil {
+                    continue
+                }
                 if swiftCoreReferences.removeValue(forKey: destroy[0]) != nil { continue }
+                if objectiveCBridgeReferences.removeValue(forKey: destroy[0]) != nil { continue }
+                if optionSetArrayLiteralReferences.removeValue(forKey: destroy[0]) != nil {
+                    continue
+                }
                 if localFactoryReferences.removeValue(forKey: destroy[0]) != nil { continue }
+                knownOptionalSomePayloads.removeValue(forKey: destroy[0])
+                optionalAddressSelectionConditions.removeValue(forKey: destroy[0])
+                compilerOptionalVoidValues.remove(destroy[0])
                 let value = try resolve(destroy[0], line: sourceLine)
+                try closeBorrowedNativeConversionLifetime(
+                    for: destroy[0],
+                    resolved: value
+                )
                 if case .closure = registerTypes[Int(value.rawValue)] { continue }
                 appendInstruction(.destroyValue(value))
                 continue
@@ -4613,6 +5876,10 @@ public struct Lowerer: Sendable {
                     // its release remains an explicit linear consume.
                     if ownership[0] == "release_value",
                        !isBorrowedParameter(value) {
+                        try closeBorrowedNativeConversionLifetime(
+                            for: ownership[1],
+                            resolved: value
+                        )
                         appendInstruction(.destroyValue(value))
                     }
                 }
@@ -4634,7 +5901,55 @@ public struct Lowerer: Sendable {
                     )
                 }
                 if ownership[0] == "release", !isBorrowedParameter(value) {
+                    try closeBorrowedNativeConversionLifetime(
+                        for: ownership[1],
+                        resolved: value
+                    )
                     appendInstruction(.destroyValue(value))
+                }
+                continue
+            }
+
+            if let selection = match(
+                line,
+                pattern: #"^(%[0-9]+) = select_enum_addr (%[0-9]+), case #Optional\.(some|none)!enumelt: (%[0-9]+), default (%[0-9]+) : \$Builtin\.Int1$"#
+            ) {
+                guard let optional = stackValue(at: selection[1]),
+                      case .optional = registerTypes[Int(optional.rawValue)],
+                      let caseValue = boolLiterals[selection[3]],
+                      let defaultValue = boolLiterals[selection[4]],
+                      caseValue != defaultValue
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "select_enum_addr requires initialized Optional storage and complementary Bool values"
+                    )
+                }
+                let someValue = selection[2] == "some" ? caseValue : defaultValue
+                let result = try allocate(type: .bool)
+                values[selection[0]] = result
+                optionalAddressSelectionConditions[selection[0]] = (
+                    address: selection[1],
+                    someWhenTrue: someValue
+                )
+                if someValue {
+                    appendInstruction(.optionalIsSome(result: result, optional: optional))
+                } else {
+                    let isSome = try allocate(type: .bool)
+                    let trueToken = caseValue ? selection[3] : selection[4]
+                    guard let trueValue = values[trueToken] else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "select_enum_addr lost its true Bool operand"
+                        )
+                    }
+                    appendInstruction(.optionalIsSome(result: isSome, optional: optional))
+                    appendInstruction(
+                        .booleanBinary(
+                            result: result,
+                            operation: .xor,
+                            lhs: isSome,
+                            rhs: trueValue
+                        )
+                    )
                 }
                 continue
             }
@@ -4671,6 +5986,11 @@ public struct Lowerer: Sendable {
                     address: branch[0],
                     payload: payload
                 )
+                try inheritCompilerAddressValue(
+                    optional,
+                    at: branch[0],
+                    into: [someTarget, noneTarget]
+                )
                 appendInstruction(
                     .switchOptional(
                         optional: optional,
@@ -4697,6 +6017,31 @@ public struct Lowerer: Sendable {
                         )
                     )
                 }
+                continue
+            }
+
+            if let branch = match(
+                line,
+                pattern: #"^switch_enum (%[0-9]+), case #Optional\.(some|none)!enumelt: bb([0-9]+), case #Optional\.(some|none)!enumelt: bb([0-9]+)$"#
+            ), compilerOptionalVoidValues.contains(branch[0]) {
+                guard branch[1] != branch[3] else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional<Void> switch must contain distinct cases"
+                    )
+                }
+                let firstTarget = try parseBlockID(branch[2])
+                let secondTarget = try parseBlockID(branch[4])
+                let someTarget = branch[1] == "some" ? firstTarget : secondTarget
+                let noneTarget = branch[1] == "none" ? firstTarget : secondTarget
+                appendInstruction(
+                    .conditionalBranch(
+                        condition: try resolve(branch[0], line: sourceLine),
+                        trueTarget: someTarget,
+                        trueArguments: [],
+                        falseTarget: noneTarget,
+                        falseArguments: []
+                    )
+                )
                 continue
             }
 
@@ -4888,6 +6233,68 @@ public struct Lowerer: Sendable {
             }
             if let branch = match(
                 line,
+                pattern: #"^cond_br (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
+            ), let selection = optionalAddressSelectionConditions.removeValue(
+                forKey: branch[0]
+            ) {
+                let trueTarget = try parseBlockID(branch[1])
+                let falseTarget = try parseBlockID(branch[2])
+                let someTarget = selection.someWhenTrue ? trueTarget : falseTarget
+                let noneTarget = selection.someWhenTrue ? falseTarget : trueTarget
+                guard let optional = stackValue(at: selection.address),
+                      case let .optional(wrapped) = registerTypes[Int(optional.rawValue)],
+                      optionalSourceBySomeBlock[someTarget] == nil,
+                      optionalSourceByNoneBlock[noneTarget] == nil,
+                      optionalAddressPayloadByBlock[someTarget] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional address condition does not dominate distinct case blocks"
+                    )
+                }
+                optionalSourceBySomeBlock[someTarget] = selection.address
+                optionalSourceByNoneBlock[noneTarget] = selection.address
+                let payload = try allocate(type: wrapped)
+                let payloadTarget = try allocateSyntheticBlockID()
+                optionalAddressPayloadByBlock[someTarget] = (
+                    address: selection.address,
+                    payload: payload
+                )
+                try inheritCompilerAddressValue(
+                    optional,
+                    at: selection.address,
+                    into: [someTarget, noneTarget]
+                )
+                appendInstruction(
+                    .switchOptional(
+                        optional: optional,
+                        someTarget: payloadTarget,
+                        noneTarget: noneTarget
+                    )
+                )
+                finishCurrent()
+                blocks.append(
+                    .init(
+                        id: payloadTarget,
+                        parameters: [payload],
+                        instructions: [
+                            .branch(target: someTarget, arguments: []),
+                        ]
+                    )
+                )
+                if let currentSourceLocation {
+                    sourceMap.append(
+                        .init(
+                            blockID: payloadTarget,
+                            instructionOffset: 0,
+                            location: currentSourceLocation
+                        )
+                    )
+                }
+                continue
+            }
+
+            if let branch = match(
+                line,
                 pattern: #"^cond_br (%[0-9]+), bb([0-9]+)(?:\(([^)]*)\))?, bb([0-9]+)(?:\(([^)]*)\))?$"#
             ) {
                 let trueTarget = try parseBlockID(branch[1])
@@ -5001,34 +6408,64 @@ public struct Lowerer: Sendable {
             )
         }
         guard optionalAddressInitializations.isEmpty,
-              optionalPayloadAddressRoots.isEmpty
+              optionalPayloadAddressRoots.isEmpty,
+              optionalAddressSelectionConditions.isEmpty
         else {
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "Optional address initialization is incomplete"
             )
         }
-        guard pendingArrayIteratorTypes.isEmpty,
-              arrayIteratorStates.isEmpty,
-              destroyedArrayIterators.isEmpty,
-              integerRangeValues.isEmpty,
-              integerRangeAddresses.isEmpty,
-              integerRangeAddressValues.isEmpty,
-              integerRangeIteratorAddresses.isEmpty,
-              integerRangeIteratorStates.isEmpty,
-              pendingIntegerRangeNextAddresses.isEmpty,
-              pendingIntegerRangeNextValues.isEmpty,
-              arrayElementMutations.isEmpty,
-              arrayMutationYieldByToken.isEmpty,
-              pendingDictionaryIteratorTypes.isEmpty,
-              pendingDictionaryIteratorValues.isEmpty,
-              dictionaryIteratorStates.isEmpty,
-              destroyedDictionaryIterators.isEmpty,
-              pendingStringInterpolationAddresses.isEmpty,
-              stringInterpolationAddressValues.isEmpty,
-              stringInterpolationValues.isEmpty
-        else {
+        var incompleteCompilerLifetimes: [String] = []
+        func recordIncompleteLifetime(_ name: String, count: Int) {
+            guard count > 0 else { return }
+            incompleteCompilerLifetimes.append("\(name)=\(count)")
+        }
+        recordIncompleteLifetime(
+            "array-iterator",
+            count: pendingArrayIteratorTypes.count
+                + arrayIteratorStates.count
+                + destroyedArrayIterators.count
+        )
+        recordIncompleteLifetime(
+            "integer-range",
+            count: integerRangeValues.count
+                + integerRangeAddresses.count
+                + integerRangeAddressValues.count
+                + integerRangeIteratorAddresses.count
+                + integerRangeIteratorStates.count
+                + pendingIntegerRangeNextAddresses.count
+                + pendingIntegerRangeNextValues.count
+        )
+        recordIncompleteLifetime(
+            "array-mutation",
+            count: arrayElementMutations.count + arrayMutationYieldByToken.count
+        )
+        recordIncompleteLifetime(
+            "dictionary-iterator",
+            count: pendingDictionaryIteratorTypes.count
+                + pendingDictionaryIteratorValues.count
+                + dictionaryIteratorStates.count
+                + destroyedDictionaryIterators.count
+        )
+        recordIncompleteLifetime(
+            "string-interpolation",
+            count: pendingStringInterpolationAddresses.count
+                + stringInterpolationAddressValues.count
+                + stringInterpolationValues.count
+        )
+        recordIncompleteLifetime(
+            "borrow",
+            count: borrowedValueTokens.count
+        )
+        let nativeConversionTokens = borrowedNativeConversionValues.keys.sorted()
+        recordIncompleteLifetime(
+            "native-conversion[\(nativeConversionTokens.joined(separator: "|"))]",
+            count: nativeConversionTokens.count
+        )
+        guard incompleteCompilerLifetimes.isEmpty else {
             throw CanonicalSIL.LoweringError.malformedSIL(
-                "compiler-only iterator or interpolation lifetime is incomplete"
+                "compiler-only lifetime is incomplete: "
+                    + incompleteCompilerLifetimes.joined(separator: ", ")
             )
         }
 
@@ -5074,18 +6511,24 @@ public struct Lowerer: Sendable {
         }
         return parameterConventions(
             rawParameters: rawParameters,
-            parameterTypes: parameterTypes
+            parameterTypes: parameterTypes,
+            implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix)
         )
     }
 
     func parseFunctionType(
-        _ text: String
+        _ text: String,
+        bridgingTo expected: (
+            parameters: [Bytecode.ValueType], result: Bytecode.ValueType
+        )? = nil,
+        abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter = .direct
     ) throws -> (
         parameters: [Bytecode.ValueType],
         parameterConventions: [Bytecode.ParameterConvention],
         result: Bytecode.ValueType,
         hasIndirectResult: Bool,
-        effects: Core.Effects
+        effects: Core.Effects,
+        erasedNativeMetatypes: [ErasedNativeMetatype]
     ) {
         guard let arrow = outerFunctionArrow(in: text) else {
             throw CanonicalSIL.LoweringError.malformedSIL("function type has no result arrow")
@@ -5100,53 +6543,216 @@ public struct Lowerer: Sendable {
         }
         let parametersText = prefix[prefix.index(after: open)..<close]
         let rawParameters = splitTopLevel(String(parametersText)).filter { !$0.isEmpty }
-        let parameters = try rawParameters.map(parseType)
-        let parameterConventions = parameterConventions(
-            rawParameters: rawParameters,
-            parameterTypes: parameters
-        )
+        let parameters: [Bytecode.ValueType]
+        let parameterConventions: [Bytecode.ParameterConvention]
+        var erasedNativeMetatypes: [ErasedNativeMetatype] = []
+        let physicalResultExpectation: Bytecode.ValueType?
+        if let expected {
+            let physicalExpectations: [Bytecode.ValueType]
+            switch abiAdapter {
+            case .direct:
+                physicalExpectations = expected.parameters
+                physicalResultExpectation = expected.result
+            case .mutatingValueReceiver:
+                guard let receiver = expected.parameters.last,
+                      expected.result == receiver
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "mutating value-receiver binding has an invalid logical signature"
+                    )
+                }
+                physicalExpectations = Array(expected.parameters.dropLast())
+                    + [.address(receiver)]
+                physicalResultExpectation = .void
+            }
+            var valueSpellings: [String] = []
+            valueSpellings.reserveCapacity(physicalExpectations.count)
+            for (index, spelling) in rawParameters.enumerated() {
+                if let typeID = nativeMetatypeTypeID(spelling) {
+                    erasedNativeMetatypes.append(
+                        .init(physicalIndex: index, typeID: typeID)
+                    )
+                } else {
+                    valueSpellings.append(spelling)
+                }
+            }
+            guard valueSpellings.count == physicalExpectations.count else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "physical function parameters differ from its Swift NativeImport"
+                )
+            }
+            let physicalParameters = try zip(valueSpellings, physicalExpectations).map {
+                try parsePhysicalType($0.0, bridgedTo: $0.1)
+            }
+            parameters = expected.parameters
+            parameterConventions = self.parameterConventions(
+                rawParameters: valueSpellings,
+                parameterTypes: physicalParameters,
+                implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix)
+            )
+        } else {
+            parameters = try rawParameters.map(parseType)
+            parameterConventions = self.parameterConventions(
+                rawParameters: rawParameters,
+                parameterTypes: parameters,
+                implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix)
+            )
+            physicalResultExpectation = nil
+        }
         let isAsync = prefix.range(
             of: #"(?:^|\s)@async(?:\s|$)"#,
             options: .regularExpression
         ) != nil
         let resultComponents = splitTopLevelTuple(resultText)
+        let parsedResult: (type: Bytecode.ValueType, isIndirect: Bool)
+        let mayThrow: Bool
         if resultComponents.count == 2,
            resultComponents[1].trimmingCharacters(in: .whitespaces).hasPrefix("@error ") {
-            let result = try parseFunctionResult(resultComponents[0])
-            return (
-                parameters,
-                parameterConventions,
-                result.type,
-                result.isIndirect,
-                .init(mayThrow: true, isAsync: isAsync)
+            parsedResult = try parseFunctionResult(
+                resultComponents[0],
+                bridgedTo: physicalResultExpectation
             )
+            mayThrow = true
+        } else {
+            parsedResult = try parseFunctionResult(
+                resultText,
+                bridgedTo: physicalResultExpectation
+            )
+            mayThrow = false
         }
-        let result = try parseFunctionResult(resultText)
         return (
             parameters,
             parameterConventions,
-            result.type,
-            result.isIndirect,
-            .init(isAsync: isAsync)
+            expected?.result ?? parsedResult.type,
+            parsedResult.isIndirect,
+            .init(mayThrow: mayThrow, isAsync: isAsync),
+            erasedNativeMetatypes
         )
     }
 
+    private func nativeMetatypeTypeID(_ raw: String) -> Core.TypeID? {
+        var spelling = raw.trimmingCharacters(in: .whitespaces)
+        if spelling.hasPrefix("$") { spelling.removeFirst() }
+        let prefixes = ["@thin ", "@thick ", "@objc_metatype "]
+        guard let prefix = prefixes.first(where: spelling.hasPrefix),
+              spelling.hasSuffix(".Type")
+        else { return nil }
+        let start = spelling.index(spelling.startIndex, offsetBy: prefix.count)
+        let end = spelling.index(spelling.endIndex, offsetBy: -".Type".count)
+        guard start < end,
+              let type = try? parseType(String(spelling[start..<end])),
+              case let .native(typeID) = type
+        else { return nil }
+        return typeID
+    }
+
+    private func supportsIndirectResult(_ type: Bytecode.ValueType) -> Bool {
+        switch type {
+        case .void, .never, .address:
+            false
+        case .bool, .integer, .float, .string, .any, .array, .dictionary,
+             .tuple, .native, .local, .error, .closure, .optional:
+            true
+        }
+    }
+
     private func parseFunctionResult(
-        _ raw: String
+        _ raw: String,
+        bridgedTo expected: Bytecode.ValueType? = nil
     ) throws -> (type: Bytecode.ValueType, isIndirect: Bool) {
         let value = raw.trimmingCharacters(in: .whitespaces)
         if value.hasPrefix("@out ") {
+            let spelling = String(value.dropFirst("@out ".count))
             return (
-                try parseType(String(value.dropFirst("@out ".count))),
+                try expected.map { try parsePhysicalType(spelling, bridgedTo: $0) }
+                    ?? parseType(spelling),
                 true
             )
         }
-        return (try parseType(value), false)
+        return (
+            try expected.map { try parsePhysicalType(value, bridgedTo: $0) }
+                ?? parseType(value),
+            false
+        )
+    }
+
+    private func parsePhysicalType(
+        _ raw: String,
+        bridgedTo expected: Bytecode.ValueType
+    ) throws -> Bytecode.ValueType {
+        do {
+            let actual = try parseType(raw)
+            guard actual == expected else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "foreign physical type \(actual) differs from Swift NativeImport type \(expected)"
+                )
+            }
+            return actual
+        } catch {
+            guard isSupportedObjectiveCBridgeSpelling(raw, to: expected) else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "foreign physical type \(raw) cannot bridge to frozen logical type \(expected)"
+                )
+            }
+            return expected
+        }
+    }
+
+    private func isSupportedObjectiveCBridgeSpelling(
+        _ raw: String,
+        to expected: Bytecode.ValueType
+    ) -> Bool {
+        var spelling = raw.trimmingCharacters(in: .whitespaces)
+        var removed = true
+        while removed {
+            removed = false
+            for prefix in [
+                "$", "@owned ", "@guaranteed ", "@unowned ",
+                "@autoreleased ", "@in_guaranteed ",
+            ] where spelling.hasPrefix(prefix) {
+                spelling.removeFirst(prefix.count)
+                spelling = spelling.trimmingCharacters(in: .whitespaces)
+                removed = true
+                break
+            }
+        }
+        switch expected {
+        case .string:
+            return ["NSString", "Foundation.NSString", "__C.NSString"]
+                .contains(spelling)
+        case .array:
+            if ["NSArray", "Foundation.NSArray", "__C.NSArray"]
+                .contains(spelling) {
+                return true
+            }
+            for prefix in ["Optional<", "Swift.Optional<"]
+            where spelling.hasPrefix(prefix) && spelling.hasSuffix(">") {
+                let body = String(spelling.dropFirst(prefix.count).dropLast())
+                return ["NSArray", "Foundation.NSArray", "__C.NSArray"]
+                    .contains(body)
+            }
+            return false
+        case let .native(typeID):
+            return typeEnvironment.matchesPseudogenericNativeType(
+                spelling,
+                expected: typeID
+            )
+        case let .optional(wrapped):
+            for prefix in ["Optional<", "Swift.Optional<"]
+            where spelling.hasPrefix(prefix) && spelling.hasSuffix(">") {
+                let body = String(spelling.dropFirst(prefix.count).dropLast())
+                return isSupportedObjectiveCBridgeSpelling(body, to: wrapped)
+            }
+            return false
+        default:
+            return false
+        }
     }
 
     private func parameterConventions(
         rawParameters: [String],
-        parameterTypes: [Bytecode.ValueType]
+        parameterTypes: [Bytecode.ValueType],
+        implicitlyBorrowsLinearValues: Bool
     ) -> [Bytecode.ParameterConvention] {
         zip(rawParameters, parameterTypes).map {
             raw, type -> Bytecode.ParameterConvention in
@@ -5154,14 +6760,30 @@ public struct Lowerer: Sendable {
                 .trimmingPrefix("$")
             if value.hasPrefix("@inout ") || value.hasPrefix("*") { return .inout }
             // Copyable VM values do not need SIL's borrow distinction. Linear
-            // native handles do: a guaranteed Shell receiver remains owned by
-            // the invocation boundary and is copied only when an owned native
-            // call consumes it.
-            if value.hasPrefix("@guaranteed "), type.requiresLinearOwnership {
+            // native handles do. Objective-C method parameters are +0 unless
+            // SIL explicitly marks them @owned, even when the printed type has
+            // no ownership spelling. The NativeImport boundary is consuming,
+            // so lowering copies these borrowed physical values before it.
+            let explicitlyBorrowed = value.hasPrefix("@guaranteed ")
+                || value.hasPrefix("@unowned ")
+                || value.hasPrefix("@in_guaranteed ")
+            let explicitlyOwned = value.hasPrefix("@owned ")
+            if type.requiresLinearOwnership,
+               explicitlyBorrowed
+                || (implicitlyBorrowsLinearValues
+                    && !explicitlyOwned
+                    && typeEnvironment.containsReferenceNativeValue(type)) {
                 return .borrowed
             }
             return .owned
         }
+    }
+
+    private func isObjectiveCMethodConvention(_ prefix: String) -> Bool {
+        prefix.range(
+            of: #"@convention\s*\(\s*objc_method\s*\)"#,
+            options: .regularExpression
+        ) != nil
     }
 
     private func matchingOpeningParenthesis(
@@ -5335,6 +6957,7 @@ public struct Lowerer: Sendable {
     private func parseBlockHeader(
         _ line: String,
         entryParameterTypes: [Bytecode.ValueType]?,
+        bridgedParameterTypes: [Bytecode.ValueType]?,
         indirectResultType: Bytecode.ValueType?,
         suppressVoidParameter: Bool,
         allocate: (Bytecode.ValueType) throws -> Bytecode.Register
@@ -5343,7 +6966,8 @@ public struct Lowerer: Sendable {
         parameters: [(String, Bytecode.Register)],
         indirectResultAddress: String?,
         indirectValueParameters: [String: Bytecode.ValueType],
-        suppressedVoidParameter: String?
+        suppressedVoidParameter: String?,
+        compilerOptionalVoidParameters: Set<String>
     )? {
         guard let match = match(line, pattern: #"^bb([0-9]+)(?:\((.*)\))?:$"#) else { return nil }
         let id = try parseBlockID(match[0])
@@ -5352,8 +6976,15 @@ public struct Lowerer: Sendable {
         var indirectResultAddress: String?
         var indirectValueParameters: [String: Bytecode.ValueType] = [:]
         var suppressedVoidParameter: String?
+        var compilerOptionalVoidParameters = Set<String>()
         if !parameterText.isEmpty {
             let components = splitTopLevel(parameterText)
+            if let bridgedParameterTypes,
+               bridgedParameterTypes.count != components.count {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "bridged block parameter count differs from its Optional payload"
+                )
+            }
             if suppressVoidParameter, components.count != 1 {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "indirect try_apply normal block has unexpected SIL parameters"
@@ -5363,7 +6994,21 @@ public struct Lowerer: Sendable {
                 guard let value = self.match(component, pattern: #"^(%[0-9]+)\s*:\s*(.+)$"#) else {
                     throw CanonicalSIL.LoweringError.malformedSIL("invalid block parameter \(component)")
                 }
-                let physicalType = try parseType(value[1])
+                let physicalType: Bytecode.ValueType
+                if let bridgedParameterTypes {
+                    physicalType = try parsePhysicalType(
+                        value[1],
+                        bridgedTo: bridgedParameterTypes[physicalIndex]
+                    )
+                } else {
+                    let parsed = try parseType(value[1])
+                    if entryParameterTypes == nil, parsed == .optional(.void) {
+                        physicalType = .bool
+                        compilerOptionalVoidParameters.insert(value[0])
+                    } else {
+                        physicalType = parsed
+                    }
+                }
                 if suppressVoidParameter {
                     guard physicalIndex == 0, physicalType == .void else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -5400,7 +7045,8 @@ public struct Lowerer: Sendable {
             parameters,
             indirectResultAddress,
             indirectValueParameters,
-            suppressedVoidParameter
+            suppressedVoidParameter,
+            compilerOptionalVoidParameters
         )
     }
 

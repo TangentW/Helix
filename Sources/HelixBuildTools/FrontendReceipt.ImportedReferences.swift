@@ -3,6 +3,22 @@ import HelixCore
 import HelixInterface
 
 extension FrontendReceipt.Adapter {
+    struct ImportedNativeType: Hashable, Sendable {
+        enum Representation: String, Hashable, Sendable {
+            case reference
+            case rawRepresentable
+            case opaqueValue
+        }
+
+        var canonicalName: String
+        var swiftType: String
+        var kind: InterfaceArchive.TypeKind
+        var aliases: [String]
+        var representation: Representation
+        var sourceFileLogicalID: String
+        var importedModules: [String]
+        var requiresMainActor: Bool
+    }
     struct ImportedReference: Sendable {
         var runtimeName: String
         var sourceFileLogicalID: String
@@ -119,7 +135,7 @@ extension FrontendReceipt.Adapter {
         }
     }
 
-    private func itemRequiresMainActor(
+    func itemRequiresMainActor(
         _ item: [String: Any],
         demangled: [String: String]
     ) -> Bool {
@@ -134,7 +150,93 @@ extension FrontendReceipt.Adapter {
         }
     }
 
-    private static func objectiveCClassRuntimeName(_ mangled: String) -> String? {
+    func mergeImportedNativeTypes(
+        references: [ImportedReference],
+        operationTypes: [ImportedNativeType]
+    ) throws -> [ImportedNativeType] {
+        var uses = operationTypes
+        uses.append(contentsOf: references.map {
+            ImportedNativeType(
+                canonicalName: $0.runtimeName,
+                swiftType: $0.runtimeName,
+                kind: .reference,
+                aliases: [],
+                representation: .reference,
+                sourceFileLogicalID: $0.sourceFileLogicalID,
+                importedModules: $0.importedModules,
+                requiresMainActor: $0.requiresMainActor
+            )
+        })
+        var result: [String: ImportedNativeType] = [:]
+        for use in uses.sorted(by: {
+            ($0.canonicalName, $0.sourceFileLogicalID)
+                < ($1.canonicalName, $1.sourceFileLogicalID)
+        }) {
+            guard !use.canonicalName.isEmpty,
+                  !use.swiftType.isEmpty,
+                  !use.importedModules.isEmpty
+            else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "imported native type metadata is incomplete"
+                )
+            }
+            if var existing = result[use.canonicalName] {
+                guard existing.swiftType == use.swiftType else {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "imported native type \(use.canonicalName) has conflicting Swift spellings"
+                    )
+                }
+                var mergeActorIsolation = true
+                if existing.representation == .opaqueValue,
+                   use.representation == .rawRepresentable {
+                    existing.kind = use.kind
+                    existing.representation = .rawRepresentable
+                    existing.requiresMainActor = use.requiresMainActor
+                    mergeActorIsolation = false
+                } else if existing.representation == .rawRepresentable,
+                          use.representation == .opaqueValue {
+                    // Explicit enum/OptionSet evidence is more precise than
+                    // the fallback opaque-value classification, including its
+                    // actor-neutral value semantics.
+                    mergeActorIsolation = false
+                } else if existing.kind != use.kind
+                            || existing.representation != use.representation {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "imported native type \(use.canonicalName) has conflicting representations"
+                    )
+                }
+                existing.sourceFileLogicalID = min(
+                    existing.sourceFileLogicalID,
+                    use.sourceFileLogicalID
+                )
+                existing.importedModules = Array(Set(
+                    existing.importedModules + use.importedModules
+                )).sorted()
+                existing.aliases = Array(Set(
+                    existing.aliases + use.aliases
+                )).sorted()
+                if mergeActorIsolation {
+                    existing.requiresMainActor = existing.requiresMainActor
+                        || use.requiresMainActor
+                }
+                result[use.canonicalName] = existing
+            } else {
+                var canonical = use
+                canonical.importedModules = Array(Set(use.importedModules)).sorted()
+                canonical.aliases = Array(Set(use.aliases)).sorted()
+                result[use.canonicalName] = canonical
+            }
+        }
+        let preciseAliases = Set(result.values
+            .filter { $0.representation == .rawRepresentable }
+            .flatMap(\.aliases))
+        return result.values.filter {
+            !($0.representation == .opaqueValue
+                && preciseAliases.contains($0.canonicalName))
+        }.sorted { $0.canonicalName < $1.canonicalName }
+    }
+
+    static func objectiveCClassRuntimeName(_ mangled: String) -> String? {
         let prefix = "$sSo"
         guard mangled.hasPrefix(prefix), mangled.hasSuffix("D") else { return nil }
         let bytes = Array(mangled.dropFirst(prefix.count).utf8)
@@ -177,7 +279,8 @@ extension FrontendReceipt.Adapter {
                     $0.isLetter || $0.isNumber || $0 == "_"
                 })
                 guard let first = name.first,
-                      first.isLetter || first == "_"
+                      first.isLetter || first == "_",
+                      suffix.dropFirst(name.count).first != "<"
                 else { return nil }
                 return name
             }
@@ -186,29 +289,34 @@ extension FrontendReceipt.Adapter {
 
     func makeNativeTypeLookup(
         records: [InterfaceArchive.TypeRecord],
-        importedReferences: [ImportedReference],
+        importedTypes: [ImportedNativeType],
         sourceNominals: [SourceNominal]
     ) throws -> [String: Core.TypeID] {
         var result = Dictionary(uniqueKeysWithValues: records.map {
             ($0.canonicalName, $0.id)
         })
         let sourceTypeNames = Set(sourceNominals.map(\.canonicalName))
-        for reference in importedReferences {
+        for imported in importedTypes {
             let exactMatches = records.filter {
-                $0.canonicalName == reference.runtimeName
+                $0.canonicalName == imported.canonicalName
             }
             let qualifiedMatches = records.filter {
                 !sourceTypeNames.contains($0.canonicalName)
                     && $0.canonicalName.split(separator: ".").last
-                        == Substring(reference.runtimeName)
+                        == Substring(imported.canonicalName)
             }
             let matches = exactMatches.isEmpty ? qualifiedMatches : exactMatches
             guard matches.count == 1, let record = matches.first else {
                 throw FrontendReceipt.Error.invalidRequest(
-                    "Objective-C runtime type \(reference.runtimeName) has no unique frozen TypeID"
+                    "imported type \(imported.canonicalName) has no unique frozen TypeID"
                 )
             }
-            for alias in [reference.runtimeName, "__C.\(reference.runtimeName)"] {
+            let aliases = Set([
+                imported.canonicalName,
+                imported.swiftType,
+                "__C.\(imported.canonicalName)",
+            ] + imported.aliases)
+            for alias in aliases.sorted() {
                 if let existing = result[alias], existing != record.id {
                     throw FrontendReceipt.Error.invalidRequest(
                         "native type alias \(alias) resolves to multiple TypeIDs"

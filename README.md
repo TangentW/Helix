@@ -100,8 +100,10 @@ Live Reload acceptance run.
   VM-owned `Any` with common dynamic casts, automatically frozen `Swift.print`,
   and non-suspending async entries.
 - NativeImport v2 and schema 2 build-time discovery by declaration, file,
-  module, or project scope. Broad scopes expand into exact generated invokers;
-  they are never device-side wildcards.
+  module, or project scope, plus dual-evidence freezing of baseline-used APIs
+  from imported Apple or third-party modules. Raw enums, OptionSets, opaque
+  values, references, accessors, methods, Objective-C bridges, and ownership
+  are emitted as exact generated invokers; they are never device wildcards.
 - Signed `.hlxp` creation and verification, bounded downloads, immutable
   storage, anti-rollback, activation WAL, Crash Guard, last-known-good recovery,
   signed revocation, and rollback.
@@ -182,7 +184,7 @@ swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
 ```
 
-The current full SwiftPM baseline contains 441 tests in 72 suites. The recorded
+The current full SwiftPM baseline contains 452 tests in 73 suites. The recorded
 Debug, warnings-as-errors, and optimized Release runs pass. Platform-specific
 fixtures can be run with an available Simulator UDID:
 

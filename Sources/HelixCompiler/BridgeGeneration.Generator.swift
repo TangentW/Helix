@@ -77,10 +77,14 @@ public struct NativeImportBinding: Hashable, Sendable {
 public struct GeneratedNativeImport: Hashable, Sendable {
     public enum Dispatch: String, Hashable, Sendable {
         case globalFunction
+        case initializer
         case staticMethod
+        case nativeUpcast
+        case staticGetter
         case instanceMethod
         case instanceGetter
         case instanceSetter
+        case instanceValueSetter
     }
 
     public var declarationMangledName: String
@@ -162,12 +166,24 @@ public struct NativeTypeBinding: Hashable, Sendable {
 }
 
 public struct GeneratedNativeType: Hashable, Sendable {
+    public enum Representation: String, Hashable, Sendable {
+        case reference
+        case rawRepresentable
+        case opaqueValue
+    }
+
     public var sourceFileLogicalID: String
     public var swiftType: String
+    public var representation: Representation
 
-    public init(sourceFileLogicalID: String, swiftType: String) {
+    public init(
+        sourceFileLogicalID: String,
+        swiftType: String,
+        representation: Representation = .reference
+    ) {
         self.sourceFileLogicalID = sourceFileLogicalID
         self.swiftType = swiftType
+        self.representation = representation
     }
 
     public static func groupName(sourceFileLogicalID: String) -> String {
@@ -696,7 +712,10 @@ public struct Generator: Sendable {
                 : ["\(stem)\(width)", "Swift.\(stem)\(width)"]
             return names.contains(name)
         case let (.named(name), .float(width)):
-            let names = width == 32 ? ["Float", "Swift.Float"] : ["Double", "Swift.Double"]
+            let names = width == 32
+                ? ["Float", "Swift.Float"]
+                : ["Double", "Swift.Double", "CGFloat", "CoreFoundation.CGFloat",
+                   "CoreGraphics.CGFloat"]
             return names.contains(name)
         case let (.named(name), .native(typeID)):
             guard let canonicalName = archive.nativeTypes.first(where: {
@@ -915,21 +934,20 @@ public struct Generator: Sendable {
         generated: BridgeGeneration.GeneratedNativeType,
         record: InterfaceArchive.TypeRecord
     ) throws -> String {
-        guard record.kind == .reference, record.isCopyable else {
+        guard record.isCopyable else {
             throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
         }
         let swiftType = generated.swiftType.split(separator: ".").map {
             escapedSwiftIdentifier(String($0))
         }.joined(separator: ".")
         let factory = BridgeGeneration.GeneratedNativeType.factoryName(id: binding.id)
-        return """
-        static func \(factory)(
-            id: Core.TypeID,
-            canonicalName: String,
-            layoutFingerprint: Core.Digest,
-            requiresMainActor: Bool,
-            estimatedSize: UInt64
-        ) -> VM.NativeTypeOperations {
+        let operations: String
+        switch generated.representation {
+        case .reference:
+            guard record.kind == .reference else {
+                throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
+            }
+            operations = """
             VM.NativeTypeOperations.reference(
                 id: id,
                 canonicalName: canonicalName,
@@ -938,6 +956,50 @@ public struct Generator: Sendable {
                 estimatedSize: estimatedSize,
                 estimatedByteCount: { (_: \(swiftType)) in estimatedSize }
             )
+            """
+        case .rawRepresentable:
+            guard record.kind == .value || record.kind == .enumeration else {
+                throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
+            }
+            let kind = record.kind == .value ? "value" : "enumeration"
+            operations = """
+            VM.NativeTypeOperations(
+                id: id,
+                canonicalName: canonicalName,
+                kind: .\(kind),
+                layoutFingerprint: layoutFingerprint,
+                requiresMainActor: requiresMainActor,
+                estimatedSize: estimatedSize,
+                clone: { (value: \(swiftType)) in value },
+                estimatedByteCount: { (_: \(swiftType)) in estimatedSize },
+                equals: { $0.rawValue == $1.rawValue },
+                hash: { value, hasher in hasher.combine(value.rawValue) }
+            )
+            """
+        case .opaqueValue:
+            guard record.kind == .value else {
+                throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
+            }
+            operations = """
+            VM.NativeTypeOperations.opaqueValue(
+                id: id,
+                canonicalName: canonicalName,
+                layoutFingerprint: layoutFingerprint,
+                requiresMainActor: requiresMainActor,
+                estimatedSize: estimatedSize,
+                clone: { (value: \(swiftType)) in value }
+            )
+            """
+        }
+        return """
+        static func \(factory)(
+            id: Core.TypeID,
+            canonicalName: String,
+            layoutFingerprint: Core.Digest,
+            requiresMainActor: Bool,
+            estimatedSize: UInt64
+        ) -> VM.NativeTypeOperations {
+        \(indent(operations, spaces: 4))
         }
         """
     }
@@ -998,7 +1060,9 @@ public struct Generator: Sendable {
     ) throws -> String {
         let shapes = try generated.parameterSwiftTypes.map(parseSwiftType)
         let decoded = zip(shapes, record.parameterTypes).enumerated().map { offset, pair in
-            "let argument\(offset): \(pair.0.rendered) = "
+            let binding = generated.dispatch == .instanceValueSetter
+                && offset == record.parameterTypes.count - 1 ? "var" : "let"
+            return "\(binding) argument\(offset): \(pair.0.rendered) = "
                 + renderDecode(
                     expression: "arguments[\(offset)]",
                     shape: pair.0,
@@ -1006,9 +1070,13 @@ public struct Generator: Sendable {
                 )
         }
         let resultShape = try parseSwiftType(generated.resultSwiftType)
-        let call = renderGeneratedNativeImportCall(generated: generated, effects: record.effects)
+        let directCall = renderGeneratedNativeImportCall(
+            generated: generated,
+            effects: record.effects
+        )
         let invocation: String
         if record.resultType == .void {
+            let call = renderMainActorCall(directCall, effects: record.effects)
             let callBody = renderGeneratedThrowingCall(
                 call,
                 resultDeclaration: nil,
@@ -1017,18 +1085,35 @@ public struct Generator: Sendable {
             invocation = callBody
                 + "\nreturn .returned(try Runtime.BridgeValueCodec.encodeVoid())"
         } else {
-            let callBody = renderGeneratedThrowingCall(
-                call,
-                resultDeclaration: "let result: \(resultShape.rendered)",
-                effects: record.effects
-            )
             let encoded = renderEncode(
                 expression: "result",
                 shape: resultShape,
                 type: record.resultType,
                 nativeCatalog: "try Runtime.Bridge.shared.requireNativeTypeCatalog()"
             )
-            invocation = callBody + "\nreturn .returned(\(encoded))"
+            if record.effects.requiresMainActor {
+                // Keep potentially non-Sendable native values actor-isolated;
+                // only their Sendable VM representation crosses the boundary.
+                let call = """
+                try context.withMainActor {
+                    let result: \(resultShape.rendered) = \(directCall)
+                    return \(encoded)
+                }
+                """
+                let callBody = renderGeneratedThrowingCall(
+                    call,
+                    resultDeclaration: "let encodedResult: VM.Value",
+                    effects: record.effects
+                )
+                invocation = callBody + "\nreturn .returned(encodedResult)"
+            } else {
+                let callBody = renderGeneratedThrowingCall(
+                    directCall,
+                    resultDeclaration: "let result: \(resultShape.rendered)",
+                    effects: record.effects
+                )
+                invocation = callBody + "\nreturn .returned(\(encoded))"
+            }
         }
         let body = (decoded + [invocation]).joined(separator: "\n")
         let factoryName = BridgeGeneration.GeneratedNativeImport.factoryName(key: binding.key)
@@ -1065,23 +1150,37 @@ public struct Generator: Sendable {
         switch generated.dispatch {
         case .globalFunction:
             target = escapedSwiftIdentifier(generated.baseName)
+        case .initializer:
+            target = generated.ownerType!.split(separator: ".").map {
+                escapedSwiftIdentifier(String($0))
+            }.joined(separator: ".")
         case .staticMethod:
             let owner = generated.ownerType!.split(separator: ".").map {
                 escapedSwiftIdentifier(String($0))
             }.joined(separator: ".")
             target = owner + "." + escapedSwiftIdentifier(generated.baseName)
+        case .nativeUpcast:
+            let owner = generated.ownerType!.split(separator: ".").map {
+                escapedSwiftIdentifier(String($0))
+            }.joined(separator: ".")
+            return "argument0 as \(owner)"
+        case .staticGetter:
+            let owner = generated.ownerType!.split(separator: ".").map {
+                escapedSwiftIdentifier(String($0))
+            }.joined(separator: ".")
+            return owner + "." + escapedSwiftIdentifier(generated.baseName)
         case .instanceMethod:
             target = "argument\(generated.parameterSwiftTypes.count - 1)."
                 + escapedSwiftIdentifier(generated.baseName)
         case .instanceGetter:
-            let direct = "argument0." + escapedSwiftIdentifier(generated.baseName)
-            guard effects.requiresMainActor else { return direct }
-            return "try context.withMainActor { \(direct) }"
+            return "argument0." + escapedSwiftIdentifier(generated.baseName)
         case .instanceSetter:
-            let direct = "argument1." + escapedSwiftIdentifier(generated.baseName)
+            return "argument1." + escapedSwiftIdentifier(generated.baseName)
                 + " = argument0"
-            guard effects.requiresMainActor else { return direct }
-            return "try context.withMainActor { \(direct) }"
+        case .instanceValueSetter:
+            let mutation = "argument1." + escapedSwiftIdentifier(generated.baseName)
+                + " = argument0; return argument1"
+            return "{ \(mutation) }()"
         }
         let arguments = generated.argumentLabels.enumerated().map { offset, label in
             label == "_"
@@ -1089,8 +1188,16 @@ public struct Generator: Sendable {
                 : "\(label): argument\(offset)"
         }.joined(separator: ", ")
         let direct = (effects.mayThrow ? "try " : "") + "\(target)(\(arguments))"
-        guard effects.requiresMainActor else { return direct }
-        return "try context.withMainActor { \(direct) }"
+        return direct
+    }
+
+    private func renderMainActorCall(_ directCall: String, effects: Core.Effects) -> String {
+        guard effects.requiresMainActor else { return directCall }
+        return """
+        try context.withMainActor {
+        \(indent(directCall, spaces: 4))
+        }
+        """
     }
 
     private func renderGeneratedThrowingCall(
@@ -1382,13 +1489,23 @@ public struct Generator: Sendable {
                   $0.logicalPath == generated.sourceFileLogicalID
               }),
               isSafeLogicalPath(generated.sourceFileLogicalID),
-              generated.swiftType.split(separator: ".", omittingEmptySubsequences: false)
-                .allSatisfy({ isValidSwiftIdentifier(String($0)) }),
+              isValidGeneratedSwiftTypeSpelling(generated.swiftType),
               swiftTypeMatches(shape, type: .native(record.id), archive: archive),
-              record.kind == .reference,
+              Self.generatedRepresentation(generated.representation, matches: record.kind),
               record.isCopyable
         else {
             throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
+        }
+    }
+
+    private static func generatedRepresentation(
+        _ representation: BridgeGeneration.GeneratedNativeType.Representation,
+        matches kind: InterfaceArchive.TypeKind
+    ) -> Bool {
+        switch representation {
+        case .reference: kind == .reference
+        case .rawRepresentable: kind == .value || kind == .enumeration
+        case .opaqueValue: kind == .value
         }
     }
 
@@ -1430,21 +1547,55 @@ public struct Generator: Sendable {
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
             }
+        case .initializer:
+            guard record.contract.kind == .initializer,
+                  let owner = generated.ownerType,
+                  generated.baseName == "init",
+                  isValidGeneratedSwiftTypeSpelling(owner),
+                  record.parameterTypes.allSatisfy(isGeneratedValueType),
+                  isNativeType(record.resultType),
+                  generated.resultSwiftType == owner
+            else {
+                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            }
         case .staticMethod:
             guard record.contract.kind == .staticMethod,
                   let owner = generated.ownerType,
-                  owner.split(separator: ".", omittingEmptySubsequences: false)
-                    .allSatisfy({ isValidSwiftIdentifier(String($0)) }),
+                  isValidGeneratedSwiftTypeSpelling(owner),
                   record.parameterTypes.allSatisfy(isGeneratedValueType),
                   isGeneratedResultType(record.resultType)
+            else {
+                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            }
+        case .nativeUpcast:
+            guard record.contract.kind == .staticMethod,
+                  let owner = generated.ownerType,
+                  generated.baseName == "upcast",
+                  isValidGeneratedSwiftTypeSpelling(owner),
+                  generated.argumentLabels == ["_"],
+                  record.parameterTypes.count == 1,
+                  isNativeType(record.parameterTypes[0]),
+                  isNativeType(record.resultType),
+                  generated.resultSwiftType == owner
+            else {
+                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            }
+        case .staticGetter:
+            guard record.contract.kind == .staticGetter,
+                  let owner = generated.ownerType,
+                  isValidGeneratedSwiftTypeSpelling(owner),
+                  generated.argumentLabels.isEmpty,
+                  generated.parameterSwiftTypes.isEmpty,
+                  record.parameterTypes.isEmpty,
+                  record.resultType != .void,
+                  isGeneratedValueType(record.resultType)
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
             }
         case .instanceMethod:
             guard record.contract.kind == .instanceMethod,
                   let owner = generated.ownerType,
-                  owner.split(separator: ".", omittingEmptySubsequences: false)
-                    .allSatisfy({ isValidSwiftIdentifier(String($0)) }),
+                  isValidGeneratedSwiftTypeSpelling(owner),
                   record.parameterTypes.dropLast().allSatisfy(isGeneratedValueType),
                   record.parameterTypes.last.map(isNativeType) == true,
                   generated.parameterSwiftTypes.last == owner,
@@ -1455,8 +1606,7 @@ public struct Generator: Sendable {
         case .instanceGetter:
             guard record.contract.kind == .instanceGetter,
                   let owner = generated.ownerType,
-                  owner.split(separator: ".", omittingEmptySubsequences: false)
-                    .allSatisfy({ isValidSwiftIdentifier(String($0)) }),
+                  isValidGeneratedSwiftTypeSpelling(owner),
                   generated.argumentLabels.isEmpty,
                   record.parameterTypes.count == 1,
                   isNativeType(record.parameterTypes[0]),
@@ -1468,15 +1618,30 @@ public struct Generator: Sendable {
             }
         case .instanceSetter:
             guard record.contract.kind == .instanceSetter,
+                  record.effectiveABIAdapter == .direct,
                   let owner = generated.ownerType,
-                  owner.split(separator: ".", omittingEmptySubsequences: false)
-                    .allSatisfy({ isValidSwiftIdentifier(String($0)) }),
+                  isValidGeneratedSwiftTypeSpelling(owner),
                   generated.argumentLabels == ["_"],
                   record.parameterTypes.count == 2,
                   isGeneratedValueType(record.parameterTypes[0]),
                   isNativeType(record.parameterTypes[1]),
                   generated.parameterSwiftTypes.last == owner,
                   record.resultType == .void
+            else {
+                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            }
+        case .instanceValueSetter:
+            guard record.contract.kind == .instanceSetter,
+                  record.effectiveABIAdapter == .mutatingValueReceiver,
+                  let owner = generated.ownerType,
+                  isValidGeneratedSwiftTypeSpelling(owner),
+                  generated.argumentLabels == ["_"],
+                  record.parameterTypes.count == 2,
+                  isGeneratedValueType(record.parameterTypes[0]),
+                  isNativeType(record.parameterTypes[1]),
+                  generated.parameterSwiftTypes.last == owner,
+                  record.resultType == record.parameterTypes[1],
+                  generated.resultSwiftType == owner
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
             }
@@ -1499,8 +1664,10 @@ public struct Generator: Sendable {
         _ dispatch: BridgeGeneration.GeneratedNativeImport.Dispatch
     ) -> Bool {
         switch dispatch {
-        case .instanceMethod, .instanceGetter, .instanceSetter: true
-        case .globalFunction, .staticMethod: false
+        case .instanceMethod, .instanceGetter, .instanceSetter,
+             .instanceValueSetter: true
+        case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+             .staticGetter: false
         }
     }
 
@@ -1533,6 +1700,47 @@ public struct Generator: Sendable {
         case .bool, .integer, .string: true
         default: false
         }
+    }
+
+    private func isValidGeneratedSwiftTypeSpelling(_ raw: String) -> Bool {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value.utf8.count <= 64 * 1_024 else { return false }
+        if value.hasSuffix("?") {
+            return isValidGeneratedSwiftTypeSpelling(String(value.dropLast()))
+        }
+        if value.hasPrefix("["), value.hasSuffix("]") {
+            return isValidGeneratedSwiftTypeSpelling(String(value.dropFirst().dropLast()))
+        }
+        if let open = value.firstIndex(of: "<") {
+            guard value.hasSuffix(">"),
+                  isValidModulePath(String(value[..<open]))
+            else { return false }
+            let body = value[value.index(after: open)..<value.index(before: value.endIndex)]
+            var arguments: [String] = []
+            var start = body.startIndex
+            var depth = 0
+            for index in body.indices {
+                switch body[index] {
+                case "<": depth += 1
+                case ">":
+                    depth -= 1
+                    if depth < 0 { return false }
+                case "," where depth == 0:
+                    arguments.append(
+                        String(body[start..<index]).trimmingCharacters(in: .whitespaces)
+                    )
+                    start = body.index(after: index)
+                default: break
+                }
+            }
+            guard depth == 0 else { return false }
+            arguments.append(
+                String(body[start...]).trimmingCharacters(in: .whitespaces)
+            )
+            return !arguments.isEmpty
+                && arguments.allSatisfy(isValidGeneratedSwiftTypeSpelling)
+        }
+        return isValidModulePath(value)
     }
 
     private func isSafeLogicalPath(_ path: String) -> Bool {

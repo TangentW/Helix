@@ -11,6 +11,18 @@ import Testing
 extension BuildToolsTests {
 @Suite("Scoped NativeImport discovery")
 struct NativeImportDiscoveryTests {
+    @Test("Generated Swift type syntax accepts nested collections and rejects code")
+    func validatesGeneratedSwiftTypeSyntax() {
+        #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("[Swift.String: [UIKit.UIView?]]"))
+        #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+            "Swift.Dictionary<Swift.String, Swift.Array<Foundation.Date>>"
+        ))
+        #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("(Foundation.Date, UIKit.UIView?)"))
+        #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("UIKit.UIView; fatalError()"))
+        #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("[Swift.String:]"))
+        #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("Swift.Array<UIKit.UIView"))
+    }
+
     @Test("Real module indexing generates exact invokers for a selected source range")
     func indexesAndMaterializesGeneratedInvokers() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -472,8 +484,8 @@ struct NativeImportDiscoveryTests {
         )
     }
 
-    @Test("Managed Debug freezes imported UIKit TypeOps and lowers a stored reference")
-    func lowersImportedUIKitStoredReference() throws {
+    @Test("Managed Debug freezes UIKit and Foundation call surfaces end to end")
+    func lowersImportedFrameworkOperations() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-uikit-reference-\(UUID().uuidString)",
             isDirectory: true
@@ -486,6 +498,7 @@ struct NativeImportDiscoveryTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let sourceURL = sourceDirectory.appendingPathComponent("Screen.swift")
         let baseline = """
+        import Foundation
         import UIKit
 
         @MainActor
@@ -501,6 +514,30 @@ struct NativeImportDiscoveryTests {
                 label = next
                 _ = seed + 3
                 return label
+            }
+
+            public func configure(_ date: Date, interval: Double) -> Date {
+                label.textAlignment = .center
+                label.accessibilityTraits = [.button]
+                label.font = UIFont.systemFont(ofSize: 17, weight: .bold)
+                return date.addingTimeInterval(interval + 1)
+            }
+
+            public func currentSubviews() -> [UIView] {
+                if label.isHidden { return [] }
+                return label.subviews
+            }
+
+            public func constraints(
+                x: NSLayoutXAxisAnchor,
+                otherX: NSLayoutXAxisAnchor,
+                y: NSLayoutYAxisAnchor,
+                otherY: NSLayoutYAxisAnchor
+            ) -> [NSLayoutConstraint] {
+                [
+                    x.constraint(equalTo: otherX),
+                    y.constraint(equalTo: otherY),
+                ]
             }
         }
         """
@@ -559,12 +596,12 @@ struct NativeImportDiscoveryTests {
         let labelBinding = try #require(output.receipt.nativeTypeBindings.first {
             $0.canonicalName == "UILabel"
         })
-        #expect(labelBinding.importedModules == ["UIKit"])
+        #expect(labelBinding.importedModules.contains("UIKit"))
         #expect(labelBinding.generated?.swiftType == "UILabel")
         let labelGetterBinding = try #require(output.receipt.nativeImportBindings.first {
             $0.generated?.dispatch == .instanceGetter
         })
-        #expect(labelGetterBinding.importedModules == ["UIKit"])
+        #expect(labelGetterBinding.importedModules.contains("UIKit"))
 
         var missingTypeImport = output.receipt
         let labelTypeBindingIndex = try #require(
@@ -587,11 +624,59 @@ struct NativeImportDiscoveryTests {
         #expect(throws: ShellBuildReceipt.Error.self) {
             try missingGetterImport.validate()
         }
-        #expect(output.receipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
-            "\(moduleName).Screen.label.get",
-            "\(moduleName).Screen.label.set",
-            "Swift.print(_:separator:terminator:)",
-        ])
+        let candidateNames = Set(
+            output.receipt.nativeImportCandidates.map(\.canonicalCallee)
+        )
+        #expect(candidateNames.contains("\(moduleName).Screen.label.get"))
+        #expect(candidateNames.contains("\(moduleName).Screen.label.set"))
+        #expect(candidateNames.contains("Swift.print(_:separator:terminator:)"))
+        let generatedSymbols = Set(
+            output.receipt.nativeImportCandidates.flatMap(\.silMangledNames)
+        )
+        #expect(generatedSymbols.contains { $0.hasPrefix("$hlx_native_foreign_") })
+        #expect(!generatedSymbols.contains { $0.hasSuffix(".foreign") })
+        let constraintImports = output.receipt.nativeImportCandidates.filter {
+            $0.canonicalCallee.contains("NSLayoutAnchor")
+                && $0.canonicalCallee.contains("constraint")
+        }
+        #expect(constraintImports.count == 2)
+        #expect(Set(constraintImports.flatMap(\.silMangledNames)).count == 2)
+        #expect(generatedSymbols.contains { $0.hasPrefix("$hlx_native_option_set_literal_") })
+        #expect(generatedSymbols.contains { $0.hasPrefix("$hlx_native_global_") })
+        #expect(generatedSymbols.contains { $0.hasPrefix("$s") })
+
+        let typeBindings = output.receipt.nativeTypeBindings.compactMap(\.generated)
+        #expect(typeBindings.contains {
+            $0.swiftType == "NSTextAlignment"
+                && $0.effectiveRepresentation == .rawRepresentable
+        })
+        #expect(typeBindings.contains {
+            $0.swiftType == "UIAccessibilityTraits"
+                && $0.effectiveRepresentation == .rawRepresentable
+        })
+        #expect(typeBindings.contains {
+            $0.swiftType.hasSuffix("Date")
+                && $0.effectiveRepresentation == .opaqueValue
+        })
+
+        var legacyDispatchReceipt = output.receipt
+        legacyDispatchReceipt.schemaVersion = 8
+        #expect(throws: ShellBuildReceipt.Error.invalid(
+            "generated imported-operation NativeImports require Shell receipt schema 9"
+        )) {
+            try legacyDispatchReceipt.validate()
+        }
+
+        var legacyTypeReceipt = output.receipt
+        legacyTypeReceipt.schemaVersion = 8
+        legacyTypeReceipt.nativeImportCandidates = []
+        legacyTypeReceipt.nativeImportBindings = []
+        #expect(throws: ShellBuildReceipt.Error.invalid(
+            "generated native type representations require Shell receipt schema 9"
+        )) {
+            try legacyTypeReceipt.validate()
+        }
+
         let selected = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "selectedLabel"
         })
@@ -613,8 +698,20 @@ struct NativeImportDiscoveryTests {
         #expect(shell.bridge.sourceFiles.values.contains {
             $0.contains("argument0.label")
         })
+        let generatedBridge = shell.bridge.sourceFiles.values.joined(separator: "\n")
+        #expect(generatedBridge.contains("import Foundation"))
+        #expect(generatedBridge.contains(".textAlignment ="))
+        #expect(generatedBridge.contains(".accessibilityTraits ="))
+        #expect(generatedBridge.contains("UIFont.systemFont("))
+        #expect(generatedBridge.contains(".addingTimeInterval("))
+        #expect(generatedBridge.contains(".subviews"))
 
-        let changed = baseline.replacingOccurrences(of: "seed + 3", with: "seed + 4")
+        let changed = baseline
+            .replacingOccurrences(of: "interval + 1", with: "interval + 2")
+            .replacingOccurrences(
+                of: "if label.isHidden { return [] }",
+                with: "if !label.isHidden { return [] }"
+            )
         try Data(changed.utf8).write(to: sourceURL)
         let patch = try ReleaseCompiler.Driver().build(
             .init(
@@ -623,8 +720,16 @@ struct NativeImportDiscoveryTests {
                 compilerURL: compilerURL
             )
         )
-        #expect(patch.module.imports.count == 2)
-        #expect(patch.disassembly.contains("native_apply"))
+        #expect(patch.changedFunctions.map(\.canonicalDeclaration).contains {
+            $0.contains("configure")
+        })
+        #expect(patch.changedFunctions.map(\.canonicalDeclaration).contains {
+            $0.contains("currentSubviews")
+        })
+        #expect(patch.module.imports.count >= 6)
+        #expect(
+            patch.disassembly.components(separatedBy: "native_apply").count - 1 >= 6
+        )
         _ = try Verification.Engine().verify(
             bytes: patch.bytecode,
             shell: Verification.ShellInterface(archive: shell.archive),

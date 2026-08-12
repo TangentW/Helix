@@ -36,7 +36,7 @@ public enum Codec {
         let archiveHash = domainHasher.finalize()
 
         var output = Data(magic)
-        output.appendLittleEndian(InterfaceArchive.Archive.currentSchemaVersion)
+        output.appendLittleEndian(normalized.schemaVersion)
         output.appendLittleEndian(UInt16(0))
         output.appendLittleEndian(UInt64(payload.count))
         output.append(payloadHash.data)
@@ -56,7 +56,8 @@ public enum Codec {
         guard Array(data.prefix(magic.count)) == magic else { throw InterfaceArchive.Error.invalidMagic }
         var cursor = magic.count
         let schema: UInt16 = try data.readLittleEndian(at: &cursor)
-        guard schema == InterfaceArchive.Archive.currentSchemaVersion else {
+        let supportedSchemas = InterfaceArchive.Archive.minimumSupportedSchemaVersion...InterfaceArchive.Archive.currentSchemaVersion
+        guard supportedSchemas.contains(schema) else {
             throw InterfaceArchive.Error.unsupportedSchema(schema)
         }
         let flags: UInt16 = try data.readLittleEndian(at: &cursor)
@@ -93,6 +94,11 @@ public enum Codec {
         }
         guard try Core.CanonicalJSON.encode(archive) == payload else {
             throw InterfaceArchive.Error.nonCanonicalPayload
+        }
+        guard archive.schemaVersion == schema else {
+            throw InterfaceArchive.Error.invalidArchive(
+                "container and payload schema versions differ"
+            )
         }
         try archive.validate()
         return .init(archive: archive, archiveHash: archiveHash, payloadHash: payloadHash)

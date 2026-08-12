@@ -5,6 +5,11 @@ extension CanonicalSIL {
 /// A statically resolved Swift call target. Helix never performs symbol lookup
 /// on-device; the release archive freezes every mapping before patch creation.
 public struct DirectCallBinding: Hashable, Sendable {
+    public enum ABIAdapter: Hashable, Sendable {
+        case direct
+        case mutatingValueReceiver
+    }
+
     public enum Target: Hashable, Sendable {
         case function(Bytecode.FunctionID)
         case entry(Core.EntryIndex)
@@ -17,6 +22,7 @@ public struct DirectCallBinding: Hashable, Sendable {
     public var resultType: Bytecode.ValueType
     public var effects: Core.Effects
     public var target: Target
+    public var abiAdapter: ABIAdapter
 
     public init(
         mangledName: String,
@@ -24,7 +30,8 @@ public struct DirectCallBinding: Hashable, Sendable {
         parameterConventions: [Bytecode.ParameterConvention]? = nil,
         resultType: Bytecode.ValueType,
         effects: Core.Effects = .init(),
-        target: Target
+        target: Target,
+        abiAdapter: ABIAdapter = .direct
     ) {
         self.mangledName = mangledName
         self.parameterTypes = parameterTypes
@@ -35,6 +42,7 @@ public struct DirectCallBinding: Hashable, Sendable {
         self.resultType = resultType
         self.effects = effects
         self.target = target
+        self.abiAdapter = abiAdapter
     }
 }
 

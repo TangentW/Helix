@@ -64,12 +64,18 @@ enum DirectCalls {
                 // A patchable Shell entry is generation-aware and therefore
                 // takes precedence over an optional native-original binding.
                 guard bindingsBySymbol[mangledName] == nil else { continue }
+                let abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter =
+                    switch item.effectiveABIAdapter {
+                    case .direct: .direct
+                    case .mutatingValueReceiver: .mutatingValueReceiver
+                    }
                 bindingsBySymbol[mangledName] = .init(
                     mangledName: mangledName,
                     parameterTypes: item.parameterTypes,
                     resultType: item.resultType,
                     effects: item.effects,
-                    target: .nativeImport(requirement)
+                    target: .nativeImport(requirement),
+                    abiAdapter: abiAdapter
                 )
             }
         }

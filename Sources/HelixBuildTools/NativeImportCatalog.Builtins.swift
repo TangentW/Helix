@@ -71,15 +71,24 @@ enum Builtins {
     static func bindings(
         archive: InterfaceArchive.Archive
     ) throws -> [ShellBuildReceipt.NativeImportBinding] {
-        let byCallee = Dictionary(
-            uniqueKeysWithValues: archive.nativeImports.map {
-                ($0.canonicalCallee, $0)
+        var byKey: [Core.NativeImportKey: InterfaceArchive.NativeImportRecord] = [:]
+        for record in archive.nativeImports {
+            guard byKey.updateValue(record, forKey: record.key) == nil else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "indexed NativeImport keys are not unique"
+                )
             }
-        )
+        }
         return try definitions.compactMap { definition in
             let descriptor = definition.descriptor
-            guard let record = byCallee[descriptor.canonicalCallee],
-                  record.isEmittedToDevice
+            let key = try Core.NativeImportKey.derive(
+                namespace: archive.metadata.shellNamespaceID,
+                canonicalCallee: descriptor.canonicalCallee,
+                signature: descriptor.signature,
+                effects: descriptor.effects,
+                contract: descriptor.contract
+            )
+            guard let record = byKey[key], record.isEmittedToDevice
             else { return nil }
             guard let id = record.id,
                   record.silMangledNames == descriptor.silMangledNames,

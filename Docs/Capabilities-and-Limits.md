@@ -18,7 +18,7 @@ current practical boundary.
 | Native experiment | Explicit-only Dynamic Replacement builder, recursion/previous tests, signed dylib and loader probes | Product support; it is intentionally absent from automatic routing |
 | Control plane | Client-side package and policy contracts | Production Registry, HSM operations, approval, rollout, telemetry, and fleet coordination services |
 
-The checked-in SwiftPM baseline contains 441 tests in 72 suites. Debug,
+The checked-in SwiftPM baseline contains 452 tests in 73 suites. Debug,
 warnings-as-errors, and optimized Release runs are recorded as passing. An iOS
 Simulator target covers 9 runtime and UI cases. Those counts describe repository
 evidence, not device or distribution certification.
@@ -75,7 +75,11 @@ evidence, not device or distribution certification.
   separator/terminator semantics, and a 64 KiB output bound without App catalog
   configuration.
 - Calls to same-image helpers, eligible Shell entries, and exact allowlisted
-  NativeImports already emitted in the target Shell.
+  NativeImports already emitted in the target Shell. Baseline-used imported
+  APIs can be frozen automatically when Typed AST semantics and canonical SIL
+  physical ABI agree; current coverage includes references, raw enums,
+  OptionSets, opaque copyable values, accessors, methods, globals, Selector,
+  upcasts, and validated String/Array Objective-C bridges.
 
 ### Rejected or intentionally incomplete
 
@@ -101,7 +105,9 @@ evidence, not device or distribution certification.
 - Unrestricted pointers, `unsafeBitCast`, arbitrary Objective-C selector/IMP,
   `dlopen`/`dlsym`, Mirror-driven field mutation, and unknown builtins.
 - A native call that does not have an exact `NativeImportID` in the released
-  Shell, even if a similarly named Swift function exists.
+  Shell, even if a similarly named Swift function exists. A patch also cannot
+  add a framework or use an SDK operation for the first time after that Shell
+  was released.
 
 ## Development Live Reload boundary
 

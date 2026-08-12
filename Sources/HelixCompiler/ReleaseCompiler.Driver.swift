@@ -275,13 +275,19 @@ extension ReleaseCompiler {
                     invocation: request.archive.metadata.frontendInvocation
                 )
             let silFile = try CanonicalSIL.File(text: canonicalSIL)
+            let frozenNativeTypeRecords = request.archive.nativeTypes
+                .filter(\.isEmittedToDevice)
             let frozenNativeTypes = Dictionary(
-                uniqueKeysWithValues: request.archive.nativeTypes
-                    .filter(\.isEmittedToDevice)
-                    .map { ($0.canonicalName, $0.id) }
+                uniqueKeysWithValues: frozenNativeTypeRecords.map {
+                    ($0.canonicalName, $0.id)
+                }
+            )
+            let frozenNativeTypeKinds = Dictionary(
+                uniqueKeysWithValues: frozenNativeTypeRecords.map { ($0.id, $0.kind) }
             )
             let silTypeEnvironment = try silFile.typeEnvironment.includingNativeTypes(
-                frozenNativeTypes
+                frozenNativeTypes,
+                kinds: frozenNativeTypeKinds
             )
             let archivedSymbols = Set(request.archive.functions.map(\.mangledName))
 
@@ -450,7 +456,10 @@ extension ReleaseCompiler {
                 loweringSILFile = try CanonicalSIL.File(text: loweringSIL)
             }
             let loweringTypeEnvironment = try loweringSILFile.typeEnvironment
-                .includingNativeTypes(frozenNativeTypes)
+                .includingNativeTypes(
+                    frozenNativeTypes,
+                    kinds: frozenNativeTypeKinds
+                )
 
             var localFunctionIDs: [Core.FunctionKey: Bytecode.FunctionID] = [:]
             for (offset, item) in changedSIL.enumerated() {

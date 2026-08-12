@@ -1353,6 +1353,27 @@ struct Interpreter {
         #expect(boxedReference == copiedReference)
         #expect(Set([boxedReference, copiedReference]).count == 1)
         #expect(copiedToken === token)
+
+        let opaqueType = Core.TypeID.derive(
+            namespace: namespace(),
+            canonicalType: "Fixture.OpaqueValue"
+        )
+        let opaqueOperations = VM.NativeTypeOperations.opaqueValue(
+            id: opaqueType,
+            canonicalName: "Fixture.OpaqueValue",
+            layoutFingerprint: .sha256("Fixture.OpaqueValue.layout.v1"),
+            clone: { (value: NonHashableValue) in value },
+            describe: { $0.values.description }
+        )
+        let opaque = try opaqueOperations.box(NonHashableValue(values: [4, 5]))
+        let opaqueCopy = try opaqueOperations.copy(opaque)
+        let separatelyBoxed = try opaqueOperations.box(
+            NonHashableValue(values: [4, 5])
+        )
+
+        #expect(opaque == opaqueCopy)
+        #expect(opaque != separatelyBoxed)
+        #expect(opaqueCopy.value(as: NonHashableValue.self)?.values == [4, 5])
     }
 
     @Test("MainActor native TypeOps reject background boxing")

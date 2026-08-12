@@ -198,6 +198,7 @@ enum ValueTypeParser {
         case "UInt64": return .integer(bitWidth: 64, signed: false)
         case "Float": return .float(bitWidth: 32)
         case "Double": return .float(bitWidth: 64)
+        case "CGFloat", "CoreFoundation.CGFloat", "CoreGraphics.CGFloat": return .float(bitWidth: 64)
         case "String": return .string
         case "Any": return .any
         default: return nil

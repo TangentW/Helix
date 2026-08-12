@@ -20,6 +20,13 @@ public struct Function: Hashable, Sendable {
         hasStrippedDebugMetadata = false
     }
 
+    /// Returns the original Swift source location associated with a normalized
+    /// SIL body line. Body lines are one-based, matching lowering diagnostics.
+    public func sourceLocation(atBodyLine line: Int) -> Core.SourceLocation? {
+        guard line > 0 else { return nil }
+        return debugLineLocations.first { $0.line == line }?.location
+    }
+
     init(
         mangledName: String,
         loweredType: String,
