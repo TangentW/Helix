@@ -71,7 +71,8 @@ public final class ObjectReference: @unchecked Sendable, Hashable, CustomStringC
         hasher.combine(ObjectIdentifier(storage))
     }
 
-    var nativeHost: VM.NativeValue? {
+    /// Frozen native-superclass view of the Objective-C host, when present.
+    public var nativeHost: VM.NativeValue? {
         lock.withLock { nativeHostStorage }
     }
 

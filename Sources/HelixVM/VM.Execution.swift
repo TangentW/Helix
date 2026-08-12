@@ -152,12 +152,18 @@ public struct RootExecutionContext: Equatable, Sendable {
     private enum Kind: Equatable, Sendable {
         case synchronous
         case generatedAsyncBridge
+        case hostedCallback
     }
 
     private let kind: Kind
 
     public static let synchronous = Self(kind: .synchronous)
     package static let generatedAsyncBridge = Self(kind: .generatedAsyncBridge)
+    package static let hostedCallback = Self(kind: .hostedCallback)
+
+    var permitsPatchLocalObjectArguments: Bool {
+        kind == .hostedCallback
+    }
 }
 
 public final class InvocationBudget: @unchecked Sendable {

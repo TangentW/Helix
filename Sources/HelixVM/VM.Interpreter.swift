@@ -62,17 +62,20 @@ public struct Interpreter: Sendable {
     public var nativeCatalog: VM.NativeCatalog
     public var nativeTypeCatalog: VM.NativeTypeCatalog
     public var entryInvocation: VM.EntryInvocation?
+    public var objectHost: VM.ObjectHost?
     public var trapObserver: VM.TrapObserver?
 
     public init(
         nativeCatalog: VM.NativeCatalog = .init(),
         nativeTypeCatalog: VM.NativeTypeCatalog = .init(),
         entryInvocation: VM.EntryInvocation? = nil,
+        objectHost: VM.ObjectHost? = nil,
         trapObserver: VM.TrapObserver? = nil
     ) {
         self.nativeCatalog = nativeCatalog
         self.nativeTypeCatalog = nativeTypeCatalog
         self.entryInvocation = entryInvocation
+        self.objectHost = objectHost
         self.trapObserver = trapObserver
     }
 
@@ -143,7 +146,15 @@ public struct Interpreter: Sendable {
                 )
             }
             for (register, value) in zip(rootFunction.parameterRegisters, arguments) {
-                try resolvedBudget.consumeBoundaryValue(value)
+                if case .object = value,
+                   rootContext.permitsPatchLocalObjectArguments {
+                    // The Runtime reconstructed this identity from storage
+                    // already owned by the pinned image; no boundary heap was
+                    // introduced, but the validation work still consumes fuel.
+                    try resolvedBudget.consumeWork(units: 1)
+                } else {
+                    try resolvedBudget.consumeBoundaryValue(value)
+                }
                 try validateRuntimeValue(
                     value,
                     expected: rootFunction.type(of: register)!,
@@ -555,15 +566,34 @@ public struct Interpreter: Sendable {
                             actual: nil
                         )
                     }
-                    guard hostedSuperclass == nil else {
-                        throw VM.RuntimeTrap.explicit(
-                            "hosted class allocation requires a Runtime object host"
-                        )
-                    }
                     try budget.consumeLinearWork(elementCount: fields.count)
                     try chargeAggregate(elementCount: fields.count, budget: budget)
+                    let reference = VM.ObjectReference(
+                        typeKey: key,
+                        fieldCount: fields.count
+                    )
+                    if let hostedSuperclass {
+                        guard let objectHost else {
+                            throw VM.RuntimeTrap.explicit(
+                                "hosted class allocation requires a Runtime object host"
+                            )
+                        }
+                        let native = try objectHost.allocate(
+                            object: reference,
+                            definition: definition
+                        )
+                        guard native.typeID == hostedSuperclass.typeID else {
+                            throw VM.RuntimeTrap.nativeTypeMismatch(
+                                expected: hostedSuperclass.typeID
+                            )
+                        }
+                        try budget.consumeNativeOwned(
+                            bytes: native.estimatedByteCount
+                        )
+                        try reference.attach(nativeHost: native)
+                    }
                     try initialize(
-                        .object(.init(typeKey: key, fieldCount: fields.count)),
+                        .object(reference),
                         register: result,
                         registers: &registers
                     )
@@ -586,6 +616,44 @@ public struct Interpreter: Sendable {
                         ),
                         register: result,
                         registers: &registers
+                    )
+                case let .projectHostedObject(result, object):
+                    let value = try read(object, registers: registers)
+                    guard case let .object(reference) = value,
+                          let native = reference.nativeHost
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: object)!,
+                            actual: value.type
+                        )
+                    }
+                    try initialize(
+                        try copyCharging(.native(native), budget: budget),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .hostedSuperApply(object, methodIndex, arguments):
+                    let value = try read(object, registers: registers)
+                    guard case let .object(reference) = value,
+                          let definition = localTypes[reference.typeKey],
+                          case let .class(_, _, methods) = definition.kind,
+                          let index = Int(exactly: methodIndex),
+                          methods.indices.contains(index),
+                          let objectHost
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: object)!,
+                            actual: value.type
+                        )
+                    }
+                    let argumentValues = try arguments.map {
+                        try read($0, registers: registers)
+                    }
+                    try budget.consumeNativeCall(hasSideEffects: true)
+                    try objectHost.invokeSuper(
+                        object: reference,
+                        method: methods[index],
+                        arguments: argumentValues
                     )
                 case let .makeEnum(result, caseIndex, payload):
                     guard case let .local(key) = function.type(of: result),

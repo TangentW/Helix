@@ -127,14 +127,20 @@ native implementation must run outside HLVM.
 
 A save may introduce a reachable ordinary top-level helper, private class
 instance method, or computed accessor in an existing source file. It may also
-introduce non-exported file/module-scope struct and enum types used by that
-graph. The compiler follows the direct same-module call graph, assigns
+introduce non-exported file/module-scope struct, enum, and pure class types used
+by that graph. The compiler follows the direct same-module call graph, assigns
 image-local function and qualified nominal IDs, verifies every signature,
 ownership convention, and value shape, and ships the closed graph with the
-changed Shell root. These declarations are not dynamically registered native
-Swift symbols or metadata; they live only in that HLBC generation. Calls through
-dynamic dispatch, Objective-C selectors, a new source file, or a new native ABI
-surface are not implied by this feature.
+changed Shell root. A pure class's reference identity and field storage belong
+to HLVM; they are not dynamically registered Swift metadata.
+
+When a new `final` class inherits an HLXI-frozen, `NSObject`-compatible project
+or system type, Helix can register an Objective-C host under the closed hosted
+profile and pass the object to UIKit as that superclass. The initial profile is
+limited to inherited no-argument initialization, no new stored properties, and
+no-argument/Bool `Void` overrides; native code cannot identify the patch's
+concrete Swift type. This is a verified selector/ABI surface, not arbitrary IMP
+or native-ABI injection.
 
 Every new Dev Shell automatically includes the exact NativeImport for
 `Swift.print(_:separator:terminator:)`, so adding
@@ -291,12 +297,15 @@ still cannot cross the Shell/Native boundary or survive the current pinned VM
 invocation.
 
 The current generator collects reachable ordinary functions, private class
-instance methods, computed accessors, and their non-exported patch-local value
-types when they are added to an existing watched source file. Patch-local
+instance methods, computed accessors, and their non-exported patch-local types
+when they are added to an existing watched source file. Patch-local
 nonrecursive structs and enums may be newly declared at file/module scope and
 may contain supported stored fields, instance/static computed accessors, and
-mutating helpers. Their values cannot cross a Shell Entry, NativeImport,
-generation, or native storage boundary. A type declared inside a function has
+mutating helpers. A pure `final class` supports reference identity, stored
+fields, private/ordinary methods, and computed accessors. These types cannot
+cross a Shell Entry, NativeImport, generation, or native-storage boundary; the
+one exception is a verifier-approved hosted-class projection to its frozen
+superclass. A type declared inside a function has
 no stable declaration identity in Helix's current textual SIL contract and is
 rejected with its exact type name; move it to file/module scope instead.
 

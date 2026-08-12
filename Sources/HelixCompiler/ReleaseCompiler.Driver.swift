@@ -285,9 +285,13 @@ extension ReleaseCompiler {
             let frozenNativeTypeKinds = Dictionary(
                 uniqueKeysWithValues: frozenNativeTypeRecords.map { ($0.id, $0.kind) }
             )
+            let mainActorNativeTypes = Set(
+                frozenNativeTypeRecords.filter(\.requiresMainActor).map(\.id)
+            )
             let silTypeEnvironment = try silFile.typeEnvironment.includingNativeTypes(
                 frozenNativeTypes,
-                kinds: frozenNativeTypeKinds
+                kinds: frozenNativeTypeKinds,
+                requiresMainActor: mainActorNativeTypes
             )
             let archivedSymbols = Set(request.archive.functions.map(\.mangledName))
 
@@ -458,7 +462,8 @@ extension ReleaseCompiler {
             let loweringTypeEnvironment = try loweringSILFile.typeEnvironment
                 .includingNativeTypes(
                     frozenNativeTypes,
-                    kinds: frozenNativeTypeKinds
+                    kinds: frozenNativeTypeKinds,
+                    requiresMainActor: mainActorNativeTypes
                 )
 
             var localFunctionIDs: [Core.FunctionKey: Bytecode.FunctionID] = [:]
@@ -560,6 +565,14 @@ extension ReleaseCompiler {
                     )
                 )
             }
+            let hostedMethods = try mergeHostedMethods(
+                optimized: silTypeEnvironment.hostedMethodCandidates(in: silFile)
+                    .filter { !archivedSymbols.contains($0.symbol) },
+                semantic: loweringTypeEnvironment.hostedMethodCandidates(
+                    in: loweringSILFile
+                ).filter { !archivedSymbols.contains($0.symbol) },
+                imageFunctions: imageFunctions
+            )
             let directCalls = try PatchCompiler.DirectCalls.make(
                 archive: request.archive,
                 localFunctionIDs: localFunctionIDs,
@@ -633,7 +646,8 @@ extension ReleaseCompiler {
                                 optimized,
                                 displayName: item.symbol,
                                 kind: item.kind,
-                                directCalls: directCalls
+                                directCalls: directCalls,
+                                expectedEffects: item.signature.effects
                             )
                         } catch let error as CanonicalSIL.LoweringError {
                             guard let semantic = item.semantic,
@@ -645,7 +659,8 @@ extension ReleaseCompiler {
                                 semantic,
                                 displayName: item.symbol,
                                 kind: item.kind,
-                                directCalls: directCalls
+                                directCalls: directCalls,
+                                expectedEffects: item.signature.effects
                             )
                         }
                     } else if let semantic = item.semantic {
@@ -655,7 +670,8 @@ extension ReleaseCompiler {
                             semantic,
                             displayName: item.symbol,
                             kind: item.kind,
-                            directCalls: directCalls
+                            directCalls: directCalls,
+                            expectedEffects: item.signature.effects
                         )
                     } else {
                         throw DriverError.generatedFunctionUnsupported(
@@ -722,7 +738,9 @@ extension ReleaseCompiler {
             }
             loweredByID.append(contentsOf: imageLowered)
             let reachableIDs = reachableFunctions(
-                roots: Set(entries.map(\.functionID)),
+                roots: Set(entries.map(\.functionID)).union(
+                    hostedMethods.values.flatMap { $0.map(\.functionID) }
+                ),
                 functions: loweredByID
             )
             let logicalPaths = request.archive.sources.map(\.logicalPath)
@@ -745,7 +763,8 @@ extension ReleaseCompiler {
             let localTypes = try mergedLocalTypeDefinitions(
                 optimized: silTypeEnvironment,
                 semantic: loweringTypeEnvironment,
-                referencedBy: reachableIR
+                referencedBy: reachableIR,
+                hostedMethods: hostedMethods
             )
             let capabilities = CompilerCapabilities.infer(
                 for: reachableIR,
@@ -839,9 +858,14 @@ extension ReleaseCompiler {
             typeEnvironment: CanonicalSIL.TypeEnvironment
         ) throws -> [String: DiscoveredImageFunction] {
             do {
-                return try CanonicalSIL.ImageFunctions.discover(
+                let existingSymbols = Set(archive.functions.map(\.mangledName))
+                let hostedCandidates = try typeEnvironment.hostedMethodCandidates(
+                    in: file
+                ).filter { !existingSymbols.contains($0.symbol) }
+                let hostedSymbols = Set(hostedCandidates.map(\.symbol))
+                var discovered = try CanonicalSIL.ImageFunctions.discover(
                     in: file,
-                    startingAt: archivedSymbols,
+                    startingAt: archivedSymbols.union(hostedSymbols),
                     excluding: Set(archive.functions.map(\.mangledName)),
                     kindForSymbol: { symbol in
                         generatedFunctionKind(
@@ -853,6 +877,13 @@ extension ReleaseCompiler {
                         )
                     }
                 )
+                for candidate in hostedCandidates {
+                    discovered[candidate.symbol] = .init(
+                        function: candidate.function,
+                        kind: .ordinary
+                    )
+                }
+                return discovered
             } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
                 switch error {
                 case let .unsupported(symbol, reason):
@@ -888,6 +919,7 @@ extension ReleaseCompiler {
             file: CanonicalSIL.File
         ) -> Bytecode.FunctionKind? {
             guard !typeEnvironment.isStructFactory(symbol),
+                  !typeEnvironment.isHostedClassAllocator(symbol),
                   file.function(mangledName: symbol).map(
                       typeEnvironment.hasStructFactorySignature
                   ) != true,
@@ -947,10 +979,16 @@ extension ReleaseCompiler {
         private func mergedLocalTypeDefinitions(
             optimized: CanonicalSIL.TypeEnvironment,
             semantic: CanonicalSIL.TypeEnvironment,
-            referencedBy functions: [IntermediateRepresentation.Function]
+            referencedBy functions: [IntermediateRepresentation.Function],
+            hostedMethods: [Bytecode.LocalTypeKey: [Bytecode.HostedMethod]]
         ) throws -> [Bytecode.LocalTypeDefinition] {
-            let candidates = try optimized.definitions(referencedBy: functions)
-                + semantic.definitions(referencedBy: functions)
+            let candidates = try optimized.definitions(
+                referencedBy: functions,
+                hostedMethods: hostedMethods
+            ) + semantic.definitions(
+                referencedBy: functions,
+                hostedMethods: hostedMethods
+            )
             var byKey: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition] = [:]
             for candidate in candidates {
                 if let existing = byKey[candidate.key], existing != candidate {
@@ -961,6 +999,64 @@ extension ReleaseCompiler {
                 byKey[candidate.key] = candidate
             }
             return byKey.values.sorted { $0.key < $1.key }
+        }
+
+        private func mergeHostedMethods(
+            optimized: [CanonicalSIL.TypeEnvironment.HostedMethodCandidate],
+            semantic: [CanonicalSIL.TypeEnvironment.HostedMethodCandidate],
+            imageFunctions: [ImageFunction]
+        ) throws -> [Bytecode.LocalTypeKey: [Bytecode.HostedMethod]] {
+            let idBySymbol = Dictionary(
+                uniqueKeysWithValues: imageFunctions.map { ($0.symbol, $0.id) }
+            )
+            func identities(
+                _ values: [CanonicalSIL.TypeEnvironment.HostedMethodCandidate]
+            ) -> [(Bytecode.LocalTypeKey, UInt32, String, Bytecode.HostedMethodABI, String)] {
+                values.map {
+                    ($0.typeKey, $0.methodIndex, $0.selector, $0.abi, $0.symbol)
+                }.sorted {
+                    ($0.0, $0.1, $0.2, $0.4) < ($1.0, $1.1, $1.2, $1.4)
+                }
+            }
+            let optimizedIdentities = identities(optimized)
+            let semanticIdentities = identities(semantic)
+            guard optimizedIdentities.elementsEqual(
+                semanticIdentities,
+                by: { left, right in
+                    left.0 == right.0 && left.1 == right.1
+                        && left.2 == right.2 && left.3 == right.3
+                        && left.4 == right.4
+                }
+            ) else {
+                throw DriverError.sourceSetMismatch(
+                    "optimized and semantic SIL disagree on hosted class methods"
+                )
+            }
+            var result: [Bytecode.LocalTypeKey: [(
+                index: UInt32,
+                method: Bytecode.HostedMethod
+            )]] = [:]
+            for candidate in optimized {
+                guard let id = idBySymbol[candidate.symbol] else {
+                    throw DriverError.generatedFunctionUnsupported(
+                        candidate.symbol,
+                        reason: "hosted method was not assigned an image-local function ID"
+                    )
+                }
+                result[candidate.typeKey, default: []].append(
+                    (
+                        candidate.methodIndex,
+                        .init(
+                            selector: candidate.selector,
+                            functionID: id,
+                            abi: candidate.abi
+                        )
+                    )
+                )
+            }
+            return result.mapValues { values in
+                values.sorted { $0.index < $1.index }.map(\.method)
+            }
         }
 
         private func lowerProductionFunction(

@@ -31,6 +31,17 @@ public protocol NativeTypeFactory {
     ) -> VM.NativeTypeOperations
 }
 
+/// Sendable holder for the concrete class behind frozen reference TypeOps.
+/// Runtime uses this metadata only to create a verified Objective-C subclass;
+/// downloaded bytecode never receives the metatype itself.
+public final class NativeReferenceClass: @unchecked Sendable {
+    public let metatype: AnyClass
+
+    public init(_ metatype: AnyClass) {
+        self.metatype = metatype
+    }
+}
+
 public final class NativeValue: @unchecked Sendable, Hashable, CustomStringConvertible {
     public let typeID: Core.TypeID
     public let canonicalTypeName: String
@@ -94,6 +105,7 @@ public struct NativeTypeOperations: Sendable {
     public let isCopyable: Bool
     public let requiresMainActor: Bool
     public let estimatedSize: UInt64
+    public let referenceClass: VM.NativeReferenceClass?
 
     private let boxStorage: @Sendable (Any) throws -> VM.NativeValue
     private let copyStorage: @Sendable (VM.NativeValue) throws -> VM.NativeValue
@@ -121,6 +133,7 @@ public struct NativeTypeOperations: Sendable {
         self.isCopyable = isCopyable
         self.requiresMainActor = requiresMainActor
         self.estimatedSize = estimatedSize
+        referenceClass = nil
 
         @Sendable func makeBox(_ value: Value) -> VM.NativeValue {
             VM.NativeValue(
@@ -214,7 +227,7 @@ public struct NativeTypeOperations: Sendable {
             equals: { $0 === $1 },
             hash: { value, hasher in hasher.combine(ObjectIdentifier(value)) },
             describe: describe
-        )
+        ).attachingReferenceClass(Value.self)
     }
 
     /// Creates TypeOps for a copyable Swift value whose layout and equality
@@ -263,6 +276,7 @@ public struct NativeTypeOperations: Sendable {
             isCopyable: isCopyable,
             requiresMainActor: requiresMainActor,
             estimatedSize: estimatedSize,
+            referenceClass: referenceClass,
             boxStorage: { storage in
                 guard let value = storage as? Value else {
                     throw VM.RuntimeTrap.nativeTypeMismatch(expected: operations.id)
@@ -281,6 +295,7 @@ public struct NativeTypeOperations: Sendable {
         isCopyable: Bool,
         requiresMainActor: Bool,
         estimatedSize: UInt64,
+        referenceClass: VM.NativeReferenceClass?,
         boxStorage: @escaping @Sendable (Any) throws -> VM.NativeValue,
         copyStorage: @escaping @Sendable (VM.NativeValue) throws -> VM.NativeValue
     ) {
@@ -291,8 +306,24 @@ public struct NativeTypeOperations: Sendable {
         self.isCopyable = isCopyable
         self.requiresMainActor = requiresMainActor
         self.estimatedSize = estimatedSize
+        self.referenceClass = referenceClass
         self.boxStorage = boxStorage
         self.copyStorage = copyStorage
+    }
+
+    private func attachingReferenceClass(_ metatype: AnyClass) -> Self {
+        Self(
+            id: id,
+            canonicalName: canonicalName,
+            kind: kind,
+            layoutFingerprint: layoutFingerprint,
+            isCopyable: isCopyable,
+            requiresMainActor: requiresMainActor,
+            estimatedSize: estimatedSize,
+            referenceClass: .init(metatype),
+            boxStorage: boxStorage,
+            copyStorage: copyStorage
+        )
     }
 
     public func box<Value>(_ value: Value) throws -> VM.NativeValue {
@@ -331,11 +362,28 @@ public struct NativeTypeCatalog: Sendable {
         operations[id]
     }
 
+    /// Concrete frozen class for a reference TypeID, used by Runtime hosting.
+    public func referenceClass(for id: Core.TypeID) -> AnyClass? {
+        operations[id]?.referenceClass?.metatype
+    }
+
     public func box<Value>(
         _ value: Value,
         as id: Core.TypeID
     ) throws -> VM.NativeValue {
         guard let operations = operations[id] else {
+            throw VM.RuntimeTrap.unknownNativeType(id)
+        }
+        return try operations.box(value)
+    }
+
+    /// Boxes a dynamically created Objective-C subclass as its frozen native
+    /// superclass. The registered TypeOps performs the concrete runtime cast.
+    public func boxReference(
+        _ value: AnyObject,
+        as id: Core.TypeID
+    ) throws -> VM.NativeValue {
+        guard let operations = operations[id], operations.kind == .reference else {
             throw VM.RuntimeTrap.unknownNativeType(id)
         }
         return try operations.box(value)

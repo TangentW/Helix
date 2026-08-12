@@ -19,6 +19,12 @@ public struct Request: Sendable {
     public var directCalls: CanonicalSIL.DirectCallTable
     public var nativeTypes: [String: Core.TypeID]
     public var nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind]
+    /// Frozen native types whose values and hosted subclasses are MainActor-bound.
+    public var mainActorNativeTypes: Set<Core.TypeID>
+    /// SIL symbols that already belong to the finalized Shell. Hosted callback
+    /// discovery must never reinterpret one of these declarations as a newly
+    /// introduced patch-local class method.
+    public var shellDeclarationSymbols: Set<String>
     public var effects: Core.Effects?
     /// The only source path permitted in emitted HLBC diagnostics. When nil,
     /// the compiler drops all source locations instead of retaining host paths.
@@ -37,6 +43,8 @@ public struct Request: Sendable {
         directCalls: CanonicalSIL.DirectCallTable = .empty,
         nativeTypes: [String: Core.TypeID] = [:],
         nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:],
+        mainActorNativeTypes: Set<Core.TypeID> = [],
+        shellDeclarationSymbols: Set<String> = [],
         effects: Core.Effects? = nil,
         sourceFileLogicalID: String? = nil
     ) {
@@ -52,6 +60,8 @@ public struct Request: Sendable {
         self.directCalls = directCalls
         self.nativeTypes = nativeTypes
         self.nativeTypeKinds = nativeTypeKinds
+        self.mainActorNativeTypes = mainActorNativeTypes
+        self.shellDeclarationSymbols = shellDeclarationSymbols
         self.effects = effects
         self.sourceFileLogicalID = sourceFileLogicalID
     }
@@ -71,7 +81,8 @@ public struct Driver: Sendable {
         let file = try CanonicalSIL.File(text: request.canonicalSIL)
         let typeEnvironment = try file.typeEnvironment.includingNativeTypes(
             request.nativeTypes,
-            kinds: request.nativeTypeKinds
+            kinds: request.nativeTypeKinds,
+            requiresMainActor: request.mainActorNativeTypes
         )
         guard let silFunction = file.function(mangledName: request.mangledName) else {
             throw CanonicalSIL.LoweringError.functionSelection("function @\(request.mangledName) was not found")
@@ -81,7 +92,8 @@ public struct Driver: Sendable {
             root: silFunction,
             rootID: request.functionID,
             typeEnvironment: typeEnvironment,
-            directCalls: request.directCalls
+            directCalls: request.directCalls,
+            shellDeclarationSymbols: request.shellDeclarationSymbols
         )
         var root = try CanonicalSIL.Lowerer(
             typeEnvironment: typeEnvironment
@@ -136,7 +148,10 @@ public struct Driver: Sendable {
         let imports = try imagePlan.directCalls.importRequirements(
             referencedBy: loweredFunctions
         )
-        let localTypes = try typeEnvironment.definitions(referencedBy: loweredFunctions)
+        let localTypes = try typeEnvironment.definitions(
+            referencedBy: loweredFunctions,
+            hostedMethods: imagePlan.hostedMethods
+        )
         let functions = loweredByID.map {
             IntermediateRepresentation.ToBytecode.lower($0.function, id: $0.id)
         }
@@ -225,6 +240,12 @@ public struct Driver: Sendable {
                         .filter(\.isEmittedToDevice)
                         .map { ($0.id, $0.kind) }
                 ),
+                mainActorNativeTypes: Set(
+                    archive.nativeTypes
+                        .filter { $0.isEmittedToDevice && $0.requiresMainActor }
+                        .map(\.id)
+                ),
+                shellDeclarationSymbols: Set(archive.functions.map(\.mangledName)),
                 effects: record.effects,
                 sourceFileLogicalID: record.sourceFileLogicalID
             )

@@ -167,7 +167,7 @@ let package = Package(
             name: "HelixDevRuntimeIOSTests",
             dependencies: [
                 "HelixDevRuntime", "HelixDevProtocol", "HelixLiveReloadAPI",
-                "HelixBytecode", "HelixCore", "HelixVM",
+                "HelixBytecode", "HelixCore", "HelixRuntime", "HelixVerifier", "HelixVM",
             ]
         ),
         .testTarget(

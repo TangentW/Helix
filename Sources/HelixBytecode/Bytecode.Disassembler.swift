@@ -153,6 +153,10 @@ public enum Disassembler {
             "\(result) = allocate_object"
         case let .projectObjectAddress(result, object, fieldIndex):
             "\(result) = project_object_address \(object), #\(fieldIndex)"
+        case let .projectHostedObject(result, object):
+            "\(result) = project_hosted_object \(object)"
+        case let .hostedSuperApply(object, methodIndex, arguments):
+            "hosted_super_apply \(object), #\(methodIndex)(\(arguments.map(\.description).joined(separator: ", ")))"
         case let .beginAccess(result, address, kind):
             "\(result) = begin_access.\(kind.rawValue) \(address)"
         case let .endAccess(address):

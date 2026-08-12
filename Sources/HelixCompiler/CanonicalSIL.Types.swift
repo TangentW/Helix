@@ -15,10 +15,21 @@ public struct TypeEnvironment: Sendable {
         var associatedTypes: [String]
     }
 
+    private struct RawHostedMethod: Equatable, Sendable {
+        var name: String
+        var selector: String
+        var abi: Bytecode.HostedMethodABI
+    }
+
     private enum RawKind: Sendable {
         case structure([RawField])
         case enumeration([RawEnumCase])
-        case `class`(fields: [RawField], superclass: String?, isFinal: Bool)
+        case `class`(
+            fields: [RawField],
+            superclass: String?,
+            isFinal: Bool,
+            hostedMethods: [RawHostedMethod]
+        )
     }
 
     private struct RawDefinition: Sendable {
@@ -103,6 +114,7 @@ public struct TypeEnvironment: Sendable {
             let key = Bytecode.LocalTypeKey(rawValue: name)
             var fields: [RawField] = []
             var cases: [RawEnumCase] = []
+            var hostedMethods: [RawHostedMethod] = []
             index += 1
 
             while index < lines.count {
@@ -130,7 +142,8 @@ public struct TypeEnvironment: Sendable {
                         kind = .class(
                             fields: fields,
                             superclass: inherited,
-                            isFinal: !header[0].isEmpty
+                            isFinal: !header[0].isEmpty,
+                            hostedMethods: hostedMethods
                         )
                     default:
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -164,6 +177,11 @@ public struct TypeEnvironment: Sendable {
                     pattern: TypeEnvironment.storedFieldPattern
                    ) {
                     fields.append(.init(name: field[0], type: field[1]))
+                } else if header[1] == "class",
+                          let method = TypeEnvironment.hostedMethodDeclaration(
+                            in: member
+                          ) {
+                    hostedMethods.append(method)
                 } else if header[1] == "enum",
                           let item = TypeEnvironment.captures(
                     member,
@@ -209,6 +227,23 @@ public struct TypeEnvironment: Sendable {
     private var requiresTypedErrors: Bool
     private var nativeTypes: [String: Core.TypeID]
     private var nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind]
+    private var mainActorNativeTypes: Set<Core.TypeID>
+
+    struct HostedMethodCandidate: Sendable {
+        var typeKey: Bytecode.LocalTypeKey
+        var methodIndex: UInt32
+        var selector: String
+        var abi: Bytecode.HostedMethodABI
+        var symbol: String
+        var function: CanonicalSIL.Function
+    }
+
+    struct HostedMethodContext: Equatable, Sendable {
+        var typeKey: Bytecode.LocalTypeKey
+        var methodIndex: UInt32
+        var selector: String
+        var abi: Bytecode.HostedMethodABI
+    }
 
     public static let empty = Self()
 
@@ -219,6 +254,7 @@ public struct TypeEnvironment: Sendable {
         requiresTypedErrors = false
         nativeTypes = [:]
         nativeTypeKinds = [:]
+        mainActorNativeTypes = []
     }
 
     init(text: String, functions: [CanonicalSIL.Function]) throws {
@@ -227,6 +263,7 @@ public struct TypeEnvironment: Sendable {
         classAllocators = [:]
         nativeTypes = [:]
         nativeTypeKinds = [:]
+        mainActorNativeTypes = []
         // Keep payload-free legacy Error patches on the 1.0 String error path.
         // Typed storage is enabled only when the SIL or a local declaration needs it.
         requiresTypedErrors = text.contains("checked_cast_addr_br")
@@ -247,15 +284,19 @@ public struct TypeEnvironment: Sendable {
     /// module-relative form are accepted; ambiguous aliases fail closed.
     func includingNativeTypes(
         _ records: [String: Core.TypeID],
-        kinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:]
+        kinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:],
+        requiresMainActor: Set<Core.TypeID> = []
     ) throws -> Self {
         let frozenTypeIDs = Set(records.values)
-        guard Set(kinds.keys).isSubset(of: frozenTypeIDs) else {
+        guard Set(kinds.keys).isSubset(of: frozenTypeIDs),
+              requiresMainActor.isSubset(of: frozenTypeIDs)
+        else {
             throw CanonicalSIL.LoweringError.invalidCallTable(
-                "native type kind metadata references an unknown TypeID"
+                "native type metadata references an unknown TypeID"
             )
         }
         var result = self
+        result.mainActorNativeTypes.formUnion(requiresMainActor)
         for (id, kind) in kinds {
             if let existing = result.nativeTypeKinds[id], existing != kind {
                 throw CanonicalSIL.LoweringError.invalidCallTable(
@@ -358,7 +399,7 @@ public struct TypeEnvironment: Sendable {
             return !fields.isEmpty
         case let .enumeration(cases):
             return cases.contains { !$0.associatedTypes.isEmpty }
-        case let .class(fields, _, _):
+        case let .class(fields, _, _, _):
             return !fields.isEmpty
         }
     }
@@ -607,6 +648,11 @@ public struct TypeEnvironment: Sendable {
         classAllocators[mangledName] != nil
     }
 
+    func isHostedClassAllocator(_ mangledName: String) -> Bool {
+        guard let key = classAllocators[mangledName] else { return false }
+        return (try? hostedSuperclass(for: key)) != nil
+    }
+
     func isStructFactory(_ mangledName: String) -> Bool {
         structFactories[mangledName] != nil
     }
@@ -656,7 +702,7 @@ public struct TypeEnvironment: Sendable {
                         return .init(name: item.name, payloadType: payload)
                     }
                 )
-            case let .class(fields, superclass, isFinal):
+            case let .class(fields, superclass, isFinal, _):
                 guard isFinal else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
                         "non-final patch-local class \(key)"
@@ -724,7 +770,8 @@ public struct TypeEnvironment: Sendable {
     }
 
     func definitions(
-        referencedBy functions: [IntermediateRepresentation.Function]
+        referencedBy functions: [IntermediateRepresentation.Function],
+        hostedMethods: [Bytecode.LocalTypeKey: [Bytecode.HostedMethod]] = [:]
     ) throws -> [Bytecode.LocalTypeDefinition] {
         var pending: [Bytecode.LocalTypeKey] = []
         var seen = Set<Bytecode.LocalTypeKey>()
@@ -753,7 +800,15 @@ public struct TypeEnvironment: Sendable {
         }
         var result: [Bytecode.LocalTypeDefinition] = []
         while let key = pending.popLast() {
-            let item = try definition(for: key)
+            var item = try definition(for: key)
+            if let methods = hostedMethods[key],
+               case let .class(fields, superclass, _) = item.kind {
+                item.kind = .class(
+                    fields: fields,
+                    hostedSuperclass: superclass,
+                    hostedMethods: methods
+                )
+            }
             result.append(item)
             switch item.kind {
             case let .structure(fields):
@@ -864,6 +919,140 @@ public struct TypeEnvironment: Sendable {
             throw CanonicalSIL.LoweringError.malformedSIL("\(key) is not a class")
         }
         return fields
+    }
+
+    func hostedSuperclass(
+        for key: Bytecode.LocalTypeKey
+    ) throws -> Bytecode.HostedSuperclass? {
+        guard case let .class(_, superclass, _) = try definition(for: key).kind else {
+            return nil
+        }
+        return superclass
+    }
+
+    func hostedMethodCandidates(
+        in file: CanonicalSIL.File
+    ) throws -> [HostedMethodCandidate] {
+        var result: [HostedMethodCandidate] = []
+        for (key, raw) in rawDefinitions.sorted(by: { $0.key < $1.key }) {
+            guard case let .class(_, superclass, isFinal, methods) = raw.kind,
+                  isFinal,
+                  superclass != nil,
+                  !methods.isEmpty
+            else { continue }
+            for (index, method) in methods.enumerated() {
+                guard let methodIndex = UInt32(exactly: index) else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "hosted class \(key) has too many methods"
+                    )
+                }
+                let matches = try file.functions.filter { function in
+                    try hostedMethodContext(for: function) == .init(
+                        typeKey: key,
+                        methodIndex: methodIndex,
+                        selector: method.selector,
+                        abi: method.abi
+                    )
+                }
+                guard matches.count == 1, let function = matches.first else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "hosted method \(key).\(method.name) resolves to \(matches.count) canonical SIL bodies"
+                    )
+                }
+                result.append(
+                    .init(
+                        typeKey: key,
+                        methodIndex: methodIndex,
+                        selector: method.selector,
+                        abi: method.abi,
+                        symbol: function.mangledName,
+                        function: function
+                    )
+                )
+            }
+        }
+        return result.sorted {
+            ($0.typeKey, $0.methodIndex, $0.symbol)
+                < ($1.typeKey, $1.methodIndex, $1.symbol)
+        }
+    }
+
+    func hostedMethodContext(
+        for function: CanonicalSIL.Function
+    ) throws -> HostedMethodContext? {
+        guard function.loweredType.contains("@convention(method)"),
+              !function.mangledName.hasSuffix("TD"),
+              !function.mangledName.hasSuffix("To")
+        else { return nil }
+        var rawMatches: [(
+            key: Bytecode.LocalTypeKey,
+            index: Int,
+            method: RawHostedMethod
+        )] = []
+        for (key, raw) in rawDefinitions {
+            guard case let .class(_, superclass, isFinal, methods) = raw.kind,
+                  isFinal,
+                  superclass != nil
+            else { continue }
+            for (index, method) in methods.enumerated() {
+                let nameFragment = "\(method.name.utf8.count)\(method.name)"
+                if function.mangledName.contains(nameFragment) {
+                    rawMatches.append((key, index, method))
+                }
+            }
+        }
+        guard !rawMatches.isEmpty else { return nil }
+        let signature = try CanonicalSIL.Lowerer(
+            typeEnvironment: self
+        ).parseFunctionType(function.loweredType)
+        var matches: [HostedMethodContext] = []
+        for candidate in rawMatches {
+            let key = candidate.key
+            let method = candidate.method
+            let index = candidate.index
+            guard signature.result == .void,
+                  !signature.effects.mayThrow,
+                  !signature.effects.isAsync,
+                  signature.parameters == expectedHostedParameters(
+                    abi: method.abi,
+                    typeKey: key
+                  ),
+                  let methodIndex = UInt32(exactly: index)
+            else { continue }
+            matches.append(
+                .init(
+                    typeKey: key,
+                    methodIndex: methodIndex,
+                    selector: method.selector,
+                    abi: method.abi
+                )
+            )
+        }
+        guard matches.count <= 1 else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "function @\(function.mangledName) ambiguously matches hosted methods"
+            )
+        }
+        return matches.first
+    }
+
+    func hostedMethodRequiresMainActor(
+        _ context: HostedMethodContext
+    ) throws -> Bool {
+        guard let superclass = try hostedSuperclass(for: context.typeKey) else {
+            return false
+        }
+        return mainActorNativeTypes.contains(superclass.typeID)
+    }
+
+    private func expectedHostedParameters(
+        abi: Bytecode.HostedMethodABI,
+        typeKey: Bytecode.LocalTypeKey
+    ) -> [Bytecode.ValueType] {
+        switch abi {
+        case .voidNoArguments: [.local(typeKey)]
+        case .voidBool: [.bool, .local(typeKey)]
+        }
     }
 
     func isClass(_ key: Bytecode.LocalTypeKey) -> Bool {
@@ -1051,6 +1240,79 @@ public struct TypeEnvironment: Sendable {
         #"^(?:@[^\s]+\s+)*@_hasStorage\s+(?:(?:public|internal|package|private|fileprivate)\s+)?(?:final\s+)?(?:var|let)\s+([^:]+):\s*(.+?)(?:\s*\{.*)?$"#
     private static let enumCasePattern =
         #"^(?:indirect )?case\s+([^\s(]+)(?:\((.*)\))?$"#
+
+    private static let hostedMethodPattern =
+        #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate|override|final|dynamic|class|nonisolated)\s+)*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)(?:\s+(?:async|throws|rethrows))*\s*$"#
+
+    private static func hostedMethodDeclaration(
+        in line: String
+    ) -> RawHostedMethod? {
+        guard let capture = captures(line, pattern: hostedMethodPattern) else {
+            return nil
+        }
+        guard let functionKeyword = line.range(
+            of: #"\bfunc\s+"#,
+            options: .regularExpression
+        ) else { return nil }
+        let declarationPrefix = String(line[..<functionKeyword.lowerBound])
+        let modifiers = declarationPrefix.split(whereSeparator: \.isWhitespace)
+        guard modifiers.contains("override"),
+              !modifiers.contains("class"),
+              !modifiers.contains("static")
+        else { return nil }
+        let name = capture[0]
+        let explicitSelector = captures(
+            declarationPrefix,
+            pattern: #"@objc\(([^)]+)\)"#
+        )?.first
+        let parameters = capture[1].trimmingCharacters(in: .whitespaces)
+        if parameters.isEmpty {
+            return .init(
+                name: name,
+                selector: explicitSelector ?? name,
+                abi: .voidNoArguments
+            )
+        }
+        guard let parameter = hostedBooleanParameter(parameters) else {
+            return nil
+        }
+        let selector = explicitSelector ?? {
+            guard parameter.externalLabel != "_" else { return "\(name):" }
+            let label = parameter.externalLabel
+            let initial = label.prefix(1).uppercased()
+            return "\(name)With\(initial)\(label.dropFirst()):"
+        }()
+        return .init(name: name, selector: selector, abi: .voidBool)
+    }
+
+    private static func hostedBooleanParameter(
+        _ declaration: String
+    ) -> (externalLabel: String, localName: String)? {
+        guard !declaration.contains(","),
+              let colon = declaration.firstIndex(of: ":")
+        else { return nil }
+        let names = declaration[..<colon].split(whereSeparator: \.isWhitespace)
+        guard !names.isEmpty, names.count <= 2 else { return nil }
+        let type = declaration[declaration.index(after: colon)...]
+            .trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: "Swift.", with: "")
+        guard type == "Bool" else { return nil }
+        let external = String(names[0])
+        let local = String(names.count == 2 ? names[1] : names[0])
+        guard external == "_" || isSwiftIdentifier(external),
+              isSwiftIdentifier(local)
+        else { return nil }
+        return (external, local)
+    }
+
+    private static func isSwiftIdentifier(_ value: String) -> Bool {
+        guard let first = value.unicodeScalars.first,
+              first == "_" || CharacterSet.letters.contains(first)
+        else { return false }
+        return value.unicodeScalars.dropFirst().allSatisfy {
+            $0 == "_" || CharacterSet.alphanumerics.contains($0)
+        }
+    }
 
     private static func qualified(
         _ name: String,

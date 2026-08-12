@@ -244,6 +244,15 @@ public struct Engine: Verification.ImageVerifying {
                             .hostedObjectiveCClassesV1
                         )
                     }
+                    // Runtime intentionally exposes only inherited no-argument
+                    // initialization in hosted profile v1. Until an initializer
+                    // descriptor proves field initialization order, a native
+                    // callback could otherwise observe uninitialized VM storage.
+                    guard fields.isEmpty else {
+                        throw Verification.Error.invalidModule(
+                            "hosted class \(definition.key) cannot declare stored fields"
+                        )
+                    }
                 } else if !hostedMethods.isEmpty {
                     throw Verification.Error.invalidModule(
                         "VM-only class \(definition.key) declares native callbacks"
@@ -268,8 +277,27 @@ public struct Engine: Verification.ImageVerifying {
                         "hosted class \(definition.key) has duplicate selectors"
                     )
                 }
+                guard Set(hostedMethods.map(\.functionID)).count
+                        == hostedMethods.count
+                else {
+                    throw Verification.Error.invalidModule(
+                        "hosted class \(definition.key) reuses one callback function"
+                    )
+                }
                 for method in hostedMethods {
                     try verifyObjectiveCSelector(method.selector)
+                    let colonCount = method.selector.reduce(into: 0) { count, character in
+                        if character == ":" { count += 1 }
+                    }
+                    let expectedColonCount = switch method.abi {
+                    case .voidNoArguments: 0
+                    case .voidBool: 1
+                    }
+                    guard colonCount == expectedColonCount else {
+                        throw Verification.Error.invalidModule(
+                            "hosted selector \(method.selector) does not match \(method.abi.rawValue)"
+                        )
+                    }
                 }
             }
             guard members <= structuralLimits.maximumLocalTypeMembers else {
@@ -573,11 +601,18 @@ public struct Engine: Verification.ImageVerifying {
                 case .voidNoArguments: [.local(definition.key)]
                 case .voidBool: [.bool, .local(definition.key)]
                 }
+                let actorCompatible = hostedSuperclass
+                    .flatMap { shell.types[$0.typeID] }
+                    .map {
+                        !$0.requiresMainActor
+                            || function.effects.requiresMainActor
+                    } ?? true
                 guard parameters.count == function.parameterRegisters.count,
                       parameters == expected,
                       function.resultType == .void,
                       !function.effects.mayThrow,
-                      !function.effects.isAsync
+                      !function.effects.isAsync,
+                      actorCompatible
                 else {
                     throw Verification.Error.invalidModule(
                         "hosted selector \(method.selector) has an incompatible HLBC function"
@@ -1641,6 +1676,37 @@ public struct Engine: Verification.ImageVerifying {
             else {
                 throw fail("project_object_address must reference a valid local class field")
             }
+        case let .projectHostedObject(result, object):
+            guard capabilities.contains(.hostedObjectiveCClassesV1),
+                  case let .local(key) = type(object),
+                  let definition = localTypes[key],
+                  case let .class(_, hostedSuperclass, _) = definition.kind,
+                  let hostedSuperclass,
+                  type(result) == .native(hostedSuperclass.typeID)
+            else {
+                throw fail("project_hosted_object must produce the frozen native superclass")
+            }
+        case let .hostedSuperApply(object, methodIndex, arguments):
+            guard capabilities.contains(.hostedObjectiveCClassesV1),
+                  case let .local(key) = type(object),
+                  let definition = localTypes[key],
+                  case let .class(_, hostedSuperclass, methods) = definition.kind,
+                  hostedSuperclass != nil,
+                  let index = Int(exactly: methodIndex),
+                  methods.indices.contains(index),
+                  methods[index].functionID == function.id
+            else {
+                throw fail("hosted_super_apply must target the current hosted method")
+            }
+            let expectedArguments: [Bytecode.ValueType] = switch methods[index].abi {
+            case .voidNoArguments: []
+            case .voidBool: [.bool]
+            }
+            guard arguments.count == expectedArguments.count,
+                  zip(arguments, expectedArguments).allSatisfy({ type($0.0) == $0.1 })
+            else {
+                throw fail("hosted_super_apply arguments do not match the callback ABI")
+            }
         case let .beginAccess(result, address, _):
             guard capabilities.contains(.addressValuesV1),
                   case .address = type(address),
@@ -2494,11 +2560,13 @@ public struct Engine: Verification.ImageVerifying {
                 case .makeStruct, .structExtract, .makeEnum, .makeError, .castError,
                      .eraseToAny, .checkedCastAny, .forceCastAny, .stackAddress,
                      .projectStructAddress, .allocateObject, .projectObjectAddress,
-                     .beginAccess, .endAccess:
+                     .hostedSuperApply, .beginAccess, .endAccess:
                     // Allocation and address projection do not transfer a
                     // native handle. A local class field load/store is tracked
                     // by the corresponding address instruction instead.
                     break
+                case let .projectHostedObject(result, _):
+                    live.insert(result)
                 case let .switchEnum(_, cases, defaultTarget):
                     let targets = cases.map(\.target) + (defaultTarget.map { [$0] } ?? [])
                     for target in targets {

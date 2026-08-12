@@ -87,19 +87,22 @@ Live Reload acceptance run.
   capabilities, quotas, diagnostics, and interface archives.
 - Release Derived Sources and permanent Swift bridges without modifying
   handwritten source files.
-- Canonical HLBC 1.10 encoding/decoding, independent structural and semantic
+- Canonical HLBC 1.11 / HLXI 2.6 encoding/decoding, independent structural and semantic
   verification, a typed-register HLVM, exact native bridges, immutable
   generations, and pinned call-chain snapshots.
 - Exact-toolchain Swift-to-HLBC compilation for the documented subset: common
   scalar and String operations, bounded Character predicates, Optional
   projection, `Range<Int>` loops, Array/Dictionary value semantics,
-  newly introduced file/module-scope patch-local struct/enum, concrete
-  `Result`, computed accessors, payload-carrying local errors, scoped local
+  newly introduced image-local ordinary/private functions, computed accessors,
+  file/module-scope patch-local struct/enum/class, concrete `Result`,
+  payload-carrying local errors, scoped local
   `inout`/`mutating`, synchronous
   patch-local closures including bounded `@escaping` return/capture flows,
   concrete compiler specializations and default-argument generators,
   VM-owned `Any` with common dynamic casts, automatically frozen `Swift.print`,
-  and non-suspending async entries.
+  and non-suspending async entries. A closed hosted profile can additionally
+  project a new final subclass of an HLXI-frozen `NSObject`-compatible project
+  or system type to native code, including a bounded `UIViewController` path.
 - NativeImport v2 and schema 2 build-time discovery by declaration, file,
   module, or project scope, plus dual-evidence freezing of baseline-used APIs
   from imported Apple or third-party modules. Raw enums, OptionSets, opaque
@@ -189,7 +192,7 @@ swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
 ```
 
-The current full SwiftPM baseline contains 469 tests in 73 suites. The recorded
+The current full SwiftPM baseline contains 482 tests in 75 suites. The recorded
 Debug, warnings-as-errors, and optimized Release runs pass. Platform-specific
 fixtures can be run with an available Simulator UDID:
 
@@ -199,7 +202,7 @@ Tests/Fixtures/LiveReloadE2E/run-simulator-e2e.sh SIMULATOR_UDID
 Tests/Fixtures/LiveReloadE2E/run-release-audit.sh
 ```
 
-The iOS target contains 9 runtime/UI cases. The HLBC Live Reload E2E preserves
+The iOS target contains 10 runtime/UI cases. The HLBC Live Reload E2E preserves
 one App PID while applying a changed implementation and then a second generation
 that restores the baseline. The Release audit builds a separate iOS 15 target
 linked only to `HelixAppRuntime`.

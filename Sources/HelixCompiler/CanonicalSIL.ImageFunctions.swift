@@ -90,11 +90,16 @@ enum ImageFunctions {
                     reason: "async helpers require a suspension-aware call contract"
                 )
             }
+            var effects = parsed.effects
+            if let context = try environment.hostedMethodContext(for: function),
+               try environment.hostedMethodRequiresMainActor(context) {
+                effects.requiresMainActor = true
+            }
             return .init(
                 parameters: parsed.parameters,
                 parameterConventions: parsed.parameterConventions,
                 result: parsed.result,
-                effects: parsed.effects
+                effects: effects
             )
         } catch let error as DiscoveryError {
             throw error

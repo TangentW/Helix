@@ -700,6 +700,126 @@ struct ReleaseDriver {
         )
     }
 
+    @Test("Production driver links a hosted UIViewController class")
+    func linksHostedUIViewControllerClass() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-hosted-uiviewcontroller-release-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        import UIKit
+
+        @MainActor
+        @inline(never)
+        public func transform() -> UIViewController {
+            fatalError("baseline")
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+
+        let namespace = Core.ShellNamespaceID.derive(
+            bundleID: "dev.helix.release-driver",
+            buildNumber: "1",
+            seed: "fixture"
+        )
+        let controllerType = Core.TypeID.derive(
+            namespace: namespace,
+            canonicalType: "UIKit.UIViewController"
+        )
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            transformSignature: .init(
+                parameters: [],
+                result: "UIKit.UIViewController",
+                isolation: "MainActor"
+            ),
+            transformParameterTypes: [],
+            transformResultType: .native(controllerType),
+            transformCanonicalDeclaration:
+                "@MainActor func transform() -> UIViewController",
+            transformFormalType: "() -> UIKit.UIViewController",
+            transformLoweredSILType:
+                "@convention(thin) () -> @owned UIViewController",
+            transformEffects: .init(
+                mayAllocate: true,
+                requiresMainActor: true
+            ),
+            optimization: "-Onone",
+            nativeTypes: [
+                .init(
+                    id: controllerType,
+                    canonicalName: "UIKit.UIViewController",
+                    kind: .reference,
+                    layoutFingerprint: .sha256("UIViewController-layout"),
+                    isCopyable: true,
+                    requiresMainActor: true,
+                    isEmittedToDevice: true,
+                    estimatedSize: 8
+                ),
+            ]
+        )
+        let transform = try #require(archive.functions.first)
+
+        let changed = """
+        import UIKit
+
+        final class EmergencyController: UIViewController {
+            override func viewDidLoad() {
+                super.viewDidLoad()
+            }
+        }
+
+        @MainActor
+        @inline(never)
+        public func transform() -> UIViewController {
+            EmergencyController()
+        }
+        """
+        try Data(changed.utf8).write(to: sourceURL)
+        let result = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+
+        #expect(result.changedFunctions.map(\.key) == [transform.key])
+        let definition = try #require(
+            result.module.localTypes.first {
+                $0.key.rawValue == "EmergencyController"
+            }
+        )
+        guard case let .class(fields, superclass, methods) = definition.kind else {
+            Issue.record("expected a hosted UIViewController definition")
+            return
+        }
+        #expect(fields.isEmpty)
+        #expect(superclass?.typeID == controllerType)
+        #expect(methods.map(\.selector) == ["viewDidLoad"])
+        #expect(methods.allSatisfy { method in
+            result.module.functions.first { $0.id == method.functionID }?
+                .effects.requiresMainActor == true
+        })
+        #expect(result.module.capabilities.contains(.hostedObjectiveCClassesV1))
+        #expect(result.disassembly.contains("project_hosted_object"))
+
+        _ = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(
+                acceptedCapabilities: Set(archive.capabilities),
+                allowMainActorSynchronousEntries: true
+            )
+        )
+    }
+
     @Test("An allowlisted Swift callee becomes a typed native import")
     func lowersCallsToNativeImports() throws {
         let directory = FileManager.default.temporaryDirectory

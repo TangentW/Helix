@@ -277,9 +277,13 @@ Changing an existing native stored layout, signature, inheritance, conformance,
 enum cases, actor isolation, source membership, linked dependencies, or build
 settings requires a normal build. A changed root may use newly introduced
 reachable ordinary helpers, private class methods, computed accessors, and
-non-exported file/module-scope struct or enum values declared in an existing
-watched source file; adding a new file or native ABI surface remains outside
-this workflow.
+non-exported file/module-scope struct, enum, or pure class types declared in an
+existing watched source file. A new `final` class may also inherit an
+HLXI-frozen, `NSObject`-compatible project or system type under the closed
+hosted profile and cross into native code as that superclass; the current
+profile permits only inherited no-argument initialization, no new stored
+properties, and no-argument/Bool `Void` overrides. Adding a new file or
+arbitrary native Swift metadata remains outside this workflow.
 
 ## 11. Build a Hot Patch
 

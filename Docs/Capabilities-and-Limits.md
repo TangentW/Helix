@@ -13,17 +13,17 @@ current practical boundary.
 | Area | Implemented | Not yet qualified or implemented |
 | --- | --- | --- |
 | Release Shell | Exact frontend indexing, Derived Sources, interface archive, permanent bridge, NativeImport discovery, Xcode integration, bundle leakage audit | Broad real-application migration and long-running CI matrix |
-| Production HLBC | HLBC 1.10 / HLXI 2.5 compiler path, verifier, HLVM, signed package, safe installation, immutable activation, rollback and revocation; checked-in business corpus | App Store distribution approval, external top-200 corpus, long fuzz/sanitizer campaigns, real-device macro performance |
+| Production HLBC | HLBC 1.11 / HLXI 2.6 compiler path, verifier, HLVM, signed package, safe installation, immutable activation, rollback and revocation; checked-in business corpus | App Store distribution approval, external top-200 corpus, long fuzz/sanitizer campaigns, real-device macro performance, and hosted UIKit-page soak |
 | Development Live Reload | Exact build capture, stable snapshots, body diff, session-bound verified HLBC, authenticated transfer, atomic activation, UIKit/SwiftUI refresh, logical source maps and a 128-generation in-process soak | Physical-iPhone matrix, long-duration device soak, interactive bytecode stepping, large-project latency qualification |
 | Native experiment | Explicit-only Dynamic Replacement builder, recursion/previous tests, signed dylib and loader probes | Product support; it is intentionally absent from automatic routing |
 | Control plane | Client-side package and policy contracts | Production Registry, HSM operations, approval, rollout, telemetry, and fleet coordination services |
 
-The checked-in SwiftPM baseline contains 461 tests in 73 suites. Debug,
+The checked-in SwiftPM baseline contains 482 tests in 75 suites. Debug,
 warnings-as-errors, and optimized Release runs are recorded as passing. An iOS
-Simulator target covers 9 runtime and UI cases. Those counts describe repository
+Simulator target covers 10 runtime and UI cases. Those counts describe repository
 evidence, not device or distribution certification.
 
-## Production HLBC 1.10 Swift subset
+## Production HLBC 1.11 Swift subset
 
 ### Implemented
 
@@ -50,6 +50,18 @@ evidence, not device or distribution certification.
   switch, instance/static computed getters and setters, and supported mutating
   helpers. Nested declarations keep their namespace-qualified identity. These
   are generation-local VM values, not newly loaded Swift metadata.
+- Newly introduced ordinary functions, private methods, and computed accessors
+  are transitively linked as same-image functions, getters, or setters without
+  requiring a pre-existing Shell EntryIndex. A patch-local `final class` has
+  HLVM-owned reference identity, field storage, and method dispatch; a pure
+  HLVM class cannot cross the native boundary.
+- A new `final` class may name an HLXI-frozen, `NSObject`-compatible reference
+  superclass. Runtime registers an Objective-C host per immutable image so the
+  instance can cross into native code as that superclass, including a project
+  base class or `UIViewController`. The current hosted profile permits only an
+  inherited no-argument initializer, no new stored properties, and `Void`
+  overrides with either no arguments or one `Bool`; native code cannot identify
+  the patch's concrete Swift type.
 - Synchronous patch-local `inout` and `mutating` helpers under verified address,
   access, aliasing, ownership, and same-frame/same-block restrictions.
 - Synchronous patch-local closure values with copyable VM-managed captures.
@@ -100,9 +112,10 @@ evidence, not device or distribution certification.
   declarations. Move a non-exported patch-local struct or enum to file/module
   scope in an existing watched source file; no Shell rebuild is needed when the
   resulting declaration remains private to the HLBC image.
-- New native classes, new Swift metadata visible across the patch boundary,
-  retroactive conformances, layout changes, superclass changes, and enum-case
-  changes.
+- Arbitrary new Swift metadata, a patch concrete class identity visible to
+  native code, retroactive conformances, or changes to a Shell type's layout,
+  superclass, or enum cases. The hosted Objective-C subclass above is a frozen
+  superclass projection, not arbitrary Swift metadata generation.
 - Generic or `inout` Shell entries, noncopyable roots, arbitrary borrowing and
   consuming ABI, typed-throws roots, `rethrows`, and general unwind cleanup.
 - Unrestricted pointers, `unsafeBitCast`, arbitrary Objective-C selector/IMP,
@@ -132,6 +145,8 @@ machine code.
 | Use `for value in lower..<upper` where both bounds are `Int` | Supported with Swift's precondition that `lower <= upper`; other range families require a full build |
 | Use a one-grapheme Character literal in supported `String.contains` | Supported as a compiler-only String representation; general Character storage/API is not implied |
 | Declare a patch-local struct or enum | A newly introduced non-exported type is supported at file/module scope, including namespace nesting and supported computed accessors; a function-local nominal is rejected with an exact type diagnostic |
+| Declare a pure patch-local class | A final, nongeneric type used only inside one image supports reference identity, stored properties, private/ordinary methods, and computed accessors; it cannot cross into native code |
+| Declare a hosted class inheriting a project or system type | The superclass must be frozen as `NSObject`-compatible reference TypeOps; the current profile supports inherited no-argument initialization, no new stored properties, and no-argument/Bool `Void` overrides, and projects the instance to native code as its superclass |
 | Add an unrelated declaration, a new native ABI surface, or a new Swift file | Not collected merely by existence; a source-membership or native ABI change requires a full build |
 | Change a stored property, signature, generic constraint, actor isolation, superclass, conformance, or enum case | Rejected; full build required |
 | Change default-argument behavior | A fully concrete generator is patched with eligible archived callers in one complete module; cross-module public/package defaults, an ineligible caller, or a generic ABI require a full build |

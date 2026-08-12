@@ -58,6 +58,24 @@ final class ExecutionContextStorage: @unchecked Sendable {
         return try body()
     }
 
+    /// Temporarily replaces a different generation context for a callback on
+    /// an object pinned to an older immutable image, then restores the caller.
+    func withIsolatedContext<T>(
+        _ context: Runtime.ExecutionContext,
+        body: () throws -> T
+    ) rethrows -> T {
+        let previous = Thread.current.threadDictionary[key]
+        Thread.current.threadDictionary[key] = context
+        defer {
+            if let previous {
+                Thread.current.threadDictionary[key] = previous
+            } else {
+                Thread.current.threadDictionary.removeObject(forKey: key)
+            }
+        }
+        return try body()
+    }
+
     private func bodyWithExisting<T>(_ context: Runtime.ExecutionContext, body: () throws -> T) rethrows -> T {
         _ = context
         return try body()

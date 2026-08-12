@@ -228,6 +228,11 @@ public struct Lowerer: Sendable {
         var usesObjectiveCBridge: Bool
     }
 
+    private struct HostedSuperReference {
+        var context: CanonicalSIL.TypeEnvironment.HostedMethodContext
+        var objectToken: String
+    }
+
     private struct ExistentialProjection {
         var destination: String
         var concreteType: Bytecode.ValueType
@@ -256,6 +261,9 @@ public struct Lowerer: Sendable {
         expectedEffects: Core.Effects? = nil
     ) throws -> IntermediateRepresentation.Function {
         let signature = try parseFunctionType(function.loweredType)
+        let hostedMethodContext = try typeEnvironment.hostedMethodContext(
+            for: function
+        )
         let effectiveEffects = expectedEffects ?? signature.effects
         guard effectiveEffects.mayThrow == signature.effects.mayThrow,
               effectiveEffects.isAsync == signature.effects.isAsync
@@ -298,6 +306,8 @@ public struct Lowerer: Sendable {
         var registerTypes: [Bytecode.ValueType] = []
         var values: [String: Bytecode.Register] = [:]
         var functionReferences: [String: ResolvedFunctionReference] = [:]
+        var hostedAllocatorReferences: [String: Core.TypeID] = [:]
+        var hostedSuperReferences: [String: HostedSuperReference] = [:]
         var deferredForeignReferences: [String: (reference: String, loweredType: String)] = [:]
         var swiftCoreReferences: [String: SwiftCoreIntrinsic] = [:]
         var objectiveCBridgeReferences: [String: ObjectiveCBridgeIntrinsic] = [:]
@@ -315,6 +325,14 @@ public struct Lowerer: Sendable {
         var metatypeValues = Set<String>()
         var arrayMetatypeValues: [String: Bytecode.ValueType] = [:]
         var nativeMetatypeValues: [String: Core.TypeID] = [:]
+        var hostedMetatypeValues: [String: (
+            key: Bytecode.LocalTypeKey,
+            superclass: Core.TypeID
+        )] = [:]
+        var hostedAllocationObjects: [String: (
+            key: Bytecode.LocalTypeKey,
+            object: Bytecode.Register
+        )] = [:]
         var nativeGlobalAddresses: [String: CanonicalSIL.DirectCallBinding] = [:]
         var characterMetatypeValues = Set<String>()
         var localMetatypeValues: [String: Bytecode.LocalTypeKey] = [:]
@@ -2544,6 +2562,9 @@ public struct Lowerer: Sendable {
                 pattern: #"^(%[0-9]+) = metatype \$@(?:thin|thick|objc_metatype) (.+)\.Type$"#
             ), let key = typeEnvironment.localKey(for: metatype[1]) {
                 localMetatypeValues[metatype[0]] = key
+                if let superclass = try typeEnvironment.hostedSuperclass(for: key) {
+                    hostedMetatypeValues[metatype[0]] = (key, superclass.typeID)
+                }
                 continue
             }
 
@@ -2553,6 +2574,16 @@ public struct Lowerer: Sendable {
             ), let type = try? parseType(metatype[1]),
                case let .native(typeID) = type {
                 nativeMetatypeValues[metatype[0]] = typeID
+                continue
+            }
+
+            if let cast = match(
+                line,
+                pattern: #"^(%[0-9]+) = upcast (%[0-9]+) to \$@(?:thick|objc_metatype) (.+)\.Type$"#
+            ), let key = localMetatypeValues[cast[1]],
+               case let .native(targetType) = try parseType(cast[2]),
+               try typeEnvironment.hostedSuperclass(for: key)?.typeID == targetType {
+                hostedMetatypeValues[cast[0]] = (key, targetType)
                 continue
             }
 
@@ -3540,6 +3571,23 @@ public struct Lowerer: Sendable {
                 continue
             }
 
+            if hostedMethodContext?.abi == .voidBool,
+               let bridge = match(
+                   line,
+                   pattern: #"^(%[0-9]+) = struct \$(?:ObjectiveC\.)?ObjCBool \((%[0-9]+)\)$"#
+               ) {
+                let value = try resolve(bridge[1], line: sourceLine)
+                guard registerTypes[Int(value.rawValue)] == .bool else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "hosted Objective-C Bool bridge does not wrap Swift.Bool"
+                    )
+                }
+                // ObjCBool is only the physical foreign-call wrapper. The
+                // bounded Runtime trampoline consumes the logical Bool.
+                values[bridge[0]] = value
+                continue
+            }
+
             if let construction = match(
                 line,
                 pattern: #"^(%[0-9]+) = struct \$(.+) \((%[0-9]+)\)$"#
@@ -3630,7 +3678,31 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = upcast (%[0-9]+) to \$(.+)$"#
             ) {
+                if let allocation = hostedAllocationObjects[cast[1]] {
+                    guard case let .native(targetType) = try parseType(cast[2]),
+                          try typeEnvironment.hostedSuperclass(
+                            for: allocation.key
+                          )?.typeID == targetType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "hosted class allocation is upcast to a different superclass"
+                        )
+                    }
+                    values[cast[1]] = allocation.object
+                    hostedAllocationObjects.removeValue(forKey: cast[1])
+                }
                 let source = try resolve(cast[1], line: sourceLine)
+                if case let .local(key) = registerTypes[Int(source.rawValue)],
+                   case let .native(targetType) = try parseType(cast[2]),
+                   try typeEnvironment.hostedSuperclass(for: key)?.typeID
+                    == targetType {
+                    let result = try allocate(type: .native(targetType))
+                    values[cast[0]] = result
+                    appendInstruction(
+                        .projectHostedObject(result: result, object: source)
+                    )
+                    continue
+                }
                 guard case let .native(sourceType) = registerTypes[Int(source.rawValue)],
                       case let .native(targetType) = try parseType(cast[2]),
                       sourceType != targetType
@@ -3814,6 +3886,25 @@ public struct Lowerer: Sendable {
 
             if let reference = match(
                 line,
+                pattern: #"^(%[0-9]+) = (?:objc_)?super_method (%[0-9]+), #([^.\s:]+)\.([^!\s:]+)(?:!foreign)? : .*, \$(.+)$"#
+            ), let context = hostedMethodContext {
+                let selectorBase = context.selector.hasSuffix(":")
+                    ? String(context.selector.dropLast())
+                    : context.selector
+                guard reference[3] == selectorBase else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "hosted method \(context.selector) calls a different superclass selector \(reference[3])"
+                    )
+                }
+                hostedSuperReferences[reference[0]] = .init(
+                    context: context,
+                    objectToken: reference[1]
+                )
+                continue
+            }
+
+            if let reference = match(
+                line,
                 pattern: #"^(%[0-9]+) = (?:objc|objc_super|class)_method .*, (#[^\s:]+) : .*, \$(.+)$"#
             ) {
                 let usesObjectiveCBridge = reference[1].hasSuffix("foreign")
@@ -3908,6 +3999,19 @@ public struct Lowerer: Sendable {
                 if let key = typeEnvironment.structFactory(reference[1]) {
                     localFactoryReferences[reference[0]] = key
                     continue
+                }
+                if let key = typeEnvironment.classAllocator(reference[1]),
+                   let superclass = try typeEnvironment.hostedSuperclass(for: key) {
+                    hostedAllocatorReferences[reference[0]] = superclass.typeID
+                    continue
+                }
+                if let allocatorType = try hostedAllocatorType(
+                    loweredType: reference[2]
+                ) {
+                    hostedAllocatorReferences[reference[0]] = allocatorType
+                    if directCalls.binding(for: reference[1]) == nil {
+                        continue
+                    }
                 }
                 guard let binding = directCalls.binding(for: reference[1]) else {
                     if let unavailable = directCalls.unavailableCall(for: reference[1]) {
@@ -4110,6 +4214,10 @@ public struct Lowerer: Sendable {
                     functionReferences[borrowed[0]] = reference
                 } else if let reference = deferredForeignReferences[borrowed[1]] {
                     deferredForeignReferences[borrowed[0]] = reference
+                } else if let reference = hostedSuperReferences[borrowed[1]] {
+                    hostedSuperReferences[borrowed[0]] = reference
+                } else if let typeID = hostedAllocatorReferences[borrowed[1]] {
+                    hostedAllocatorReferences[borrowed[0]] = typeID
                 } else if let reference = swiftCoreReferences[borrowed[1]] {
                     swiftCoreReferences[borrowed[0]] = reference
                 } else if let reference = objectiveCBridgeReferences[borrowed[1]] {
@@ -4331,6 +4439,101 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(?:(%[0-9]+) = )?apply (%[0-9]+)(?:<(.+)>)?\((.*)\) : \$(.+)$"#
             ) {
+                if let reference = hostedSuperReferences[call[1]] {
+                    guard call[2].isEmpty else {
+                        throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                            line: sourceLine,
+                            text: "generic hosted superclass call"
+                        )
+                    }
+                    let tokens = try parseApplyValueTokens(
+                        call[3],
+                        line: sourceLine
+                    )
+                    let expectedArgumentCount: Int = switch reference.context.abi {
+                    case .voidNoArguments: 0
+                    case .voidBool: 1
+                    }
+                    guard tokens.count == expectedArgumentCount + 1 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "hosted superclass call has an incompatible physical arity"
+                        )
+                    }
+                    let object = try resolve(
+                        reference.objectToken,
+                        line: sourceLine
+                    )
+                    guard registerTypes[Int(object.rawValue)]
+                            == .local(reference.context.typeKey)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "hosted superclass call uses a different local object"
+                        )
+                    }
+                    let arguments = try tokens.dropLast().map {
+                        try resolve($0, line: sourceLine)
+                    }
+                    let expectedTypes: [Bytecode.ValueType] = switch reference.context.abi {
+                    case .voidNoArguments: []
+                    case .voidBool: [.bool]
+                    }
+                    guard arguments.map({ registerTypes[Int($0.rawValue)] })
+                            == expectedTypes
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "hosted superclass call arguments do not match its ABI"
+                        )
+                    }
+                    appendInstruction(
+                        .hostedSuperApply(
+                            object: object,
+                            methodIndex: reference.context.methodIndex,
+                            arguments: arguments
+                        )
+                    )
+                    if !call[0].isEmpty { voidValues.insert(call[0]) }
+                    continue
+                }
+                if let superclass = hostedAllocatorReferences[call[1]] {
+                    guard call[2].isEmpty, !call[0].isEmpty else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "hosted class allocator has generic arguments or no result"
+                        )
+                    }
+                    let tokens = try parseApplyValueTokens(
+                        call[3],
+                        line: sourceLine
+                    )
+                    if tokens.count == 1,
+                       let metatype = hostedMetatypeValues[tokens[0]],
+                       metatype.superclass == superclass {
+                        let fields = try typeEnvironment.classFields(for: metatype.key)
+                        guard fields.isEmpty else {
+                            throw CanonicalSIL.LoweringError.unsupportedType(
+                                "hosted class \(metatype.key) stored properties require an explicit hosted initializer profile"
+                            )
+                        }
+                        let object = try allocate(type: .local(metatype.key))
+                        appendInstruction(.allocateObject(result: object))
+                        let appliedType = try parseFunctionType(call[4])
+                        if appliedType.result == .local(metatype.key) {
+                            values[call[0]] = object
+                        } else {
+                            hostedAllocationObjects[call[0]] = (
+                                metatype.key,
+                                object
+                            )
+                        }
+                        continue
+                    }
+                    // A normal native allocation may share this function
+                    // reference; its frozen NativeImport handles that path.
+                    guard functionReferences[call[1]] != nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "unfrozen native allocator is not applied to a hosted metatype"
+                        )
+                    }
+                }
                 if let closure = values[call[1]],
                    case let .closure(signature) = registerTypes[Int(closure.rawValue)] {
                     guard call[2].isEmpty else {
@@ -4819,6 +5022,17 @@ public struct Lowerer: Sendable {
             ), let allocation = arrayLiteralStorageTokens[projection[1]]
                 ?? arrayLiteralAllocationByValue[projection[1]] {
                 arrayLiteralStorageTokens[projection[0]] = allocation
+                continue
+            }
+
+            if let cast = match(
+                line,
+                pattern: #"^(%[0-9]+) = unchecked_ref_cast (%[0-9]+) to \$(.+)$"#
+            ), let allocation = hostedAllocationObjects.removeValue(
+                forKey: cast[1]
+            ), let target = typeEnvironment.localKey(for: cast[2]),
+               target == allocation.key {
+                values[cast[0]] = allocation.object
                 continue
             }
 
@@ -6004,6 +6218,14 @@ public struct Lowerer: Sendable {
                     deferredForeignReferences[copy[0]] = reference
                     continue
                 }
+                if let reference = hostedSuperReferences[copy[1]] {
+                    hostedSuperReferences[copy[0]] = reference
+                    continue
+                }
+                if let typeID = hostedAllocatorReferences[copy[1]] {
+                    hostedAllocatorReferences[copy[0]] = typeID
+                    continue
+                }
                 if let reference = swiftCoreReferences[copy[1]] {
                     swiftCoreReferences[copy[0]] = reference
                     continue
@@ -6051,6 +6273,14 @@ public struct Lowerer: Sendable {
                     deferredForeignReferences[move[0]] = reference
                     continue
                 }
+                if let reference = hostedSuperReferences.removeValue(forKey: move[1]) {
+                    hostedSuperReferences[move[0]] = reference
+                    continue
+                }
+                if let typeID = hostedAllocatorReferences.removeValue(forKey: move[1]) {
+                    hostedAllocatorReferences[move[0]] = typeID
+                    continue
+                }
                 if let reference = swiftCoreReferences.removeValue(forKey: move[1]) {
                     swiftCoreReferences[move[0]] = reference
                     continue
@@ -6089,6 +6319,12 @@ public struct Lowerer: Sendable {
             if let destroy = match(line, pattern: #"^destroy_value (%[0-9]+)$"#) {
                 if functionReferences.removeValue(forKey: destroy[0]) != nil { continue }
                 if deferredForeignReferences.removeValue(forKey: destroy[0]) != nil {
+                    continue
+                }
+                if hostedSuperReferences.removeValue(forKey: destroy[0]) != nil {
+                    continue
+                }
+                if hostedAllocatorReferences.removeValue(forKey: destroy[0]) != nil {
                     continue
                 }
                 if swiftCoreReferences.removeValue(forKey: destroy[0]) != nil { continue }
@@ -6680,6 +6916,11 @@ public struct Lowerer: Sendable {
                 "Optional address initialization is incomplete"
             )
         }
+        guard hostedAllocationObjects.isEmpty else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "hosted class allocation is not completed by its canonical subclass cast"
+            )
+        }
         var incompleteCompilerLifetimes: [String] = []
         func recordIncompleteLifetime(_ name: String, count: Int) {
             guard count > 0 else { return }
@@ -6912,6 +7153,23 @@ public struct Lowerer: Sendable {
         case let .local(key): .local(key)
         default: nil
         }
+    }
+
+    private func hostedAllocatorType(
+        loweredType: String
+    ) throws -> Core.TypeID? {
+        guard loweredType.contains("@convention(method)") else { return nil }
+        let signature = try parseFunctionType(loweredType)
+        guard signature.parameters.isEmpty,
+              signature.result != .void,
+              !signature.effects.mayThrow,
+              !signature.effects.isAsync,
+              signature.erasedMetatypes.count == 1,
+              signature.erasedMetatypes[0].physicalIndex == 0,
+              case let .native(resultType) = signature.result,
+              signature.erasedMetatypes[0].identity == .native(resultType)
+        else { return nil }
+        return resultType
     }
 
     private func supportsIndirectResult(_ type: Bytecode.ValueType) -> Bool {

@@ -14,6 +14,7 @@ enum ImageFunctions {
     struct Plan: Sendable {
         var functions: [Planned]
         var directCalls: CanonicalSIL.DirectCallTable
+        var hostedMethods: [Bytecode.LocalTypeKey: [Bytecode.HostedMethod]]
     }
 
     static func makePlan(
@@ -21,11 +22,16 @@ enum ImageFunctions {
         root: CanonicalSIL.Function,
         rootID: Bytecode.FunctionID,
         typeEnvironment: CanonicalSIL.TypeEnvironment,
-        directCalls: CanonicalSIL.DirectCallTable
+        directCalls: CanonicalSIL.DirectCallTable,
+        shellDeclarationSymbols: Set<String>
     ) throws -> Plan {
-        let rootSymbols: Set<String> = [root.mangledName]
+        let hostedCandidates = try typeEnvironment.hostedMethodCandidates(in: file)
+            .filter { !shellDeclarationSymbols.contains($0.symbol) }
+        let hostedSymbols = Set(hostedCandidates.map(\.symbol))
+        let rootSymbols: Set<String> = Set([root.mangledName])
+            .union(hostedSymbols)
         let moduleName = CanonicalSIL.SymbolIdentity.moduleName(of: root.mangledName)
-        let discovered: [String: CanonicalSIL.ImageFunctions.Discovered]
+        var discovered: [String: CanonicalSIL.ImageFunctions.Discovered]
         do {
             discovered = try CanonicalSIL.ImageFunctions.discover(
                 in: file,
@@ -44,11 +50,18 @@ enum ImageFunctions {
         } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
             throw map(error)
         }
+        for candidate in hostedCandidates {
+            discovered[candidate.symbol] = .init(
+                function: candidate.function,
+                kind: .ordinary
+            )
+        }
 
         var occupiedIDs = directCalls.functionIDs
         occupiedIDs.insert(rootID)
         var planned: [Planned] = []
         var bindings: [CanonicalSIL.DirectCallBinding] = []
+        var idBySymbol: [String: Bytecode.FunctionID] = [:]
         for symbol in discovered.keys.sorted() {
             guard let item = discovered[symbol] else { continue }
             let signature: CanonicalSIL.ImageFunctions.Signature
@@ -62,6 +75,7 @@ enum ImageFunctions {
                 throw map(error)
             }
             let id = try allocateFunctionID(occupied: &occupiedIDs)
+            idBySymbol[symbol] = id
             planned.append(
                 .init(
                     symbol: symbol,
@@ -82,9 +96,36 @@ enum ImageFunctions {
                 )
             )
         }
+        var hostedMethods: [Bytecode.LocalTypeKey: [Bytecode.HostedMethod]] = [:]
+        for candidate in hostedCandidates {
+            guard let id = idBySymbol[candidate.symbol] else {
+                throw PatchCompiler.CompilationError.generatedFunctionUnsupported(
+                    candidate.symbol,
+                    reason: "hosted method was not assigned an image-local function ID"
+                )
+            }
+            hostedMethods[candidate.typeKey, default: []].append(
+                .init(
+                    selector: candidate.selector,
+                    functionID: id,
+                    abi: candidate.abi
+                )
+            )
+        }
+        for key in hostedMethods.keys {
+            hostedMethods[key]?.sort { left, right in
+                guard let leftCandidate = hostedCandidates.first(where: {
+                    $0.typeKey == key && $0.selector == left.selector
+                }), let rightCandidate = hostedCandidates.first(where: {
+                    $0.typeKey == key && $0.selector == right.selector
+                }) else { return left.selector < right.selector }
+                return leftCandidate.methodIndex < rightCandidate.methodIndex
+            }
+        }
         return try .init(
             functions: planned,
-            directCalls: directCalls.adding(bindings)
+            directCalls: directCalls.adding(bindings),
+            hostedMethods: hostedMethods
         )
     }
 
@@ -96,6 +137,7 @@ enum ImageFunctions {
         file: CanonicalSIL.File
     ) -> Bytecode.FunctionKind? {
         guard !typeEnvironment.isStructFactory(symbol),
+              !typeEnvironment.isHostedClassAllocator(symbol),
               file.function(mangledName: symbol).map(
                   typeEnvironment.hasStructFactorySignature
               ) != true,

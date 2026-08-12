@@ -386,7 +386,8 @@ public enum Encoder {
                     }
                     if formatMinor < 11 {
                         switch instruction {
-                        case .allocateObject, .projectObjectAddress:
+                        case .allocateObject, .projectObjectAddress,
+                             .projectHostedObject, .hostedSuperApply:
                             throw Bytecode.CodecError.invalidHeader(
                                 "class instructions require HLBC format 1.11"
                             )

@@ -389,6 +389,7 @@ struct Container {
         module.functions[0].registerTypes.append(contentsOf: [
             .local(key),
             .address(.int64),
+            .native(superclass),
         ])
         module.functions[0].blocks[0].instructions.insert(contentsOf: [
             .allocateObject(result: .init(rawValue: 5)),
@@ -396,6 +397,15 @@ struct Container {
                 result: .init(rawValue: 6),
                 object: .init(rawValue: 5),
                 fieldIndex: 0
+            ),
+            .projectHostedObject(
+                result: .init(rawValue: 7),
+                object: .init(rawValue: 5)
+            ),
+            .hostedSuperApply(
+                object: .init(rawValue: 5),
+                methodIndex: 0,
+                arguments: []
             ),
         ], at: 0)
 

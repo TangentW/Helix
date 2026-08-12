@@ -43,7 +43,7 @@ flowchart LR
     T --> D["Interface and transitive body diff"]
     D --> S["Canonical OSSA SIL"]
     S --> L["HLIR lowering"]
-    L --> B["HLBC 1.10 encoder"]
+    L --> B["HLBC 1.11 encoder"]
     B --> V["Independent verifier"]
     V --> P["Signed .hlxp"]
 ```
@@ -164,24 +164,30 @@ device performance qualification.
 
 ## Current language boundary
 
-The current wire versions are HLBC 1.10 and HLXI 2.5. The implemented subset
+The current wire versions are HLBC 1.11 and HLXI 2.6. The implemented subset
 includes common integer and floating-point operations and conversions, Bool,
 String operations and interpolation, one-grapheme Character literals for the
 bounded String predicate path, tuple/Optional including address projection,
 Array and Dictionary value semantics, VM-owned `Any` and common dynamic casts,
 half-open `Range<Int>` loops, structured
-control flow, newly introduced non-exported file- or module-scope patch-local
-struct/enum and concrete `Result` values, their supported computed accessors,
+control flow, newly introduced non-exported ordinary/private helpers, computed
+accessors, file- or module-scope patch-local struct/enum, pure HLVM classes, and
+concrete `Result` values,
 payload-carrying local errors, scoped patch-local `inout`/`mutating` helpers,
 synchronous patch-local closures including
 same-image `@escaping` return/capture flows, fully concrete compiler
 specializations and default-argument generators, an automatically frozen
 `Swift.print` NativeImport, and top-level non-suspending `async`, `async throws`,
-and `@MainActor async` entries.
+and `@MainActor async` entries. A new `final` class may also inherit an
+HLXI-frozen, `NSObject`-compatible project or system type under the closed hosted
+profile and cross into native code as that superclass. The current profile is
+limited to inherited no-argument initialization, no stored properties, and
+no-argument/Bool `Void` overrides.
 
-It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch,
-new native classes, function-local nominal declarations, changes to existing
-native stored layout, closure persistence or native/Shell boundary crossing,
+It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch, a
+patch concrete Swift type identity visible to native code, function-local
+nominal declarations, hosted stored properties/custom initializers/arbitrary
+callback ABIs, changes to existing native stored layout, closure persistence or native/Shell boundary crossing,
 throwing/async closures, true `await`/continuations, actor-isolated `self`,
 custom global actors, unrestricted pointers, reflection-based field access, and
 unregistered native APIs are rejected. See

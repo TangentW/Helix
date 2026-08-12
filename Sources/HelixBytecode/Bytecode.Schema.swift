@@ -296,6 +296,20 @@ public enum Instruction: Codable, Hashable, Sendable {
         object: Bytecode.Register,
         fieldIndex: UInt32
     )
+    /// Projects the Objective-C host of a patch-local class as its frozen
+    /// native superclass. The host is created by Runtime; HLVM never fabricates
+    /// Swift class metadata.
+    case projectHostedObject(
+        result: Bytecode.Register,
+        object: Bytecode.Register
+    )
+    /// Calls the exact superclass implementation for one bounded hosted method.
+    /// `methodIndex` addresses the immutable descriptor on the local class.
+    case hostedSuperApply(
+        object: Bytecode.Register,
+        methodIndex: UInt32,
+        arguments: [Bytecode.Register]
+    )
     case beginAccess(
         result: Bytecode.Register,
         address: Bytecode.Register,
@@ -496,6 +510,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .projectStructAddress(result, _, _),
              let .allocateObject(result),
              let .projectObjectAddress(result, _, _),
+             let .projectHostedObject(result, _),
              let .beginAccess(result, _, _),
              let .loadAddress(result, _, _),
              let .floatingBinary(result, _, _, _),
@@ -535,7 +550,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .nativeApply(result, _, _),
              let .closureApply(result, _, _):
             result.map { [$0] } ?? []
-        case .destroyValue, .switchEnum, .storeStack, .destroyStack, .endAccess,
+        case .destroyValue, .switchEnum, .storeStack, .destroyStack,
+             .hostedSuperApply, .endAccess,
              .storeAddress, .switchOptional, .branch,
              .conditionalBranch, .tryApply, .entryTryApply, .nativeTryApply,
              .returnValue, .throwError, .trap:
@@ -583,6 +599,10 @@ public enum Instruction: Codable, Hashable, Sendable {
             [base]
         case let .projectObjectAddress(_, object, _):
             [object]
+        case let .projectHostedObject(_, object):
+            [object]
+        case let .hostedSuperApply(object, _, arguments):
+            [object] + arguments
         case let .beginAccess(_, address, _),
              let .endAccess(address),
              let .loadAddress(_, address, _):

@@ -1,6 +1,7 @@
 import Foundation
 import HelixBytecode
 import HelixCore
+import HelixVerifier
 import HelixVM
 
 extension Runtime {
@@ -14,6 +15,8 @@ public protocol Observing: Sendable {
     func didTrap(generation: Runtime.GenerationID, entry: Core.EntryIndex, trap: VM.RuntimeTrap)
     /// Called with the deepest known HLBC and logical Swift trap coordinate.
     func didTrap(diagnostic: Runtime.TrapDiagnostic)
+    /// Called when a callback implemented by a hosted local class traps.
+    func didTrap(hostedDiagnostic: Runtime.HostedTrapDiagnostic)
 }
 
 /// Observer implementation that intentionally discards every Runtime event.
@@ -256,6 +259,11 @@ public final class Engine: @unchecked Sendable {
                     )
                 )
             },
+            objectHost: Runtime.HostedClasses.makeObjectHost(
+                engine: self,
+                context: context,
+                image: image
+            ),
             trapObserver: { diagnostic in
                 let function = diagnostic.programCounter.flatMap { programCounter in
                     image.module.functions.first { $0.id == programCounter.functionID }
@@ -308,6 +316,99 @@ public final class Engine: @unchecked Sendable {
             )
         }
         return .executed(result)
+    }
+
+    func invokeHostedMethod(
+        _ method: Bytecode.HostedMethod,
+        typeKey: Bytecode.LocalTypeKey,
+        image: Verification.Image,
+        lease: Runtime.GenerationLease,
+        arguments: [VM.Value]
+    ) -> (result: VM.ExecutionResult, sideEffectsCommitted: Bool) {
+        let execute: (Runtime.ExecutionContext) -> (
+            result: VM.ExecutionResult,
+            sideEffectsCommitted: Bool
+        ) = { [self] context in
+            let budget = context.budget()
+            let generationID = lease.generation.id
+            let telemetryObserver = observer
+            let interpreter = VM.Interpreter(
+                nativeCatalog: nativeCatalog,
+                nativeTypeCatalog: nativeTypeCatalog,
+                entryInvocation: { [weak self, weak context] nestedEntry, nestedArguments, nestedBudget in
+                    guard let self, let context else {
+                        return .trapped(
+                            .explicit("Helix Runtime was released during a hosted invocation")
+                        )
+                    }
+                    guard nestedBudget === budget else {
+                        return .trapped(
+                            .explicit("hosted invocation attempted to replace its root budget")
+                        )
+                    }
+                    return self.executionResult(
+                        self.invokePinned(
+                            entry: nestedEntry,
+                            arguments: nestedArguments,
+                            context: context,
+                            originalResolution: .catalog
+                        )
+                    )
+                },
+                objectHost: Runtime.HostedClasses.makeObjectHost(
+                    engine: self,
+                    context: context,
+                    image: image
+                ),
+                trapObserver: { diagnostic in
+                    let function = diagnostic.programCounter.flatMap { programCounter in
+                        image.module.functions.first { $0.id == programCounter.functionID }
+                    }
+                    let sourceLocation = diagnostic.programCounter.flatMap { programCounter in
+                        image.module.sourceLocation(
+                            functionID: programCounter.functionID,
+                            blockID: programCounter.blockID,
+                            instructionOffset: programCounter.instructionOffset
+                        )
+                    } ?? function?.sourceLocation
+                    telemetryObserver.didTrap(
+                        hostedDiagnostic: .init(
+                            generationID: generationID,
+                            typeKey: typeKey,
+                            selector: method.selector,
+                            trap: diagnostic.trap,
+                            programCounter: diagnostic.programCounter,
+                            functionName: function?.name,
+                            sourceLocation: sourceLocation
+                        )
+                    )
+                }
+            )
+            let result = interpreter.invoke(
+                function: method.functionID,
+                image: image,
+                arguments: arguments,
+                budget: budget,
+                rootContext: .hostedCallback
+            )
+            if case let .trapped(trap) = result, isRuntimeInvariantViolation(trap) {
+                let activeBeforeQuarantine = registry.snapshot().activeGenerationID
+                registry.quarantine(generationID)
+                let activeAfterQuarantine = registry.snapshot().activeGenerationID
+                if activeBeforeQuarantine == generationID,
+                   activeAfterQuarantine != activeBeforeQuarantine {
+                    observer.didRollback(from: generationID, to: activeAfterQuarantine)
+                }
+            }
+            return (result, budget.sideEffectsCommitted)
+        }
+
+        if let current = contexts.current,
+           current.lease.generation.id == lease.generation.id {
+            return execute(current)
+        }
+        let context = Runtime.ExecutionContext(lease: lease)
+        return contexts.withIsolatedContext(context) { execute(context) }
     }
 
     private func routeEncodedFromBridgePinned(
@@ -439,6 +540,10 @@ public final class Engine: @unchecked Sendable {
             }
             do {
                 try interpreter.validate(image: image)
+                try Runtime.HostedClasses.validateBindings(
+                    image: image,
+                    nativeTypeCatalog: nativeTypeCatalog
+                )
             } catch {
                 throw Runtime.ActivationError.invalidGeneration("native catalog binding failed: \(error)")
             }
