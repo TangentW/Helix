@@ -121,6 +121,23 @@ struct PairingProtocol {
         }
     }
 
+    @Test("An unactivated manual code expires on the user-visible deadline")
+    func manualReservationExpiration() async throws {
+        let fixture = Fixture()
+        let authority = try Pairing.Authority(
+            configuration: .init(invitationLifetime: 10)
+        )
+        let now = Date(timeIntervalSince1970: 2_500)
+        let reservation = try await authority.reserve(kind: .manual, now: now)
+        await expectFailure(.expiredInvitation) {
+            _ = try await authority.activate(
+                invitationID: reservation.invitationID,
+                shellIdentity: fixture.shellIdentity,
+                now: now.addingTimeInterval(11)
+            )
+        }
+    }
+
     @Test("Expired invitations preserve a useful rejection reason")
     func expiration() async throws {
         let fixture = Fixture()

@@ -150,8 +150,9 @@ public actor Authority {
     ) throws {
         purge(now: now)
         try reservation.validate()
+        let maximumAge = reservationLifetime(for: reservation.kind)
         guard reservation.reservedAt <= now,
-              now.timeIntervalSince(reservation.reservedAt) <= configuration.reservationLifetime,
+              now.timeIntervalSince(reservation.reservedAt) <= maximumAge,
               reservations[reservation.invitationID] == nil,
               invitations[reservation.invitationID] == nil,
               invitationByCode[reservation.code] == nil
@@ -171,21 +172,32 @@ public actor Authority {
         shellIdentity: DevProtocol.ShellIdentity,
         now: Date = Date()
     ) throws -> Pairing.Invitation {
-        purge(now: now)
+        purge(now: now, preservingReservationID: invitationID)
         try shellIdentity.validate()
-        guard let reservation = reservations[invitationID],
-              reservation.reservedAt <= now,
-              now.timeIntervalSince(reservation.reservedAt) <= configuration.reservationLifetime
-        else {
+        guard let reservation = reservations[invitationID] else {
             throw Pairing.Failure(
                 reason: .invalidInvitation,
                 detail: "invitation reservation is unavailable"
             )
         }
+        let maximumAge = reservationLifetime(for: reservation.kind)
+        guard reservation.reservedAt <= now,
+              now.timeIntervalSince(reservation.reservedAt) <= maximumAge
+        else {
+            invalidate(invitationID: invitationID)
+            throw Pairing.Failure(
+                reason: reservation.kind == .manual
+                    ? .expiredInvitation : .invalidInvitation,
+                detail: "invitation reservation expired"
+            )
+        }
+        let expiresAt = reservation.kind == .manual
+            ? reservation.reservedAt.addingTimeInterval(configuration.invitationLifetime)
+            : now.addingTimeInterval(configuration.invitationLifetime)
         let invitation = Pairing.Invitation(
             reservation: reservation,
             shellIdentity: shellIdentity,
-            expiresAt: now.addingTimeInterval(configuration.invitationLifetime)
+            expiresAt: expiresAt
         )
         try invitation.validate()
         reservations[invitationID] = nil
@@ -430,10 +442,12 @@ public actor Authority {
 
     private func purge(
         now: Date,
+        preservingReservationID: DevProtocol.InvitationID? = nil,
         preservingInvitationID: DevProtocol.InvitationID? = nil
     ) {
         let expiredReservations = reservations.values.filter {
-            now.timeIntervalSince($0.reservedAt) > configuration.reservationLifetime
+            now.timeIntervalSince($0.reservedAt) > reservationLifetime(for: $0.kind)
+                && $0.invitationID != preservingReservationID
         }
         for reservation in expiredReservations {
             reservations[reservation.invitationID] = nil
@@ -453,6 +467,13 @@ public actor Authority {
                 return now < blockedUntil
             }
             return now.timeIntervalSince(state.lastFailureAt) <= configuration.attemptWindow
+        }
+    }
+
+    private func reservationLifetime(for kind: Pairing.Kind) -> TimeInterval {
+        switch kind {
+        case .automaticXcode: configuration.reservationLifetime
+        case .manual: configuration.invitationLifetime
         }
     }
 }
