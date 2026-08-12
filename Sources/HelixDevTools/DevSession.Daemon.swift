@@ -138,7 +138,7 @@ public actor Daemon {
     }
 
     public let prepared: DevSession.PreparedConfiguration
-    public let serverIdentity: NetworkTransport.EphemeralIdentity
+    public let serverIdentity: NetworkTransport.ServerIdentity
 
     private let sessionSecret: Data
     private let disconnectPolicy: DevSession.DisconnectPolicy
@@ -159,7 +159,7 @@ public actor Daemon {
     ) throws {
         try disconnectPolicy.validate()
         self.prepared = prepared
-        serverIdentity = try NetworkTransport.IdentityFactory.makeEphemeralServerIdentity()
+        serverIdentity = try NetworkTransport.IdentityFactory.makeServerIdentity()
         sessionSecret = try DevProtocol.SecureRandom.bytes(count: 32)
         self.disconnectPolicy = disconnectPolicy
         self.eventHandler = eventHandler

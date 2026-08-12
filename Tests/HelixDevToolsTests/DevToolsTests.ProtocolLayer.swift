@@ -30,9 +30,9 @@ struct ProtocolLayer {
     }
 
     #if canImport(Network) && canImport(Security)
-    @Test("Ephemeral TLS identity pins and exports the same channel binding on both peers")
-    func ephemeralTLSExporter() async throws {
-        let identity = try NetworkTransport.IdentityFactory.makeEphemeralServerIdentity()
+    @Test("Pinned TLS identity exports the same channel binding on both peers")
+    func pinnedTLSExporter() async throws {
+        let identity = try NetworkTransport.IdentityFactory.makeServerIdentity()
         let parameters = try NetworkTransport.ByteTransport.tlsServerParameters(
             identity: identity.identity
         )

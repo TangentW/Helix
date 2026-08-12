@@ -44,8 +44,8 @@ public final class ByteTransport: DevProtocol.ByteTransport, @unchecked Sendable
             { _, trust, completion in
                 let secTrust = sec_trust_copy_ref(trust).takeRetainedValue()
                 let pin = try? NetworkTransport.SPKIPin.hash(trust: secTrust)
-                // The daemon certificate is ephemeral and self-signed. The
-                // launch/pairing channel supplies its SPKI pin as the trust root.
+                // The certificate is self-signed. The generated Shell contract
+                // supplies the stable Host Identity SPKI pin as its trust root.
                 completion(pin?.constantTimeEquals(expectedSPKIHash) == true)
             },
             verificationQueue
@@ -413,6 +413,8 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case invalidLength
     case missingTLSMetadata
     case identityGenerationFailed(String)
+    case identityStorageFailed(String)
+    case insecureIdentityStorage(String)
 
     public var description: String {
         switch self {
@@ -424,7 +426,11 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
         case .invalidLength: "transport requested a negative byte count"
         case .missingTLSMetadata: "TLS exporter metadata is unavailable"
         case let .identityGenerationFailed(reason):
-            "cannot create an ephemeral TLS identity: \(reason)"
+            "cannot create the Helix TLS identity: \(reason)"
+        case let .identityStorageFailed(reason):
+            "cannot access the Helix Host Identity: \(reason)"
+        case let .insecureIdentityStorage(reason):
+            "Helix Host Identity storage is insecure: \(reason)"
         }
     }
 }

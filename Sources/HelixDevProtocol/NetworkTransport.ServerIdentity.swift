@@ -5,10 +5,15 @@ import Security
 import HelixCore
 
 extension NetworkTransport {
-public final class EphemeralIdentity: @unchecked Sendable {
+/// TLS identity whose public-key pin can remain stable across certificates.
+public final class ServerIdentity: @unchecked Sendable {
+    /// Security identity supplied to Network.framework's TLS listener.
     public let identity: SecIdentity
+    /// Self-signed certificate associated with ``identity``.
     public let certificate: SecCertificate
+    /// SHA-256 digest of the certificate's SubjectPublicKeyInfo.
     public let spkiHash: Core.Digest
+    /// Certificate expiry. The host key and SPKI pin may outlive this value.
     public let validUntil: Date
 
     fileprivate init(
@@ -25,19 +30,32 @@ public final class EphemeralIdentity: @unchecked Sendable {
 }
 
 public enum IdentityFactory {
-    public static func makeEphemeralServerIdentity(
+    /// Creates a TLS identity from a new or previously persisted P-256 key.
+    public static func makeServerIdentity(
+        privateKeyRawRepresentation: Data? = nil,
         now: Date = Date(),
-        lifetime: TimeInterval = 3_600
-    ) throws -> NetworkTransport.EphemeralIdentity {
-        guard lifetime.isFinite, (60...86_400).contains(lifetime) else {
+        lifetime: TimeInterval = 30 * 24 * 60 * 60
+    ) throws -> NetworkTransport.ServerIdentity {
+        guard lifetime.isFinite, (60...366 * 24 * 60 * 60).contains(lifetime) else {
             throw NetworkTransport.Error.identityGenerationFailed(
-                "certificate lifetime must be between one minute and one day"
+                "certificate lifetime must be between one minute and 366 days"
             )
         }
         // CryptoKit keeps generation in-process. Importing its X9.63 representation
         // also avoids SecKeyCreateRandomKey attempting unsupported token-backed paths
         // on some macOS hosts.
-        let signingKey = P256.Signing.PrivateKey()
+        let signingKey: P256.Signing.PrivateKey
+        do {
+            if let privateKeyRawRepresentation {
+                signingKey = try .init(rawRepresentation: privateKeyRawRepresentation)
+            } else {
+                signingKey = .init()
+            }
+        } catch {
+            throw NetworkTransport.Error.identityGenerationFailed(
+                "stored P-256 private key is invalid"
+            )
+        }
         let attributes: [CFString: Any] = [
             kSecAttrKeyType: kSecAttrKeyTypeECSECPrimeRandom,
             kSecAttrKeyClass: kSecAttrKeyClassPrivate,
@@ -69,7 +87,7 @@ public enum IdentityFactory {
         let validFrom = now.addingTimeInterval(-60)
         let validUntil = now.addingTimeInterval(lifetime)
         let serial = try DevProtocol.SecureRandom.bytes(count: 16)
-        let commonName = "Helix Dev \(UUID().uuidString)"
+        let commonName = "Helix"
         let tbs = CertificateDER.tbsCertificate(
             serial: serial,
             commonName: commonName,
