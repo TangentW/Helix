@@ -95,6 +95,12 @@ public actor ConnectionBroker {
         await authority.invalidate(invitationID: invitationID)
     }
 
+    /// Clears transient invitations and leases when the owning service stops.
+    public func invalidateAll() async {
+        manualInvitationsByCode.removeAll(keepingCapacity: false)
+        await authority.invalidateAll()
+    }
+
     /// Reserves the code embedded by an Xcode build before final linking.
     public func reserveAutomaticInvitation(
         now: Date = Date()

@@ -391,6 +391,16 @@ public actor Authority {
         leases[leaseID] = nil
     }
 
+    /// Revokes every activated invitation and lease for one removed Shell.
+    public func revoke(shellID: DevProtocol.ShellID) {
+        let invitationIDs = invitations.values.compactMap { state in
+            state.invitation.shellIdentity.shellID == shellID
+                ? state.invitation.invitationID : nil
+        }
+        invitationIDs.forEach { invalidate(invitationID: $0) }
+        leases = leases.filter { $0.value.shellIdentity.shellID != shellID }
+    }
+
     /// Clears every invitation, lease, and rate-limit record.
     public func invalidateAll() {
         reservations.removeAll(keepingCapacity: false)

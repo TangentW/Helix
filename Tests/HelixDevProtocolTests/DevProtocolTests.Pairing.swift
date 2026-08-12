@@ -291,6 +291,65 @@ struct PairingProtocol {
             )
         }
     }
+
+    @Test("Removing one Shell revokes only its invitations and leases")
+    func shellRevocation() async throws {
+        let first = Fixture()
+        let second = Fixture()
+        let authority = try Pairing.Authority()
+        let now = Date(timeIntervalSince1970: 6_000)
+        let consumed = try await authority.issue(
+            kind: .manual,
+            shellIdentity: first.shellIdentity,
+            now: now
+        )
+        let established = try await authority.redeem(
+            first.request(code: consumed.code),
+            rateLimitKey: .init(stableSource: "revocation-peer"),
+            tlsExporterHash: .sha256("revocation-first"),
+            now: now.addingTimeInterval(1)
+        )
+        let pending = try await authority.issue(
+            kind: .manual,
+            shellIdentity: first.shellIdentity,
+            now: now.addingTimeInterval(2)
+        )
+        let unaffected = try await authority.issue(
+            kind: .manual,
+            shellIdentity: second.shellIdentity,
+            now: now.addingTimeInterval(2)
+        )
+
+        await authority.revoke(shellID: first.shellIdentity.shellID)
+        await expectFailure(.invalidInvitation) {
+            _ = try await authority.redeem(
+                first.request(code: pending.code),
+                rateLimitKey: .init(stableSource: "revocation-peer"),
+                tlsExporterHash: .sha256("revocation-pending"),
+                now: now.addingTimeInterval(3)
+            )
+        }
+        let resumeExporter = Core.Digest.sha256("revocation-resume")
+        let resume = try Pairing.ResumeRequest.signed(
+            leaseID: established.grant.leaseID,
+            peerIdentity: first.peerIdentity,
+            sessionSecret: established.grant.sessionSecret,
+            tlsExporterHash: resumeExporter
+        )
+        await expectFailure(.invalidLease) {
+            _ = try await authority.resume(
+                resume,
+                tlsExporterHash: resumeExporter,
+                now: now.addingTimeInterval(3)
+            )
+        }
+        _ = try await authority.redeem(
+            second.request(code: unaffected.code),
+            rateLimitKey: .init(stableSource: "unaffected-peer"),
+            tlsExporterHash: .sha256("revocation-unaffected"),
+            now: now.addingTimeInterval(3)
+        )
+    }
 }
 }
 

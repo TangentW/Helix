@@ -94,6 +94,29 @@ public actor ContextRegistry {
         return contextsByShell[shellID] == context
     }
 
+    /// Registers and persists one context as a single actor-isolated transaction.
+    ///
+    /// If the atomic file write fails, the complete in-memory index—including
+    /// entries removed by retention limits—is restored before the error escapes.
+    @discardableResult
+    public func register(
+        _ context: DevSession.BuildContext,
+        persistingTo store: DevSession.ContextStore
+    ) throws -> Bool {
+        let previousContexts = contextsByShell
+        let previousBuilds = shellByBuild
+        do {
+            let changed = try register(context)
+            guard changed else { return false }
+            try store.save(contexts())
+            return true
+        } catch {
+            contextsByShell = previousContexts
+            shellByBuild = previousBuilds
+            throw error
+        }
+    }
+
     /// Finds the only context matching the exact App build facts.
     public func resolve(
         _ build: DevProtocol.PeerBuildIdentity
@@ -126,6 +149,25 @@ public actor ContextRegistry {
         }
         shellByBuild[removed.shellIdentity.build] = nil
         return removed
+    }
+
+    /// Removes and persists one context, rolling the index back on write failure.
+    @discardableResult
+    public func remove(
+        shellID: DevProtocol.ShellID,
+        persistingTo store: DevSession.ContextStore
+    ) throws -> DevSession.BuildContext? {
+        let previousContexts = contextsByShell
+        let previousBuilds = shellByBuild
+        guard let removed = remove(shellID: shellID) else { return nil }
+        do {
+            try store.save(contexts())
+            return removed
+        } catch {
+            contextsByShell = previousContexts
+            shellByBuild = previousBuilds
+            throw error
+        }
     }
 
     /// Removes contexts older than the supplied cutoff.

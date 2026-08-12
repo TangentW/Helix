@@ -126,6 +126,31 @@ struct ContextRegistry {
         #expect(data == reencoded)
     }
 
+    @Test("A failed persistent registration restores the complete in-memory index")
+    func transactionalPersistenceRollback() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HelixContextRollback-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let blocker = directory.appendingPathComponent("not-a-directory")
+        try Data("blocker".utf8).write(to: blocker)
+        let store = DevSession.ContextStore(
+            url: blocker.appendingPathComponent("BuildContexts.json")
+        )
+        let original = try makeContext(index: 1, registeredAt: 100)
+        let candidate = try makeContext(index: 2, registeredAt: 200)
+        let registry = try DevSession.ContextRegistry(contexts: [original])
+
+        do {
+            _ = try await registry.register(candidate, persistingTo: store)
+            Issue.record("Expected the persistent registration to fail")
+        } catch {
+            // The filesystem error is expected; registry rollback is asserted below.
+        }
+        #expect(await registry.contexts() == [original])
+        #expect(await registry.resolve(candidate.shellIdentity.build) == nil)
+    }
+
     @Test("Build Context rejects noncanonical or mismatched workspace paths")
     func validatesPaths() throws {
         var item = try makeContext(index: 1, registeredAt: 100)

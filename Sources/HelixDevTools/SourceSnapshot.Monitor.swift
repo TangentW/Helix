@@ -28,10 +28,15 @@ private struct WorkspaceScanner: Sendable {
         fingerprints = [:]
         self.maximumSourceBytes = maximumSourceBytes
         for source in sources {
-            fingerprints[source.absolutePath] = try Self.fingerprint(
+            var fingerprint = try Self.fingerprint(
                 source.absolutePath,
                 maximumSourceBytes: maximumSourceBytes
             )
+            // The frozen Shell, rather than connection time, is the source
+            // baseline. This lets an installed test build catch up when it
+            // pairs after the developer has already edited a file.
+            fingerprint.contentHash = source.contentHash
+            fingerprints[source.absolutePath] = fingerprint
         }
     }
 
@@ -141,6 +146,7 @@ public actor Monitor {
                 await self?.scheduleScan()
             }
         }
+        flushAndDeliver()
     }
 
     public func stop() {

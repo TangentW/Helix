@@ -15,6 +15,23 @@ public struct ContextStore: Sendable {
         self.url = url.standardizedFileURL
     }
 
+    /// Creates the per-user store used by the long-running Helix service.
+    public static func applicationSupportStore() throws -> Self {
+        guard let root = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            throw DevSession.ContextError.invalidDocument(
+                "the user Application Support directory is unavailable"
+            )
+        }
+        return .init(
+            url: root
+                .appendingPathComponent("Helix", isDirectory: true)
+                .appendingPathComponent("BuildContexts.json", isDirectory: false)
+        )
+    }
+
     /// Loads and validates a snapshot, or returns an empty list when absent.
     public func load() throws -> [DevSession.BuildContext] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }

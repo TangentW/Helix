@@ -9,6 +9,12 @@ import HelixCore
 public enum NetworkTransport {}
 
 extension NetworkTransport {
+/// Bonjour contract shared by the Helix service and every development App.
+public enum ServiceDiscovery {
+    public static let type = "_helix._tcp"
+    public static let visibleName = "Helix"
+}
+
 public final class ByteTransport: DevProtocol.ByteTransport, @unchecked Sendable {
     private let connection: NWConnection
     private let queue: DispatchQueue
@@ -147,6 +153,27 @@ public final class ByteTransport: DevProtocol.ByteTransport, @unchecked Sendable
         return try Core.Digest(bytes: Data(data))
     }
 
+    /// Normalized remote host used only as input to a one-way rate-limit key.
+    ///
+    /// The transport intentionally omits the ephemeral source port so opening a
+    /// new TCP connection cannot reset the pairing-attempt budget.
+    public var remoteSourceIdentifier: String {
+        switch connection.endpoint {
+        case let .hostPort(host, _):
+            "host:\(String(describing: host).lowercased())"
+        case let .service(name, type, domain, _):
+            "service:\(name.lowercased()).\(type.lowercased()).\(domain.lowercased())"
+        case let .unix(path):
+            "unix:\(path)"
+        case let .url(url):
+            "url:\(url.host?.lowercased() ?? url.absoluteString.lowercased())"
+        case let .opaque(value):
+            "opaque:\(String(describing: value).lowercased())"
+        @unknown default:
+            "endpoint:\(String(describing: connection.endpoint).lowercased())"
+        }
+    }
+
     private func receive(maximumLength: Int) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             connection.receive(
@@ -263,7 +290,7 @@ public final class Browser: @unchecked Sendable {
     private let updateHandler: UpdateHandler
 
     public init(
-        serviceType: String = "_helix-live._tcp",
+        serviceType: String = NetworkTransport.ServiceDiscovery.type,
         domain: String? = nil,
         updateHandler: @escaping UpdateHandler
     ) {

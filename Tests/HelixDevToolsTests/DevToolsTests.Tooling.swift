@@ -764,6 +764,28 @@ struct Tooling {
         #expect(await recorder.changedPaths == [fixture.sourceURL.path])
     }
 
+    @Test("A monitor catches source edits made before a test App connects")
+    func monitorReconcilesFrozenShellBaseline() async throws {
+        let directory = try temporaryDirectory("helix-late-connect-monitor")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try PipelineFixture(directory: directory)
+        try fixture.write("func render() { print(99) }\n")
+        let recorder = MonitorRecorder()
+        let monitor = try SourceSnapshot.Monitor(
+            manifest: fixture.manifest,
+            debounceNanoseconds: 20_000_000
+        ) { event in
+            await recorder.record(event)
+        }
+
+        await monitor.start()
+        for _ in 0..<100 where await recorder.changedPaths.isEmpty {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        await monitor.stop()
+        #expect(await recorder.changedPaths == [fixture.sourceURL.path])
+    }
+
     @Test("An in-place file save is observed even when its directory entry is unchanged")
     func inPlaceFileSaveMonitor() async throws {
         let directory = try temporaryDirectory("helix-in-place-save-monitor")
