@@ -221,19 +221,17 @@ public struct IdentityFactory: Sendable {
     /// Creates a stateless identity factory.
     public init() {}
 
-    /// Validates all inputs and creates the session identity advertised to the daemon.
+    /// Validates frozen and measured facts before any network access begins.
     ///
     /// Build and process bundle, platform, and architecture values must match.
     /// The runtime image identity must also prove that exactly one compatible
     /// Helix aggregate product is linked into this configuration.
-    public func make(
-        connection: DevConnection.Configuration,
+    public func makePeer(
+        protocolVersion: UInt16 = DevProtocol.Metadata.currentProtocolVersion,
         build: DevRuntime.BuildContract,
         process: DevRuntime.ProcessIdentity,
-        supportedBackends: [LiveReload.Backend],
-        nativeChainingProbePassed: Bool
-    ) throws -> DevProtocol.SessionIdentity {
-        try connection.validate()
+        supportedBackends: [LiveReload.Backend]
+    ) throws -> DevProtocol.PeerIdentity {
         try build.validate()
         try process.validate()
         guard build.runtimeImageIdentity == .current else {
@@ -248,19 +246,48 @@ public struct IdentityFactory: Sendable {
         guard process.architecture == build.architecture else {
             throw DevRuntime.BootstrapError.buildMismatch("architecture")
         }
-        let identity = DevProtocol.SessionIdentity(
-            protocolVersion: connection.protocolVersion,
-            sessionID: connection.sessionID,
+        let buildIdentity = DevProtocol.PeerBuildIdentity(
+            protocolVersion: protocolVersion,
             bundleID: process.bundleID,
             executableUUID: process.executableUUID,
-            processID: process.processID,
             platform: process.platform,
             architecture: process.architecture,
+            xcodeBuild: build.xcodeBuild,
+            swiftCompilerFingerprint: build.swiftCompilerFingerprint,
+            liveReloadIndexHash: build.liveReloadIndexHash
+        )
+        let identity = DevProtocol.PeerIdentity(
+            peerID: .init(rawValue: UUID()),
+            build: buildIdentity,
+            processID: process.processID,
             operatingSystemBuild: process.operatingSystemBuild,
+            supportedBackends: supportedBackends
+        )
+        try identity.validate()
+        return identity
+    }
+
+    /// Binds an authenticated Shell grant to the immutable process identity.
+    public func makeSession(
+        shellID: DevProtocol.ShellID,
+        peer: DevProtocol.PeerIdentity,
+        nativeChainingProbePassed: Bool
+    ) throws -> DevProtocol.SessionIdentity {
+        try peer.validate()
+        let build = peer.build
+        let identity = DevProtocol.SessionIdentity(
+            protocolVersion: build.protocolVersion,
+            sessionID: shellID.rawValue,
+            bundleID: build.bundleID,
+            executableUUID: build.executableUUID,
+            processID: peer.processID,
+            platform: build.platform,
+            architecture: build.architecture,
+            operatingSystemBuild: peer.operatingSystemBuild,
             xcodeBuild: build.xcodeBuild,
             swiftCompilerFingerprint: build.swiftCompilerFingerprint,
             liveReloadIndexHash: build.liveReloadIndexHash,
-            supportedBackends: supportedBackends,
+            supportedBackends: peer.supportedBackends,
             nativeChainingProbePassed: nativeChainingProbePassed
         )
         try identity.validate()
@@ -270,6 +297,8 @@ public struct IdentityFactory: Sendable {
 
 /// Fail-closed setup errors raised before a development connection starts.
 public enum BootstrapError: Swift.Error, Equatable, Sendable, CustomStringConvertible {
+    /// Development runtime was explicitly disabled for this configuration.
+    case disabled
     /// Required generated or frozen build metadata is malformed.
     case invalidBuildContract
     /// Measured process facts are missing or malformed.
@@ -296,6 +325,8 @@ public enum BootstrapError: Swift.Error, Equatable, Sendable, CustomStringConver
     /// Human-readable bootstrap failure detail.
     public var description: String {
         switch self {
+        case .disabled:
+            "Helix Dev Runtime is disabled"
         case .invalidBuildContract:
             "Helix Dev build contract is incomplete or malformed"
         case .invalidProcessIdentity:
@@ -376,6 +407,23 @@ public final class Bootstrap: @unchecked Sendable {
             self.liveness = liveness
             self.cacheDirectory = cacheDirectory
         }
+
+        /// Validates all resource and transport settings before networking starts.
+        public func validate() throws {
+            try activationLimits.validate()
+            try reconnectPolicy.validate()
+            try liveness.validate()
+            if nativeChainingProbePassed,
+               !supportedBackends.contains(.nativeDynamicReplacement) {
+                throw DevProtocol.Error.malformedMessage(
+                    "Native chaining requires the Native Dynamic Replacement backend"
+                )
+            }
+            if let cacheDirectory,
+               (!cacheDirectory.isFileURL || cacheDirectory.path.isEmpty) {
+                throw DevActivation.ConfigurationError.invalidCacheDirectory
+            }
+        }
     }
 
     /// Callbacks that connect activation to product diagnostics and UI refresh.
@@ -408,61 +456,61 @@ public final class Bootstrap: @unchecked Sendable {
         }
     }
 
-    /// Immutable identity advertised to the paired Mac daemon.
-    public let identity: DevProtocol.SessionIdentity
-    /// Controller that verifies and activates temporary generations.
-    public let activation: DevActivation.Controller
-    /// Private directory used for native images and session artifacts.
-    public let cacheDirectory: URL
+    /// Activation policy measured once at process launch.
+    public let launchMode: DevRuntime.LaunchMode
+    /// Immutable process and linked-build facts sent during pairing.
+    public let peerIdentity: DevProtocol.PeerIdentity
+    /// Generated Host Identity pin and optional build-scoped Xcode invitation.
+    public let hubContract: DevRuntime.HubContract
 
-    private let client: DevConnection.Client
-    private let runTask: Task<Void, Never>
+    private let coordinator: ConnectionCoordinator
     private let stoppedHandler: @Sendable () async -> Void
     private let stopLock = NSLock()
     private var hasStopped = false
 
     private init(
-        identity: DevProtocol.SessionIdentity,
-        activation: DevActivation.Controller,
-        cacheDirectory: URL,
-        client: DevConnection.Client,
-        runTask: Task<Void, Never>,
+        launchMode: DevRuntime.LaunchMode,
+        peerIdentity: DevProtocol.PeerIdentity,
+        hubContract: DevRuntime.HubContract,
+        coordinator: ConnectionCoordinator,
         stoppedHandler: @escaping @Sendable () async -> Void
     ) {
-        self.identity = identity
-        self.activation = activation
-        self.cacheDirectory = cacheDirectory
-        self.client = client
-        self.runTask = runTask
+        self.launchMode = launchMode
+        self.peerIdentity = peerIdentity
+        self.hubContract = hubContract
+        self.coordinator = coordinator
         self.stoppedHandler = stoppedHandler
     }
 
     deinit {
-        runTask.cancel()
-        let client = client
-        Task { await client.stop() }
+        let coordinator = coordinator
+        Task { await coordinator.stop() }
     }
 
-    /// Starts only when explicitly enabled and a complete launch environment
-    /// is present. Optimized builds are disabled by default.
+    /// Builds the local activation graph without opening a network connection.
     ///
-    /// - Returns: A running bootstrap, or `nil` when disabled or when no Helix
-    ///   launch variables are present.
-    public static func startIfConfigured(
+    /// An Xcode-traced process starts Bonjour discovery asynchronously with its
+    /// generated one-time invitation. A directly opened test App remains fully
+    /// offline until ``connect(pairingCode:)`` is called.
+    ///
+    /// - Returns: A prepared bootstrap, or `nil` when development runtime is
+    ///   explicitly disabled.
+    public static func prepare(
+        hubContract: DevRuntime.HubContract,
+        launchMode: DevRuntime.LaunchMode = .current(),
         build: DevRuntime.BuildContract,
         runtime: Runtime.Engine,
         shell: Verification.ShellInterface,
         options: Options = .init(),
-        handlers: Handlers = .init(),
-        launchEnvironment: [String: String] = ProcessInfo.processInfo.environment
+        handlers: Handlers = .init()
     ) throws -> DevRuntime.Bootstrap? {
         guard options.isEnabled else { return nil }
-        guard let connection = try DevConnection.Configuration.load(
-            environment: launchEnvironment
-        ) else { return nil }
+        try options.validate()
+        try hubContract.validate()
         let process = try DevRuntime.ProcessIdentity.current()
-        return try start(
-            connection: connection,
+        return try prepare(
+            hubContract: hubContract,
+            launchMode: launchMode,
             build: build,
             process: process,
             runtime: runtime,
@@ -470,6 +518,37 @@ public final class Bootstrap: @unchecked Sendable {
             options: options,
             handlers: handlers
         )
+    }
+
+    /// Begins manual pairing after a developer confirms the four-character code.
+    ///
+    /// Calling this API is the only operation that enables discovery for a test
+    /// App opened without Xcode. Codes are trimmed and matched case-insensitively.
+    ///
+    /// ```swift
+    /// try await session.bootstrap?.connect(pairingCode: "a7kp")
+    /// ```
+    public func connect(pairingCode: String) async throws {
+        let code: Pairing.Code
+        do {
+            code = try Pairing.Code(pairingCode)
+        } catch {
+            await coordinator.reportSetupFailure(error)
+            throw error
+        }
+        try await connect(pairingCode: code)
+    }
+
+    /// Begins manual pairing with a prevalidated code.
+    public func connect(pairingCode: Pairing.Code) async throws {
+        guard launchMode == .manual else {
+            throw DevConnection.Error.manualActivationUnavailable
+        }
+        let configuration = try DevConnection.Configuration(
+            hubContract: hubContract,
+            pairingCode: pairingCode
+        )
+        try await coordinator.start(configuration: configuration)
     }
 
     /// Idempotently stops transport, activation work, and the stopped callback.
@@ -480,21 +559,24 @@ public final class Bootstrap: @unchecked Sendable {
             return true
         }
         guard shouldStop else { return }
-        runTask.cancel()
-        await client.stop()
-        _ = await runTask.result
+        await coordinator.stop()
         await stoppedHandler()
     }
 
-    private static func start(
-        connection: DevConnection.Configuration,
+    /// Explicit-process overload used by tests and alternate build adapters.
+    public static func prepare(
+        hubContract: DevRuntime.HubContract,
+        launchMode: DevRuntime.LaunchMode,
         build: DevRuntime.BuildContract,
         process: DevRuntime.ProcessIdentity,
         runtime: Runtime.Engine,
         shell: Verification.ShellInterface,
         options: Options,
         handlers: Handlers
-    ) throws -> DevRuntime.Bootstrap {
+    ) throws -> DevRuntime.Bootstrap? {
+        guard options.isEnabled else { return nil }
+        try options.validate()
+        try hubContract.validate()
         guard runtime.shellInterfaceHash == shell.interfaceHash else {
             throw DevRuntime.BootstrapError.runtimeShellMismatch
         }
@@ -507,98 +589,276 @@ public final class Bootstrap: @unchecked Sendable {
         else {
             throw DevRuntime.BootstrapError.runtimeAlreadyActive
         }
-        let identity = try DevRuntime.IdentityFactory().make(
-            connection: connection,
+        let peerIdentity = try DevRuntime.IdentityFactory().makePeer(
+            protocolVersion: hubContract.protocolVersion,
             build: build,
             process: process,
-            supportedBackends: options.supportedBackends,
-            nativeChainingProbePassed: options.nativeChainingProbePassed
+            supportedBackends: options.supportedBackends
         )
-        let cacheDirectory = try options.cacheDirectory
-            ?? defaultCacheDirectory(sessionID: identity.sessionID)
         let policy = options.runtimePolicy ?? Core.RuntimePolicy(
             acceptedCapabilities: shell.capabilities,
             allowedNativeImports: Set(shell.imports.keys),
             allowMainActorSynchronousEntries: true,
             productionChannelEnabled: false
         )
-        let activation = try DevActivation.Controller(
-            identity: identity,
+        let graph = SessionGraph(
+            peerIdentity: peerIdentity,
             shell: shell,
+            runtime: runtime,
             runtimePolicy: policy,
-            registry: runtime.registry,
-            cacheDirectory: cacheDirectory,
+            nativeChainingProbePassed: options.nativeChainingProbePassed,
+            cacheDirectory: options.cacheDirectory,
             limits: options.activationLimits,
             reloadHandler: handlers.activationReload
         )
-        let client = try DevConnection.Client(
-            configuration: connection,
-            identity: identity,
-            activation: activation,
+        let coordinator = ConnectionCoordinator(
+            peerIdentity: peerIdentity,
+            graph: graph,
             reconnectPolicy: options.reconnectPolicy,
             liveness: options.liveness,
             eventHandler: handlers.connectionEvent,
             manualReloadHandler: handlers.manualReload
         )
-        let eventHandler = handlers.connectionEvent
-        let runTask = Task {
-            do {
-                try await client.run()
-            } catch is CancellationError {
-                // Explicit stop owns the final status transition.
-            } catch {
-                await eventHandler(
-                    .session(.closed("Dev connection stopped: \(error)"))
-                )
-            }
-        }
-        return .init(
-            identity: identity,
-            activation: activation,
-            cacheDirectory: cacheDirectory,
-            client: client,
-            runTask: runTask,
+        let bootstrap = DevRuntime.Bootstrap(
+            launchMode: launchMode,
+            peerIdentity: peerIdentity,
+            hubContract: hubContract,
+            coordinator: coordinator,
             stoppedHandler: handlers.stopped
         )
+        switch launchMode {
+        case .automaticXcode:
+            guard let pairingCode = hubContract.automaticPairingCode else {
+                throw DevConnection.Error.missingAutomaticInvitation
+            }
+            let configuration = try DevConnection.Configuration(
+                hubContract: hubContract,
+                pairingCode: pairingCode
+            )
+            Task {
+                do {
+                    try await coordinator.start(configuration: configuration)
+                } catch DevConnection.Error.stopped {
+                    // A near-immediate owner teardown won the launch race.
+                } catch {
+                    await handlers.connectionEvent(
+                        .failed("Automatic Helix connection failed: \(error)")
+                    )
+                }
+            }
+        case .manual:
+            Task { await coordinator.announceManualPairing() }
+        }
+        return bootstrap
     }
 
-    private static func defaultCacheDirectory(sessionID: UUID) throws -> URL {
-        guard let base = FileManager.default.urls(
-            for: .cachesDirectory,
-            in: .userDomainMask
-        ).first else {
-            throw DevRuntime.BootstrapError.cacheDirectoryUnavailable
+    private actor SessionGraph {
+        let peerIdentity: DevProtocol.PeerIdentity
+
+        private let shell: Verification.ShellInterface
+        private let runtime: Runtime.Engine
+        private let runtimePolicy: Core.RuntimePolicy
+        private let nativeChainingProbePassed: Bool
+        private let configuredCacheDirectory: URL?
+        private let limits: DevActivation.Limits
+        private let reloadHandler: DevActivation.Controller.ReloadHandler
+        private var context: DevConnection.SessionContext?
+
+        init(
+            peerIdentity: DevProtocol.PeerIdentity,
+            shell: Verification.ShellInterface,
+            runtime: Runtime.Engine,
+            runtimePolicy: Core.RuntimePolicy,
+            nativeChainingProbePassed: Bool,
+            cacheDirectory: URL?,
+            limits: DevActivation.Limits,
+            reloadHandler: @escaping DevActivation.Controller.ReloadHandler
+        ) {
+            self.peerIdentity = peerIdentity
+            self.shell = shell
+            self.runtime = runtime
+            self.runtimePolicy = runtimePolicy
+            self.nativeChainingProbePassed = nativeChainingProbePassed
+            configuredCacheDirectory = cacheDirectory
+            self.limits = limits
+            self.reloadHandler = reloadHandler
         }
-        return base
-            .appendingPathComponent("HelixDev", isDirectory: true)
-            .appendingPathComponent(sessionID.uuidString, isDirectory: true)
+
+        func sessionContext(
+            shellID: DevProtocol.ShellID
+        ) throws -> DevConnection.SessionContext {
+            if let context {
+                guard context.identity.sessionID == shellID.rawValue else {
+                    throw DevConnection.Error.sessionIdentityMismatch
+                }
+                return context
+            }
+            let snapshot = runtime.registry.snapshot()
+            guard snapshot.activeGenerationID == nil,
+                  snapshot.loadedGenerationIDs.isEmpty
+            else { throw DevRuntime.BootstrapError.runtimeAlreadyActive }
+            let identity = try DevRuntime.IdentityFactory().makeSession(
+                shellID: shellID,
+                peer: peerIdentity,
+                nativeChainingProbePassed: nativeChainingProbePassed
+            )
+            let directory = try configuredCacheDirectory
+                ?? Self.defaultCacheDirectory(shellID: shellID)
+            let activation = try DevActivation.Controller(
+                identity: identity,
+                shell: shell,
+                runtimePolicy: runtimePolicy,
+                registry: runtime.registry,
+                cacheDirectory: directory,
+                limits: limits,
+                reloadHandler: reloadHandler
+            )
+            let context = try DevConnection.SessionContext(
+                identity: identity,
+                activation: activation
+            )
+            self.context = context
+            return context
+        }
+
+        private static func defaultCacheDirectory(
+            shellID: DevProtocol.ShellID
+        ) throws -> URL {
+            guard let base = FileManager.default.urls(
+                for: .cachesDirectory,
+                in: .userDomainMask
+            ).first else {
+                throw DevRuntime.BootstrapError.cacheDirectoryUnavailable
+            }
+            return base
+                .appendingPathComponent("HelixDev", isDirectory: true)
+                .appendingPathComponent(shellID.rawValue.uuidString, isDirectory: true)
+        }
+    }
+
+    private actor ConnectionCoordinator {
+        private let peerIdentity: DevProtocol.PeerIdentity
+        private let graph: SessionGraph
+        private let reconnectPolicy: DevConnection.ReconnectPolicy
+        private let liveness: DevProtocol.LivenessConfiguration
+        private let eventHandler: DevConnection.Client.EventHandler
+        private let manualReloadHandler:
+            DevRuntimeSession.Controller.ManualReloadHandler
+        private var client: DevConnection.Client?
+        private var runTask: Task<Void, Never>?
+        private var runToken: UUID?
+        private var isStopped = false
+
+        init(
+            peerIdentity: DevProtocol.PeerIdentity,
+            graph: SessionGraph,
+            reconnectPolicy: DevConnection.ReconnectPolicy,
+            liveness: DevProtocol.LivenessConfiguration,
+            eventHandler: @escaping DevConnection.Client.EventHandler,
+            manualReloadHandler: @escaping
+                DevRuntimeSession.Controller.ManualReloadHandler
+        ) {
+            self.peerIdentity = peerIdentity
+            self.graph = graph
+            self.reconnectPolicy = reconnectPolicy
+            self.liveness = liveness
+            self.eventHandler = eventHandler
+            self.manualReloadHandler = manualReloadHandler
+        }
+
+        func start(configuration: DevConnection.Configuration) throws {
+            guard !isStopped else { throw DevConnection.Error.stopped }
+            guard client == nil, runTask == nil else {
+                throw DevConnection.Error.alreadyRunning
+            }
+            let graph = graph
+            let client = try DevConnection.Client(
+                configuration: configuration,
+                peerIdentity: peerIdentity,
+                reconnectPolicy: reconnectPolicy,
+                liveness: liveness,
+                sessionFactory: { shellID in
+                    try await graph.sessionContext(shellID: shellID)
+                },
+                eventHandler: eventHandler,
+                manualReloadHandler: manualReloadHandler
+            )
+            let token = UUID()
+            self.client = client
+            runToken = token
+            let eventHandler = eventHandler
+            runTask = Task { [weak self] in
+                do {
+                    try await client.run()
+                } catch is CancellationError {
+                    // Explicit stop owns the final state transition.
+                } catch {
+                    await eventHandler(
+                        .failed("Dev connection stopped: \(error)")
+                    )
+                }
+                await self?.finished(token: token)
+            }
+        }
+
+        func announceManualPairing() async {
+            guard !isStopped else { return }
+            await eventHandler(.awaitingManualPairing)
+        }
+
+        func reportSetupFailure(_ error: any Swift.Error) async {
+            guard !isStopped else { return }
+            await eventHandler(.failed("Helix pairing could not start: \(error)"))
+        }
+
+        func stop() async {
+            guard !isStopped else { return }
+            isStopped = true
+            let task = runTask
+            let client = client
+            runTask = nil
+            self.client = nil
+            runToken = nil
+            task?.cancel()
+            await client?.stop()
+            _ = await task?.result
+        }
+
+        private func finished(token: UUID) {
+            guard runToken == token else { return }
+            runTask = nil
+            client = nil
+            runToken = nil
+        }
     }
 }
 }
 
 #if canImport(UIKit) && canImport(SwiftUI)
 extension DevRuntime.Bootstrap {
-/// Starts a configured development session and wires the standard UI environment.
+/// Prepares a development session and wires the standard UI environment.
 ///
 /// The environment supplies status reduction, automatic UIKit/SwiftUI refresh,
-/// and the optional debug overlay. The overlay starts only when launch variables
-/// produce a real bootstrap and is stopped with the session.
+/// and the optional debug overlay. In manual mode the overlay starts while the
+/// network remains off, so a debug page can present pairing status safely.
 ///
 /// Applications normally use `DevRuntime.ApplicationSession`; this overload is
 /// available for custom ownership while retaining the standard UI integration.
 ///
-/// - Returns: A running bootstrap, or `nil` when development runtime is disabled
-///   or no Helix launch variables are present.
+/// - Returns: A prepared bootstrap, or `nil` when development runtime is disabled.
 @MainActor
-public static func startIfConfigured(
+public static func prepare(
+    hubContract: DevRuntime.HubContract,
+    launchMode: DevRuntime.LaunchMode = .current(),
     build: DevRuntime.BuildContract,
     runtime: Runtime.Engine,
     shell: Verification.ShellInterface,
     liveReloadEnvironment: DevRuntime.LiveReloadEnvironment,
-    options: Options = .init(),
-    launchEnvironment: [String: String] = ProcessInfo.processInfo.environment
+    options: Options = .init()
 ) throws -> DevRuntime.Bootstrap? {
-    let bootstrap = try startIfConfigured(
+    let bootstrap = try prepare(
+        hubContract: hubContract,
+        launchMode: launchMode,
         build: build,
         runtime: runtime,
         shell: shell,
@@ -610,8 +870,7 @@ public static func startIfConfigured(
             stopped: { @MainActor [weak liveReloadEnvironment] in
                 liveReloadEnvironment?.stopOverlay()
             }
-        ),
-        launchEnvironment: launchEnvironment
+        )
     )
     if bootstrap != nil { liveReloadEnvironment.startOverlay() }
     return bootstrap

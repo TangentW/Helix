@@ -7,6 +7,23 @@ extension DevRuntimeTests {
 @MainActor
 @Suite("Development status model")
 struct StatusTests {
+    @Test("Manual pairing and terminal connection failures are explicit")
+    func modelsPairingLifecycle() throws {
+        let store = DevStatus.Store()
+        store.handle(.awaitingManualPairing)
+        #expect(store.snapshot.phase == .awaitingPairing)
+        #expect(store.snapshot.detail?.contains("Networking is off") == true)
+
+        store.handle(.pairing(attempt: 2))
+        #expect(store.snapshot.phase == .connecting)
+        #expect(store.snapshot.detail?.contains("2") == true)
+
+        store.handle(.failed("invitation expired"))
+        #expect(store.snapshot.phase == .failed)
+        #expect(store.snapshot.tone == .error)
+        #expect(store.snapshot.detail == "invitation expired")
+    }
+
     @Test("Session events preserve the distinction between code and UI state")
     func modelsSessionLifecycle() {
         let store = DevStatus.Store()

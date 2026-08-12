@@ -6,256 +6,193 @@ import HelixLiveReloadAPI
 import Testing
 
 extension DevRuntimeTests {
-@Suite("Device Dev connection bootstrap")
+@Suite("Helix Hub App connection")
 struct DevConnectionBootstrap {
-    @Test("Runtime polling outlives the LLDB installer deadline")
-    func debuggerHandoffTiming() {
-        let timing = DevProtocol.DebuggerHandoffTiming.self
-        #expect(
-            DevRuntime.DebuggerHandoff.defaultIntervalNanoseconds
-                == timing.pollIntervalNanoseconds
-        )
-        #expect(
-            DevRuntime.DebuggerHandoff.defaultMaximumAttempts
-                == timing.runtimeMaximumAttempts
-        )
-
-        let runtimeWindow =
-            UInt64(timing.runtimeMaximumAttempts - 1) * timing.pollIntervalNanoseconds
-        let installerWindow = UInt64(timing.installerTimeoutSeconds) * 1_000_000_000
-        #expect(runtimeWindow > installerWindow)
+    @Test("Launch policy is determined only by debugger attachment")
+    func launchModeResolution() {
+        #expect(DevRuntime.LaunchMode.resolve(debuggerAttached: true) == .automaticXcode)
+        #expect(DevRuntime.LaunchMode.resolve(debuggerAttached: false) == .manual)
     }
 
-    @Test("Debugger handoff accepts only a complete session-marked snapshot")
-    func debuggerHandoffReadiness() async {
-        let sessionID = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
-        let source = HandoffEnvironmentSource([
-            [:],
-            [
-                "HLX_DEV_SESSION_ID": sessionID,
-                "HLX_DEV_HANDOFF_READY": "stale-session",
-            ],
-            [
-                "HLX_DEV_SESSION_ID": sessionID,
-                "HLX_DEV_HANDOFF_READY": sessionID,
-            ],
-        ])
-        let environment = await DevRuntime.DebuggerHandoff.waitForEnvironment(
-            maximumAttempts: 3,
-            intervalNanoseconds: 1,
-            environment: { source.next() }
+    @Test("Hub contract and pairing configuration never disclose invitations")
+    func redactsPairingMaterial() throws {
+        let code = try Pairing.Code("a7kp")
+        let contract = try makeHubContract(automaticPairingCode: code)
+        let configuration = try DevConnection.Configuration(
+            hubContract: contract,
+            pairingCode: code
         )
-        #expect(environment?["HLX_DEV_SESSION_ID"] == sessionID)
 
-        let partial = await DevRuntime.DebuggerHandoff.waitForEnvironment(
-            maximumAttempts: 1,
-            intervalNanoseconds: 0,
-            environment: {
-                [
-                    "HLX_DEV_SESSION_ID": sessionID,
-                    "HLX_DEV_HANDOFF_READY": "different-session",
-                ]
-            }
-        )
-        #expect(partial == nil)
+        #expect(contract.automaticPairingCode == code)
+        #expect(contract.description.contains(code.rawValue) == false)
+        #expect(configuration.description.contains(code.rawValue) == false)
+        #expect(configuration.expectedSPKIHash == contract.expectedSPKIHash)
+        #expect(configuration.pairingCode == code)
+
+        var reflected = ""
+        dump(contract, to: &reflected)
+        dump(configuration, to: &reflected)
+        #expect(reflected.contains(code.rawValue) == false)
     }
 
-    @Test("Debugger handoff cancellation ends the bounded wait")
-    func debuggerHandoffCancellation() async {
-        let task = Task {
-            await DevRuntime.DebuggerHandoff.waitForEnvironment(
-                maximumAttempts: 1_000,
-                intervalNanoseconds: 1_000_000_000,
-                environment: { [:] }
+    @Test("Hub contract rejects a different protocol generation")
+    func rejectsProtocolMismatch() {
+        #expect(throws: DevConnection.Error.protocolVersionMismatch) {
+            _ = try DevRuntime.HubContract(
+                protocolVersion: DevProtocol.Metadata.currentProtocolVersion + 1,
+                expectedSPKIHash: .sha256("host")
             )
         }
-        await Task.yield()
-        task.cancel()
-        #expect(await task.value == nil)
     }
 
-    @Test("Absent launch variables disable the Dev connection cleanly")
-    func absentEnvironment() throws {
-        #expect(try DevConnection.Configuration.load(environment: [:]) == nil)
-    }
-
-    @Test("Simulator and device launch environments select deterministic endpoints")
-    func endpointSelection() throws {
-        let sessionID = UUID()
-        let secret = Data(repeating: 0x3c, count: 32)
-        var environment = baseEnvironment(sessionID: sessionID, secret: secret)
-        environment["HLX_DEV_HOST"] = "127.0.0.1"
-        environment["HLX_DEV_PORT"] = "54321"
-        let simulator = try #require(
-            try DevConnection.Configuration.load(environment: environment)
-        )
-        #expect(simulator.sessionID == sessionID)
-        #expect(simulator.sessionSecret == secret)
-        #expect(simulator.endpoint == .direct(host: "127.0.0.1", port: 54_321))
-
-        environment.removeValue(forKey: "HLX_DEV_HOST")
-        environment.removeValue(forKey: "HLX_DEV_PORT")
-        let device = try #require(
-            try DevConnection.Configuration.load(environment: environment)
-        )
-        #expect(device.endpoint == .bonjour(serviceName: "Helix-12345678"))
-    }
-
-    @Test("Partial, stale, and malformed launch credentials fail closed")
-    func rejectsMalformedEnvironment() throws {
-        let sessionID = UUID()
-        var environment = baseEnvironment(
-            sessionID: sessionID,
-            secret: Data(repeating: 0x7a, count: 32)
-        )
-        environment.removeValue(forKey: "HLX_DEV_SPKI_SHA256")
-        #expect(throws: DevConnection.Error.invalidEnvironment) {
-            _ = try DevConnection.Configuration.load(environment: environment)
+    @Test("Pairing codes normalize case and reject ambiguous input")
+    func validatesPairingCode() throws {
+        #expect(try Pairing.Code(" a7kp\n").rawValue == "A7KP")
+        #expect(throws: DevProtocol.Error.invalidPairingCode) {
+            _ = try Pairing.Code("AIL0")
         }
-
-        environment = baseEnvironment(
-            sessionID: sessionID,
-            secret: Data(repeating: 0x7a, count: 32)
-        )
-        environment["HLX_DEV_PROTOCOL_VERSION"] = "1"
-        #expect(throws: DevConnection.Error.protocolVersionMismatch) {
-            _ = try DevConnection.Configuration.load(environment: environment)
-        }
-
-        environment = baseEnvironment(
-            sessionID: sessionID,
-            secret: Data(repeating: 0x7a, count: 32)
-        )
-        environment["HLX_DEV_HOST"] = "127.0.0.1"
-        #expect(throws: DevConnection.Error.invalidEnvironment) {
-            _ = try DevConnection.Configuration.load(environment: environment)
+        #expect(throws: DevProtocol.Error.invalidPairingCode) {
+            _ = try Pairing.Code("ABC")
         }
     }
 
-    @Test("Reconnect policy is bounded and ordered")
+    @Test("Reconnect policy bounds discovery, TLS, pairing, and retry delays")
     func reconnectPolicyValidation() throws {
         try DevConnection.ReconnectPolicy().validate()
-        #expect(throws: DevConnection.Error.invalidEnvironment) {
+        #expect(throws: DevConnection.Error.invalidConfiguration) {
             try DevConnection.ReconnectPolicy(
                 initialDelayNanoseconds: 2,
                 maximumDelayNanoseconds: 1
             ).validate()
         }
+        #expect(throws: DevConnection.Error.invalidConfiguration) {
+            try DevConnection.ReconnectPolicy(
+                pairingTimeoutNanoseconds: 0
+            ).validate()
+        }
     }
 
-    @Test("Identity factory combines frozen build values with measured process facts")
-    func makesBoundProcessIdentity() throws {
-        let sessionID = UUID()
-        let connection = try makeConnection(sessionID: sessionID)
+    @Test("Bootstrap options fail before discovery when backend or cache is invalid")
+    func validatesBootstrapOptions() throws {
+        #expect(throws: DevProtocol.Error.self) {
+            try DevRuntime.Bootstrap.Options(
+                supportedBackends: [.hlbc],
+                nativeChainingProbePassed: true
+            ).validate()
+        }
+        #expect(throws: DevActivation.ConfigurationError.invalidCacheDirectory) {
+            try DevRuntime.Bootstrap.Options(
+                cacheDirectory: URL(string: "https://example.invalid/cache")
+            ).validate()
+        }
+        try DevRuntime.Bootstrap.Options(
+            isEnabled: true,
+            supportedBackends: [.hlbc]
+        ).validate()
+    }
+
+    @Test("Identity construction waits for the granted Shell ID")
+    func makesPeerThenSessionIdentity() throws {
         let build = try makeBuildContract()
         let executableUUID = UUID()
-        let process = try DevRuntime.ProcessIdentity(
-            bundleID: build.bundleID,
+        let process = try makeProcess(
+            build: build,
             executableUUID: executableUUID,
-            processID: 42,
-            platform: build.platform,
-            architecture: build.architecture,
-            operatingSystemBuild: "25G91"
+            processID: 42
         )
-
-        let identity = try DevRuntime.IdentityFactory().make(
-            connection: connection,
+        let factory = DevRuntime.IdentityFactory()
+        let peer = try factory.makePeer(
             build: build,
             process: process,
-            supportedBackends: [.nativeDynamicReplacement, .hlbc],
+            supportedBackends: [.nativeDynamicReplacement, .hlbc]
+        )
+
+        #expect(peer.build.bundleID == build.bundleID)
+        #expect(peer.build.executableUUID == executableUUID)
+        #expect(peer.processID == 42)
+        #expect(peer.supportedBackends == [.hlbc, .nativeDynamicReplacement])
+
+        let shellID = DevProtocol.ShellID(rawValue: UUID())
+        let session = try factory.makeSession(
+            shellID: shellID,
+            peer: peer,
             nativeChainingProbePassed: true
         )
-
-        #expect(identity.sessionID == sessionID)
-        #expect(identity.bundleID == build.bundleID)
-        #expect(identity.executableUUID == executableUUID)
-        #expect(identity.processID == 42)
-        #expect(identity.operatingSystemBuild == "25G91")
-        #expect(identity.xcodeBuild == build.xcodeBuild)
-        #expect(identity.swiftCompilerFingerprint == build.swiftCompilerFingerprint)
-        #expect(identity.liveReloadIndexHash == build.liveReloadIndexHash)
-        #expect(identity.supportedBackends == [.hlbc, .nativeDynamicReplacement])
-        #expect(identity.nativeChainingProbePassed)
+        #expect(session.sessionID == shellID.rawValue)
+        #expect(session.matchesBuild(of: session))
+        #expect(session.nativeChainingProbePassed)
     }
 
-    @Test("Identity factory rejects stale launch and process dimensions independently")
+    @Test("Peer identity rejects stale process dimensions independently")
     func rejectsStaleProcessIdentity() throws {
-        let sessionID = UUID()
-        let connection = try makeConnection(sessionID: sessionID)
         let build = try makeBuildContract()
-        let process = try DevRuntime.ProcessIdentity(
-            bundleID: build.bundleID,
-            executableUUID: UUID(),
-            processID: 73,
-            platform: build.platform,
-            architecture: build.architecture,
-            operatingSystemBuild: "25G91"
-        )
+        let process = try makeProcess(build: build)
         let factory = DevRuntime.IdentityFactory()
 
         var staleBundle = process
         staleBundle.bundleID = "dev.helix.stale"
         #expect(throws: DevRuntime.BootstrapError.buildMismatch("bundle ID")) {
-            _ = try factory.make(
-                connection: connection,
+            _ = try factory.makePeer(
                 build: build,
                 process: staleBundle,
-                supportedBackends: [.hlbc],
-                nativeChainingProbePassed: false
+                supportedBackends: [.hlbc]
             )
         }
 
         var stalePlatform = process
         stalePlatform.platform = .iOS
         #expect(throws: DevRuntime.BootstrapError.buildMismatch("platform")) {
-            _ = try factory.make(
-                connection: connection,
+            _ = try factory.makePeer(
                 build: build,
                 process: stalePlatform,
-                supportedBackends: [.hlbc],
-                nativeChainingProbePassed: false
+                supportedBackends: [.hlbc]
             )
         }
 
         var staleArchitecture = process
         staleArchitecture.architecture = "x86_64"
         #expect(throws: DevRuntime.BootstrapError.buildMismatch("architecture")) {
-            _ = try factory.make(
-                connection: connection,
+            _ = try factory.makePeer(
                 build: build,
                 process: staleArchitecture,
-                supportedBackends: [.hlbc],
-                nativeChainingProbePassed: false
+                supportedBackends: [.hlbc]
             )
         }
     }
 
     @Test("Identity factory rejects overlapping Helix package products")
     func rejectsDuplicateRuntimeImages() throws {
-        let connection = try makeConnection(sessionID: UUID())
         var build = try makeBuildContract()
         build.runtimeImageIdentity = .init()
-        let process = try DevRuntime.ProcessIdentity(
-            bundleID: build.bundleID,
-            executableUUID: UUID(),
-            processID: 74,
-            platform: build.platform,
-            architecture: build.architecture,
-            operatingSystemBuild: "25G91"
-        )
+        let process = try makeProcess(build: build)
 
         #expect(throws: DevRuntime.BootstrapError.duplicateRuntimeImages) {
-            _ = try DevRuntime.IdentityFactory().make(
-                connection: connection,
+            _ = try DevRuntime.IdentityFactory().makePeer(
                 build: build,
                 process: process,
-                supportedBackends: [.hlbc],
-                nativeChainingProbePassed: false
+                supportedBackends: [.hlbc]
             )
         }
     }
 
-    @Test("Build, process, and backend validation fail closed")
+    @Test("Native probe state cannot be claimed by an HLBC-only peer")
+    func rejectsUnsupportedNativeProbe() throws {
+        let build = try makeBuildContract()
+        let peer = try DevRuntime.IdentityFactory().makePeer(
+            build: build,
+            process: makeProcess(build: build),
+            supportedBackends: [.hlbc]
+        )
+        #expect(throws: DevProtocol.Error.self) {
+            _ = try DevRuntime.IdentityFactory().makeSession(
+                shellID: .init(rawValue: UUID()),
+                peer: peer,
+                nativeChainingProbePassed: true
+            )
+        }
+    }
+
+    @Test("Build and process placeholders fail closed")
     func rejectsInvalidBootstrapInputs() throws {
         let zero = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         #expect(throws: DevRuntime.BootstrapError.invalidBuildContract) {
@@ -278,50 +215,14 @@ struct DevConnectionBootstrap {
                 operatingSystemBuild: "25G91"
             )
         }
-
-        let sessionID = UUID()
-        #expect(throws: DevProtocol.Error.self) {
-            _ = try DevRuntime.IdentityFactory().make(
-                connection: makeConnection(sessionID: sessionID),
-                build: makeBuildContract(),
-                process: DevRuntime.ProcessIdentity(
-                    bundleID: "dev.helix.host",
-                    executableUUID: UUID(),
-                    processID: 99,
-                    platform: .iOSSimulator,
-                    architecture: "arm64",
-                    operatingSystemBuild: "25G91"
-                ),
-                supportedBackends: [.hlbc],
-                nativeChainingProbePassed: true
-            )
-        }
     }
 
-    private func baseEnvironment(
-        sessionID: UUID,
-        secret: Data
-    ) -> [String: String] {
-        [
-            "HLX_DEV_PROTOCOL_VERSION": String(
-                DevProtocol.SessionIdentity.currentProtocolVersion
-            ),
-            "HLX_DEV_SESSION_ID": sessionID.uuidString,
-            "HLX_DEV_SERVICE_NAME": "Helix-12345678",
-            "HLX_DEV_SPKI_SHA256": Core.Digest.sha256("certificate").hex,
-            "HLX_DEV_SESSION_SECRET": secret.map {
-                String(format: "%02x", $0)
-            }.joined(),
-        ]
-    }
-
-    private func makeConnection(sessionID: UUID) throws -> DevConnection.Configuration {
+    private func makeHubContract(
+        automaticPairingCode: Pairing.Code? = nil
+    ) throws -> DevRuntime.HubContract {
         try .init(
-            protocolVersion: DevProtocol.SessionIdentity.currentProtocolVersion,
-            sessionID: sessionID,
-            endpoint: .direct(host: "127.0.0.1", port: 54_321),
-            expectedSPKIHash: .sha256("certificate"),
-            sessionSecret: Data(repeating: 0x4a, count: 32)
+            expectedSPKIHash: .sha256("persistent-host-identity"),
+            automaticPairingCode: automaticPairingCode
         )
     }
 
@@ -336,20 +237,19 @@ struct DevConnectionBootstrap {
         )
     }
 
-    private final class HandoffEnvironmentSource: @unchecked Sendable {
-        private let lock = NSLock()
-        private var snapshots: [[String: String]]
-
-        init(_ snapshots: [[String: String]]) {
-            self.snapshots = snapshots
-        }
-
-        func next() -> [String: String] {
-            lock.lock()
-            defer { lock.unlock() }
-            guard snapshots.count > 1 else { return snapshots.first ?? [:] }
-            return snapshots.removeFirst()
-        }
+    private func makeProcess(
+        build: DevRuntime.BuildContract,
+        executableUUID: UUID = UUID(),
+        processID: Int32 = 73
+    ) throws -> DevRuntime.ProcessIdentity {
+        try .init(
+            bundleID: build.bundleID,
+            executableUUID: executableUUID,
+            processID: processID,
+            platform: build.platform,
+            architecture: build.architecture,
+            operatingSystemBuild: "25G91"
+        )
     }
 }
 }

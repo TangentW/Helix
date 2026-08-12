@@ -6,35 +6,40 @@ import HelixDevProtocol
 import HelixLiveReloadAPI
 
 extension DevConnection {
-/// Bounded exponential-backoff behavior for transient connection failures.
+/// Bounded retry, discovery, TLS, and pairing deadlines.
 public struct ReconnectPolicy: Hashable, Sendable {
-    /// Maximum number of reconnects after the initial attempt.
+    /// Maximum reconnects after the initial attempt.
     public var maximumAttempts: Int
     /// Delay before the first reconnect, in nanoseconds.
     public var initialDelayNanoseconds: UInt64
-    /// Upper bound for the doubled reconnect delay, in nanoseconds.
+    /// Upper bound for exponential backoff, in nanoseconds.
     public var maximumDelayNanoseconds: UInt64
-    /// Bonjour discovery deadline for each attempt, in nanoseconds.
+    /// Deadline for each Bonjour discovery attempt, in nanoseconds.
     public var discoveryTimeoutNanoseconds: UInt64
-    /// Network connection readiness deadline for each attempt, in nanoseconds.
+    /// Deadline for each candidate TLS connection, in nanoseconds.
     public var connectionTimeoutNanoseconds: UInt64
+    /// Deadline for invitation or reconnect-lease authentication, in nanoseconds.
+    public var pairingTimeoutNanoseconds: UInt64
 
-    /// Creates a reconnect policy.
+    /// Creates bounded connection timing. `maximumAttempts` counts retries,
+    /// so zero still permits one initial connection attempt.
     public init(
         maximumAttempts: Int = 20,
         initialDelayNanoseconds: UInt64 = 250_000_000,
         maximumDelayNanoseconds: UInt64 = 5_000_000_000,
         discoveryTimeoutNanoseconds: UInt64 = 10_000_000_000,
-        connectionTimeoutNanoseconds: UInt64 = 10_000_000_000
+        connectionTimeoutNanoseconds: UInt64 = 10_000_000_000,
+        pairingTimeoutNanoseconds: UInt64 = 10_000_000_000
     ) {
         self.maximumAttempts = maximumAttempts
         self.initialDelayNanoseconds = initialDelayNanoseconds
         self.maximumDelayNanoseconds = maximumDelayNanoseconds
         self.discoveryTimeoutNanoseconds = discoveryTimeoutNanoseconds
         self.connectionTimeoutNanoseconds = connectionTimeoutNanoseconds
+        self.pairingTimeoutNanoseconds = pairingTimeoutNanoseconds
     }
 
-    /// Validates attempt bounds, positive deadlines, and backoff ordering.
+    /// Rejects unbounded, zero, or internally inconsistent timing values.
     public func validate() throws {
         let maximumTimeout: UInt64 = 5 * 60 * 1_000_000_000
         guard (0...10_000).contains(maximumAttempts),
@@ -44,121 +49,162 @@ public struct ReconnectPolicy: Hashable, Sendable {
               discoveryTimeoutNanoseconds > 0,
               discoveryTimeoutNanoseconds <= maximumTimeout,
               connectionTimeoutNanoseconds > 0,
-              connectionTimeoutNanoseconds <= maximumTimeout
-        else { throw DevConnection.Error.invalidEnvironment }
+              connectionTimeoutNanoseconds <= maximumTimeout,
+              pairingTimeoutNanoseconds > 0,
+              pairingTimeoutNanoseconds <= maximumTimeout
+        else { throw DevConnection.Error.invalidConfiguration }
     }
 }
 
-/// Lifecycle event emitted by ``Client`` for status UI and diagnostics.
+/// Identity and activation state selected after a pairing grant names its Shell.
+public struct SessionContext: Sendable {
+    /// Full App identity bound to the granted Shell.
+    public let identity: DevProtocol.SessionIdentity
+    /// Activation state retained across transport reconnects.
+    public let activation: DevActivation.Controller
+
+    /// Creates a context only when activation and advertised identity agree.
+    public init(
+        identity: DevProtocol.SessionIdentity,
+        activation: DevActivation.Controller
+    ) throws {
+        try identity.validate()
+        guard activation.identity == identity else {
+            throw DevConnection.Error.sessionIdentityMismatch
+        }
+        self.identity = identity
+        self.activation = activation
+    }
+}
+
+/// Lifecycle event emitted for status UI and diagnostics.
 public enum ClientEvent: Sendable {
-    /// A discovery or transport attempt is starting. Attempts are one-based.
+    /// A directly opened test App is offline until the developer enters a code.
+    case awaitingManualPairing
+    /// Bonjour discovery or pinned TLS connection is starting.
     case connecting(attempt: Int)
-    /// Event emitted by an authenticated protocol session.
+    /// A one-time invitation or reconnect lease is being authenticated.
+    case pairing(attempt: Int)
+    /// Pairing selected an exact Shell.
+    case paired(DevProtocol.ShellID)
+    /// Event emitted by an authenticated Dev Protocol session.
     case session(DevRuntimeSession.Event)
     /// A transient failure will be retried after the supplied delay.
     case reconnectScheduled(attempt: Int, delayNanoseconds: UInt64, reason: String)
+    /// Setup, pairing, or authentication ended with a non-retryable failure.
+    case failed(String)
     /// The client was intentionally stopped.
     case stopped
 }
 
-/// Establishes an authenticated session from launch-only credentials. Native
-/// and HLBC generations live in DevActivation, so a transport reconnect never
-/// rolls back already active code.
+/// Discovers the single Helix Bonjour service, pins its persistent Host
+/// Identity, redeems or resumes a session, then runs the Dev Protocol.
 public actor Client {
-    /// Async lifecycle callback. Keep handlers lightweight and non-blocking.
+    /// Async lifecycle callback used by diagnostics and status presentation.
     public typealias EventHandler = @Sendable (DevConnection.ClientEvent) async -> Void
+    /// Lazily creates persistent activation state for the Shell selected by Hub.
+    public typealias SessionFactory = @Sendable (
+        DevProtocol.ShellID
+    ) async throws -> DevConnection.SessionContext
 
-    /// Validated endpoint and ephemeral launch credentials.
-    public let configuration: DevConnection.Configuration
-    /// App process identity authenticated to the paired daemon.
-    public let identity: DevProtocol.SessionIdentity
-    /// Retry and backoff limits used by ``run()``.
+    private struct Lease: Sendable {
+        var shellID: DevProtocol.ShellID
+        var leaseID: DevProtocol.LeaseID
+        var sessionSecret: Data
+        var expiresAt: Date
+    }
+
+    private struct Authorization: Sendable {
+        var shellID: DevProtocol.ShellID
+        var sessionSecret: Data
+    }
+
+    private let configuration: DevConnection.Configuration
+    /// Immutable build and process facts presented before authorization.
+    public let peerIdentity: DevProtocol.PeerIdentity
+    /// Retry and deadline policy for discovery through pairing.
     public let reconnectPolicy: DevConnection.ReconnectPolicy
-    /// Heartbeat, inactivity, and clock-skew limits for authenticated messages.
+    /// Liveness policy used after Dev Protocol authentication.
     public let liveness: DevProtocol.LivenessConfiguration
 
-    private let activation: DevActivation.Controller
+    private let sessionFactory: SessionFactory
     private let eventHandler: EventHandler
     private let manualReloadHandler: DevRuntimeSession.Controller.ManualReloadHandler
+    private var lease: Lease?
     private var currentTransport: NetworkTransport.ByteTransport?
     private var currentBrowser: NetworkTransport.Browser?
+    private var discoveryContinuation:
+        AsyncStream<[NetworkTransport.DiscoveredService]>.Continuation?
+    private var discoveryTimeoutTask: Task<Void, Never>?
     private var retryDelayTask: Task<Void, any Swift.Error>?
     private var isRunning = false
     private var isStopping = false
 
-    /// Creates a client around an existing activation controller.
+    /// Creates a client that always discovers `_helix._tcp` and pins the Hub key.
     ///
-    /// `configuration` and `identity` must refer to the same session and protocol
-    /// version. TLS pinning and frame authentication are mandatory.
+    /// Session state is requested only after Hub grants an exact Shell ID; this
+    /// prevents an App from activating artifacts for a merely similar build.
     public init(
         configuration: DevConnection.Configuration,
-        identity: DevProtocol.SessionIdentity,
-        activation: DevActivation.Controller,
+        peerIdentity: DevProtocol.PeerIdentity,
         reconnectPolicy: DevConnection.ReconnectPolicy = .init(),
         liveness: DevProtocol.LivenessConfiguration = .init(),
+        sessionFactory: @escaping SessionFactory,
         eventHandler: @escaping EventHandler = { _ in },
         manualReloadHandler: @escaping DevRuntimeSession.Controller.ManualReloadHandler = { _ in
             (.manualRefreshRequired, "no manual UI reload handler is installed")
         }
     ) throws {
         try configuration.validate()
-        try identity.validate()
+        try peerIdentity.validate()
         try reconnectPolicy.validate()
         try liveness.validate()
-        guard configuration.sessionID == identity.sessionID,
-              configuration.protocolVersion == identity.protocolVersion
-        else { throw DevConnection.Error.sessionIdentityMismatch }
+        guard configuration.protocolVersion == peerIdentity.build.protocolVersion else {
+            throw DevConnection.Error.protocolVersionMismatch
+        }
         self.configuration = configuration
-        self.identity = identity
-        self.activation = activation
+        self.peerIdentity = peerIdentity
         self.reconnectPolicy = reconnectPolicy
         self.liveness = liveness
+        self.sessionFactory = sessionFactory
         self.eventHandler = eventHandler
         self.manualReloadHandler = manualReloadHandler
     }
 
-    /// Runs discovery, pinned TLS, authentication, and message processing.
-    ///
-    /// The call remains suspended until the peer closes, the client is stopped,
-    /// or a terminal error occurs. Reconnectable transport failures use the
-    /// configured exponential backoff; active code is not rolled back.
+    /// Runs until the authenticated peer closes, retry limits are exhausted,
+    /// or ``stop()`` is called. Active code survives transport reconnections.
     public func run() async throws {
         guard !isRunning else { throw DevConnection.Error.alreadyRunning }
         isRunning = true
         isStopping = false
-        defer {
-            currentBrowser?.cancel()
-            currentBrowser = nil
-            retryDelayTask?.cancel()
-            retryDelayTask = nil
-            currentTransport = nil
-            isRunning = false
-            isStopping = false
-        }
+        defer { resetTransientState() }
 
         var retryCount = 0
         var delay = reconnectPolicy.initialDelayNanoseconds
         while !Task.isCancelled, !isStopping {
             await eventHandler(.connecting(attempt: retryCount + 1))
             do {
-                let endpoint = try await resolveEndpoint()
+                let transport = try await connectToPinnedService()
                 guard !isStopping else { return }
-                let transport = NetworkTransport.ByteTransport.pinnedTLSClient(
-                    endpoint: endpoint,
-                    expectedSPKIHash: configuration.expectedSPKIHash
-                )
                 currentTransport = transport
-                try await start(transport)
                 let exporter = try transport.tlsExporterHash()
+                await eventHandler(.pairing(attempt: retryCount + 1))
+                let authorization = try await authorize(
+                    transport: transport,
+                    tlsExporterHash: exporter
+                )
+                let context = try await sessionFactory(authorization.shellID)
+                try validate(context: context, shellID: authorization.shellID)
+                await eventHandler(.paired(authorization.shellID))
                 let channel = try DevProtocol.AuthenticatedChannel(
                     transport: transport,
-                    sessionSecret: configuration.sessionSecret
+                    sessionSecret: authorization.sessionSecret
                 )
                 let session = try DevRuntimeSession.Controller(
-                    identity: identity,
-                    sessionSecret: configuration.sessionSecret,
+                    identity: context.identity,
+                    sessionSecret: authorization.sessionSecret,
                     tlsTranscriptHash: exporter,
-                    activation: activation,
+                    activation: context.activation,
                     liveness: liveness,
                     eventHandler: { [eventHandler] event in
                         await eventHandler(.session(event))
@@ -169,12 +215,10 @@ public actor Client {
                 currentTransport = nil
                 return
             } catch is CancellationError {
-                if let currentTransport { await currentTransport.close() }
-                currentTransport = nil
+                await closeCurrentTransport()
                 return
             } catch {
-                if let currentTransport { await currentTransport.close() }
-                currentTransport = nil
+                await closeCurrentTransport()
                 guard !isStopping else { return }
                 guard Self.isReconnectable(error),
                       retryCount < reconnectPolicy.maximumAttempts
@@ -187,18 +231,18 @@ public actor Client {
                         reason: String(describing: error)
                     )
                 )
-                let retryDelayTask = Task { [delay] in
+                let task = Task { [delay] in
                     try await Task.sleep(nanoseconds: delay)
                 }
-                self.retryDelayTask = retryDelayTask
+                retryDelayTask = task
                 do {
-                    try await retryDelayTask.value
+                    try await task.value
                 } catch is CancellationError {
-                    self.retryDelayTask = nil
+                    retryDelayTask = nil
                     if isStopping || Task.isCancelled { return }
                     throw CancellationError()
                 }
-                self.retryDelayTask = nil
+                retryDelayTask = nil
                 let doubled = delay.multipliedReportingOverflow(by: 2)
                 delay = doubled.overflow
                     ? reconnectPolicy.maximumDelayNanoseconds
@@ -207,63 +251,202 @@ public actor Client {
         }
     }
 
-    /// Idempotently cancels discovery, backoff, and the active transport.
+    /// Idempotently cancels discovery, retry delay, and the current connection.
     public func stop() async {
         guard isRunning, !isStopping else { return }
         isStopping = true
         currentBrowser?.cancel()
         currentBrowser = nil
+        discoveryContinuation?.finish()
+        discoveryContinuation = nil
+        discoveryTimeoutTask?.cancel()
+        discoveryTimeoutTask = nil
         retryDelayTask?.cancel()
         retryDelayTask = nil
-        if let currentTransport { await currentTransport.close() }
-        currentTransport = nil
+        await closeCurrentTransport()
         await eventHandler(.stopped)
     }
 
-    private func resolveEndpoint() async throws -> NWEndpoint {
-        switch configuration.endpoint {
-        case let .direct(host, port):
-            guard let networkPort = NWEndpoint.Port(rawValue: port) else {
-                throw DevConnection.Error.invalidEnvironment
-            }
-            return .hostPort(host: NWEndpoint.Host(host), port: networkPort)
-        case let .bonjour(serviceName):
-            let stream = AsyncStream.makeStream(
-                of: [NetworkTransport.DiscoveredService].self,
-                bufferingPolicy: .bufferingNewest(1)
-            )
-            let browser = NetworkTransport.Browser { services in
-                stream.continuation.yield(services)
-            }
-            currentBrowser = browser
-            defer {
-                browser.cancel()
+    private func connectToPinnedService() async throws -> NetworkTransport.ByteTransport {
+        let stream = AsyncStream.makeStream(
+            of: [NetworkTransport.DiscoveredService].self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let browser = NetworkTransport.Browser { services in
+            stream.continuation.yield(services)
+        }
+        currentBrowser = browser
+        discoveryContinuation = stream.continuation
+        defer {
+            browser.cancel()
+            stream.continuation.finish()
+            currentBrowser = nil
+            discoveryContinuation = nil
+            discoveryTimeoutTask?.cancel()
+            discoveryTimeoutTask = nil
+        }
+        try await start(browser)
+        let timeoutTask = Task { [timeout = reconnectPolicy.discoveryTimeoutNanoseconds] in
+            do {
+                try await Task.sleep(nanoseconds: timeout)
                 stream.continuation.finish()
-                currentBrowser = nil
-            }
-            try await start(browser)
-            return try await withThrowingTaskGroup(of: NWEndpoint.self) { group in
-                group.addTask {
-                    for await services in stream.stream {
-                        if let service = services.first(where: {
-                            $0.name == serviceName && $0.type == "_helix-live._tcp"
-                        }) {
-                            return service.endpoint
-                        }
-                    }
-                    throw DevConnection.Error.stopped
-                }
-                group.addTask { [timeout = reconnectPolicy.discoveryTimeoutNanoseconds] in
-                    try await Task.sleep(nanoseconds: timeout)
-                    throw DevConnection.Error.discoveryTimedOut
-                }
-                defer { group.cancelAll() }
-                guard let endpoint = try await group.next() else {
-                    throw DevConnection.Error.discoveryTimedOut
-                }
-                return endpoint
+                browser.cancel()
+            } catch {
+                // Successful connection or explicit stop owns cleanup.
             }
         }
+        discoveryTimeoutTask = timeoutTask
+        var attempted = Set<NWEndpoint>()
+        for await services in stream.stream {
+            guard !isStopping else { throw DevConnection.Error.stopped }
+            for service in services
+                where service.type == NetworkTransport.ServiceDiscovery.type
+                    && attempted.insert(service.endpoint).inserted {
+                let transport = NetworkTransport.ByteTransport.pinnedTLSClient(
+                    endpoint: service.endpoint,
+                    expectedSPKIHash: configuration.expectedSPKIHash
+                )
+                currentTransport = transport
+                do {
+                    try await start(transport)
+                    return transport
+                } catch {
+                    await transport.close()
+                    currentTransport = nil
+                }
+            }
+        }
+        guard !isStopping else { throw DevConnection.Error.stopped }
+        throw DevConnection.Error.discoveryTimedOut
+    }
+
+    private func authorize(
+        transport: NetworkTransport.ByteTransport,
+        tlsExporterHash: Core.Digest
+    ) async throws -> Authorization {
+        let channel = Pairing.Channel(transport: transport)
+        if let lease {
+            guard Date() <= lease.expiresAt else {
+                throw DevConnection.Error.pairingRejected(
+                    .invalidLease,
+                    "the reconnect lease expired; enter a new Hub code"
+                )
+            }
+            let request = try Pairing.ResumeRequest.signed(
+                leaseID: lease.leaseID,
+                peerIdentity: peerIdentity,
+                sessionSecret: lease.sessionSecret,
+                tlsExporterHash: tlsExporterHash
+            )
+            try await channel.send(.resume(request))
+            let response = try await receivePairingMessage(from: channel)
+            switch response {
+            case let .sessionResumed(grant):
+                guard grant.shellID == lease.shellID,
+                      grant.leaseID == lease.leaseID,
+                      try grant.verify(
+                          request: request,
+                          tlsExporterHash: tlsExporterHash,
+                          sessionSecret: lease.sessionSecret,
+                          now: Date()
+                      )
+                else { throw DevProtocol.Error.invalidAuthentication }
+                self.lease?.expiresAt = grant.expiresAt
+                return .init(
+                    shellID: grant.shellID,
+                    sessionSecret: lease.sessionSecret
+                )
+            case let .rejected(rejection):
+                throw DevConnection.Error.pairingRejected(
+                    rejection.reason,
+                    rejection.detail
+                )
+            case .redeem, .resume, .sessionGranted:
+                throw DevProtocol.Error.malformedMessage(
+                    "unexpected response to a Helix lease resume"
+                )
+            }
+        }
+
+        let request = Pairing.RedeemRequest(
+            code: configuration.pairingCode,
+            peerIdentity: peerIdentity,
+            clientNonce: try DevProtocol.SecureRandom.bytes(count: 32)
+        )
+        try await channel.send(.redeem(request))
+        let response = try await receivePairingMessage(from: channel)
+        switch response {
+        case let .sessionGranted(grant):
+            guard try grant.verify(
+                request: request,
+                tlsExporterHash: tlsExporterHash,
+                now: Date()
+            ) else { throw DevProtocol.Error.invalidAuthentication }
+            lease = .init(
+                shellID: grant.shellID,
+                leaseID: grant.leaseID,
+                sessionSecret: grant.sessionSecret,
+                expiresAt: grant.expiresAt
+            )
+            return .init(
+                shellID: grant.shellID,
+                sessionSecret: grant.sessionSecret
+            )
+        case let .rejected(rejection):
+            throw DevConnection.Error.pairingRejected(
+                rejection.reason,
+                rejection.detail
+            )
+        case .redeem, .resume, .sessionResumed:
+            throw DevProtocol.Error.malformedMessage(
+                "unexpected response to a Helix invitation"
+            )
+        }
+    }
+
+    private func receivePairingMessage(
+        from channel: Pairing.Channel<NetworkTransport.ByteTransport>
+    ) async throws -> Pairing.Message {
+        try await withThrowingTaskGroup(of: Pairing.Message.self) { group in
+            group.addTask { try await channel.receive() }
+            group.addTask { [timeout = reconnectPolicy.pairingTimeoutNanoseconds] in
+                try await Task.sleep(nanoseconds: timeout)
+                try Task.checkCancellation()
+                await channel.close()
+                throw DevConnection.Error.pairingTimedOut
+            }
+            do {
+                guard let message = try await group.next() else {
+                    throw DevProtocol.Error.truncatedFrame
+                }
+                group.cancelAll()
+                return message
+            } catch {
+                group.cancelAll()
+                throw error
+            }
+        }
+    }
+
+    private func validate(
+        context: DevConnection.SessionContext,
+        shellID: DevProtocol.ShellID
+    ) throws {
+        let identity = context.identity
+        guard identity.sessionID == shellID.rawValue,
+              identity.protocolVersion == peerIdentity.build.protocolVersion,
+              identity.bundleID == peerIdentity.build.bundleID,
+              identity.executableUUID == peerIdentity.build.executableUUID,
+              identity.processID == peerIdentity.processID,
+              identity.platform == peerIdentity.build.platform,
+              identity.architecture == peerIdentity.build.architecture,
+              identity.operatingSystemBuild == peerIdentity.operatingSystemBuild,
+              identity.xcodeBuild == peerIdentity.build.xcodeBuild,
+              identity.swiftCompilerFingerprint
+                == peerIdentity.build.swiftCompilerFingerprint,
+              identity.liveReloadIndexHash == peerIdentity.build.liveReloadIndexHash,
+              identity.supportedBackends == peerIdentity.supportedBackends
+        else { throw DevConnection.Error.sessionIdentityMismatch }
     }
 
     private func start(_ transport: NetworkTransport.ByteTransport) async throws {
@@ -292,10 +475,31 @@ public actor Client {
         }
     }
 
+    private func closeCurrentTransport() async {
+        if let currentTransport { await currentTransport.close() }
+        currentTransport = nil
+    }
+
+    private func resetTransientState() {
+        currentBrowser?.cancel()
+        currentBrowser = nil
+        discoveryContinuation?.finish()
+        discoveryContinuation = nil
+        discoveryTimeoutTask?.cancel()
+        discoveryTimeoutTask = nil
+        retryDelayTask?.cancel()
+        retryDelayTask = nil
+        currentTransport = nil
+        isRunning = false
+        isStopping = false
+    }
+
     private static func isReconnectable(_ error: any Swift.Error) -> Bool {
         if error is NetworkTransport.Error { return true }
         if let error = error as? DevConnection.Error {
-            return error == .discoveryTimedOut || error == .connectionTimedOut
+            return error == .discoveryTimedOut
+                || error == .connectionTimedOut
+                || error == .pairingTimedOut
         }
         if let error = error as? DevProtocol.Error {
             return error == .sessionTimedOut || error == .truncatedFrame

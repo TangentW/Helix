@@ -11,6 +11,8 @@ extension DevStatus {
 public enum Phase: String, Codable, Hashable, Sendable {
     /// Live Reload has not started or has stopped cleanly.
     case idle
+    /// The App is intentionally offline and waiting for explicit code entry.
+    case awaitingPairing
     /// The App is discovering or connecting to its paired daemon.
     case connecting
     /// The authenticated session is ready for messages.
@@ -216,12 +218,33 @@ public final class Store: ObservableObject {
     /// Reduces a connection lifecycle event into presentation state.
     public func handle(_ event: DevConnection.ClientEvent) {
         switch event {
+        case .awaitingManualPairing:
+            publish(
+                phase: .awaitingPairing,
+                tone: .neutral,
+                headline: "Enter Helix code",
+                detail: "Networking is off until you confirm the code"
+            )
         case let .connecting(attempt):
             publish(
                 phase: .connecting,
                 tone: .progress,
                 headline: "Connecting",
                 detail: "Attempt \(attempt)"
+            )
+        case let .pairing(attempt):
+            publish(
+                phase: .connecting,
+                tone: .progress,
+                headline: "Pairing",
+                detail: "Authenticating attempt \(attempt)"
+            )
+        case let .paired(shellID):
+            publish(
+                phase: .connecting,
+                tone: .progress,
+                headline: "Pairing accepted",
+                detail: "Authenticating Shell \(shellID)"
             )
         case let .session(event):
             handle(event)
@@ -232,6 +255,13 @@ public final class Store: ObservableObject {
                 tone: .warning,
                 headline: "Reconnecting",
                 detail: "Attempt \(attempt) in \(String(format: "%.2f", seconds)) s: \(reason)"
+            )
+        case let .failed(reason):
+            publish(
+                phase: .failed,
+                tone: .error,
+                headline: "Helix connection failed",
+                detail: reason
             )
         case .stopped:
             publish(

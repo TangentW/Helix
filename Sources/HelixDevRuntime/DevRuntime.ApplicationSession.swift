@@ -5,20 +5,19 @@ import HelixRuntime
 import HelixVerifier
 
 extension DevRuntime {
-/// Thin App-owned composition root for the generated Bridge, Runtime Engine,
-/// authenticated Dev connection, UI reload coordinators, and debug overlay.
+/// App-owned composition root for development activation, UI refresh, and Hub pairing.
 ///
-/// Keep one session alive for the App process while using a Helix-enabled Debug
-/// scheme. The session is inert when no Helix launch configuration is present;
-/// partial or malformed configuration fails initialization.
+/// Keep one session alive for the App process. Xcode launches connect
+/// automatically; an installed test App opened directly stays offline until
+/// ``connect(pairingCode:)`` is called from the App's debug UI.
 ///
 /// ```swift
 /// @MainActor
 /// final class DevelopmentRuntimeOwner {
-///     let session: DevRuntime.ApplicationSession
+///     let session = try! DevRuntime.ApplicationSession()
 ///
-///     init() throws {
-///         session = try DevRuntime.ApplicationSession()
+///     func pair(code: String) async throws {
+///         try await session.connect(pairingCode: code)
 ///     }
 /// }
 /// ```
@@ -28,114 +27,80 @@ public final class ApplicationSession {
     public let environment: DevRuntime.LiveReloadEnvironment
     /// Runtime Engine that receives temporary development generations.
     public let runtime: Runtime.Engine
-    /// Active authenticated connection graph, or `nil` when disabled or
-    /// awaiting debugger handoff.
-    public private(set) var bootstrap: DevRuntime.Bootstrap?
+    /// Process-lifetime activation policy measured before any network access.
+    public let launchMode: DevRuntime.LaunchMode
+    /// Prepared connection graph, or `nil` when development runtime is disabled.
+    public let bootstrap: DevRuntime.Bootstrap?
 
-    private var debuggerHandoffTask: Task<Void, Never>?
-
-    /// Creates a Dev session from the hidden Bridge linked by the Helix Xcode
-    /// phase. The optional provider exists for tests and advanced composition;
-    /// ordinary App code uses the linked provider automatically.
+    /// Creates a Dev session from the hidden Bridge and Hub contract generated
+    /// by the Helix Xcode integration.
     ///
-    /// - Parameters:
-    ///   - environment: UI refresh and diagnostics environment to retain.
-    ///   - options: Enabled backends, limits, reconnect policy, and cache path.
-    ///   - debuggerHandoffEnabled: Whether to wait for late Xcode credential
-    ///     injection when launch variables are initially absent.
-    ///   - launchEnvironment: Process environment containing one-run credentials.
-    ///   - bridgeProvider: Explicit provider for tests; production Debug builds
-    ///     should use the linked provider.
+    /// App code does not configure endpoints, credentials, or debugger scripts.
+    /// `bridgeProvider` and `hubContract` are test seams; normal callers omit them.
     public convenience init(
         environment: DevRuntime.LiveReloadEnvironment = .init(),
         options: DevRuntime.Bootstrap.Options = .init(),
-        debuggerHandoffEnabled: Bool = true,
-        launchEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-        bridgeProvider: Runtime.BridgeProvider? = nil
+        bridgeProvider: Runtime.BridgeProvider? = nil,
+        hubContract: DevRuntime.HubContract? = nil
     ) throws {
-        let provider: Runtime.BridgeProvider
-        if let bridgeProvider {
-            provider = bridgeProvider
-        } else {
-            provider = try Runtime.LinkedBridge.load()
-        }
+        let launchMode = DevRuntime.LaunchMode.current()
+        let provider = try bridgeProvider ?? Runtime.LinkedBridge.load()
+        let contract = try hubContract ?? DevRuntime.LinkedHubContract.load()
         let runtime = try provider.makeRuntime()
         try self.init(
+            hubContract: contract,
+            launchMode: launchMode,
             build: DevRuntime.BuildContract(bridge: provider.descriptor),
             runtime: runtime,
             shell: provider.makeShellInterface(),
             environment: environment,
             installBridge: provider.install(on:),
-            options: options,
-            debuggerHandoffEnabled: debuggerHandoffEnabled,
-            launchEnvironment: launchEnvironment
+            options: options
         )
     }
 
     /// Creates a session from explicitly assembled Runtime components.
     ///
-    /// This initializer is intended for tests and alternate build adapters.
-    /// Applications using the generated Xcode integration should use the
-    /// convenience initializer.
+    /// This initializer is intended for tests and alternate build adapters. The
+    /// supplied launch mode is immutable for the lifetime of the returned object.
     public init(
+        hubContract: DevRuntime.HubContract,
+        launchMode: DevRuntime.LaunchMode,
         build: DevRuntime.BuildContract,
         runtime: Runtime.Engine,
         shell: Verification.ShellInterface,
         environment: DevRuntime.LiveReloadEnvironment = .init(),
         installBridge: (Runtime.Engine) throws -> Void,
-        options: DevRuntime.Bootstrap.Options = .init(),
-        debuggerHandoffEnabled: Bool = true,
-        launchEnvironment: [String: String] = ProcessInfo.processInfo.environment
+        options: DevRuntime.Bootstrap.Options = .init()
     ) throws {
         try installBridge(runtime)
-        bootstrap = try DevRuntime.Bootstrap.startIfConfigured(
+        self.environment = environment
+        self.runtime = runtime
+        self.launchMode = launchMode
+        bootstrap = try DevRuntime.Bootstrap.prepare(
+            hubContract: hubContract,
+            launchMode: launchMode,
             build: build,
             runtime: runtime,
             shell: shell,
             liveReloadEnvironment: environment,
-            options: options,
-            launchEnvironment: launchEnvironment
+            options: options
         )
-        self.environment = environment
-        self.runtime = runtime
-        debuggerHandoffTask = nil
-
-        if bootstrap == nil, options.isEnabled, debuggerHandoffEnabled {
-            debuggerHandoffTask = Task { @MainActor [weak self, environment] in
-                guard let launchEnvironment =
-                    await DevRuntime.DebuggerHandoff.waitForEnvironment()
-                else { return }
-                guard let self, self.bootstrap == nil else { return }
-                do {
-                    self.bootstrap = try DevRuntime.Bootstrap.startIfConfigured(
-                        build: build,
-                        runtime: self.runtime,
-                        shell: shell,
-                        liveReloadEnvironment: environment,
-                        options: options,
-                        launchEnvironment: launchEnvironment
-                    )
-                } catch {
-                    await environment.connectionEventHandler()(
-                        .session(.closed("Debugger handoff failed: \(error)"))
-                    )
-                }
-            }
-        }
     }
 
-    /// Stops the authenticated Dev connection and cancels pending debugger handoff.
+    /// Enables discovery and pairs a directly opened test App with Helix Hub.
     ///
-    /// Scheme lifecycle scripts normally stop the daemon automatically. Call
-    /// this method when an application explicitly tears down its runtime owner.
-    public func stop() async {
-        debuggerHandoffTask?.cancel()
-        debuggerHandoffTask = nil
-        await bootstrap?.stop()
+    /// The code is four characters, case-insensitive, and generated by the Mac
+    /// app. Calling this from an Xcode-launched process fails because that launch
+    /// already uses its build-scoped automatic invitation.
+    public func connect(pairingCode: String) async throws {
+        guard let bootstrap else { throw DevRuntime.BootstrapError.disabled }
+        try await bootstrap.connect(pairingCode: pairingCode)
     }
 
-    deinit {
-        debuggerHandoffTask?.cancel()
+    /// Stops discovery, transport, and the debug overlay. It is safe to repeat.
+    public func stop() async {
+        await bootstrap?.stop()
     }
 }
 }
