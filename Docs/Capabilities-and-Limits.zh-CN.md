@@ -26,7 +26,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - Array 值语义、append、迭代、安全下标和返回新值的更新；支持键值类型下的 Dictionary 构建、查找、更新与迭代。
 - 结构化分支、循环、switch、调用、递归、显式业务错误边和带 payload 的局部 Error 值。
 - `Range<Int>` 半开区间 `for` 循环；Lowerer 会把它变成 HLBC 的强类型 cursor 控制流，不依赖 Swift 标准库 Range/Iterator ABI 对象。
-- 文件或 module scope 的补丁内非递归 stored struct/enum、具体 `Result`、字段读取、enum switch 与支持的 mutating helper。它们是 VM 值，不是新加载的 Swift metadata。
+- 可在现有受监视文件中新加、且不导出到原生 ABI 的文件或 module scope 补丁内非递归 stored struct/enum；支持具体 `Result`、字段读取、enum switch、实例/静态计算 getter/setter 与受支持的 mutating helper。嵌套声明保留完整 namespace identity。它们是仅属于当前 generation 的 VM 值，不是新加载的 Swift metadata。
 - 同步补丁内 `inout` 与 `mutating` helper，并受 Address、access、alias、ownership、同 frame/同 block 规则验证。
 - 捕获 copyable VM-managed 值的同步补丁内 closure。它包括同 image helper 的 `@escaping` 参数、从同 image 函数把 closure 返回给调用者，以及 closure 再捕获另一个 closure；该值必须在同一次固定 generation 的 HLVM invocation 内用完。返回与嵌套捕获语义由 `escaping-closure-values-1` 独立门禁，不能因为旧 closure capability 存在就默认放行。另支持不再包含 archetype、metadata 或 witness 依赖的编译器完全具体化 specialization。
 - 顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` entry。生成的精确 Swift wrapper 保留 ABI，HLVM 只执行已经证明不会挂起的 body。
@@ -41,7 +41,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - 真正 suspension：`await`、continuation、Task、async callee、async closure、cancellation，以及跨 suspension ownership 或 generation lease。
 - actor-isolated instance root、custom global actor 和任意 executor hop；上面的受限 `@MainActor async` leaf 是不同能力。
 - 穿过 Shell Entry 或 NativeImport 边界、持久化到 native/global/property 状态，或者存活时间超过当前 HLVM invocation/generation 的 closure。throwing、async、`@Sendable`，以及 closure 自身参数或返回值仍是 closure 的高阶签名也暂不支持。
-- 上述受限字面量判断以外的一般 `Character` 值/API；`ClosedRange`、非 `Int` Range、`stride`，以及函数局部 nominal type 声明。补丁内 struct/enum 应移到文件 scope，并在 Shell 正常构建后再修改其使用逻辑。
+- 上述受限字面量判断以外的一般 `Character` 值/API；`ClosedRange`、非 `Int` Range、`stride`，以及函数局部 nominal type 声明。把不导出的补丁内 struct/enum 移到现有受监视文件的文件/module scope 后即可随补丁编译；只要它仍是 image 私有声明，就不要求重建 Shell。
 - 新原生 class、跨补丁边界可见的新 Swift metadata、retroactive conformance、layout、superclass 与 enum case 变化。
 - Generic 或 `inout` Shell entry、noncopyable root、任意 borrowing/consuming ABI、typed-throws root、`rethrows` 与通用 unwind cleanup。
 - 不受限 pointer、`unsafeBitCast`、任意 Objective-C selector/IMP、`dlopen`/`dlsym`、Mirror 字段修改与未知 builtin。
@@ -55,15 +55,15 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | --- | --- |
 | 修改已索引的 global 函数体 | canonical SIL 位于文档子集内时支持 |
 | 修改已索引的源码 class 实例方法体 | 支持；生成 TypeOps 会把精确 `self` 引用传入 HLVM |
-| 修改 struct/enum/actor 实例方法或 static/class 方法 | 在 value writeback、executor 与 metatype ABI 实现前拒绝 |
+| 修改 Shell 已有 struct/enum/actor 实例 root 或已有原生 static/class 方法 | 在 Shell value writeback、executor 与 native metatype ABI 实现前拒绝；这不限制 image-local 值类型的 accessor/helper |
 | 从函数体调用已有 private/internal/public 声明 | 仅在解析为同 image 函数、eligible Shell Entry 或实际生成的精确 NativeImport 时支持 |
-| 在现有源码文件新增普通顶层 helper 或 class private 实例方法 | 能从变化 root 到达、且具体签名与函数体落在 HLBC 子集内时支持；声明仅属于该 image |
+| 在现有源码文件新增普通顶层 helper、class private 实例方法或计算 accessor | 能从变化 root 到达、且具体签名与函数体落在 HLBC 子集内时支持；声明仅属于该 image |
 | 普通直接递归 | 解析到同一不可变 HLBC image 内的函数 |
 | 从源码有意调用上一代 | HLBC 不支持；应保存/激活一个恢复 generation |
 | 使用受支持的局部 closure，或调用已经索引且带 `@escaping` closure 参数的同 image helper | 降入同一 image；closure 的返回和捕获只能发生在固定的 VM invocation 内 |
 | 使用两个 `Int` 边界的 `for value in lower..<upper` | 支持，并保留 Swift 的 `lower <= upper` 前置条件；其他 Range 族需要完整构建 |
 | 在受支持的 `String.contains` 中使用单 grapheme Character 字面量 | 以编译器内部 String 表示支持，不代表一般 Character 存储/API 已支持 |
-| 声明补丁内 struct 或 enum | 文件/module scope 支持；函数局部 nominal 会用精确类型诊断拒绝 |
+| 声明补丁内 struct 或 enum | 新增的不导出类型在文件/module scope 支持，包括 namespace 嵌套和受支持的计算 accessor；函数局部 nominal 会用精确类型诊断拒绝 |
 | 新增无关声明、新原生 ABI 表面或新 Swift 文件 | 不会仅因声明存在而收集；source membership 或原生 ABI 变化需要完整构建 |
 | 修改 stored property、签名、generic constraint、actor isolation、superclass、conformance 或 enum case | 拒绝，需要完整构建 |
 | 修改 default argument 行为 | 完全具体的 generator 会与同一完整 module 内 eligible、已归档的调用点一起进入补丁；跨 module public/package 默认值、非 eligible 调用点或泛型 ABI 要求完整构建 |

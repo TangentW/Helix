@@ -401,7 +401,7 @@ struct ReleaseDriver {
         #expect(later.bodyFingerprints[transform.key] != result.bodyFingerprints[transform.key])
     }
 
-    @Test("A new private method receives the frozen native self inside HLBC")
+    @Test("New private methods and computed getters receive frozen native self")
     func linksNewPrivateInstanceMethod() throws {
         final class NativeScreen: @unchecked Sendable {}
 
@@ -460,20 +460,26 @@ struct ReleaseDriver {
         let entry = try #require(transform.entryIndex)
 
         let changed = """
+        private var offset: Int {
+            @inline(never) get { 2 }
+        }
+
         public final class Screen {
-            @inline(never)
-            private func check(_ value: Int) -> Int { value * 3 }
+            private var multiplier: Int { 3 }
 
             @inline(never)
-            public func transform(_ x: Int) -> Int { check(x) + 2 }
+            private func check(_ value: Int) -> Int { value * multiplier }
+
+            @inline(never)
+            public func transform(_ x: Int) -> Int { check(x) + offset }
         }
         """
         try Data(changed.utf8).write(to: sourceURL)
         let result = try driver.build(.init(archive: archive, sourceFiles: [sourceURL]))
 
         #expect(result.changedFunctions.map(\.key) == [transform.key])
-        #expect(result.module.functions.count == 2)
-        #expect(result.disassembly.contains("hlbc_apply"))
+        #expect(result.module.functions.count == 4)
+        #expect(result.disassembly.components(separatedBy: "hlbc_apply").count - 1 == 3)
 
         let image = try Verification.Engine().verify(
             bytes: result.bytecode,
@@ -502,6 +508,110 @@ struct ReleaseDriver {
                 .integer(try VM.Integer(signed: 14, bitWidth: 64, isSigned: true))
             )
         )
+    }
+
+    @Test("New struct, enum, and computed accessors remain image-local VM values")
+    func linksNewPatchLocalNominalsAndAccessors() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-new-local-nominals-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = "@inline(never) public func transform(_ x: Int) -> Int { x }\n"
+        try Data(baseline.utf8).write(to: sourceURL)
+
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            optimization: "-Onone"
+        )
+        let transform = try #require(archive.functions.first)
+        let entry = try #require(transform.entryIndex)
+
+        let changed = """
+        private enum Feature {}
+
+        private extension Feature {
+            struct Counter {
+                var raw: Int
+
+                static var base: Int {
+                    @inline(never) get { 3 }
+                }
+
+                var adjusted: Int {
+                    @inline(never) get { raw * 2 }
+                    @inline(never) set { raw = newValue + 1 }
+                }
+            }
+
+            enum Outcome {
+                case value(Counter)
+                case empty
+            }
+        }
+
+        @inline(never)
+        private func evaluate(_ input: Int) -> Int {
+            var counter = Feature.Counter(raw: input)
+            counter.adjusted = input + Feature.Counter.base
+            let outcome: Feature.Outcome = input >= 0 ? .value(counter) : .empty
+            switch outcome {
+            case let .value(value): return value.adjusted
+            case .empty: return -1
+            }
+        }
+
+        @inline(never)
+        public func transform(_ x: Int) -> Int { evaluate(x) }
+        """
+        try Data(changed.utf8).write(to: sourceURL)
+        let result = try driver.build(.init(archive: archive, sourceFiles: [sourceURL]))
+
+        #expect(result.changedFunctions.map(\.key) == [transform.key])
+        #expect(result.module.localTypes.map(\.key.rawValue) == [
+            "Feature.Counter", "Feature.Outcome",
+        ])
+        #expect(result.disassembly.contains("make_struct"))
+        #expect(result.disassembly.contains("make_enum"))
+        #expect(result.disassembly.contains("switch_enum"))
+        #expect(result.disassembly.components(separatedBy: "hlbc_apply").count - 1 >= 3)
+
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        for (input, expected) in [(4, 16), (-1, -1)] {
+            #expect(
+                VM.Interpreter().invoke(
+                    entry: entry,
+                    image: image,
+                    arguments: [
+                        .integer(
+                            try VM.Integer(
+                                signed: Int64(input),
+                                bitWidth: 64,
+                                isSigned: true
+                            )
+                        ),
+                    ]
+                ) == .returned(
+                    .integer(
+                        try VM.Integer(
+                            signed: Int64(expected),
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    )
+                )
+            )
+        }
     }
 
     @Test("An allowlisted Swift callee becomes a typed native import")

@@ -45,10 +45,11 @@ evidence, not device or distribution certification.
   error edges, and local payload-carrying Error values.
 - Half-open `Range<Int>` `for` loops, lowered to typed HLBC cursor control flow
   rather than a Swift standard-library Range/Iterator ABI object.
-- File- or module-scope patch-local nonrecursive stored struct and enum values,
-  concrete `Result`, field extraction, enum switch, and supported mutating
-  helpers. These are VM
-  values, not newly loaded Swift metadata.
+- Newly introduced, non-exported file- or module-scope patch-local nonrecursive
+  stored struct and enum values, concrete `Result`, field extraction, enum
+  switch, instance/static computed getters and setters, and supported mutating
+  helpers. Nested declarations keep their namespace-qualified identity. These
+  are generation-local VM values, not newly loaded Swift metadata.
 - Synchronous patch-local `inout` and `mutating` helpers under verified address,
   access, aliasing, ownership, and same-frame/same-block restrictions.
 - Synchronous patch-local closure values with copyable VM-managed captures.
@@ -96,8 +97,9 @@ evidence, not device or distribution certification.
   parameter or result is another closure also remain unsupported.
 - General `Character` values/APIs beyond the bounded literal predicate above;
   `ClosedRange`, non-`Int` ranges, `stride`, and function-local nominal type
-  declarations. Move a patch-local struct or enum to file scope and rebuild the
-  Shell before patching it.
+  declarations. Move a non-exported patch-local struct or enum to file/module
+  scope in an existing watched source file; no Shell rebuild is needed when the
+  resulting declaration remains private to the HLBC image.
 - New native classes, new Swift metadata visible across the patch boundary,
   retroactive conformances, layout changes, superclass changes, and enum-case
   changes.
@@ -121,15 +123,15 @@ machine code.
 | --- | --- |
 | Change an indexed global function body | Supported when its canonical SIL is in the documented subset |
 | Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM |
-| Change a struct/enum/actor instance method or a static/class method | Rejected until value writeback, executor, and metatype ABI are implemented |
+| Change an existing Shell struct/enum/actor instance root or existing native static/class method | Rejected until Shell value writeback, executor, and native metatype ABI are implemented; this does not restrict image-local value-type accessors/helpers |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
-| Add an ordinary top-level helper or private class instance method in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
+| Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |
 | Use a supported local closure or an already indexed same-image helper with an `@escaping` closure parameter | Lowered into the same image; closure return/capture is allowed only inside the pinned VM invocation |
 | Use `for value in lower..<upper` where both bounds are `Int` | Supported with Swift's precondition that `lower <= upper`; other range families require a full build |
 | Use a one-grapheme Character literal in supported `String.contains` | Supported as a compiler-only String representation; general Character storage/API is not implied |
-| Declare a patch-local struct or enum | Supported at file/module scope; a function-local nominal is rejected with an exact type diagnostic |
+| Declare a patch-local struct or enum | A newly introduced non-exported type is supported at file/module scope, including namespace nesting and supported computed accessors; a function-local nominal is rejected with an exact type diagnostic |
 | Add an unrelated declaration, a new native ABI surface, or a new Swift file | Not collected merely by existence; a source-membership or native ABI change requires a full build |
 | Change a stored property, signature, generic constraint, actor isolation, superclass, conformance, or enum case | Rejected; full build required |
 | Change default-argument behavior | A fully concrete generator is patched with eligible archived callers in one complete module; cross-module public/package defaults, an ineligible caller, or a generic ABI require a full build |

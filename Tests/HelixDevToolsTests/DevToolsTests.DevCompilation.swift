@@ -127,6 +127,61 @@ struct DevCompilationTests {
         #expect(Bytecode.Disassembler.disassemble(module).contains("hlbc_apply"))
     }
 
+    @Test("A save may add image-local value types and computed accessors")
+    func compilesNewPatchLocalTypes() async throws {
+        let fixture = try Fixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let builder = DevCompilation.BytecodeBuilder(
+            archive: fixture.archive,
+            manifest: fixture.manifest
+        )
+
+        try fixture.write(
+            """
+            private enum Feature {}
+
+            private extension Feature {
+                struct Measurement {
+                    var raw: Int
+                    var doubled: Int {
+                        @inline(never) get { raw * 2 }
+                    }
+                }
+
+                enum Selection {
+                    case measurement(Measurement)
+                    case none
+                }
+            }
+
+            @inline(never)
+            public func transform(_ x: Int) -> Int {
+                let selection = Feature.Selection.measurement(
+                    Feature.Measurement(raw: x)
+                )
+                switch selection {
+                case let .measurement(value): return value.doubled
+                case .none: return -1
+                }
+            }
+            """
+        )
+        let outcome = try await builder.build(
+            fixture.request(revision: 1, generation: 1)
+        )
+        let patch = try #require(outcome.patch)
+        let module = try Bytecode.Decoder.decode(patch.payload).module
+        let disassembly = Bytecode.Disassembler.disassemble(module)
+
+        #expect(patch.backend == .hlbc)
+        #expect(module.localTypes.map(\.key.rawValue) == [
+            "Feature.Measurement", "Feature.Selection",
+        ])
+        #expect(disassembly.contains("make_struct"))
+        #expect(disassembly.contains("make_enum"))
+        #expect(disassembly.contains("hlbc_apply"))
+    }
+
     @Test("A Swift syntax error remains a compile diagnostic and preserves active code")
     func reportsSwiftDiagnostic() async throws {
         let fixture = try Fixture.make()

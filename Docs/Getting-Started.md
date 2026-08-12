@@ -273,11 +273,13 @@ Then:
 5. Save another edit to verify that a later HLBC generation atomically replaces
    the first one in the same App process.
 
-Changing stored layout, signatures, inheritance, conformances, enum cases,
-actor isolation, source membership, linked dependencies, or build settings
-requires a normal build. A changed root may call a new reachable ordinary helper
-or private class method declared in an existing watched source file; adding a
-new file or native ABI surface remains outside this workflow.
+Changing an existing native stored layout, signature, inheritance, conformance,
+enum cases, actor isolation, source membership, linked dependencies, or build
+settings requires a normal build. A changed root may use newly introduced
+reachable ordinary helpers, private class methods, computed accessors, and
+non-exported file/module-scope struct or enum values declared in an existing
+watched source file; adding a new file or native ABI surface remains outside
+this workflow.
 
 ## 11. Build a Hot Patch
 

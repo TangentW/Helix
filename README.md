@@ -93,8 +93,9 @@ Live Reload acceptance run.
 - Exact-toolchain Swift-to-HLBC compilation for the documented subset: common
   scalar and String operations, bounded Character predicates, Optional
   projection, `Range<Int>` loops, Array/Dictionary value semantics,
-  file/module-scope patch-local struct/enum and concrete `Result`,
-  payload-carrying local errors, scoped local `inout`/`mutating`, synchronous
+  newly introduced file/module-scope patch-local struct/enum, concrete
+  `Result`, computed accessors, payload-carrying local errors, scoped local
+  `inout`/`mutating`, synchronous
   patch-local closures including bounded `@escaping` return/capture flows,
   concrete compiler specializations and default-argument generators,
   VM-owned `Any` with common dynamic casts, automatically frozen `Swift.print`,
@@ -130,11 +131,12 @@ Live Reload acceptance run.
   native machine code and do not use a JIT.
 - A production patch may call only same-image functions, eligible Shell entries,
   and exact NativeImports already emitted into the released App.
-- Live Reload starts from declarations already present in the Dev Shell, but a
-  changed body may introduce reachable same-module ordinary functions or
-  private instance methods in an existing source file. Helix links that closed
-  implementation graph into the same HLBC image. New source files and new ABI
-  surface still require a normal build.
+- Live Reload starts from roots already present in the Dev Shell, but a changed
+  body may introduce reachable same-module ordinary functions, private instance
+  methods, computed accessors, and non-exported file/module-scope struct or enum
+  types in an existing source file. Helix links that closed implementation and
+  value-type graph into one HLBC image. New source files, native Swift metadata,
+  and new ABI surface still require a normal build.
 - Stored-layout, function-signature, superclass, conformance, enum-case,
   isolation, source-membership, linked-dependency, and build-setting changes
   require a normal build.
@@ -187,7 +189,7 @@ swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
 ```
 
-The current full SwiftPM baseline contains 461 tests in 73 suites. The recorded
+The current full SwiftPM baseline contains 469 tests in 73 suites. The recorded
 Debug, warnings-as-errors, and optimized Release runs pass. Platform-specific
 fixtures can be run with an available Simulator UDID:
 

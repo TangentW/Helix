@@ -793,6 +793,112 @@ struct Pipeline {
         }
     }
 
+    @Test("Namespace-qualified local types keep sibling short names unambiguous")
+    func compilesNamespacedLocalNominals() throws {
+        let fixture = try compileFixture(
+            source: """
+            enum First {
+                struct Value { let number: Int }
+                enum Outcome {
+                    case value(Value)
+                    case none
+                }
+            }
+
+            enum Second {
+                struct Value { let number: Int }
+                enum Outcome {
+                    case value(Value)
+                    case none
+                }
+            }
+
+            @inline(never)
+            public func namespacedNominal(_ input: Int) -> Int {
+                let outcome = First.Outcome.value(First.Value(number: input))
+                switch outcome {
+                case let .value(value): return value.number
+                case .none: return -1
+                }
+            }
+            """,
+            functionName: "namespacedNominal",
+            signature: .init(parameters: ["Swift.Int"], result: "Swift.Int"),
+            parameterTypes: [.int64],
+            resultType: .int64,
+            additionalFrontendArguments: ["-Xfrontend", "-disable-sil-perf-optzns"]
+        )
+
+        #expect(fixture.compiled.module.localTypes.map(\.key.rawValue) == [
+            "First.Outcome", "First.Value",
+        ])
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: fixture.image,
+                arguments: [
+                    .integer(try VM.Integer(signed: 9, bitWidth: 64, isSigned: true)),
+                ]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 9, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
+    @Test("Patch-local raw enums support construction, rawValue, and switching")
+    func compilesLocalRawEnums() throws {
+        let fixture = try compileFixture(
+            source: """
+            private enum Status: Int {
+                case idle = 0
+                case ready = 1
+                case failed = 2
+            }
+
+            @inline(never)
+            public func rawEnum(_ input: Int) -> Int {
+                guard let status = Status(rawValue: input) else { return -1 }
+                switch status {
+                case .idle: return status.rawValue + 10
+                case .ready: return status.rawValue + 20
+                case .failed: return status.rawValue + 30
+                }
+            }
+            """,
+            functionName: "rawEnum",
+            signature: .init(parameters: ["Swift.Int"], result: "Swift.Int"),
+            parameterTypes: [.int64],
+            resultType: .int64,
+            additionalFrontendArguments: ["-Xfrontend", "-disable-sil-perf-optzns"]
+        )
+
+        for (input, expected) in [(0, 10), (1, 21), (2, 32), (3, -1)] {
+            #expect(
+                VM.Interpreter().invoke(
+                    entry: .init(rawValue: 0),
+                    image: fixture.image,
+                    arguments: [
+                        .integer(
+                            try VM.Integer(
+                                signed: Int64(input),
+                                bitWidth: 64,
+                                isSigned: true
+                            )
+                        ),
+                    ]
+                ) == .returned(
+                    .integer(
+                        try VM.Integer(
+                            signed: Int64(expected),
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    )
+                )
+            )
+        }
+    }
+
     @Test("Function-local nominal declarations fail with an exact type diagnostic")
     func rejectsFunctionLocalNominal() throws {
         let directory = FileManager.default.temporaryDirectory

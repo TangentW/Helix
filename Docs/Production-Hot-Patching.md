@@ -170,20 +170,21 @@ String operations and interpolation, one-grapheme Character literals for the
 bounded String predicate path, tuple/Optional including address projection,
 Array and Dictionary value semantics, VM-owned `Any` and common dynamic casts,
 half-open `Range<Int>` loops, structured
-control flow, file- or module-scope patch-local struct/enum and concrete
-`Result` values, payload-carrying local errors, scoped patch-local
-`inout`/`mutating` helpers, synchronous patch-local closures including
+control flow, newly introduced non-exported file- or module-scope patch-local
+struct/enum and concrete `Result` values, their supported computed accessors,
+payload-carrying local errors, scoped patch-local `inout`/`mutating` helpers,
+synchronous patch-local closures including
 same-image `@escaping` return/capture flows, fully concrete compiler
 specializations and default-argument generators, an automatically frozen
 `Swift.print` NativeImport, and top-level non-suspending `async`, `async throws`,
 and `@MainActor async` entries.
 
 It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch,
-new native classes, function-local nominal declarations, stored-layout changes,
-closure persistence or native/Shell boundary crossing, throwing/async closures,
-true `await`/continuations, actor-isolated `self`, custom global actors,
-unrestricted pointers, reflection-based field access, and unregistered native
-APIs are rejected. See
+new native classes, function-local nominal declarations, changes to existing
+native stored layout, closure persistence or native/Shell boundary crossing,
+throwing/async closures, true `await`/continuations, actor-isolated `self`,
+custom global actors, unrestricted pointers, reflection-based field access, and
+unregistered native APIs are rejected. See
 [Capabilities and Limits](Capabilities-and-Limits.md) for the practical matrix.
 
 HLBC carries a verifier-checked source map from function/block/instruction

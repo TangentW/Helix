@@ -99,9 +99,9 @@ sequenceDiagram
 
 ## 当前语言边界
 
-当前 wire 版本为 HLBC 1.10 与 HLXI 2.5。已实现子集包括常用整数和浮点操作与转换、Bool、String 操作和插值、用于有界 String predicate 路径的单 grapheme Character 字面量、包含 address projection 的 Tuple/Optional、Array 与 Dictionary 值语义、VM-owned `Any` 与常用动态转换、半开 `Range<Int>` 循环、结构化控制流、文件或 module scope 的补丁内 struct/enum 与具体 `Result`、带 payload 的局部 Error、受限的补丁内 `inout`/`mutating` helper、包含同 image `@escaping` 返回/捕获流程的同步补丁内 closure、编译器已经完全具体化的 specialization 和默认参数 generator、自动冻结的 `Swift.print` NativeImport，以及顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` 入口。
+当前 wire 版本为 HLBC 1.10 与 HLXI 2.5。已实现子集包括常用整数和浮点操作与转换、Bool、String 操作和插值、用于有界 String predicate 路径的单 grapheme Character 字面量、包含 address projection 的 Tuple/Optional、Array 与 Dictionary 值语义、VM-owned `Any` 与常用动态转换、半开 `Range<Int>` 循环、结构化控制流、可随补丁新增且不导出 ABI 的文件/module scope struct/enum、具体 `Result` 及受支持的计算 accessor、带 payload 的局部 Error、受限的补丁内 `inout`/`mutating` helper、包含同 image `@escaping` 返回/捕获流程的同步补丁内 closure、编译器已经完全具体化的 specialization 和默认参数 generator、自动冻结的 `Swift.print` NativeImport，以及顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` 入口。
 
-它并非任意 Swift。generic root、运行时 metadata/witness 分派、新原生 class、函数内部 nominal 声明、stored layout 变化、closure 持久化或跨 Native/Shell 边界、throwing/async closure、真正的 `await`/continuation、actor-isolated `self`、custom global actor、不受限指针、基于反射的字段访问和未注册原生 API 都会被拒绝。实用矩阵见[能力与限制](Capabilities-and-Limits.zh-CN.md)。
+它并非任意 Swift。generic root、运行时 metadata/witness 分派、新原生 class、函数内部 nominal 声明、已有原生类型的 stored layout 变化、closure 持久化或跨 Native/Shell 边界、throwing/async closure、真正的 `await`/continuation、actor-isolated `self`、custom global actor、不受限指针、基于反射的字段访问和未注册原生 API 都会被拒绝。实用矩阵见[能力与限制](Capabilities-and-Limits.zh-CN.md)。
 
 HLBC 会携带经过 Verifier 检查的 function/block/instruction → 逻辑 Swift 位置映射；生产打包会移除构建机绝对路径。执行发生 trap 时，HLVM 会给出精确 program counter，Runtime 再补充固定的 generation、Shell entry、函数和逻辑文件/行/列。这是诊断映射，不是支持 breakpoint、单步或表达式求值的交互式调试器。
 

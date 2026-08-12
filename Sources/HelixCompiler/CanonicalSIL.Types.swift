@@ -22,8 +22,161 @@ public struct TypeEnvironment: Sendable {
 
     private struct RawDefinition: Sendable {
         var key: Bytecode.LocalTypeKey
+        var parentScope: String?
         var kind: RawKind
         var conformsToError: Bool
+    }
+
+    private struct DefinitionParser {
+        let lines: [String]
+        var index = 0
+        var definitions: [Bytecode.LocalTypeKey: RawDefinition] = [:]
+
+        // Canonical SIL starts with a declaration summary before function
+        // bodies. Walk that brace tree so nested namespace identities remain
+        // exact without treating arbitrary SIL text as a Swift type parser.
+        mutating func parse() throws -> [Bytecode.LocalTypeKey: RawDefinition] {
+            try scanScope(parentScope: nil, stopsAtClosingBrace: false)
+            return definitions
+        }
+
+        private mutating func scanScope(
+            parentScope: String?,
+            stopsAtClosingBrace: Bool
+        ) throws {
+            while index < lines.count {
+                let line = lines[index].trimmingCharacters(in: .whitespaces)
+                if line == "}" {
+                    guard stopsAtClosingBrace else {
+                        index += 1
+                        continue
+                    }
+                    index += 1
+                    return
+                }
+                if let extended = TypeEnvironment.captures(
+                    line,
+                    pattern: TypeEnvironment.extensionHeaderPattern
+                ) {
+                    let scope = TypeEnvironment.qualified(
+                        extended[0],
+                        relativeTo: parentScope
+                    )
+                    index += 1
+                    try scanScope(parentScope: scope, stopsAtClosingBrace: true)
+                    continue
+                }
+                if let header = TypeEnvironment.captures(
+                    line,
+                    pattern: TypeEnvironment.nominalHeaderPattern
+                ) {
+                    try parseNominal(header, parentScope: parentScope)
+                    continue
+                }
+                if TypeEnvironment.braceDelta(in: line) > 0 {
+                    try skipBracedDeclaration()
+                } else {
+                    index += 1
+                }
+            }
+            guard !stopsAtClosingBrace else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "unterminated declaration scope \(parentScope ?? "<module>")"
+                )
+            }
+        }
+
+        private mutating func parseNominal(
+            _ header: [String],
+            parentScope: String?
+        ) throws {
+            let shortName = header[1]
+            guard !shortName.contains("<") else {
+                try skipBracedDeclaration()
+                return
+            }
+            let name = TypeEnvironment.qualified(
+                shortName,
+                relativeTo: parentScope
+            )
+            let key = Bytecode.LocalTypeKey(rawValue: name)
+            var fields: [RawField] = []
+            var cases: [RawEnumCase] = []
+            index += 1
+
+            while index < lines.count {
+                let member = lines[index].trimmingCharacters(in: .whitespaces)
+                if member == "}" {
+                    index += 1
+                    let conformances = header[2]
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                    let definition = RawDefinition(
+                        key: key,
+                        parentScope: TypeEnvironment.parentScope(of: name),
+                        kind: header[0] == "struct"
+                            ? .structure(fields)
+                            : .enumeration(cases),
+                        conformsToError: conformances.contains("Error")
+                            || conformances.contains("Swift.Error")
+                    )
+                    guard definitions.updateValue(definition, forKey: key) == nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "duplicate nominal type \(name)"
+                        )
+                    }
+                    return
+                }
+                if let nested = TypeEnvironment.captures(
+                    member,
+                    pattern: TypeEnvironment.nominalHeaderPattern
+                ) {
+                    try parseNominal(nested, parentScope: name)
+                    continue
+                }
+                if header[0] == "struct",
+                   let field = TypeEnvironment.captures(
+                    member,
+                    pattern: TypeEnvironment.storedFieldPattern
+                   ) {
+                    fields.append(.init(name: field[0], type: field[1]))
+                } else if header[0] == "enum",
+                          let item = TypeEnvironment.captures(
+                    member,
+                    pattern: TypeEnvironment.enumCasePattern
+                          ) {
+                    cases.append(
+                        .init(
+                            name: item[0],
+                            associatedTypes: item[1].isEmpty
+                                ? []
+                                : TypeEnvironment.splitTopLevel(item[1])
+                        )
+                    )
+                }
+                if TypeEnvironment.braceDelta(in: member) > 0 {
+                    try skipBracedDeclaration()
+                } else {
+                    index += 1
+                }
+            }
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "unterminated nominal type \(name)"
+            )
+        }
+
+        private mutating func skipBracedDeclaration() throws {
+            var depth = 0
+            repeat {
+                guard index < lines.count else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "unterminated braced declaration"
+                    )
+                }
+                depth += TypeEnvironment.braceDelta(in: lines[index])
+                index += 1
+            } while depth > 0
+        }
     }
 
     private var rawDefinitions: [Bytecode.LocalTypeKey: RawDefinition]
@@ -168,12 +321,26 @@ public struct TypeEnvironment: Sendable {
     }
 
     func resolve(_ raw: String) throws -> Bytecode.ValueType {
+        try resolve(raw, relativeTo: nil)
+    }
+
+    private func resolve(
+        _ raw: String,
+        relativeTo parentScope: String?
+    ) throws -> Bytecode.ValueType {
         var type = raw.trimmingCharacters(in: .whitespaces)
         if type.hasPrefix("$*") {
-            return .address(try resolve(String(type.dropFirst(2))))
+            return .address(
+                try resolve(String(type.dropFirst(2)), relativeTo: parentScope)
+            )
         }
         if type.hasPrefix("@inout ") {
-            return .address(try resolve(String(type.dropFirst("@inout ".count))))
+            return .address(
+                try resolve(
+                    String(type.dropFirst("@inout ".count)),
+                    relativeTo: parentScope
+                )
+            )
         }
         var removedPrefix = true
         while removedPrefix {
@@ -200,16 +367,28 @@ public struct TypeEnvironment: Sendable {
         }
 
         if type.contains(" -> ") {
-            return .closure(try resolveClosureSignature(type))
+            return .closure(
+                try resolveClosureSignature(type, relativeTo: parentScope)
+            )
         }
 
         for optionalPrefix in ["Optional<", "Swift.Optional<"]
         where type.hasPrefix(optionalPrefix) && type.hasSuffix(">") {
-            return .optional(try resolve(genericBody(type, prefix: optionalPrefix)))
+            return .optional(
+                try resolve(
+                    genericBody(type, prefix: optionalPrefix),
+                    relativeTo: parentScope
+                )
+            )
         }
         for arrayPrefix in ["Array<", "Swift.Array<"]
         where type.hasPrefix(arrayPrefix) && type.hasSuffix(">") {
-            return .array(try resolve(genericBody(type, prefix: arrayPrefix)))
+            return .array(
+                try resolve(
+                    genericBody(type, prefix: arrayPrefix),
+                    relativeTo: parentScope
+                )
+            )
         }
         for dictionaryPrefix in ["Dictionary<", "Swift.Dictionary<"]
         where type.hasPrefix(dictionaryPrefix) && type.hasSuffix(">") {
@@ -219,13 +398,16 @@ public struct TypeEnvironment: Sendable {
                     "Dictionary generic arguments must contain Key and Value"
                 )
             }
-            let key = try resolve(components[0])
+            let key = try resolve(components[0], relativeTo: parentScope)
             guard Self.isSupportedDictionaryKey(key) else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
                     "Dictionary key \(key)"
                 )
             }
-            return .dictionary(key: key, value: try resolve(components[1]))
+            return .dictionary(
+                key: key,
+                value: try resolve(components[1], relativeTo: parentScope)
+            )
         }
         for resultPrefix in ["Result<", "Swift.Result<"]
         where type.hasPrefix(resultPrefix) && type.hasSuffix(">") {
@@ -235,14 +417,18 @@ public struct TypeEnvironment: Sendable {
                     "Result generic arguments must contain Success and Failure"
                 )
             }
-            let success = try resolve(components[0])
-            let failure = try resolve(components[1])
+            let success = try resolve(components[0], relativeTo: parentScope)
+            let failure = try resolve(components[1], relativeTo: parentScope)
             return .local(resultKey(success: success, failure: failure))
         }
         if type.hasPrefix("("), type.hasSuffix(")") {
             let elements = splitTopLevelTuple(type)
             if elements.count == 1, elements[0].isEmpty { return .void }
-            return .tuple(try elements.map { try resolve(removeTupleLabel($0)) })
+            return .tuple(
+                try elements.map {
+                    try resolve(removeTupleLabel($0), relativeTo: parentScope)
+                }
+            )
         }
 
         switch type {
@@ -272,24 +458,44 @@ public struct TypeEnvironment: Sendable {
         case "Never", "Swift.Never": return .never
         default:
             if let id = nativeTypes[type] { return .native(id) }
-            if let key = localKey(for: type) { return .local(key) }
+            if let key = localKey(for: type, relativeTo: parentScope) {
+                return .local(key)
+            }
             throw CanonicalSIL.LoweringError.unsupportedType(type)
         }
     }
 
     func localKey(for raw: String) -> Bytecode.LocalTypeKey? {
+        localKey(for: raw, relativeTo: nil)
+    }
+
+    private func localKey(
+        for raw: String,
+        relativeTo parentScope: String?
+    ) -> Bytecode.LocalTypeKey? {
         let type = raw.trimmingCharacters(in: .whitespaces)
         let exact = Bytecode.LocalTypeKey(rawValue: type)
         if rawDefinitions[exact] != nil { return exact }
-        guard let separator = type.firstIndex(of: ".") else { return nil }
-        let withoutModule = Bytecode.LocalTypeKey(
-            rawValue: String(type[type.index(after: separator)...])
-        )
-        return rawDefinitions[withoutModule] == nil ? nil : withoutModule
+        if let parentScope {
+            let relative = Bytecode.LocalTypeKey(
+                rawValue: "\(parentScope).\(type)"
+            )
+            if rawDefinitions[relative] != nil { return relative }
+        }
+        if let separator = type.firstIndex(of: ".") {
+            let withoutModule = Bytecode.LocalTypeKey(
+                rawValue: String(type[type.index(after: separator)...])
+            )
+            if rawDefinitions[withoutModule] != nil { return withoutModule }
+        }
+        let suffix = ".\(type)"
+        let matches = rawDefinitions.keys.filter { $0.rawValue.hasSuffix(suffix) }
+        return matches.count == 1 ? matches[0] : nil
     }
 
     private func resolveClosureSignature(
-        _ raw: String
+        _ raw: String,
+        relativeTo parentScope: String?
     ) throws -> Bytecode.ClosureSignature {
         var type = raw.trimmingCharacters(in: .whitespaces)
         var removedAttribute = true
@@ -325,9 +531,14 @@ public struct TypeEnvironment: Sendable {
         if components.count == 1, components[0].isEmpty {
             parameters = []
         } else {
-            parameters = try components.map { try resolve(removeTupleLabel($0)) }
+            parameters = try components.map {
+                try resolve(removeTupleLabel($0), relativeTo: parentScope)
+            }
         }
-        let result = try resolve(String(type[arrow.upperBound...]))
+        let result = try resolve(
+            String(type[arrow.upperBound...]),
+            relativeTo: parentScope
+        )
         return .init(parameters: parameters, result: result)
     }
 
@@ -350,7 +561,13 @@ public struct TypeEnvironment: Sendable {
             case let .structure(fields):
                 kind = .structure(
                     fields: try fields.map {
-                        .init(name: $0.name, type: try resolve($0.type))
+                        .init(
+                            name: $0.name,
+                            type: try resolve(
+                                $0.type,
+                                relativeTo: raw.parentScope
+                            )
+                        )
                     }
                 )
             case let .enumeration(cases):
@@ -361,11 +578,17 @@ public struct TypeEnvironment: Sendable {
                         case 0:
                             payload = nil
                         case 1:
-                            payload = try resolve(removeTupleLabel(item.associatedTypes[0]))
+                            payload = try resolve(
+                                removeTupleLabel(item.associatedTypes[0]),
+                                relativeTo: raw.parentScope
+                            )
                         default:
                             payload = .tuple(
                                 try item.associatedTypes.map {
-                                    try resolve(removeTupleLabel($0))
+                                    try resolve(
+                                        removeTupleLabel($0),
+                                        relativeTo: raw.parentScope
+                                    )
                                 }
                             )
                         }
@@ -657,73 +880,58 @@ public struct TypeEnvironment: Sendable {
         _ text: String
     ) throws -> [Bytecode.LocalTypeKey: RawDefinition] {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var result: [Bytecode.LocalTypeKey: RawDefinition] = [:]
-        var index = 0
-        while index < lines.count {
-            let line = lines[index].trimmingCharacters(in: .whitespaces)
-            guard let header = captures(
-                line,
-                pattern: #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate)\s+)*(?:indirect )?(struct|enum)\s+([^\s:{]+)(?:\s*:\s*([^\{]+))?\s*\{$"#
-            ) else {
-                index += 1
-                continue
-            }
-            let name = header[1]
-            if name.contains("<") {
-                index += 1
-                continue
-            }
-            let key = Bytecode.LocalTypeKey(rawValue: name)
-            var fields: [RawField] = []
-            var cases: [RawEnumCase] = []
-            index += 1
-            while index < lines.count {
-                let member = lines[index].trimmingCharacters(in: .whitespaces)
-                if member == "}" { break }
-                if header[0] == "struct",
-                   let field = captures(
-                    member,
-                    pattern: #"^(?:@[^\s]+\s+)*@_hasStorage\s+(?:(?:public|internal|package|private|fileprivate)\s+)?(?:var|let)\s+([^:]+):\s*(.+?)(?:\s*\{.*)?$"#
-                   ) {
-                    fields.append(.init(name: field[0], type: field[1]))
-                } else if header[0] == "enum",
-                          let item = captures(
-                    member,
-                    pattern: #"^(?:indirect )?case\s+([^\s(]+)(?:\((.*)\))?$"#
-                          ) {
-                    cases.append(
-                        .init(
-                            name: item[0],
-                            associatedTypes: item[1].isEmpty
-                                ? []
-                                : splitTopLevel(item[1])
-                        )
-                    )
-                }
-                index += 1
-            }
-            guard index < lines.count else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "unterminated nominal type \(name)"
-                )
-            }
-            let conformances = header[2]
-                .split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-            let definition = RawDefinition(
-                key: key,
-                kind: header[0] == "struct" ? .structure(fields) : .enumeration(cases),
-                conformsToError: conformances.contains("Error")
-                    || conformances.contains("Swift.Error")
-            )
-            guard result.updateValue(definition, forKey: key) == nil else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "duplicate nominal type \(name)"
-                )
-            }
-            index += 1
+        var parser = DefinitionParser(lines: lines)
+        return try parser.parse()
+    }
+
+    private static let nominalHeaderPattern =
+        #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate)\s+)*(?:indirect )?(struct|enum)\s+([^\s:{]+)(?:\s*:\s*([^\{]+))?\s*\{$"#
+    private static let extensionHeaderPattern =
+        #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate)\s+)*extension\s+([^\s:{]+)(?:\s*:\s*[^\{]+)?(?:\s+where\s+[^\{]+)?\s*\{$"#
+    private static let storedFieldPattern =
+        #"^(?:@[^\s]+\s+)*@_hasStorage\s+(?:(?:public|internal|package|private|fileprivate)\s+)?(?:var|let)\s+([^:]+):\s*(.+?)(?:\s*\{.*)?$"#
+    private static let enumCasePattern =
+        #"^(?:indirect )?case\s+([^\s(]+)(?:\((.*)\))?$"#
+
+    private static func qualified(
+        _ name: String,
+        relativeTo parentScope: String?
+    ) -> String {
+        guard !name.contains("."), let parentScope, !parentScope.isEmpty else {
+            return name
         }
-        return result
+        return "\(parentScope).\(name)"
+    }
+
+    private static func parentScope(of name: String) -> String? {
+        guard let separator = name.lastIndex(of: ".") else { return nil }
+        return String(name[..<separator])
+    }
+
+    private static func braceDelta(in line: String) -> Int {
+        var depth = 0
+        var isQuoted = false
+        var isEscaped = false
+        var index = line.startIndex
+        while index < line.endIndex {
+            let character = line[index]
+            if isEscaped {
+                isEscaped = false
+            } else if character == "\\", isQuoted {
+                isEscaped = true
+            } else if character == "\"" {
+                isQuoted.toggle()
+            } else if !isQuoted, character == "/" {
+                let next = line.index(after: index)
+                if next < line.endIndex, line[next] == "/" { break }
+            } else if !isQuoted, character == "{" {
+                depth += 1
+            } else if !isQuoted, character == "}" {
+                depth -= 1
+            }
+            index = line.index(after: index)
+        }
+        return depth
     }
 
     private func genericBody(_ type: String, prefix: String) -> String {

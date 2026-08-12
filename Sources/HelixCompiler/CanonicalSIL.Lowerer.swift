@@ -208,9 +208,14 @@ public struct Lowerer: Sendable {
         var unavailableSetter: CanonicalSIL.UnavailableDirectCall?
     }
 
-    struct ErasedNativeMetatype: Equatable {
+    enum MetatypeIdentity: Equatable {
+        case native(Core.TypeID)
+        case local(Bytecode.LocalTypeKey)
+    }
+
+    struct ErasedMetatype: Equatable {
         var physicalIndex: Int
-        var typeID: Core.TypeID
+        var identity: MetatypeIdentity
     }
 
     /// Keeps the physical SIL ABI separate from the frozen device target.
@@ -219,7 +224,7 @@ public struct Lowerer: Sendable {
         var binding: CanonicalSIL.DirectCallBinding
         var physicalParameterConventions: [Bytecode.ParameterConvention]
         var hasIndirectResult: Bool
-        var erasedNativeMetatypes: [ErasedNativeMetatype]
+        var erasedMetatypes: [ErasedMetatype]
         var usesObjectiveCBridge: Bool
     }
 
@@ -837,20 +842,20 @@ public struct Lowerer: Sendable {
                 binding: binding,
                 physicalParameterConventions: callee.parameterConventions,
                 hasIndirectResult: callee.hasIndirectResult,
-                erasedNativeMetatypes: callee.erasedNativeMetatypes,
+                erasedMetatypes: callee.erasedMetatypes,
                 usesObjectiveCBridge: true
             )
         }
 
-        func eraseNativeMetatypeArguments(
+        func eraseMetatypeArguments(
             _ tokens: [String],
             for reference: ResolvedFunctionReference,
             line: Int
         ) throws -> [String] {
-            guard !reference.erasedNativeMetatypes.isEmpty else { return tokens }
+            guard !reference.erasedMetatypes.isEmpty else { return tokens }
             let erasedByIndex = Dictionary(
-                uniqueKeysWithValues: reference.erasedNativeMetatypes.map {
-                    ($0.physicalIndex, $0.typeID)
+                uniqueKeysWithValues: reference.erasedMetatypes.map {
+                    ($0.physicalIndex, $0.identity)
                 }
             )
             guard tokens.count
@@ -863,10 +868,16 @@ public struct Lowerer: Sendable {
             var logical: [String] = []
             logical.reserveCapacity(reference.physicalParameterConventions.count)
             for (index, token) in tokens.enumerated() {
-                if let typeID = erasedByIndex[index] {
-                    guard nativeMetatypeValues[token] == typeID else {
+                if let identity = erasedByIndex[index] {
+                    let matches: Bool = switch identity {
+                    case let .native(typeID):
+                        nativeMetatypeValues[token] == typeID
+                    case let .local(key):
+                        localMetatypeValues[token] == key
+                    }
+                    guard matches else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "direct call metatype argument does not match its frozen native type"
+                            "direct call metatype argument does not match its concrete type"
                         )
                     }
                 } else {
@@ -2299,6 +2310,9 @@ public struct Lowerer: Sendable {
                 entryParameterTypes: entryBlock == nil
                     ? signature.parameters
                     : nil,
+                erasedMetatypes: entryBlock == nil
+                    ? signature.erasedMetatypes
+                    : [],
                 bridgedParameterTypes: bridgedBlockParameterTypes,
                 indirectResultType: entryBlock == nil && signature.hasIndirectResult
                     ? signature.result
@@ -2339,6 +2353,14 @@ public struct Lowerer: Sendable {
                     }
                 }
                 current = loweredBlock
+                for (token, identity) in block.erasedMetatypeParameters {
+                    switch identity {
+                    case let .native(typeID):
+                        nativeMetatypeValues[token] = typeID
+                    case let .local(key):
+                        localMetatypeValues[token] = key
+                    }
+                }
                 for (silValue, register) in explicitParameters {
                     values[silValue] = register
                 }
@@ -2804,18 +2826,20 @@ public struct Lowerer: Sendable {
                     }
                     continue
                 }
-                if let slot = runtimeStackSlots.removeValue(forKey: address) {
-                    if stackAddressValues.removeValue(forKey: address) != nil {
+                if let slot = runtimeStackSlots[address] {
+                    if stackAddressValues[address] != nil {
                         appendInstruction(.destroyStack(slot))
                     }
-                    runtimeAddressValues.removeValue(forKey: address)
-                    runtimeAddressPointees.removeValue(forKey: address)
-                    values.removeValue(forKey: address)
-                    guard stackAddressTypes.removeValue(forKey: address) != nil else {
+                    guard stackAddressTypes[address] != nil else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "runtime stack address lost its declared type"
                         )
                     }
+                    // SIL prints mutually exclusive successor blocks in one
+                    // linear stream. Keep the compile-time slot declaration
+                    // and initialization evidence so each successor can emit
+                    // its own destroy_stack; HLBC verification then proves
+                    // exactly one destroy occurs on every runtime path.
                     continue
                 }
                 guard stackAddressTypes[address] != nil else {
@@ -3786,7 +3810,7 @@ public struct Lowerer: Sendable {
                     binding: binding,
                     physicalParameterConventions: callee.parameterConventions,
                     hasIndirectResult: callee.hasIndirectResult,
-                    erasedNativeMetatypes: callee.erasedNativeMetatypes,
+                    erasedMetatypes: callee.erasedMetatypes,
                     usesObjectiveCBridge: usesObjectiveCBridge
                 )
                 continue
@@ -3857,7 +3881,7 @@ public struct Lowerer: Sendable {
                     binding: binding,
                     physicalParameterConventions: callee.parameterConventions,
                     hasIndirectResult: callee.hasIndirectResult,
-                    erasedNativeMetatypes: callee.erasedNativeMetatypes,
+                    erasedMetatypes: callee.erasedMetatypes,
                     usesObjectiveCBridge: false
                 )
                 continue
@@ -4139,7 +4163,7 @@ public struct Lowerer: Sendable {
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
                       appliedType.hasIndirectResult == reference.hasIndirectResult,
-                      appliedType.erasedNativeMetatypes == reference.erasedNativeMetatypes,
+                      appliedType.erasedMetatypes == reference.erasedMetatypes,
                       appliedType.effects.mayThrow,
                       !appliedType.effects.isAsync,
                       call[1].isEmpty
@@ -4159,7 +4183,7 @@ public struct Lowerer: Sendable {
                     guard supportsIndirectResult(binding.resultType),
                           argumentTokens.count
                             == reference.physicalParameterConventions.count
-                                + reference.erasedNativeMetatypes.count + 1
+                                + reference.erasedMetatypes.count + 1
                     else {
                         throw CanonicalSIL.LoweringError.unsupportedType(
                             "indirect throwing call result \(binding.resultType)"
@@ -4180,7 +4204,7 @@ public struct Lowerer: Sendable {
                         (destination, result),
                     ]
                 }
-                argumentTokens = try eraseNativeMetatypeArguments(
+                argumentTokens = try eraseMetatypeArguments(
                     argumentTokens,
                     for: reference,
                     line: sourceLine
@@ -4504,7 +4528,7 @@ public struct Lowerer: Sendable {
                         binding: binding,
                         physicalParameterConventions: callee.parameterConventions,
                         hasIndirectResult: callee.hasIndirectResult,
-                        erasedNativeMetatypes: callee.erasedNativeMetatypes,
+                        erasedMetatypes: callee.erasedMetatypes,
                         usesObjectiveCBridge: false
                     )
                 } else {
@@ -4524,7 +4548,7 @@ public struct Lowerer: Sendable {
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
                       appliedType.hasIndirectResult == reference.hasIndirectResult,
-                      appliedType.erasedNativeMetatypes == reference.erasedNativeMetatypes,
+                      appliedType.erasedMetatypes == reference.erasedMetatypes,
                       appliedType.effects.mayThrow == binding.effects.mayThrow,
                       appliedType.effects.isAsync == binding.effects.isAsync,
                       !binding.effects.isAsync
@@ -4543,7 +4567,7 @@ public struct Lowerer: Sendable {
                     guard supportsIndirectResult(binding.resultType),
                           argumentTokens.count
                             == reference.physicalParameterConventions.count
-                                + reference.erasedNativeMetatypes.count + 1
+                                + reference.erasedMetatypes.count + 1
                     else {
                         throw CanonicalSIL.LoweringError.unsupportedType(
                             "indirect call result \(binding.resultType)"
@@ -4559,7 +4583,7 @@ public struct Lowerer: Sendable {
                 } else {
                     indirectResultDestination = nil
                 }
-                argumentTokens = try eraseNativeMetatypeArguments(
+                argumentTokens = try eraseMetatypeArguments(
                     argumentTokens,
                     for: reference,
                     line: sourceLine
@@ -6647,7 +6671,7 @@ public struct Lowerer: Sendable {
         result: Bytecode.ValueType,
         hasIndirectResult: Bool,
         effects: Core.Effects,
-        erasedNativeMetatypes: [ErasedNativeMetatype]
+        erasedMetatypes: [ErasedMetatype]
     ) {
         guard let arrow = outerFunctionArrow(in: text) else {
             throw CanonicalSIL.LoweringError.malformedSIL("function type has no result arrow")
@@ -6664,7 +6688,18 @@ public struct Lowerer: Sendable {
         let rawParameters = splitTopLevel(String(parametersText)).filter { !$0.isEmpty }
         let parameters: [Bytecode.ValueType]
         let parameterConventions: [Bytecode.ParameterConvention]
-        var erasedNativeMetatypes: [ErasedNativeMetatype] = []
+        var erasedMetatypes: [ErasedMetatype] = []
+        var valueSpellings: [String] = []
+        valueSpellings.reserveCapacity(rawParameters.count)
+        for (index, spelling) in rawParameters.enumerated() {
+            if let identity = metatypeIdentity(spelling) {
+                erasedMetatypes.append(
+                    .init(physicalIndex: index, identity: identity)
+                )
+            } else {
+                valueSpellings.append(spelling)
+            }
+        }
         let physicalResultExpectation: Bytecode.ValueType?
         if let expected {
             let physicalExpectations: [Bytecode.ValueType]
@@ -6684,17 +6719,6 @@ public struct Lowerer: Sendable {
                     + [.address(receiver)]
                 physicalResultExpectation = .void
             }
-            var valueSpellings: [String] = []
-            valueSpellings.reserveCapacity(physicalExpectations.count)
-            for (index, spelling) in rawParameters.enumerated() {
-                if let typeID = nativeMetatypeTypeID(spelling) {
-                    erasedNativeMetatypes.append(
-                        .init(physicalIndex: index, typeID: typeID)
-                    )
-                } else {
-                    valueSpellings.append(spelling)
-                }
-            }
             guard valueSpellings.count == physicalExpectations.count else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "physical function parameters differ from its Swift NativeImport"
@@ -6710,9 +6734,9 @@ public struct Lowerer: Sendable {
                 implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix)
             )
         } else {
-            parameters = try rawParameters.map(parseType)
+            parameters = try valueSpellings.map(parseType)
             parameterConventions = self.parameterConventions(
-                rawParameters: rawParameters,
+                rawParameters: valueSpellings,
                 parameterTypes: parameters,
                 implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix)
             )
@@ -6745,11 +6769,11 @@ public struct Lowerer: Sendable {
             expected?.result ?? parsedResult.type,
             parsedResult.isIndirect,
             .init(mayThrow: mayThrow, isAsync: isAsync),
-            erasedNativeMetatypes
+            erasedMetatypes
         )
     }
 
-    private func nativeMetatypeTypeID(_ raw: String) -> Core.TypeID? {
+    private func metatypeIdentity(_ raw: String) -> MetatypeIdentity? {
         var spelling = raw.trimmingCharacters(in: .whitespaces)
         if spelling.hasPrefix("$") { spelling.removeFirst() }
         let prefixes = ["@thin ", "@thick ", "@objc_metatype "]
@@ -6759,10 +6783,13 @@ public struct Lowerer: Sendable {
         let start = spelling.index(spelling.startIndex, offsetBy: prefix.count)
         let end = spelling.index(spelling.endIndex, offsetBy: -".Type".count)
         guard start < end,
-              let type = try? parseType(String(spelling[start..<end])),
-              case let .native(typeID) = type
+              let type = try? parseType(String(spelling[start..<end]))
         else { return nil }
-        return typeID
+        return switch type {
+        case let .native(typeID): .native(typeID)
+        case let .local(key): .local(key)
+        default: nil
+        }
     }
 
     private func supportsIndirectResult(_ type: Bytecode.ValueType) -> Bool {
@@ -7076,6 +7103,7 @@ public struct Lowerer: Sendable {
     private func parseBlockHeader(
         _ line: String,
         entryParameterTypes: [Bytecode.ValueType]?,
+        erasedMetatypes: [ErasedMetatype],
         bridgedParameterTypes: [Bytecode.ValueType]?,
         indirectResultType: Bytecode.ValueType?,
         suppressVoidParameter: Bool,
@@ -7086,7 +7114,8 @@ public struct Lowerer: Sendable {
         indirectResultAddress: String?,
         indirectValueParameters: [String: Bytecode.ValueType],
         suppressedVoidParameter: String?,
-        compilerOptionalVoidParameters: Set<String>
+        compilerOptionalVoidParameters: Set<String>,
+        erasedMetatypeParameters: [(String, MetatypeIdentity)]
     )? {
         guard let match = match(line, pattern: #"^bb([0-9]+)(?:\((.*)\))?:$"#) else { return nil }
         let id = try parseBlockID(match[0])
@@ -7096,6 +7125,12 @@ public struct Lowerer: Sendable {
         var indirectValueParameters: [String: Bytecode.ValueType] = [:]
         var suppressedVoidParameter: String?
         var compilerOptionalVoidParameters = Set<String>()
+        var erasedMetatypeParameters: [(String, MetatypeIdentity)] = []
+        let erasedByIndex = Dictionary(
+            uniqueKeysWithValues: erasedMetatypes.map {
+                ($0.physicalIndex, $0.identity)
+            }
+        )
         if !parameterText.isEmpty {
             let components = splitTopLevel(parameterText)
             if let bridgedParameterTypes,
@@ -7112,6 +7147,15 @@ public struct Lowerer: Sendable {
             for (physicalIndex, component) in components.enumerated() {
                 guard let value = self.match(component, pattern: #"^(%[0-9]+)\s*:\s*(.+)$"#) else {
                     throw CanonicalSIL.LoweringError.malformedSIL("invalid block parameter \(component)")
+                }
+                if let identity = erasedByIndex[physicalIndex] {
+                    guard metatypeIdentity(value[1]) == identity else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "entry metatype parameter does not match its concrete type"
+                        )
+                    }
+                    erasedMetatypeParameters.append((value[0], identity))
+                    continue
                 }
                 let physicalType: Bytecode.ValueType
                 if let bridgedParameterTypes {
@@ -7165,7 +7209,8 @@ public struct Lowerer: Sendable {
             indirectResultAddress,
             indirectValueParameters,
             suppressedVoidParameter,
-            compilerOptionalVoidParameters
+            compilerOptionalVoidParameters,
+            erasedMetatypeParameters
         )
     }
 

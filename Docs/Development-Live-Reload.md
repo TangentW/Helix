@@ -125,14 +125,16 @@ that Shell. Entry routes are preferred, so ordinary calls between patchable App
 functions remain generation-aware; NativeImport is for a bounded API whose
 native implementation must run outside HLVM.
 
-A save may introduce a reachable ordinary top-level helper or private class
-instance method in an existing source file. The compiler follows its direct
-same-module call graph, assigns image-local function IDs, verifies every
-signature and ownership convention, and ships the closed graph with the changed
-Shell root. These helpers are not dynamically registered native Swift symbols;
-they live only in that HLBC generation. Calls through dynamic dispatch,
-Objective-C selectors, a new source file, or a new native ABI surface are not
-implied by this feature.
+A save may introduce a reachable ordinary top-level helper, private class
+instance method, or computed accessor in an existing source file. It may also
+introduce non-exported file/module-scope struct and enum types used by that
+graph. The compiler follows the direct same-module call graph, assigns
+image-local function and qualified nominal IDs, verifies every signature,
+ownership convention, and value shape, and ships the closed graph with the
+changed Shell root. These declarations are not dynamically registered native
+Swift symbols or metadata; they live only in that HLBC generation. Calls through
+dynamic dispatch, Objective-C selectors, a new source file, or a new native ABI
+surface are not implied by this feature.
 
 Every new Dev Shell automatically includes the exact NativeImport for
 `Swift.print(_:separator:terminator:)`, so adding
@@ -288,20 +290,22 @@ parameters, internal closure returns, and nested closure captures. The closure
 still cannot cross the Shell/Native boundary or survive the current pinned VM
 invocation.
 
-The current generator collects reachable ordinary functions and private class
-instance methods added to an existing watched source file. It does not collect
-an unrelated declaration merely because it exists, and it does not add new
-source files or a new native ABI surface. It also rejects changes to stored
-layout, signatures, generic constraints, isolation, superclass, conformance,
-enum cases, source membership, build settings, macro/plugin inputs, linked
-dependencies, assets, storyboards, and generated resources. Those changes need
-a normal build and, where applicable, reinstall.
+The current generator collects reachable ordinary functions, private class
+instance methods, computed accessors, and their non-exported patch-local value
+types when they are added to an existing watched source file. Patch-local
+nonrecursive structs and enums may be newly declared at file/module scope and
+may contain supported stored fields, instance/static computed accessors, and
+mutating helpers. Their values cannot cross a Shell Entry, NativeImport,
+generation, or native storage boundary. A type declared inside a function has
+no stable declaration identity in Helix's current textual SIL contract and is
+rejected with its exact type name; move it to file/module scope instead.
 
-Patch-local nonrecursive structs and enums are supported when their declarations
-already exist at file/module scope in the Shell. A type declared inside a
-function has no frozen declaration identity in Helix's current textual SIL
-contract and is rejected with its exact type name; move it to file scope and do
-a normal build first.
+An unrelated declaration is not collected merely because it exists, and this
+feature does not add source files or native ABI. Changes to an existing native
+stored layout, signature, generic constraint, isolation, superclass,
+conformance, enum cases, source membership, build settings, macro/plugin input,
+linked dependency, asset, storyboard, or generated resource still require a
+normal build and, where applicable, reinstall.
 
 See [Capabilities and Limits](Capabilities-and-Limits.md) for the comparison
 with production HLBC.
