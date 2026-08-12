@@ -76,7 +76,7 @@ public struct Driver: Sendable {
         guard let silFunction = file.function(mangledName: request.mangledName) else {
             throw CanonicalSIL.LoweringError.functionSelection("function @\(request.mangledName) was not found")
         }
-        let generatedPlan = try PatchCompiler.GeneratedFunctions.makePlan(
+        let imagePlan = try PatchCompiler.ImageFunctions.makePlan(
             file: file,
             root: silFunction,
             rootID: request.functionID,
@@ -88,7 +88,7 @@ public struct Driver: Sendable {
         ).lower(
             silFunction,
             displayName: request.displayName,
-            directCalls: generatedPlan.directCalls,
+            directCalls: imagePlan.directCalls,
             expectedEffects: request.effects
         )
         root = IntermediateRepresentation.SourceMapping.retainingLogicalPaths(
@@ -99,14 +99,14 @@ public struct Driver: Sendable {
             id: Bytecode.FunctionID,
             function: IntermediateRepresentation.Function
         )] = [(request.functionID, root)]
-        for item in generatedPlan.functions {
+        for item in imagePlan.functions {
             var lowered = try CanonicalSIL.Lowerer(
                 typeEnvironment: typeEnvironment
             ).lower(
                 item.function,
                 displayName: item.symbol,
                 kind: item.kind,
-                directCalls: generatedPlan.directCalls,
+                directCalls: imagePlan.directCalls,
                 expectedEffects: item.signature.effects
             )
             let actualParameters = lowered.parameterRegisters.compactMap { register in
@@ -133,7 +133,7 @@ public struct Driver: Sendable {
         }
         loweredByID.sort { $0.id < $1.id }
         let loweredFunctions = loweredByID.map(\.function)
-        let imports = try generatedPlan.directCalls.importRequirements(
+        let imports = try imagePlan.directCalls.importRequirements(
             referencedBy: loweredFunctions
         )
         let localTypes = try typeEnvironment.definitions(referencedBy: loweredFunctions)
@@ -172,7 +172,8 @@ public struct Driver: Sendable {
             bodyFingerprint: ReleaseCompiler.ImplementationFingerprint.compute(
                 root: silFunction,
                 in: file,
-                archivedSymbols: [silFunction.mangledName]
+                archivedSymbols: [silFunction.mangledName],
+                imageLocalSymbols: Set(imagePlan.functions.map(\.symbol))
             )
         )
     }

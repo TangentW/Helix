@@ -96,6 +96,37 @@ struct DevCompilationTests {
         #expect(await builder.activeFunctionKeys.isEmpty)
     }
 
+    @Test("A save may add an image-local helper without rebuilding the Dev Shell")
+    func compilesNewPatchLocalFunction() async throws {
+        let fixture = try Fixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let builder = DevCompilation.BytecodeBuilder(
+            archive: fixture.archive,
+            manifest: fixture.manifest
+        )
+
+        try fixture.write(
+            """
+            @inline(never)
+            private func check(_ value: Int) -> Int { value * 4 }
+
+            @inline(never)
+            public func transform(_ x: Int) -> Int { check(x) + 1 }
+            """
+        )
+        let outcome = try await builder.build(
+            fixture.request(revision: 1, generation: 1)
+        )
+        let patch = try #require(outcome.patch)
+        let module = try Bytecode.Decoder.decode(patch.payload).module
+
+        #expect(patch.backend == .hlbc)
+        #expect(patch.changedFunctions == [fixture.function.key])
+        #expect(module.functions.count == 2)
+        #expect(module.functions.allSatisfy { $0.kind == .ordinary })
+        #expect(Bytecode.Disassembler.disassemble(module).contains("hlbc_apply"))
+    }
+
     @Test("A Swift syntax error remains a compile diagnostic and preserves active code")
     func reportsSwiftDiagnostic() async throws {
         let fixture = try Fixture.make()

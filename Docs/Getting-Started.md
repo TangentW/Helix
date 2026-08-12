@@ -275,8 +275,9 @@ Then:
 
 Changing stored layout, signatures, inheritance, conformances, enum cases,
 actor isolation, source membership, linked dependencies, or build settings
-requires a normal build. New files and arbitrary new file-level declarations
-are also outside the current body-only workflow.
+requires a normal build. A changed root may call a new reachable ordinary helper
+or private class method declared in an existing watched source file; adding a
+new file or native ABI surface remains outside this workflow.
 
 ## 11. Build a Hot Patch
 

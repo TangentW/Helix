@@ -69,6 +69,16 @@ in the App. Calls cross one of these frozen boundaries:
 - an allowlisted `NativeImportID` backed by a generated, exact-signature Swift
   factory in the installed App.
 
+The patch compiler closes over reachable same-module implementation functions.
+Consequently, a patch may add an ordinary top-level helper or a private class
+instance method and call it from a changed archived root, provided its complete
+concrete signature and body fit the HLBC profile. Such a declaration is private
+to that immutable bytecode image: it does not create a new Shell entry, native
+symbol, Swift metadata record, selector, or callable API for native code. Its
+body is included in the root's transitive implementation fingerprint, so a
+later change produces a distinct generation even when the root call site stays
+textually unchanged.
+
 Native imports may be listed explicitly or discovered at build time from a
 file, module, or project scope. Project scope expands into individual canonical
 descriptors and generated invokers; it is never a wildcard interpreted on the

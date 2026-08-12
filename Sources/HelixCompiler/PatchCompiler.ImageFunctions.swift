@@ -2,12 +2,12 @@ import HelixBytecode
 import HelixCore
 
 extension PatchCompiler {
-enum GeneratedFunctions {
+enum ImageFunctions {
     struct Planned: Sendable {
         var symbol: String
         var id: Bytecode.FunctionID
         var kind: Bytecode.FunctionKind
-        var signature: CanonicalSIL.GeneratedFunctions.Signature
+        var signature: CanonicalSIL.ImageFunctions.Signature
         var function: CanonicalSIL.Function
     }
 
@@ -24,17 +24,24 @@ enum GeneratedFunctions {
         directCalls: CanonicalSIL.DirectCallTable
     ) throws -> Plan {
         let rootSymbols: Set<String> = [root.mangledName]
-        let discovered: [String: CanonicalSIL.GeneratedFunctions.Discovered]
+        let moduleName = CanonicalSIL.SymbolIdentity.moduleName(of: root.mangledName)
+        let discovered: [String: CanonicalSIL.ImageFunctions.Discovered]
         do {
-            discovered = try CanonicalSIL.GeneratedFunctions.discover(
+            discovered = try CanonicalSIL.ImageFunctions.discover(
                 in: file,
                 startingAt: rootSymbols,
                 excluding: directCalls.boundSymbols.union(rootSymbols),
                 kindForSymbol: { symbol in
-                    kind(for: symbol, rootedAt: rootSymbols)
+                    kind(
+                        for: symbol,
+                        rootedAt: rootSymbols,
+                        moduleName: moduleName,
+                        typeEnvironment: typeEnvironment,
+                        file: file
+                    )
                 }
             )
-        } catch let error as CanonicalSIL.GeneratedFunctions.DiscoveryError {
+        } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
             throw map(error)
         }
 
@@ -44,14 +51,14 @@ enum GeneratedFunctions {
         var bindings: [CanonicalSIL.DirectCallBinding] = []
         for symbol in discovered.keys.sorted() {
             guard let item = discovered[symbol] else { continue }
-            let signature: CanonicalSIL.GeneratedFunctions.Signature
+            let signature: CanonicalSIL.ImageFunctions.Signature
             do {
-                signature = try CanonicalSIL.GeneratedFunctions.signature(
+                signature = try CanonicalSIL.ImageFunctions.signature(
                     of: item.function,
                     environment: typeEnvironment,
                     symbol: symbol
                 )
-            } catch let error as CanonicalSIL.GeneratedFunctions.DiscoveryError {
+            } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
                 throw map(error)
             }
             let id = try allocateFunctionID(occupied: &occupiedIDs)
@@ -83,8 +90,21 @@ enum GeneratedFunctions {
 
     private static func kind(
         for symbol: String,
-        rootedAt roots: Set<String>
+        rootedAt roots: Set<String>,
+        moduleName: String?,
+        typeEnvironment: CanonicalSIL.TypeEnvironment,
+        file: CanonicalSIL.File
     ) -> Bytecode.FunctionKind? {
+        guard !typeEnvironment.isStructFactory(symbol),
+              file.function(mangledName: symbol).map(
+                  typeEnvironment.hasStructFactorySignature
+              ) != true,
+              file.function(mangledName: symbol)?.hasNominalValueConstructorABI != true
+        else { return nil }
+        let isRooted = roots.contains { symbol != $0 && symbol.hasPrefix($0) }
+        let isModuleLocal = moduleName.map {
+            CanonicalSIL.SymbolIdentity.moduleName(of: symbol) == $0
+        } ?? false
         if ReleaseCompiler.ImplementationFingerprint
             .isDefaultArgumentGenerator(symbol) {
             return .concreteSpecialization
@@ -94,16 +114,15 @@ enum GeneratedFunctions {
         if symbol.contains("fA"), symbol.contains("cfU") || symbol.contains("fU") {
             return .closureBody
         }
-        guard roots.contains(where: {
-            symbol != $0 && symbol.hasPrefix($0)
-        }) else { return nil }
-        if symbol.contains("_Tg") || symbol.contains("Tf") {
+        if (isRooted || isModuleLocal),
+           symbol.contains("_Tg") || symbol.contains("Tf") {
             return .concreteSpecialization
         }
-        if symbol.contains("cfU") || symbol.contains("fU") {
+        if (isRooted || isModuleLocal),
+           symbol.contains("cfU") || symbol.contains("fU") {
             return .closureBody
         }
-        return nil
+        return isModuleLocal ? .ordinary : nil
     }
 
     private static func allocateFunctionID(
@@ -121,7 +140,7 @@ enum GeneratedFunctions {
     }
 
     private static func map(
-        _ error: CanonicalSIL.GeneratedFunctions.DiscoveryError
+        _ error: CanonicalSIL.ImageFunctions.DiscoveryError
     ) -> PatchCompiler.CompilationError {
         switch error {
         case let .unsupported(symbol, reason):
@@ -141,9 +160,9 @@ public enum CompilationError: Error, Equatable, Sendable, CustomStringConvertibl
     public var description: String {
         switch self {
         case let .generatedFunctionUnsupported(symbol, reason):
-            "compiler-generated function \(symbol) is outside the current HLBC profile: \(reason)"
+            "image-local function \(symbol) is outside the current HLBC profile: \(reason)"
         case .functionIDSpaceExhausted:
-            "the HLBC module has no free function identifier for a generated helper"
+            "the HLBC module has no free function identifier for an image-local function"
         }
     }
 }

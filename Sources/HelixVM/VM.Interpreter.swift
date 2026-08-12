@@ -7,6 +7,56 @@ private final class ExecutionTrace {
     var programCounter: VM.ProgramCounter?
 }
 
+private final class ExecutionFrame {
+    let function: Bytecode.Function
+    let blocks: [Bytecode.BlockID: Bytecode.Block]
+    var registers: [VM.Value?]
+    var stackSlots: [VM.MemoryCell]
+    var currentBlock: Bytecode.BlockID
+    var instructionOffset: Int
+
+    init(
+        function: Bytecode.Function,
+        registers: [VM.Value?],
+        stackSlots: [VM.MemoryCell]
+    ) {
+        self.function = function
+        blocks = Dictionary(uniqueKeysWithValues: function.blocks.map { ($0.id, $0) })
+        self.registers = registers
+        self.stackSlots = stackSlots
+        currentBlock = function.entryBlock
+        instructionOffset = 0
+    }
+}
+
+private enum CallContinuation {
+    case returning(
+        result: Bytecode.Register?,
+        programCounter: VM.ProgramCounter
+    )
+    case throwing(
+        normalTarget: Bytecode.BlockID,
+        errorTarget: Bytecode.BlockID,
+        programCounter: VM.ProgramCounter
+    )
+}
+
+private struct SuspendedFrame {
+    var frame: ExecutionFrame
+    var continuation: CallContinuation
+}
+
+private struct FrameCall {
+    var functionID: Bytecode.FunctionID
+    var arguments: [VM.Value]
+    var continuation: CallContinuation
+}
+
+private enum FrameOutcome {
+    case call(FrameCall)
+    case returned(VM.Value?)
+}
+
 extension VM {
 public struct Interpreter: Sendable {
     public var nativeCatalog: VM.NativeCatalog
@@ -211,53 +261,187 @@ public struct Interpreter: Sendable {
         budget: VM.InvocationBudget,
         trace: ExecutionTrace
     ) throws -> VM.Value? {
+        var current = try makeFrame(
+            functionID: functionID,
+            functions: functions,
+            arguments: arguments,
+            localTypes: localTypes,
+            budget: budget
+        )
+        var suspended: [SuspendedFrame] = []
+        var activeFrameCount = 1
+        defer {
+            while activeFrameCount > 0 {
+                budget.leaveFrame()
+                activeFrameCount -= 1
+            }
+        }
+
+        while true {
+            let outcome: FrameOutcome
+            do {
+                outcome = try executeFrame(
+                    current,
+                    functions: functions,
+                    localTypes: localTypes,
+                    budget: budget,
+                    trace: trace
+                )
+            } catch let business as VM.BusinessError {
+                budget.leaveFrame()
+                activeFrameCount -= 1
+
+                let pendingError = business
+                var didFindHandler = false
+                while let caller = suspended.popLast() {
+                    current = caller.frame
+                    switch caller.continuation {
+                    case .returning:
+                        budget.leaveFrame()
+                        activeFrameCount -= 1
+                    case let .throwing(_, errorTarget, programCounter):
+                        trace.programCounter = programCounter
+                        try transferBusinessError(
+                            pendingError,
+                            to: current.blocks[errorTarget]!,
+                            function: current.function,
+                            registers: &current.registers,
+                            budget: budget
+                        )
+                        current.currentBlock = errorTarget
+                        current.instructionOffset = 0
+                        didFindHandler = true
+                    }
+                    if didFindHandler { break }
+                }
+                guard didFindHandler else { throw pendingError }
+                continue
+            }
+
+            switch outcome {
+            case let .call(call):
+                let callee = try makeFrame(
+                    functionID: call.functionID,
+                    functions: functions,
+                    arguments: call.arguments,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+                activeFrameCount += 1
+                suspended.append(
+                    SuspendedFrame(frame: current, continuation: call.continuation)
+                )
+                current = callee
+
+            case let .returned(value):
+                budget.leaveFrame()
+                activeFrameCount -= 1
+                guard let caller = suspended.popLast() else { return value }
+                current = caller.frame
+                switch caller.continuation {
+                case let .returning(result, programCounter):
+                    trace.programCounter = programCounter
+                    try storeCallResult(
+                        value,
+                        in: result,
+                        function: current.function,
+                        registers: &current.registers,
+                        localTypes: localTypes,
+                        budget: budget
+                    )
+                case let .throwing(normalTarget, _, programCounter):
+                    trace.programCounter = programCounter
+                    try transferCallOutcome(
+                        value,
+                        to: current.blocks[normalTarget]!,
+                        function: current.function,
+                        registers: &current.registers,
+                        localTypes: localTypes,
+                        budget: budget
+                    )
+                    current.currentBlock = normalTarget
+                    current.instructionOffset = 0
+                }
+            }
+        }
+    }
+
+    private func makeFrame(
+        functionID: Bytecode.FunctionID,
+        functions: [Bytecode.FunctionID: Bytecode.Function],
+        arguments: [VM.Value],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget
+    ) throws -> ExecutionFrame {
         guard let function = functions[functionID] else { throw VM.RuntimeTrap.unknownFunction(functionID) }
         guard arguments.count == function.parameterRegisters.count else {
             throw VM.RuntimeTrap.typeMismatch(expected: .tuple(function.parameterRegisters.map { function.type(of: $0)! }), actual: .tuple(arguments.map(\.type)))
         }
         try budget.enterFrame()
-        defer { budget.leaveFrame() }
-
-        let frameValues = function.registerTypes.count.addingReportingOverflow(
-            function.stackSlotTypes.count
-        )
-        guard !frameValues.overflow else { throw VM.RuntimeTrap.vmHeapLimitExceeded }
-        let frameBytes = UInt64(frameValues.partialValue).multipliedReportingOverflow(
-            by: UInt64(MemoryLayout<VM.Value?>.stride)
-        )
-        guard !frameBytes.overflow else { throw VM.RuntimeTrap.vmHeapLimitExceeded }
-        try budget.consumeVMHeap(bytes: frameBytes.partialValue)
-        var registers = Array<VM.Value?>(repeating: nil, count: function.registerTypes.count)
-        var stackSlots = (0..<function.stackSlotTypes.count).map { _ in VM.MemoryCell() }
-        for ((register, convention), value) in zip(
-            zip(function.parameterRegisters, function.parameterConventions),
-            arguments
-        ) {
-            let expected = function.type(of: register)!
-            try validateRuntimeValue(
-                value,
-                expected: expected,
-                localTypes: localTypes
+        do {
+            let frameValues = function.registerTypes.count.addingReportingOverflow(
+                function.stackSlotTypes.count
             )
-            if convention == .inout {
-                guard case let .address(address) = value, address.canModify else {
-                    throw VM.RuntimeTrap.addressWriteRequiresModifyAccess
+            guard !frameValues.overflow else { throw VM.RuntimeTrap.vmHeapLimitExceeded }
+            let frameBytes = UInt64(frameValues.partialValue).multipliedReportingOverflow(
+                by: UInt64(MemoryLayout<VM.Value?>.stride)
+            )
+            guard !frameBytes.overflow else { throw VM.RuntimeTrap.vmHeapLimitExceeded }
+            try budget.consumeVMHeap(bytes: frameBytes.partialValue)
+            var registers = Array<VM.Value?>(repeating: nil, count: function.registerTypes.count)
+            let stackSlots = (0..<function.stackSlotTypes.count).map { _ in VM.MemoryCell() }
+            for ((register, convention), value) in zip(
+                zip(function.parameterRegisters, function.parameterConventions),
+                arguments
+            ) {
+                let expected = function.type(of: register)!
+                try validateRuntimeValue(
+                    value,
+                    expected: expected,
+                    localTypes: localTypes
+                )
+                if convention == .inout {
+                    guard case let .address(address) = value, address.canModify else {
+                        throw VM.RuntimeTrap.addressWriteRequiresModifyAccess
+                    }
                 }
+                try initialize(value, register: register, registers: &registers)
             }
-            try initialize(value, register: register, registers: &registers)
+            return ExecutionFrame(
+                function: function,
+                registers: registers,
+                stackSlots: stackSlots
+            )
+        } catch {
+            budget.leaveFrame()
+            throw error
         }
-        let blocks = Dictionary(uniqueKeysWithValues: function.blocks.map { ($0.id, $0) })
-        var currentBlock = function.entryBlock
+    }
+
+    private func executeFrame(
+        _ frame: ExecutionFrame,
+        functions: [Bytecode.FunctionID: Bytecode.Function],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget,
+        trace: ExecutionTrace
+    ) throws -> FrameOutcome {
+        let function = frame.function
+        var registers = frame.registers
+        var stackSlots = frame.stackSlots
+        var currentBlock = frame.currentBlock
 
         while true {
-            guard let block = blocks[currentBlock] else { throw VM.RuntimeTrap.invalidProgramCounter }
+            guard let block = frame.blocks[currentBlock] else {
+                throw VM.RuntimeTrap.invalidProgramCounter
+            }
             var advancedToNextBlock = false
-            for (instructionIndex, instruction) in block.instructions.enumerated() {
+            for instructionIndex in frame.instructionOffset..<block.instructions.count {
+                let instruction = block.instructions[instructionIndex]
                 guard let instructionOffset = UInt32(exactly: instructionIndex) else {
                     throw VM.RuntimeTrap.invalidProgramCounter
                 }
                 let programCounter = VM.ProgramCounter(
-                    functionID: functionID,
+                    functionID: function.id,
                     blockID: block.id,
                     instructionOffset: instructionOffset
                 )
@@ -399,7 +583,7 @@ public struct Interpreter: Sendable {
                     guard let target else { throw VM.RuntimeTrap.invalidProgramCounter }
                     try transferValues(
                         payload.map { [$0] } ?? [],
-                        to: blocks[target]!,
+                        to: frame.blocks[target]!,
                         registers: &registers
                     )
                     currentBlock = target
@@ -555,7 +739,7 @@ public struct Interpreter: Sendable {
                     let values = value.map { [$0] } ?? []
                     try transferValues(
                         values,
-                        to: blocks[target]!,
+                        to: frame.blocks[target]!,
                         registers: &registers
                     )
                     currentBlock = target
@@ -1284,7 +1468,12 @@ public struct Interpreter: Sendable {
                     )
                     try initialize(.bool(comparison), register: result, registers: &registers)
                 case let .branch(target, arguments):
-                    try transfer(arguments, to: blocks[target]!, function: function, registers: &registers)
+                    try transfer(
+                        arguments,
+                        to: frame.blocks[target]!,
+                        function: function,
+                        registers: &registers
+                    )
                     currentBlock = target
                     advancedToNextBlock = true
                 case let .conditionalBranch(condition, trueTarget, trueArguments, falseTarget, falseArguments):
@@ -1293,7 +1482,12 @@ public struct Interpreter: Sendable {
                     }
                     let target = value ? trueTarget : falseTarget
                     let arguments = value ? trueArguments : falseArguments
-                    try transfer(arguments, to: blocks[target]!, function: function, registers: &registers)
+                    try transfer(
+                        arguments,
+                        to: frame.blocks[target]!,
+                        function: function,
+                        registers: &registers
+                    )
                     currentBlock = target
                     advancedToNextBlock = true
                 case let .apply(result, callee, arguments):
@@ -1308,22 +1502,23 @@ public struct Interpreter: Sendable {
                         function: function,
                         registers: &registers
                     )
-                    let value = try execute(
-                        functionID: callee,
-                        functions: functions,
-                        arguments: values,
-                        localTypes: localTypes,
-                        budget: budget,
-                        trace: trace
+                    persist(
+                        frame,
+                        registers: registers,
+                        stackSlots: stackSlots,
+                        currentBlock: currentBlock,
+                        nextInstruction: instructionIndex + 1
                     )
-                    trace.programCounter = programCounter
-                    try storeCallResult(
-                        value,
-                        in: result,
-                        function: function,
-                        registers: &registers,
-                        localTypes: localTypes,
-                        budget: budget
+                    try budget.checkDeadline()
+                    return .call(
+                        FrameCall(
+                            functionID: callee,
+                            arguments: values,
+                            continuation: .returning(
+                                result: result,
+                                programCounter: programCounter
+                            )
+                        )
                     )
                 case let .entryApply(result, entry, arguments):
                     guard let entryInvocation else { throw VM.RuntimeTrap.unknownEntry(entry) }
@@ -1447,22 +1642,23 @@ public struct Interpreter: Sendable {
                         function: function,
                         registers: &registers
                     )
-                    let value = try execute(
-                        functionID: closure.functionID,
-                        functions: functions,
-                        arguments: callValues,
-                        localTypes: localTypes,
-                        budget: budget,
-                        trace: trace
+                    persist(
+                        frame,
+                        registers: registers,
+                        stackSlots: stackSlots,
+                        currentBlock: currentBlock,
+                        nextInstruction: instructionIndex + 1
                     )
-                    trace.programCounter = programCounter
-                    try storeCallResult(
-                        value,
-                        in: result,
-                        function: function,
-                        registers: &registers,
-                        localTypes: localTypes,
-                        budget: budget
+                    try budget.checkDeadline()
+                    return .call(
+                        FrameCall(
+                            functionID: closure.functionID,
+                            arguments: callValues,
+                            continuation: .returning(
+                                result: result,
+                                programCounter: programCounter
+                            )
+                        )
                     )
                 case let .tryApply(callee, arguments, normalTarget, errorTarget):
                     guard let calleeFunction = functions[callee] else {
@@ -1476,37 +1672,25 @@ public struct Interpreter: Sendable {
                         function: function,
                         registers: &registers
                     )
-                    do {
-                        let value = try execute(
+                    persist(
+                        frame,
+                        registers: registers,
+                        stackSlots: stackSlots,
+                        currentBlock: currentBlock,
+                        nextInstruction: instructionIndex + 1
+                    )
+                    try budget.checkDeadline()
+                    return .call(
+                        FrameCall(
                             functionID: callee,
-                            functions: functions,
                             arguments: values,
-                            localTypes: localTypes,
-                            budget: budget,
-                            trace: trace
+                            continuation: .throwing(
+                                normalTarget: normalTarget,
+                                errorTarget: errorTarget,
+                                programCounter: programCounter
+                            )
                         )
-                        trace.programCounter = programCounter
-                        try transferCallOutcome(
-                            value,
-                            to: blocks[normalTarget]!,
-                            function: function,
-                            registers: &registers,
-                            localTypes: localTypes,
-                            budget: budget
-                        )
-                        currentBlock = normalTarget
-                    } catch let error as VM.BusinessError {
-                        trace.programCounter = programCounter
-                        try transferBusinessError(
-                            error,
-                            to: blocks[errorTarget]!,
-                            function: function,
-                            registers: &registers,
-                            budget: budget
-                        )
-                        currentBlock = errorTarget
-                    }
-                    advancedToNextBlock = true
+                    )
                 case let .entryTryApply(entry, arguments, normalTarget, errorTarget):
                     guard let entryInvocation else { throw VM.RuntimeTrap.unknownEntry(entry) }
                     let values = try arguments.map { try read($0, registers: registers) }
@@ -1521,7 +1705,7 @@ public struct Interpreter: Sendable {
                     case let .returned(value):
                         try transferCallOutcome(
                             value,
-                            to: blocks[normalTarget]!,
+                            to: frame.blocks[normalTarget]!,
                             function: function,
                             registers: &registers,
                             localTypes: localTypes,
@@ -1531,7 +1715,7 @@ public struct Interpreter: Sendable {
                     case let .businessError(message):
                         try transferBusinessError(
                             VM.BusinessError(message: message, requiresBoundaryCharge: true),
-                            to: blocks[errorTarget]!,
+                            to: frame.blocks[errorTarget]!,
                             function: function,
                             registers: &registers,
                             budget: budget
@@ -1578,7 +1762,7 @@ public struct Interpreter: Sendable {
                         }
                         try transferCallOutcome(
                             value,
-                            to: blocks[normalTarget]!,
+                            to: frame.blocks[normalTarget]!,
                             function: function,
                             registers: &registers,
                             localTypes: localTypes,
@@ -1593,7 +1777,7 @@ public struct Interpreter: Sendable {
                         }
                         try transferBusinessError(
                             VM.BusinessError(message: message, requiresBoundaryCharge: true),
-                            to: blocks[errorTarget]!,
+                            to: frame.blocks[errorTarget]!,
                             function: function,
                             registers: &registers,
                             budget: budget
@@ -1603,7 +1787,9 @@ public struct Interpreter: Sendable {
                     advancedToNextBlock = true
                 case let .returnValue(register):
                     try budget.checkDeadline()
-                    return try register.map { try read($0, registers: registers) }
+                    return .returned(
+                        try register.map { try read($0, registers: registers) }
+                    )
                 case let .throwError(error):
                     let value = try consume(
                         error,
@@ -1628,10 +1814,27 @@ public struct Interpreter: Sendable {
                     throw runtimeTrap(for: reason)
                 }
                 try budget.checkDeadline()
-                if advancedToNextBlock { break }
+                if advancedToNextBlock {
+                    frame.currentBlock = currentBlock
+                    frame.instructionOffset = 0
+                    break
+                }
             }
             guard advancedToNextBlock else { throw VM.RuntimeTrap.invalidProgramCounter }
         }
+    }
+
+    private func persist(
+        _ frame: ExecutionFrame,
+        registers: [VM.Value?],
+        stackSlots: [VM.MemoryCell],
+        currentBlock: Bytecode.BlockID,
+        nextInstruction: Int
+    ) {
+        frame.registers = registers
+        frame.stackSlots = stackSlots
+        frame.currentBlock = currentBlock
+        frame.instructionOffset = nextInstruction
     }
 
     private func initialize(

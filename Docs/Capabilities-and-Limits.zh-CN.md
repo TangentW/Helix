@@ -57,13 +57,14 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | 修改已索引的源码 class 实例方法体 | 支持；生成 TypeOps 会把精确 `self` 引用传入 HLVM |
 | 修改 struct/enum/actor 实例方法或 static/class 方法 | 在 value writeback、executor 与 metatype ABI 实现前拒绝 |
 | 从函数体调用已有 private/internal/public 声明 | 仅在解析为同 image 函数、eligible Shell Entry 或实际生成的精确 NativeImport 时支持 |
+| 在现有源码文件新增普通顶层 helper 或 class private 实例方法 | 能从变化 root 到达、且具体签名与函数体落在 HLBC 子集内时支持；声明仅属于该 image |
 | 普通直接递归 | 解析到同一不可变 HLBC image 内的函数 |
 | 从源码有意调用上一代 | HLBC 不支持；应保存/激活一个恢复 generation |
 | 使用受支持的局部 closure，或调用已经索引且带 `@escaping` closure 参数的同 image helper | 降入同一 image；closure 的返回和捕获只能发生在固定的 VM invocation 内 |
 | 使用两个 `Int` 边界的 `for value in lower..<upper` | 支持，并保留 Swift 的 `lower <= upper` 前置条件；其他 Range 族需要完整构建 |
 | 在受支持的 `String.contains` 中使用单 grapheme Character 字面量 | 以编译器内部 String 表示支持，不代表一般 Character 存储/API 已支持 |
 | 声明补丁内 struct 或 enum | 文件/module scope 支持；函数局部 nominal 会用精确类型诊断拒绝 |
-| 新增任意文件级 helper/type/extension 或新 Swift 文件 | 当前生成器不收集，需要完整构建 |
+| 新增无关声明、新原生 ABI 表面或新 Swift 文件 | 不会仅因声明存在而收集；source membership 或原生 ABI 变化需要完整构建 |
 | 修改 stored property、签名、generic constraint、actor isolation、superclass、conformance 或 enum case | 拒绝，需要完整构建 |
 | 修改 default argument 行为 | 完全具体的 generator 会与同一完整 module 内 eligible、已归档的调用点一起进入补丁；跨 module public/package 默认值、非 eligible 调用点或泛型 ABI 要求完整构建 |
 | 修改 static/global initializer | 已经初始化的状态不会自动重放 |

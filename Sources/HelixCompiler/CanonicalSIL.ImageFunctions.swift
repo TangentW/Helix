@@ -3,7 +3,7 @@ import HelixBytecode
 import HelixCore
 
 extension CanonicalSIL {
-enum GeneratedFunctions {
+enum ImageFunctions {
     struct Discovered: Sendable {
         var function: CanonicalSIL.Function
         var kind: Bytecode.FunctionKind
@@ -22,14 +22,15 @@ enum GeneratedFunctions {
         var description: String {
             switch self {
             case let .unsupported(symbol, reason):
-                "compiler-generated function \(symbol) is unsupported: \(reason)"
+                "image-local function \(symbol) is unsupported: \(reason)"
             }
         }
     }
 
-    /// Finds generated implementation dependencies reachable from the supplied
-    /// roots. The caller owns symbol classification because an App archive and
-    /// a standalone source compilation have different trust boundaries.
+    /// Finds image-local implementation dependencies reachable from the
+    /// supplied roots. The caller classifies both compiler-generated helpers
+    /// and ordinary patch-local declarations because an App archive and a
+    /// standalone source compilation have different trust boundaries.
     static func discover(
         in file: CanonicalSIL.File,
         startingAt rootSymbols: Set<String>,
@@ -160,7 +161,7 @@ enum GeneratedFunctions {
                 }
                 let kind: Bytecode.FunctionKind = switch usages.first {
                 case .closureConstruction: .closureBody
-                case .directCall: .concreteSpecialization
+                case .directCall: fallback
                 case nil: fallback
                 }
                 return (symbol, kind)

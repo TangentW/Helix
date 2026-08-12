@@ -125,6 +125,15 @@ that Shell. Entry routes are preferred, so ordinary calls between patchable App
 functions remain generation-aware; NativeImport is for a bounded API whose
 native implementation must run outside HLVM.
 
+A save may introduce a reachable ordinary top-level helper or private class
+instance method in an existing source file. The compiler follows its direct
+same-module call graph, assigns image-local function IDs, verifies every
+signature and ownership convention, and ships the closed graph with the changed
+Shell root. These helpers are not dynamically registered native Swift symbols;
+they live only in that HLBC generation. Calls through dynamic dispatch,
+Objective-C selectors, a new source file, or a new native ABI surface are not
+implied by this feature.
+
 Every new Dev Shell automatically includes the exact NativeImport for
 `Swift.print(_:separator:terminator:)`, so adding
 `print("value: \(value)", value)` to a supported body needs no App catalog setup. The
@@ -279,8 +288,10 @@ parameters, internal closure returns, and nested closure captures. The closure
 still cannot cross the Shell/Native boundary or survive the current pinned VM
 invocation.
 
-The current generator does not automatically collect arbitrary new file-level
-functions, types, extensions, or Swift files. It also rejects changes to stored
+The current generator collects reachable ordinary functions and private class
+instance methods added to an existing watched source file. It does not collect
+an unrelated declaration merely because it exists, and it does not add new
+source files or a new native ABI surface. It also rejects changes to stored
 layout, signatures, generic constraints, isolation, superclass, conformance,
 enum cases, source membership, build settings, macro/plugin inputs, linked
 dependencies, assets, storyboards, and generated resources. Those changes need

@@ -335,6 +335,14 @@ public struct TypeEnvironment: Sendable {
         structFactories[mangledName]
     }
 
+    func isStructFactory(_ mangledName: String) -> Bool {
+        structFactories[mangledName] != nil
+    }
+
+    func hasStructFactorySignature(_ function: CanonicalSIL.Function) -> Bool {
+        (try? structFactoryShape(function)) != nil
+    }
+
     func definition(for key: Bytecode.LocalTypeKey) throws -> Bytecode.LocalTypeDefinition {
         if let raw = rawDefinitions[key] {
             let kind: Bytecode.LocalTypeKind
@@ -551,27 +559,10 @@ public struct TypeEnvironment: Sendable {
     private func detectStructFactory(
         _ function: CanonicalSIL.Function
     ) throws -> Bytecode.LocalTypeKey? {
-        guard let arrow = function.loweredType.range(of: " -> ", options: .backwards) else {
-            return nil
-        }
-        let rawResult = String(function.loweredType[arrow.upperBound...])
-            .trimmingCharacters(in: .whitespaces)
-        guard case let .local(key) = try? resolve(rawResult),
-              case let .structure(fields) = try definition(for: key).kind
-        else { return nil }
-        let prefix = String(function.loweredType[..<arrow.lowerBound])
-        guard let open = prefix.lastIndex(of: "("),
-              let close = prefix.lastIndex(of: ")"),
-              open < close
-        else { return nil }
-        let parameters = splitTopLevel(String(prefix[prefix.index(after: open)..<close]))
-        guard parameters.count == fields.count + 1,
-              parameters.last?.trimmingCharacters(in: .whitespaces)
-                == "@thin \(key.rawValue).Type"
-        else { return nil }
-        for (parameter, field) in zip(parameters.dropLast(), fields) {
-            guard try resolve(parameter) == field.type else { return nil }
-        }
+        guard let shape = try structFactoryShape(function) else { return nil }
+        let key = shape.key
+        let fields = shape.fields
+        let rawResult = shape.rawResult
 
         let semanticLines = function.body.split(separator: "\n").map { rawLine in
             CanonicalSIL.DebugMetadata.strippingComment(from: String(rawLine))
@@ -626,6 +617,33 @@ public struct TypeEnvironment: Sendable {
         ), returned[0] == emptyTuple[0]
         else { return nil }
         return key
+    }
+
+    private func structFactoryShape(
+        _ function: CanonicalSIL.Function
+    ) throws -> (key: Bytecode.LocalTypeKey, fields: [Bytecode.LocalStructField], rawResult: String)? {
+        guard let arrow = function.loweredType.range(of: " -> ", options: .backwards) else {
+            return nil
+        }
+        let rawResult = String(function.loweredType[arrow.upperBound...])
+            .trimmingCharacters(in: .whitespaces)
+        guard case let .local(key) = try? resolve(rawResult),
+              case let .structure(fields) = try definition(for: key).kind
+        else { return nil }
+        let prefix = String(function.loweredType[..<arrow.lowerBound])
+        guard let open = prefix.lastIndex(of: "("),
+              let close = prefix.lastIndex(of: ")"),
+              open < close
+        else { return nil }
+        let parameters = splitTopLevel(String(prefix[prefix.index(after: open)..<close]))
+        guard parameters.count == fields.count + 1,
+              parameters.last?.trimmingCharacters(in: .whitespaces)
+                == "@thin \(key.rawValue).Type"
+        else { return nil }
+        for (parameter, field) in zip(parameters.dropLast(), fields) {
+            guard try resolve(parameter) == field.type else { return nil }
+        }
+        return (key, fields, rawResult)
     }
 
     private func resultKey(

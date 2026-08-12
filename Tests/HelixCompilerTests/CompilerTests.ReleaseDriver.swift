@@ -326,6 +326,184 @@ struct ReleaseDriver {
         )
     }
 
+    @Test("New private functions form a closed image-local call graph")
+    func linksNewPatchLocalFunctions() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-new-local-functions-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = "@inline(never) public func transform(_ x: Int) -> Int { x }\n"
+        try Data(baseline.utf8).write(to: sourceURL)
+
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            optimization: "-Onone"
+        )
+        let transform = try #require(archive.functions.first)
+        let entry = try #require(transform.entryIndex)
+
+        let changed = """
+        @inline(never)
+        private func sumDown(_ value: Int) -> Int {
+            if value <= 0 { return 0 }
+            return value + sumDown(value - 1)
+        }
+
+        @inline(never)
+        private func check(_ value: Int) -> Int {
+            sumDown(value) + 4
+        }
+
+        @inline(never)
+        public func transform(_ x: Int) -> Int { check(x) }
+        """
+        try Data(changed.utf8).write(to: sourceURL)
+        let result = try driver.build(.init(archive: archive, sourceFiles: [sourceURL]))
+
+        #expect(result.changedFunctions.map(\.key) == [transform.key])
+        #expect(result.module.functions.count == 3)
+        #expect(result.module.functions.filter { $0.kind == .ordinary }.count == 3)
+        #expect(result.disassembly.components(separatedBy: "hlbc_apply").count - 1 == 3)
+
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: entry,
+                image: image,
+                arguments: [
+                    .integer(try VM.Integer(signed: 4, bitWidth: 64, isSigned: true)),
+                ]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 14, bitWidth: 64, isSigned: true))
+            )
+        )
+
+        try Data(
+            changed.replacingOccurrences(
+                of: "sumDown(value) + 4",
+                with: "sumDown(value) + 5"
+            ).utf8
+        )
+            .write(to: sourceURL)
+        let later = try driver.build(.init(archive: archive, sourceFiles: [sourceURL]))
+        #expect(later.bytecode != result.bytecode)
+        #expect(later.bodyFingerprints[transform.key] != result.bodyFingerprints[transform.key])
+    }
+
+    @Test("A new private method receives the frozen native self inside HLBC")
+    func linksNewPrivateInstanceMethod() throws {
+        final class NativeScreen: @unchecked Sendable {}
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-new-private-method-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        public final class Screen {
+            @inline(never) public func transform(_ x: Int) -> Int { x }
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+
+        let namespace = Core.ShellNamespaceID.derive(
+            bundleID: "dev.helix.release-driver",
+            buildNumber: "1",
+            seed: "fixture"
+        )
+        let canonicalType = "ReleaseDriverFixture.Screen"
+        let typeID = Core.TypeID.derive(namespace: namespace, canonicalType: canonicalType)
+        let layout = Core.Digest.sha256("ReleaseDriverFixture.Screen.layout.v1")
+        let nativeType = InterfaceArchive.TypeRecord(
+            id: typeID,
+            canonicalName: canonicalType,
+            kind: .reference,
+            layoutFingerprint: layout,
+            isCopyable: true,
+            isEmittedToDevice: true,
+            estimatedSize: 8
+        )
+
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            transformSignature: .init(
+                parameters: ["Swift.Int", canonicalType],
+                result: "Swift.Int"
+            ),
+            transformParameterTypes: [.int64, .native(typeID)],
+            transformParameterConventions: [.owned, .borrowed],
+            transformCanonicalDeclaration: "Screen.func transform(_: Int) -> Int",
+            transformFormalType: "(Screen) -> (Swift.Int) -> Swift.Int",
+            transformLoweredSILType:
+                "@convention(method) (Int, @guaranteed Screen) -> Int",
+            optimization: "-Onone",
+            nativeTypes: [nativeType]
+        )
+        let transform = try #require(archive.functions.first)
+        let entry = try #require(transform.entryIndex)
+
+        let changed = """
+        public final class Screen {
+            @inline(never)
+            private func check(_ value: Int) -> Int { value * 3 }
+
+            @inline(never)
+            public func transform(_ x: Int) -> Int { check(x) + 2 }
+        }
+        """
+        try Data(changed.utf8).write(to: sourceURL)
+        let result = try driver.build(.init(archive: archive, sourceFiles: [sourceURL]))
+
+        #expect(result.changedFunctions.map(\.key) == [transform.key])
+        #expect(result.module.functions.count == 2)
+        #expect(result.disassembly.contains("hlbc_apply"))
+
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        let operations = VM.NativeTypeOperations.reference(
+            id: typeID,
+            canonicalName: canonicalType,
+            layoutFingerprint: layout,
+            estimatedSize: 8,
+            estimatedByteCount: { (_: NativeScreen) in 8 }
+        )
+        let boxed = try operations.box(NativeScreen())
+        #expect(
+            VM.Interpreter(
+                nativeTypeCatalog: try VM.NativeTypeCatalog([operations])
+            ).invoke(
+                entry: entry,
+                image: image,
+                arguments: [
+                    .integer(try VM.Integer(signed: 4, bitWidth: 64, isSigned: true)),
+                    .native(boxed),
+                ]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 14, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
     @Test("An allowlisted Swift callee becomes a typed native import")
     func lowersCallsToNativeImports() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -1905,6 +2083,7 @@ struct ReleaseDriver {
             result: "Swift.Int"
         ),
         transformParameterTypes: [Bytecode.ValueType] = [.int64],
+        transformParameterConventions: [Bytecode.ParameterConvention]? = nil,
         transformResultType: Bytecode.ValueType = .int64,
         transformCanonicalDeclaration: String = "func transform(_: Int) -> Int",
         transformFormalType: String = "(Swift.Int) -> Swift.Int",
@@ -1923,7 +2102,8 @@ struct ReleaseDriver {
         helperExposure: HelperExposure = .shellEntry,
         emitHelperImport: Bool = true,
         optimization: String = "-O",
-        additionalCapabilities: Set<Core.Capability> = []
+        additionalCapabilities: Set<Core.Capability> = [],
+        nativeTypes: [InterfaceArchive.TypeRecord] = []
     ) throws -> InterfaceArchive.Archive {
         let moduleName = "ReleaseDriverFixture"
         let frontend = SwiftFrontend.Driver()
@@ -2015,6 +2195,7 @@ struct ReleaseDriver {
                 role: .function,
                 loweredSignature: signature,
                 parameterTypes: transformParameterTypes,
+                parameterConventions: transformParameterConventions,
                 resultType: transformResultType,
                 interface: interface,
                 canonicalSILBody: transform.body,
@@ -2149,6 +2330,7 @@ struct ReleaseDriver {
                 ],
                 declarations: declarations,
                 nativeImportCandidates: nativeImports,
+                nativeTypes: nativeTypes,
                 capabilities: additionalCapabilities
             )
         )

@@ -64,6 +64,8 @@ iOS 进程不会接收或执行 Swift 编译器、linker、JIT、dylib 或源文
 
 一个 Swift 符号仅仅存在于进程中，并不代表 HLBC 可以随意调用它。调用必须精确解析到同一 bytecode image 中的函数、eligible Shell Entry，或者已生成进 Shell 的精确 NativeImport。Entry 路由优先，因此可补丁 App 函数之间的普通调用仍然感知 generation；NativeImport 用来承载必须离开 HLVM 执行的有界原生 API。
 
+一次保存可以在现有源码文件中新增可达的普通顶层 helper 或 class private 实例方法。编译器会沿当前 module 的直接调用图递归收集，为它们分配 image-local FunctionID，逐一验证具体签名与 ownership convention，再与变化的 Shell root 一起下发闭合图。这些 helper 并不是动态注册的原生 Swift 符号，只存在于该代 HLBC 中；该能力不代表支持动态派发、Objective-C selector、新源码文件或新的原生 ABI 表面。
+
 新 Dev Shell 会自动包含 `Swift.print(_:separator:terminator:)` 的精确 NativeImport，因此在受支持 body 中新增 `print("value: \(value)", value)` 不需要开发者配置 Catalog。编译器会把 variadic 参数降成 VM-owned `Array<Any>`，并把省略的 separator/terminator 作为通用默认参数 generator 链入同一 image。其他函数的完全具体默认参数使用同一机制；非 eligible 调用点、泛型 metadata 或跨 module public/package 默认值无法证明完整覆盖时，保存事务会明确失败并要求正常构建。
 
 对于受支持的源码 `class` 实例方法，隐藏 Bridge 会把 `self` 作为冻结的引用 `TypeID` 传入。生成的 `NativeTypeOperations` 负责 retain、identity 与类型验证，不把进程指针写进 HLBC。这条路径解决了 class method receiver；具体属性或方法操作仍必须拥有受支持的 Shell Entry 或精确 NativeImport。struct/enum writeback、actor executor 与 static/class metatype ABI 不会被猜测模拟，当前需要正常构建。
@@ -124,7 +126,7 @@ struct ProfileScreen: View {
 
 默认工作流面向 Dev Shell 中已经存在、且字节码后端支持的声明 body。原 Swift access control 会保留，但源码可见并不自动创造 VM capability；每个原生操作还必须通过 eligible Entry 或精确 NativeImport 解析。受支持的局部 closure 与已经索引的同 image helper 可以使用同步 `@escaping` 参数、内部 closure 返回和嵌套 closure 捕获；closure 仍不能跨 Shell/Native 边界，也不能活过当前固定的 VM invocation。
 
-当前生成器不会自动收集任意新增的文件级函数、类型、extension 或 Swift 文件，也会拒绝 stored layout、函数签名、泛型约束、isolation、superclass、conformance、enum case、source membership、Build Settings、macro/plugin 输入、链接依赖、asset、storyboard 和生成资源变化。这些修改需要正常构建，必要时重新安装。
+当前生成器会收集现有受监视源码文件中新增、且能从变化 root 到达的普通函数与 class private 实例方法；仅仅声明但不可达的内容不会进入补丁，也不会因此新增源码文件或原生 ABI 表面。stored layout、函数签名、泛型约束、isolation、superclass、conformance、enum case、source membership、Build Settings、macro/plugin 输入、链接依赖、asset、storyboard 和生成资源变化仍需要正常构建，必要时重新安装。
 
 补丁内非递归 struct/enum 在声明已经随 Shell 存在于文件/module scope 时受支持。函数内部声明的 nominal type 在当前 textual SIL 合同中没有冻结的声明身份，因此会用精确类型名拒绝；应先移到文件 scope 并正常构建一次。
 

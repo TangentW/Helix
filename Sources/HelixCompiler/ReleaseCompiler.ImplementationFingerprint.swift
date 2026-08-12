@@ -2,9 +2,9 @@ import HelixCore
 
 extension ReleaseCompiler {
 public enum ImplementationFingerprint {
-    /// Computes the versioned implementation fingerprint for a root with no
-    /// compiler-generated dependencies. Indexer uses this for typed clients
-    /// that provide one declaration at a time.
+    /// Computes the versioned implementation fingerprint for a root whose
+    /// transitive implementation graph is unavailable. Indexer uses this for
+    /// typed clients that provide one declaration at a time.
     public static func compute(
         symbol: String,
         loweredType: String,
@@ -21,7 +21,8 @@ public enum ImplementationFingerprint {
     public static func compute(
         root: CanonicalSIL.Function,
         in file: CanonicalSIL.File,
-        archivedSymbols: Set<String>
+        archivedSymbols: Set<String>,
+        imageLocalSymbols: Set<String> = []
     ) -> Core.Digest {
         var functions: [String: CanonicalSIL.Function] = [root.mangledName: root]
         var pending = referencedSymbols(in: root.body).sorted()
@@ -30,7 +31,7 @@ public enum ImplementationFingerprint {
         while let symbol = pending.popLast() {
             guard visited.insert(symbol).inserted,
                   !archivedSymbols.contains(symbol),
-                  isCompilerGeneratedSymbol(symbol),
+                  isCompilerGeneratedSymbol(symbol) || imageLocalSymbols.contains(symbol),
                   let function = file.function(mangledName: symbol)
             else { continue }
             functions[symbol] = function

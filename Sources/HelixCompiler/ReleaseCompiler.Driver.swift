@@ -87,7 +87,7 @@ extension ReleaseCompiler {
                 "function \(key) changed its lowered Swift/SIL signature"
             case .noSemanticChanges: "no selected function body differs from the HLXI baseline"
             case let .generatedFunctionUnsupported(symbol, reason):
-                "compiler-generated function \(symbol) is outside the current HLBC profile: \(reason)"
+                "image-local function \(symbol) is outside the current HLBC profile: \(reason)"
             case let .toolchainMismatch(expected, actual):
                 "exact Swift toolchain mismatch; HLXI requires \(expected), current compiler is \(actual)"
             case let .compilerIdentityFailed(reason): "cannot fingerprint Swift compiler: \(reason)"
@@ -469,30 +469,35 @@ extension ReleaseCompiler {
                 localFunctionIDs[item.record.key] = .init(rawValue: rawValue)
             }
             let compilationSymbols = Set(changedSIL.map(\.record.mangledName))
-            let optimizedGenerated = try discoverGeneratedFunctions(
+            let optimizedImageFunctions = try discoverImageFunctions(
                 in: silFile,
                 startingAt: compilationSymbols,
-                archive: request.archive
+                archive: request.archive,
+                moduleName: moduleName,
+                typeEnvironment: silTypeEnvironment
             )
-            let semanticGenerated = try discoverGeneratedFunctions(
+            let semanticImageFunctions = try discoverImageFunctions(
                 in: loweringSILFile,
                 startingAt: compilationSymbols,
-                archive: request.archive
+                archive: request.archive,
+                moduleName: moduleName,
+                typeEnvironment: loweringTypeEnvironment
             )
-            let generatedSymbols = Set(optimizedGenerated.keys)
-                .union(semanticGenerated.keys)
+            let imageSymbols = Set(optimizedImageFunctions.keys)
+                .union(semanticImageFunctions.keys)
                 .sorted()
-            var generatedFunctions: [GeneratedFunction] = []
-            var generatedBindings: [CanonicalSIL.DirectCallBinding] = []
-            for (offset, symbol) in generatedSymbols.enumerated() {
+            let imageLocalSymbols = Set(imageSymbols)
+            var imageFunctions: [ImageFunction] = []
+            var imageBindings: [CanonicalSIL.DirectCallBinding] = []
+            for (offset, symbol) in imageSymbols.enumerated() {
                 let rawID = changedSIL.count.addingReportingOverflow(offset)
                 guard !rawID.overflow, let id = UInt32(exactly: rawID.partialValue) else {
                     throw DriverError.sourceSetMismatch(
-                        "too many archived and compiler-generated functions for HLBC"
+                        "too many archived and image-local functions for HLBC"
                     )
                 }
-                let optimized = optimizedGenerated[symbol]
-                let semantic = semanticGenerated[symbol]
+                let optimized = optimizedImageFunctions[symbol]
+                let semantic = semanticImageFunctions[symbol]
                 let selected = optimized ?? semantic
                 guard let selected else {
                     throw DriverError.generatedFunctionUnsupported(
@@ -534,7 +539,7 @@ extension ReleaseCompiler {
                     )
                 }
                 let functionID = Bytecode.FunctionID(rawValue: id)
-                generatedFunctions.append(
+                imageFunctions.append(
                     .init(
                         symbol: symbol,
                         id: functionID,
@@ -544,7 +549,7 @@ extension ReleaseCompiler {
                         semantic: semantic?.function
                     )
                 )
-                generatedBindings.append(
+                imageBindings.append(
                     .init(
                         mangledName: symbol,
                         parameterTypes: signature.parameters,
@@ -558,7 +563,7 @@ extension ReleaseCompiler {
             let directCalls = try PatchCompiler.DirectCalls.make(
                 archive: request.archive,
                 localFunctionIDs: localFunctionIDs,
-                additionalBindings: generatedBindings
+                additionalBindings: imageBindings
             )
             var changed: [(
                 record: InterfaceArchive.FunctionRecord,
@@ -599,14 +604,25 @@ extension ReleaseCompiler {
                 else {
                     throw DriverError.loweredSignatureChanged(item.record.key)
                 }
-                changed.append((item.record, lowered, item.fingerprint))
+                changed.append(
+                    (
+                        item.record,
+                        lowered,
+                        ReleaseCompiler.ImplementationFingerprint.compute(
+                            root: item.function,
+                            in: silFile,
+                            archivedSymbols: archivedSymbols,
+                            imageLocalSymbols: imageLocalSymbols
+                        )
+                    )
+                )
             }
 
-            var generatedLowered: [(
+            var imageLowered: [(
                 id: Bytecode.FunctionID,
                 function: IntermediateRepresentation.Function
             )] = []
-            for item in generatedFunctions {
+            for item in imageFunctions {
                 let lowered: IntermediateRepresentation.Function
                 do {
                     if let optimized = item.optimized {
@@ -672,7 +688,7 @@ extension ReleaseCompiler {
                         reason: "lowering changed its discovered concrete signature"
                     )
                 }
-                generatedLowered.append((item.id, lowered))
+                imageLowered.append((item.id, lowered))
             }
 
             var entries: [Bytecode.EntryPoint] = []
@@ -704,7 +720,7 @@ extension ReleaseCompiler {
                 )
                 fingerprints[item.record.key] = item.fingerprint
             }
-            loweredByID.append(contentsOf: generatedLowered)
+            loweredByID.append(contentsOf: imageLowered)
             let reachableIDs = reachableFunctions(
                 roots: Set(entries.map(\.functionID)),
                 functions: loweredByID
@@ -765,19 +781,19 @@ extension ReleaseCompiler {
             )
         }
 
-        private typealias DiscoveredGeneratedFunction =
-            CanonicalSIL.GeneratedFunctions.Discovered
+        private typealias DiscoveredImageFunction =
+            CanonicalSIL.ImageFunctions.Discovered
 
-        private struct GeneratedFunction {
+        private struct ImageFunction {
             var symbol: String
             var id: Bytecode.FunctionID
             var kind: Bytecode.FunctionKind
-            var signature: GeneratedSignature
+            var signature: ImageSignature
             var optimized: CanonicalSIL.Function?
             var semantic: CanonicalSIL.Function?
         }
 
-        private typealias GeneratedSignature = CanonicalSIL.GeneratedFunctions.Signature
+        private typealias ImageSignature = CanonicalSIL.ImageFunctions.Signature
 
         private func isLocalArchivedHelper(
             _ record: InterfaceArchive.FunctionRecord
@@ -815,21 +831,29 @@ extension ReleaseCompiler {
             return false
         }
 
-        private func discoverGeneratedFunctions(
+        private func discoverImageFunctions(
             in file: CanonicalSIL.File,
             startingAt archivedSymbols: Set<String>,
-            archive: InterfaceArchive.Archive
-        ) throws -> [String: DiscoveredGeneratedFunction] {
+            archive: InterfaceArchive.Archive,
+            moduleName: String,
+            typeEnvironment: CanonicalSIL.TypeEnvironment
+        ) throws -> [String: DiscoveredImageFunction] {
             do {
-                return try CanonicalSIL.GeneratedFunctions.discover(
+                return try CanonicalSIL.ImageFunctions.discover(
                     in: file,
                     startingAt: archivedSymbols,
                     excluding: Set(archive.functions.map(\.mangledName)),
                     kindForSymbol: { symbol in
-                        generatedFunctionKind(symbol, archive: archive)
+                        generatedFunctionKind(
+                            symbol,
+                            archive: archive,
+                            moduleName: moduleName,
+                            typeEnvironment: typeEnvironment,
+                            file: file
+                        )
                     }
                 )
-            } catch let error as CanonicalSIL.GeneratedFunctions.DiscoveryError {
+            } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
                 switch error {
                 case let .unsupported(symbol, reason):
                     throw DriverError.generatedFunctionUnsupported(symbol, reason: reason)
@@ -841,14 +865,14 @@ extension ReleaseCompiler {
             of function: CanonicalSIL.Function,
             environment: CanonicalSIL.TypeEnvironment,
             symbol: String
-        ) throws -> GeneratedSignature {
+        ) throws -> ImageSignature {
             do {
-                return try CanonicalSIL.GeneratedFunctions.signature(
+                return try CanonicalSIL.ImageFunctions.signature(
                     of: function,
                     environment: environment,
                     symbol: symbol
                 )
-            } catch let error as CanonicalSIL.GeneratedFunctions.DiscoveryError {
+            } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
                 switch error {
                 case let .unsupported(symbol, reason):
                     throw DriverError.generatedFunctionUnsupported(symbol, reason: reason)
@@ -858,8 +882,21 @@ extension ReleaseCompiler {
 
         private func generatedFunctionKind(
             _ symbol: String,
-            archive: InterfaceArchive.Archive
+            archive: InterfaceArchive.Archive,
+            moduleName: String,
+            typeEnvironment: CanonicalSIL.TypeEnvironment,
+            file: CanonicalSIL.File
         ) -> Bytecode.FunctionKind? {
+            guard !typeEnvironment.isStructFactory(symbol),
+                  file.function(mangledName: symbol).map(
+                      typeEnvironment.hasStructFactorySignature
+                  ) != true,
+                  file.function(mangledName: symbol)?.hasNominalValueConstructorABI != true
+            else { return nil }
+            let isRooted = archive.functions.contains {
+                symbol != $0.mangledName && symbol.hasPrefix($0.mangledName)
+            }
+            let isModuleLocal = CanonicalSIL.SymbolIdentity.moduleName(of: symbol) == moduleName
             if ReleaseCompiler.ImplementationFingerprint
                 .isDefaultArgumentGenerator(symbol) {
                 return .concreteSpecialization
@@ -869,16 +906,15 @@ extension ReleaseCompiler {
             if symbol.contains("fA"), symbol.contains("cfU") || symbol.contains("fU") {
                 return .closureBody
             }
-            guard archive.functions.contains(where: {
-                symbol != $0.mangledName && symbol.hasPrefix($0.mangledName)
-            }) else { return nil }
-            if symbol.contains("_Tg") || symbol.contains("Tf") {
+            if (isRooted || isModuleLocal),
+               symbol.contains("_Tg") || symbol.contains("Tf") {
                 return .concreteSpecialization
             }
-            if symbol.contains("cfU") || symbol.contains("fU") {
+            if (isRooted || isModuleLocal),
+               symbol.contains("cfU") || symbol.contains("fU") {
                 return .closureBody
             }
-            return nil
+            return isModuleLocal ? .ordinary : nil
         }
 
         private func reachableFunctions(

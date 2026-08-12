@@ -130,9 +130,11 @@ Live Reload acceptance run.
   native machine code and do not use a JIT.
 - A production patch may call only same-image functions, eligible Shell entries,
   and exact NativeImports already emitted into the released App.
-- Live Reload currently targets bodies of declarations already present in the
-  Dev Shell. New arbitrary file-level declarations and new Swift files require a
-  normal build.
+- Live Reload starts from declarations already present in the Dev Shell, but a
+  changed body may introduce reachable same-module ordinary functions or
+  private instance methods in an existing source file. Helix links that closed
+  implementation graph into the same HLBC image. New source files and new ABI
+  surface still require a normal build.
 - Stored-layout, function-signature, superclass, conformance, enum-case,
   isolation, source-membership, linked-dependency, and build-setting changes
   require a normal build.

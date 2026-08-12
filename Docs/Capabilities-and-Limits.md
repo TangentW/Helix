@@ -123,13 +123,14 @@ machine code.
 | Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM |
 | Change a struct/enum/actor instance method or a static/class method | Rejected until value writeback, executor, and metatype ABI are implemented |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
+| Add an ordinary top-level helper or private class instance method in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |
 | Use a supported local closure or an already indexed same-image helper with an `@escaping` closure parameter | Lowered into the same image; closure return/capture is allowed only inside the pinned VM invocation |
 | Use `for value in lower..<upper` where both bounds are `Int` | Supported with Swift's precondition that `lower <= upper`; other range families require a full build |
 | Use a one-grapheme Character literal in supported `String.contains` | Supported as a compiler-only String representation; general Character storage/API is not implied |
 | Declare a patch-local struct or enum | Supported at file/module scope; a function-local nominal is rejected with an exact type diagnostic |
-| Add an arbitrary file-level helper/type/extension or a new Swift file | Not collected by the current generator; full build required |
+| Add an unrelated declaration, a new native ABI surface, or a new Swift file | Not collected merely by existence; a source-membership or native ABI change requires a full build |
 | Change a stored property, signature, generic constraint, actor isolation, superclass, conformance, or enum case | Rejected; full build required |
 | Change default-argument behavior | A fully concrete generator is patched with eligible archived callers in one complete module; cross-module public/package defaults, an ineligible caller, or a generic ABI require a full build |
 | Change a static/global initializer | Existing initialized state is not replayed automatically |

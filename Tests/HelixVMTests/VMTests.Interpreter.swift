@@ -732,11 +732,11 @@ struct Interpreter {
         )
     }
 
-    @Test("Recursive calls share the root depth budget")
+    @Test("Recursive calls use the explicit frame stack and share the root depth budget")
     func recursionSharesDepthBudget() throws {
         let limits = Core.ResourceLimits(
             instructionFuelPerEntry: 1_000,
-            maxCallDepth: 4,
+            maxCallDepth: 64,
             maxWallTimeMainThreadMilliseconds: 1_000
         )
         let function = Bytecode.Function(
@@ -2140,9 +2140,43 @@ struct Interpreter {
             ]
         )
 
+        let forwardingCallee = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "forwardingMayFail",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.bool, .int64, .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .tryApply(
+                            function: .init(rawValue: 2),
+                            arguments: [.init(rawValue: 0)],
+                            normalTarget: .init(rawValue: 1),
+                            errorTarget: .init(rawValue: 2)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 1)],
+                    instructions: [.returnValue(.init(rawValue: 1))]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 2)],
+                    instructions: [.throwError(.init(rawValue: 2))]
+                ),
+            ],
+            effects: .init(mayThrow: true)
+        )
+
         func callee(failure: Bytecode.Instruction) -> Bytecode.Function {
             Bytecode.Function(
-                id: .init(rawValue: 1),
+                id: .init(rawValue: 2),
                 name: "mayFail",
                 parameterRegisters: [.init(rawValue: 0)],
                 resultType: .int64,
@@ -2190,7 +2224,10 @@ struct Interpreter {
             signature: .init(parameters: ["Swift.Bool"], result: "Swift.Int"),
             parameterTypes: [.bool],
             resultType: .int64,
-            additionalFunctions: [callee(failure: .throwError(.init(rawValue: 1)))]
+            additionalFunctions: [
+                forwardingCallee,
+                callee(failure: .throwError(.init(rawValue: 1))),
+            ]
         )
         #expect(
             VM.Interpreter().invoke(
@@ -2213,7 +2250,10 @@ struct Interpreter {
             signature: .init(parameters: ["Swift.Bool"], result: "Swift.Int"),
             parameterTypes: [.bool],
             resultType: .int64,
-            additionalFunctions: [callee(failure: .trap(.explicit("fatal fixture")))]
+            additionalFunctions: [
+                forwardingCallee,
+                callee(failure: .trap(.explicit("fatal fixture"))),
+            ]
         )
         #expect(
             VM.Interpreter().invoke(
