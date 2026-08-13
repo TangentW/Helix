@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="980" viewBox="0 0 1440 980" role="img" aria-labelledby="title description">
+  <title id="title">Helix system architecture</title>
+  <desc id="description">Production Hot Patch and Development Live Reload use isolated delivery, trust, and lifetime boundaries while sharing the Swift compiler pipeline, HLBC bytecode, verifier, HLVM virtual machine, exact bridges, and immutable generation routing.</desc>
+
+  <defs>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <path d="M 28 0 L 0 0 0 28" class="grid-line" fill="none"/>
+    </pattern>
+    <marker id="arrowNeutral" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-neutral-fill"/>
+    </marker>
+    <marker id="arrowCoral" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-coral-fill"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-blue-fill"/>
+    </marker>
+  </defs>
+
+  <style>
+    :root { color-scheme: light dark; }
+    text {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      text-rendering: geometricPrecision;
+    }
+    .canvas { fill: #f6f8fa; stroke: #d0d7de; }
+    .grid-line { stroke: #d8dee4; stroke-width: 1; opacity: 0.32; }
+    .panel { fill: #ffffff; stroke: #d0d7de; stroke-width: 1.5; }
+    .subpanel { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.25; }
+    .node { fill: #ffffff; stroke: #c7ced6; stroke-width: 1.25; }
+    .shared-panel { fill: #ffffff; stroke: #8c99a8; stroke-width: 1.5; }
+    .coral-soft { fill: #fff0ed; }
+    .blue-soft { fill: #eaf2ff; }
+    .coral-line { stroke: #ff6b57; }
+    .blue-line { stroke: #176bff; }
+    .neutral-line { stroke: #7d8998; }
+    .divider { stroke: #d8dee4; stroke-width: 1; }
+    .dash { stroke-dasharray: 6 7; }
+    .arrow-neutral-fill { fill: #7d8998; }
+    .arrow-coral-fill { fill: #ff6b57; }
+    .arrow-blue-fill { fill: #176bff; }
+    .title { fill: #071b3d; font-size: 34px; font-weight: 750; letter-spacing: -0.5px; }
+    .subtitle { fill: #576577; font-size: 16px; }
+    .eyebrow { fill: #176bff; font-size: 13px; font-weight: 750; letter-spacing: 2.4px; }
+    .lane-title { fill: #172b4d; font-size: 23px; font-weight: 750; }
+    .lane-kicker { font-size: 12px; font-weight: 750; letter-spacing: 1.6px; }
+    .coral-text { fill: #c43f31; }
+    .blue-text { fill: #0f58cf; }
+    .label { fill: #69788a; font-size: 11px; font-weight: 750; letter-spacing: 1.2px; }
+    .value { fill: #172b4d; font-size: 17px; font-weight: 700; }
+    .detail { fill: #657487; font-size: 13px; }
+    .section-title { fill: #172b4d; font-size: 18px; font-weight: 750; }
+    .section-detail { fill: #657487; font-size: 13px; }
+    .node-title { fill: #172b4d; font-size: 15px; font-weight: 750; }
+    .node-detail { fill: #657487; font-size: 12px; }
+    .term { fill: #176bff; font-size: 18px; font-weight: 800; letter-spacing: 0.4px; }
+    .badge { fill: #eef2f6; stroke: #d0d7de; stroke-width: 1; }
+    .badge-text { fill: #526174; font-size: 11px; font-weight: 750; letter-spacing: 0.7px; }
+
+    @media (prefers-color-scheme: dark) {
+      .canvas { fill: #0d1117; stroke: #30363d; }
+      .grid-line { stroke: #30363d; opacity: 0.34; }
+      .panel { fill: #161b22; stroke: #30363d; }
+      .subpanel { fill: #0d1117; stroke: #30363d; }
+      .node { fill: #161b22; stroke: #3d444d; }
+      .shared-panel { fill: #161b22; stroke: #59636e; }
+      .coral-soft { fill: #341d20; }
+      .blue-soft { fill: #10233f; }
+      .coral-line { stroke: #ff7b72; }
+      .blue-line { stroke: #58a6ff; }
+      .neutral-line { stroke: #768390; }
+      .divider { stroke: #30363d; }
+      .arrow-neutral-fill { fill: #768390; }
+      .arrow-coral-fill { fill: #ff7b72; }
+      .arrow-blue-fill { fill: #58a6ff; }
+      .title { fill: #f0f6fc; }
+      .subtitle { fill: #9da7b3; }
+      .eyebrow { fill: #58a6ff; }
+      .lane-title, .value, .section-title, .node-title { fill: #e6edf3; }
+      .coral-text { fill: #ff7b72; }
+      .blue-text, .term { fill: #58a6ff; }
+      .label, .detail, .section-detail, .node-detail { fill: #9da7b3; }
+      .badge { fill: #21262d; stroke: #3d444d; }
+      .badge-text { fill: #b1bac4; }
+    }
+  </style>
+
+  <rect x="1" y="1" width="1438" height="978" rx="28" class="canvas"/>
+  <rect x="1" y="1" width="1438" height="978" rx="28" fill="url(#grid)"/>
+
+  <text x="720" y="48" text-anchor="middle" class="eyebrow">HELIX SYSTEM ARCHITECTURE</text>
+  <text x="720" y="86" text-anchor="middle" class="title">Two workflows. One virtual machine core.</text>
+  <text x="720" y="116" text-anchor="middle" class="subtitle">Ordinary Swift stays the authoring model; delivery, trust, and lifetime remain workflow-specific.</text>
+
+  <!-- Production Hot Patch -->
+  <rect x="50" y="150" width="650" height="350" rx="22" class="panel"/>
+  <rect x="50" y="150" width="9" height="350" rx="4.5" class="coral-soft"/>
+  <rect x="50" y="150" width="9" height="350" rx="4.5" fill="#ff6b57"/>
+  <text x="84" y="183" class="lane-kicker coral-text">RELEASE WORKFLOW</text>
+  <text x="84" y="211" class="lane-title">Production Hot Patch</text>
+  <rect x="505" y="171" width="161" height="30" rx="15" class="coral-soft"/>
+  <text x="585.5" y="191" text-anchor="middle" class="lane-kicker coral-text">PERSISTENT</text>
+
+  <line x1="82" y1="229" x2="668" y2="229" class="divider"/>
+  <text x="84" y="253" class="label">INPUT</text>
+  <text x="225" y="251" class="value">Release body edit</text>
+  <text x="225" y="270" class="detail">Shell — Prepared App Build · HLXI — Interface Archive</text>
+
+  <line x1="82" y1="286" x2="668" y2="286" class="divider"/>
+  <text x="84" y="316" class="label">ARTIFACT</text>
+  <text x="225" y="312" class="value">Signed .hlxp</text>
+  <text x="225" y="331" class="detail">Patch Package containing verified HLBC</text>
+
+  <line x1="82" y1="347" x2="668" y2="347" class="divider"/>
+  <text x="84" y="377" class="label">TRUST &amp; LIFE</text>
+  <text x="225" y="373" class="value">Policy-bound and persistent</text>
+  <text x="225" y="392" class="detail">Signature, health checks, revocation, and rollback</text>
+
+  <line x1="82" y1="408" x2="668" y2="408" class="divider"/>
+  <text x="84" y="438" class="label">APP MODULE</text>
+  <text x="225" y="434" class="value">HelixAppRuntime</text>
+  <text x="225" y="453" class="detail">Production client shipped inside the released App</text>
+
+  <!-- Development Live Reload -->
+  <rect x="740" y="150" width="650" height="350" rx="22" class="panel"/>
+  <rect x="740" y="150" width="9" height="350" rx="4.5" fill="#176bff"/>
+  <text x="774" y="183" class="lane-kicker blue-text">DEBUG WORKFLOW</text>
+  <text x="774" y="211" class="lane-title">Development Live Reload</text>
+  <rect x="1194" y="171" width="162" height="30" rx="15" class="blue-soft"/>
+  <text x="1275" y="191" text-anchor="middle" class="lane-kicker blue-text">EPHEMERAL</text>
+
+  <line x1="772" y1="229" x2="1358" y2="229" class="divider"/>
+  <text x="774" y="253" class="label">INPUT</text>
+  <text x="915" y="251" class="value">Editor save</text>
+  <text x="915" y="270" class="detail">Dev Shell + Build Manifest — Exact Debug context</text>
+
+  <line x1="772" y1="286" x2="1358" y2="286" class="divider"/>
+  <text x="774" y="316" class="label">ARTIFACT</text>
+  <text x="915" y="312" class="value">Authenticated live artifact</text>
+  <text x="915" y="331" class="detail">Session-bound HLBC for one exact App build</text>
+
+  <line x1="772" y1="347" x2="1358" y2="347" class="divider"/>
+  <text x="774" y="377" class="label">TRUST &amp; LIFE</text>
+  <text x="915" y="373" class="value">Pinned session, current process</text>
+  <text x="915" y="392" class="detail">Code activation, UIKit invalidation, or SwiftUI pulse</text>
+
+  <line x1="772" y1="408" x2="1358" y2="408" class="divider"/>
+  <text x="774" y="438" class="label">APP MODULE</text>
+  <text x="915" y="434" class="value">HelixDevAppRuntime</text>
+  <text x="915" y="453" class="detail">Authenticated Dev transport, diagnostics, and UI refresh</text>
+
+  <!-- Built-on connectors -->
+  <path d="M 375 500 L 375 535 L 512 535 L 512 558" fill="none" class="coral-line dash" stroke-width="2.25" marker-end="url(#arrowCoral)"/>
+  <path d="M 1065 500 L 1065 535 L 928 535 L 928 558" fill="none" class="blue-line dash" stroke-width="2.25" marker-end="url(#arrowBlue)"/>
+  <rect x="618" y="518" width="204" height="34" rx="17" class="badge"/>
+  <text x="720" y="540" text-anchor="middle" class="badge-text">BUILT ON THE SAME CORE</text>
+
+  <!-- Shared foundation -->
+  <rect x="50" y="558" width="1340" height="360" rx="22" class="shared-panel"/>
+  <text x="84" y="590" class="lane-kicker blue-text">SHARED FOUNDATION</text>
+  <text x="84" y="615" class="section-title">Build-specific compiler facts and verifier-enforced execution</text>
+
+  <!-- Shared compiler pipeline -->
+  <rect x="80" y="636" width="1280" height="112" rx="16" class="subpanel"/>
+  <text x="104" y="662" class="label">COMPILER PIPELINE · MAC</text>
+
+  <rect x="104" y="676" width="204" height="52" rx="11" class="node"/>
+  <text x="206" y="698" text-anchor="middle" class="node-title">Ordinary Swift</text>
+  <text x="206" y="716" text-anchor="middle" class="node-detail">Eligible implementation edit</text>
+
+  <path d="M 308 702 L 337 702" fill="none" class="neutral-line" stroke-width="2" marker-end="url(#arrowNeutral)"/>
+
+  <rect x="344" y="676" width="218" height="52" rx="11" class="node"/>
+  <text x="453" y="698" text-anchor="middle" class="node-title">Exact Swift Frontend</text>
+  <text x="453" y="716" text-anchor="middle" class="node-detail">Shell compiler + SDK context</text>
+
+  <path d="M 562 702 L 591 702" fill="none" class="neutral-line" stroke-width="2" marker-end="url(#arrowNeutral)"/>
+
+  <rect x="598" y="676" width="202" height="52" rx="11" class="node"/>
+  <text x="699" y="697" text-anchor="middle" class="term">HLIR</text>
+  <text x="699" y="716" text-anchor="middle" class="node-detail">Intermediate Representation</text>
+
+  <path d="M 800 702 L 829 702" fill="none" class="neutral-line" stroke-width="2" marker-end="url(#arrowNeutral)"/>
+
+  <rect x="836" y="676" width="202" height="52" rx="11" class="node"/>
+  <text x="937" y="697" text-anchor="middle" class="term">HLBC</text>
+  <text x="937" y="716" text-anchor="middle" class="node-detail">Typed Bytecode</text>
+
+  <path d="M 1038 702 L 1067 702" fill="none" class="neutral-line" stroke-width="2" marker-end="url(#arrowNeutral)"/>
+
+  <rect x="1074" y="676" width="262" height="52" rx="11" class="node"/>
+  <text x="1205" y="698" text-anchor="middle" class="node-title">Independent Verifier</text>
+  <text x="1205" y="716" text-anchor="middle" class="node-detail">Types · ownership · capabilities · limits</text>
+
+  <!-- Shared App execution core -->
+  <rect x="80" y="764" width="1280" height="126" rx="16" class="subpanel"/>
+  <text x="104" y="790" class="label">VERIFIED ACTIVATION &amp; EXECUTION CORE · APP</text>
+
+  <rect x="104" y="804" width="194" height="64" rx="11" class="node"/>
+  <text x="201" y="829" text-anchor="middle" class="node-title">Artifact Gate</text>
+  <text x="201" y="848" text-anchor="middle" class="node-detail">Target · trust · identity</text>
+
+  <path d="M 298 836 L 325 836" fill="none" class="neutral-line" stroke-width="2" marker-end="url(#arrowNeutral)"/>
+
+  <rect x="332" y="804" width="204" height="64" rx="11" class="node"/>
+  <text x="434" y="829" text-anchor="middle" class="node-title">HLBC Verifier</text>
+  <text x="434" y="848" text-anchor="middle" class="node-detail">Decode + semantic checks</text>
+
+  <path d="M 536 836 L 563 836" fill="none" class="neutral-line" stroke-width="2" marker-end="url(#arrowNeutral)"/>
+
+  <rect x="570" y="804" width="240" height="64" rx="11" class="node"/>
+  <text x="690" y="829" text-anchor="middle" class="node-title">Generation Routing</text>
+  <text x="690" y="848" text-anchor="middle" class="node-detail">Atomic activation + pinned lookup</text>
+
+  <path d="M 810 836 L 837 836" fill="none" class="neutral-line" stroke-width="2" marker-end="url(#arrowNeutral)"/>
+
+  <rect x="844" y="804" width="176" height="64" rx="11" class="node"/>
+  <text x="932" y="828" text-anchor="middle" class="term">HLVM</text>
+  <text x="932" y="848" text-anchor="middle" class="node-detail">Virtual Machine</text>
+
+  <path d="M 1020 836 L 1047 836" fill="none" class="neutral-line" stroke-width="2" marker-end="url(#arrowNeutral)"/>
+
+  <rect x="1054" y="804" width="282" height="64" rx="11" class="node"/>
+  <text x="1195" y="829" text-anchor="middle" class="node-title">Exact Native Bridges</text>
+  <text x="1195" y="848" text-anchor="middle" class="node-detail">Predeclared NativeImports</text>
+
+  <!-- Guardrail badges -->
+  <rect x="140" y="934" width="138" height="28" rx="14" class="badge"/>
+  <text x="209" y="952" text-anchor="middle" class="badge-text">NO JIT</text>
+  <rect x="304" y="934" width="258" height="28" rx="14" class="badge"/>
+  <text x="433" y="952" text-anchor="middle" class="badge-text">NO DOWNLOADED SWIFT SOURCE</text>
+  <rect x="588" y="934" width="252" height="28" rx="14" class="badge"/>
+  <text x="714" y="952" text-anchor="middle" class="badge-text">NO DOWNLOADED NATIVE CODE</text>
+  <rect x="866" y="934" width="300" height="28" rx="14" class="badge"/>
+  <text x="1016" y="952" text-anchor="middle" class="badge-text">BUILD-SPECIFIC IDENTITY + CAPABILITIES</text>
+  <rect x="1192" y="934" width="108" height="28" rx="14" class="badge"/>
+  <text x="1246" y="952" text-anchor="middle" class="badge-text">FAIL CLOSED</text>
+</svg>

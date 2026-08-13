@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 260" role="img" aria-labelledby="title description">
+  <title id="title">HELIX</title>
+  <desc id="description">The Helix brand mark and HELIX wordmark.</desc>
+  <style>
+    .ink-stroke { stroke: #071b3d; }
+    .ink-fill { fill: #071b3d; }
+    @media (prefers-color-scheme: light) {
+      .ink-stroke { stroke: #071b3d; }
+      .ink-fill { fill: #071b3d; }
+    }
+    @media (prefers-color-scheme: dark) {
+      .ink-stroke { stroke: #f0f6fc; }
+      .ink-fill { fill: #f0f6fc; }
+    }
+  </style>
+
+  <g transform="translate(106 21) scale(.68)">
+    <g fill="none" stroke-linecap="butt" stroke-width="54">
+      <path d="M72 102 C152.24 99.28 191.79 157.13 278.06 194.44" class="ink-stroke"/>
+      <path d="M278.06 194.44 C300.89 204.31 327 212.75 358.01 218.24" stroke="#ff6b57"/>
+      <path d="M358.01 218.24 C382.12 222.51 409.2 225 440 225" stroke="#176bff"/>
+      <path d="M72 225 C190 225 220 98 440 102" stroke="#176bff"/>
+    </g>
+    <g fill="#176bff">
+      <circle cx="72" cy="225" r="27"/>
+      <circle cx="440" cy="102" r="27"/>
+      <circle cx="440" cy="225" r="27"/>
+    </g>
+    <circle cx="72" cy="102" r="27" class="ink-fill"/>
+  </g>
+
+  <text x="492" y="145" dominant-baseline="middle" class="ink-fill"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="128" font-weight="800" letter-spacing="2">HELIX</text>
+</svg>
