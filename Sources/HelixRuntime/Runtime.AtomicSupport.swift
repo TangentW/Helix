@@ -1,4 +1,6 @@
+#if canImport(HelixCore)
 import HelixRuntimeSupport
+#endif
 
 extension Runtime {
 final class AtomicFlag: @unchecked Sendable {

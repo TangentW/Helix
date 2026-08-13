@@ -1,8 +1,10 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixRuntime
 import HelixVerifier
+#endif
 
 /// Verified package activation, rollback, and revocation operations.
 public enum PatchActivation {}

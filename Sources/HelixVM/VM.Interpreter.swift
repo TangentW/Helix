@@ -1,7 +1,9 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixVerifier
+#endif
 
 private final class ExecutionTrace {
     var programCounter: VM.ProgramCounter?

@@ -1,7 +1,9 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixVM
+#endif
 
 extension Runtime {
 /// Original App implementation and ABI shape for one instrumented entry point.

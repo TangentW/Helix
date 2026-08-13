@@ -1,7 +1,9 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixVM
+#endif
 
 extension Runtime {
 /// Value codecs used by generated Shell bridges. Statically typed aggregates

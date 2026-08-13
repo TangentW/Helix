@@ -1,6 +1,8 @@
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixVM
+#endif
 
 extension Runtime {
 /// Trusted Swift standard-library operations installed by every current Shell.

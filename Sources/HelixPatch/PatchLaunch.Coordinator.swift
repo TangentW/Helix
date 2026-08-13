@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
 import HelixRuntime
+#endif
 
 /// Launch-time restoration, crash-loop rollback, and health confirmation.
 public enum PatchLaunch {}

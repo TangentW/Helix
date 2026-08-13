@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
 import HelixDevProtocol
+#endif
 
 /// Secure discovery and pairing configuration for development sessions.
 public enum DevConnection {}

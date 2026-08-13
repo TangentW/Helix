@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension PatchPackage {
 /// Payload execution format stored in a patch package.

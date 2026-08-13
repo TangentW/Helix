@@ -1,4 +1,6 @@
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 /// High-level entry points and metadata for Helix's App-side development runtime.
 public enum DevRuntime {}

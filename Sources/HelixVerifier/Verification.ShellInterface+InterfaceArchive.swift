@@ -1,4 +1,6 @@
+#if canImport(HelixCore)
 import HelixInterface
+#endif
 
 extension Verification.ShellInterface {
     public init(archive: InterfaceArchive.Archive) throws {

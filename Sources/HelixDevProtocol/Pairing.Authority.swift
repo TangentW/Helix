@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension Pairing {
 /// Security and lifetime policy enforced by ``Authority``.

@@ -55,7 +55,7 @@ end
 
 生产项目应固定 tag 或 commit。两份 podspec 以后也可放进私有 Specs 仓库，不要求发布到 CocoaPods trunk。CocoaPods 下的 App 源码 import `HelixAppRuntime` 或 `HelixDevAppRuntime`，因为每个 Pod 都是自包含的聚合 module。隐藏 Bridge 会在编译时自动选择 SwiftPM leaf module 或 CocoaPods 聚合 module，不增加业务配置。
 
-Feature target 不需要链接 Helix Runtime。Compiler、Build Tools、Dev Tools 与 `helix` CLI 只在 macOS 构建侧运行，不能进入 Release App bundle。仅本地 `:path` 开发需要按 [CocoaPods 说明](../CocoaPods/README.md)手动准备一次聚合源码；Git 和私有 spec 安装会自动执行。
+Feature target 不需要链接 Helix Runtime。Compiler、Build Tools、Dev Tools 与 `helix` CLI 只在 macOS 构建侧运行，不能进入 Release App bundle。Git、私有 spec 和本地 `:path` 都直接编译仓库中同一份 Runtime 源码，不再运行准备脚本或创建聚合源码目录；精确边界与验证命令见 [CocoaPods 说明](../CocoaPods/README.md)。
 
 ## 4. 打开 Helix 并选择工程
 

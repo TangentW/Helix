@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
+#endif
 
 extension VM {
 /// A frame-owned mutable cell. Its initializer is intentionally internal so

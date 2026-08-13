@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
 import HelixVM
+#endif
 
 extension Runtime {
 /// Result of asking Runtime to route one exact-ABI generated wrapper.

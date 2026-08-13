@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
+#endif
 
 extension VM {
 /// Shared mutable storage behind one patch-local class identity.

@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension InterfaceArchive {
 public struct DecodingLimits: Hashable, Sendable {

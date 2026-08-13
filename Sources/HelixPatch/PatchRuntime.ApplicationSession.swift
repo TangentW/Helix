@@ -1,7 +1,9 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
 import HelixRuntime
 import HelixVerifier
+#endif
 
 extension PatchRuntime {
 /// The application-owned entry point for production HLBC hot patching.

@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
 import HelixRuntime
+#endif
 
 /// Persistent health journal and crash-loop rollback policy.
 public enum CrashProtection {}

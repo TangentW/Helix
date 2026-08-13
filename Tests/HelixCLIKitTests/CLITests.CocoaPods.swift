@@ -4,153 +4,125 @@ import Testing
 extension CLITests {
 @Suite("CocoaPods distribution")
 struct CocoaPodsDistribution {
-    @Test("App-facing specs remain self-contained and manager-safe")
+    private static let productionSourceModules = [
+        "HelixCore", "HelixBytecode", "HelixInterface", "HelixVerifier",
+        "HelixVM", "HelixRuntime", "HelixPatch",
+    ]
+    private static let developmentSourceModules = productionSourceModules + [
+        "HelixLiveReloadAPI", "HelixDevProtocol", "HelixDevRuntime",
+    ]
+    private static let internalModules = Set(developmentSourceModules + [
+        "HelixRuntimeSupport",
+    ])
+
+    @Test("App-facing specs compile the checked-in Runtime source boundary")
     func podspecContracts() throws {
         let root = repositoryRoot()
-        let app = try String(
-            contentsOf: root.appendingPathComponent("HelixAppRuntime.podspec"),
-            encoding: .utf8
+        let app = try text(at: root.appendingPathComponent("HelixAppRuntime.podspec"))
+        let development = try text(
+            at: root.appendingPathComponent("HelixDevAppRuntime.podspec")
         )
-        let development = try String(
-            contentsOf: root.appendingPathComponent("HelixDevAppRuntime.podspec"),
-            encoding: .utf8
-        )
-        let ignore = try String(
-            contentsOf: root.appendingPathComponent(".gitignore"),
-            encoding: .utf8
+        let repositorySourceModules = try sourceModuleNames(
+            in: root.appendingPathComponent("Sources")
         )
 
-        try expectSpec(
+        expectSpec(
             app,
             product: "HelixAppRuntime",
-            generatedPath: "CocoaPods/Generated/HelixAppRuntime"
+            sourceModules: Self.productionSourceModules,
+            repositorySourceModules: repositorySourceModules
         )
-        try expectSpec(
+        expectSpec(
             development,
             product: "HelixDevAppRuntime",
-            generatedPath: "CocoaPods/Generated/HelixDevAppRuntime"
+            sourceModules: Self.developmentSourceModules,
+            repositorySourceModules: repositorySourceModules
         )
-        #expect(!app.contains("HelixDevRuntime"))
-        #expect(!app.contains("HelixLiveReloadAPI"))
-        #expect(ignore.split(separator: "\n").contains("/CocoaPods/Generated/"))
     }
 
-    @Test("Runtime source preparation is deterministic and product-isolated")
-    func preparesRuntimeSources() throws {
+    @Test("Every internal Runtime import is leaf-module-only")
+    func internalImportsAreConditional() throws {
         let root = repositoryRoot()
-        let output = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "helix-cocoapods-tests-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        defer { try? FileManager.default.removeItem(at: output) }
-        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
-
-        let appFirst = try prepare("HelixAppRuntime", root: root, output: output)
-        let development = try prepare("HelixDevAppRuntime", root: root, output: output)
-        let appSecond = try prepare("HelixAppRuntime", root: root, output: output)
-
-        #expect(appFirst == appSecond)
-        #expect(appFirst.product == "HelixAppRuntime")
-        #expect(appFirst.modules == [
-            "HelixCore", "HelixBytecode", "HelixInterface", "HelixVerifier",
-            "HelixVM", "HelixRuntime", "HelixPatch",
-        ])
-        #expect(development.product == "HelixDevAppRuntime")
-        #expect(development.modules.suffix(3) == [
-            "HelixLiveReloadAPI", "HelixDevProtocol", "HelixDevRuntime",
-        ])
-        #expect(Set(appFirst.files.keys).isSubset(of: Set(development.files.keys)))
-        #expect(
-            appFirst.files.keys.allSatisfy {
-                !$0.contains("HelixDev") && !$0.contains("HelixLiveReload")
-            }
-        )
-
-        for product in ["HelixAppRuntime", "HelixDevAppRuntime"] {
-            let productURL = output.appendingPathComponent(product, isDirectory: true)
-            for source in try swiftFiles(in: productURL) {
-                let text = try String(contentsOf: source, encoding: .utf8)
-                #expect(!text.split(separator: "\n").contains { line in
-                    line.trimmingCharacters(in: .whitespaces).hasPrefix("import Helix")
-                })
+        for module in Self.developmentSourceModules {
+            let directory = root.appendingPathComponent("Sources/\(module)")
+            let sources = try swiftFiles(in: directory)
+            #expect(!sources.isEmpty, "Runtime source module is empty: \(module)")
+            for source in sources {
+                try expectInternalImportsAreLeafModuleOnly(in: source)
             }
         }
-    }
-
-    @Test("Unknown products fail without creating an output")
-    func rejectsUnknownProduct() throws {
-        let root = repositoryRoot()
-        let output = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "helix-cocoapods-rejection-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        defer { try? FileManager.default.removeItem(at: output) }
-        let result = try runPreparation(
-            product: "HelixCompiler",
-            root: root,
-            output: output
-        )
-        #expect(result.status != 0)
-        #expect(result.standardError.contains("unknown CocoaPods product"))
-        #expect(!FileManager.default.fileExists(atPath: output.path))
     }
 
     private func expectSpec(
         _ source: String,
         product: String,
-        generatedPath: String
-    ) throws {
+        sourceModules: [String],
+        repositorySourceModules: [String]
+    ) {
         #expect(source.contains("spec.name = '\(product)'"))
         #expect(source.contains(":git => 'https://github.com/TangentW/Helix.git'"))
         #expect(source.contains(":tag => \"v#{spec.version}\""))
         #expect(source.contains("spec.static_framework = true"))
-        #expect(source.contains("prepare_runtime_sources.rb \(product)"))
-        #expect(source.contains("spec.source_files = '\(generatedPath)/**/*.{swift,c,h}'"))
         #expect(source.contains("-package-name Helix"))
-        #expect(!source.contains("Sources/HelixCompiler"))
-        #expect(!source.contains("Sources/HelixHub"))
+        #expect(source.contains("Sources/HelixRuntimeSupport/RuntimeAtomic.c"))
+        #expect(source.contains("Sources/HelixRuntimeSupport/include/RuntimeAtomic.h"))
+        #expect(!source.contains("prepare_command"))
+        #expect(!source.contains("CocoaPods/Generated"))
+        let expectedModules = Set(sourceModules)
+        for module in repositorySourceModules where module != "HelixRuntimeSupport" {
+            let isIncluded = source.contains("'Sources/\(module)/**/*.swift'")
+            #expect(
+                isIncluded == expectedModules.contains(module),
+                "Unexpected \(product) source boundary for \(module)"
+            )
+        }
     }
 
-    private func prepare(
-        _ product: String,
-        root: URL,
-        output: URL
-    ) throws -> SourceManifest {
-        let result = try runPreparation(product: product, root: root, output: output)
-        #expect(result.status == 0)
-        let data = try Data(contentsOf: output
-            .appendingPathComponent(product)
-            .appendingPathComponent("CocoaPodsSourceManifest.json"))
-        return try JSONDecoder().decode(SourceManifest.self, from: data)
-    }
-
-    private func runPreparation(
-        product: String,
-        root: URL,
-        output: URL
-    ) throws -> ProcessResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = [
-            "ruby",
-            root.appendingPathComponent("CocoaPods/Scripts/prepare_runtime_sources.rb").path,
-            product,
-            "--output-root", output.path,
-        ]
-        process.currentDirectoryURL = root
-        let standardOutput = Pipe()
-        let standardError = Pipe()
-        process.standardOutput = standardOutput
-        process.standardError = standardError
-        try process.run()
-        let outputData = standardOutput.fileHandleForReading.readDataToEndOfFile()
-        let errorData = standardError.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return .init(
-            status: process.terminationStatus,
-            standardOutput: String(decoding: outputData, as: UTF8.self),
-            standardError: String(decoding: errorData, as: UTF8.self)
+    private func expectInternalImportsAreLeafModuleOnly(in source: URL) throws {
+        let lines = try text(at: source).split(
+            separator: "\n",
+            omittingEmptySubsequences: false
         )
+        var conditions: [String] = []
+        for line in lines {
+            let value = line.trimmingCharacters(in: .whitespaces)
+            if value.hasPrefix("#if ") {
+                conditions.append(value)
+            } else if value.hasPrefix("#elseif ") {
+                if !conditions.isEmpty { conditions[conditions.count - 1] = value }
+            } else if value == "#else" {
+                if !conditions.isEmpty { conditions[conditions.count - 1] = value }
+            } else if value == "#endif" {
+                if !conditions.isEmpty { conditions.removeLast() }
+            } else if value.hasPrefix("import ") {
+                let module = String(value.dropFirst("import ".count))
+                if Self.internalModules.contains(module) {
+                    #expect(
+                        conditions.contains("#if canImport(HelixCore)"),
+                        "Internal import is not leaf-module-only: \(source.path): \(value)"
+                    )
+                }
+            }
+        }
+        #expect(conditions.isEmpty, "Unbalanced conditional compilation in \(source.path)")
+    }
+
+    private func text(at url: URL) throws -> String {
+        try String(contentsOf: url, encoding: .utf8)
+    }
+
+    private func sourceModuleNames(in directory: URL) throws -> [String] {
+        let keys: [URLResourceKey] = [.isDirectoryKey]
+        return try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles]
+        ).compactMap { url in
+            guard try url.resourceValues(forKeys: Set(keys)).isDirectory == true else {
+                return nil
+            }
+            return url.lastPathComponent
+        }.sorted()
     }
 
     private func swiftFiles(in directory: URL) throws -> [URL] {
@@ -166,25 +138,7 @@ struct CocoaPodsDistribution {
                   try url.resourceValues(forKeys: Set(keys)).isRegularFile == true
             else { return nil }
             return url
-        }
-    }
-
-    private struct ProcessResult {
-        var status: Int32
-        var standardOutput: String
-        var standardError: String
-    }
-
-    private struct SourceManifest: Codable, Equatable {
-        struct FileEntry: Codable, Equatable {
-            var sourceSHA256: String
-            var generatedSHA256: String
-        }
-
-        var schemaVersion: Int
-        var product: String
-        var modules: [String]
-        var files: [String: FileEntry]
+        }.sorted { $0.path < $1.path }
     }
 }
 }

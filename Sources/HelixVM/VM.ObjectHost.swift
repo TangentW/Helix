@@ -1,4 +1,6 @@
+#if canImport(HelixCore)
 import HelixBytecode
+#endif
 
 extension VM {
 /// Runtime-owned bridge for local classes backed by an Objective-C instance.

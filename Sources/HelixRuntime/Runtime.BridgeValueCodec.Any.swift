@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixVM
+#endif
 
 extension Runtime.BridgeValueCodec {
 /// Encodes the supported standard-library subset of a dynamic Swift value.

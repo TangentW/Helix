@@ -20,11 +20,19 @@ Pod::Spec.new do |spec|
   spec.cocoapods_version = '>= 1.12'
   spec.module_name = 'HelixAppRuntime'
   spec.static_framework = true
-  spec.prepare_command = 'ruby CocoaPods/Scripts/prepare_runtime_sources.rb HelixAppRuntime'
-  spec.source_files = 'CocoaPods/Generated/HelixAppRuntime/**/*.{swift,c,h}'
-  spec.public_header_files = 'CocoaPods/Generated/HelixAppRuntime/HelixRuntimeSupport/*.h'
-  spec.header_mappings_dir = 'CocoaPods/Generated/HelixAppRuntime/HelixRuntimeSupport'
-  spec.preserve_paths = 'CocoaPods/Scripts/**/*'
+  spec.source_files = [
+    'Sources/HelixCore/**/*.swift',
+    'Sources/HelixBytecode/**/*.swift',
+    'Sources/HelixInterface/**/*.swift',
+    'Sources/HelixVerifier/**/*.swift',
+    'Sources/HelixVM/**/*.swift',
+    'Sources/HelixRuntime/**/*.swift',
+    'Sources/HelixPatch/**/*.swift',
+    'Sources/HelixRuntimeSupport/RuntimeAtomic.c',
+    'Sources/HelixRuntimeSupport/include/RuntimeAtomic.h'
+  ]
+  spec.public_header_files = 'Sources/HelixRuntimeSupport/include/*.h'
+  spec.header_mappings_dir = 'Sources/HelixRuntimeSupport/include'
   spec.frameworks = 'Foundation', 'CryptoKit'
   spec.pod_target_xcconfig = {
     'OTHER_SWIFT_FLAGS' => '$(inherited) -package-name Helix',

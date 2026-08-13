@@ -1,7 +1,9 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixVerifier
+#endif
 
 extension Runtime {
 /// Monotonic identity of one activated Runtime generation.

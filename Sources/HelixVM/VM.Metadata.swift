@@ -1,6 +1,8 @@
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixVerifier
+#endif
 
 public enum VM {}
 

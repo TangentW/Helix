@@ -1,9 +1,11 @@
 #if canImport(Network) && canImport(Security)
 import Foundation
 import Network
+#if canImport(HelixCore)
 import HelixCore
 import HelixDevProtocol
 import HelixLiveReloadAPI
+#endif
 
 extension DevConnection {
 /// Bounded retry, discovery, TLS, and pairing deadlines.

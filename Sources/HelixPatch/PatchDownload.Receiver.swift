@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 /// Bounded transports that stage package bytes in a ``PatchStore``.
 public enum PatchDownload {}

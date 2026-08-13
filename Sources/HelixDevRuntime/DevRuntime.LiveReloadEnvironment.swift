@@ -1,6 +1,8 @@
 #if canImport(UIKit) && canImport(SwiftUI)
+#if canImport(HelixCore)
 import HelixDevProtocol
 import HelixLiveReloadAPI
+#endif
 import SwiftUI
 import UIKit
 

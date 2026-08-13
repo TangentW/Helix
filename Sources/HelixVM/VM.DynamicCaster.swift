@@ -1,4 +1,6 @@
+#if canImport(HelixCore)
 import HelixBytecode
+#endif
 
 extension VM {
 struct DynamicCaster {

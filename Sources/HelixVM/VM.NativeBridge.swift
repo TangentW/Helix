@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
+#endif
 
 extension VM {
 public enum NativeInvocationResult: Equatable, Sendable {

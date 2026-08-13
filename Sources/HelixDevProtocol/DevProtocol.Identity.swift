@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
 import HelixLiveReloadAPI
+#endif
 
 extension DevProtocol {
 /// Stable identity of one linked development Shell.

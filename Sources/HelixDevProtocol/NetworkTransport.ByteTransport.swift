@@ -4,7 +4,9 @@ import Dispatch
 import Foundation
 import Network
 import Security
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 public enum NetworkTransport {}
 

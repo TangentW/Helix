@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension Runtime {
 /// Point-in-time view of generation routing and retained resource usage.

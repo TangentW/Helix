@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
 import HelixRuntime
+#endif
 
 /// App-side assembly helpers for the production-safe HLBC runtime graph.
 public enum PatchRuntime {}

@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension Pairing {
 /// How an invitation is intended to activate a development session.

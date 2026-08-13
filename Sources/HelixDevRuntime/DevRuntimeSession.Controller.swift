@@ -1,7 +1,9 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
 import HelixDevProtocol
 import HelixLiveReloadAPI
+#endif
 
 /// Authenticated App-side state machine for the Helix development protocol.
 public enum DevRuntimeSession {}

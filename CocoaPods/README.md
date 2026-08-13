@@ -47,35 +47,30 @@ The Hub-generated hidden Bridge detects this module shape automatically. It
 continues to import leaf modules when the App uses SwiftPM, so handwritten App
 and Feature code never references generated Bridge source.
 
-## Source preparation
+## Direct source compilation
 
-CocoaPods subspecs share one Swift module and therefore cannot model Helix's
-SwiftPM leaf-module graph. Each App-facing podspec runs
-`CocoaPods/Scripts/prepare_runtime_sources.rb` after a Git checkout and before
-CocoaPods collects source paths. The script deterministically copies only the
-selected runtime graph into `CocoaPods/Generated`, removes imports that became
-same-module references, and emits a SHA-256 manifest. Generated files are
-ignored by Git and are managed inside the dependency sandbox; they never gain
-membership in the application's own Xcode project.
+CocoaPods subspecs share one Swift module and therefore cannot reproduce
+Helix's SwiftPM leaf-module graph. Each App-facing podspec instead names the
+exact Runtime directories that belong to its aggregate and compiles those
+files directly from `Sources/`, the same source of truth used by SwiftPM.
 
-CocoaPods does not execute a podspec `prepare_command` for a local `:path`
-dependency. Contributors using that mode must prepare the selected product
-before `pod install`:
+Imports between SwiftPM leaf modules are guarded by a compiler module-
+availability check:
 
-```bash
-ruby CocoaPods/Scripts/prepare_runtime_sources.rb HelixAppRuntime
-# or
-ruby CocoaPods/Scripts/prepare_runtime_sources.rb HelixDevAppRuntime
+```swift
+#if canImport(HelixCore)
+import HelixCore
+#endif
 ```
 
-Direct Git and private-spec installations execute the command normally.
+SwiftPM therefore keeps its explicit module graph. CocoaPods omits only those
+same-module imports while compiling the unmodified declarations into the
+aggregate module. There is no prepare command, copied source tree, generated
+manifest, or special handling for a local `:path` dependency.
 
 ## Local validation
 
 ```bash
-ruby -c CocoaPods/Scripts/prepare_runtime_sources.rb
-ruby CocoaPods/Scripts/prepare_runtime_sources.rb HelixAppRuntime
-ruby CocoaPods/Scripts/prepare_runtime_sources.rb HelixDevAppRuntime
 pod lib lint HelixAppRuntime.podspec --platforms=ios
 pod lib lint HelixDevAppRuntime.podspec --platforms=ios
 ```

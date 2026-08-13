@@ -74,9 +74,10 @@ compile time without an application setting.
 
 The Feature target does not need a Helix runtime dependency. Build-side
 products and the `helix` executable run on macOS and must not enter a Release
-App bundle. Local `:path` development has one CocoaPods-specific preparation
-step documented in [CocoaPods/README.md](../CocoaPods/README.md); normal Git and
-private-spec installations perform it automatically.
+App bundle. Git, private-spec, and local `:path` installations all compile the
+same checked-in Runtime sources directly; no preparation command or generated
+source directory is involved. See [CocoaPods/README.md](../CocoaPods/README.md)
+for the exact source boundary and validation commands.
 
 ## 4. Open Helix and choose the project
 

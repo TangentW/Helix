@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
 import HelixVerifier
+#endif
 
 #if canImport(Darwin)
 import Darwin

@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension Runtime {
 /// Host-side limits applied while a generated Shell bridge materializes

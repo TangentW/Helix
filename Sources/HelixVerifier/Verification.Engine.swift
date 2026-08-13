@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
+#endif
 
 extension Verification {
 public struct Engine: Verification.ImageVerifying {

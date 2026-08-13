@@ -2,7 +2,9 @@
 import CryptoKit
 import Foundation
 import Security
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension NetworkTransport {
 /// TLS identity whose public-key pin can remain stable across certificates.

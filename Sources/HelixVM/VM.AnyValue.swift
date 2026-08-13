@@ -1,4 +1,6 @@
+#if canImport(HelixCore)
 import HelixBytecode
+#endif
 
 extension VM {
 /// A VM-owned existential. It deliberately stores a stable HLBC type rather

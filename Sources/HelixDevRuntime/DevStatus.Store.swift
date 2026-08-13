@@ -1,7 +1,9 @@
 import Combine
 import Foundation
+#if canImport(HelixCore)
 import HelixDevProtocol
 import HelixLiveReloadAPI
+#endif
 
 /// Observable, presentation-ready state for a Helix development session.
 public enum DevStatus {}

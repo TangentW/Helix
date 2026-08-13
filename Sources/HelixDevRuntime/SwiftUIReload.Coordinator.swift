@@ -1,6 +1,8 @@
 #if canImport(SwiftUI)
+#if canImport(HelixCore)
 import HelixDevProtocol
 import HelixLiveReloadAPI
+#endif
 import SwiftUI
 
 /// Development-time orchestration for SwiftUI Live Reload boundaries.

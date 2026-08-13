@@ -1,6 +1,8 @@
 #if canImport(UIKit)
 import Foundation
+#if canImport(HelixCore)
 import HelixLiveReloadAPI
+#endif
 import ObjectiveC
 import UIKit
 

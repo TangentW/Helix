@@ -1,6 +1,8 @@
 import CoreGraphics
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 #if canImport(UIKit)
 import UIKit

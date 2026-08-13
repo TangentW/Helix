@@ -1,11 +1,13 @@
 import CryptoKit
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixDevProtocol
 import HelixLiveReloadAPI
 import HelixRuntime
 import HelixVerifier
+#endif
 
 /// Validation, transfer, and activation primitives for development generations.
 public enum DevActivation {}

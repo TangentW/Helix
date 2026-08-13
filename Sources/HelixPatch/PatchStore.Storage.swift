@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
 import HelixRuntime
+#endif
 
 /// Durable, App-private state used by production patch verification and recovery.
 public enum PatchStore {}

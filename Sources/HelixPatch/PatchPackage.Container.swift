@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension PatchPackage {
 /// Hard ceilings applied before untrusted container fields are allocated.

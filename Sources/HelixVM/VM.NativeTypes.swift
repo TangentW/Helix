@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension VM {
 public enum NativeTypeKind: String, Hashable, Sendable {

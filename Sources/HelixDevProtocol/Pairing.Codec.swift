@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension Pairing {
 /// Canonical, length-prefixed framing used before a session secret exists.

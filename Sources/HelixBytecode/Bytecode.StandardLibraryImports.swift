@@ -1,4 +1,6 @@
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension Bytecode {
 /// Native imports supplied by Helix itself rather than by App configuration.

@@ -1,6 +1,8 @@
 import Darwin
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension PatchDownload {
 /// A bounded file-backed transport used by demos, tests, MDM drops, and other

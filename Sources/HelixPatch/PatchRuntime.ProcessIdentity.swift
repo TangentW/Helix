@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension PatchRuntime {
 /// Security-relevant facts measured from the running App process.

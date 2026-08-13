@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension Bytecode {
 public enum SectionKind: UInt32, Codable, Hashable, Sendable, Comparable, CaseIterable, CustomStringConvertible {

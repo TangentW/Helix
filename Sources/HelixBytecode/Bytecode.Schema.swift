@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension Bytecode {
 public struct FunctionID: RawRepresentable, Hashable, Codable, Sendable, Comparable, CustomStringConvertible {

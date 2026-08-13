@@ -1,8 +1,10 @@
 #if canImport(Network) && canImport(Security) && canImport(UIKit) && canImport(SwiftUI)
 import Foundation
+#if canImport(HelixCore)
 import HelixLiveReloadAPI
 import HelixRuntime
 import HelixVerifier
+#endif
 
 extension DevRuntime {
 /// App-owned composition root for development activation, UI refresh, and Hub pairing.

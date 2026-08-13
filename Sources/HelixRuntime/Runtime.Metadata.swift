@@ -1,7 +1,9 @@
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixVerifier
 import HelixVM
+#endif
 
 /// Execution, generation routing, and generated Bridge support for Helix code.
 public enum Runtime {}

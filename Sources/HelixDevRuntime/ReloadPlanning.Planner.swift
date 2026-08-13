@@ -1,5 +1,7 @@
+#if canImport(HelixCore)
 import HelixDevProtocol
 import HelixLiveReloadAPI
+#endif
 
 /// Conversion of compiler reload hints into deterministic per-type UI actions.
 public enum ReloadPlanning {}

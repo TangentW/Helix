@@ -1,5 +1,7 @@
 #if canImport(Network) && canImport(Security) && canImport(UIKit) && canImport(SwiftUI)
+#if canImport(HelixCore)
 import HelixDevProtocol
+#endif
 import SwiftUI
 
 extension DevRuntime {

@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
+#endif
 
 extension PatchPackage {
 /// Exact App and Shell identity used when selecting a package target.

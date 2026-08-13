@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixCore
 import HelixVM
+#endif
 
 extension Runtime {
 /// Internal invocation scope that pins one immutable generation across nested calls.

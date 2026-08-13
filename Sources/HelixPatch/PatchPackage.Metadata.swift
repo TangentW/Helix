@@ -1,7 +1,9 @@
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixRuntime
 import HelixVerifier
+#endif
 
 /// Signed patch-package models, trust policy, verification, and container I/O.
 ///

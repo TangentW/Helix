@@ -1,8 +1,10 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixVerifier
 import HelixVM
+#endif
 
 extension Runtime {
 /// Receives Runtime activation, rollback, and trap telemetry.

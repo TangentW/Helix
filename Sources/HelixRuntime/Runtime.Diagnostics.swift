@@ -1,6 +1,8 @@
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixVM
+#endif
 
 extension Runtime {
 /// A Runtime trap enriched with the active generation and logical Swift source.

@@ -1,7 +1,9 @@
 import Foundation
+#if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
 import HelixVM
+#endif
 
 extension Runtime.BridgeValueCodec {
 /// A per-dispatch encoder supplied to generated bridge code. It reserves the
