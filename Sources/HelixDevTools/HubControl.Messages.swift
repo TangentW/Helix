@@ -56,16 +56,31 @@ public enum Command: Codable, Hashable, Sendable {
         invitationID: DevProtocol.InvitationID,
         context: DevSession.BuildContext
     )
+    /// Read lifecycle and socket counts for the thin Hub UI.
+    case serviceSnapshot
+    /// List exact Build Contexts, optionally scoped to one project.
+    case buildContexts(workspacePathHash: Core.Digest?)
+    /// Create a short-lived code for explicit entry in an App debug page.
+    case createManualInvitation(workspacePathHash: Core.Digest?)
+    /// Invalidate a code displayed by the Hub UI.
+    case cancelManualInvitation(invitationID: DevProtocol.InvitationID)
+    /// List the active manual codes owned by the service.
+    case manualInvitations
 
     fileprivate func validate() throws {
         switch self {
-        case .reserveAutomaticInvitation:
+        case .reserveAutomaticInvitation, .serviceSnapshot,
+             .buildContexts, .createManualInvitation, .manualInvitations:
             break
         case let .registerAndActivate(invitationID, context):
             guard invitationID.rawValue != Self.zeroUUID else {
                 throw HubControl.Error.invalidMessage
             }
             try context.validate()
+        case let .cancelManualInvitation(invitationID):
+            guard invitationID.rawValue != Self.zeroUUID else {
+                throw HubControl.Error.invalidMessage
+            }
         }
     }
 
@@ -117,6 +132,11 @@ public struct Request: Codable, Hashable, Sendable {
 public enum Success: Codable, Hashable, Sendable {
     case automaticInvitationReserved(Pairing.Reservation)
     case automaticInvitationActivated(Pairing.Invitation)
+    case serviceSnapshot(DevSession.ServiceSnapshot)
+    case buildContexts([DevSession.BuildContext])
+    case manualInvitationCreated(DevSession.ManualInvitation)
+    case manualInvitationCancelled(DevProtocol.InvitationID)
+    case manualInvitations([DevSession.ManualInvitation])
 
     fileprivate func validate() throws {
         switch self {
@@ -130,8 +150,36 @@ public enum Success: Codable, Hashable, Sendable {
             guard invitation.kind == .automaticXcode else {
                 throw HubControl.Error.invalidMessage
             }
+        case let .serviceSnapshot(snapshot):
+            guard snapshot.openConnectionCount >= 0,
+                  snapshot.pendingPairingCount >= 0,
+                  snapshot.pendingPairingCount <= snapshot.openConnectionCount,
+                  (snapshot.state == .running) == (snapshot.endpoint != nil)
+            else { throw HubControl.Error.invalidMessage }
+        case let .buildContexts(contexts):
+            guard contexts.count <= 4_096,
+                  Set(contexts.map(\.shellIdentity.shellID)).count == contexts.count
+            else { throw HubControl.Error.invalidMessage }
+            try contexts.forEach { try $0.validate() }
+        case let .manualInvitationCreated(invitation):
+            try invitation.validate()
+        case let .manualInvitationCancelled(invitationID):
+            guard invitationID.rawValue != Self.zeroUUID else {
+                throw HubControl.Error.invalidMessage
+            }
+        case let .manualInvitations(invitations):
+            guard invitations.count <= 4_096,
+                  Set(invitations.map(\.reservation.invitationID)).count
+                    == invitations.count,
+                  Set(invitations.map(\.code)).count == invitations.count
+            else { throw HubControl.Error.invalidMessage }
+            try invitations.forEach { try $0.validate() }
         }
     }
+
+    private static let zeroUUID = UUID(
+        uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    )
 }
 
 /// Bounded failure safe to display in Xcode.

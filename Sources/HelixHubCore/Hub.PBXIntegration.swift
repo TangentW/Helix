@@ -1,0 +1,391 @@
+#if os(macOS)
+import Foundation
+import HelixBuildTools
+import HelixCore
+
+extension Hub {
+struct PBXIntegration {
+    struct Output {
+        var projectData: Data
+        var wrappers: [String: Data]
+        var patchTargetIDs: [String: String]
+    }
+
+    private let fileManager: FileManager
+
+    init(fileManager: FileManager = .default) {
+        self.fileManager = fileManager
+    }
+
+    func prepare(
+        plan: XcodeIntegration.HostPlan,
+        project: Hub.XcodeProject,
+        featureTargetNames: [String: String]
+    ) throws -> Output {
+        let projectFile = project.projectURL.appendingPathComponent("project.pbxproj")
+        let data = try boundedFile(projectFile, maximumBytes: Hub.OpenStep.maximumDocumentBytes)
+        var document = try Hub.PBXProjectDocument(data: data)
+        var wrappers: [String: Data] = [:]
+        var patchTargetIDs: [String: String] = [:]
+
+        for profile in plan.profiles {
+            let feature = try plan.feature(id: profile.featureID)
+            guard let featureTargetName = featureTargetNames[feature.id],
+                let featureTarget = project.target(named: featureTargetName),
+                let appTarget = project.target(named: profile.applicationTargetName)
+            else {
+                throw Hub.Error.integrationConflict(
+                    "profile \(profile.id) targets no longer match the Xcode project"
+                )
+            }
+            let featureWrapper = try configureBase(
+                role: "Feature",
+                target: featureTarget,
+                profile: profile,
+                generatedPath: "\(plan.integrationRoot)/Profiles/\(profile.id)/Feature.xcconfig",
+                plan: plan,
+                project: project,
+                document: &document
+            )
+            wrappers[featureWrapper.path] = featureWrapper.data
+            let appWrapper = try configureBase(
+                role: "Application",
+                target: appTarget,
+                profile: profile,
+                generatedPath: "\(plan.integrationRoot)/Profiles/\(profile.id)/Application.xcconfig",
+                plan: plan,
+                project: project,
+                document: &document
+            )
+            wrappers[appWrapper.path] = appWrapper.data
+
+            let bridgePhaseID = identifier(
+                component: "bridge-phase:\(profile.id):\(appTarget.id)"
+            )
+            try document.addObject(
+                bridgePhaseID,
+                isa: "PBXShellScriptBuildPhase",
+                fields: shellPhase(
+                    name: "Helix Bridge (Generated)",
+                    script: "/bin/sh \"$(HELIX_INTEGRATION_ROOT)/Profiles/\(profile.id)/bridge.sh\"",
+                    inputs: [],
+                    outputs: ["$(HELIX_BRIDGE_OBJECT)"],
+                    alwaysOutOfDate: true
+                )
+            )
+            var ownedAppPhases = [bridgePhaseID]
+            if let patch = profile.patch {
+                let trustPhaseID = identifier(
+                    component: "trust-phase:\(profile.id):\(appTarget.id)"
+                )
+                try document.addObject(
+                    trustPhaseID,
+                    isa: "PBXShellScriptBuildPhase",
+                    fields: shellPhase(
+                        name: "Embed Helix Trust Root (Generated)",
+                        script: "set -eu\n/usr/bin/install -m 0444 \"$SRCROOT/\(patch.trustedRootPath)\" \"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/HelixTrustedRoot.json\"\n",
+                        inputs: ["$(SRCROOT)/\(patch.trustedRootPath)"],
+                        outputs: ["$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/HelixTrustedRoot.json"],
+                        alwaysOutOfDate: false
+                    )
+                )
+                ownedAppPhases.append(trustPhaseID)
+                patchTargetIDs[profile.id] = try configurePatchAction(
+                    profile: profile,
+                    plan: plan,
+                    project: project,
+                    document: &document
+                )
+            }
+            try installOwnedPhases(
+                ownedAppPhases,
+                targetID: appTarget.id,
+                document: &document
+            )
+        }
+        return .init(
+            projectData: try document.serialized(),
+            wrappers: wrappers,
+            patchTargetIDs: patchTargetIDs
+        )
+    }
+
+    private func configureBase(
+        role: String,
+        target: Hub.XcodeTarget,
+        profile: XcodeIntegration.Profile,
+        generatedPath: String,
+        plan: XcodeIntegration.HostPlan,
+        project: Hub.XcodeProject,
+        document: inout Hub.PBXProjectDocument
+    ) throws -> (path: String, data: Data) {
+        let wrapperPath = "\(plan.integrationRoot)/ProjectConfigurations/\(profile.id)-\(role)-\(profile.configurationName).xcconfig"
+        let current = target.baseConfigurationPaths[profile.configurationName]
+        let original = try originalBaseConfiguration(
+            current: current,
+            wrapperPath: wrapperPath,
+            project: project
+        )
+        let contents = try wrapper(
+            originalPath: original == generatedPath ? nil : original,
+            generatedPath: generatedPath,
+            wrapperPath: wrapperPath
+        )
+        let referenceID = identifier(component: "xcconfig:\(wrapperPath)")
+        try document.addObject(
+            referenceID,
+            isa: "PBXFileReference",
+            fields: [
+                "lastKnownFileType": .string("text.xcconfig"),
+                "path": .string(wrapperPath),
+                "sourceTree": .string("SOURCE_ROOT"),
+            ]
+        )
+        let configurationID = try document.configurationID(
+            targetID: target.id,
+            named: profile.configurationName
+        )
+        try document.updateObject(configurationID) {
+            $0["baseConfigurationReference"] = .string(referenceID)
+        }
+        return (wrapperPath, Data(contents.utf8))
+    }
+
+    private func originalBaseConfiguration(
+        current: String?,
+        wrapperPath: String,
+        project: Hub.XcodeProject
+    ) throws -> String? {
+        guard current == wrapperPath else { return current }
+        let url = project.sourceRootURL.appendingPathComponent(wrapperPath)
+        let data = try boundedFile(url, maximumBytes: 1 * 1_024 * 1_024)
+        let text = String(decoding: data, as: UTF8.self)
+        let prefix = "// HELIX_ORIGINAL_BASE: "
+        guard let line = text.split(separator: "\n", omittingEmptySubsequences: false)
+            .first(where: { $0.hasPrefix(prefix) })
+        else {
+            throw Hub.Error.integrationConflict(
+                "existing generated xcconfig has no ownership metadata: \(wrapperPath)"
+            )
+        }
+        let encoded = String(line.dropFirst(prefix.count))
+        if encoded == "none" { return nil }
+        guard let bytes = Data(base64Encoded: encoded),
+              let path = String(data: bytes, encoding: .utf8),
+              isSafeRelativePath(path)
+        else {
+            throw Hub.Error.integrationConflict(
+                "existing generated xcconfig has invalid ownership metadata"
+            )
+        }
+        return path
+    }
+
+    private func wrapper(
+        originalPath: String?,
+        generatedPath: String,
+        wrapperPath: String
+    ) throws -> String {
+        let marker = originalPath.map { Data($0.utf8).base64EncodedString() } ?? "none"
+        var lines = [
+            "// Generated by Helix Hub. Do not edit.",
+            "// HELIX_ORIGINAL_BASE: \(marker)",
+        ]
+        if let originalPath {
+            lines.append("#include? \"\(try includePath(from: wrapperPath, to: originalPath))\"")
+        }
+        lines.append("#include \"\(try includePath(from: wrapperPath, to: generatedPath))\"")
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    private func includePath(from source: String, to destination: String) throws -> String {
+        guard isSafeRelativePath(source), isSafeRelativePath(destination) else {
+            throw Hub.Error.integrationConflict("xcconfig include path is unsafe")
+        }
+        let sourceDirectory = Array(source.split(separator: "/").dropLast())
+        let destinationComponents = Array(destination.split(separator: "/"))
+        var common = 0
+        while common < sourceDirectory.count, common < destinationComponents.count,
+              sourceDirectory[common] == destinationComponents[common] {
+            common += 1
+        }
+        let parent = Array(repeating: "..", count: sourceDirectory.count - common)
+        let tail = destinationComponents.dropFirst(common).map(String.init)
+        return (parent + tail).joined(separator: "/")
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    private func installOwnedPhases(
+        _ phaseIDs: [String],
+        targetID: String,
+        document: inout Hub.PBXProjectDocument
+    ) throws {
+        let sources = Set(document.objects.compactMap { identifier, value in
+            value.dictionary?["isa"]?.string == "PBXSourcesBuildPhase"
+                ? identifier : nil
+        })
+        try document.updateObject(targetID) { target in
+            var phases = target["buildPhases"]?.array?.compactMap(\.string) ?? []
+            let owned = Set(phaseIDs)
+            phases.removeAll { owned.contains($0) }
+            let insertion = phases.firstIndex {
+                sources.contains($0)
+            } ?? 0
+            phases.insert(contentsOf: phaseIDs, at: insertion)
+            target["buildPhases"] = .strings(phases)
+        }
+    }
+
+    private func configurePatchAction(
+        profile: XcodeIntegration.Profile,
+        plan: XcodeIntegration.HostPlan,
+        project: Hub.XcodeProject,
+        document: inout Hub.PBXProjectDocument
+    ) throws -> String {
+        guard let patch = profile.patch else {
+            throw Hub.Error.invalidOnboarding("Hot Patch profile has no action settings")
+        }
+        let targetID = identifier(
+            component: "patch-target:\(profile.id):\(patch.actionTargetName)"
+        )
+        for (identifier, value) in document.objects where identifier != targetID {
+            let object = value.dictionary
+            if ["PBXNativeTarget", "PBXAggregateTarget"].contains(
+                object?["isa"]?.string ?? ""
+            ), object?["name"]?.string == patch.actionTargetName {
+                throw Hub.Error.integrationConflict(
+                    "target name \(patch.actionTargetName) is already in use"
+                )
+            }
+        }
+        let profileReferenceID = identifier(
+            component: "xcconfig:\(plan.integrationRoot):\(profile.id):patch"
+        )
+        try document.addObject(
+            profileReferenceID,
+            isa: "PBXFileReference",
+            fields: [
+                "lastKnownFileType": .string("text.xcconfig"),
+                "path": .string("\(plan.integrationRoot)/Profiles/\(profile.id)/Profile.xcconfig"),
+                "sourceTree": .string("SOURCE_ROOT"),
+            ]
+        )
+        let phaseID = identifier(component: "patch-phase:\(profile.id)")
+        try document.addObject(
+            phaseID,
+            isa: "PBXShellScriptBuildPhase",
+            fields: shellPhase(
+                name: "Build Helix Patch (Generated)",
+                script: "/bin/sh \"$(HELIX_INTEGRATION_ROOT)/Profiles/\(profile.id)/patch.sh\"",
+                inputs: [],
+                outputs: [],
+                alwaysOutOfDate: true
+            )
+        )
+        let names = project.configurations.isEmpty
+            ? [profile.configurationName] : project.configurations
+        var configurationIDs: [String] = []
+        for name in names {
+            let configurationID = identifier(
+                component: "patch-configuration:\(profile.id):\(name)"
+            )
+            try document.addObject(
+                configurationID,
+                isa: "XCBuildConfiguration",
+                fields: [
+                    "baseConfigurationReference": .string(profileReferenceID),
+                    "buildSettings": .dictionary([
+                        "ARCHS": .string("arm64"),
+                        "ONLY_ACTIVE_ARCH": .string("YES"),
+                        "SDKROOT": .string("iphoneos"),
+                        "SUPPORTED_PLATFORMS": .string("iphoneos iphonesimulator"),
+                        "SWIFT_EXEC": .string("$(TOOLCHAIN_DIR)/usr/bin/swiftc"),
+                    ]),
+                    "name": .string(name),
+                ]
+            )
+            configurationIDs.append(configurationID)
+        }
+        let listID = identifier(
+            component: "patch-configuration-list:\(profile.id)"
+        )
+        try document.addObject(
+            listID,
+            isa: "XCConfigurationList",
+            fields: [
+                "buildConfigurations": .strings(configurationIDs),
+                "defaultConfigurationIsVisible": .string("0"),
+                "defaultConfigurationName": .string(profile.configurationName),
+            ]
+        )
+        try document.addObject(
+            targetID,
+            isa: "PBXAggregateTarget",
+            fields: [
+                "buildConfigurationList": .string(listID),
+                "buildPhases": .strings([phaseID]),
+                "buildRules": .array([]),
+                "dependencies": .array([]),
+                "name": .string(patch.actionTargetName),
+                "productName": .string(patch.actionTargetName),
+            ]
+        )
+        try document.updateObject(document.projectObjectID) { root in
+            var targets = root["targets"]?.array?.compactMap(\.string) ?? []
+            targets.removeAll { $0 == targetID }
+            targets.append(targetID)
+            root["targets"] = .strings(targets)
+        }
+        return targetID
+    }
+
+    private func shellPhase(
+        name: String,
+        script: String,
+        inputs: [String],
+        outputs: [String],
+        alwaysOutOfDate: Bool
+    ) -> [String: Hub.OpenStep.Value] {
+        var fields: [String: Hub.OpenStep.Value] = [
+            "buildActionMask": .string("2147483647"),
+            "files": .array([]),
+            "inputPaths": .strings(inputs),
+            "name": .string(name),
+            "outputPaths": .strings(outputs),
+            "runOnlyForDeploymentPostprocessing": .string("0"),
+            "shellPath": .string("/bin/sh"),
+            "shellScript": .string(script),
+            "showEnvVarsInLog": .string("0"),
+        ]
+        if alwaysOutOfDate { fields["alwaysOutOfDate"] = .string("1") }
+        return fields
+    }
+
+    private func identifier(component: String) -> String {
+        String(Core.Digest.sha256(
+            "helix-hub-pbx:\(component)"
+        ).hex.prefix(24)).uppercased()
+    }
+
+    private func boundedFile(_ url: URL, maximumBytes: Int) throws -> Data {
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        guard (attributes[.type] as? FileAttributeType) == .typeRegular,
+              let size = (attributes[.size] as? NSNumber)?.intValue,
+              size > 0, size <= maximumBytes
+        else {
+            throw Hub.Error.invalidProject("required project file is missing or oversized")
+        }
+        return try Data(contentsOf: url, options: .mappedIfSafe)
+    }
+
+    private func isSafeRelativePath(_ path: String) -> Bool {
+        guard !path.isEmpty, !path.hasPrefix("/"), !path.contains("\\"),
+              !path.contains("\0")
+        else { return false }
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false)
+        return !parts.contains("") && !parts.contains(".") && !parts.contains("..")
+    }
+}
+}
+#endif

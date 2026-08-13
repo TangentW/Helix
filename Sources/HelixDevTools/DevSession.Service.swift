@@ -38,7 +38,7 @@ public struct ServiceConfiguration: Hashable, Sendable {
 }
 
 /// Stable trust pin and current dynamic port of a running service.
-public struct ServiceEndpoint: Hashable, Sendable {
+public struct ServiceEndpoint: Codable, Hashable, Sendable {
     public var port: UInt16
     public var spkiSHA256: Core.Digest
     public var bonjourAdvertised: Bool
@@ -55,18 +55,30 @@ public struct ServiceEndpoint: Hashable, Sendable {
     }
 }
 
-public enum ServiceState: String, Hashable, Sendable {
+public enum ServiceState: String, Codable, Hashable, Sendable {
     case stopped
     case starting
     case running
     case stopping
 }
 
-public struct ServiceSnapshot: Hashable, Sendable {
+public struct ServiceSnapshot: Codable, Hashable, Sendable {
     public var state: DevSession.ServiceState
     public var endpoint: DevSession.ServiceEndpoint?
     public var openConnectionCount: Int
     public var pendingPairingCount: Int
+
+    public init(
+        state: DevSession.ServiceState,
+        endpoint: DevSession.ServiceEndpoint?,
+        openConnectionCount: Int,
+        pendingPairingCount: Int
+    ) {
+        self.state = state
+        self.endpoint = endpoint
+        self.openConnectionCount = openConnectionCount
+        self.pendingPairingCount = pendingPairingCount
+    }
 }
 
 /// Events suitable for the CLI, Hub UI, and structured diagnostics.
@@ -649,6 +661,23 @@ public actor Service {
                         context: context
                     )
                 )
+            case .serviceSnapshot:
+                value = .serviceSnapshot(snapshot())
+            case let .buildContexts(workspacePathHash):
+                value = .buildContexts(
+                    await buildContexts(workspacePathHash: workspacePathHash)
+                )
+            case let .createManualInvitation(workspacePathHash):
+                value = .manualInvitationCreated(
+                    try await createManualInvitation(
+                        workspacePathHash: workspacePathHash
+                    )
+                )
+            case let .cancelManualInvitation(invitationID):
+                await cancelManualInvitation(invitationID: invitationID)
+                value = .manualInvitationCancelled(invitationID)
+            case .manualInvitations:
+                value = .manualInvitations(await manualInvitations())
             }
             try await channel.send(
                 .success(requestID: request.requestID, value: value)

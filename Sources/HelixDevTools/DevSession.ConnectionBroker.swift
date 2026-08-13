@@ -4,7 +4,7 @@ import HelixDevProtocol
 
 extension DevSession {
 /// User-facing manual invitation produced by the Mac-side service.
-public struct ManualInvitation: Hashable, Sendable {
+public struct ManualInvitation: Codable, Hashable, Sendable {
     /// Reserved four-character code and invitation identity.
     public var reservation: Pairing.Reservation
     /// Optional workspace restriction selected in Helix Hub.
@@ -23,6 +23,18 @@ public struct ManualInvitation: Hashable, Sendable {
         self.reservation = reservation
         self.workspacePathHash = workspacePathHash
         self.expiresAt = expiresAt
+    }
+
+    public func validate() throws {
+        try reservation.validate()
+        guard reservation.kind == .manual,
+              expiresAt.timeIntervalSinceReferenceDate.isFinite,
+              expiresAt > reservation.reservedAt
+        else {
+            throw DevProtocol.Error.malformedMessage(
+                "manual pairing invitation is invalid"
+            )
+        }
     }
 }
 

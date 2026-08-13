@@ -196,6 +196,23 @@ struct Service {
         #expect(await registry.context(shellID: rotated.shellIdentity.shellID) == rotated)
         #expect(await sessions.removedShells == [context.shellIdentity.shellID])
 
+        let snapshot = try await client.serviceSnapshot()
+        #expect(snapshot.state == .running)
+        #expect(snapshot.endpoint == endpoint)
+        let contexts = try await client.buildContexts(
+            workspacePathHash: context.workspacePathHash
+        )
+        #expect(contexts == [rotated])
+        let manual = try await client.createManualInvitation(
+            workspacePathHash: context.workspacePathHash
+        )
+        #expect(manual.code.rawValue.count == Pairing.Code.characterCount)
+        #expect(try await client.manualInvitations() == [manual])
+        try await client.cancelManualInvitation(
+            invitationID: manual.reservation.invitationID
+        )
+        #expect(try await client.manualInvitations().isEmpty)
+
         let attributes = try FileManager.default.attributesOfItem(
             atPath: rendezvousStore.url.path
         )

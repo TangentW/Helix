@@ -241,7 +241,7 @@ public struct HostPlan: Codable, Hashable, Sendable {
     private static func validate(_ feature: XcodeIntegration.Feature) throws {
         guard isFileComponent(feature.id),
               isSwiftIdentifier(feature.moduleName),
-              isSafeRelativePath(feature.sourceRoot),
+              feature.sourceRoot == "." || isSafeRelativePath(feature.sourceRoot),
               isSafeRelativePath(feature.patchConfigurationPath),
               ["yml", "yaml"].contains(
                   URL(fileURLWithPath: feature.patchConfigurationPath)

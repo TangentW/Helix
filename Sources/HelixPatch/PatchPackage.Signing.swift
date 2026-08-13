@@ -359,25 +359,21 @@ public struct TrustStore: Sendable {
         self.revokedPackageHashes = revokedPackageHashes
     }
 
-    func verify(
-        envelope: PatchPackage.SignatureEnvelope,
-        material: Data,
-        manifest: PatchPackage.Manifest,
-        packageHash: Core.Digest,
+    /// Validates a leaf certificate and its complete authorization scope.
+    ///
+    /// Build-side tools can use this before reusing persisted signing material.
+    /// Runtime package verification calls the same path, so both sides enforce
+    /// identical trust, expiry, revocation, and issuer-signature rules.
+    public func validate(
+        certificate: PatchPackage.SigningCertificate,
+        bundleIDs: Set<String>,
+        distributionPolicy: Core.DistributionPolicy,
+        backends: Set<PatchPackage.Backend>,
+        payloadByteCount: UInt64,
         nowUnixSeconds: Int64
     ) throws {
-        guard envelope.schemaVersion == 1, envelope.algorithm == "ed25519" else {
-            throw PatchPackage.Error.unsupportedSignatureAlgorithm(envelope.algorithm)
-        }
-        let certificate = envelope.certificate
         guard certificate.schemaVersion == 1, certificate.algorithm == "ed25519" else {
             throw PatchPackage.Error.unsupportedSignatureAlgorithm(certificate.algorithm)
-        }
-        guard manifest.security.signerKeyID == certificate.keyID else {
-            throw PatchPackage.Error.invalidSigningCertificate("manifest signer key ID does not match envelope")
-        }
-        guard !revokedPackageHashes.contains(packageHash) else {
-            throw PatchPackage.Error.packageRevoked(packageHash)
         }
         if let revoked = [certificate.keyID, certificate.issuerKeyID].first(where: {
             revokedKeyIDs.contains($0)
@@ -395,38 +391,34 @@ public struct TrustStore: Sendable {
               certificate.validFromUnixSeconds >= root.validFromUnixSeconds,
               certificate.validUntilUnixSeconds <= root.validUntilUnixSeconds
         else {
-            throw PatchPackage.Error.invalidSigningCertificate("certificate or root is outside its validity window")
+            throw PatchPackage.Error.invalidSigningCertificate(
+                "certificate or root is outside its validity window"
+            )
         }
         try certificate.validate()
-        guard root.allowedDistributionPolicies.contains(manifest.distributionPolicy),
-              certificate.allowedDistributionPolicies.contains(manifest.distributionPolicy)
+        guard root.allowedDistributionPolicies.contains(distributionPolicy),
+              certificate.allowedDistributionPolicies.contains(distributionPolicy)
         else {
             throw PatchPackage.Error.signerScopeDenied("distribution policy")
         }
-        let backends = Set(manifest.payloads.map(\.backend))
         guard backends.isSubset(of: root.allowedBackends),
               backends.isSubset(of: certificate.allowedBackends)
         else {
             throw PatchPackage.Error.signerScopeDenied("backend")
         }
-        let bundleIDs = Set(manifest.targets.map(\.bundleID))
-        guard bundleIDs.isSubset(of: certificate.allowedBundleIDs) else {
+        guard !bundleIDs.isEmpty,
+              bundleIDs.isSubset(of: certificate.allowedBundleIDs)
+        else {
             throw PatchPackage.Error.signerScopeDenied("bundle ID")
         }
-        let totalBytes = manifest.payloads.reduce(UInt64(0)) { partial, descriptor in
-            partial.addingReportingOverflow(descriptor.byteLength).overflow
-                ? UInt64.max
-                : partial + descriptor.byteLength
-        }
-        guard totalBytes <= certificate.maximumPayloadBytes else {
+        guard payloadByteCount <= certificate.maximumPayloadBytes else {
             throw PatchPackage.Error.signerScopeDenied("payload byte limit")
         }
 
         let rootPublicKey: Curve25519.Signing.PublicKey
-        let leafPublicKey: Curve25519.Signing.PublicKey
         do {
             rootPublicKey = try .init(rawRepresentation: root.publicKey)
-            leafPublicKey = try .init(rawRepresentation: certificate.publicKey)
+            _ = try Curve25519.Signing.PublicKey(rawRepresentation: certificate.publicKey)
         } catch {
             throw PatchPackage.Error.invalidSigningCertificate("invalid Ed25519 public key")
         }
@@ -435,6 +427,46 @@ public struct TrustStore: Sendable {
             for: try certificate.signingBytes()
         ) else {
             throw PatchPackage.Error.invalidSigningCertificate("issuer signature failed")
+        }
+    }
+
+    func verify(
+        envelope: PatchPackage.SignatureEnvelope,
+        material: Data,
+        manifest: PatchPackage.Manifest,
+        packageHash: Core.Digest,
+        nowUnixSeconds: Int64
+    ) throws {
+        guard envelope.schemaVersion == 1, envelope.algorithm == "ed25519" else {
+            throw PatchPackage.Error.unsupportedSignatureAlgorithm(envelope.algorithm)
+        }
+        let certificate = envelope.certificate
+        guard manifest.security.signerKeyID == certificate.keyID else {
+            throw PatchPackage.Error.invalidSigningCertificate("manifest signer key ID does not match envelope")
+        }
+        guard !revokedPackageHashes.contains(packageHash) else {
+            throw PatchPackage.Error.packageRevoked(packageHash)
+        }
+        let backends = Set(manifest.payloads.map(\.backend))
+        let bundleIDs = Set(manifest.targets.map(\.bundleID))
+        let totalBytes = manifest.payloads.reduce(UInt64(0)) { partial, descriptor in
+            partial.addingReportingOverflow(descriptor.byteLength).overflow
+                ? UInt64.max
+                : partial + descriptor.byteLength
+        }
+        try validate(
+            certificate: certificate,
+            bundleIDs: bundleIDs,
+            distributionPolicy: manifest.distributionPolicy,
+            backends: backends,
+            payloadByteCount: totalBytes,
+            nowUnixSeconds: nowUnixSeconds
+        )
+        let leafPublicKey: Curve25519.Signing.PublicKey
+        do {
+            leafPublicKey = try .init(rawRepresentation: certificate.publicKey)
+        } catch {
+            throw PatchPackage.Error.invalidSigningCertificate("invalid Ed25519 public key")
         }
         guard leafPublicKey.isValidSignature(envelope.signature, for: material) else {
             throw PatchPackage.Error.invalidPackageSignature

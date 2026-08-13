@@ -73,6 +73,58 @@ public struct Client: HubControl.ClientProtocol, Sendable {
         return invitation
     }
 
+    public func serviceSnapshot() async throws -> DevSession.ServiceSnapshot {
+        let rendezvous = try rendezvousStore.load()
+        guard case let .serviceSnapshot(snapshot) = try await send(
+            .serviceSnapshot,
+            rendezvous: rendezvous
+        ) else { throw HubControl.Error.responseMismatch }
+        return snapshot
+    }
+
+    public func buildContexts(
+        workspacePathHash: Core.Digest? = nil
+    ) async throws -> [DevSession.BuildContext] {
+        let rendezvous = try rendezvousStore.load()
+        guard case let .buildContexts(contexts) = try await send(
+            .buildContexts(workspacePathHash: workspacePathHash),
+            rendezvous: rendezvous
+        ) else { throw HubControl.Error.responseMismatch }
+        return contexts
+    }
+
+    public func createManualInvitation(
+        workspacePathHash: Core.Digest? = nil
+    ) async throws -> DevSession.ManualInvitation {
+        let rendezvous = try rendezvousStore.load()
+        guard case let .manualInvitationCreated(invitation) = try await send(
+            .createManualInvitation(workspacePathHash: workspacePathHash),
+            rendezvous: rendezvous
+        ) else { throw HubControl.Error.responseMismatch }
+        return invitation
+    }
+
+    public func cancelManualInvitation(
+        invitationID: DevProtocol.InvitationID
+    ) async throws {
+        let rendezvous = try rendezvousStore.load()
+        guard case let .manualInvitationCancelled(cancelled) = try await send(
+            .cancelManualInvitation(invitationID: invitationID),
+            rendezvous: rendezvous
+        ), cancelled == invitationID else {
+            throw HubControl.Error.responseMismatch
+        }
+    }
+
+    public func manualInvitations() async throws -> [DevSession.ManualInvitation] {
+        let rendezvous = try rendezvousStore.load()
+        guard case let .manualInvitations(invitations) = try await send(
+            .manualInvitations,
+            rendezvous: rendezvous
+        ) else { throw HubControl.Error.responseMismatch }
+        return invitations
+    }
+
     private func send(
         _ command: HubControl.Command,
         rendezvous: HubControl.Rendezvous
