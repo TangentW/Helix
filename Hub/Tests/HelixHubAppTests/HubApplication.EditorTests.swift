@@ -19,6 +19,7 @@ struct HubApplicationEditorTests {
         #expect(editor.forms[1].schemeName == "Reload Scheme")
         #expect(editor.canInstall)
         #expect(try editor.selections().count == 2)
+        #expect(!editor.hasInstalledCapabilities)
     }
 
     @Test("One App target keeps both defaults visible but explains isolation")
@@ -60,6 +61,7 @@ struct HubApplicationEditorTests {
         )
 
         #expect(editor.forms.first { $0.capability == .liveReload }?.isInstalled == true)
+        #expect(editor.hasInstalledCapabilities)
         #expect(editor.forms.first { $0.capability == .hotPatch }?.isEnabled == false)
         editor.setEnabled(false, capability: .liveReload)
         #expect(editor.forms.first { $0.capability == .liveReload }?.isEnabled == true)

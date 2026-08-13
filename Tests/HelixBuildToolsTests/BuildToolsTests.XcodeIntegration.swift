@@ -113,9 +113,16 @@ struct XcodeIntegrationContract {
         #expect(guide.contains("Do not configure a custom LLDB init file"))
         #expect(guide.contains("offline until a developer enters"))
         #expect(guide.contains("Aggregate Target `Build Patch`"))
-        #expect(guide.contains("`SUPPORTED_PLATFORMS` to `iphoneos iphonesimulator`"))
+        #expect(guide.contains(
+            "`SUPPORTED_PLATFORMS` set to `iphoneos iphonesimulator`"
+        ))
         #expect(guide.contains("destination must match the SDK"))
         #expect(guide.contains("Scheme `Helix Patch Action`"))
+        let patchGuide = try #require(
+            guide.split(separator: "## `patch`", maxSplits: 1).last.map(String.init)
+        )
+        #expect(patchGuide.contains("Bridge produced from the current prepared Shell"))
+        #expect(!patchGuide.contains("fresh one-time invitation"))
         let liveProfile = text(
             try #require(first.artifacts[live.commonConfiguration])
         )
@@ -127,11 +134,30 @@ struct XcodeIntegrationContract {
         #expect(!first.artifacts.keys.contains { $0.hasSuffix("Bridge.xcconfig") })
         #expect(guide.contains("never add Helix"))
         #expect(guide.contains("DerivedData output to the project"))
+        let livePrepare = text(try #require(
+            first.artifacts["Profiles/live/prepare.sh"]
+        ))
+        #expect(livePrepare.contains("script_directory=$(CDPATH= cd"))
+        #expect(livePrepare.contains("$script_directory/../.."))
+        #expect(livePrepare.contains(
+            "export HELIX_HOST_PLAN=\"$integration_root/HostPlan.json\""
+        ))
+        #expect(livePrepare.contains("export HELIX_PROFILE_ID=\"live\""))
         let dispatcher = text(
             try #require(first.artifacts["Scripts/helix-phase.sh"])
         )
         #expect(dispatcher.contains("exec \"$helix_executable\" xcode phase"))
-        #expect(dispatcher.contains("${HELIX_EXECUTABLE:-helix}"))
+        #expect(dispatcher.contains("${HELIX_EXECUTABLE:-}"))
+        #expect(dispatcher.contains(
+            "Library/Application Support/Helix/Service.json"
+        ))
+        #expect(dispatcher.contains(
+            "plutil -extract toolExecutablePath raw"
+        ))
+        #expect(dispatcher.contains("plutil -extract schemaVersion raw"))
+        #expect(dispatcher.contains("plutil -extract processIdentifier raw"))
+        #expect(dispatcher.contains("/bin/kill -0 \"$record_pid\""))
+        #expect(dispatcher.contains("[ \"$record_mode\" = \"600\" ]"))
         #expect(dispatcher.contains("clean|analyze|installhdrs|installsrc"))
         #expect(dispatcher.contains(
             "unset SWIFT_DEBUG_INFORMATION_FORMAT SWIFT_DEBUG_INFORMATION_VERSION"
@@ -150,6 +176,129 @@ struct XcodeIntegrationContract {
         let capture = try #require(proxyText.range(of: "mv -f \"$temporary\" \"$capture_file\""))
         #expect(invocation.lowerBound < capture.lowerBound)
         #expect(proxyText.contains("compiler_status=$?"))
+    }
+
+    @Test("Xcode phase discovers the exact tool published by the running Hub")
+    func dispatcherDiscoversHubTool() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-xcode-tool-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let serviceDirectory = root.appendingPathComponent(
+            "Library/Application Support/Helix",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: serviceDirectory,
+            withIntermediateDirectories: true
+        )
+        let tool = root.appendingPathComponent("Helix Tool")
+        let capture = root.appendingPathComponent("Arguments.txt")
+        try Data(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HELIX_TEST_CAPTURE\"\n".utf8
+        ).write(to: tool)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: tool.path
+        )
+        let service = serviceDirectory.appendingPathComponent("Service.json")
+        let escapedTool = tool.path.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let processIdentifier = ProcessInfo.processInfo.processIdentifier
+        try Data(
+            """
+            {"schemaVersion":2,"processIdentifier":\(processIdentifier),"toolExecutablePath":"\(escapedTool)"}
+            """.utf8
+        ).write(to: service)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: service.path
+        )
+
+        let kit = try XcodeIntegration.KitGenerator().generate(plan: makePlan())
+        let dispatcher = root.appendingPathComponent("helix-phase.sh")
+        try #require(kit.artifacts["Scripts/helix-phase.sh"]).write(to: dispatcher)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [dispatcher.path, "prepare"]
+        process.environment = [
+            "HOME": root.path,
+            "HELIX_HOST_PLAN": "/tmp/HostPlan.json",
+            "HELIX_PROFILE_ID": "live",
+            "HELIX_TEST_CAPTURE": capture.path,
+        ]
+        try process.run()
+        process.waitUntilExit()
+
+        #expect(process.terminationStatus == 0)
+        #expect(try String(contentsOf: capture, encoding: .utf8) == """
+        xcode
+        phase
+        --plan
+        /tmp/HostPlan.json
+        --profile
+        live
+        --phase
+        prepare
+        """ + "\n")
+    }
+
+    @Test("Xcode phase ignores a stale Hub service record")
+    func dispatcherRejectsStaleHubRecord() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-xcode-stale-tool-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let serviceDirectory = root.appendingPathComponent(
+            "Library/Application Support/Helix",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: serviceDirectory,
+            withIntermediateDirectories: true
+        )
+        let tool = root.appendingPathComponent("helix")
+        let capture = root.appendingPathComponent("Arguments.txt")
+        try Data(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HELIX_TEST_CAPTURE\"\n".utf8
+        ).write(to: tool)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: tool.path
+        )
+        let escapedTool = tool.path.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let service = serviceDirectory.appendingPathComponent("Service.json")
+        try Data(
+            """
+            {"schemaVersion":2,"processIdentifier":2147483647,"toolExecutablePath":"\(escapedTool)"}
+            """.utf8
+        ).write(to: service)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: service.path
+        )
+
+        let kit = try XcodeIntegration.KitGenerator().generate(plan: makePlan())
+        let dispatcher = root.appendingPathComponent("helix-phase.sh")
+        try #require(kit.artifacts["Scripts/helix-phase.sh"]).write(to: dispatcher)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [dispatcher.path, "prepare"]
+        process.environment = [
+            "HOME": root.path,
+            "PATH": "/usr/bin:/bin",
+            "HELIX_HOST_PLAN": "/tmp/HostPlan.json",
+            "HELIX_PROFILE_ID": "live",
+            "HELIX_TEST_CAPTURE": capture.path,
+        ]
+        try process.run()
+        process.waitUntilExit()
+
+        #expect(process.terminationStatus != 0)
+        #expect(!FileManager.default.fileExists(atPath: capture.path))
     }
 
     @Test("Hidden Bridge compilation preserves semantics but rejects Feature build outputs")
@@ -252,6 +401,26 @@ struct XcodeIntegrationContract {
         #expect(throws: XcodeIntegration.Error.self) {
             try duplicateActionScheme.validate()
         }
+
+        var duplicateApplicationSlot = makePlan()
+        let applicationPatchIndex = try #require(
+            duplicateApplicationSlot.profiles.firstIndex { $0.id == "patch" }
+        )
+        duplicateApplicationSlot.profiles[applicationPatchIndex].applicationTargetName = "LiveDemo"
+        duplicateApplicationSlot.profiles[applicationPatchIndex].configurationName = "Debug"
+        #expect(throws: XcodeIntegration.Error.self) {
+            try duplicateApplicationSlot.validate()
+        }
+
+        var duplicateFeatureSlot = makePlan()
+        let featurePatchIndex = try #require(
+            duplicateFeatureSlot.profiles.firstIndex { $0.id == "patch" }
+        )
+        duplicateFeatureSlot.profiles[featurePatchIndex].featureID = "live-feature"
+        duplicateFeatureSlot.profiles[featurePatchIndex].configurationName = "Debug"
+        #expect(throws: XcodeIntegration.Error.self) {
+            try duplicateFeatureSlot.validate()
+        }
     }
 
     @Test("Xcode environment resolves exact build identity and rejects profile drift")
@@ -276,7 +445,7 @@ struct XcodeIntegrationContract {
             [.posixPermissions: 0o755],
             ofItemAtPath: compiler.path
         )
-        let planURL = root.appendingPathComponent("HelixXcode.json")
+        let planURL = root.appendingPathComponent("HostPlan.json")
         var variables = [
             "SRCROOT": root.path,
             "BUILD_DIR": root.appendingPathComponent("DerivedData/Build/Products").path,
@@ -463,7 +632,7 @@ struct XcodeIntegrationContract {
         let plan = makePlan()
         let context = try XcodeIntegration.EnvironmentResolver().resolve(
             plan: plan,
-            planURL: root.appendingPathComponent("HelixXcode.json"),
+            planURL: root.appendingPathComponent("HostPlan.json"),
             profileID: "patch",
             variables: variables,
             requireFeatureCompilerSettings: false

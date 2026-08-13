@@ -1,4 +1,5 @@
 import Foundation
+import HelixDevProtocol
 
 public enum ReleaseLeakage {}
 
@@ -90,7 +91,7 @@ public struct Scanner: Sendable {
             "DevActivation.Controller",
             "DevProtocol.LiveArtifact",
             "HLX_DEV_",
-            "_helix-live._tcp",
+            "_helix._tcp",
         ],
         forbiddenImageNameFragments: [String] = [
             "HelixDevAppRuntime",
@@ -191,7 +192,7 @@ public struct Scanner: Sendable {
             let normalized = service.lowercased().trimmingCharacters(
                 in: CharacterSet(charactersIn: ".")
             )
-            if normalized == "_helix-live._tcp" {
+            if normalized == NetworkTransport.ServiceDiscovery.type {
                 findings.append(
                     .init(
                         severity: .critical,

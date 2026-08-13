@@ -40,7 +40,16 @@ extension CLI.Application {
             throw CLI.Error.usage("hub run accepts no arguments")
         }
 
-        let service = try DevSession.Service.persistent { event in
+        let toolExecutableURL = Bundle.main.executableURL ?? URL(
+            fileURLWithPath: CommandLine.arguments[0],
+            relativeTo: URL(
+                fileURLWithPath: FileManager.default.currentDirectoryPath,
+                isDirectory: true
+            )
+        ).absoluteURL
+        let service = try DevSession.Service.persistent(
+            toolExecutableURL: toolExecutableURL
+        ) { event in
             if let output = Self.describe(event) {
                 outputHandler(output)
             }

@@ -10,13 +10,14 @@ public enum HubControl {}
 extension HubControl {
 /// Private rendezvous data published by the running Helix service.
 public struct Rendezvous: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 1
+    public static let currentSchemaVersion: UInt16 = 2
 
     public var schemaVersion: UInt16
     public var processIdentifier: Int32
     public var port: UInt16
     public var spkiSHA256: Core.Digest
     public var controlSecret: Data
+    public var toolExecutablePath: String
     public var startedAt: Date
 
     public init(
@@ -25,6 +26,7 @@ public struct Rendezvous: Codable, Hashable, Sendable {
         port: UInt16,
         spkiSHA256: Core.Digest,
         controlSecret: Data,
+        toolExecutablePath: String,
         startedAt: Date = Date()
     ) {
         self.schemaVersion = schemaVersion
@@ -32,6 +34,7 @@ public struct Rendezvous: Codable, Hashable, Sendable {
         self.port = port
         self.spkiSHA256 = spkiSHA256
         self.controlSecret = controlSecret
+        self.toolExecutablePath = toolExecutablePath
         self.startedAt = startedAt
     }
 
@@ -40,6 +43,13 @@ public struct Rendezvous: Codable, Hashable, Sendable {
               processIdentifier > 1,
               port > 0,
               controlSecret.count == 32,
+              toolExecutablePath.utf8.count <= 4_096,
+              toolExecutablePath.hasPrefix("/"),
+              URL(fileURLWithPath: toolExecutablePath).standardizedFileURL.path
+                == toolExecutablePath,
+              !toolExecutablePath.unicodeScalars.contains(where: {
+                  CharacterSet.controlCharacters.contains($0)
+              }),
               startedAt.timeIntervalSinceReferenceDate.isFinite
         else {
             throw HubControl.Error.invalidRendezvous

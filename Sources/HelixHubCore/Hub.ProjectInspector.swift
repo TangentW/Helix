@@ -12,6 +12,10 @@ public struct TargetSettings: Hashable, Sendable {
     public var productName: String
     public var swiftVersion: String?
     public var sourceRootURL: URL
+    /// Resolved source Info.plist, when the target uses an explicit file.
+    public var informationPropertyListURL: URL?
+    /// Whether Xcode synthesizes the target Info.plist from build settings.
+    public var generatesInformationPropertyList: Bool
 
     public init(
         targetName: String,
@@ -20,7 +24,9 @@ public struct TargetSettings: Hashable, Sendable {
         bundleIdentifier: String?,
         productName: String,
         swiftVersion: String?,
-        sourceRootURL: URL
+        sourceRootURL: URL,
+        informationPropertyListURL: URL? = nil,
+        generatesInformationPropertyList: Bool = false
     ) {
         self.targetName = targetName
         self.configurationName = configurationName
@@ -29,6 +35,8 @@ public struct TargetSettings: Hashable, Sendable {
         self.productName = productName
         self.swiftVersion = swiftVersion
         self.sourceRootURL = sourceRootURL
+        self.informationPropertyListURL = informationPropertyListURL
+        self.generatesInformationPropertyList = generatesInformationPropertyList
     }
 }
 
@@ -108,6 +116,11 @@ public struct ProjectInspector: Sendable {
         }
         let sourceRoot = value("SRCROOT").map(URL.init(fileURLWithPath:))
             ?? project.sourceRootURL
+        let informationPropertyListURL = value("INFOPLIST_FILE").map { path in
+            return path.hasPrefix("/")
+                ? URL(fileURLWithPath: path).standardizedFileURL
+                : sourceRoot.appendingPathComponent(path).standardizedFileURL
+        }
         return .init(
             targetName: targetName,
             configurationName: configurationName,
@@ -115,7 +128,10 @@ public struct ProjectInspector: Sendable {
             bundleIdentifier: value("PRODUCT_BUNDLE_IDENTIFIER"),
             productName: value("PRODUCT_NAME") ?? target.productName,
             swiftVersion: value("SWIFT_VERSION"),
-            sourceRootURL: sourceRoot.standardizedFileURL
+            sourceRootURL: sourceRoot.standardizedFileURL,
+            informationPropertyListURL: informationPropertyListURL,
+            generatesInformationPropertyList:
+                value("GENERATE_INFOPLIST_FILE")?.uppercased() == "YES"
         )
     }
 

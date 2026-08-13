@@ -160,7 +160,10 @@ public struct KitGenerator: Sendable {
         )
         for phase in phaseNames(for: profile) {
             try insert(
-                Data(renderPhaseWrapper(phase: phase).utf8),
+                Data(renderPhaseWrapper(
+                    profileID: profile.id,
+                    phase: phase
+                ).utf8),
                 at: "\(root)/\(phase).sh",
                 into: &artifacts
             )
@@ -273,10 +276,35 @@ public struct KitGenerator: Sendable {
         # the SWIFT_DEBUG_* environment namespace for its own diagnostics.
         unset SWIFT_DEBUG_INFORMATION_FORMAT SWIFT_DEBUG_INFORMATION_VERSION
 
-        helix_executable="${HELIX_EXECUTABLE:-helix}"
-        if ! command -v "$helix_executable" >/dev/null 2>&1; then
-            echo "error: Helix executable not found: $helix_executable" >&2
-            echo "error: configure HELIX_EXECUTABLE as a user-defined Xcode build setting" >&2
+        helix_executable="${HELIX_EXECUTABLE:-}"
+        service_record="${HOME:?}/Library/Application Support/Helix/Service.json"
+        if [ -z "$helix_executable" ] && [ -f "$service_record" ] && [ ! -L "$service_record" ]; then
+            record_owner=$(/usr/bin/stat -f "%u" "$service_record" 2>/dev/null || true)
+            record_mode=$(/usr/bin/stat -f "%Lp" "$service_record" 2>/dev/null || true)
+            if [ "$record_owner" = "$(/usr/bin/id -u)" ] && [ "$record_mode" = "600" ]; then
+                record_schema=$(
+                    /usr/bin/plutil -extract schemaVersion raw -o - "$service_record" 2>/dev/null || true
+                )
+                record_pid=$(
+                    /usr/bin/plutil -extract processIdentifier raw -o - "$service_record" 2>/dev/null || true
+                )
+                case "$record_pid" in
+                    ''|*[!0-9]*) record_pid=0 ;;
+                esac
+                if [ "$record_schema" = "2" ] && [ "$record_pid" -gt 1 ] \
+                    && /bin/kill -0 "$record_pid" 2>/dev/null; then
+                    helix_executable=$(
+                        /usr/bin/plutil -extract toolExecutablePath raw -o - "$service_record" 2>/dev/null || true
+                    )
+                fi
+            fi
+        fi
+        if [ -z "$helix_executable" ]; then
+            helix_executable=$(command -v helix 2>/dev/null || true)
+        fi
+        if [ -z "$helix_executable" ] || ! command -v "$helix_executable" >/dev/null 2>&1; then
+            echo "error: no Helix build tool is available; open Helix and try again" >&2
+            echo "error: headless workflows may install helix on PATH or set HELIX_EXECUTABLE" >&2
             exit 1
         fi
 
@@ -288,10 +316,18 @@ public struct KitGenerator: Sendable {
         """
     }
 
-    private func renderPhaseWrapper(phase: String) -> String {
+    private func renderPhaseWrapper(profileID: String, phase: String) -> String {
         """
         #!/bin/sh
         set -eu
+        script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+        integration_root=$(CDPATH= cd -- "$script_directory/../.." && pwd -P)
+
+        # Scheme pre-actions run before target xcconfig values are exported.
+        export HELIX_INTEGRATION_ROOT="$integration_root"
+        export HELIX_HOST_PLAN="$integration_root/HostPlan.json"
+        export HELIX_PROFILE_ID="\(profileID)"
+
         exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Scripts/helix-phase.sh" \(phase)
 
         """
@@ -314,6 +350,21 @@ public struct KitGenerator: Sendable {
     ) -> String {
         let orderedContracts = contracts.sorted { $0.profileID < $1.profileID }
         let profiles = zip(orderedContracts, plan.profiles).map { contract, profile in
+            let bridgeFreshness: String
+            switch profile.workflow {
+            case .hotPatch:
+                bridgeFreshness = """
+                  Disable "Based on dependency analysis" for this phase so every App build
+                  links the Bridge produced from the current prepared Shell, including an
+                  incremental build where no handwritten source changed.
+                """
+            case .liveReload:
+                bridgeFreshness = """
+                  Disable "Based on dependency analysis" for this phase: every Xcode Run must
+                  embed the fresh one-time invitation reserved by the Build pre-action, even
+                  when no project source changed.
+                """
+            }
             let common = """
             ## `\(contract.profileID)` (`\(profile.workflow.rawValue)`)
 
@@ -323,12 +374,10 @@ public struct KitGenerator: Sendable {
               DerivedData output to the project.
             - Use `\(contract.applicationConfiguration)` as the App target base configuration.
             - Add one Run Script phase before the App's Sources phase:
-              `/bin/sh "$(HELIX_INTEGRATION_ROOT)/Profiles/\(contract.profileID)/bridge.sh"`.
+              `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/\(contract.profileID)/bridge.sh"`.
               Declare `$(HELIX_BRIDGE_OBJECT)` as its output. The script compiles the generated
               Bridge privately in DerivedData before the App links.
-              Disable "Based on dependency analysis" for this phase: every Xcode Run must embed
-              the fresh one-time invitation
-              reserved by the Build pre-action, even when no project source changed.
+            \(bridgeFreshness)
             - Run `Profiles/\(contract.profileID)/prepare.sh` as the first Scheme Build
               pre-action, with build settings supplied by the Feature target.
             """
@@ -336,14 +385,15 @@ public struct KitGenerator: Sendable {
             case .hotPatch:
                 let patchAction = profile.patch.map {
                     """
-                    - Create Aggregate Target `\($0.actionTargetName)`, use
-                      `\(contract.commonConfiguration)` as its base configuration, and run
-                      `Profiles/\(contract.profileID)/patch.sh` in its only Run Script phase.
-                      Set `SUPPORTED_PLATFORMS` to `iphoneos iphonesimulator`; the selected
+                    - Create an empty Aggregate Target `\($0.actionTargetName)` with
+                      `SUPPORTED_PLATFORMS` set to `iphoneos iphonesimulator`; the selected
                       destination must match the SDK of the audited Release baseline.
-                    - Share Scheme `\($0.actionSchemeName)` with only that Aggregate Target.
-                      Building this scheme compiles, signs, and optionally stages a patch; it
-                      does not rebuild or reinstall the App.
+                    - Share Scheme `\($0.actionSchemeName)` with only that Aggregate Target,
+                      and run `Profiles/\(contract.profileID)/patch.sh` as its Build
+                      pre-action using the App target as `EnvironmentBuildable`. This supplies
+                      the App's exact version and platform settings without copying them into a
+                      second target. Building the scheme compiles, signs, and optionally stages
+                      a patch; it does not rebuild or reinstall the App.
                     """
                 } ?? ""
                 return common + """
@@ -377,8 +427,8 @@ public struct KitGenerator: Sendable {
         return """
         # Helix Xcode integration
 
-        This directory is generated from `HostPlan.json`. Regenerate it with
-        `helix xcode generate`; do not edit individual files.
+        This directory is owned by Helix Hub and generated from `HostPlan.json`.
+        Reconfigure the project from Helix; do not edit individual files.
 
         The following target and Scheme edits are one-time project setup. After
         setup, developers use Xcode Run, Build, Archive, and the shared Patch

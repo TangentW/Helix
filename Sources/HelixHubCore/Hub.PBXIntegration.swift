@@ -20,7 +20,8 @@ struct PBXIntegration {
     func prepare(
         plan: XcodeIntegration.HostPlan,
         project: Hub.XcodeProject,
-        featureTargetNames: [String: String]
+        featureTargetNames: [String: String],
+        applicationBuildSettings: [String: String] = [:]
     ) throws -> Output {
         let projectFile = project.projectURL.appendingPathComponent("project.pbxproj")
         let data = try boundedFile(projectFile, maximumBytes: Hub.OpenStep.maximumDocumentBytes)
@@ -43,6 +44,7 @@ struct PBXIntegration {
                 target: featureTarget,
                 profile: profile,
                 generatedPath: "\(plan.integrationRoot)/Profiles/\(profile.id)/Feature.xcconfig",
+                additionalSettings: nil,
                 plan: plan,
                 project: project,
                 document: &document
@@ -53,6 +55,7 @@ struct PBXIntegration {
                 target: appTarget,
                 profile: profile,
                 generatedPath: "\(plan.integrationRoot)/Profiles/\(profile.id)/Application.xcconfig",
+                additionalSettings: applicationBuildSettings[profile.id],
                 plan: plan,
                 project: project,
                 document: &document
@@ -67,7 +70,7 @@ struct PBXIntegration {
                 isa: "PBXShellScriptBuildPhase",
                 fields: shellPhase(
                     name: "Helix Bridge (Generated)",
-                    script: "/bin/sh \"$(HELIX_INTEGRATION_ROOT)/Profiles/\(profile.id)/bridge.sh\"",
+                    script: "exec /bin/sh \"${HELIX_INTEGRATION_ROOT:?}/Profiles/\(profile.id)/bridge.sh\"",
                     inputs: [],
                     outputs: ["$(HELIX_BRIDGE_OBJECT)"],
                     alwaysOutOfDate: true
@@ -115,6 +118,7 @@ struct PBXIntegration {
         target: Hub.XcodeTarget,
         profile: XcodeIntegration.Profile,
         generatedPath: String,
+        additionalSettings: String?,
         plan: XcodeIntegration.HostPlan,
         project: Hub.XcodeProject,
         document: inout Hub.PBXProjectDocument
@@ -129,7 +133,8 @@ struct PBXIntegration {
         let contents = try wrapper(
             originalPath: original == generatedPath ? nil : original,
             generatedPath: generatedPath,
-            wrapperPath: wrapperPath
+            wrapperPath: wrapperPath,
+            additionalSettings: additionalSettings
         )
         let referenceID = identifier(component: "xcconfig:\(wrapperPath)")
         try document.addObject(
@@ -184,7 +189,8 @@ struct PBXIntegration {
     private func wrapper(
         originalPath: String?,
         generatedPath: String,
-        wrapperPath: String
+        wrapperPath: String,
+        additionalSettings: String?
     ) throws -> String {
         let marker = originalPath.map { Data($0.utf8).base64EncodedString() } ?? "none"
         var lines = [
@@ -195,6 +201,10 @@ struct PBXIntegration {
             lines.append("#include? \"\(try includePath(from: wrapperPath, to: originalPath))\"")
         }
         lines.append("#include \"\(try includePath(from: wrapperPath, to: generatedPath))\"")
+        if let additionalSettings {
+            lines.append("")
+            lines.append(additionalSettings.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
         return lines.joined(separator: "\n") + "\n"
     }
 
@@ -259,30 +269,11 @@ struct PBXIntegration {
                 )
             }
         }
-        let profileReferenceID = identifier(
+        let obsoleteProfileReferenceID = identifier(
             component: "xcconfig:\(plan.integrationRoot):\(profile.id):patch"
         )
-        try document.addObject(
-            profileReferenceID,
-            isa: "PBXFileReference",
-            fields: [
-                "lastKnownFileType": .string("text.xcconfig"),
-                "path": .string("\(plan.integrationRoot)/Profiles/\(profile.id)/Profile.xcconfig"),
-                "sourceTree": .string("SOURCE_ROOT"),
-            ]
-        )
-        let phaseID = identifier(component: "patch-phase:\(profile.id)")
-        try document.addObject(
-            phaseID,
-            isa: "PBXShellScriptBuildPhase",
-            fields: shellPhase(
-                name: "Build Helix Patch (Generated)",
-                script: "/bin/sh \"$(HELIX_INTEGRATION_ROOT)/Profiles/\(profile.id)/patch.sh\"",
-                inputs: [],
-                outputs: [],
-                alwaysOutOfDate: true
-            )
-        )
+        document.removeObject(obsoleteProfileReferenceID)
+        document.removeObject(identifier(component: "patch-phase:\(profile.id)"))
         let names = project.configurations.isEmpty
             ? [profile.configurationName] : project.configurations
         var configurationIDs: [String] = []
@@ -294,7 +285,6 @@ struct PBXIntegration {
                 configurationID,
                 isa: "XCBuildConfiguration",
                 fields: [
-                    "baseConfigurationReference": .string(profileReferenceID),
                     "buildSettings": .dictionary([
                         "ARCHS": .string("arm64"),
                         "ONLY_ACTIVE_ARCH": .string("YES"),
@@ -324,7 +314,7 @@ struct PBXIntegration {
             isa: "PBXAggregateTarget",
             fields: [
                 "buildConfigurationList": .string(listID),
-                "buildPhases": .strings([phaseID]),
+                "buildPhases": .array([]),
                 "buildRules": .array([]),
                 "dependencies": .array([]),
                 "name": .string(patch.actionTargetName),

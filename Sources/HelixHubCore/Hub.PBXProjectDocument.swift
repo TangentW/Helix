@@ -10,6 +10,7 @@ struct PBXProjectDocument {
     private let originalText: String
     private var replacements: [String: Hub.OpenStep.Value] = [:]
     private var additions: [String: Hub.OpenStep.Value] = [:]
+    private var removals: Set<String> = []
 
     init(data: Data) throws {
         guard let text = String(data: data, encoding: .utf8) else {
@@ -72,6 +73,14 @@ struct PBXProjectDocument {
         additions[identifier] = value
     }
 
+    mutating func removeObject(_ identifier: String) {
+        guard objects.removeValue(forKey: identifier) != nil else { return }
+        replacements.removeValue(forKey: identifier)
+        if additions.removeValue(forKey: identifier) == nil {
+            removals.insert(identifier)
+        }
+    }
+
     func configurationID(targetID: String, named name: String) throws -> String {
         let target = try object(targetID)
         guard let listID = target["buildConfigurationList"]?.string,
@@ -93,6 +102,9 @@ struct PBXProjectDocument {
 
     func serialized() throws -> Data {
         var text = originalText
+        for identifier in removals.sorted() {
+            text = try Self.removingRecord(identifier: identifier, in: text)
+        }
         for identifier in replacements.keys.sorted() {
             guard let value = replacements[identifier] else { continue }
             text = try Self.replacingRecord(
@@ -133,6 +145,31 @@ struct PBXProjectDocument {
         value: Hub.OpenStep.Value,
         in text: String
     ) throws -> String {
+        let range = try recordRange(identifier: identifier, in: text)
+        return text.replacingCharacters(
+            in: range,
+            with: "\t\t\(identifier) = \(render(value));"
+        )
+    }
+
+    private static func removingRecord(
+        identifier: String,
+        in text: String
+    ) throws -> String {
+        var range = try recordRange(identifier: identifier, in: text)
+        if range.upperBound < text.endIndex, text[range.upperBound] == "\r" {
+            range = range.lowerBound..<text.index(after: range.upperBound)
+        }
+        if range.upperBound < text.endIndex, text[range.upperBound] == "\n" {
+            range = range.lowerBound..<text.index(after: range.upperBound)
+        }
+        return text.replacingCharacters(in: range, with: "")
+    }
+
+    private static func recordRange(
+        identifier: String,
+        in text: String
+    ) throws -> Range<String.Index> {
         let escaped = NSRegularExpression.escapedPattern(for: identifier)
         let expression = try NSRegularExpression(
             pattern: "(?m)^[\\t ]*\(escaped)(?:[\\t ]*/\\*[^\\r\\n]*?\\*/)?[\\t ]*=[\\t ]*"
@@ -152,10 +189,7 @@ struct PBXProjectDocument {
         }
         let end = try dictionaryRecordEnd(from: brace, in: text)
         let start = prefixRange.lowerBound
-        return text.replacingCharacters(
-            in: start..<end,
-            with: "\t\t\(identifier) = \(render(value));"
-        )
+        return start..<end
     }
 
     private static func dictionaryRecordEnd(

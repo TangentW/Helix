@@ -36,18 +36,30 @@ trap cleanup EXIT INT TERM
     --package-path "$REPOSITORY_ROOT" \
     --configuration "$CONFIGURATION" \
     --product helix-hub-app
+/usr/bin/xcrun swift build \
+    --package-path "$REPOSITORY_ROOT" \
+    --configuration "$CONFIGURATION" \
+    --product helix
 BIN_DIRECTORY=$(/usr/bin/xcrun swift build \
     --package-path "$REPOSITORY_ROOT" \
     --configuration "$CONFIGURATION" \
     --show-bin-path)
 
-/bin/mkdir -p "$STAGING/Contents/MacOS" "$STAGING/Contents/Resources"
+/bin/mkdir -p \
+    "$STAGING/Contents/MacOS" \
+    "$STAGING/Contents/Helpers" \
+    "$STAGING/Contents/Resources"
 /usr/bin/install -m 0755 \
     "$BIN_DIRECTORY/helix-hub-app" \
     "$STAGING/Contents/MacOS/Helix"
+/usr/bin/install -m 0755 \
+    "$BIN_DIRECTORY/helix" \
+    "$STAGING/Contents/Helpers/helix"
 /usr/bin/install -m 0644 \
     "$REPOSITORY_ROOT/Hub/SupportingFiles/Info.plist" \
     "$STAGING/Contents/Info.plist"
+/usr/bin/codesign --force --sign - --timestamp=none \
+    "$STAGING/Contents/Helpers/helix"
 /usr/bin/codesign --force --sign - --timestamp=none "$STAGING"
 /usr/bin/codesign --verify --strict --verbose=2 "$STAGING"
 

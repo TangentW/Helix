@@ -67,10 +67,13 @@ struct OnboardingView: View {
 
     private var integrationSettings: some View {
         GroupBox("Integration location") {
-            HStack {
+            VStack(alignment: .leading, spacing: 6) {
                 TextField("Project-relative generated-kit directory", text: $editor.integrationRoot)
                     .textFieldStyle(.roundedBorder)
-                Text("Generated and Hub-owned")
+                    .disabled(editor.hasInstalledCapabilities)
+                Text(editor.hasInstalledCapabilities
+                    ? "This Hub-owned location is locked after the first capability is installed."
+                    : "Generated and Hub-owned")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

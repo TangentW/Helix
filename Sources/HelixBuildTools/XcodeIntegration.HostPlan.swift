@@ -116,13 +116,23 @@ public struct Profile: Codable, Hashable, Sendable {
 /// measured from the active Xcode build environment.
 public struct HostPlan: Codable, Hashable, Sendable {
     public static let currentSchemaVersion: UInt16 = 3
-    public static let defaultFileName = "HelixXcode.json"
+    public static let defaultFileName = "HostPlan.json"
 
     public var schemaVersion: UInt16
     public var projectPath: String
     public var integrationRoot: String
     public var features: [XcodeIntegration.Feature]
     public var profiles: [XcodeIntegration.Profile]
+
+    private struct BuildSlot: Hashable {
+        var target: String
+        var configuration: String
+
+        init(target: String, configuration: String) {
+            self.target = target
+            self.configuration = configuration
+        }
+    }
 
     public init(
         schemaVersion: UInt16 = Self.currentSchemaVersion,
@@ -179,6 +189,25 @@ public struct HostPlan: Codable, Hashable, Sendable {
         else {
             throw XcodeIntegration.Error.invalidHostPlan(
                 "profiles must be nonempty, sorted, and use unique schemes"
+            )
+        }
+        let applicationSlots = profiles.map {
+            BuildSlot(
+                target: $0.applicationTargetName,
+                configuration: $0.configurationName
+            )
+        }
+        let featureSlots = profiles.map {
+            BuildSlot(
+                target: $0.featureID,
+                configuration: $0.configurationName
+            )
+        }
+        guard Set(applicationSlots).count == applicationSlots.count,
+              Set(featureSlots).count == featureSlots.count
+        else {
+            throw XcodeIntegration.Error.invalidHostPlan(
+                "each App and Feature target configuration may belong to only one profile"
             )
         }
         let featureIDs = Set(features.map(\.id))

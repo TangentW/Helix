@@ -103,6 +103,10 @@ struct Editor: Hashable, Sendable, Identifiable {
         forms.filter(\.isEnabled)
     }
 
+    var hasInstalledCapabilities: Bool {
+        forms.contains(where: \.isInstalled)
+    }
+
     var validationMessages: [String] {
         var result: [String] = []
         let selected = selectedForms

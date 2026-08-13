@@ -47,6 +47,30 @@ public enum Tone: String, Codable, Hashable, Sendable {
     case error
 }
 
+/// Connection-only lifecycle, independent from compilation and activation UI.
+///
+/// A source diagnostic can make ``Snapshot/phase`` equal to ``Phase/failed``
+/// while the authenticated transport remains healthy. Pairing UI should use
+/// this value rather than infer connectivity from the presentation snapshot.
+public enum ConnectionState: String, Codable, Hashable, Sendable {
+    /// No connection has been requested in this process.
+    case idle
+    /// A directly opened test App is intentionally offline.
+    case awaitingPairing
+    /// Bonjour, TLS, or pairing is in progress.
+    case connecting
+    /// The Dev Protocol session is authenticated.
+    case authenticated
+    /// A bounded automatic reconnect is waiting or running.
+    case retrying
+    /// The prior session closed and a fresh manual code may be entered.
+    case disconnected
+    /// Connection setup terminated and a fresh manual code may be entered.
+    case failed
+    /// The owning runtime explicitly stopped the session.
+    case stopped
+}
+
 /// Immutable status value suitable for UIKit, SwiftUI, logs, or tests.
 public struct Snapshot: Codable, Hashable, Sendable {
     /// Monotonically increasing local publication sequence.
@@ -127,6 +151,8 @@ public final class Store: ObservableObject {
 
     /// Most recently reduced development status.
     @Published public private(set) var snapshot = DevStatus.Snapshot()
+    /// Current transport/pairing state, kept separate from code diagnostics.
+    @Published public private(set) var connectionState = DevStatus.ConnectionState.idle
     /// Up to 50 recent publications, ordered from oldest to newest.
     public private(set) var history: [DevStatus.Snapshot] = []
 
@@ -167,6 +193,7 @@ public final class Store: ObservableObject {
     public func handle(_ event: DevRuntimeSession.Event) {
         switch event {
         case .authenticated:
+            connectionState = .authenticated
             publish(
                 phase: .authenticated,
                 tone: .success,
@@ -205,6 +232,7 @@ public final class Store: ObservableObject {
         case let .activationCompleted(result):
             record(result)
         case let .closed(reason):
+            connectionState = .disconnected
             publish(
                 phase: .disconnected,
                 tone: .warning,
@@ -219,6 +247,7 @@ public final class Store: ObservableObject {
     public func handle(_ event: DevConnection.ClientEvent) {
         switch event {
         case .awaitingManualPairing:
+            connectionState = .awaitingPairing
             publish(
                 phase: .awaitingPairing,
                 tone: .neutral,
@@ -226,6 +255,7 @@ public final class Store: ObservableObject {
                 detail: "Networking is off until you confirm the code"
             )
         case let .connecting(attempt):
+            connectionState = .connecting
             publish(
                 phase: .connecting,
                 tone: .progress,
@@ -233,6 +263,7 @@ public final class Store: ObservableObject {
                 detail: "Attempt \(attempt)"
             )
         case let .pairing(attempt):
+            connectionState = .connecting
             publish(
                 phase: .connecting,
                 tone: .progress,
@@ -240,6 +271,7 @@ public final class Store: ObservableObject {
                 detail: "Authenticating attempt \(attempt)"
             )
         case let .paired(shellID):
+            connectionState = .connecting
             publish(
                 phase: .connecting,
                 tone: .progress,
@@ -249,6 +281,7 @@ public final class Store: ObservableObject {
         case let .session(event):
             handle(event)
         case let .reconnectScheduled(attempt, delay, reason):
+            connectionState = .retrying
             let seconds = Double(delay) / 1_000_000_000
             publish(
                 phase: .disconnected,
@@ -257,6 +290,7 @@ public final class Store: ObservableObject {
                 detail: "Attempt \(attempt) in \(String(format: "%.2f", seconds)) s: \(reason)"
             )
         case let .failed(reason):
+            connectionState = .failed
             publish(
                 phase: .failed,
                 tone: .error,
@@ -264,6 +298,7 @@ public final class Store: ObservableObject {
                 detail: reason
             )
         case .stopped:
+            connectionState = .stopped
             publish(
                 phase: .idle,
                 tone: .neutral,

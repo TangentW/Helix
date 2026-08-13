@@ -569,7 +569,7 @@ struct Tooling {
     func releaseLeakageAudit() throws {
         let plist = try PropertyListSerialization.data(
             fromPropertyList: [
-                "NSBonjourServices": ["_business._tcp", "_helix-live._tcp"],
+                "NSBonjourServices": ["_business._tcp", "_helix._tcp"],
                 "NSLocalNetworkUsageDescription": "Helix developer connection",
             ],
             format: .binary,

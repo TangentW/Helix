@@ -87,12 +87,16 @@ public actor ServiceController {
     private var ownedService: DevSession.Service?
     private var mode = Hub.ServiceMode.stopped
 
-    public init() throws {
+    public init(toolExecutableURL: URL? = nil) throws {
         let log = ServiceLog()
+        let toolExecutableURL = try toolExecutableURL ?? Hub.ToolLocator().locate()
         self.log = log
         controlClient = try .applicationSupport()
         serviceFactory = { handler in
-            try DevSession.Service.persistent(eventHandler: handler)
+            try DevSession.Service.persistent(
+                toolExecutableURL: toolExecutableURL,
+                eventHandler: handler
+            )
         }
     }
 

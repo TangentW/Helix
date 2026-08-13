@@ -122,6 +122,7 @@ public actor Service {
     private let contextStore: DevSession.ContextStore?
     private let controlSecret: Data?
     private let rendezvousStore: HubControl.RendezvousStore?
+    private let toolExecutablePath: String?
     private let eventHandler: EventHandler
     private var listener: NetworkTransport.Listener?
     private var endpoint: DevSession.ServiceEndpoint?
@@ -143,13 +144,20 @@ public actor Service {
         contextStore: DevSession.ContextStore? = nil,
         controlSecret: Data? = nil,
         rendezvousStore: HubControl.RendezvousStore? = nil,
+        toolExecutableURL: URL? = nil,
         eventHandler: @escaping EventHandler = { _ in }
     ) throws {
         try configuration.validate()
         guard (controlSecret == nil) == (rendezvousStore == nil),
-              controlSecret == nil || controlSecret?.count == 32
+              controlSecret == nil || controlSecret?.count == 32,
+              (rendezvousStore == nil) == (toolExecutableURL == nil)
         else {
             throw DevSession.ServiceError.invalidConfiguration
+        }
+        let toolExecutablePath = toolExecutableURL?.standardizedFileURL.path
+        if let toolExecutablePath {
+            guard FileManager.default.isExecutableFile(atPath: toolExecutablePath)
+            else { throw DevSession.ServiceError.invalidConfiguration }
         }
         self.configuration = configuration
         self.serverIdentity = serverIdentity
@@ -158,11 +166,13 @@ public actor Service {
         self.contextStore = contextStore
         self.controlSecret = controlSecret
         self.rendezvousStore = rendezvousStore
+        self.toolExecutablePath = toolExecutablePath
         self.eventHandler = eventHandler
     }
 
     /// Opens the owner-only persistent stores used by CLI and Helix Hub frontends.
     public static func persistent(
+        toolExecutableURL: URL,
         configuration: DevSession.ServiceConfiguration = .init(),
         authorityConfiguration: Pairing.AuthorityConfiguration = .init(),
         eventHandler: @escaping EventHandler = { _ in }
@@ -184,6 +194,7 @@ public actor Service {
             contextStore: contextStore,
             controlSecret: try DevProtocol.SecureRandom.bytes(count: 32),
             rendezvousStore: rendezvousStore,
+            toolExecutableURL: toolExecutableURL,
             eventHandler: eventHandler
         )
     }
@@ -229,13 +240,14 @@ public actor Service {
                 bonjourAdvertised: configuration.advertiseBonjour
             )
             self.endpoint = endpoint
-            if let controlSecret, let rendezvousStore {
+            if let controlSecret, let rendezvousStore, let toolExecutablePath {
                 try rendezvousStore.publish(
                     .init(
                         processIdentifier: ProcessInfo.processInfo.processIdentifier,
                         port: endpoint.port,
                         spkiSHA256: endpoint.spkiSHA256,
-                        controlSecret: controlSecret
+                        controlSecret: controlSecret,
+                        toolExecutablePath: toolExecutablePath
                     )
                 )
             }

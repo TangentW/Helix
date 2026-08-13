@@ -46,7 +46,8 @@ struct ProjectInstallationTests {
             ]
         )
         let plan = try Hub.OnboardingPlanner().plan(draft)
-        let first = try Hub.ProjectInstaller().install(plan)
+        let installer = generatedInfoPlistInstaller()
+        let first = try installer.install(plan)
         #expect(first.capabilities == [.hotPatch, .liveReload])
         #expect(first.writtenRelativePaths.contains(".helix/xcode/HostPlan.json"))
         let keyURL = root.appendingPathComponent(".helix/private/PatchSigningKey.json")
@@ -85,6 +86,11 @@ struct ProjectInstallationTests {
         )
         #expect(projectText.components(separatedBy: "Helix Bridge (Generated)").count - 1 == 2)
         #expect(projectText.contains("alwaysOutOfDate = 1"))
+        #expect(projectText.contains(
+            "${HELIX_INTEGRATION_ROOT:?}/Profiles/live/bridge.sh"
+        ))
+        #expect(!projectText.contains("Build Helix Patch (Generated)"))
+        #expect(!projectText.contains("$(HELIX_INTEGRATION_ROOT)/Profiles/"))
         #expect(!projectText.contains("HelixBridge.swift"))
         let liveSchemeURL = projectURL.appendingPathComponent(
             "xcshareddata/xcschemes/Live.xcscheme"
@@ -92,13 +98,38 @@ struct ProjectInstallationTests {
         let liveScheme = String(decoding: try Data(contentsOf: liveSchemeURL), as: UTF8.self)
         #expect(liveScheme.components(separatedBy: "Helix Hub: Prepare live").count - 1 == 1)
         #expect(liveScheme.components(separatedBy: "Helix Hub: Register live").count - 1 == 1)
-        #expect(FileManager.default.fileExists(
-            atPath: projectURL.appendingPathComponent(
-                "xcshareddata/xcschemes/Helix Build Patch.xcscheme"
-            ).path
-        ))
+        let patchSchemeURL = projectURL.appendingPathComponent(
+            "xcshareddata/xcschemes/Helix Build Patch.xcscheme"
+        )
+        let patchScheme = String(
+            decoding: try Data(contentsOf: patchSchemeURL),
+            as: UTF8.self
+        )
+        #expect(patchScheme.contains("Helix Hub: Build hot patch"))
+        #expect(patchScheme.contains("Profiles/hot/patch.sh"))
+        #expect(patchScheme.contains("BlueprintName=\"HotApp\""))
+        #expect(patchScheme.contains("BlueprintName=\"HelixPatchAction\""))
         #expect(permissions(keyURL) == 0o600)
         #expect(permissions(root.appendingPathComponent(".helix/private")) == 0o700)
+        let generatedInfoURL = root.appendingPathComponent(
+            ".helix/xcode/ProjectConfigurations/live-Application-Info.plist"
+        )
+        let generatedInfo = try propertyList(at: generatedInfoURL)
+        #expect(generatedInfo["NSBonjourServices"] as? [String] == ["_helix._tcp"])
+        #expect(
+            generatedInfo["NSLocalNetworkUsageDescription"] as? String
+                == Hub.DevelopmentNetworkConfiguration.usageDescription
+        )
+        let liveApplicationConfiguration = String(
+            decoding: try Data(contentsOf: root.appendingPathComponent(
+                ".helix/xcode/ProjectConfigurations/live-Application-Debug.xcconfig"
+            )),
+            as: UTF8.self
+        )
+        #expect(liveApplicationConfiguration.contains("GENERATE_INFOPLIST_FILE = NO"))
+        #expect(liveApplicationConfiguration.contains(
+            "live-Application-Info.plist"
+        ))
 
         let configurationURL = root.appendingPathComponent(
             "Configurations/Helix/livefeature.yml"
@@ -116,7 +147,7 @@ struct ProjectInstallationTests {
         let customRecipe = try Core.CanonicalJSON.encode(recipe)
         try customRecipe.write(to: recipeURL)
 
-        _ = try Hub.ProjectInstaller().install(plan)
+        _ = try installer.install(plan)
         #expect(try Data(contentsOf: keyURL) == firstKey)
         #expect(try Data(contentsOf: configurationURL) == customConfiguration)
         #expect(try Data(contentsOf: recipeURL) == customRecipe)
@@ -172,7 +203,115 @@ struct ProjectInstallationTests {
         )
         try Core.CanonicalJSON.encode(unrelatedKey).write(to: keyURL)
         #expect(throws: Hub.Error.self) {
-            _ = try Hub.ProjectInstaller().install(plan)
+            _ = try installer.install(plan)
+        }
+    }
+
+    @Test("Existing Info.plist keeps product network declarations")
+    func mergesExistingInformationPropertyList() throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let infoURL = root.appendingPathComponent("Live/Info.plist")
+        try FileManager.default.createDirectory(
+            at: infoURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let original: [String: Any] = [
+            "CFBundleDisplayName": "Example",
+            "NSBonjourServices": ["_business._tcp", "_helix._tcp", "_business._tcp"],
+            "NSLocalNetworkUsageDescription": "Find nearby business devices.",
+        ]
+        try PropertyListSerialization.data(
+            fromPropertyList: original,
+            format: .xml,
+            options: 0
+        ).write(to: infoURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: infoURL.path
+        )
+        let project = try Hub.ProjectFileParser().parse(
+            projectURL: root.appendingPathComponent("Example.xcodeproj")
+        )
+        let profile = XcodeIntegration.Profile(
+            id: "live",
+            workflow: .liveReload,
+            schemeName: "Live",
+            applicationTargetName: "LiveApp",
+            configurationName: "Debug",
+            bundleIdentifier: "dev.example.live",
+            namespaceSeed: "example-live",
+            featureID: "livefeature"
+        )
+        let settings = Hub.TargetSettings(
+            targetName: "LiveApp",
+            configurationName: "Debug",
+            moduleName: "LiveApp",
+            bundleIdentifier: "dev.example.live",
+            productName: "LiveApp",
+            swiftVersion: "6.0",
+            sourceRootURL: root,
+            informationPropertyListURL: infoURL,
+            generatesInformationPropertyList: false
+        )
+        let result = try Hub.DevelopmentNetworkConfiguration().plan(
+            profile: profile,
+            project: project,
+            settings: settings,
+            integrationRoot: ".helix/xcode"
+        )
+        #expect(result.applicationBuildSettings == nil)
+        let mutation = try #require(result.mutations.first)
+        #expect(mutation.relativePath == "Live/Info.plist")
+        #expect(mutation.permissions == 0o600)
+        let merged = try propertyList(mutation.data)
+        #expect(
+            merged["NSBonjourServices"] as? [String]
+                == ["_business._tcp", "_helix._tcp"]
+        )
+        #expect(
+            merged["NSLocalNetworkUsageDescription"] as? String
+                == "Find nearby business devices."
+        )
+        #expect(merged["CFBundleDisplayName"] as? String == "Example")
+    }
+
+    @Test("A missing configured Info.plist is never replaced silently")
+    func rejectsMissingConfiguredInformationPropertyList() throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = try Hub.ProjectFileParser().parse(
+            projectURL: root.appendingPathComponent("Example.xcodeproj")
+        )
+        let profile = XcodeIntegration.Profile(
+            id: "live",
+            workflow: .liveReload,
+            schemeName: "Live",
+            applicationTargetName: "LiveApp",
+            configurationName: "Debug",
+            bundleIdentifier: "dev.example.live",
+            namespaceSeed: "example-live",
+            featureID: "livefeature"
+        )
+        let settings = Hub.TargetSettings(
+            targetName: "LiveApp",
+            configurationName: "Debug",
+            moduleName: "LiveApp",
+            bundleIdentifier: "dev.example.live",
+            productName: "LiveApp",
+            swiftVersion: "6.0",
+            sourceRootURL: root,
+            informationPropertyListURL: root.appendingPathComponent("Missing-Info.plist"),
+            generatesInformationPropertyList: true
+        )
+
+        #expect(throws: Hub.Error.self) {
+            _ = try Hub.DevelopmentNetworkConfiguration().plan(
+                profile: profile,
+                project: project,
+                settings: settings,
+                integrationRoot: ".helix/xcode"
+            )
         }
     }
 
@@ -224,6 +363,35 @@ struct ProjectInstallationTests {
     private func permissions(_ url: URL) -> Int? {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         return (attributes?[.posixPermissions] as? NSNumber)?.intValue
+    }
+
+    private func generatedInfoPlistInstaller() -> Hub.ProjectInstaller {
+        Hub.ProjectInstaller { project, targetName, configurationName in
+            Hub.TargetSettings(
+                targetName: targetName,
+                configurationName: configurationName,
+                moduleName: targetName,
+                bundleIdentifier: "dev.example.live",
+                productName: targetName,
+                swiftVersion: "6.0",
+                sourceRootURL: project.sourceRootURL,
+                generatesInformationPropertyList: true
+            )
+        }
+    }
+
+    private func propertyList(at url: URL) throws -> [String: Any] {
+        try propertyList(Data(contentsOf: url))
+    }
+
+    private func propertyList(_ data: Data) throws -> [String: Any] {
+        try #require(
+            PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: nil
+            ) as? [String: Any]
+        )
     }
 
     private func scheme(name: String) -> String {

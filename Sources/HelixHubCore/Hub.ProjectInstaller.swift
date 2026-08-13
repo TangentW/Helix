@@ -38,7 +38,28 @@ public struct InstallationResult: Hashable, Sendable {
 /// exclusively in DerivedData; only xcconfig references and build phases enter
 /// the PBX graph.
 public struct ProjectInstaller: Sendable {
-    public init() {}
+    typealias TargetSettingsResolver = @Sendable (
+        _ project: Hub.XcodeProject,
+        _ targetName: String,
+        _ configurationName: String
+    ) throws -> Hub.TargetSettings
+
+    private let targetSettingsResolver: TargetSettingsResolver
+
+    public init() {
+        let inspector = Hub.ProjectInspector()
+        targetSettingsResolver = { project, targetName, configurationName in
+            try inspector.settings(
+                project: project,
+                targetName: targetName,
+                configurationName: configurationName
+            )
+        }
+    }
+
+    init(targetSettingsResolver: @escaping TargetSettingsResolver) {
+        self.targetSettingsResolver = targetSettingsResolver
+    }
 
     public func install(_ onboarding: Hub.OnboardingPlan) throws -> Hub.InstallationResult {
         try onboarding.hostPlan.validate()
@@ -53,11 +74,30 @@ public struct ProjectInstaller: Sendable {
             )
         }
         let sourceRoot = project.sourceRootURL
+        var networkMutations: [Hub.FileMutation] = []
+        var applicationBuildSettings: [String: String] = [:]
+        let networkConfiguration = Hub.DevelopmentNetworkConfiguration()
+        for profile in onboarding.hostPlan.profiles where profile.workflow == .liveReload {
+            let settings = try targetSettingsResolver(
+                project,
+                profile.applicationTargetName,
+                profile.configurationName
+            )
+            let networkPlan = try networkConfiguration.plan(
+                profile: profile,
+                project: project,
+                settings: settings,
+                integrationRoot: onboarding.hostPlan.integrationRoot
+            )
+            networkMutations.append(contentsOf: networkPlan.mutations)
+            applicationBuildSettings[profile.id] = networkPlan.applicationBuildSettings
+        }
         let kit = try XcodeIntegration.KitGenerator().generate(plan: onboarding.hostPlan)
         let integration = try Hub.PBXIntegration().prepare(
             plan: onboarding.hostPlan,
             project: project,
-            featureTargetNames: onboarding.featureTargetNames
+            featureTargetNames: onboarding.featureTargetNames,
+            applicationBuildSettings: applicationBuildSettings
         )
         var mutations: [Hub.FileMutation] = []
         let projectRelative = try relative(
@@ -73,6 +113,7 @@ public struct ProjectInstaller: Sendable {
             onboarding: onboarding,
             sourceRoot: sourceRoot
         ))
+        mutations.append(contentsOf: networkMutations)
         for (path, data) in kit.artifacts {
             mutations.append(.init(
                 relativePath: "\(onboarding.hostPlan.integrationRoot)/\(path)",
@@ -118,7 +159,9 @@ public struct ProjectInstaller: Sendable {
                     data: try Hub.SchemeDocument.patchActionScheme(
                         profile: profile,
                         targetID: targetID,
-                        projectName: project.name
+                        applicationTarget: app,
+                        projectName: project.name,
+                        integrationRoot: onboarding.hostPlan.integrationRoot
                     ),
                     permissions: 0o644
                 ))

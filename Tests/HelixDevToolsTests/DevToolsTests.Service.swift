@@ -155,9 +155,11 @@ struct Service {
             broker: broker,
             sessionServer: sessions,
             controlSecret: Data(repeating: 0xC7, count: 32),
-            rendezvousStore: rendezvousStore
+            rendezvousStore: rendezvousStore,
+            toolExecutableURL: URL(fileURLWithPath: "/usr/bin/true")
         )
         let endpoint = try await service.start()
+        #expect(try rendezvousStore.load().toolExecutablePath == "/usr/bin/true")
         let client = try HubControl.Client(rendezvousStore: rendezvousStore)
         let first = try await client.reserveAutomaticInvitation()
         #expect(first.reservation.kind == .automaticXcode)
@@ -220,6 +222,36 @@ struct Service {
         #expect(try rendezvousStore.load().controlSecret == Data(repeating: 0xC7, count: 32))
         await service.stop()
         #expect(!FileManager.default.fileExists(atPath: rendezvousStore.url.path))
+    }
+
+    @Test("Rendezvous accepts only canonical absolute tool paths")
+    func rendezvousToolPath() throws {
+        var rendezvous = HubControl.Rendezvous(
+            processIdentifier: ProcessInfo.processInfo.processIdentifier,
+            port: 8_888,
+            spkiSHA256: .sha256("hub-tool"),
+            controlSecret: Data(repeating: 0x48, count: 32),
+            toolExecutablePath: "/Applications/Helix.app/Contents/Helpers/helix"
+        )
+        try rendezvous.validate()
+
+        rendezvous.toolExecutablePath = "relative/helix"
+        #expect(throws: HubControl.Error.invalidRendezvous) {
+            try rendezvous.validate()
+        }
+        rendezvous.toolExecutablePath = "/Applications/Helix.app/../tool"
+        #expect(throws: HubControl.Error.invalidRendezvous) {
+            try rendezvous.validate()
+        }
+        rendezvous.toolExecutablePath = "/Applications/Helix\nTool"
+        #expect(throws: HubControl.Error.invalidRendezvous) {
+            try rendezvous.validate()
+        }
+        rendezvous.toolExecutablePath = "/usr/bin/true"
+        rendezvous.schemaVersion = 1
+        #expect(throws: HubControl.Error.invalidRendezvous) {
+            try rendezvous.validate()
+        }
     }
 
     @Test("Control framing is canonical, correlated, and route-versioned")

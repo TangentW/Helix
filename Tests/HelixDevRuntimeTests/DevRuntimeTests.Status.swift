@@ -10,18 +10,53 @@ struct StatusTests {
     @Test("Manual pairing and terminal connection failures are explicit")
     func modelsPairingLifecycle() throws {
         let store = DevStatus.Store()
+        #expect(store.connectionState == .idle)
         store.handle(.awaitingManualPairing)
         #expect(store.snapshot.phase == .awaitingPairing)
+        #expect(store.connectionState == .awaitingPairing)
         #expect(store.snapshot.detail?.contains("Networking is off") == true)
 
         store.handle(.pairing(attempt: 2))
         #expect(store.snapshot.phase == .connecting)
+        #expect(store.connectionState == .connecting)
         #expect(store.snapshot.detail?.contains("2") == true)
 
         store.handle(.failed("invitation expired"))
         #expect(store.snapshot.phase == .failed)
+        #expect(store.connectionState == .failed)
         #expect(store.snapshot.tone == .error)
         #expect(store.snapshot.detail == "invitation expired")
+    }
+
+    @Test("Code diagnostics do not erase authenticated transport state")
+    func separatesConnectionAndCompilationState() {
+        let store = DevStatus.Store()
+        store.handle(DevRuntimeSession.Event.authenticated)
+        #expect(store.connectionState == .authenticated)
+
+        store.handle(
+            DevRuntimeSession.Event.diagnostics([
+                .init(
+                    code: "HLXLR299",
+                    message: "unsupported source",
+                    sourceRevision: .init(rawValue: 1),
+                    nextAction: "correct the source"
+                ),
+            ])
+        )
+        #expect(store.snapshot.phase == .failed)
+        #expect(store.connectionState == .authenticated)
+
+        store.handle(DevRuntimeSession.Event.closed("service restarted"))
+        #expect(store.connectionState == .disconnected)
+        store.handle(
+            DevConnection.ClientEvent.reconnectScheduled(
+                attempt: 1,
+                delayNanoseconds: 1_000_000,
+                reason: "service restarted"
+            )
+        )
+        #expect(store.connectionState == .retrying)
     }
 
     @Test("Session events preserve the distinction between code and UI state")

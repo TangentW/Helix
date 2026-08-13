@@ -82,6 +82,7 @@ struct ServiceControllerTests {
             sessionServer: EmptySessionServer(),
             controlSecret: Data(repeating: 0x71, count: 32),
             rendezvousStore: .init(url: fixture.rendezvousURL),
+            toolExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
             eventHandler: eventHandler
         )
     }

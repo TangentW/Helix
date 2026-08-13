@@ -25,7 +25,7 @@ struct ProjectParserTests {
         ])
         #expect(
             liveFeature.baseConfigurationPaths["Debug"]
-                == ".helix/xcode/Profiles/live/Feature.xcconfig"
+                == ".helix/xcode/ProjectConfigurations/live-Feature-Debug.xcconfig"
         )
 
         let liveApp = try #require(project.target(named: "LiveReloadDemo"))
@@ -106,7 +106,9 @@ struct ProjectParserTests {
           "PRODUCT_BUNDLE_IDENTIFIER":"dev.example.live",
           "PRODUCT_NAME":"Example Live",
           "SRCROOT":"\(project.sourceRootURL.path)",
-          "SWIFT_VERSION":"6.0"
+          "SWIFT_VERSION":"6.0",
+          "INFOPLIST_FILE":"LiveReloadDemo/Info.plist",
+          "GENERATE_INFOPLIST_FILE":"NO"
         }}]
         """
         let inspector = Hub.ProjectInspector(
@@ -125,6 +127,13 @@ struct ProjectParserTests {
         #expect(settings.bundleIdentifier == "dev.example.live")
         #expect(settings.productName == "Example Live")
         #expect(settings.swiftVersion == "6.0")
+        #expect(
+            settings.informationPropertyListURL
+                == project.sourceRootURL.appendingPathComponent(
+                    "LiveReloadDemo/Info.plist"
+                ).standardizedFileURL
+        )
+        #expect(settings.generatesInformationPropertyList == false)
     }
 }
 

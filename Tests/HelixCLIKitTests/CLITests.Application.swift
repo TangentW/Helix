@@ -279,7 +279,7 @@ struct Application {
                 ),
             ]
         )
-        let planURL = directory.appendingPathComponent("HelixXcode.json")
+        let planURL = directory.appendingPathComponent("HostPlan.json")
         try XcodeIntegration.HostPlanCodec.encode(plan).write(to: planURL)
         let application = CLI.Application(currentDirectoryURL: directory)
 
@@ -325,6 +325,24 @@ struct Application {
         let replaced = application.run(generationArguments + ["--force"])
         #expect(replaced.exitCode == 0)
 
+        let installedPlanURL = output.appendingPathComponent("HostPlan.json")
+        let installedValidation = application.run([
+            "xcode", "validate", "--plan", installedPlanURL.path, "--json",
+        ])
+        #expect(
+            installedValidation.exitCode == 0,
+            Comment(rawValue: installedValidation.standardError)
+        )
+        let installedGeneration = application.run([
+            "xcode", "generate", "--plan", installedPlanURL.path,
+        ])
+        #expect(installedGeneration.exitCode == 1)
+        #expect(
+            installedGeneration.standardError.contains(
+                "Host Plan input must be outside the generated integration root"
+            )
+        )
+
         let doctor = application.run([
             "xcode", "doctor", "--plan", planURL.path,
             "--profile", "live", "--static", "--json",
@@ -336,6 +354,18 @@ struct Application {
         )
         #expect(doctorReport.passed)
         #expect(!doctorReport.checks.contains { $0.severity == .error })
+
+        let installedDoctor = application.run([
+            "xcode", "doctor", "--plan", installedPlanURL.path,
+            "--profile", "live", "--static", "--json",
+        ])
+        #expect(installedDoctor.exitCode == 0, Comment(rawValue: installedDoctor.standardOutput))
+        let installedDoctorReport = try JSONDecoder().decode(
+            CLI.XcodeDoctorReport.self,
+            from: Data(installedDoctor.standardOutput.dropLast().utf8)
+        )
+        #expect(installedDoctorReport.passed)
+        #expect(!installedDoctorReport.checks.contains { $0.severity == .error })
     }
 
     @Test("Xcode prepare keeps Production explicit and manages the Debug calling surface")
@@ -405,7 +435,7 @@ struct Application {
                 ),
             ]
         )
-        let planURL = directory.appendingPathComponent("HelixXcode.json")
+        let planURL = directory.appendingPathComponent("HostPlan.json")
         let planBytes = try XcodeIntegration.HostPlanCodec.encode(plan)
         try planBytes.write(to: planURL)
         let generatedPlanURL = directory.appendingPathComponent(

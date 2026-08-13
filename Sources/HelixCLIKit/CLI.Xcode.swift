@@ -204,7 +204,7 @@ private func inspectGeneratedKit(
     planURL: URL,
     profile: XcodeIntegration.Profile
 ) -> [CLI.XcodeDoctorCheck] {
-    let root = planURL.deletingLastPathComponent()
+    let root = xcodeSourceRoot(plan: plan, planURL: planURL)
         .appendingPathComponent(plan.integrationRoot, isDirectory: true)
         .standardizedFileURL
     let manifestURL = root.appendingPathComponent("IntegrationManifest.json")
@@ -271,7 +271,7 @@ private func inspectXcodeProject(
     planURL: URL,
     profile: XcodeIntegration.Profile
 ) -> [CLI.XcodeDoctorCheck] {
-    let projectURL = planURL.deletingLastPathComponent()
+    let projectURL = xcodeSourceRoot(plan: plan, planURL: planURL)
         .appendingPathComponent(plan.projectPath).standardizedFileURL
     let schemeURL = projectURL.appendingPathComponent(
         "xcshareddata/xcschemes/\(profile.schemeName).xcscheme"
@@ -1387,7 +1387,8 @@ private func generateXcodeIntegration(_ arguments: [String]) throws -> CLI.Resul
     let plan = try loadHostPlan(at: planURL)
     _ = try validateHostInputs(plan: plan, planURL: planURL)
 
-    let expectedOutput = planURL.deletingLastPathComponent()
+    let sourceRoot = xcodeSourceRoot(plan: plan, planURL: planURL)
+    let expectedOutput = sourceRoot
         .appendingPathComponent(plan.integrationRoot, isDirectory: true)
         .standardizedFileURL
     let outputURL = try options.value("output").map(files.resolve) ?? expectedOutput
@@ -1401,7 +1402,7 @@ private func generateXcodeIntegration(_ arguments: [String]) throws -> CLI.Resul
     guard inputPath != outputURL.path, !inputPath.hasPrefix(outputPrefix) else {
         throw CLI.Error.input("Host Plan input must be outside the generated integration root")
     }
-    let base = planURL.deletingLastPathComponent().resolvingSymlinksInPath()
+    let base = sourceRoot.resolvingSymlinksInPath()
     let parent = outputURL.deletingLastPathComponent()
     let resolvedParent = parent.resolvingSymlinksInPath()
     guard Self.contains(resolvedParent, in: base),
@@ -1486,7 +1487,8 @@ private func validateHostInputs(
     planURL: URL
 ) throws -> CLI.XcodeValidationReport {
     let manager = FileManager.default
-    let base = planURL.deletingLastPathComponent().resolvingSymlinksInPath()
+    let base = xcodeSourceRoot(plan: plan, planURL: planURL)
+        .resolvingSymlinksInPath()
     let project = base.appendingPathComponent(plan.projectPath).standardizedFileURL
     guard Self.contains(project.resolvingSymlinksInPath(), in: base) else {
         throw CLI.Error.input("Xcode project or workspace escapes the Host Plan root")
@@ -1607,6 +1609,29 @@ private func validateHostInputs(
     }
 }
 
+/// Resolves the project source root for both an authoring plan beside the
+/// project and the canonical copy installed at `<integrationRoot>/HostPlan.json`.
+/// All paths inside a Host Plan remain source-root-relative in either form.
+private func xcodeSourceRoot(
+    plan: XcodeIntegration.HostPlan,
+    planURL: URL
+) -> URL {
+    let normalizedPlan = planURL.standardizedFileURL
+    let integrationComponents = plan.integrationRoot.split(separator: "/")
+    var installedCandidate = normalizedPlan.deletingLastPathComponent()
+    for _ in integrationComponents {
+        installedCandidate.deleteLastPathComponent()
+    }
+    let expectedInstalledPlan = installedCandidate
+        .appendingPathComponent(plan.integrationRoot, isDirectory: true)
+        .appendingPathComponent("HostPlan.json")
+        .standardizedFileURL
+    if expectedInstalledPlan == normalizedPlan {
+        return installedCandidate.standardizedFileURL
+    }
+    return normalizedPlan.deletingLastPathComponent().standardizedFileURL
+}
+
 private func requireNoXcodePositionals(
     _ options: CLI.Arguments,
     command: String
@@ -1623,21 +1648,21 @@ private static func contains(_ candidate: URL, in root: URL) -> Bool {
 }
 
 static let xcodeGenerateHelp = """
-Usage: helix xcode generate --plan HelixXcode.json [--output .helix/xcode] [--force]
+Usage: helix xcode generate --plan HostPlan.json [--output .helix/xcode] [--force]
 
 The output must match the plan's integrationRoot. Helix writes the entire kit
 atomically so Xcode never observes a partially regenerated source contract.
 """ + "\n"
 
 static let xcodeValidateHelp = """
-Usage: helix xcode validate --plan HelixXcode.json [--json]
+Usage: helix xcode validate --plan HostPlan.json [--json]
 
 Validation checks canonical schema, workflow/runtime separation, project and
 configuration inputs, source containment, and every declared Swift file.
 """ + "\n"
 
 static let xcodePhaseHelp = """
-Usage: helix xcode phase --plan HelixXcode.json --profile ID --phase PHASE
+Usage: helix xcode phase --plan HostPlan.json --profile ID --phase PHASE
 
 Phases: prepare, bridge, finalize, audit, patch, live-register. This command is
 designed for generated Xcode scripts and reads volatile build facts only from
@@ -1645,7 +1670,7 @@ the active Xcode environment.
 """ + "\n"
 
 static let xcodeDoctorHelp = """
-Usage: helix xcode doctor --plan HelixXcode.json --profile ID [--static] [--json]
+Usage: helix xcode doctor --plan HostPlan.json --profile ID [--static] [--json]
 
 Doctor verifies the generated kit, shared scheme, application target, runtime
 product, and—unless --static is used—the active Xcode compiler environment.

@@ -85,7 +85,9 @@ struct SchemeDocument {
     static func patchActionScheme(
         profile: XcodeIntegration.Profile,
         targetID: String,
-        projectName: String
+        applicationTarget: Hub.XcodeTarget,
+        projectName: String,
+        integrationRoot: String
     ) throws -> Data {
         guard let patch = profile.patch else {
             throw Hub.Error.invalidOnboarding("Hot Patch profile has no action settings")
@@ -94,10 +96,27 @@ struct SchemeDocument {
         let escapedName = xml(patch.actionTargetName)
         let escapedProject = xml(projectName)
         let escapedConfiguration = xml(profile.configurationName)
+        let escapedApplicationID = xml(applicationTarget.id)
+        let escapedApplicationName = xml(applicationTarget.name)
+        let escapedApplicationProduct = xml(
+            applicationTarget.buildableName ?? applicationTarget.productName
+        )
+        let escapedScript = xml(
+            "/bin/sh \"$SRCROOT/\(integrationRoot)/Profiles/\(profile.id)/patch.sh\""
+        )
         let source = """
         <?xml version="1.0" encoding="UTF-8"?>
         <Scheme version="1.7">
           <BuildAction parallelizeBuildables="NO" buildImplicitDependencies="NO">
+            <PreActions>
+              <ExecutionAction ActionType="Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
+                <ActionContent title="Helix Hub: Build \(xml(profile.id)) patch" scriptText="\(escapedScript)">
+                  <EnvironmentBuildable>
+                    <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="\(escapedApplicationID)" BuildableName="\(escapedApplicationProduct)" BlueprintName="\(escapedApplicationName)" ReferencedContainer="container:\(escapedProject).xcodeproj"/>
+                  </EnvironmentBuildable>
+                </ActionContent>
+              </ExecutionAction>
+            </PreActions>
             <BuildActionEntries>
               <BuildActionEntry buildForTesting="NO" buildForRunning="YES" buildForProfiling="NO" buildForArchiving="NO" buildForAnalyzing="NO">
                 <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="\(escapedTarget)" BuildableName="\(escapedName)" BlueprintName="\(escapedName)" ReferencedContainer="container:\(escapedProject).xcodeproj"/>
