@@ -1,33 +1,38 @@
-# Helix Xcode Run 端到端测试用例
+# Helix Xcode / Hub 端到端测试用例
 
-这份文档记录必须通过真实 Xcode GUI 执行的 Helix Live Reload 验收。它补充自动化测试，不替代 `swift test`、Simulator fixture 或 `xcodebuild build`：只有 Xcode Run 才会覆盖共享 Scheme 的 Run pre/post-action、自定义 LLDB init、调试器附加时序、App 进程 handoff，以及保存源码后的同进程 UI 刷新。
+这份清单覆盖 Helix Hub、Xcode 自动连接、测试包手动配对、同进程 Live Reload 和 Xcode Patch Action。它补充 `swift test`、Simulator fixture 与 `xcodebuild`，不把其中任何一项当作其他证据的替代品。
 
-测试只操作仓库中的原工程：
+测试使用仓库中的原工程：
 
 ```text
 /Users/tangent/Desktop/Helix/Demo/HelixDemo.xcodeproj
 ```
 
-不要用复制到 `/tmp` 的工程作为验收结论。每次测试结束都必须把 `Demo/LiveReloadFeature/Sources/LiveReloadFeature.Screen.swift` 恢复为仓库 baseline。
+不要用复制到 `/tmp` 的工程作为最终结论。每轮结束都要逐字恢复：
+
+```text
+Demo/LiveReloadFeature/Sources/LiveReloadFeature.Screen.swift
+Demo/HotPatchFeature/Sources/HotPatchFeature.Pricing.swift
+```
 
 ## 1. 通过标准
 
-一轮完整验收同时满足以下条件才算通过：
+一轮完整验收至少满足：
 
-1. Xcode 直接 Run `Helix Live Reload Demo`，无需手动执行 Helix 命令来启动会话。
-2. App 与 daemon 完成认证连接，Overlay 不长期停留在 `Idle`。
-3. 连续两次修改并保存 `viewDidLayoutSubviews()` 后，页面均在同一 App PID 中更新，不发生重新 Build、安装或启动。
-4. 页面内存状态保持不变；后来的 generation 不会被较早的慢任务覆盖。
-5. 一次语法错误只报告编译失败，上一代代码仍然生效。
-6. 把源码恢复为 baseline 后，会生成新的恢复 generation，页面和磁盘源码都回到 baseline。
-7. Xcode Stop 会停止 daemon 并清理本次临时 handoff 文件。
-8. 控制台没有 Helix 引入的未满足 Auto Layout 约束、无效 LLDB 命令或凭据明文。
+1. Helix 菜单栏应用能发现并配置工程，用户可见名称和进程名称都是 **Helix**。
+2. 普通 Xcode Run 使用默认 Apple debugger 自动连接，不设置自定义 LLDB、launch environment、host、port、secret 或 `HELIX_EXECUTABLE`。
+3. App 从桌面直接打开时默认不浏览 Bonjour、不连接；用户进入调试页输入四位码并确认后才开始发现和认证。
+4. Xcode 自动连接和四位码手动连接都使用唯一 `_helix._tcp`、同一 Host Identity pin、Build Context、TLS 与 HLBC 会话协议。
+5. 连续保存两次受支持实现，页面在同一 App PID 内变化，内存状态保留，较旧任务不能覆盖新 generation。
+6. 语法错误或不支持的 SIL 会显示明确失败，上一成功 generation 继续生效。
+7. 源码恢复 baseline 后产生恢复 generation，不依赖重启 App。
+8. Xcode Stop 只结束 App 会话；长期运行的 Helix Service 与 Build Context registry 继续可用。
+9. Patch Scheme 只生成、签名并可选 stage `.hlxp`，不重建或重装 App。
+10. 证据中没有 Service secret、private key、完整 invitation、TLS key material 或认证帧。
 
-Simulator HLBC 通过不等于真机已经通过资格测试。两者使用相同 artifact、协议、Verifier 与 HLVM，但真机仍必须单独记录 Xcode、iOS、设备、连接和性能结果。
+Simulator 通过不代表真机资格完成。两者走相同 HLBC artifact、协议、Verifier 与 HLVM，但真机仍要单独记录设备、iOS、Xcode、网络、前后台和长时间运行结果。
 
-## 2. 测试环境记录
-
-执行前填写：
+## 2. 环境记录
 
 | 项目 | 值 |
 | --- | --- |
@@ -36,194 +41,200 @@ Simulator HLBC 通过不等于真机已经通过资格测试。两者使用相�
 | macOS | |
 | Xcode 版本与 build | |
 | Swift 版本 | |
-| Simulator 型号、iOS、UDID | |
-| Scheme | `Helix Live Reload Demo` |
+| Simulator / iPhone 型号与 OS | |
+| Scheme | `Helix Live Reload Demo` / `Helix Hot Patch Demo` |
 | Run Destination | |
-| DerivedData 路径 | |
-| macOS 登录会话 | 已解锁，Xcode 与 Simulator UI 可操作 |
+| DerivedData | |
+| Helix App 构建 | |
 | 测试人 | |
 
-证据中可以记录 session ID 的末四位、端口是否存在以及变量是否存在，但不得复制 `HLX_DEV_SESSION_SECRET`、SPKI 内容、完整 LLDB init 或其他凭据。
+四位码可以出现在临时截图里，但验收归档应遮掉或只保留末一位。不要直接读取或粘贴 `~/Library/Application Support/Helix/Service.json`；如需检查，只记录 owner、`0600` 权限、schema、mode 和已脱敏的 tool path 结论。
 
-## 3. 前置检查
+## 3. 自动化前置 Gate
 
-### XR-00：自动化基线
-
-在仓库根目录执行：
+从仓库根目录执行：
 
 ```bash
 swift build --product helix
 swift test
 swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
-.build/debug/helix xcode validate --plan Demo/HelixXcode.json
+
+.build/debug/helix xcode validate \
+  --plan Demo/.helix/xcode/HostPlan.json
+.build/debug/helix xcode doctor \
+  --plan Demo/.helix/xcode/HostPlan.json \
+  --profile live \
+  --static
+
+Hub/Scripts/build-app.sh release /tmp/Helix-Validation.app
+
 xcodebuild -project Demo/HelixDemo.xcodeproj \
   -scheme "Helix Live Reload Demo" \
-  -destination "platform=iOS Simulator,id=<UDID>" \
+  -destination "generic/platform=iOS Simulator" \
   build
 ```
 
 预期：
 
-- 六条命令全部成功，SwiftPM 三轮测试的测试数与 suite 数一致；
-- Xcode package 解析到当前 `/Users/tangent/Desktop/Helix`；
-- 工程中不存在小写 `demo/` 路径引用；
-- Debug App 的 `HelixDevAppRuntime` package framework 导出
-  `_helix_dev_runtime_handoff_probe`，Hot Patch Release App 的
-  `HelixAppRuntime` 与主 executable 均不包含该符号；
-- `LiveReloadFeature.Screen.swift` 的 baseline 标记为：
+- 测试和两种编译 Gate 全部成功；
+- installed `HostPlan.json` 能直接通过 validate/doctor，工程路径解析到 `Demo/`，不会错误落到 `.helix/xcode/`；
+- `/tmp/Helix-Validation.app/Contents/Helpers/helix` 存在且可执行；
+- App 与嵌套 helper 的签名结构可通过 `codesign --verify --strict`；
+- Demo 工程没有生成 Swift reference、Bridge target、`HELIX_EXECUTABLE`、自定义 LLDB init、`live-start.sh` 或 `live-stop.sh`。
 
-  ```swift
-  titleLabel.text = "SAVE TO RELOAD" // HELIX_LIVE_BASELINE
-  ```
+## 4. Helix Hub 与工程接入
 
-### XR-01：原工程与 Scheme 接线
+### XR-01：打开 Helix
 
-1. 退出其他同名临时 Demo 工程，避免 Xcode 复用错误的本地 package identity。
-2. 从 Xcode 打开 `Demo/HelixDemo.xcodeproj`。
-3. 选择 `Helix Live Reload Demo`。
-4. 选择目标 Simulator。
-5. 检查 Run action 的 Custom LLDB Init File 为 `$(HELIX_LLDB_INIT_FILE)`。
-6. 检查 Run pre-action 为 `live-start.sh`，Run post-action 为 `live-stop.sh`。
+1. 打开打包后的 Helix。
+2. 确认菜单栏出现 Helix，主窗口显示 Service 为 Running。
+3. 选择 `Demo/HelixDemo.xcodeproj`。
 
-预期：Xcode 显示的工程 URL 使用 `/Helix/Demo/`，Package Graph 无缺失产品，Scheme 和 destination 均正确。
+预期：
 
-## 4. 会话启动与 handoff
+- 工程列表显示 Hot Patch 与 Live Reload；
+- Helix 显示一个大小写不敏感的四位码及过期时间；
+- Service 只发布 `_helix._tcp`；
+- 如果外部 `helix hub run` 已经运行，GUI 显示 external/adopted 状态，退出 GUI 不会停止外部进程。
 
-### XR-02：真实 Xcode Run
+### XR-02：配置事务与幂等
 
-1. 清空或记下 Xcode 控制台当前内容。
+1. 打开 Configure。
+2. 检查两个能力默认选中，且分别匹配正确 App、Feature、shared Scheme 与 configuration。
+3. 应用配置。
+4. 不改任何选择，再应用一次。
+
+预期：
+
+- 第二次运行不产生 diff；
+- `.helix/xcode/HostPlan.json`、`Configurations/Helix`、PBX wrapper、Scheme action 与 plist 网络声明保持 canonical；
+- 生成 Swift 不出现在 Project Navigator；
+- 已安装能力不能被静默关闭，integration root 被锁定；
+- GUI 只列出 Package linkage 与 Runtime 初始化等代码层动作，不注入隐藏业务代码。
+
+## 5. Xcode 自动连接
+
+### XR-03：检查 Scheme
+
+在 Xcode 打开 Demo 并检查 `Helix Live Reload Demo`：
+
+- Build pre-action 是 `Profiles/live/prepare.sh`，Build Settings 来自 Feature；
+- Run pre-action 是 `Profiles/live/live-register.sh`，Build Settings 来自 App；
+- Run action 使用默认 debugger；
+- 没有 Run post-action、Custom LLDB Init File 或 Helix launch environment；
+- App Sources 前存在隐藏 Bridge phase，output 是 `$(HELIX_BRIDGE_OBJECT)`。
+
+### XR-04：真实 Xcode Run
+
+1. 保持 Helix 运行。
 2. 点击 Xcode Run。
-3. 等待 App 首屏和 Overlay 出现。
-4. 观察 DerivedData 下 `Build/Products/HelixGenerated/live/Daemon.log`。
+3. 等待 App 首屏与 Overlay。
 
 预期：
 
-- Xcode 最终显示 `Running LiveReloadDemo`；
-- daemon 日志先记录 listening，随后记录 App 认证与连接；
-- Overlay 进入 Connecting/Connected/Ready 状态，而不是一直 Idle；
-- App 进程中七个 `HLX_DEV_*` 会话变量和 `HLX_DEV_HANDOFF_READY` 均存在，ready 标记与 session ID 匹配；检查工具只能输出布尔值；
-- LLDB installer 在真实 App target 和导出 probe 都可用后完成注入，App 不会停在 probe，也不会留下任何 handoff breakpoint；
-- 控制台没有 handoff timeout、resume error、`Invalid breakpoint name`、expression 失败、Helix Overlay 约束冲突或启动 fatal error。
+- App 启动时锁定 `automaticXcode`；
+- Helix 出现对应的精确 Build Context 和连接事件；
+- Overlay 进入 Connected/Ready，不长期停留在 Connecting；
+- App 内调试页显示 Xcode 自动模式，不出现四位码输入框；
+- 无 LLDB 注入、probe、environment handoff 或凭据日志。
 
-机制预期：生成的 init 先配置 LLDB-owned launch environment，再启动15秒有界 installer。installer 等真实进程正在运行且 C probe已经解析，短暂停住 App，通过 LLDB command interpreter执行一条短路表达式注入完整环境，在 `finally` 路径恢复进程。若初始环境为空，`DevRuntime.DebuggerHandoff` 会在有限时间内显式调用 C探针。ready 标记最后写入；Runtime 只在 ready 与 session ID 一致后启动。实现不应创建 handoff breakpoint。
+## 6. 同进程保存与刷新
 
-## 5. 同进程保存与刷新
+### XR-05：建立状态
 
-### XR-03：建立状态基线
+记录 App PID，点击两次计数按钮，确认 `State retained: 2`。
 
-1. 记录 `LiveReloadDemo` PID。
-2. 点击两次 “Change in-memory state”。
-3. 确认页面显示 `State retained: 2`。
+### XR-06：连续两个 generation
 
-预期：App 稳定运行，Overlay 不遮挡按钮触摸，计数为 2。
-
-### XR-04：第一代修改
-
-只修改 `viewDidLayoutSubviews()` 中的 presentation 值：
+只修改 `viewDidLayoutSubviews()` 中的展示文本并保存，不点 Build/Run：
 
 ```swift
-titleLabel.text = "XCODE RUN RELOAD ONE" // HELIX_LIVE_BASELINE
+titleLabel.text = "XCODE RELOAD ONE" // HELIX_LIVE_BASELINE
 ```
 
-保存文件，不点击 Build 或 Run。
-
-预期：
-
-- 页面变为 `XCODE RUN RELOAD ONE`；
-- PID 与 XR-03 相同；
-- 计数仍为 2；
-- daemon 日志包含稳定快照、编译、传输、激活与 UI refresh 成功；
-- Xcode 没有执行 App 安装或重新启动。
-
-### XR-05：第二代修改
-
-把同一行改为：
+生效后再改为：
 
 ```swift
-titleLabel.text = "XCODE RUN RELOAD TWO" // HELIX_LIVE_BASELINE
+titleLabel.text = "XCODE RELOAD TWO" // HELIX_LIVE_BASELINE
 ```
 
-保存后立即再次点击计数按钮。
+预期：两次 UI 都更新；PID 不变；计数仍为 2；revision/generation 单调递增；Xcode 不安装或重启 App。
 
-预期：页面变为第二代文本，PID 不变，计数从 2 递增到 3；活动 generation 单调增加，第一代不会在第二代之后重新覆盖页面。
+### XR-07：失败保留上一代
 
-### XR-06：编译失败保留上一代
+在同一函数体制造明确语法错误并保存。
 
-在同一 callback 中临时制造一个明确的 Swift 语法错误并保存，例如删除一个右括号。不要修改声明签名或 stored layout。
+预期：Mac 诊断与 App Overlay 都显示失败和修复提示；页面仍是 `XCODE RELOAD TWO`；active generation、PID 和内存状态不变。修复语法后后续保存仍可工作。
 
-预期：
+### XR-08：恢复 baseline
 
-- Overlay/daemon 报告 compile failed，并说明 old code remains active；
-- 页面仍显示 `XCODE RUN RELOAD TWO`；
-- PID 和计数保持；
-- 不产生新的 active generation；
-- 修复语法后下一次保存仍能继续生成 patch。
-
-### XR-07：恢复 baseline
-
-恢复为：
+恢复：
 
 ```swift
 titleLabel.text = "SAVE TO RELOAD" // HELIX_LIVE_BASELINE
 ```
 
-保存。
+预期：同一进程恢复 baseline；这是新的 tombstone/restore generation，磁盘文件也与 Git baseline 一致。
 
-预期：页面恢复 `SAVE TO RELOAD`，但这是新的恢复 generation，通过 route tombstone 停止继承旧实现；PID 与计数仍保持。确认磁盘文件也已经恢复，不能只恢复 Xcode editor buffer。
+## 7. 直接启动与手动配对
 
-## 6. 生命周期与负向用例
+### XR-09：Xcode Stop 后直接打开
 
-### XR-08：停止与清理
-
-1. 在 Xcode 点击 Stop。
-2. 等待 Run post-action 完成；若 Xcode 跳过它，最多等待五秒断线宽限
-   加少量进程调度时间。
-3. 检查 daemon 进程与 session 输出目录。
+1. Xcode Stop。
+2. 确认 App 连接数回落，但 Helix Service 仍 Running。
+3. 从 Simulator 或设备桌面直接打开同一个包。
+4. 进入导航栏的 **Helix** 调试页。
 
 预期：
 
-- daemon 退出；
-- `Session.json`、`Helix.lldbinit` 和 bootstrap private document 被清理；
-- source monitor 不再响应保存；
-- App 结束后没有后台 Helix 会话残留。
+- 新进程锁定 `manual`；
+- 确认前状态说明网络关闭，页面显示四位码输入框；
+- 不会复用上一次 Xcode invitation 或 lease；
+- later attach debugger 不改变 manual 模式。
 
-这里同时验证主动 `live-stop` 与受监管daemon自清理。Xcode 26实测可能在
-界面显示Run已结束后跳过Launch post-action，因此不能只检查Scheme配置。
-若 Xcode 或宿主机异常退出，旧的 owner-only
-`Session.json` 或 LLDB init 可能来不及删除；下一次 Run pre-action 必须根据
-lifecycle lock 安全回收旧 owner 并换成新会话，不能要求开发者手工删除文件来
-恢复工作流。
+### XR-10：四位码成功与失败
 
-### XR-09：再次 Run 是新会话
+1. 先输入格式合法但错误的码。
+2. 确认错误直接显示在调试页，输入框仍可重试。
+3. 输入 Mac Helix 当前码并确认。
 
-再次点击 Run。
+预期：错误码不会进入任何 Shell host；正确码在两分钟有效期内只兑换一次，并且只匹配已注册的精确 Build Context。成功后页面显示 Connected，保存 Swift 文件继续走与 Xcode 模式相同的 HLBC 链。
 
-预期：产生新的 session identity 与一次性凭据，App 从已编译 baseline 启动，旧 live generation 不会跨进程持久化。
+另测过期码、已使用码、连续失败限流，以及“App 已重新构建但 Hub 只有旧 Build Context”。最后一种必须明确拒绝，不能按 bundle ID 猜测。
 
-### XR-10：需要完整 Build 的修改
+## 8. Hot Patch Action
 
-扩展验收时可修改函数签名、stored property、source membership 或 Build Setting。
+### XR-11：冻结 Shell 并构建 Patch
 
-预期：Helix 明确返回 `rebuildRequired`，不会错误生成 live artifact，也不会破坏上一代活动代码。测试后完整恢复工程。
+1. 通过 `Helix Hot Patch Demo` 的 Release destination Build/Archive，完成 finalize 与 bundle audit。
+2. 记录 App 产物 UUID、版本与平台。
+3. 修改 eligible fee 实现和 recipe revision。
+4. 使用同一平台 destination Build `Helix Build Patch`。
 
-## 7. 证据与结果模板
+预期：
+
+- Scheme 的空 `HelixPatchAction` 只作锚点；
+- `patch.sh` 是 App-scoped Build pre-action，从 App `EnvironmentBuildable` 取得版本和平台；
+- 不发生 App compile、link、install 或 launch；
+- 输出签名 `.hlxp` 与冻结 Shell、平台、架构、bundle/version、recipe 和 trust identity 一致；
+- 重复应用同一 active package 不创建新 generation；
+- Demo mock install 能激活补丁并回滚 baseline。
+
+## 9. 证据模板
 
 每轮至少保存：
 
-- Xcode 工程 URL、Scheme、destination 和 Running 状态截图；
-- 首屏、第一代、第二代、编译失败、恢复 baseline 的页面截图；
-- 各阶段 PID 与计数；
-- 已脱敏 daemon 关键事件；
-- Xcode 控制台中 LLDB handoff 与约束检查结果；
-- 自动化命令摘要；
-- 所有临时源码修改均已恢复的确认。
+- Helix 工程页、Service 状态、已脱敏四位码与 Build Context；
+- Xcode 工程 URL、Scheme、destination 和 Running 状态；
+- 自动连接、手动未激活、手动成功、错误码的 App 页面；
+- baseline、两次成功修改、失败、恢复的页面；
+- 各阶段 PID、counter、revision/generation；
+- Patch 产物摘要与“App 未重建”的 Xcode build log；
+- 所有源码和工程文件已恢复或只有预期提交内 diff 的确认。
 
-结果表：
-
-| 用例 | 结果 | 证据 | 问题/修复 |
+| 用例 | 结果 | 证据 | 问题 / 修复 |
 | --- | --- | --- | --- |
-| XR-00 | | | |
 | XR-01 | | | |
 | XR-02 | | | |
 | XR-03 | | | |
@@ -234,41 +245,16 @@ lifecycle lock 安全回收旧 owner 并换成新会话，不能要求开发者�
 | XR-08 | | | |
 | XR-09 | | | |
 | XR-10 | | | |
+| XR-11 | | | |
 
-## 8. 失败定位顺序
+## 10. 失败定位顺序
 
-1. **Build 失败**：先看 Xcode Report Navigator，确认本地 Package 指向当前 Helix，且 `HelixDevAppRuntime` 产品存在。
-2. **daemon 只有 listening**：检查生成 init 的权限和命令结构，不输出其中的值；确认导出符号 `_helix_dev_runtime_handoff_probe` 存在于 Dev package framework。
-3. **installer 超时或 App停在 probe**：确认 Runtime owner 被强引用、`debuggerHandoffEnabled` 未关闭、App链接的是 `HelixDevAppRuntime`，并检查 installer是否找到了真实 target、`process.Stop()` 后的唯一command-interpreter注入是否成功且 `process.Continue()` 总能执行；不应存在 handoff breakpoint。
-4. **已连接但保存无反应**：确认编辑的是 Manifest 冻结的原始文件，source monitor 已启动，且可见值位于可重入的 reload callback，而不是只运行一次的 `viewDidLoad`/安装层级代码。
-5. **代码激活但 UI 不变**：检查 Reload Index、自动 UIKit 类型匹配、invalidation hint 或 `LiveReload.Reloadable` hook；代码激活与 UI refresh 是两个独立结果。
-6. **状态丢失或 PID 改变**：说明发生了 rebuild/relaunch，不能算 Live Reload 通过。
-7. **Stop 后残留**：先检查App连接是否真的断开、daemon是否进入五秒宽限和私有artifact目录校验，再检查Run post-action与`live-stop.sh`主动路径；不要手工删除正在被daemon使用的文件来掩盖生命周期错误。
-
-## 9. 2026-08-10 历史 GUI 实测记录
-
-这份记录早于 HLBC 默认路由定案，仅用于保留 Xcode handoff 与 UI 刷新问题的历史证据，不再作为当前后端资格结论。当前结论以自动化 HLBC Simulator E2E 为准；完整 GUI 用例需要按本页重新执行。
-
-本轮严格使用 `/Users/tangent/Desktop/Helix/Demo/HelixDemo.xcodeproj`，没有使用
-`/tmp` 副本。环境为 Xcode 26.6（Build 17F113）、iPhone 17 Pro Simulator
-（iOS 26.4），Scheme 为 `Helix Live Reload Demo`。
-
-| 用例 | 结果 | 核心证据 | 本轮发现与修复 |
-| --- | --- | --- | --- |
-| XR-00 | 通过 | Kit validate、自动化测试与 Demo 构建通过 | 最终门禁结果以本轮 Review 记录为准 |
-| XR-01 | 通过 | 原工程、共享 Scheme、本地 package 与生成 phase 均生效 | 无需手工启动 Helix 命令 |
-| XR-02 | 通过 | App 完成认证连接，页面显示 `SAVE TO RELOAD` | 后台 LLDB Python 创建的 breakpoint 属性会静默丢失；改为短暂停进程并由 command interpreter 直接注入，`finally` 恢复运行 |
-| XR-03 | 通过 | 同一 PID 内变为 `RELOADED WITHOUT BUILD`，revision/generation 为 1/1 | 未触发 Build、安装或 relaunch |
-| XR-04 | 通过 | 点击按钮后计数为 1，再保存为 `SECOND GENERATION`，revision/generation 为 2/2 | PID 与计数均保持 |
-| XR-05 | 通过 | 保存不完整表达式后 revision/generation 3/3 编译失败，页面仍为上一成功代 | 修复语法后可继续 reload |
-| XR-06 | 通过 | 恢复 `SAVE TO RELOAD` 后 revision/generation 4/4 激活并刷新 | PID 与计数仍保持，磁盘源码逐字恢复 baseline |
-| XR-07 | 通过 | baseline 页面、源码与标记一致 | 恢复是新 generation |
-| XR-08 | 通过 | Xcode Stop 后 App、debugserver 与 daemon 均退出；三份 private handoff 文件消失 | Xcode 26.6 实际跳过 Launch post-action；增加已认证 App 断线五秒后的受监管 daemon 自停与安全清理 |
-| XR-09 | 通过 | 再次 Run 获得新 App PID 和新会话，随后再次 Stop 完整清理 | 旧 generation 与一次性凭据未跨进程复用 |
-| XR-10 | 自动化覆盖 | interface、source membership 与配置漂移由既有 rebuild-required/doctor 测试覆盖 | 本轮未在 GUI 中破坏 Demo 工程图 |
-
-本轮没有记录或复制 session secret、SPKI、私钥内容或完整 LLDB init。第一次
-Run 的 App PID 在两次成功修改、一次编译失败和 baseline 恢复期间保持不变；第二次
-Run 使用不同 PID，证明测试确实跨越了新会话。Stop 验收特意没有手工执行
-`live-stop`：它验证的是即使 Xcode 跳过 post-action，受监管 daemon 仍能自行收敛，
-而不是用测试命令掩盖宿主生命周期缺陷。
+1. **Xcode phase 找不到工具**：先确认 Helix 正在运行，Service rendezvous 文件 owner/mode 正确，打包 App 内有 `Contents/Helpers/helix`。不要先给工程加 `HELIX_EXECUTABLE`。
+2. **自动模式一直 Connecting**：确认是 Xcode debugger 从进程启动时就附着，而不是直接启动后 late attach；检查 Build pre-action reservation、Run pre-action final executable registration、Host pin 与 exact Build Context。
+3. **手动页没有输入框**：确认当前进程不是 Xcode launch；模式只在启动时决定。需要 Stop 后从桌面新开进程。
+4. **正确码仍被拒绝**：检查码是否过期/使用过、当前 App Mach-O 是否与 registry 中 Build Context 完全相同、工程范围是否一致。不要降级为 bundle-ID 匹配。
+5. **连接后保存无反应**：确认编辑的是 Manifest 冻结的原始文件、source monitor 已启动、配置 `entrypoints` 包含目标，并查看 Mac 与 Overlay 的编译诊断。
+6. **代码 active 但 UI 不变**：区分代码激活和 UI refresh；检查 Reload Index、当前是否有匹配的 UIKit 实例、invalidation hint，或是否确实需要显式 `Reloadable`/SwiftUI boundary。
+7. **PID 改变或状态丢失**：说明发生了 Build/relaunch，不能算 Live Reload。
+8. **Xcode Stop 后 Service 退出**：如果 GUI 内嵌 Service 随 GUI 一起退出是正常的；只 Stop App 时 Service 应继续运行。外部 `helix hub run` 永远不应被 GUI 停止。
+9. **Patch Scheme 重建 App**：检查 Patch target 是否为空、脚本是否在 Scheme Build pre-action、App 是否只作为 `EnvironmentBuildable`，以及 Patch Scheme 的 BuildAction graph。

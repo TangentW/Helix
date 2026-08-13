@@ -48,31 +48,47 @@ details, read [Architecture](Docs/Architecture.md),
 
 ## Start using Helix
 
-The full guide contains the Host Plan schemas, Xcode target graph, Scheme action
-locations, runtime bootstrap examples, first Live Reload, first Hot Patch, and
-troubleshooting. The shortest path is:
+The normal entry point is the macOS status-bar application whose visible name
+is **Helix**. Its implementation lives under `Hub/`; reusable project, build,
+service, and session capabilities remain under `Sources/` and are also
+available to the CLI.
 
-1. Add the Helix package and choose a focused Swift Feature framework.
-2. Link `HelixDevAppRuntime` for a Debug Live Reload profile or
-   `HelixAppRuntime` for a Release Hot Patch profile.
-3. Write `HelixXcode.json` with the complete Feature source list and profile.
-4. Generate and validate the deterministic integration:
+1. Add the Helix Swift package and put the implementations you want to patch in
+   a focused Swift Feature framework.
+2. Link `HelixDevAppRuntime` to the Debug Live Reload App target and
+   `HelixAppRuntime` to the Release Hot Patch App target. These products must
+   not share one App image, so a project enabling both workflows needs distinct
+   App targets. Runtime initialization remains explicit application code.
+3. Build and open Helix while developing this repository:
 
    ```bash
-   swift run helix xcode generate \
-     --plan HelixXcode.json \
-     --output .helix/xcode
-   swift run helix xcode validate --plan HelixXcode.json
+   Hub/Scripts/build-app.sh release
+   open Hub/.build/Helix.app
    ```
 
-5. Follow `.helix/xcode/Integration.md` to connect the Feature and aggregate
-   runtime, apply the Feature/App xcconfig files, add the hidden Bridge phase,
-   and wire Scheme actions. No generated Swift file or Bridge target enters the
-   Xcode project. Then run `helix xcode doctor` for each profile.
-6. Keep one stable `ApplicationSession` alive. UIKit automatically discovers
-   displayed controller/view instances; SwiftUI still needs a pulse boundary.
-7. Run the Live Reload Scheme once and save an existing Swift body, or freeze a
-   Release Shell and use the Patch-only Scheme to build a signed `.hlxp`.
+4. Choose the project in Helix. Hot Patch and Live Reload are selected by
+   default. For each workflow, choose its App target, Feature target, shared
+   Scheme, and configuration; advanced patch trust/output paths remain
+   editable. A skipped workflow can be added later.
+5. Apply the configuration. Helix writes the Host Plan, patch configuration,
+   xcconfig wrappers, hidden Bridge phase, Scheme actions, Patch action, and
+   Live Reload local-network declarations as one transaction. Generated Swift
+   stays in DerivedData and never appears in the Xcode navigator. Helix reports
+   any package-linkage or runtime-bootstrap work that still belongs in App code.
+6. Keep one process-lifetime `DevRuntime.ApplicationSession` in a development
+   App. UIKit instance discovery is automatic; SwiftUI still needs a pulse
+   boundary.
+7. Keep Helix open and Run the configured Live Reload Scheme with Xcode's
+   normal Apple debugger. No custom LLDB script, launch environment, host, port,
+   or secret is configured. Save a supported Swift implementation to reload it,
+   or archive the Hot Patch Shell and build the generated Patch-only Scheme to
+   produce a signed `.hlxp` without rebuilding or reinstalling the App.
+
+When the same development build is opened directly instead of launched by the
+Xcode debugger, networking remains off. Present
+`DevRuntime.PairingView(session:)` from an existing debug menu, enter the
+four-character code shown by Helix, and tap Connect. The code is not remembered
+for the next process launch.
 
 Before migrating a production project, run the checked-in
 [UIKit demo](Demo/README.md) end to end. Its Host Plan, five-target Xcode graph,
@@ -192,8 +208,8 @@ swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
 ```
 
-The current full SwiftPM baseline contains 483 tests in 75 suites. The recorded
-Debug, warnings-as-errors, and optimized Release runs pass. Platform-specific
+The full SwiftPM suite, warnings-as-errors build, and optimized Release build
+are release gates. Platform-specific
 fixtures can be run with an available Simulator UDID:
 
 ```bash
@@ -261,17 +277,21 @@ unsupported SIL mismatch fails before package creation.
 
 ## Xcode integration and demos
 
-The generated integration starts from a checked-in Host Plan:
+Helix Hub inspects the selected `.xcodeproj`, resolves real target settings,
+shows the proposed workflow choices, and applies the PBX project, shared Scheme,
+public configuration, and local-network changes transactionally. The resulting
+`.helix/xcode/HostPlan.json` is the canonical input used by generated phases and
+headless tooling; developers do not author it by hand. Low-level
+`helix xcode generate|validate|doctor` commands remain available for CI and
+adapter development.
 
-```bash
-swift run helix xcode generate --plan HelixXcode.json --output .helix/xcode
-swift run helix xcode validate --plan HelixXcode.json
-```
-
-It generates xcconfig fragments, file lists, Scheme actions, Derived Sources,
-and lifecycle scripts without silently rewriting an unknown project graph.
-Connect the generated artifacts to the documented targets and shared Schemes,
-then keep the plan under review as the project changes.
+The configured Xcode dispatcher finds the exact bundled `helix` helper through
+the owner-only service rendezvous file. Normal projects do not set
+`HELIX_EXECUTABLE` or depend on shell `PATH`. The Live Reload Build pre-action
+reserves an invitation, the hidden Bridge embeds only that invitation and the
+persistent Host Identity pin, and the Run pre-action registers the exact final
+executable. The App decides automatic versus manual mode once from debugger
+attachment at process launch.
 
 For an executable reference, open
 [Demo/HelixDemo.xcodeproj](Demo/HelixDemo.xcodeproj) and follow
@@ -296,6 +316,11 @@ and UI refresh.
   graph; it is neither a standalone product nor part of `HelixAppRuntime`.
 - `Sources/HelixCLIKit`, `HelixCLI`, `HelixBenchmarks`, and
   `HelixBenchmarkCLI`: commands and performance tooling.
+- `Sources/HelixHubCore`: reusable project discovery, transactional onboarding,
+  service ownership, pairing-code control, Build Context registry access, and
+  exact build-tool discovery.
+- `Hub`: the thin SwiftUI menu-bar application packaged under the visible name
+  Helix. Helix remains usable through `Sources` and the CLI without this GUI.
 - `Tests`: unit, negative, compiler fixture, integration, Simulator, release
   leakage, and benchmark regression coverage.
 - `Demo`: checked-in UIKit Hot Patch and Live Reload applications and generated

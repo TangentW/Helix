@@ -51,126 +51,101 @@ the App configuration:
 The Feature target does not need a Helix runtime product. Build-side products
 and the `helix` executable run on macOS and must not enter a Release App bundle.
 
-## 4. Describe the integration
+## 4. Open Helix and choose the project
 
-Create a checked-in `HelixXcode.json` at the project root. Schema 3 records
-stable project facts only; it contains no DerivedData path, device ID, session
-credential, or generated module name.
-
-```json
-{
-  "schemaVersion": 3,
-  "projectPath": "Store.xcodeproj",
-  "integrationRoot": ".helix/xcode",
-  "features": [
-    {
-      "id": "checkout",
-      "moduleName": "CheckoutFeature",
-      "sourceRoot": "CheckoutFeature",
-      "patchConfigurationPath": "Configurations/Checkout.yml",
-      "sourceFiles": [
-        "Sources/CheckoutViewController.swift",
-        "Sources/CheckoutModel.swift"
-      ]
-    }
-  ],
-  "profiles": [
-    {
-      "id": "checkout-live",
-      "workflow": "liveReload",
-      "schemeName": "Store Live Reload",
-      "applicationTargetName": "Store",
-      "configurationName": "Debug",
-      "bundleIdentifier": "com.example.store",
-      "namespaceSeed": "store-checkout-live",
-      "featureID": "checkout"
-    }
-  ]
-}
-```
-
-`sourceFiles` is the complete module context, not a list of files expected to
-change today. Every path is relative to `sourceRoot`. The patch configuration
-selects declarations from those same logical paths:
-
-```yaml
-schema: 1
-modules:
-  CheckoutFeature:
-    include:
-      - Sources/**/*.swift
-```
-
-A Hot Patch profile uses a Release configuration and adds the `patch` object
-shown in [Demo/HelixXcode.json](../Demo/HelixXcode.json). It names the
-Patch-only Aggregate target and Scheme, recipe, trust files, output directory,
-and optional Simulator inbox. Secret contents never belong in the Host Plan.
-
-## 5. Generate the Integration Kit
+The user-facing macOS application is named **Helix**. In this repository it is
+built from `Hub/`:
 
 ```bash
-swift run helix xcode generate --plan HelixXcode.json
-swift run helix xcode validate --plan HelixXcode.json
+Hub/Scripts/build-app.sh release
+open Hub/.build/Helix.app
 ```
 
-The output root comes from `integrationRoot`; passing `--output` is optional.
-The kit contains canonical contracts, xcconfig files, and thin lifecycle
-scripts. It deliberately contains no Xcode source list and asks the project to
-reference no generated Swift file. Change the Host Plan and regenerate instead
-of editing individual kit files.
+The status-bar UI is a thin frontend. Project parsing, deterministic planning,
+file transactions, service ownership, pairing, and Build Context registration
+are reusable `Sources` modules, so headless tools do not depend on SwiftUI.
 
-## 6. Perform the one-time Xcode wiring
+Choose an `.xcodeproj`, `.xcworkspace`, or a source directory. A workspace is
+resolved to concrete projects; if it contains more than one, Helix asks which
+project to configure. This discovery step is read-only.
 
-For each profile, follow its generated `.helix/xcode/Integration.md`:
+## 5. Configure the workflows in the GUI
 
-1. Keep the Feature's ordinary Swift files in its existing Sources phase and
-   set `Profiles/<profile>/Feature.xcconfig` as that configuration's Base
-   Configuration.
-2. Set `Profiles/<profile>/Application.xcconfig` as the App configuration's
-   Base Configuration.
-3. Add one App Run Script phase **before App Sources**:
+A new project starts with Hot Patch and Live Reload selected. For each selected
+workflow choose:
 
-   ```sh
-   /bin/sh "$(HELIX_INTEGRATION_ROOT)/Profiles/<profile>/bridge.sh"
-   ```
+- an App target;
+- the Swift Feature target that owns the editable implementations;
+- a shared Scheme;
+- one configuration present on both targets.
 
-   Declare `$(HELIX_BRIDGE_OBJECT)` as its output. Do not add that object or any
-   file below `$(HELIX_BUILD_ROOT)` to the Project navigator.
-4. Link the Feature framework and the profile's single aggregate runtime into
-   the App. There is no Bridge target or Bridge framework to link or embed.
+Helix resolves the module name and bundle identifier from Xcode's real build
+settings. Profile identity, namespace, patch recipe, trust files, output path,
+and optional Simulator inbox remain editable under Advanced settings. A skipped
+workflow stays available for later installation. An installed workflow cannot
+be silently disabled, and the integration root is locked after the first
+installation so reconfiguration cannot leave stale PBX references behind.
 
-`HelixAppRuntime` contains only production hot-patch modules.
-`HelixDevAppRuntime` additionally carries the Dev protocol, Live Reload API,
-transport, activation, and UI tooling. The Live Reload API is not a standalone
-package product and cannot enter Release through the documented aggregate.
+Hot Patch and Live Reload require distinct App targets. The Release target must
+link only `HelixAppRuntime`; the development target must link only
+`HelixDevAppRuntime`. Helix detects the products and reports a code-level action
+when one is missing, but it does not inject package linkage or application
+startup code.
 
-`Application.xcconfig` adds the hidden object to `OTHER_LDFLAGS` and forces the
-provider symbol `_hlx_bridge_provider_v1` to remain reachable. The build phase
-reconstructs the successful Feature compiler invocation, compiles the generated
-Bridge in an isolated temporary directory, validates its architecture and
-platform, then atomically publishes `HelixBridge.o` under DerivedData.
+## 6. Apply and review the project transaction
 
-## 7. Wire the Scheme lifecycle
+Click **Configure Project**. Helix rereads the project, resolves exact build
+settings, builds one canonical plan, and commits every owned mutation together.
+If validation or a write fails, no partial project state is kept.
 
-| Workflow | Xcode location | Generated script | Build settings from |
-| --- | --- | --- | --- |
-| Both | First Scheme Build pre-action | `prepare.sh` | Feature target |
-| Hot Patch | Last Scheme Build post-action | `audit.sh` | App target |
-| Live Reload | Scheme Run pre-action | `live-start.sh` | App target |
-| Live Reload | Scheme Run post-action | `live-stop.sh` | App target |
-| Live Reload | Run custom LLDB init file | `$(HELIX_LLDB_INIT_FILE)` | Scheme |
-| Patch build | Patch Aggregate target Run Script | `patch.sh` | Aggregate target |
+The transaction creates or updates:
 
-The compiler proxy is scoped to the Feature target. It transparently forwards
-the real `swiftc` invocation and stores a permission-restricted, atomic capture
-for later live generations. The App, packages, and unrelated targets keep Xcode's
-normal driver.
+| Area | What Helix owns |
+| --- | --- |
+| Public plan | `.helix/xcode/HostPlan.json`, profile contracts, manifest, and generated guide |
+| Compiler selection | one `Configurations/Helix/<feature>.yml` with project-wide source discovery and explicit entrypoint policy |
+| Xcode settings | wrapper xcconfigs that preserve the target's previous Base Configuration |
+| Bridge | one App phase before Sources; generated Swift and `HelixBridge.o` stay under DerivedData |
+| Scheme lifecycle | Build preparation, Release audit, exact Live executable registration, and Patch build action |
+| Hot Patch | an empty Aggregate target used only as a Patch Scheme anchor, recipe, output paths, and optional local development trust material |
+| Live Reload networking | `_helix._tcp` plus a local-network usage description in the App plist |
 
-The Live Run pre-action creates a one-run authenticated session. The LLDB init
-injects its credentials without checking them into the Scheme. Keep the default
-debugger handoff enabled; it covers Xcode's late-attach launch ordering. The Run
-post-action stops eagerly, while the daemon also has a bounded disconnect
-cleanup path.
+For an explicit existing `Info.plist`, Helix preserves unrelated keys and an
+existing nonempty usage description while adding the missing Bonjour service.
+For a target that asked Xcode to generate its plist, Helix creates a small
+Hub-owned plist and points only that configuration at it. A configured plist
+path that is missing is an error; Helix does not guess a replacement.
+
+Generated Swift is never added to the project navigator, target membership, or
+Compile Sources. The phase compiles the Bridge privately using the captured
+Feature invocation, validates its platform and architecture, and atomically
+publishes the object before the App links it. The stable provider symbol lets
+the runtime load the exact Shell contract without a generated import.
+
+The generated Xcode dispatcher locates the exact `helix` helper published by
+the running service in an owner-only rendezvous file. A packaged Helix app ships
+that helper inside `Contents/Helpers`. Normal projects need neither
+`HELIX_EXECUTABLE` nor a shell `PATH` edit.
+
+## 7. Understand the generated Xcode lifecycle
+
+| Workflow | Xcode location | Purpose |
+| --- | --- | --- |
+| Both | first Scheme Build pre-action | prepare the exact Feature Shell and capture contract |
+| Hot Patch | last Scheme Build post-action | finalize the linked executable and audit the complete Release bundle |
+| Live Reload | Scheme Run pre-action | register the exact final executable and activate its reserved invitation |
+| Patch build | Patch Scheme Build pre-action, App as `EnvironmentBuildable` | compile, sign, and optionally stage `.hlxp` without rebuilding the App |
+
+Live Reload uses Xcode's ordinary Apple debugger. The Build pre-action reserves
+a one-time invitation; the hidden Bridge contains only that invitation and the
+persistent Helix Host Identity pin. After link, the Run pre-action registers the
+exact executable UUID and Build Context. There is no custom LLDB init, Python
+installer, launch environment, Run post-action, host address, port, or session
+secret in the project.
+
+The Feature compiler proxy is limited to the selected Feature configuration. It
+forwards every real `swiftc` argument and commits an owner-only capture used by
+later saves. App, package, and unrelated targets keep Xcode's normal driver.
 
 ## 8. Start the runtime without generated imports
 
@@ -190,6 +165,29 @@ final class DevelopmentRuntimeOwner {
     }
 }
 ```
+
+Keep the owner for the process lifetime. In an App with an existing debug menu,
+present the reusable pairing/status page for direct launches:
+
+```swift
+NavigationLink("Helix") {
+    DevRuntime.PairingView(session: runtimeOwner.session)
+}
+```
+
+The same operation is also available without SwiftUI:
+
+```swift
+try await runtimeOwner.session.connect(pairingCode: "AB2C")
+```
+
+An App launched by the Xcode debugger locks into automatic mode at process
+startup, discovers the single `_helix._tcp` service, verifies the compiled Host
+pin, and redeems the build-scoped invitation. Opening the installed App later
+from the Home Screen creates a new process in manual mode. It performs no
+Bonjour browsing or network access until the developer enters the current
+four-character Helix code and confirms. Attaching a debugger later does not
+change that decision, and a manual pairing is not persisted to the next launch.
 
 Ordinary App code imports only the stable runtime module. At startup,
 `Runtime.LinkedBridge` resolves `hlx_bridge_provider_v1` from the current
@@ -259,7 +257,7 @@ for ordinary Live Reload.
 
 ```bash
 swift run helix xcode doctor \
-  --plan HelixXcode.json \
+  --plan .helix/xcode/HostPlan.json \
   --profile checkout-live \
   --static
 ```

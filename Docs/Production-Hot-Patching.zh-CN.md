@@ -122,7 +122,7 @@ swift run helix patch build \
 
 源码列表必须代表冻结归档所需的完整 module。生产签名可以通过注入 signing service 完成，让 Builder 无需直接接触长期私钥。
 
-使用 Xcode 集成时，Patch Aggregate Target 必须同时支持 `iphoneos` 与 `iphonesimulator`。构建 Patch Scheme 时应选择与已审计 Release Shell 相同的平台：真机归档产生 iOS/arm64 包，Simulator 基线产生 iOS Simulator 包。Patch Action 不会把一个平台的基线转换成另一个平台。
+Helix Hub 会创建一个同时支持 `iphoneos` 与 `iphonesimulator` 的空 Patch Aggregate target；它只作为 shared Scheme 的构建锚点。真正的 `patch.sh` 是 Scheme Build pre-action，`EnvironmentBuildable` 指向 App target，因此能拿到 App 的精确版本与平台设置，不需要复制配置，也不会重建 App。构建 Patch Scheme 时应选择与已审计 Release Shell 相同的平台：真机归档产生 iOS/arm64 包，Simulator 基线产生 iOS Simulator 包。Patch Action 不会把一个平台的基线转换成另一个平台。
 
 ## 分发状态
 

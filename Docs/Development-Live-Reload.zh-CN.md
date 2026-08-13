@@ -8,15 +8,23 @@ Helix Live Reload 用于缩短正在运行的 Debug App 的修改循环。完成
 
 App 不会编译或 import 生成 Swift。Feature target 始终保留原始源码；App build phase 只在 DerivedData 中把 Helix Bridge 编译成经过校验的 object，再链接进 executable。`DevRuntime.ApplicationSession` 通过稳定 C provider 符号自动取得 Build Contract、Shell interface、Runtime factory 与 Bridge installer。
 
-## Xcode Run 会话交接
+## 统一 Helix Service 与启动模式
 
-共享 Live Reload Scheme 会在 Run pre-action 中启动一次认证 daemon，并写出权限为 `0600` 的自定义 LLDB init；文件只包含本次会话的临时材料。init 先用 `target.env-vars` 覆盖由 LLDB 负责 launch 的快路径，同时启动一个有界的 LLDB Python installer。之所以需要后者，是因为 Xcode 可能在真实 App target 创建前加载 init，并丢弃挂在临时 target 上的状态。
+Live Reload 不再为每次 Xcode Run 创建 daemon，也不使用自定义 LLDB init、LLDB Python、launch environment、注入 secret 或直连 host。macOS Helix 应用持有唯一 `_helix._tcp` 服务；如果开发者已经运行 `helix hub run`，GUI 会通过同一个 owner-only control interface 接管显示，但不会终止不属于自己的 Service。
 
-installer 等待正在运行的真实 target 和已经解析的 `helix_dev_runtime_handoff_probe`。找到后短暂停住 App，通过 LLDB command interpreter 执行一条环境注入表达式，并在 `finally` 路径恢复进程。表达式遇错即短路，最后才写 `HLX_DEV_HANDOFF_READY=sessionID`，所以 Runtime 不会读取半套凭据。这里不再从后台 Python 线程修改 `SBBreakpoint` 属性；Xcode 26 实测中曾出现“断点已创建，但 command、one-shot 与 auto-continue 静默丢失”的情况。
+Xcode lifecycle 传递的是身份，不是凭据：
 
-初始环境为空时，`DevRuntime.ApplicationSession` 最多二十秒显式调用 C probe，比 installer deadline 多保留五秒。probe 用来确认 Dev Runtime image 已加载，并给 App 一个有界的 handoff 观察点；它不再承担注入断点。probe 也不是运行时分发入口，不进入生产路径。Release 聚合产品不链接 `HelixDevRuntime`。
+1. Scheme Build pre-action 向 Service 预留一个绑定 profile 的一次性邀请。
+2. 隐藏 Bridge object 只嵌入邀请和持久 Helix Host Identity 的公开 pin。Project 与 App environment 都不会写入 session secret。
+3. App link 完成后，Scheme Run pre-action 注册精确 executable UUID 与完整 Build Context，再把预留邀请绑定到最终 Shell。
+4. Xcode 用默认 Apple debugger 启动 App。进程开始时，`DevRuntime.LaunchMode.current()` 只调用一次 Darwin `sysctl` 并检查 `P_TRACED`。被跟踪的进程进入 `automaticXcode`；探测失败会保守进入 `manual`。
+5. Automatic 模式发现唯一服务、校验编译进 Bridge 的 Host pin、证明精确 App/Shell identity，再通过 pinned TLS 兑换邀请。后续认证通道传输源码诊断、HLBC generation、激活结果与 reconnect lease。
 
-`live-stop.sh` 仍是主动清理快路径，但 Xcode 在显式 Stop 后可能跳过 Launch post-action。受监管 daemon 因此会在已认证 App 断线后保留五秒重连窗口；仍未重连就自行停止，并清理 `Session.json`、`Helix.lldbinit` 与 private bootstrap。业务必须在 App 生命周期中强持有 `ApplicationSession`，生成的 Xcode 工作流不要关闭 `debuggerHandoffEnabled`。
+模式在整个进程周期内固定。开发者 Stop Xcode 后，从桌面直接打开同一个已安装包会产生 manual 新进程：输入 Mac Helix 当前四位码并确认前，它不浏览 Bonjour，也不请求本地网络。之后再 attach debugger 也不能把进程切成 automatic。
+
+四位码大小写不敏感，字符集是 `ABCDEFGHJKMNPQRSTUVWXYZ23456789`，默认两分钟过期且只能兑换一次；连续五次失败会触发配置的限流。短码只代表用户在场，连接仍须同时通过 P-256 Host Identity pin、精确注册的 Build Context、TLS transcript 与 App process identity。只有相同 bundle ID 并不足以配对。
+
+App 可以从已有调试菜单展示 `DevRuntime.PairingView(session:)`，也可以直接调用 `ApplicationSession.connect(pairingCode:)`。`ApplicationSession` 必须在 App 进程周期内强持有；手动配对不会保存到下次启动。
 
 ## 从保存到页面变化
 

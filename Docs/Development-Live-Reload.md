@@ -17,42 +17,50 @@ a validated object under DerivedData and links it into the executable. A stable
 C provider symbol lets `DevRuntime.ApplicationSession` discover the Build
 Contract, Shell interface, Runtime factory, and Bridge installer automatically.
 
-## Xcode Run session handoff
+## Unified Helix service and launch modes
 
-The shared Live Reload Scheme starts one authenticated daemon in its Run
-pre-action and writes a mode-`0600` custom LLDB init containing the
-single-session launch material. The init first configures
-`target.env-vars` as the fast path for LLDB-owned launches. It also starts a
-bounded LLDB Python installer because Xcode can source the init before the
-real App target exists and discard state attached to its temporary target.
+Live Reload no longer creates a daemon per Xcode Run and does not use a custom
+LLDB init, LLDB Python, launch environment, injected secret, or direct host
+setting. The macOS Helix application owns one `_helix._tcp` service. It can also
+adopt an already running `helix hub run` process through the same owner-only
+control interface; the GUI never terminates a service it does not own.
 
-The installer waits for a running real target in which the exported
-`helix_dev_runtime_handoff_probe` symbol has resolved. It briefly stops that
-process, runs one LLDB command-interpreter expression that injects every
-environment value, and resumes the process in a `finally` path. The expression
-short-circuits on failure and writes `HLX_DEV_HANDOFF_READY=sessionID` last, so
-Runtime never consumes a partially injected credential set. This direct
-handoff avoids mutating `SBBreakpoint` options from a background Python thread;
-Xcode 26 testing showed that a breakpoint could be created while its command,
-one-shot, and auto-continue properties were silently lost.
+The Xcode lifecycle carries identity instead of credentials:
 
-When its initial environment is empty, `DevRuntime.ApplicationSession` polls
-the C entry point explicitly for up to twenty seconds, five seconds longer than
-the installer deadline. The probe proves that the Dev Runtime image is loaded
-and gives the App a bounded point at which to observe the completed handoff; it
-is not used as an injection breakpoint.
+1. The Scheme Build pre-action asks the service to reserve a one-time
+   invitation for this profile.
+2. The hidden Bridge object embeds that invitation plus the public pin of the
+   persistent Helix Host Identity. No session secret is written to the project
+   or App environment.
+3. After the App is linked, the Scheme Run pre-action registers the exact
+   executable UUID and complete Build Context, then binds the reservation to
+   that final Shell.
+4. Xcode launches the App with the normal Apple debugger. At process startup,
+   `DevRuntime.LaunchMode.current()` uses Darwin `sysctl` and `P_TRACED` once.
+   A traced launch enters `automaticXcode`; failure to inspect the process
+   fails closed into `manual`.
+5. Automatic mode browses the single service, verifies the compiled Host pin,
+   proves the exact App/Shell identity, and redeems the invitation over pinned
+   TLS. The authenticated channel then carries source diagnostics, HLBC
+   generations, activation results, and reconnect leases.
 
-The probe is not a dispatch hook and has no production role. A tiny C shim
-target owns the symbol and Runtime calls its imported declaration, preventing
-Swift optimization from bypassing the address LLDB observes. The Release
-aggregate does not link
-`HelixDevRuntime`. The generated `live-stop.sh` remains the eager cleanup path,
-but Xcode may skip a Launch post-action after an explicit Stop. A supervised
-daemon therefore waits five seconds for a genuine reconnect after its
-authenticated App disconnects, then stops itself and removes `Session.json`,
-`Helix.lldbinit`, and the private bootstrap. Keep the `ApplicationSession`
-strongly owned for the App lifetime and do not disable
-`debuggerHandoffEnabled` for the generated Xcode workflow.
+The decision is locked for the process lifetime. If the developer stops Xcode
+and later opens the same installed build from the Home Screen, the new process
+is manual: it does no Bonjour browsing and requests no local-network access
+until the developer enters the four-character code shown by Helix and confirms.
+Attaching a debugger later cannot turn that process into automatic mode.
+
+Codes are case-insensitive, contain four characters from
+`ABCDEFGHJKMNPQRSTUVWXYZ23456789`, expire after two minutes by default, and are
+single-use. Five failed attempts trigger the configured rate limit. A short
+code is only a user-presence signal: the connection still requires the pinned
+P-256 Host Identity, exact registered Build Context, TLS transcript, and App
+process identity. A code cannot select a vaguely matching bundle ID.
+
+Apps may present `DevRuntime.PairingView(session:)` from an existing debug menu
+or call `ApplicationSession.connect(pairingCode:)` directly. Keep the
+`ApplicationSession` strongly owned for the App process lifetime. A successful
+manual pairing is intentionally not persisted across launches.
 
 ## Save-to-screen sequence
 
