@@ -58,6 +58,9 @@ BIN_DIRECTORY=$(/usr/bin/xcrun swift build \
 /usr/bin/install -m 0644 \
     "$REPOSITORY_ROOT/Hub/SupportingFiles/Info.plist" \
     "$STAGING/Contents/Info.plist"
+/usr/bin/install -m 0644 \
+    "$REPOSITORY_ROOT/Hub/SupportingFiles/Helix.icns" \
+    "$STAGING/Contents/Resources/Helix.icns"
 /usr/bin/codesign --force --sign - --timestamp=none \
     "$STAGING/Contents/Helpers/helix"
 /usr/bin/codesign --force --sign - --timestamp=none "$STAGING"

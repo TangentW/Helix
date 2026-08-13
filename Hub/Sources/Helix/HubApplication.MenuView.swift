@@ -10,9 +10,9 @@ struct MenuView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Image(systemName: "point.3.connected.trianglepath.dotted")
-                    .font(.title2)
-                    .foregroundStyle(.tint)
+                Brand.Mark()
+                    .frame(width: 40, height: 25)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Helix").font(.headline)
                     Text("Hub service and project setup")

@@ -9,10 +9,13 @@ struct HelixApplication: App {
         MenuBarExtra {
             HubApplication.MenuView(model: model)
         } label: {
-            Label(
-                "Helix",
-                systemImage: model.serviceIsRunning
-                    ? "point.3.connected.trianglepath.dotted" : "bolt.slash"
+            HubApplication.Brand.Mark(
+                style: .template,
+                disconnected: !model.serviceIsRunning
+            )
+            .frame(width: 22, height: 14)
+            .accessibilityLabel(
+                model.serviceIsRunning ? "Helix running" : "Helix offline"
             )
             // The label exists from process launch, even before either window
             // is opened, so the service cannot depend on lazy view creation.

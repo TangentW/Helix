@@ -113,7 +113,12 @@ private struct WelcomeView: View {
 
     var body: some View {
         ContentUnavailableView {
-            Label("Helix", systemImage: "point.3.connected.trianglepath.dotted")
+            VStack(spacing: 12) {
+                HubApplication.Brand.Mark()
+                    .frame(width: 96, height: 60)
+                    .accessibilityHidden(true)
+                Text("Helix")
+            }
         } description: {
             Text("Configure Hot Patch and Live Reload without adding generated Swift files to your Xcode navigator.")
         } actions: {

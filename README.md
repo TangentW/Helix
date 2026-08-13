@@ -1,5 +1,9 @@
 # Helix
 
+<p align="center">
+  <img src="Assets/Brand/Helix.Mark.svg" alt="Helix brand mark" width="280">
+</p>
+
 [简体中文](README.zh-CN.md)
 
 Helix turns edits to existing Swift implementations into either a verified

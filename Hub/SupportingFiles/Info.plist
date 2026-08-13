@@ -8,6 +8,8 @@
     <string>Helix</string>
     <key>CFBundleExecutable</key>
     <string>Helix</string>
+    <key>CFBundleIconFile</key>
+    <string>Helix</string>
     <key>CFBundleIdentifier</key>
     <string>dev.helix.hub</string>
     <key>CFBundleInfoDictionaryVersion</key>

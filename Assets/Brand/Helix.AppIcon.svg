@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">Helix app icon</title>
+  <desc id="description">The Helix double-helix mark on a midnight-blue macOS icon.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B2450"/>
+      <stop offset="1" stop-color="#06142D"/>
+    </linearGradient>
+  </defs>
+  <rect x="52" y="52" width="920" height="920" rx="210" fill="url(#background)"/>
+  <g transform="translate(102.4 256) scale(1.6)" fill="none" stroke-linecap="butt" stroke-width="54">
+    <path d="M72 102 C152.24 99.28 191.79 157.13 278.06 194.44" stroke="#FFFFFF"/>
+    <path d="M278.06 194.44 C300.89 204.31 327.00 212.75 358.01 218.24" stroke="#FF6B57"/>
+    <path d="M358.01 218.24 C382.12 222.51 409.20 225 440 225" stroke="#FFFFFF"/>
+    <path d="M72 225 C190 225 220 98 440 102" stroke="#176BFF"/>
+  </g>
+  <g transform="translate(102.4 256) scale(1.6)">
+    <circle cx="72" cy="102" r="27" fill="#FFFFFF"/>
+    <circle cx="440" cy="225" r="27" fill="#FFFFFF"/>
+    <circle cx="72" cy="225" r="27" fill="#176BFF"/>
+    <circle cx="440" cy="102" r="27" fill="#176BFF"/>
+  </g>
+</svg>

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 320" role="img" aria-labelledby="title description">
+  <title id="title">Helix</title>
+  <desc id="description">A horizontal double helix forming an X with a coral replacement patch.</desc>
+  <g fill="none" stroke-linecap="butt" stroke-width="54">
+    <path d="M72 102 C152.24 99.28 191.79 157.13 278.06 194.44" stroke="#071B3D"/>
+    <path d="M278.06 194.44 C300.89 204.31 327.00 212.75 358.01 218.24" stroke="#FF6B57"/>
+    <path d="M358.01 218.24 C382.12 222.51 409.20 225 440 225" stroke="#176BFF"/>
+    <path d="M72 225 C190 225 220 98 440 102" stroke="#176BFF"/>
+  </g>
+  <g fill="#176BFF">
+    <circle cx="72" cy="225" r="27"/>
+    <circle cx="440" cy="102" r="27"/>
+    <circle cx="440" cy="225" r="27"/>
+  </g>
+  <circle cx="72" cy="102" r="27" fill="#071B3D"/>
+</svg>

@@ -1,5 +1,9 @@
 # Helix
 
+<p align="center">
+  <img src="Assets/Brand/Helix.Mark.svg" alt="Helix 品牌标志" width="280">
+</p>
+
 [English](README.md)
 
 Helix 可以把已有 Swift 实现的修改编译成经过验证的生产字节码补丁，或者仅用于开发的 Live Reload generation。补丁作者仍然编写普通 Swift；Helix 会保留目标构建的编译器上下文，并拒绝无法安全应用的修改。

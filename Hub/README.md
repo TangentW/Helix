@@ -50,6 +50,17 @@ open Hub/.build/Helix.app
 
 The bundle is ad-hoc signed for local development. Distribution signing and notarization belong to the release pipeline and must replace that local signature.
 
+The app icon and menu-bar glyph share the checked-in vector geometry under
+`Assets/Brand/`. `Hub/SupportingFiles/Helix.icns` is the packaged macOS icon;
+the menu-bar representation is drawn as a monochrome template so macOS can
+adapt it to the active appearance.
+
+After editing the app-icon master, regenerate the packaged icon with:
+
+```sh
+Assets/Brand/generate-app-icon.sh
+```
+
 The bundle's visible name, executable, and service-facing product name are all
 `Helix`. `Helix Hub` is the architecture and code name used for this thin
 developer-experience layer.

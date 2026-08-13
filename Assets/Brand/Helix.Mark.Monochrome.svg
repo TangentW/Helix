@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 320" role="img" aria-labelledby="title description">
+  <title id="title">Helix monochrome mark</title>
+  <desc id="description">A horizontal double helix forming an X with two seams around a replacement patch.</desc>
+  <g fill="none" stroke="#000000" stroke-linecap="butt" stroke-width="54">
+    <path d="M72 102 C151.30 99.31 190.43 155.64 271.54 191.61"/>
+    <path d="M285.49 197.64 C305.28 206.13 327.30 212.78 352.33 217.18"/>
+    <path d="M366.37 219.70 C384.57 222.78 410.73 225 440 225"/>
+    <path d="M72 225 C190 225 220 98 440 102"/>
+  </g>
+  <g fill="#000000">
+    <circle cx="72" cy="102" r="27"/>
+    <circle cx="72" cy="225" r="27"/>
+    <circle cx="440" cy="102" r="27"/>
+    <circle cx="440" cy="225" r="27"/>
+  </g>
+</svg>
