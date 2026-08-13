@@ -1,7 +1,7 @@
 # Helix Xcode integration
 
-This directory is generated from `HostPlan.json`. Regenerate it with
-`helix xcode generate`; do not edit individual files.
+This directory is owned by Helix Hub and generated from `HostPlan.json`.
+Reconfigure the project from Helix; do not edit individual files.
 
 The following target and Scheme edits are one-time project setup. After
 setup, developers use Xcode Run, Build, Archive, and the shared Patch
@@ -15,12 +15,12 @@ scheme; no Helix command needs to be typed during ordinary work.
   DerivedData output to the project.
 - Use `Profiles/live/Application.xcconfig` as the App target base configuration.
 - Add one Run Script phase before the App's Sources phase:
-  `/bin/sh "$(HELIX_INTEGRATION_ROOT)/Profiles/live/bridge.sh"`.
+  `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/live/bridge.sh"`.
   Declare `$(HELIX_BRIDGE_OBJECT)` as its output. The script compiles the generated
   Bridge privately in DerivedData before the App links.
-  Disable "Based on dependency analysis" for this phase: every Xcode Run must embed
-  the fresh one-time invitation
-  reserved by the Build pre-action, even when no project source changed.
+  Disable "Based on dependency analysis" for this phase: every Xcode Run must
+  embed the fresh one-time invitation reserved by the Build pre-action, even
+  when no project source changed.
 - Run `Profiles/live/prepare.sh` as the first Scheme Build
   pre-action, with build settings supplied by the Feature target.
 - Keep the Helix status-bar app open. The Build pre-action reserves a one-time

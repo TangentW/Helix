@@ -2,5 +2,5 @@ schema: 1
 modules:
   LiveReloadFeature:
     include:
-      - Sources/**/*.swift
+      - **/*.swift
     entrypoints: all

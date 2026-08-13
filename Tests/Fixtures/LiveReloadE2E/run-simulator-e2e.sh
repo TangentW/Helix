@@ -112,7 +112,7 @@ mkdir -p "$generated_directory"
 cd "$repository_root"
 swift build --product helix
 "$helix" xcode generate \
-    --plan "$script_directory/HelixXcode.json" \
+    --plan "$script_directory/HostPlan.json" \
     --force
 : > "$hub_log"
 "$helix" hub run > "$hub_log" 2>&1 &
@@ -161,7 +161,7 @@ env \
     HELIX_ACTIVITY_LOG_DIR="$(setting HELIX_ACTIVITY_LOG_DIR)" \
     HELIX_PROFILE_OUTPUT_DIR="$(setting HELIX_PROFILE_OUTPUT_DIR)" \
     "$helix" xcode phase \
-        --plan "$script_directory/HelixXcode.json" \
+        --plan "$script_directory/HostPlan.json" \
         --profile live \
         --phase live-register
 

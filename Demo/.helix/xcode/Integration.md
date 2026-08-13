@@ -1,7 +1,7 @@
 # Helix Xcode integration
 
-This directory is generated from `HostPlan.json`. Regenerate it with
-`helix xcode generate`; do not edit individual files.
+This directory is owned by Helix Hub and generated from `HostPlan.json`.
+Reconfigure the project from Helix; do not edit individual files.
 
 The following target and Scheme edits are one-time project setup. After
 setup, developers use Xcode Run, Build, Archive, and the shared Patch
@@ -15,12 +15,12 @@ scheme; no Helix command needs to be typed during ordinary work.
   DerivedData output to the project.
 - Use `Profiles/hot/Application.xcconfig` as the App target base configuration.
 - Add one Run Script phase before the App's Sources phase:
-  `/bin/sh "$(HELIX_INTEGRATION_ROOT)/Profiles/hot/bridge.sh"`.
+  `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/hot/bridge.sh"`.
   Declare `$(HELIX_BRIDGE_OBJECT)` as its output. The script compiles the generated
   Bridge privately in DerivedData before the App links.
-  Disable "Based on dependency analysis" for this phase: every Xcode Run must embed
-  the fresh one-time invitation
-  reserved by the Build pre-action, even when no project source changed.
+  Disable "Based on dependency analysis" for this phase so every App build
+  links the Bridge produced from the current prepared Shell, including an
+  incremental build where no handwritten source changed.
 - Run `Profiles/hot/prepare.sh` as the first Scheme Build
   pre-action, with build settings supplied by the Feature target.
 - Run `Profiles/hot/audit.sh` as the last Scheme Build
@@ -28,14 +28,15 @@ scheme; no Helix command needs to be typed during ordinary work.
   finalization itself and writes the immutable Release baseline used by Patch.
 - `finalize.sh` is available only for a deliberately separate finalization
   workflow; do not run it immediately before `audit.sh`.
-- Create Aggregate Target `HelixPatchAction`, use
-  `Profiles/hot/Profile.xcconfig` as its base configuration, and run
-  `Profiles/hot/patch.sh` in its only Run Script phase.
-  Set `SUPPORTED_PLATFORMS` to `iphoneos iphonesimulator`; the selected
+- Create an empty Aggregate Target `HelixPatchAction` with
+  `SUPPORTED_PLATFORMS` set to `iphoneos iphonesimulator`; the selected
   destination must match the SDK of the audited Release baseline.
-- Share Scheme `Helix Build Patch` with only that Aggregate Target.
-  Building this scheme compiles, signs, and optionally stages a patch; it
-  does not rebuild or reinstall the App.
+- Share Scheme `Helix Build Patch` with only that Aggregate Target,
+  and run `Profiles/hot/patch.sh` as its Build
+  pre-action using the App target as `EnvironmentBuildable`. This supplies
+  the App's exact version and platform settings without copying them into a
+  second target. Building the scheme compiles, signs, and optionally stages
+  a patch; it does not rebuild or reinstall the App.
 
 ## `live` (`liveReload`)
 
@@ -45,12 +46,12 @@ scheme; no Helix command needs to be typed during ordinary work.
   DerivedData output to the project.
 - Use `Profiles/live/Application.xcconfig` as the App target base configuration.
 - Add one Run Script phase before the App's Sources phase:
-  `/bin/sh "$(HELIX_INTEGRATION_ROOT)/Profiles/live/bridge.sh"`.
+  `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/live/bridge.sh"`.
   Declare `$(HELIX_BRIDGE_OBJECT)` as its output. The script compiles the generated
   Bridge privately in DerivedData before the App links.
-  Disable "Based on dependency analysis" for this phase: every Xcode Run must embed
-  the fresh one-time invitation
-  reserved by the Build pre-action, even when no project source changed.
+  Disable "Based on dependency analysis" for this phase: every Xcode Run must
+  embed the fresh one-time invitation reserved by the Build pre-action, even
+  when no project source changed.
 - Run `Profiles/live/prepare.sh` as the first Scheme Build
   pre-action, with build settings supplied by the Feature target.
 - Keep the Helix status-bar app open. The Build pre-action reserves a one-time

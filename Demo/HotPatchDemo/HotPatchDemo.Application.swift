@@ -12,7 +12,7 @@ final class RuntimeOwner {
 
     init() throws {
         let rootURL = try Self.requiredResource(
-            name: "HelixDemoTrustedRoot",
+            name: "HelixTrustedRoot",
             extension: "json"
         )
         let root = try JSONDecoder().decode(

@@ -1,5 +1,6 @@
 import HelixDevRuntime
 import LiveReloadFeature
+import SwiftUI
 import UIKit
 
 enum LiveReloadDemo {}
@@ -8,18 +9,12 @@ extension LiveReloadDemo {
 @MainActor
 final class RuntimeOwner {
     let session: DevRuntime.ApplicationSession
-    private let environment: DevRuntime.LiveReloadEnvironment
 
     init() throws {
         let environment = DevRuntime.LiveReloadEnvironment(
             overlayConfiguration: .init(startsExpanded: false)
         )
-        self.environment = environment
         session = try DevRuntime.ApplicationSession(environment: environment)
-    }
-
-    func startOverlay() {
-        environment.startOverlay()
     }
 }
 }
@@ -37,14 +32,31 @@ final class LiveReloadDemoApplication: UIResponder, UIApplicationDelegate {
         do {
             let owner = try LiveReloadDemo.RuntimeOwner()
             let window = UIWindow(frame: UIScreen.main.bounds)
-            window.rootViewController = LiveReloadFeature.ScreenViewController()
+            let screen = LiveReloadFeature.ScreenViewController()
+            screen.navigationItem.title = "Live Reload"
+            screen.navigationItem.rightBarButtonItem = UIBarButtonItem(
+                title: "Helix",
+                style: .plain,
+                target: self,
+                action: #selector(showHelixDebugPage)
+            )
+            window.rootViewController = UINavigationController(rootViewController: screen)
             window.makeKeyAndVisible()
             runtimeOwner = owner
             self.window = window
-            owner.startOverlay()
             return true
         } catch {
             fatalError("Helix Live Reload Demo bootstrap failed: \(error)")
         }
+    }
+
+    @objc private func showHelixDebugPage() {
+        guard let runtimeOwner,
+              let navigation = window?.rootViewController as? UINavigationController
+        else { return }
+        let controller = UIHostingController(
+            rootView: DevRuntime.PairingView(session: runtimeOwner.session)
+        )
+        navigation.pushViewController(controller, animated: true)
     }
 }
