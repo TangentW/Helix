@@ -48,6 +48,16 @@ public struct ServiceViewState: Hashable, Sendable {
         manualInvitations.first
     }
 
+    /// Returns whether the displayed code is restricted to the selected
+    /// project. Passing `nil` intentionally represents an unscoped code.
+    public func currentInvitationMatches(projectURL: URL?) -> Bool {
+        guard let currentInvitation else { return false }
+        let expected = projectURL.map {
+            Core.Digest.sha256($0.standardizedFileURL.path)
+        }
+        return currentInvitation.workspacePathHash == expected
+    }
+
     public init(
         mode: Hub.ServiceMode,
         service: DevSession.ServiceSnapshot,

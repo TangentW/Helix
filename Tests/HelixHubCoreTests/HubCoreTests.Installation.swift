@@ -53,6 +53,21 @@ struct ProjectInstallationTests {
         let firstKey = try Data(contentsOf: keyURL)
 
         let installed = try Hub.ProjectFileParser().parse(projectURL: projectURL)
+        let record = try Hub.ProjectRecord(
+            name: "Example",
+            projectURL: first.projectURL,
+            hostPlanURL: first.hostPlanURL,
+            capabilities: first.capabilities,
+            requirements: first.requirements,
+            featureTargetNames: first.featureTargetNames,
+            developmentIdentityProfiles: first.developmentIdentityProfiles
+        )
+        let restored = try Hub.DraftLoader().load(project: installed, record: record)
+        #expect(restored.capabilities == draft.capabilities)
+        #expect(restored.integrationRoot == draft.integrationRoot)
+        #expect(restored.profiles.map(\.id) == ["hot", "live"])
+        #expect(restored.profiles.map(\.featureTargetName) == ["HotFeature", "LiveFeature"])
+        #expect(restored.profiles.first?.patch?.createDevelopmentIdentity == true)
         #expect(installed.target(named: "HelixPatchAction")?.kind == .aggregate)
         #expect(
             installed.target(named: "HotFeature")?
@@ -116,6 +131,30 @@ struct ProjectInstallationTests {
             Data(contentsOf: first.hostPlanURL)
         )
         #expect(canonicalPlan == plan.hostPlan)
+
+        let escapedPlanURL = root.deletingLastPathComponent().appendingPathComponent(
+            "helix-hub-escaped-plan-\(UUID().uuidString).json"
+        )
+        defer { try? FileManager.default.removeItem(at: escapedPlanURL) }
+        try Data(contentsOf: first.hostPlanURL).write(to: escapedPlanURL)
+        let linkURL = first.hostPlanURL.deletingLastPathComponent()
+            .appendingPathComponent("EscapedHostPlan.json")
+        try FileManager.default.createSymbolicLink(
+            atPath: linkURL.path,
+            withDestinationPath: escapedPlanURL.path
+        )
+        let escapedRecord = try Hub.ProjectRecord(
+            name: "Example",
+            projectURL: first.projectURL,
+            hostPlanURL: linkURL,
+            capabilities: first.capabilities,
+            requirements: first.requirements,
+            featureTargetNames: first.featureTargetNames,
+            developmentIdentityProfiles: first.developmentIdentityProfiles
+        )
+        #expect(throws: Hub.Error.self) {
+            _ = try Hub.DraftLoader().load(project: installed, record: escapedRecord)
+        }
         let xcode = try ProcessExecution.Runner().run(
             executable: URL(fileURLWithPath: "/usr/bin/xcrun"),
             arguments: ["xcodebuild", "-list", "-project", projectURL.path],

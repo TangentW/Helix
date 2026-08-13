@@ -66,6 +66,8 @@ struct ProjectStoreTests {
                 summary: "Example requirement",
                 detail: "Example detail"
             )],
+            featureTargetNames: ["feature": "Feature"],
+            developmentIdentityProfiles: capability == .hotPatch ? ["hot-patch"] : [],
             writtenRelativePaths: []
         )
     }

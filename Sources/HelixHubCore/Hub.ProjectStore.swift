@@ -11,6 +11,8 @@ public struct ProjectRecord: Codable, Hashable, Sendable, Identifiable {
     public var hostPlanURL: URL
     public var capabilities: [Hub.Capability]
     public var requirements: [Hub.Requirement]
+    public var featureTargetNames: [String: String]
+    public var developmentIdentityProfiles: [String]
     public var configuredAt: Date
 
     public init(
@@ -19,6 +21,8 @@ public struct ProjectRecord: Codable, Hashable, Sendable, Identifiable {
         hostPlanURL: URL,
         capabilities: [Hub.Capability],
         requirements: [Hub.Requirement],
+        featureTargetNames: [String: String],
+        developmentIdentityProfiles: [String],
         configuredAt: Date = Date()
     ) throws {
         self.name = name
@@ -26,6 +30,8 @@ public struct ProjectRecord: Codable, Hashable, Sendable, Identifiable {
         self.hostPlanURL = hostPlanURL.standardizedFileURL
         self.capabilities = Array(Set(capabilities)).sorted { $0.rawValue < $1.rawValue }
         self.requirements = requirements.sorted { $0.code < $1.code }
+        self.featureTargetNames = featureTargetNames
+        self.developmentIdentityProfiles = Array(Set(developmentIdentityProfiles)).sorted()
         self.configuredAt = configuredAt
         id = Self.identifier(for: self.projectURL)
         try validate()
@@ -46,6 +52,10 @@ public struct ProjectRecord: Codable, Hashable, Sendable, Identifiable {
               capabilities == Array(Set(capabilities)).sorted(by: { $0.rawValue < $1.rawValue }),
               requirements.count <= 1_024,
               requirements == requirements.sorted(by: { $0.code < $1.code }),
+              featureTargetNames.count <= 128,
+              !featureTargetNames.isEmpty,
+              developmentIdentityProfiles.count <= 128,
+              developmentIdentityProfiles == Array(Set(developmentIdentityProfiles)).sorted(),
               configuredAt.timeIntervalSinceReferenceDate.isFinite
         else {
             throw Hub.Error.storageFailure("project record is malformed")
@@ -58,6 +68,14 @@ public struct ProjectRecord: Codable, Hashable, Sendable, Identifiable {
                     .contains(where: { $0.contains("\0") })
             else {
                 throw Hub.Error.storageFailure("project requirement is malformed")
+            }
+        }
+        for (featureID, targetName) in featureTargetNames {
+            guard !featureID.isEmpty, featureID.utf8.count <= 1_024,
+                  !targetName.isEmpty, targetName.utf8.count <= 1_024,
+                  !featureID.contains("\0"), !targetName.contains("\0")
+            else {
+                throw Hub.Error.storageFailure("Feature target mapping is malformed")
             }
         }
     }
@@ -111,6 +129,8 @@ public actor ProjectStore {
             hostPlanURL: installation.hostPlanURL,
             capabilities: installation.capabilities,
             requirements: installation.requirements,
+            featureTargetNames: installation.featureTargetNames,
+            developmentIdentityProfiles: installation.developmentIdentityProfiles,
             configuredAt: configuredAt
         )
         var candidate = recordsByID
@@ -173,7 +193,7 @@ public actor ProjectStore {
     }
 
     private struct Document: Codable {
-        static let currentSchemaVersion: UInt16 = 1
+        static let currentSchemaVersion: UInt16 = 2
         var schemaVersion: UInt16 = Self.currentSchemaVersion
         var records: [Hub.ProjectRecord]
 

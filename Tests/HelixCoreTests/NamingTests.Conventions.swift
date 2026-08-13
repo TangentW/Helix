@@ -18,7 +18,7 @@ struct Conventions {
         let prefixedFile = try NSRegularExpression(pattern: #"^(?:HLX|HLBC|HLXI)[A-Z]"#)
         var violations: [String] = []
 
-        for directoryName in ["Sources", "Tests"] {
+        for directoryName in ["Sources", "Tests", "Hub/Sources", "Hub/Tests"] {
             let directory = packageRoot.appendingPathComponent(directoryName, isDirectory: true)
             guard let files = FileManager.default.enumerator(
                 at: directory,

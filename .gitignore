@@ -1,4 +1,5 @@
 .build/
+/Hub/.build/
 .swiftpm/
 .DS_Store
 /Docs/Implementation/

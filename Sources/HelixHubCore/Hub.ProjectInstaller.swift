@@ -11,6 +11,8 @@ public struct InstallationResult: Hashable, Sendable {
     public var hostPlanURL: URL
     public var capabilities: [Hub.Capability]
     public var requirements: [Hub.Requirement]
+    public var featureTargetNames: [String: String]
+    public var developmentIdentityProfiles: [String]
     public var writtenRelativePaths: [String]
 
     public init(
@@ -18,12 +20,16 @@ public struct InstallationResult: Hashable, Sendable {
         hostPlanURL: URL,
         capabilities: [Hub.Capability],
         requirements: [Hub.Requirement],
+        featureTargetNames: [String: String],
+        developmentIdentityProfiles: [String],
         writtenRelativePaths: [String]
     ) {
         self.projectURL = projectURL
         self.hostPlanURL = hostPlanURL
         self.capabilities = capabilities
         self.requirements = requirements
+        self.featureTargetNames = featureTargetNames
+        self.developmentIdentityProfiles = developmentIdentityProfiles
         self.writtenRelativePaths = writtenRelativePaths
     }
 }
@@ -138,6 +144,8 @@ public struct ProjectInstaller: Sendable {
             ),
             capabilities: Array(Set(capabilities)).sorted { $0.rawValue < $1.rawValue },
             requirements: onboarding.requirements,
+            featureTargetNames: onboarding.featureTargetNames,
+            developmentIdentityProfiles: onboarding.developmentIdentityProfiles,
             writtenRelativePaths: written
         )
     }

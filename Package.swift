@@ -44,6 +44,7 @@ let package = Package(
         .library(name: "HelixDevTools", targets: ["HelixDevTools"]),
         .library(name: "HelixDevRuntime", targets: ["HelixDevRuntime"]),
         .library(name: "HelixHubCore", targets: ["HelixHubCore"]),
+        .executable(name: "helix-hub-app", targets: ["HelixHubApp"]),
         .executable(name: "helix", targets: ["HelixCLI"]),
         .executable(name: "helix-benchmark", targets: ["HelixBenchmarkCLI"]),
     ],
@@ -121,6 +122,11 @@ let package = Package(
             ]
         ),
         .executableTarget(
+            name: "HelixHubApp",
+            dependencies: ["HelixHubCore"],
+            path: "Hub/Sources/Helix"
+        ),
+        .executableTarget(
             name: "HelixCLI",
             dependencies: ["HelixCLIKit"]
         ),
@@ -180,6 +186,11 @@ let package = Package(
                 "HelixHubCore", "HelixBuildTools", "HelixDevProtocol",
                 "HelixDevTools", "HelixCore", "HelixPatch", "HelixReleaseTools",
             ]
+        ),
+        .testTarget(
+            name: "HelixHubAppTests",
+            dependencies: ["HelixHubApp", "HelixHubCore"],
+            path: "Hub/Tests/HelixHubAppTests"
         ),
         .testTarget(
             name: "HelixDevRuntimeIOSTests",
