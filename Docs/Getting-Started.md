@@ -40,16 +40,43 @@ source membership, or generated import in application code. The App links one
 private relocatable object produced before its Sources phase. That object
 exports a stable provider symbol and is otherwise an implementation detail.
 
-## 3. Add the package
+## 3. Add the App runtime dependency
 
-Add Helix as a Swift package dependency. Link only one of these products into
-the App configuration:
+Choose SwiftPM or CocoaPods. Link only one runtime into an App configuration:
 
 - Debug Live Reload: `HelixDevAppRuntime`
 - Release Hot Patch: `HelixAppRuntime`
 
-The Feature target does not need a Helix runtime product. Build-side products
-and the `helix` executable run on macOS and must not enter a Release App bundle.
+With SwiftPM, add the Helix package and link the same-named product. App source
+continues to import the leaf API module, such as `HelixDevRuntime` or
+`HelixPatch`. With CocoaPods, use separate App targets:
+
+```ruby
+target 'HotPatchApp' do
+  pod 'HelixAppRuntime',
+      :git => 'https://github.com/TangentW/Helix.git',
+      :branch => 'main'
+end
+
+target 'LiveReloadApp' do
+  pod 'HelixDevAppRuntime',
+      :git => 'https://github.com/TangentW/Helix.git',
+      :branch => 'main'
+end
+```
+
+Pin a tag or commit for a production project. The podspecs can also live in a
+private Specs repository; Helix does not need to be published to CocoaPods
+trunk. CocoaPods App source imports `HelixAppRuntime` or
+`HelixDevAppRuntime` because each Pod is a self-contained aggregate module.
+The hidden Bridge selects the SwiftPM leaf modules or CocoaPods aggregate at
+compile time without an application setting.
+
+The Feature target does not need a Helix runtime dependency. Build-side
+products and the `helix` executable run on macOS and must not enter a Release
+App bundle. Local `:path` development has one CocoaPods-specific preparation
+step documented in [CocoaPods/README.md](../CocoaPods/README.md); normal Git and
+private-spec installations perform it automatically.
 
 ## 4. Open Helix and choose the project
 
@@ -88,9 +115,9 @@ installation so reconfiguration cannot leave stale PBX references behind.
 
 Hot Patch and Live Reload require distinct App targets. The Release target must
 link only `HelixAppRuntime`; the development target must link only
-`HelixDevAppRuntime`. Helix detects the products and reports a code-level action
-when one is missing, but it does not inject package linkage or application
-startup code.
+`HelixDevAppRuntime`. Helix detects SwiftPM products and App-target CocoaPods
+xcconfig linkage, then reports a code-level action when one is missing. It does
+not inject dependency linkage or application startup code.
 
 ## 6. Apply and review the project transaction
 
@@ -154,7 +181,11 @@ later saves. App, package, and unrelated targets keep Xcode's normal driver.
 Keep one session alive for the App lifetime:
 
 ```swift
+#if canImport(HelixDevAppRuntime)
+import HelixDevAppRuntime // CocoaPods
+#else
 import HelixDevRuntime
+#endif
 
 @MainActor
 final class DevelopmentRuntimeOwner {
@@ -206,6 +237,13 @@ Release code uses the same automatic provider and supplies only product-owned
 storage and policy:
 
 ```swift
+#if canImport(HelixAppRuntime)
+import HelixAppRuntime // CocoaPods
+#else
+import HelixCore
+import HelixPatch
+#endif
+
 let session = try PatchRuntime.ApplicationSession(
     installationID: installationID,
     storeRootURL: patchStoreURL,

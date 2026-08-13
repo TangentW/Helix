@@ -53,8 +53,8 @@ is **Helix**. Its implementation lives under `Hub/`; reusable project, build,
 service, and session capabilities remain under `Sources/` and are also
 available to the CLI.
 
-1. Add the Helix Swift package and put the implementations you want to patch in
-   a focused Swift Feature framework.
+1. Add Helix through SwiftPM or CocoaPods and put the implementations you want
+   to patch in a focused Swift Feature framework.
 2. Link `HelixDevAppRuntime` to the Debug Live Reload App target and
    `HelixAppRuntime` to the Release Hot Patch App target. These products must
    not share one App image, so a project enabling both workflows needs distinct
@@ -74,7 +74,7 @@ available to the CLI.
    xcconfig wrappers, hidden Bridge phase, Scheme actions, Patch action, and
    Live Reload local-network declarations as one transaction. Generated Swift
    stays in DerivedData and never appears in the Xcode navigator. Helix reports
-   any package-linkage or runtime-bootstrap work that still belongs in App code.
+   any dependency-linkage or runtime-bootstrap work that still belongs in App code.
 6. Keep one process-lifetime `DevRuntime.ApplicationSession` in a development
    App. UIKit instance discovery is automatic; SwiftUI still needs a pulse
    boundary.
@@ -184,10 +184,11 @@ The complete practical matrix is in
 The package manifest uses Swift tools 6.1. Exact patch and Live Reload builds are
 bound to the compiler and SDK identity captured for their target Shell.
 
-## Package products
+## App runtime dependencies
 
-An App target links exactly one aggregate runtime product. Do not combine an
-aggregate with overlapping leaf products.
+An App target links exactly one aggregate runtime. SwiftPM exposes it as a
+package product; CocoaPods exposes a same-named aggregate module. Do not combine
+the Release and development runtimes in one App image.
 
 | App target | Product | Purpose |
 | --- | --- | --- |
@@ -197,7 +198,9 @@ aggregate with overlapping leaf products.
 Build-side modules such as `HelixCompiler`, `HelixBuildTools`,
 `HelixReleaseTools`, `HelixDevTools`, and CLI targets belong on macOS. They must
 not be linked into an iOS Release App. The release audit scans the final bundle
-for development leakage.
+for development leakage. See the [Getting Started guide](Docs/Getting-Started.md)
+and [CocoaPods integration notes](CocoaPods/README.md) for manager-specific
+installation and import syntax.
 
 ## Build and test
 
@@ -206,6 +209,8 @@ swift build
 swift test
 swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
+pod lib lint HelixAppRuntime.podspec --platforms=ios
+pod lib lint HelixDevAppRuntime.podspec --platforms=ios
 ```
 
 The full SwiftPM suite, warnings-as-errors build, and optimized Release build

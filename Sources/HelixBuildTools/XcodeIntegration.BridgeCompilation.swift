@@ -27,6 +27,7 @@ public struct BridgeCompilationPlanner: Sendable {
         expectedTargetTriple: String,
         expectedSDKPath: String,
         expectedOptimization: String,
+        additionalModuleSearchArguments: [String] = [],
         clangModuleMapURLs: [URL],
         generatedSourceURLs: [URL],
         outputURL: URL,
@@ -90,6 +91,9 @@ public struct BridgeCompilationPlanner: Sendable {
         guard optimization == expectedOptimization else {
             throw XcodeIntegration.BridgeCompilationError.captureMismatch
         }
+        let additionalModuleSearchArguments = try validatedModuleSearchArguments(
+            additionalModuleSearchArguments
+        )
         var arguments = [
             "-emit-object", "-whole-module-optimization", "-parse-as-library",
             optimization,
@@ -104,6 +108,7 @@ public struct BridgeCompilationPlanner: Sendable {
             "-Xfrontend", "-enable-dynamic-replacement-chaining",
         ]
         arguments.append(contentsOf: preservedArguments(capturedArguments))
+        arguments.append(contentsOf: additionalModuleSearchArguments)
         for moduleMap in clangModuleMapURLs.map(\.standardizedFileURL).sorted(by: {
             $0.path < $1.path
         }) {
@@ -167,6 +172,39 @@ public struct BridgeCompilationPlanner: Sendable {
                 result.append(argument)
             }
             index += 1
+        }
+        return result
+    }
+
+    private func validatedModuleSearchArguments(
+        _ arguments: [String]
+    ) throws -> [String] {
+        guard arguments.count <= 4_096 else {
+            throw XcodeIntegration.BridgeCompilationError.invalidInput
+        }
+        var result: [String] = []
+        var seen = Set<String>()
+        var index = 0
+        while index < arguments.count {
+            let flag = arguments[index]
+            guard ["-I", "-F", "-Fsystem"].contains(flag),
+                  index + 1 < arguments.count
+            else {
+                throw XcodeIntegration.BridgeCompilationError.invalidInput
+            }
+            let path = arguments[index + 1]
+            guard path.hasPrefix("/"),
+                  path.utf8.count <= 64 * 1_024,
+                  !path.contains("$"),
+                  !path.unicodeScalars.contains(where: { $0.value == 0 })
+            else {
+                throw XcodeIntegration.BridgeCompilationError.invalidInput
+            }
+            let key = "\(flag)\u{0}\(path)"
+            if seen.insert(key).inserted {
+                result.append(contentsOf: [flag, path])
+            }
+            index += 2
         }
         return result
     }

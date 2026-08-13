@@ -1,5 +1,6 @@
 .build/
 /Hub/.build/
+/CocoaPods/Generated/
 .swiftpm/
 .DS_Store
 /Docs/Implementation/

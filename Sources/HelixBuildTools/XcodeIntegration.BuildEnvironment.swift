@@ -20,6 +20,8 @@ public struct BuildEnvironment: Hashable, Sendable {
     public var compilerURL: URL
     public var optimization: String
     public var semanticArguments: [String]
+    /// App-target module search paths needed to compile the hidden Bridge.
+    public var bridgeModuleSearchArguments: [String]
     public var shellOutputURL: URL {
         profileOutputURL.appendingPathComponent("Shell", isDirectory: true)
     }
@@ -211,6 +213,7 @@ public struct EnvironmentResolver: Sendable {
             )
         }
         let compiler = try compilerURL(in: variables)
+        let bridgeModuleSearchArguments = try moduleSearchArguments(variables: variables)
         let semanticArguments = try requireFeatureCompilerSettings
             ? semanticArguments(variables: variables)
             : []
@@ -241,7 +244,8 @@ public struct EnvironmentResolver: Sendable {
             buildNumber: buildNumber,
             compilerURL: compiler,
             optimization: optimization,
-            semanticArguments: semanticArguments
+            semanticArguments: semanticArguments,
+            bridgeModuleSearchArguments: bridgeModuleSearchArguments
         )
         let configurationURL = xcodeSourceRoot.appendingPathComponent(
             feature.patchConfigurationPath
@@ -299,15 +303,7 @@ public struct EnvironmentResolver: Sendable {
         if let flags = nonempty("OTHER_SWIFT_FLAGS", in: variables) {
             result.append(contentsOf: try words(flags).filter { $0 != "$(inherited)" })
         }
-        for (setting, flag) in [
-            ("SWIFT_INCLUDE_PATHS", "-I"),
-            ("FRAMEWORK_SEARCH_PATHS", "-F"),
-        ] {
-            guard let value = nonempty(setting, in: variables) else { continue }
-            for path in try words(value) where path != "$(inherited)" {
-                result.append(contentsOf: [flag, path])
-            }
-        }
+        result.append(contentsOf: try moduleSearchArguments(variables: variables))
         guard result.contains("-enable-private-imports") else {
             throw XcodeIntegration.EnvironmentError.mismatch(
                 name: "OTHER_SWIFT_FLAGS",
@@ -329,6 +325,27 @@ public struct EnvironmentResolver: Sendable {
             throw XcodeIntegration.EnvironmentError.malformedArguments(
                 "an inherited build-setting expression was not expanded"
             )
+        }
+        return result
+    }
+
+    private func moduleSearchArguments(
+        variables: [String: String]
+    ) throws -> [String] {
+        var result: [String] = []
+        for (setting, flag) in [
+            ("SWIFT_INCLUDE_PATHS", "-I"),
+            ("FRAMEWORK_SEARCH_PATHS", "-F"),
+        ] {
+            guard let value = nonempty(setting, in: variables) else { continue }
+            for path in try words(value) where path != "$(inherited)" {
+                guard !path.contains("$") else {
+                    throw XcodeIntegration.EnvironmentError.malformedArguments(
+                        "an inherited build-setting expression was not expanded"
+                    )
+                }
+                result.append(contentsOf: [flag, path])
+            }
         }
         return result
     }

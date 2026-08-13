@@ -34,9 +34,24 @@ public struct ProjectFileParser: Sendable {
         guard targetIDs.count <= 4_096 else {
             throw Hub.Error.invalidProject("project declares too many targets")
         }
-        let targets = try targetIDs.compactMap {
+        let cocoaPodsResolver = Hub.CocoaPodsRuntimeResolver(sourceRootURL: sourceRoot)
+        let parsedTargets: [Hub.XcodeTarget] = try targetIDs.compactMap {
             try makeTarget(id: $0, objects: objects, resolver: resolver)
-        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        }
+        let targets: [Hub.XcodeTarget] = parsedTargets.map {
+            (value: Hub.XcodeTarget) -> Hub.XcodeTarget in
+            var target = value
+            target.cocoaPodsProductsByConfiguration = Dictionary(
+                uniqueKeysWithValues: target.baseConfigurationPaths.compactMap {
+                    configuration, path in
+                    let products = cocoaPodsResolver.products(referencedBy: [path])
+                    return products.isEmpty ? nil : (configuration, products)
+                }
+            )
+            return target
+        }.sorted { (lhs: Hub.XcodeTarget, rhs: Hub.XcodeTarget) in
+            lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
         let projectConfigurations = configurationNames(
             listID: project["buildConfigurationList"]?.string,
             objects: objects

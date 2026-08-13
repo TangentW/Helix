@@ -1202,9 +1202,10 @@ private func compileXcodeBridge(
         at: context.environment.frontendInvocationURL
     )
     let moduleMapNames = ["HelixRuntimeSupport"]
-    let runtimeModuleMaps = try moduleMapNames.map { name -> URL in
+    let runtimeModuleMaps = try moduleMapNames.compactMap { name -> URL? in
         let url = context.environment.generatedModuleMapDirectoryURL
             .appendingPathComponent("\(name).modulemap")
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         _ = try readRegularFile(
             url,
             maximumBytes: 1 * 1_024 * 1_024,
@@ -1250,6 +1251,8 @@ private func compileXcodeBridge(
             expectedTargetTriple: context.environment.targetTriple,
             expectedSDKPath: context.environment.sdkRootURL.path,
             expectedOptimization: context.environment.optimization,
+            additionalModuleSearchArguments:
+                context.environment.bridgeModuleSearchArguments,
             clangModuleMapURLs: runtimeModuleMaps,
             generatedSourceURLs: sourceURLs,
             outputURL: temporary,

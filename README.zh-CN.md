@@ -33,7 +33,7 @@ flowchart LR
 
 开发者日常使用的是菜单栏应用，界面和进程名称都叫 **Helix**。它的薄 GUI 放在根目录 `Hub/`；工程解析、配置事务、Service、配对和会话能力都在 `Sources/`，没有 Hub GUI 时仍可由 CLI 使用。
 
-1. 添加 Helix Swift Package，把希望热修复的实现放进职责清楚的 Swift Feature framework。
+1. 通过 SwiftPM 或 CocoaPods 添加 Helix，把希望热修复的实现放进职责清楚的 Swift Feature framework。
 2. Debug Live Reload App target 链接 `HelixDevAppRuntime`；Release Hot Patch App target 链接 `HelixAppRuntime`。两者不能进入同一个 App image，因此同时接入两项能力时要使用不同的 App target。Runtime 初始化仍由业务代码显式完成。
 3. 在本仓库开发时构建并打开 Helix：
 
@@ -43,7 +43,7 @@ flowchart LR
    ```
 
 4. 在 Helix 中选择工程。新工程默认勾选热修复和热重载；分别选择 App target、Feature target、共享 Scheme 与 configuration。未勾选的能力以后还能补装，补丁信任与输出路径可在高级配置中调整。
-5. 点击配置。Helix 会把 Host Plan、patch 配置、xcconfig wrapper、隐藏 Bridge phase、Scheme action、Patch action 和 Live Reload 本地网络声明作为一次事务写入。生成 Swift 只存在于 DerivedData，不会出现在 Xcode Navigator。Package linkage 或 Runtime 启动等必须由业务明确决定的动作，会在界面上列出来。
+5. 点击配置。Helix 会把 Host Plan、patch 配置、xcconfig wrapper、隐藏 Bridge phase、Scheme action、Patch action 和 Live Reload 本地网络声明作为一次事务写入。生成 Swift 只存在于 DerivedData，不会出现在 Xcode Navigator。依赖链接或 Runtime 启动等必须由业务明确决定的动作，会在界面上列出来。
 6. 开发 App 在进程生命周期内持有一个 `DevRuntime.ApplicationSession`。UIKit 实例会自动发现；SwiftUI 仍需 pulse boundary。
 7. 保持 Helix 运行，用 Xcode 默认 Apple debugger Run 已配置的 Live Reload Scheme。无需自定义 LLDB、环境变量、host、port 或 secret。保存受支持的 Swift 实现即可热重载；热修复则先归档 Release Shell，再构建生成的 Patch-only Scheme，产出签名 `.hlxp`，不会重建或重装 App。
 
@@ -86,16 +86,16 @@ flowchart LR
 
 Package Manifest 使用 Swift tools 6.1。精确补丁与 Live Reload 构建会绑定对应目标 Shell 捕获到的 compiler 和 SDK 身份。
 
-## Package 产品
+## App Runtime 依赖
 
-一个 App target 只能链接一个聚合 Runtime 产品，不要再叠加有重复模块的 leaf product。
+一个 App target 只能链接一个聚合 Runtime。SwiftPM 以 package product 提供，CocoaPods 则提供同名聚合 module；生产与开发 Runtime 不能进入同一个 App image。
 
 | App target | 产品 | 用途 |
 | --- | --- | --- |
 | Release / Production | `HelixAppRuntime` | HLBC 验证、执行和包生命周期，不包含开发加载器 |
 | Debug / Dev Shell | `HelixDevAppRuntime` | Release 能力，加上认证 Dev 传输、临时 HLBC 激活与 UI Reload |
 
-`HelixCompiler`、`HelixBuildTools`、`HelixReleaseTools`、`HelixDevTools` 与 CLI 等构建侧模块只应运行在 macOS，不得链接到 iOS Release App。Release Audit 会扫描最终 bundle 是否泄漏开发能力。
+`HelixCompiler`、`HelixBuildTools`、`HelixReleaseTools`、`HelixDevTools` 与 CLI 等构建侧模块只应运行在 macOS，不得链接到 iOS Release App。Release Audit 会扫描最终 bundle 是否泄漏开发能力。不同依赖管理器的安装与 import 写法见[使用入门](Docs/Getting-Started.zh-CN.md)和 [CocoaPods 说明](CocoaPods/README.md)。
 
 ## 构建与测试
 
@@ -104,6 +104,8 @@ swift build
 swift test
 swift test -Xswiftc -warnings-as-errors
 swift test -c release -Xswiftc -warnings-as-errors
+pod lib lint HelixAppRuntime.podspec --platforms=ios
+pod lib lint HelixDevAppRuntime.podspec --platforms=ios
 ```
 
 完整 SwiftPM 测试、warnings-as-errors 与优化 Release 构建都是发布 Gate。可使用 Simulator UDID 运行平台 fixture：

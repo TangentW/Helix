@@ -288,7 +288,8 @@ public struct OnboardingPlanner: Sendable {
             ))
             requirements.append(contentsOf: Self.runtimeRequirements(
                 app: app,
-                workflow: workflow
+                workflow: workflow,
+                configurationName: profile.configurationName
             ))
         }
 
@@ -385,22 +386,23 @@ public struct OnboardingPlanner: Sendable {
 
     private static func runtimeRequirements(
         app: Hub.XcodeTarget,
-        workflow: XcodeIntegration.Workflow
+        workflow: XcodeIntegration.Workflow,
+        configurationName: String
     ) -> [Hub.Requirement] {
         let expected = workflow.runtimePackageProduct
         let opposite = workflow == .liveReload ? "HelixAppRuntime" : "HelixDevAppRuntime"
         var result: [Hub.Requirement] = []
-        if !app.packageProducts.contains(expected) {
+        if !app.linksRuntimeProduct(expected, configurationName: configurationName) {
             result.append(.init(
                 code: "HLXHUB101-\(Self.slug(app.name))-\(workflow.rawValue)",
                 severity: .actionRequired,
                 summary: "Link \(expected) to \(app.name)",
                 detail: "This is the only code-level Xcode step Hub does not infer: add the "
-                    + "Helix package product to the App target, then initialize the matching "
+                    + "Helix Swift package product or CocoaPod to the App target, then initialize the matching "
                     + "runtime API in application code."
             ))
         }
-        if app.packageProducts.contains(opposite) {
+        if app.linksRuntimeProduct(opposite, configurationName: configurationName) {
             result.append(.init(
                 code: "HLXHUB102-\(Self.slug(app.name))-\(workflow.rawValue)",
                 severity: .actionRequired,

@@ -66,6 +66,13 @@ public struct XcodeTarget: Hashable, Sendable, Identifiable {
     public var sourceFiles: [String]
     public var packageProducts: [String]
     public var baseConfigurationPaths: [String: String]
+    public var cocoaPodsProductsByConfiguration: [String: [String]]
+
+    /// App-facing Helix runtime products linked through any supported manager.
+    public var linkedRuntimeProducts: [String] {
+        Array(Set(packageProducts).union(cocoaPodsProductsByConfiguration.values.flatMap { $0 }))
+            .sorted()
+    }
 
     public init(
         id: String,
@@ -77,7 +84,8 @@ public struct XcodeTarget: Hashable, Sendable, Identifiable {
         configurationNames: [String],
         sourceFiles: [String],
         packageProducts: [String],
-        baseConfigurationPaths: [String: String]
+        baseConfigurationPaths: [String: String],
+        cocoaPodsProductsByConfiguration: [String: [String]] = [:]
     ) {
         self.id = id
         self.name = name
@@ -89,6 +97,18 @@ public struct XcodeTarget: Hashable, Sendable, Identifiable {
         self.sourceFiles = sourceFiles
         self.packageProducts = packageProducts
         self.baseConfigurationPaths = baseConfigurationPaths
+        self.cocoaPodsProductsByConfiguration = cocoaPodsProductsByConfiguration
+    }
+
+    public func linksRuntimeProduct(
+        _ product: String,
+        configurationName: String? = nil
+    ) -> Bool {
+        if packageProducts.contains(product) { return true }
+        if let configurationName {
+            return cocoaPodsProductsByConfiguration[configurationName]?.contains(product) == true
+        }
+        return cocoaPodsProductsByConfiguration.values.contains { $0.contains(product) }
     }
 }
 }

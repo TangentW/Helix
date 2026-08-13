@@ -329,6 +329,10 @@ struct XcodeIntegrationContract {
             expectedTargetTriple: "arm64-apple-ios15.0-simulator",
             expectedSDKPath: "/SDK/iPhoneSimulator.sdk",
             expectedOptimization: "-Onone",
+            additionalModuleSearchArguments: [
+                "-F", "/Pods/Build/HelixDevAppRuntime",
+                "-I", "/Pods/Headers",
+            ],
             clangModuleMapURLs: [URL(fileURLWithPath: "/Modules/Runtime.modulemap")],
             generatedSourceURLs: sources,
             outputURL: output,
@@ -341,10 +345,54 @@ struct XcodeIntegrationContract {
         #expect(plan.arguments.contains("DEBUG"))
         #expect(plan.arguments.contains("-fmodule-map-file=/Modules/Runtime.modulemap"))
         #expect(plan.arguments.contains("/Build/Products/Debug-iphonesimulator"))
+        #expect(plan.arguments.contains("/Pods/Build/HelixDevAppRuntime"))
+        #expect(plan.arguments.contains("/Pods/Headers"))
         #expect(!plan.arguments.contains("/Sources/App.swift"))
         #expect(!plan.arguments.contains("/tmp/AppOutputs.json"))
         #expect(!plan.arguments.contains("/tmp/DemoApp.swiftmodule"))
         #expect(plan.arguments.suffix(2) == ["-o", output.path])
+
+        #expect(throws: XcodeIntegration.BridgeCompilationError.invalidInput) {
+            try XcodeIntegration.BridgeCompilationPlanner().plan(
+                compilerPath: "/Toolchain/usr/bin/swiftc",
+                capturedArguments: [
+                    "-module-name", "DemoApp",
+                    "-target", "arm64-apple-ios15.0-simulator",
+                    "-sdk", "/SDK/iPhoneSimulator.sdk",
+                ],
+                expectedCompilerPath: "/Toolchain/usr/bin/swiftc",
+                expectedCapturedModuleName: "DemoApp",
+                expectedTargetTriple: "arm64-apple-ios15.0-simulator",
+                expectedSDKPath: "/SDK/iPhoneSimulator.sdk",
+                expectedOptimization: "-Onone",
+                additionalModuleSearchArguments: ["-o", "/tmp/injected.o"],
+                clangModuleMapURLs: [],
+                generatedSourceURLs: sources,
+                outputURL: output,
+                moduleName: "HelixBridge_fixture"
+            )
+        }
+
+        #expect(throws: XcodeIntegration.BridgeCompilationError.invalidInput) {
+            try XcodeIntegration.BridgeCompilationPlanner().plan(
+                compilerPath: "/Toolchain/usr/bin/swiftc",
+                capturedArguments: [
+                    "-module-name", "DemoApp",
+                    "-target", "arm64-apple-ios15.0-simulator",
+                    "-sdk", "/SDK/iPhoneSimulator.sdk",
+                ],
+                expectedCompilerPath: "/Toolchain/usr/bin/swiftc",
+                expectedCapturedModuleName: "DemoApp",
+                expectedTargetTriple: "arm64-apple-ios15.0-simulator",
+                expectedSDKPath: "/SDK/iPhoneSimulator.sdk",
+                expectedOptimization: "-Onone",
+                additionalModuleSearchArguments: ["-I", "/Pods/$(CONFIGURATION)"],
+                clangModuleMapURLs: [],
+                generatedSourceURLs: sources,
+                outputURL: output,
+                moduleName: "HelixBridge_fixture"
+            )
+        }
 
         #expect(throws: XcodeIntegration.BridgeCompilationError.captureMismatch) {
             try XcodeIntegration.BridgeCompilationPlanner().plan(
@@ -467,6 +515,10 @@ struct XcodeIntegrationContract {
             "OTHER_SWIFT_FLAGS": "-Xfrontend -enable-private-imports "
                 + "-Xfrontend -enable-implicit-dynamic "
                 + "-Xfrontend -enable-dynamic-replacement-chaining",
+            "SWIFT_INCLUDE_PATHS": root.appendingPathComponent("Pods/Headers").path,
+            "FRAMEWORK_SEARCH_PATHS": "\""
+                + root.appendingPathComponent("Pods/Build/HelixDevAppRuntime").path
+                + "\" $(inherited)",
             "HELIX_PROFILE_ID": "live",
             "HELIX_WORKFLOW": "liveReload",
             "HELIX_RUNTIME_PRODUCT": "HelixDevAppRuntime",
@@ -493,6 +545,10 @@ struct XcodeIntegrationContract {
         #expect(context.environment.semanticArguments.contains("-swift-version"))
         #expect(context.environment.semanticArguments.contains("6"))
         #expect(context.environment.semanticArguments.contains("HELIX_DEMO"))
+        #expect(context.environment.bridgeModuleSearchArguments == [
+            "-I", root.appendingPathComponent("Pods/Headers").path,
+            "-F", root.appendingPathComponent("Pods/Build/HelixDevAppRuntime").path,
+        ])
         #expect(
             context.environment.profileOutputURL.path
                 == root.appendingPathComponent(

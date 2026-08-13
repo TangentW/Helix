@@ -56,6 +56,8 @@ struct ShellBuildPipeline {
         )
         #expect(bridge.contains("public static func makePatchBuildContract()"))
         #expect(bridge.contains("runtimeImageIdentity: .current"))
+        #expect(bridge.contains("#elseif canImport(HelixDevAppRuntime)"))
+        #expect(bridge.contains("#elseif canImport(HelixAppRuntime)"))
         let devContract = String(
             decoding: try #require(
                 artifacts["Generated/FixtureBridge.DevBuildContract.swift"]
@@ -71,6 +73,8 @@ struct ShellBuildPipeline {
         #expect(devContract.contains("platform: .iOS"))
         #expect(devContract.contains("runtimeImageIdentity: .current"))
         #expect(devContract.contains(output.report.reloadIndexHash.hex))
+        #expect(devContract.contains("#elseif canImport(HelixDevAppRuntime)"))
+        #expect(!devContract.contains("#elseif canImport(HelixAppRuntime)"))
         let provider = String(
             decoding: try #require(
                 artifacts["Generated/FixtureBridge.Provider.swift"]
@@ -84,6 +88,7 @@ struct ShellBuildPipeline {
         #expect(provider.contains("try FixtureBridge.makeShellInterface()"))
         #expect(provider.contains("install: { runtime in"))
         #expect(provider.contains("try FixtureBridge.bootstrap(using: runtime)"))
+        #expect(provider.contains("#elseif canImport(HelixAppRuntime)"))
         let planBytes = try #require(artifacts["Xcode/IntegrationPlan.json"])
         let plan = try JSONDecoder().decode(XcodeIntegration.Plan.self, from: planBytes)
         try plan.validate()

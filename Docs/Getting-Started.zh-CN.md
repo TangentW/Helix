@@ -30,14 +30,32 @@ flowchart LR
 
 这里不再存在生成 Bridge framework、生成源码 target、生成源码 target membership 或生成模块 import。App 只会在 Sources phase 之前链接一个私下生成的 relocatable object；它导出稳定的 provider 符号，其余内容都属于 Helix 内部实现。
 
-## 3. 添加 Package
+## 3. 添加 App Runtime 依赖
 
-把 Helix 加为 Swift Package 依赖，并按 configuration 给 App 链接一个产品：
+选择 SwiftPM 或 CocoaPods，并按 configuration 只给 App 链接一个 Runtime：
 
 - Debug Live Reload：`HelixDevAppRuntime`
 - Release Hot Patch：`HelixAppRuntime`
 
-Feature target 不需要链接 Helix Runtime。Compiler、Build Tools、Dev Tools 与 `helix` CLI 只在 macOS 构建侧运行，不能进入 Release App bundle。
+SwiftPM 路径把 Helix 添加为 package，并链接同名 product；App 源码继续 import `HelixDevRuntime`、`HelixPatch` 等 leaf API module。CocoaPods 路径使用不同 App target：
+
+```ruby
+target 'HotPatchApp' do
+  pod 'HelixAppRuntime',
+      :git => 'https://github.com/TangentW/Helix.git',
+      :branch => 'main'
+end
+
+target 'LiveReloadApp' do
+  pod 'HelixDevAppRuntime',
+      :git => 'https://github.com/TangentW/Helix.git',
+      :branch => 'main'
+end
+```
+
+生产项目应固定 tag 或 commit。两份 podspec 以后也可放进私有 Specs 仓库，不要求发布到 CocoaPods trunk。CocoaPods 下的 App 源码 import `HelixAppRuntime` 或 `HelixDevAppRuntime`，因为每个 Pod 都是自包含的聚合 module。隐藏 Bridge 会在编译时自动选择 SwiftPM leaf module 或 CocoaPods 聚合 module，不增加业务配置。
+
+Feature target 不需要链接 Helix Runtime。Compiler、Build Tools、Dev Tools 与 `helix` CLI 只在 macOS 构建侧运行，不能进入 Release App bundle。仅本地 `:path` 开发需要按 [CocoaPods 说明](../CocoaPods/README.md)手动准备一次聚合源码；Git 和私有 spec 安装会自动执行。
 
 ## 4. 打开 Helix 并选择工程
 
@@ -63,7 +81,7 @@ open Hub/.build/Helix.app
 
 Helix 会从 Xcode 真实 Build Settings 解析 module name 与 bundle identifier。Profile identity、namespace、patch recipe、信任文件、输出目录和可选 Simulator inbox 放在高级配置中。首次没选的能力以后还能安装；已经安装的能力不能被静默关闭。第一次安装后，integration root 会锁定，避免重配置后留下旧目录和悬空 PBX 引用。
 
-Hot Patch 与 Live Reload 必须使用不同 App target。Release target 只能链接 `HelixAppRuntime`，开发 target 只能链接 `HelixDevAppRuntime`。Helix 会检查产品并列出缺失的代码层动作，但不会偷偷注入 Package linkage 或 App 启动代码。
+Hot Patch 与 Live Reload 必须使用不同 App target。Release target 只能链接 `HelixAppRuntime`，开发 target 只能链接 `HelixDevAppRuntime`。Helix 会检查 SwiftPM product 与 App target 的 CocoaPods xcconfig，并列出缺失的代码层动作，但不会偷偷注入依赖链接或 App 启动代码。
 
 ## 6. 应用并检查工程事务
 
@@ -107,7 +125,11 @@ Feature compiler proxy 只作用于所选 Feature configuration。它逐项转�
 只需让一个 session 在 App 生命周期内保持存活：
 
 ```swift
+#if canImport(HelixDevAppRuntime)
+import HelixDevAppRuntime // CocoaPods
+#else
 import HelixDevRuntime
+#endif
 
 @MainActor
 final class DevelopmentRuntimeOwner {
@@ -144,6 +166,13 @@ try await runtimeOwner.session.connect(pairingCode: "AB2C")
 Release 路径同样自动发现 provider，App 只提供自己的存储与策略：
 
 ```swift
+#if canImport(HelixAppRuntime)
+import HelixAppRuntime // CocoaPods
+#else
+import HelixCore
+import HelixPatch
+#endif
+
 let session = try PatchRuntime.ApplicationSession(
     installationID: installationID,
     storeRootURL: patchStoreURL,

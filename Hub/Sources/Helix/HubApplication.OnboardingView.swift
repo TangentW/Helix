@@ -195,7 +195,10 @@ private struct WorkflowEditor: View {
 
     private var runtimeStatus: some View {
         let linked = project.target(named: form.applicationTargetName)?
-            .packageProducts.contains(form.expectedRuntimeProduct) == true
+            .linksRuntimeProduct(
+                form.expectedRuntimeProduct,
+                configurationName: form.configurationName
+            ) == true
         return HStack(alignment: .top, spacing: 9) {
             Image(systemName: linked ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                 .foregroundStyle(linked ? Color.green : Color.orange)
@@ -206,8 +209,8 @@ private struct WorkflowEditor: View {
                     .font(.subheadline.weight(.semibold))
                 Text(
                     linked
-                        ? "Hub will preserve the current package linkage."
-                        : "Package linkage and runtime initialization are intentional code-level steps; Hub never injects hidden application code."
+                        ? "Hub will preserve the current dependency linkage."
+                        : "Add the Swift package product or CocoaPod, then initialize its runtime API; Hub never injects hidden application code."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)

@@ -258,7 +258,7 @@ struct Editor: Hashable, Sendable, Identifiable {
     ) -> Int {
         var score = nameScore(target.name, capability: capability)
         if avoiding.contains(target.name) { score -= 100 }
-        if let expectedProduct, target.packageProducts.contains(expectedProduct) {
+        if let expectedProduct, target.linksRuntimeProduct(expectedProduct) {
             score += 100
         }
         return score

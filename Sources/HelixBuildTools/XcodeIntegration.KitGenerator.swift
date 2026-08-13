@@ -368,7 +368,7 @@ public struct KitGenerator: Sendable {
             let common = """
             ## `\(contract.profileID)` (`\(profile.workflow.rawValue)`)
 
-            - Link `\(contract.runtimePackageProduct)` and the Feature framework into the App.
+            - Link `\(contract.runtimePackageProduct)` through SwiftPM or CocoaPods, and link the Feature framework into the App.
             - Use `\(contract.featureConfiguration)` as the Feature target base configuration.
               Keep the Feature's ordinary Swift files in its Sources phase; never add Helix
               DerivedData output to the project.
