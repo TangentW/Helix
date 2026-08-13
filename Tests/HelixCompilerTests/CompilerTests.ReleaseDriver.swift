@@ -2484,11 +2484,13 @@ struct ReleaseDriver {
             modules: [
                 moduleName: .init(
                     include: ["Patch.swift"],
-                    nativeImports: .init(
-                        allow: helperExposure == .nativeImport && emitHelperImport
-                            ? [helperCallee]
-                            : []
-                    )
+                    nativeImports: helperExposure == .nativeImport && emitHelperImport
+                        ? .init(
+                            candidateIndex: .explicitCatalog,
+                            emit: .allowlisted,
+                            allow: [helperCallee]
+                        )
+                        : .init()
                 ),
             ]
         )

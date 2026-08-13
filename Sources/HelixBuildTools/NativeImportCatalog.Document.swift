@@ -55,7 +55,7 @@ public struct Candidate: Codable, Hashable, Sendable {
         signature: Core.LoweredSignature,
         effects: Core.Effects = .init(),
         contract: Core.NativeImportContract,
-        capability: Core.Capability = .nativeImportsV2,
+        capability: Core.Capability = .nativeImportsV1,
         factoryType: String,
         importedModules: [String]
     ) {
@@ -75,7 +75,7 @@ public struct Candidate: Codable, Hashable, Sendable {
 }
 
 public struct Document: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 2
+    public static let currentSchemaVersion: UInt16 = 1
 
     public var schemaVersion: UInt16
     public var nativeTypes: [NativeImportCatalog.NativeType]
@@ -175,7 +175,7 @@ public struct Document: Codable, Hashable, Sendable {
                   (normalizedIsolation == "MainActor")
                       == candidate.effects.requiresMainActor,
                   normalizedIsolation == nil || normalizedIsolation == "MainActor",
-                  candidate.capability == .nativeImportsV2,
+                  candidate.capability == .nativeImportsV1,
                   Self.isQualifiedSwiftName(candidate.factoryType),
                   candidate.importedModules == Array(Set(candidate.importedModules)).sorted(),
                   !candidate.importedModules.isEmpty,

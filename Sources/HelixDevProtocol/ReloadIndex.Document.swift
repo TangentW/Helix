@@ -130,7 +130,7 @@ public struct NativeReplacement: Codable, Hashable, Sendable {
 }
 
 public struct Document: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 3
+    public static let currentSchemaVersion: UInt16 = 1
 
     public var schemaVersion: UInt16
     public var sourceRoots: [ReloadIndex.SourceRoots]

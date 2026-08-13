@@ -184,25 +184,18 @@ struct ShellBuildPipeline {
         }
     }
 
-    @Test("Schema 5 through 8 receipts remain canonical without newer generated metadata")
-    func preservesLegacyReceiptCompatibility() throws {
+    @Test("Only the current Shell Build Receipt schema is accepted")
+    func rejectsNonCurrentSchema() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
-        for schemaVersion: UInt16 in [5, 6, 7, 8] {
-            var legacy = fixture.receipt
-            legacy.schemaVersion = schemaVersion
-
-            let bytes = try ShellBuildReceipt.Codec.encode(legacy)
-            let decoded = try ShellBuildReceipt.Codec.decode(bytes)
-
-            #expect(decoded.schemaVersion == schemaVersion)
-            #expect(decoded.nativeImportBindings.allSatisfy { $0.generated == nil })
-            #expect(decoded.nativeTypeBindings.allSatisfy { $0.generated == nil })
-            #expect(try ShellBuildReceipt.Codec.encode(decoded) == bytes)
+        var unsupported = fixture.receipt
+        unsupported.schemaVersion = 2
+        #expect(throws: ShellBuildReceipt.Error.unsupportedSchema(2)) {
+            try ShellBuildReceipt.Codec.encode(unsupported)
         }
     }
 
-    @Test("Schema 8 rejects an Entry and NativeImport identity overlap")
+    @Test("The current receipt rejects an Entry and NativeImport identity overlap")
     func rejectsEntryNativeImportOverlap() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
@@ -235,7 +228,7 @@ struct ShellBuildPipeline {
                 signature: declaration.loweredSignature,
                 effects: effects,
                 contract: contract,
-                capability: .nativeImportsV2,
+                capability: .nativeImportsV1,
                 isEmittedToDevice: false
             ),
         ]

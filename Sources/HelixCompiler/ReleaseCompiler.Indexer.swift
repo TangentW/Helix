@@ -138,41 +138,24 @@ public struct Indexer: Sendable {
                     "declaration async/throwing metadata is inconsistent"
                 )
             }
-            let usesImplementationFingerprint = request.compatibility.interfaceArchive
-                >= .init(2, 3, 0)
             let referencesGeneratedImplementation =
                 ReleaseCompiler.ImplementationFingerprint
                     .referencedSymbols(in: declaration.canonicalSILBody)
                     .contains(where: ReleaseCompiler.ImplementationFingerprint
                         .isCompilerGeneratedSymbol)
-            guard usesImplementationFingerprint
-                    || declaration.implementationFingerprint == nil
-            else {
-                throw ReleaseCompiler.IndexError.invalidInput(
-                    "transitive implementation fingerprints require HLXI 2.3"
-                )
-            }
             guard !referencesGeneratedImplementation
-                    || usesImplementationFingerprint
-                        && declaration.implementationFingerprint != nil
+                    || declaration.implementationFingerprint != nil
             else {
                 throw ReleaseCompiler.IndexError.invalidInput(
                     "compiler-generated dependencies require a transitive implementation fingerprint"
                 )
             }
-            let bodyFingerprint: Core.Digest
-            if usesImplementationFingerprint {
-                bodyFingerprint = declaration.implementationFingerprint
-                    ?? ReleaseCompiler.ImplementationFingerprint.compute(
-                        symbol: declaration.mangledName,
-                        loweredType: declaration.interface.loweredSILType,
-                        body: declaration.canonicalSILBody
-                    )
-            } else {
-                bodyFingerprint = ReleaseCompiler.BodyFingerprint.compute(
-                    declaration.canonicalSILBody
+            let bodyFingerprint = declaration.implementationFingerprint
+                ?? ReleaseCompiler.ImplementationFingerprint.compute(
+                    symbol: declaration.mangledName,
+                    loweredType: declaration.interface.loweredSILType,
+                    body: declaration.canonicalSILBody
                 )
-            }
             let key = try Core.FunctionKey.derive(
                 namespace: request.metadata.shellNamespaceID,
                 module: declaration.moduleName,
@@ -184,7 +167,6 @@ public struct Indexer: Sendable {
             let patchability = eligibility(
                 of: declaration,
                 configuration: request.configuration,
-                compatibility: request.compatibility,
                 mainActorNativeTypeIDs: mainActorNativeTypeIDs
             )
             if !patchability.isEligible {
@@ -258,47 +240,27 @@ public struct Indexer: Sendable {
         }
 
         var capabilities = request.capabilities
-        capabilities.insert(.baselineV1)
-        if request.compatibility.bytecode.major == 1,
-           request.compatibility.bytecode >= .init(1, 6, 0) {
-            // These capabilities are implemented entirely by the versioned VM.
-            // Advertising them in a new Shell does not widen its native ABI.
-            capabilities.formUnion([.localNominalsV1, .structuredErrorsV1])
-        }
-        if request.compatibility.bytecode.major == 1,
-           request.compatibility.bytecode >= .init(1, 7, 0) {
-            capabilities.formUnion([.addressValuesV1, .borrowCallsV1])
-        }
-        if request.compatibility.bytecode.major == 1,
-           request.compatibility.bytecode >= .init(1, 8, 0) {
-            capabilities.formUnion([
-                .closureValuesV1,
-                .escapingClosureValuesV1,
-                .compilerSpecializationsV1,
-            ])
-        }
-        if request.compatibility.bytecode.major == 1,
-           request.compatibility.bytecode >= .init(1, 10, 0) {
-            // Any may be introduced only by a later patch body, so it cannot be
-            // inferred solely from the frozen Shell entry signatures.
-            capabilities.insert(.anyValuesV1)
-        }
-        if request.compatibility.bytecode.major == 1,
-           request.compatibility.bytecode >= .init(1, 11, 0) {
-            // New classes may appear only in a later source revision. A new
-            // Shell therefore advertises both VM-local reference semantics and
-            // the precompiled Objective-C hosting bridge up front.
-            capabilities.formUnion([
-                .localClassesV1,
-                .hostedObjectiveCClassesV1,
-            ])
-        }
+        // Patch-local features may first appear after the Shell is released.
+        // Advertising VM-only capabilities up front does not widen native ABI.
+        capabilities.formUnion([
+            .baselineV1,
+            .localNominalsV1,
+            .structuredErrorsV1,
+            .addressValuesV1,
+            .borrowCallsV1,
+            .closureValuesV1,
+            .escapingClosureValuesV1,
+            .compilerSpecializationsV1,
+            .anyValuesV1,
+            .localClassesV1,
+            .hostedObjectiveCClassesV1,
+        ])
         if records.contains(where: {
             $0.patchability.isEligible && $0.effects.isAsync
         }) {
             capabilities.insert(.asyncLeafEntriesV1)
         }
-        if imports.contains(where: \.isEmittedToDevice) { capabilities.insert(.nativeImportsV2) }
+        if imports.contains(where: \.isEmittedToDevice) { capabilities.insert(.nativeImportsV1) }
         if request.nativeTypes.contains(where: \.isEmittedToDevice) { capabilities.insert(.nativeTypesV1) }
         if records.contains(where: { record in
             record.parameterTypes.contains(where: containsString)
@@ -364,7 +326,6 @@ public struct Indexer: Sendable {
     private func eligibility(
         of candidate: ReleaseCompiler.DeclarationCandidate,
         configuration: PatchConfiguration.Document,
-        compatibility: Core.Compatibility,
         mainActorNativeTypeIDs: Set<Core.TypeID>
     ) -> InterfaceArchive.Patchability {
         if let forced = candidate.forcedPatchability { return forced }
@@ -384,16 +345,6 @@ public struct Indexer: Sendable {
             return .rejected("HLXIDX004", explanation: "initializer/deinitializer roots are not supported in HLBC v1")
         }
         if candidate.isAsync {
-            guard compatibility.bytecode.major == 1,
-                  compatibility.bytecode >= .init(1, 9, 0),
-                  compatibility.interfaceArchive.major == 2,
-                  compatibility.interfaceArchive >= .init(2, 4, 0)
-            else {
-                return .rejected(
-                    "HLXIDX005",
-                    explanation: "non-suspending async entries require HLBC 1.9 and HLXI 2.4"
-                )
-            }
             do {
                 try CanonicalSIL.AsyncLeaf.validate(
                     .init(

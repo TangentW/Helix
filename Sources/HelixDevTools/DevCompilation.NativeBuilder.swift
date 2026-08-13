@@ -476,7 +476,7 @@ public actor NativeBuilder {
             }
             return .init(
                 sourceFileLogicalPath: state.source.logicalPath,
-                privateImportSourceFile: state.source.effectivePrivateImportSourceFile,
+                privateImportSourceFile: state.source.privateImportSourceFile,
                 imports: Array(Set(values.flatMap(\.importedModules))).sorted(),
                 roots: roots
             )

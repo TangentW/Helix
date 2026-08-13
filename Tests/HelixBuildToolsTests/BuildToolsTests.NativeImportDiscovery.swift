@@ -94,7 +94,7 @@ struct NativeImportDiscoveryTests {
         let moduleName = "GeneratedImportFixture"
         let target = "arm64-apple-ios15.0-simulator"
         let configurationYAML = """
-        schema: 2
+        schema: 1
         modules:
           \(moduleName):
             include:
@@ -176,11 +176,6 @@ struct NativeImportDiscoveryTests {
         #expect(output.receipt.nativeImportBindings.contains {
             $0.generated == nil && $0.importedModules == ["HelixRuntime"]
         })
-        var forgedLegacyReceipt = output.receipt
-        forgedLegacyReceipt.schemaVersion = 7
-        #expect(throws: ShellBuildReceipt.Error.self) {
-            try forgedLegacyReceipt.validate()
-        }
         #expect(output.receipt.configuration.modules[moduleName]?.nativeImports.allow.sorted() == [
             "\(moduleName).Counter.increment(_:)",
             "\(moduleName).Counter.value.get",
@@ -685,38 +680,20 @@ struct NativeImportDiscoveryTests {
         let typeBindings = output.receipt.nativeTypeBindings.compactMap(\.generated)
         #expect(typeBindings.contains {
             $0.swiftType == "NSTextAlignment"
-                && $0.effectiveRepresentation == .rawRepresentable
+                && $0.representation == .rawRepresentable
         })
         #expect(typeBindings.contains {
             $0.swiftType == "UIAccessibilityTraits"
-                && $0.effectiveRepresentation == .rawRepresentable
+                && $0.representation == .rawRepresentable
         })
         #expect(typeBindings.contains {
             $0.swiftType.hasSuffix("Date")
-                && $0.effectiveRepresentation == .opaqueValue
+                && $0.representation == .opaqueValue
         })
         #expect(typeBindings.contains {
             $0.swiftType == "_NSRange"
-                && $0.effectiveRepresentation == .opaqueValue
+                && $0.representation == .opaqueValue
         })
-
-        var legacyDispatchReceipt = output.receipt
-        legacyDispatchReceipt.schemaVersion = 8
-        #expect(throws: ShellBuildReceipt.Error.invalid(
-            "generated imported-operation NativeImports require Shell receipt schema 9"
-        )) {
-            try legacyDispatchReceipt.validate()
-        }
-
-        var legacyTypeReceipt = output.receipt
-        legacyTypeReceipt.schemaVersion = 8
-        legacyTypeReceipt.nativeImportCandidates = []
-        legacyTypeReceipt.nativeImportBindings = []
-        #expect(throws: ShellBuildReceipt.Error.invalid(
-            "generated native type representations require Shell receipt schema 9"
-        )) {
-            try legacyTypeReceipt.validate()
-        }
 
         let selected = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "selectedLabel"
@@ -848,7 +825,7 @@ struct NativeImportDiscoveryTests {
     @Test("A source range expands deterministically into exact value-only operations")
     func discoversEligibleOperationsAndDiagnosesBoundaries() throws {
         let configuration = try PatchConfiguration.Document.parse(yaml: """
-        schema: 2
+        schema: 1
         modules:
           ScopeFixture:
             include:
@@ -976,7 +953,7 @@ struct NativeImportDiscoveryTests {
     @Test("Automatic discovery accepts frozen Native values but rejects address and closure boundaries")
     func rejectsUnsupportedBoundaryTypes() throws {
         let configuration = try PatchConfiguration.Document.parse(yaml: """
-        schema: 2
+        schema: 1
         modules:
           ScopeFixture:
             include:

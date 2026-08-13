@@ -29,7 +29,7 @@ struct ProjectIndexTests {
             seed: "fixture"
         )
         let configurationText = """
-        schema: 2
+        schema: 1
         modules:
           AccountFeature:
             include:
@@ -254,7 +254,7 @@ struct ProjectIndexTests {
     @Test("Project adapter rejects partial and cross-build module sets")
     func rejectsInconsistentProjects() throws {
         let configuration = PatchConfiguration.Document(
-            schema: 2,
+            schema: 1,
             modules: [
                 "First": .init(include: ["First/**"]),
                 "Second": .init(include: ["Second/**"]),

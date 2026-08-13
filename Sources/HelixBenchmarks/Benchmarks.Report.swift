@@ -163,8 +163,7 @@ public struct Environment: Codable, Equatable, Sendable {
 }
 
 public struct Report: Codable, Equatable, Sendable {
-    /// Schema 2 adds the MainActor-bound UIKit NativeImport scenario.
-    public static let currentSchemaVersion: UInt16 = 2
+    public static let currentSchemaVersion: UInt16 = 1
 
     public var schemaVersion: UInt16
     public var generatedAt: String

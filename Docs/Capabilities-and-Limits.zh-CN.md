@@ -9,7 +9,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | 范围 | 已实现 | 尚未认证或实现 |
 | --- | --- | --- |
 | Release Shell | 精确 frontend 索引、Derived Sources、Interface Archive、永久 Bridge、NativeImport 发现、Xcode 集成、bundle 泄漏审计 | 大型真实业务迁移和长期 CI 矩阵 |
-| 生产 HLBC | HLBC 1.11 / HLXI 2.6 编译链、Verifier、HLVM、签名包、安全安装、不可变激活、回滚与吊销；仓库内业务 corpus | App Store 分发批准、外部 top-200 corpus、长时间 fuzz/sanitizer、真机 macro 性能与 hosted UIKit 页面 soak |
+| 生产 HLBC | HLBC 1.0 / HLXI 1.0 编译链、Verifier、HLVM、签名包、安全安装、不可变激活、回滚与吊销；仓库内业务 corpus | App Store 分发批准、外部 top-200 corpus、长时间 fuzz/sanitizer、真机 macro 性能与 hosted UIKit 页面 soak |
 | 开发期 Live Reload | 精确构建捕获、稳定快照、body 差分、会话绑定的验证后 HLBC、认证传输、原子激活、UIKit/SwiftUI 刷新、逻辑源码映射与 128 代进程内 soak | 真实 iPhone 矩阵、真机长时间 soak、交互式字节码单步调试、大型工程延迟资格 |
 | Helix Hub | SwiftUI 菜单栏应用、工程发现、Hot Patch/Live Reload 事务接入、安全 helper 发现、统一 Service、精确 Build Context registry、Xcode 自动邀请与手动四位码配对 | 分发签名/公证与大范围第三方工程迁移矩阵 |
 | Native 实验 | 仅显式选择的 Dynamic Replacement builder、递归/previous 测试、签名 dylib 与 loader probe | 产品支持；自动路由有意不选择它 |
@@ -17,7 +17,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 
 完整 SwiftPM 测试、warnings-as-errors、优化 Release 构建、iOS fixture 与仓库 Demo 分别作为证据 Gate。全部通过也不等于已经完成真实设备或分发通道认证。
 
-## 生产 HLBC 1.11 的 Swift 子集
+## 生产 HLBC 1.0 的 Swift 子集
 
 ### 已实现
 
@@ -31,7 +31,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - 新增普通函数、private 方法和计算属性会作为同一 image 的普通函数、getter 或 setter 被传递发现并编译，不要求它们预先出现在 Shell EntryIndex 中。patch-local `final class` 具有 HLVM 自己的引用 identity、字段 storage 和方法调用；纯 HLVM class 仍不能跨原生边界。
 - 新增 `final` class 可以选择一个 HLXI 已冻结、`NSObject` 兼容的 reference superclass。Runtime 为每个不可变 image 注册 Objective-C host，使对象能以该 superclass（包括 `UIViewController` 或项目基类）的身份交给原生代码。当前 hosted profile 仅支持继承的无参初始化、无新增 stored property，以及无参或单个 `Bool` 参数的 `Void` override；原生侧不能识别补丁新增的 Swift 具体类型。
 - 同步补丁内 `inout` 与 `mutating` helper，并受 Address、access、alias、ownership、同 frame/同 block 规则验证。
-- 捕获 copyable VM-managed 值的同步补丁内 closure。它包括同 image helper 的 `@escaping` 参数、从同 image 函数把 closure 返回给调用者，以及 closure 再捕获另一个 closure；该值必须在同一次固定 generation 的 HLVM invocation 内用完。返回与嵌套捕获语义由 `escaping-closure-values-1` 独立门禁，不能因为旧 closure capability 存在就默认放行。另支持不再包含 archetype、metadata 或 witness 依赖的编译器完全具体化 specialization。
+- 捕获 copyable VM-managed 值的同步补丁内 closure。它包括同 image helper 的 `@escaping` 参数、从同 image 函数把 closure 返回给调用者，以及 closure 再捕获另一个 closure；该值必须在同一次固定 generation 的 HLVM invocation 内用完。返回与嵌套捕获语义由 `escaping-closure-values-1` 独立门禁，不能因为基础 closure capability 存在就默认放行。另支持不再包含 archetype、metadata 或 witness 依赖的编译器完全具体化 specialization。
 - 顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` entry。生成的精确 Swift wrapper 保留 ABI，HLVM 只执行已经证明不会挂起的 body。
 - VM-owned `Any`、`is`、`as?`、`as!`，以及受支持 Optional/Array/Dictionary 的递归动态转换；Swift existential metadata、native object 和线性生命周期不会进入下载字节码。
 - 完全具体的默认参数 generator。生产与开发编译器会把可达 `fA...` thunk 一起链接并纳入传递实现指纹；当前只承诺一个完整 module source set 内的 eligible 调用点。跨 module 的 public/package 默认值、非 eligible 调用点或仍需泛型 metadata 时要求完整构建。

@@ -29,7 +29,7 @@ flowchart LR
     T --> D["Interface 与传递 body 差分"]
     D --> S["Canonical OSSA SIL"]
     S --> L["HLIR lowering"]
-    L --> B["HLBC 1.11 encoder"]
+    L --> B["HLBC 1.0 encoder"]
     B --> V["独立 Verifier"]
     V --> P["签名 .hlxp"]
 ```
@@ -99,7 +99,7 @@ sequenceDiagram
 
 ## 当前语言边界
 
-当前 wire 版本为 HLBC 1.11 与 HLXI 2.6。已实现子集包括常用整数和浮点操作与转换、Bool、String 操作和插值、用于有界 String predicate 路径的单 grapheme Character 字面量、包含 address projection 的 Tuple/Optional、Array 与 Dictionary 值语义、VM-owned `Any` 与常用动态转换、半开 `Range<Int>` 循环、结构化控制流、可随补丁新增且不导出 ABI 的普通/private helper、computed accessor、文件/module scope struct/enum、pure HLVM class、具体 `Result` 及带 payload 的局部 Error、受限的补丁内 `inout`/`mutating` helper、包含同 image `@escaping` 返回/捕获流程的同步补丁内 closure、编译器已经完全具体化的 specialization 和默认参数 generator、自动冻结的 `Swift.print` NativeImport，以及顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` 入口。新增 `final` class 还可在闭合 hosted profile 内继承已冻结的 `NSObject` 兼容项目类或系统类，并以 superclass 身份交给原生代码；当前只支持继承无参初始化、无 stored property 与 no-arg/Bool `Void` override。
+当前 wire 版本为 HLBC 1.0 与 HLXI 1.0。已实现子集包括常用整数和浮点操作与转换、Bool、String 操作和插值、用于有界 String predicate 路径的单 grapheme Character 字面量、包含 address projection 的 Tuple/Optional、Array 与 Dictionary 值语义、VM-owned `Any` 与常用动态转换、半开 `Range<Int>` 循环、结构化控制流、可随补丁新增且不导出 ABI 的普通/private helper、computed accessor、文件/module scope struct/enum、pure HLVM class、具体 `Result` 及带 payload 的局部 Error、受限的补丁内 `inout`/`mutating` helper、包含同 image `@escaping` 返回/捕获流程的同步补丁内 closure、编译器已经完全具体化的 specialization 和默认参数 generator、自动冻结的 `Swift.print` NativeImport，以及顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` 入口。新增 `final` class 还可在闭合 hosted profile 内继承已冻结的 `NSObject` 兼容项目类或系统类，并以 superclass 身份交给原生代码；当前只支持继承无参初始化、无 stored property 与 no-arg/Bool `Void` override。
 
 它并非任意 Swift。generic root、运行时 metadata/witness 分派、原生可识别的补丁具体 Swift 类型、函数内部 nominal 声明、hosted stored property/自定义 initializer/任意 callback ABI、已有原生类型的 stored layout 变化、closure 持久化或跨 Native/Shell 边界、throwing/async closure、真正的 `await`/continuation、actor-isolated `self`、custom global actor、不受限指针、基于反射的字段访问和未注册原生 API 都会被拒绝。实用矩阵见[能力与限制](Capabilities-and-Limits.zh-CN.md)。
 

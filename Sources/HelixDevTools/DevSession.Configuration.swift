@@ -6,7 +6,7 @@ import HelixInterface
 
 extension DevSession {
 public struct Configuration: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 2
+    public static let currentSchemaVersion: UInt16 = 1
 
     public var schemaVersion: UInt16
     public var manifestPath: String

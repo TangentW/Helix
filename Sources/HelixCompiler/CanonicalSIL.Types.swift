@@ -264,8 +264,8 @@ public struct TypeEnvironment: Sendable {
         nativeTypes = [:]
         nativeTypeKinds = [:]
         mainActorNativeTypes = []
-        // Keep payload-free legacy Error patches on the 1.0 String error path.
-        // Typed storage is enabled only when the SIL or a local declaration needs it.
+        // Payload-free throws use the lightweight String error representation.
+        // Typed storage is enabled only when SIL semantics or a local declaration needs it.
         requiresTypedErrors = text.contains("checked_cast_addr_br")
             || text.contains("Result<")
             || rawDefinitions.values.contains(where: Self.hasStoredErrorPayload)

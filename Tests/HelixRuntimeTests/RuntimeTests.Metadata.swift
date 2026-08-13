@@ -5,7 +5,7 @@ extension RuntimeTests {
 @Suite("Runtime metadata")
 struct Metadata {
     @Test func moduleHasVersion() {
-        #expect(Runtime.Metadata.version.major == 0)
+        #expect(Runtime.Metadata.version == .init(1, 0, 0))
     }
 }
 }

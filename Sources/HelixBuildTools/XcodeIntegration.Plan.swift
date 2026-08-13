@@ -7,7 +7,7 @@ public enum XcodeIntegration {}
 
 extension XcodeIntegration {
 public struct Plan: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 2
+    public static let currentSchemaVersion: UInt16 = 1
 
     public var schemaVersion: UInt16
     public var featureModuleName: String

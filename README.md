@@ -107,7 +107,7 @@ Live Reload acceptance run.
   capabilities, quotas, diagnostics, and interface archives.
 - Release Derived Sources and permanent Swift bridges without modifying
   handwritten source files.
-- Canonical HLBC 1.11 / HLXI 2.6 encoding/decoding, independent structural and semantic
+- Canonical HLBC 1.0 / HLXI 1.0 encoding/decoding, independent structural and semantic
   verification, a typed-register HLVM, exact native bridges, immutable
   generations, and pinned call-chain snapshots.
 - Exact-toolchain Swift-to-HLBC compilation for the documented subset: common
@@ -123,7 +123,7 @@ Live Reload acceptance run.
   and non-suspending async entries. A closed hosted profile can additionally
   project a new final subclass of an HLXI-frozen `NSObject`-compatible project
   or system type to native code, including a bounded `UIViewController` path.
-- NativeImport v2 and schema 2 build-time discovery by declaration, file,
+- NativeImport v1 and schema 1 build-time discovery by declaration, file,
   module, or project scope, plus dual-evidence freezing of baseline-used APIs
   from imported Apple or third-party modules. Raw enums, OptionSets, opaque
   values, references, accessors, methods, global values/functions, simple
@@ -241,7 +241,7 @@ swift run -c release helix-benchmark \
   --output /tmp/helix-benchmark-candidate.json
 ```
 
-Report schema 2 includes typed HLVM calls, bridge overhead, and a
+Report schema 1 includes typed HLVM calls, bridge overhead, and a
 `@MainActor` UIKit NativeImport scenario. A comparable baseline/policy
 violation exits with status 3 so CI cannot mistake a regression for success.
 The optional `--policy PATH` flag replaces the built-in p50/p95 tolerances

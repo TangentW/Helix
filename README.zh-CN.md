@@ -59,9 +59,9 @@ flowchart LR
 
 - 绑定具体构建的 Shell identity、`FunctionKey`、`TypeID`、`EntryIndex`、capability、quota、diagnostic 与 Interface Archive。
 - 不修改手写源文件的 Release Derived Sources 与永久 Swift Bridge。
-- Canonical HLBC 1.10 编解码、独立结构/语义验证、强类型寄存器 HLVM、精确 Native Bridge、不可变 generation 与固定调用链快照。
+- Canonical HLBC 1.0 / HLXI 1.0 编解码、独立结构/语义验证、强类型寄存器 HLVM、精确 Native Bridge、不可变 generation 与固定调用链快照。
 - 使用精确工具链把已声明 Swift 子集编译成 HLBC：常用标量与 String、有界 Character predicate、Optional projection、`Range<Int>` 循环、Array/Dictionary 值语义、新增 image-local 普通/private 函数、计算 accessor、文件/module scope 的 struct/enum/class、具体 `Result`、带 payload 的局部错误、受限局部 `inout`/`mutating`、包含有界 `@escaping` 返回/捕获流程的同步 closure、具体化 compiler specialization、默认参数 generator、VM-owned `Any`、自动 `Swift.print` 与无 suspension async entry。闭合 hosted profile 还能把新增 `final` class 作为 HLXI 已冻结的 `NSObject` 兼容项目类或系统类子类投影给原生侧，包括受限 `UIViewController` 路径。
-- NativeImport v2、schema 2 的 declaration/file/module/project 构建期发现，以及对发布基线已经使用的 Apple 或第三方 module API 进行 AST/SIL 双证据自动冻结。raw enum、OptionSet、opaque value、reference、accessor、method、全局值/函数、简单 imported C value、Objective-C bridge 和 ownership 都会展开为逐项精确 invoker，不会成为设备端 wildcard。
+- NativeImport v1、schema 1 的 declaration/file/module/project 构建期发现，以及对发布基线已经使用的 Apple 或第三方 module API 进行 AST/SIL 双证据自动冻结。raw enum、OptionSet、opaque value、reference、accessor、method、全局值/函数、简单 imported C value、Objective-C bridge 和 ownership 都会展开为逐项精确 invoker，不会成为设备端 wildcard。
 - 签名 `.hlxp` 构建与验证、有界下载、不可变存储、anti-rollback、激活 WAL、Crash Guard、LKG 恢复、签名吊销与回滚。
 - 精确 Debug frontend job 捕获与复放、稳定保存快照、单调调度、HLBC 生成、认证传输、Verifier 激活、UIKit 刷新、SwiftUI pulse boundary 与 Debug Overlay。经过验证的逻辑源码映射可以增强 VM trap，同时不会泄漏生产构建机路径。
 - 仓库内接近业务代码的 corpus，以及覆盖失败保存、回滚、调用、有界 snapshot 保留和 generation ID 单调性的 128 代进程内 soak。
@@ -131,7 +131,7 @@ swift run -c release helix-benchmark \
   --output /tmp/helix-benchmark-candidate.json
 ```
 
-报告 schema 2 包含强类型 HLVM 调用、Bridge 开销和 `@MainActor` UIKit NativeImport 场景。可比的 baseline/policy 发生回归时进程会以状态码 3 退出，CI 不会把性能退化误判为成功。
+报告 schema 1 包含强类型 HLVM 调用、Bridge 开销和 `@MainActor` UIKit NativeImport 场景。可比的 baseline/policy 发生回归时进程会以状态码 3 退出，CI 不会把性能退化误判为成功。
 可选的 `--policy PATH` 会用一份 canonical `RegressionPolicy` JSON 覆盖内建的 p50/p95 容差。
 Mac microbenchmark 只作为回归证据，不能代替真实 iPhone 的启动、滚动、交互、内存压力或尾延迟测试。
 

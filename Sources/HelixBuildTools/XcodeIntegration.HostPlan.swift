@@ -115,7 +115,7 @@ public struct Profile: Codable, Hashable, Sendable {
 /// stable project facts; volatile DerivedData paths and compiler identities are
 /// measured from the active Xcode build environment.
 public struct HostPlan: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 3
+    public static let currentSchemaVersion: UInt16 = 1
     public static let defaultFileName = "HostPlan.json"
 
     public var schemaVersion: UInt16

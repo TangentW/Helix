@@ -74,7 +74,7 @@ struct Preparer {
         #expect(result.manifest.sourceFiles.first?.absolutePath == fixture.sourceURL.path)
         #expect(result.manifest.sourceFiles.first?.contentHash == fixture.archive.sources[0].contentHash)
         #expect(
-            result.manifest.sourceFiles.first?.effectivePrivateImportSourceFile
+            result.manifest.sourceFiles.first?.privateImportSourceFile
                 == "HelixGenerated.Screen.swift"
         )
     }

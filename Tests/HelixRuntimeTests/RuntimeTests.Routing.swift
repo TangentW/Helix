@@ -39,11 +39,6 @@ struct Routing {
             interfaceHash: interfaceHash,
             registrationCount: 1
         )
-        let input = try VM.Integer(signed: 9, bitWidth: 64, isSigned: true)
-        #expect(
-            bridge.invoke(entry: .init(rawValue: 0), arguments: [.integer(input)])
-                == .returned(.integer(input))
-        )
         #expect(throws: Runtime.BridgeBootstrapError.interfaceHashMismatch) {
             try Runtime.Bridge().install(
                 runtime: runtime,
@@ -870,7 +865,6 @@ struct Routing {
                 arguments: [.integer(try int(1))]
             ) == .trapped(.explicit("diagnostic fixture"))
         )
-        #expect(observer.legacyTraps == [.explicit("diagnostic fixture")])
         let diagnostic = try #require(observer.diagnostics.first)
         #expect(diagnostic.generationID == generation.id)
         #expect(diagnostic.entry == fixture.entry)
@@ -1055,14 +1049,7 @@ struct Routing {
 
     private final class TrapObserver: Runtime.Observing, @unchecked Sendable {
         private let lock = NSLock()
-        private var legacyStorage: [VM.RuntimeTrap] = []
         private var diagnosticStorage: [Runtime.TrapDiagnostic] = []
-
-        var legacyTraps: [VM.RuntimeTrap] {
-            lock.lock()
-            defer { lock.unlock() }
-            return legacyStorage
-        }
 
         var diagnostics: [Runtime.TrapDiagnostic] {
             lock.lock()
@@ -1072,16 +1059,6 @@ struct Routing {
 
         func didActivate(generation: Runtime.GenerationID) {}
         func didRollback(from: Runtime.GenerationID, to: Runtime.GenerationID?) {}
-
-        func didTrap(
-            generation: Runtime.GenerationID,
-            entry: Core.EntryIndex,
-            trap: VM.RuntimeTrap
-        ) {
-            lock.lock()
-            legacyStorage.append(trap)
-            lock.unlock()
-        }
 
         func didTrap(diagnostic: Runtime.TrapDiagnostic) {
             lock.lock()

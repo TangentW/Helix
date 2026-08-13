@@ -10,7 +10,7 @@ import HelixAppRuntime
 
 final class HelixAppRuntimeConsumerTests: XCTestCase {
     func testProductionNamespacesAreExported() {
-        XCTAssertEqual(Core.Versions.runtime, Core.SemanticVersion(0, 1, 0))
+        XCTAssertEqual(Core.Versions.runtime, Core.SemanticVersion(1, 0, 0))
         XCTAssertEqual(PatchPackage.Metadata.version, Core.SemanticVersion(1, 0, 0))
         let bridgeTypes: [Any.Type] = [
             Bytecode.Module.self,

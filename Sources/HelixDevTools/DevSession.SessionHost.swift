@@ -47,7 +47,7 @@ public enum HostEvent: Sendable {
 
 public enum HostError: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case pairingIdentityMismatch
-    case legacyHandshakeIdentityMismatch
+    case handshakeIdentityMismatch
     case missingPeerIdentity
     case unavailableBuildContext
     case stopped
@@ -56,7 +56,7 @@ public enum HostError: Swift.Error, Equatable, Sendable, CustomStringConvertible
         switch self {
         case .pairingIdentityMismatch:
             "pairing identity does not belong to the selected Dev Shell"
-        case .legacyHandshakeIdentityMismatch:
+        case .handshakeIdentityMismatch:
             "the authenticated Dev Protocol hello differs from the paired process"
         case .missingPeerIdentity:
             "the authenticated App did not expose a process identity"
@@ -233,7 +233,7 @@ public actor SessionHost {
                 throw DevSession.HostError.missingPeerIdentity
             }
             guard Self.sameProcess(peer, authorization.peerIdentity) else {
-                throw DevSession.HostError.legacyHandshakeIdentityMismatch
+                throw DevSession.HostError.handshakeIdentityMismatch
             }
 
             let candidateID = UUID()

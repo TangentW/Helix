@@ -5,8 +5,8 @@ import Testing
 extension BytecodeTests {
 @Suite("HLBC Any wire contract")
 struct AnyWireContract {
-    @Test("Any types and instructions round-trip only in HLBC 1.10")
-    func roundTripAndVersionGate() throws {
+    @Test("Any types and instructions round-trip in HLBC 1.0")
+    func roundTrip() throws {
         let module = try makeModule()
         let bytes = try Bytecode.Encoder.encode(module)
         let decoded = try Bytecode.Decoder.decode(bytes)
@@ -14,41 +14,6 @@ struct AnyWireContract {
         #expect(decoded.header.formatMinor == Bytecode.Format.minorVersion)
         #expect(decoded.module == module)
         #expect(decoded.module.capabilities.contains(.anyValuesV1))
-
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "swift-any-1 requires HLBC format 1.10"
-            )
-        ) {
-            try Bytecode.Encoder.encode(module, formatMinor: 9)
-        }
-
-        var typeOnly = module
-        typeOnly.capabilities.remove(.anyValuesV1)
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "Any value types require HLBC format 1.10"
-            )
-        ) {
-            try Bytecode.Encoder.encode(typeOnly, formatMinor: 9)
-        }
-
-        var instructionOnly = module
-        instructionOnly.capabilities.remove(.anyValuesV1)
-        instructionOnly.functions[0].registerTypes = [.int64]
-        instructionOnly.functions[0].blocks[0].instructions = [
-            .eraseToAny(
-                result: .init(rawValue: 0),
-                value: .init(rawValue: 0)
-            ),
-        ]
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "Any instructions require HLBC format 1.10"
-            )
-        ) {
-            try Bytecode.Encoder.encode(instructionOnly, formatMinor: 9)
-        }
     }
 
     @Test("Any v1 exposes a closed, VM-managed payload set")

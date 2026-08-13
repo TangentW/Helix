@@ -14,7 +14,6 @@ public struct Capability: RawRepresentable, Hashable, Codable, Sendable, Compara
     public static let collectionsV1: Self = "swift-collections-1"
     public static let nativeTypesV1: Self = "swift-native-types-1"
     public static let nativeImportsV1: Self = "native-import-1"
-    public static let nativeImportsV2: Self = "native-import-2"
     public static let untypedThrowsV1: Self = "untyped-throws-1"
     public static let localNominalsV1: Self = "local-nominals-1"
     public static let structuredErrorsV1: Self = "structured-errors-1"

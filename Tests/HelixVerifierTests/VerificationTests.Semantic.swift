@@ -1263,7 +1263,7 @@ struct SemanticVerifier {
         )
         #expect(
             throws: Verification.Error.invalidModule(
-                "HLBC 1.6 local types cannot contain native values"
+                "HLBC local types cannot contain native values"
             )
         ) {
             try Verification.Engine().verify(
@@ -1280,7 +1280,7 @@ struct SemanticVerifier {
         #expect(
             throws: Verification.Error.invalidModule(
                 "local type graph is recursive at \(key); "
-                    + "recursive local values are unsupported in HLBC 1.6"
+                    + "recursive HLBC local values are unsupported"
             )
         ) {
             try Verification.Engine().verify(
@@ -1299,7 +1299,7 @@ struct SemanticVerifier {
         fixture.policy.acceptedCapabilities.insert(.structuredErrorsV1)
         #expect(
             throws: Verification.Error.invalidModule(
-                "HLBC 1.6 local types cannot contain Error existential values"
+                "HLBC local types cannot contain Error existential values"
             )
         ) {
             try Verification.Engine().verify(
@@ -1363,7 +1363,7 @@ struct SemanticVerifier {
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
                 offset: 0,
-                reason: "HLBC 1.8 borrowed closure parameters cannot require linear ownership"
+                reason: "HLBC borrowed closure parameters cannot require linear ownership"
             )
         ) {
             try Verification.Engine().verify(

@@ -99,19 +99,6 @@ public final class Bridge: @unchecked Sendable {
         }
     }
 
-    /// Invokes an entry from already encoded values through the installed engine.
-    ///
-    /// This compatibility path returns a trap when called before installation;
-    /// generated exact-ABI wrappers normally use
-    /// ``dispatch(isolation:entry:arguments:decodeResult:)``.
-    public func invoke(entry: Core.EntryIndex, arguments: [VM.Value]) -> VM.ExecutionResult {
-        let runtime = installation.loadAcquire()?.runtime
-        guard let runtime else {
-            return .trapped(.explicit("Helix Bridge was invoked before bootstrap"))
-        }
-        return runtime.invoke(entry: entry, arguments: arguments)
-    }
-
     /// Dispatches a generated exact-Swift-ABI wrapper. Arguments are encoded
     /// lazily, so the normal no-generation path calls `previous` without
     /// allocating a VM frame or value array. The scoped encoder reserves

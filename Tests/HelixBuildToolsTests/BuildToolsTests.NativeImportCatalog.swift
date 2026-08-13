@@ -283,7 +283,7 @@ struct NativeImportCatalogPipeline {
         #expect(receipt.nativeImportBindings.contains {
             $0.importedModules == ["HelixRuntime"]
         })
-        #expect(receipt.capabilities.contains(.nativeImportsV2))
+        #expect(receipt.capabilities.contains(.nativeImportsV1))
 
         let shell = try ShellBuild.Materializer().materialize(
             receipt: receipt,

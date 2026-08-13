@@ -10,9 +10,9 @@ import HelixDevAppRuntime
 
 final class HelixDevAppRuntimeConsumerTests: XCTestCase {
     func testDevelopmentNamespacesAreExported() {
-        XCTAssertEqual(Core.Versions.runtime, Core.SemanticVersion(0, 1, 0))
+        XCTAssertEqual(Core.Versions.runtime, Core.SemanticVersion(1, 0, 0))
         XCTAssertEqual(DevRuntime.Metadata.version, Core.SemanticVersion(1, 0, 0))
-        XCTAssertEqual(DevProtocol.Metadata.currentProtocolVersion, 3)
+        XCTAssertEqual(DevProtocol.Metadata.currentProtocolVersion, 1)
         XCTAssertNotNil(try? Pairing.Code("AB2C"))
         let bridgeTypes: [Any.Type] = [
             Bytecode.Module.self,

@@ -632,12 +632,6 @@ struct UIKitIntegration {
 
         func didActivate(generation: Runtime.GenerationID) {}
         func didRollback(from: Runtime.GenerationID, to: Runtime.GenerationID?) {}
-        func didTrap(
-            generation: Runtime.GenerationID,
-            entry: Core.EntryIndex,
-            trap: VM.RuntimeTrap
-        ) {}
-
         func didTrap(hostedDiagnostic: Runtime.HostedTrapDiagnostic) {
             lock.lock()
             storage.append(hostedDiagnostic)

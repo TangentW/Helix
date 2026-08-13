@@ -221,7 +221,7 @@ enum OpenStep {
                 case "\"": result.append("\"")
                 case "\\": result.append("\\")
                 default:
-                    // Xcode occasionally emits legacy escapes. Retaining the
+                    // Xcode occasionally emits nonstandard escapes. Retaining the
                     // escaped scalar is sufficient for semantic inspection.
                     result.append(escaped)
                 }

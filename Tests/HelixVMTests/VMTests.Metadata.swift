@@ -5,7 +5,7 @@ extension VMTests {
 @Suite("Virtual machine metadata")
 struct Metadata {
     @Test func moduleMatchesRuntimeVersion() {
-        #expect(VM.Metadata.version.major == 0)
+        #expect(VM.Metadata.version == .init(1, 0, 0))
     }
 }
 }

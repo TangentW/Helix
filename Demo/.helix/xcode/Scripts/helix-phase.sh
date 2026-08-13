@@ -37,7 +37,7 @@ if [ -z "$helix_executable" ] && [ -f "$service_record" ] && [ ! -L "$service_re
         case "$record_pid" in
             ''|*[!0-9]*) record_pid=0 ;;
         esac
-        if [ "$record_schema" = "2" ] && [ "$record_pid" -gt 1 ]             && /bin/kill -0 "$record_pid" 2>/dev/null; then
+        if [ "$record_schema" = "1" ] && [ "$record_pid" -gt 1 ]             && /bin/kill -0 "$record_pid" 2>/dev/null; then
             helix_executable=$(
                 /usr/bin/plutil -extract toolExecutablePath raw -o - "$service_record" 2>/dev/null || true
             )

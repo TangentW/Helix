@@ -81,10 +81,9 @@ public struct HostedTrapDiagnostic: Equatable, Sendable, CustomStringConvertible
 }
 
 extension Runtime.Observing {
-    /// Receives source-enriched trap telemetry. Existing observers remain
-    /// source-compatible through this default implementation.
+    /// Ignores source-enriched entry telemetry unless the observer opts in.
     public func didTrap(diagnostic: Runtime.TrapDiagnostic) {}
 
-    /// Receives source-enriched telemetry for a hosted Objective-C callback.
+    /// Ignores hosted callback telemetry unless the observer opts in.
     public func didTrap(hostedDiagnostic: Runtime.HostedTrapDiagnostic) {}
 }

@@ -155,6 +155,7 @@ struct XcodeIntegrationContract {
             "plutil -extract toolExecutablePath raw"
         ))
         #expect(dispatcher.contains("plutil -extract schemaVersion raw"))
+        #expect(dispatcher.contains("[ \"$record_schema\" = \"1\" ]"))
         #expect(dispatcher.contains("plutil -extract processIdentifier raw"))
         #expect(dispatcher.contains("/bin/kill -0 \"$record_pid\""))
         #expect(dispatcher.contains("[ \"$record_mode\" = \"600\" ]"))
@@ -208,7 +209,7 @@ struct XcodeIntegrationContract {
         let processIdentifier = ProcessInfo.processInfo.processIdentifier
         try Data(
             """
-            {"schemaVersion":2,"processIdentifier":\(processIdentifier),"toolExecutablePath":"\(escapedTool)"}
+            {"schemaVersion":1,"processIdentifier":\(processIdentifier),"toolExecutablePath":"\(escapedTool)"}
             """.utf8
         ).write(to: service)
         try FileManager.default.setAttributes(
@@ -273,7 +274,7 @@ struct XcodeIntegrationContract {
         let service = serviceDirectory.appendingPathComponent("Service.json")
         try Data(
             """
-            {"schemaVersion":2,"processIdentifier":2147483647,"toolExecutablePath":"\(escapedTool)"}
+            {"schemaVersion":1,"processIdentifier":2147483647,"toolExecutablePath":"\(escapedTool)"}
             """.utf8
         ).write(to: service)
         try FileManager.default.setAttributes(

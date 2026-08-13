@@ -9,7 +9,7 @@ scheme; no Helix command needs to be typed during ordinary work.
 
 ## `live` (`liveReload`)
 
-- Link `HelixDevAppRuntime` and the Feature framework into the App.
+- Link `HelixDevAppRuntime` through SwiftPM or CocoaPods, and link the Feature framework into the App.
 - Use `Profiles/live/Feature.xcconfig` as the Feature target base configuration.
   Keep the Feature's ordinary Swift files in its Sources phase; never add Helix
   DerivedData output to the project.

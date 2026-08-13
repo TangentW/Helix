@@ -586,6 +586,46 @@ struct Tooling {
         #expect(report.findings.filter { $0.severity == .critical }.count == 3)
     }
 
+    @Test("Release leakage reports require a consistent derived status")
+    func releaseLeakageReportIsStrict() throws {
+        let encoded = try JSONEncoder().encode(ReleaseLeakage.Report(findings: []))
+        var object = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        object.removeValue(forKey: "passed")
+        let missingStatus = try JSONSerialization.data(withJSONObject: object)
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(ReleaseLeakage.Report.self, from: missingStatus)
+        }
+
+        object["passed"] = false
+        let contradictoryStatus = try JSONSerialization.data(withJSONObject: object)
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(ReleaseLeakage.Report.self, from: contradictoryStatus)
+        }
+    }
+
+    @Test("Dev Manifest sources require an explicit private-import basename on the wire")
+    func devManifestSourceIsStrict() throws {
+        let source = DevBuildManifest.SourceFile(
+            id: .derive(logicalPath: "Sources/Feature.swift"),
+            logicalPath: "Sources/Feature.swift",
+            absolutePath: "/Project/Sources/Feature.swift",
+            contentHash: .sha256("baseline")
+        )
+        #expect(source.privateImportSourceFile == "Feature.swift")
+
+        let encoded = try JSONEncoder().encode(source)
+        var object = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        object.removeValue(forKey: "privateImportSourceFile")
+        let missingIdentity = try JSONSerialization.data(withJSONObject: object)
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(DevBuildManifest.SourceFile.self, from: missingIdentity)
+        }
+    }
+
     @Test("Release leakage scanner rejects the Live Reload API module")
     func releaseLeakageRejectsLiveReloadAPI() {
         let report = ReleaseLeakage.Scanner().scan(

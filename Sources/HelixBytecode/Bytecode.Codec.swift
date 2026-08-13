@@ -9,7 +9,7 @@ private struct WireMetadata: Codable {
     var compatibility: Core.Compatibility
     var capabilities: [Core.Capability]
     var requestedResources: Core.ResourceLimits
-    var localTypes: [Bytecode.LocalTypeDefinition]?
+    var localTypes: [Bytecode.LocalTypeDefinition]
 }
 
 private struct WireImports: Codable {
@@ -27,9 +27,9 @@ private struct WireBlockLayout: Codable {
 private struct WireFunctionLayout: Codable {
     var id: Bytecode.FunctionID
     var name: String
-    var kind: Bytecode.FunctionKind?
+    var kind: Bytecode.FunctionKind
     var parameterRegisters: [Bytecode.Register]
-    var parameterConventions: [Bytecode.ParameterConvention]?
+    var parameterConventions: [Bytecode.ParameterConvention]
     var resultTypeIndex: UInt32
     var registerTypeIndices: [UInt32]
     var stackSlotTypeIndices: [UInt32]
@@ -41,30 +41,16 @@ private struct WireFunctionLayout: Codable {
 
 public enum Encoder {
     public static func encode(_ module: Bytecode.Module) throws -> Data {
-        try encode(module, formatMinor: Bytecode.Format.minorVersion)
-    }
-
-    static func encode(
-        _ module: Bytecode.Module,
-        formatMinor: UInt16
-    ) throws -> Data {
-        guard formatMinor <= Bytecode.Format.minorVersion else {
-            throw Bytecode.CodecError.unsupportedFormat(
-                major: Bytecode.Format.majorVersion,
-                minor: formatMinor
-            )
-        }
         let declaredBytecode = module.compatibility.bytecode
-        guard declaredBytecode.major == Bytecode.Format.majorVersion,
-              declaredBytecode.minor >= formatMinor
-        else {
+        guard declaredBytecode == Core.Versions.bytecode else {
             throw Bytecode.CodecError.invalidHeader(
-                "HLBC format 1.\(formatMinor) exceeds declared bytecode compatibility \(declaredBytecode)"
+                "HLBC format \(Bytecode.Format.majorVersion).\(Bytecode.Format.minorVersion) "
+                    + "requires bytecode compatibility \(Core.Versions.bytecode), "
+                    + "not \(declaredBytecode)"
             )
         }
-        try validateInstructionAvailability(in: module, formatMinor: formatMinor)
         try validateFloatingPointConstants(in: module)
-        let wire = try makeWireSections(module, formatMinor: formatMinor)
+        let wire = try makeWireSections(module)
         let sortedSections = wire.sorted { $0.key < $1.key }
         guard sortedSections.count <= Int(UInt32.max) else {
             throw Bytecode.CodecError.invalidHeader("section count does not fit UInt32")
@@ -95,7 +81,7 @@ public enum Encoder {
         var writer = Bytecode.BinaryWriter()
         writer.append(bytes: Bytecode.Format.magic)
         writer.append(Bytecode.Format.majorVersion)
-        writer.append(formatMinor)
+        writer.append(Bytecode.Format.minorVersion)
         writer.append(module.compatibility.runtime.major)
         writer.append(UInt16(0))
         writer.append(module.shellInterfaceHash.data)
@@ -123,442 +109,6 @@ public enum Encoder {
         return writer.data
     }
 
-    private static func validateInstructionAvailability(
-        in module: Bytecode.Module,
-        formatMinor: UInt16
-    ) throws {
-        if formatMinor < 1 {
-            guard !module.capabilities.contains(.stringsV1) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "strings-v1 requires HLBC format 1.1"
-                )
-            }
-            guard !module.capabilities.contains(.collectionsV1) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "collections-v1 requires HLBC format 1.1"
-                )
-            }
-            guard !module.functions.contains(where: { function in
-                (function.registerTypes + function.stackSlotTypes + [function.resultType])
-                    .contains(where: containsFloatOrString)
-            }) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "Float and String value types require HLBC format 1.1"
-                )
-            }
-            guard !module.functions.contains(where: { function in
-                      (function.registerTypes + function.stackSlotTypes + [function.resultType])
-                          .contains(where: containsArray)
-                  })
-            else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "Array value types require HLBC format 1.1"
-                )
-            }
-        }
-        if formatMinor < 2 {
-            guard !module.capabilities.contains(.untypedThrowsV1) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "untyped-throws-v1 requires HLBC format 1.2"
-                )
-            }
-            guard !module.functions.contains(where: { $0.effects.mayThrow }) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "throwing function effects require HLBC format 1.2"
-                )
-            }
-        }
-        if formatMinor < 3 {
-            guard !module.functions.contains(where: { function in
-                (function.registerTypes + function.stackSlotTypes + [function.resultType])
-                    .contains(where: containsDictionary)
-            }) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "Dictionary value types require HLBC format 1.3"
-                )
-            }
-        }
-        if formatMinor < 4 {
-            guard !module.capabilities.contains(.nativeImportsV2),
-                  module.imports.allSatisfy({
-                      $0.requiredCapability == .nativeImportsV1 && $0.contract == nil
-                  })
-            else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "native import v2 contracts require HLBC format 1.4"
-                )
-            }
-        } else {
-            guard module.imports.allSatisfy({
-                $0.requiredCapability == .nativeImportsV2 && $0.contract != nil
-            }) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "HLBC 1.4 native imports require a v2 contract"
-                )
-            }
-        }
-        if formatMinor < 6 {
-            guard module.localTypes.isEmpty,
-                  !module.capabilities.contains(.localNominalsV1),
-                  !module.capabilities.contains(.structuredErrorsV1)
-            else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "local nominal values and structured errors require HLBC format 1.6"
-                )
-            }
-            guard !module.functions.contains(where: { function in
-                (function.registerTypes + function.stackSlotTypes + [function.resultType])
-                    .contains(where: containsLocalNominalOrError)
-            }) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "local nominal and Error value types require HLBC format 1.6"
-                )
-            }
-        }
-        if formatMinor < 7 {
-            guard !module.capabilities.contains(.addressValuesV1),
-                  !module.capabilities.contains(.borrowCallsV1),
-                  module.functions.allSatisfy({
-                      $0.parameterConventions.allSatisfy { $0 == .owned }
-                  })
-            else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "address values and borrowed calls require HLBC format 1.7"
-                )
-            }
-            guard !module.functions.contains(where: { function in
-                (function.registerTypes + function.stackSlotTypes + [function.resultType])
-                    .contains(where: containsAddress)
-            }) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "address value types require HLBC format 1.7"
-                )
-            }
-        }
-        if formatMinor < 8 {
-            guard !module.capabilities.contains(.closureValuesV1),
-                  !module.capabilities.contains(.escapingClosureValuesV1),
-                  !module.capabilities.contains(.compilerSpecializationsV1),
-                  module.functions.allSatisfy({ $0.kind == .ordinary })
-            else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "closure values and compiler specializations require HLBC format 1.8"
-                )
-            }
-            guard !module.functions.contains(where: { function in
-                (function.registerTypes + function.stackSlotTypes + [function.resultType])
-                    .contains(where: containsClosure)
-            }) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "closure value types require HLBC format 1.8"
-                )
-            }
-        }
-        if formatMinor < 9 {
-            guard !module.capabilities.contains(.asyncLeafEntriesV1),
-                  module.functions.allSatisfy({ !$0.effects.isAsync })
-            else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "non-suspending async entries require HLBC format 1.9"
-                )
-            }
-        }
-        if formatMinor < 10 {
-            guard !module.capabilities.contains(.anyValuesV1) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "swift-any-1 requires HLBC format 1.10"
-                )
-            }
-            guard !containsAnyType(in: module) else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "Any value types require HLBC format 1.10"
-                )
-            }
-        }
-        if formatMinor < 11 {
-            guard !module.capabilities.contains(.localClassesV1),
-                  !module.capabilities.contains(.hostedObjectiveCClassesV1),
-                  !module.localTypes.contains(where: {
-                      if case .class = $0.kind { return true }
-                      return false
-                  })
-            else {
-                throw Bytecode.CodecError.invalidHeader(
-                    "local and hosted classes require HLBC format 1.11"
-                )
-            }
-        }
-        for function in module.functions {
-            for block in function.blocks {
-                for instruction in block.instructions {
-                    if formatMinor < 1 {
-                        switch instruction {
-                        case .constantFloat, .constantString,
-                             .floatingBinary, .floatingUnary, .stringConcat,
-                             .stringCount, .stringIsEmpty, .makeArray, .arrayCount,
-                             .arrayIsEmpty, .arrayGet, .arrayFirst, .arrayContains:
-                            throw Bytecode.CodecError.invalidHeader(
-                                "this instruction requires HLBC format 1.1"
-                            )
-                        default:
-                            break
-                        }
-                    }
-                    if formatMinor < 2 {
-                        switch instruction {
-                        case .booleanBinary, .stringify, .arrayAppend, .arrayNext:
-                            throw Bytecode.CodecError.invalidHeader(
-                                "this instruction requires HLBC format 1.2"
-                            )
-                        case .tryApply, .entryTryApply, .nativeTryApply:
-                            throw Bytecode.CodecError.invalidHeader(
-                                "try_apply instructions require HLBC format 1.2"
-                            )
-                        case .throwError:
-                            throw Bytecode.CodecError.invalidHeader(
-                                "throw_error requires HLBC format 1.2"
-                            )
-                        default:
-                            break
-                        }
-                    }
-                    if formatMinor < 3 {
-                        switch instruction {
-                        case .makeDictionary, .dictionaryCount, .dictionaryIsEmpty,
-                             .dictionaryGet, .dictionaryUpdate, .dictionaryNext:
-                            throw Bytecode.CodecError.invalidHeader(
-                                "Dictionary instructions require HLBC format 1.3"
-                            )
-                        default:
-                            break
-                        }
-                    }
-                    if formatMinor < 5 {
-                        switch instruction {
-                        case .integerConvert, .floatingConvert, .stringPredicate,
-                             .arrayUpdate:
-                            throw Bytecode.CodecError.invalidHeader(
-                                "conversion, String predicate, and Array update instructions require HLBC format 1.5"
-                            )
-                        default:
-                            break
-                        }
-                    }
-                    if formatMinor < 6 {
-                        switch instruction {
-                        case .makeStruct, .structExtract, .makeEnum, .switchEnum,
-                             .makeError, .castError:
-                            throw Bytecode.CodecError.invalidHeader(
-                                "local nominal and structured Error instructions require HLBC format 1.6"
-                            )
-                        default:
-                            break
-                        }
-                    }
-                    if formatMinor < 7 {
-                        switch instruction {
-                        case .stackAddress, .projectStructAddress, .beginAccess,
-                             .endAccess, .loadAddress, .storeAddress:
-                            throw Bytecode.CodecError.invalidHeader(
-                                "address and access instructions require HLBC format 1.7"
-                            )
-                        default:
-                            break
-                        }
-                    }
-                    if formatMinor < 8 {
-                        switch instruction {
-                        case .makeClosure, .closureApply:
-                            throw Bytecode.CodecError.invalidHeader(
-                                "closure instructions require HLBC format 1.8"
-                            )
-                        default:
-                            break
-                        }
-                    }
-                    if formatMinor < 10 {
-                        switch instruction {
-                        case .eraseToAny, .checkedCastAny, .forceCastAny:
-                            throw Bytecode.CodecError.invalidHeader(
-                                "Any instructions require HLBC format 1.10"
-                            )
-                        default:
-                            break
-                        }
-                    }
-                    if formatMinor < 11 {
-                        switch instruction {
-                        case .allocateObject, .projectObjectAddress,
-                             .projectHostedObject, .hostedSuperApply:
-                            throw Bytecode.CodecError.invalidHeader(
-                                "class instructions require HLBC format 1.11"
-                            )
-                        default:
-                            break
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private static func containsAnyType(in module: Bytecode.Module) -> Bool {
-        if module.functions.contains(where: { function in
-            (function.registerTypes + function.stackSlotTypes + [function.resultType])
-                .contains(where: containsAny)
-        }) {
-            return true
-        }
-        return module.localTypes.contains { definition in
-            switch definition.kind {
-            case let .structure(fields):
-                fields.contains { containsAny($0.type) }
-            case let .enumeration(cases):
-                cases.contains { $0.payloadType.map(containsAny) == true }
-            case let .class(fields, _, _):
-                fields.contains { containsAny($0.type) }
-            }
-        }
-    }
-
-    private static func containsAny(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .any:
-            true
-        case let .array(element), let .optional(element), let .address(element):
-            containsAny(element)
-        case let .dictionary(key, value):
-            containsAny(key) || containsAny(value)
-        case let .tuple(elements):
-            elements.contains(where: containsAny)
-        case let .closure(signature):
-            signature.parameters.contains(where: containsAny)
-                || containsAny(signature.result)
-        case .void, .never, .bool, .integer, .float, .string, .native, .local,
-             .error:
-            false
-        }
-    }
-
-    private static func containsFloatOrString(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .float, .string:
-            true
-        case let .array(element):
-            containsFloatOrString(element)
-        case let .tuple(elements):
-            elements.contains(where: containsFloatOrString)
-        case let .optional(wrapped):
-            containsFloatOrString(wrapped)
-        case .dictionary:
-            // Dictionary itself requires 1.3 and receives the more precise
-            // diagnostic below, regardless of its nested key/value types.
-            false
-        case let .address(pointee):
-            containsFloatOrString(pointee)
-        case let .closure(signature):
-            signature.parameters.contains(where: containsFloatOrString)
-                || containsFloatOrString(signature.result)
-        case .void, .never, .bool, .integer, .any, .native, .local, .error:
-            false
-        }
-    }
-
-    private static func containsLocalNominalOrError(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .local, .error:
-            true
-        case let .array(element):
-            containsLocalNominalOrError(element)
-        case let .dictionary(key, value):
-            containsLocalNominalOrError(key) || containsLocalNominalOrError(value)
-        case let .tuple(elements):
-            elements.contains(where: containsLocalNominalOrError)
-        case let .optional(wrapped):
-            containsLocalNominalOrError(wrapped)
-        case let .address(pointee):
-            containsLocalNominalOrError(pointee)
-        case let .closure(signature):
-            signature.parameters.contains(where: containsLocalNominalOrError)
-                || containsLocalNominalOrError(signature.result)
-        case .void, .never, .bool, .integer, .float, .string, .any, .native:
-            false
-        }
-    }
-
-    private static func containsArray(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .array:
-            true
-        case let .dictionary(key, value):
-            containsArray(key) || containsArray(value)
-        case let .tuple(elements):
-            elements.contains(where: containsArray)
-        case let .optional(wrapped):
-            containsArray(wrapped)
-        case let .address(pointee):
-            containsArray(pointee)
-        case let .closure(signature):
-            signature.parameters.contains(where: containsArray)
-                || containsArray(signature.result)
-        default:
-            false
-        }
-    }
-
-    private static func containsDictionary(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .dictionary:
-            true
-        case let .array(element):
-            containsDictionary(element)
-        case let .tuple(elements):
-            elements.contains(where: containsDictionary)
-        case let .optional(wrapped):
-            containsDictionary(wrapped)
-        case let .address(pointee):
-            containsDictionary(pointee)
-        case let .closure(signature):
-            signature.parameters.contains(where: containsDictionary)
-                || containsDictionary(signature.result)
-        default:
-            false
-        }
-    }
-
-    private static func containsAddress(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .address:
-            true
-        case let .array(element), let .optional(element):
-            containsAddress(element)
-        case let .dictionary(key, value):
-            containsAddress(key) || containsAddress(value)
-        case let .tuple(elements):
-            elements.contains(where: containsAddress)
-        case let .closure(signature):
-            signature.parameters.contains(where: containsAddress)
-                || containsAddress(signature.result)
-        default:
-            false
-        }
-    }
-
-    private static func containsClosure(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .closure:
-            true
-        case let .array(element), let .optional(element), let .address(element):
-            containsClosure(element)
-        case let .dictionary(key, value):
-            containsClosure(key) || containsClosure(value)
-        case let .tuple(elements):
-            elements.contains(where: containsClosure)
-        default:
-            false
-        }
-    }
-
     private static func validateFloatingPointConstants(in module: Bytecode.Module) throws {
         for function in module.functions {
             for block in function.blocks {
@@ -576,8 +126,7 @@ public enum Encoder {
     }
 
     private static func makeWireSections(
-        _ module: Bytecode.Module,
-        formatMinor: UInt16
+        _ module: Bytecode.Module
     ) throws -> [Bytecode.SectionKind: Data] {
         var types: [Bytecode.ValueType] = []
         var typeIndices: [Bytecode.ValueType: UInt32] = [:]
@@ -619,11 +168,9 @@ public enum Encoder {
                 Bytecode.WireFunctionLayout(
                     id: function.id,
                     name: function.name,
-                    kind: formatMinor >= 8 ? function.kind : nil,
+                    kind: function.kind,
                     parameterRegisters: function.parameterRegisters,
-                    parameterConventions: formatMinor >= 7
-                        ? function.parameterConventions
-                        : nil,
+                    parameterConventions: function.parameterConventions,
                     resultTypeIndex: resultTypeIndex,
                     registerTypeIndices: registerTypeIndices,
                     stackSlotTypeIndices: stackSlotTypeIndices,
@@ -640,7 +187,7 @@ public enum Encoder {
             compatibility: module.compatibility,
             capabilities: module.capabilities.sorted(),
             requestedResources: module.requestedResources,
-            localTypes: formatMinor >= 6 ? module.localTypes.sorted(by: { $0.key < $1.key }) : nil
+            localTypes: module.localTypes.sorted(by: { $0.key < $1.key })
         )
         let imports = Bytecode.WireImports(
             entries: module.entries.sorted { $0.entryIndex < $1.entryIndex },
@@ -688,7 +235,9 @@ public enum Decoder {
 
         let formatMajor = try reader.read(UInt16.self)
         let formatMinor = try reader.read(UInt16.self)
-        guard formatMajor == Bytecode.Format.majorVersion, formatMinor <= Bytecode.Format.minorVersion else {
+        guard formatMajor == Bytecode.Format.majorVersion,
+              formatMinor == Bytecode.Format.minorVersion
+        else {
             throw Bytecode.CodecError.unsupportedFormat(major: formatMajor, minor: formatMinor)
         }
         let minimumRuntimeMajor = try reader.read(UInt16.self)
@@ -794,10 +343,7 @@ public enum Decoder {
         let module = try decodeModule(shellHash: shellHash, sections: sections)
         let canonicalBytes: Data
         do {
-            canonicalBytes = try Bytecode.Encoder.encode(
-                module,
-                formatMinor: formatMinor
-            )
+            canonicalBytes = try Bytecode.Encoder.encode(module)
         } catch {
             throw Bytecode.CodecError.invalidHeader(
                 "decoded v1 image cannot be canonically re-encoded: \(error)"
@@ -880,7 +426,7 @@ public enum Decoder {
                 Bytecode.Function(
                     id: layout.id,
                     name: layout.name,
-                    kind: layout.kind ?? .ordinary,
+                    kind: layout.kind,
                     parameterRegisters: layout.parameterRegisters,
                     parameterConventions: layout.parameterConventions,
                     resultType: types[resultIndex],
@@ -903,7 +449,7 @@ public enum Decoder {
             compatibility: metadata.compatibility,
             capabilities: Set(metadata.capabilities),
             requestedResources: metadata.requestedResources,
-            localTypes: metadata.localTypes ?? [],
+            localTypes: metadata.localTypes,
             functions: functions,
             entries: imports.entries,
             imports: imports.imports,

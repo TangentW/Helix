@@ -339,7 +339,7 @@ public struct Engine: Verification.ImageVerifying {
             case .native:
                 guard permitsNative else {
                     throw Verification.Error.invalidModule(
-                        "HLBC 1.6 local types cannot contain native values"
+                        "HLBC local types cannot contain native values"
                     )
                 }
             case .address:
@@ -360,7 +360,7 @@ public struct Engine: Verification.ImageVerifying {
                 // A dynamic Error payload could recursively contain its owning
                 // local value and evade the statically bounded nominal graph.
                 throw Verification.Error.invalidModule(
-                    "HLBC 1.6 local types cannot contain Error existential values"
+                    "HLBC local types cannot contain Error existential values"
                 )
             case let .integer(bitWidth, _):
                 guard [8, 16, 32, 64].contains(bitWidth) else {
@@ -452,7 +452,7 @@ public struct Engine: Verification.ImageVerifying {
         guard visiting.insert(key).inserted else {
             throw Verification.Error.invalidModule(
                 "local type graph is recursive at \(key); "
-                    + "recursive local values are unsupported in HLBC 1.6"
+                    + "recursive HLBC local values are unsupported"
             )
         }
         defer { visiting.remove(key) }
@@ -757,8 +757,8 @@ public struct Engine: Verification.ImageVerifying {
         policy: Core.RuntimePolicy,
         capabilities: Set<Core.Capability>
     ) throws -> [Core.NativeImportID: Bytecode.ImportRequirement] {
-        if !imports.isEmpty, !capabilities.contains(.nativeImportsV2) {
-            throw Verification.Error.capabilityDenied(.nativeImportsV2)
+        if !imports.isEmpty, !capabilities.contains(.nativeImportsV1) {
+            throw Verification.Error.capabilityDenied(.nativeImportsV1)
         }
         var seen = Set<Core.NativeImportID>()
         var result: [Core.NativeImportID: Bytecode.ImportRequirement] = [:]
@@ -775,11 +775,10 @@ public struct Engine: Verification.ImageVerifying {
             guard capabilities.contains(requirement.requiredCapability) else {
                 throw Verification.Error.capabilityDenied(requirement.requiredCapability)
             }
-            guard let contract = requirement.contract,
-                  descriptor.key == requirement.key,
+            guard descriptor.key == requirement.key,
                   descriptor.signature == requirement.signature,
                   descriptor.effects == requirement.effects,
-                  descriptor.contract == contract,
+                  descriptor.contract == requirement.contract,
                   descriptor.capability == requirement.requiredCapability
             else {
                 throw Verification.Error.importDescriptorMismatch(requirement.id)
@@ -1070,7 +1069,7 @@ public struct Engine: Verification.ImageVerifying {
                 throw Verification.Error.invalidBlock(
                     function: function.id,
                     block: block.id,
-                    reason: "address values cannot be block parameters in HLBC 1.7"
+                    reason: "address values cannot be HLBC block parameters"
                 )
             }
         }
@@ -1299,7 +1298,7 @@ public struct Engine: Verification.ImageVerifying {
             if case .closure = type {
                 throw Verification.Error.invalidFunction(
                     function: function.id,
-                    reason: "HLBC 1.8 closure values cannot be stored in stack slots"
+                    reason: "HLBC closure values cannot be stored in stack slots"
                 )
             }
             try verify(type, depth: 0, isRegister: true)
@@ -1728,7 +1727,7 @@ public struct Engine: Verification.ImageVerifying {
                 throw fail("load_address result must match its address pointee")
             }
             guard mode == .copy, isCopyable(type(result), shell: shell) else {
-                throw fail("HLBC 1.7 load_address requires copy mode and a copyable pointee")
+                throw fail("HLBC load_address requires copy mode and a copyable pointee")
             }
         case let .storeAddress(address, source, mode):
             guard capabilities.contains(.addressValuesV1),
@@ -2112,7 +2111,7 @@ public struct Engine: Verification.ImageVerifying {
                 throw fail("closure body parameters must equal invocation parameters followed by captures")
             }
             guard callee.parameterConventions.allSatisfy({ $0 != .inout }) else {
-                throw fail("HLBC 1.8 closure bodies cannot carry inout parameters")
+                throw fail("HLBC closure bodies cannot carry inout parameters")
             }
             let invocationConventions = callee.parameterConventions
                 .prefix(signature.parameters.count)
@@ -2124,7 +2123,7 @@ public struct Engine: Verification.ImageVerifying {
                 // borrowed invocation parameters to VM value types so the
                 // ownership dataflow remains independent of dynamic targets.
                 throw fail(
-                    "HLBC 1.8 borrowed closure parameters cannot require linear ownership"
+                    "HLBC borrowed closure parameters cannot require linear ownership"
                 )
             }
             for captureType in captureTypes {
@@ -3089,7 +3088,7 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 case let .tryApply(calleeID, _, _, _):
                     if functions[calleeID]?.parameterConventions.contains(.inout) == true {
-                        throw fail("HLBC 1.7 does not carry inout access scopes across try_apply")
+                        throw fail("HLBC does not carry inout access scopes across try_apply")
                     }
                 case let .storeStack(slot, _, _), let .loadStack(_, slot, _),
                      let .destroyStack(slot):

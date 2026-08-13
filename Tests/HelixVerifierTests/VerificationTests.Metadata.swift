@@ -5,7 +5,7 @@ extension VerificationTests {
 @Suite("Verifier metadata")
 struct Metadata {
     @Test func moduleHasVersion() {
-        #expect(Verification.Metadata.version.major == 0)
+        #expect(Verification.Metadata.version == .init(1, 0, 0))
     }
 }
 }

@@ -60,6 +60,7 @@ struct CocoaPodsDistribution {
         repositorySourceModules: [String]
     ) {
         #expect(source.contains("spec.name = '\(product)'"))
+        #expect(source.contains("spec.version = '1.0.0'"))
         #expect(source.contains(":git => 'https://github.com/TangentW/Helix.git'"))
         #expect(source.contains(":tag => \"v#{spec.version}\""))
         #expect(source.contains("spec.static_framework = true"))

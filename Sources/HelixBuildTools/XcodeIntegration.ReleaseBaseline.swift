@@ -6,7 +6,7 @@ extension XcodeIntegration {
 /// consumes this frozen identity without rebuilding the App or redefining the
 /// source baseline after an incident edit.
 public struct ReleaseBaseline: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 2
+    public static let currentSchemaVersion: UInt16 = 1
 
     public var schemaVersion: UInt16
     public var profileID: String

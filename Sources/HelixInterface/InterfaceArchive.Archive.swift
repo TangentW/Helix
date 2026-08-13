@@ -47,8 +47,7 @@ public struct FunctionRecord: Codable, Hashable, Sendable {
     public var role: Core.FunctionRole
     public var loweredSignature: Core.LoweredSignature
     public var parameterTypes: [Bytecode.ValueType]
-    /// `nil` decodes historical archives whose parameters were all owned.
-    public var parameterConventions: [Bytecode.ParameterConvention]?
+    public var parameterConventions: [Bytecode.ParameterConvention]
     public var resultType: Bytecode.ValueType
     public var effects: Core.Effects
     public var interfaceFingerprint: Core.Digest
@@ -86,6 +85,7 @@ public struct FunctionRecord: Codable, Hashable, Sendable {
         self.loweredSignature = loweredSignature
         self.parameterTypes = parameterTypes
         self.parameterConventions = parameterConventions
+            ?? Array(repeating: .owned, count: parameterTypes.count)
         self.resultType = resultType
         self.effects = effects
         self.interfaceFingerprint = interfaceFingerprint
@@ -118,12 +118,7 @@ public struct NativeImportRecord: Codable, Hashable, Sendable {
     public var contract: Core.NativeImportContract
     public var capability: Core.Capability
     public var isEmittedToDevice: Bool
-    /// `nil` decodes historical archives, whose NativeImports were direct.
-    public var abiAdapter: InterfaceArchive.NativeImportABIAdapter?
-
-    public var effectiveABIAdapter: InterfaceArchive.NativeImportABIAdapter {
-        abiAdapter ?? .direct
-    }
+    public var abiAdapter: InterfaceArchive.NativeImportABIAdapter
 
     public init(
         id: Core.NativeImportID?,
@@ -135,9 +130,9 @@ public struct NativeImportRecord: Codable, Hashable, Sendable {
         signature: Core.LoweredSignature,
         effects: Core.Effects,
         contract: Core.NativeImportContract,
-        capability: Core.Capability = .nativeImportsV2,
+        capability: Core.Capability = .nativeImportsV1,
         isEmittedToDevice: Bool,
-        abiAdapter: InterfaceArchive.NativeImportABIAdapter? = nil
+        abiAdapter: InterfaceArchive.NativeImportABIAdapter = .direct
     ) {
         self.id = id
         self.key = key
@@ -323,8 +318,7 @@ public struct ReleaseMetadata: Codable, Hashable, Sendable {
 }
 
 public struct Archive: Codable, Hashable, Sendable {
-    public static let minimumSupportedSchemaVersion: UInt16 = 3
-    public static let currentSchemaVersion: UInt16 = 4
+    public static let currentSchemaVersion: UInt16 = 1
 
     public var schemaVersion: UInt16
     public var metadata: InterfaceArchive.ReleaseMetadata
@@ -389,13 +383,7 @@ public struct Archive: Codable, Hashable, Sendable {
     }
 
     public func computeShellInterfaceHash() throws -> Core.Digest {
-        // HLXI 2.4 adds async ABI/effect authority to the device projection.
-        // Preserve the v2 domain for older archives so their recorded Shell
-        // identity remains verifiable after a Runtime upgrade.
-        let domain = compatibility.interfaceArchive >= .init(2, 4, 0)
-            ? "HLXI.DeviceProjection.v3"
-            : "HLXI.DeviceProjection.v2"
-        var hasher = Core.StableHasher(domain: domain)
+        var hasher = Core.StableHasher(domain: "HLXI.DeviceProjection.v1")
         hasher.append(try Core.CanonicalJSON.encode(deviceProjection()))
         return hasher.finalize()
     }
@@ -409,16 +397,15 @@ public struct Archive: Codable, Hashable, Sendable {
     }
 
     public func validate() throws {
-        guard (Self.minimumSupportedSchemaVersion...Self.currentSchemaVersion)
-            .contains(schemaVersion)
-        else {
+        guard schemaVersion == Self.currentSchemaVersion else {
             throw InterfaceArchive.Error.unsupportedSchema(schemaVersion)
         }
-        guard schemaVersion >= 4
-                || nativeImports.allSatisfy({ $0.abiAdapter == nil })
+        guard compatibility.runtime == Core.Versions.runtime,
+              compatibility.bytecode == Core.Versions.bytecode,
+              compatibility.interfaceArchive == Core.Versions.interfaceArchive
         else {
             throw InterfaceArchive.Error.invalidArchive(
-                "NativeImport ABI adapters require HLXI archive schema 4"
+                "archive compatibility must match the current Helix 1.0 formats"
             )
         }
         guard !metadata.bundleID.isEmpty, !metadata.buildNumber.isEmpty,
@@ -479,7 +466,6 @@ public struct Archive: Codable, Hashable, Sendable {
                 )
             }
             let conventions = function.parameterConventions
-                ?? Array(repeating: .owned, count: function.parameterTypes.count)
             guard conventions.count == function.parameterTypes.count else {
                 throw InterfaceArchive.Error.invalidArchive(
                     "function parameter convention count is inconsistent"
@@ -500,7 +486,7 @@ public struct Archive: Codable, Hashable, Sendable {
         }
         let eligible = functions.filter(\.patchability.isEligible)
         guard eligible.allSatisfy({
-            !($0.parameterConventions ?? []).contains(.inout)
+            !$0.parameterConventions.contains(.inout)
         }) else {
             throw InterfaceArchive.Error.invalidArchive(
                 "Shell entry signatures cannot contain inout parameters"
@@ -567,12 +553,12 @@ public struct Archive: Codable, Hashable, Sendable {
                     "native import contract is invalid: \(error)"
                 )
             }
-            guard item.capability == .nativeImportsV2 else {
+            guard item.capability == .nativeImportsV1 else {
                 throw InterfaceArchive.Error.invalidArchive(
-                    "native import does not use the v2 contract capability"
+                    "native import does not use the current contract capability"
                 )
             }
-            if item.effectiveABIAdapter == .mutatingValueReceiver {
+            if item.abiAdapter == .mutatingValueReceiver {
                 guard item.parameterTypes.count >= 1,
                       case let .native(receiver) = item.parameterTypes.last,
                       item.resultType == .native(receiver),
@@ -585,8 +571,15 @@ public struct Archive: Codable, Hashable, Sendable {
                 }
             }
         }
-        if !emittedImports.isEmpty, !capabilities.contains(.nativeImportsV2) {
+        if !emittedImports.isEmpty, !capabilities.contains(.nativeImportsV1) {
             throw InterfaceArchive.Error.invalidArchive("native import capability is absent")
+        }
+        guard !capabilities.contains(.hostedObjectiveCClassesV1)
+                || capabilities.contains(.localClassesV1)
+        else {
+            throw InterfaceArchive.Error.invalidArchive(
+                "hosted Objective-C classes require local class support"
+            )
         }
         guard Set(nativeTypes.map(\.id)).count == nativeTypes.count else {
             throw InterfaceArchive.Error.invalidArchive("native type identities are not unique")
@@ -608,13 +601,9 @@ public struct Archive: Codable, Hashable, Sendable {
         let mainActorTypeIDs = Set(
             nativeTypes.filter { $0.isEmittedToDevice && $0.requiresMainActor }.map(\.id)
         )
-        var usesHLBC11DeviceType = false
-        var usesThrowingDeviceEffect = false
-        var usesDictionaryDeviceType = false
         func validateDeviceType(_ type: Bytecode.ValueType) throws {
             switch type {
             case .string:
-                usesHLBC11DeviceType = true
                 guard capabilities.contains(.stringsV1) else {
                     throw InterfaceArchive.Error.invalidArchive("String capability is absent")
                 }
@@ -627,13 +616,11 @@ public struct Archive: Codable, Hashable, Sendable {
                     throw InterfaceArchive.Error.invalidArchive("device signature references an un-emitted native type")
                 }
             case let .array(element):
-                usesHLBC11DeviceType = true
                 guard capabilities.contains(.collectionsV1) else {
                     throw InterfaceArchive.Error.invalidArchive("Array capability is absent")
                 }
                 try validateDeviceType(element)
             case let .dictionary(key, value):
-                usesDictionaryDeviceType = true
                 guard capabilities.contains(.collectionsV1) else {
                     throw InterfaceArchive.Error.invalidArchive("Dictionary capability is absent")
                 }
@@ -652,7 +639,7 @@ public struct Archive: Codable, Hashable, Sendable {
             case let .optional(wrapped):
                 try validateDeviceType(wrapped)
             case .float:
-                usesHLBC11DeviceType = true
+                break
             case .local, .error, .address, .closure:
                 throw InterfaceArchive.Error.invalidArchive(
                     "patch-local nominal, Error, address, and closure values cannot appear in a Shell signature"
@@ -663,7 +650,6 @@ public struct Archive: Codable, Hashable, Sendable {
         }
         func validateDeviceEffects(_ effects: Core.Effects) throws {
             if effects.mayThrow {
-                usesThrowingDeviceEffect = true
                 guard capabilities.contains(.untypedThrowsV1) else {
                     throw InterfaceArchive.Error.invalidArchive("untyped throws capability is absent")
                 }
@@ -720,136 +706,6 @@ public struct Archive: Codable, Hashable, Sendable {
                 )
             }
             try validateDeviceEffects(item.effects)
-        }
-        if !emittedImports.isEmpty {
-            let requiredBytecode = Core.SemanticVersion(1, 4, 0)
-            let requiredArchive = Core.SemanticVersion(2, 2, 0)
-            guard compatibility.bytecode.major == requiredBytecode.major,
-                  compatibility.bytecode >= requiredBytecode,
-                  compatibility.interfaceArchive.major == requiredArchive.major,
-                  compatibility.interfaceArchive >= requiredArchive
-            else {
-                throw InterfaceArchive.Error.invalidArchive(
-                    "native import v2 contracts require HLBC 1.4 and HLXI 2.2 compatibility"
-                )
-            }
-        }
-        if usesHLBC11DeviceType {
-            let requiredBytecode = Core.SemanticVersion(1, 1, 0)
-            guard compatibility.bytecode.major == requiredBytecode.major,
-                  compatibility.bytecode >= requiredBytecode
-            else {
-                throw InterfaceArchive.Error.invalidArchive(
-                    "Float, String, and Array device types require HLBC 1.1 compatibility"
-                )
-            }
-        }
-        if usesThrowingDeviceEffect {
-            let requiredBytecode = Core.SemanticVersion(1, 2, 0)
-            guard compatibility.bytecode.major == requiredBytecode.major,
-                  compatibility.bytecode >= requiredBytecode
-            else {
-                throw InterfaceArchive.Error.invalidArchive(
-                    "throwing device effects require HLBC 1.2 compatibility"
-                )
-            }
-        }
-        if usesDictionaryDeviceType {
-            let requiredBytecode = Core.SemanticVersion(1, 3, 0)
-            guard compatibility.bytecode.major == requiredBytecode.major,
-                  compatibility.bytecode >= requiredBytecode
-            else {
-                throw InterfaceArchive.Error.invalidArchive(
-                    "Dictionary device types require HLBC 1.3 compatibility"
-                )
-            }
-            let requiredArchive = Core.SemanticVersion(2, 1, 0)
-            guard compatibility.interfaceArchive.major == requiredArchive.major,
-                  compatibility.interfaceArchive >= requiredArchive
-            else {
-                throw InterfaceArchive.Error.invalidArchive(
-                    "Dictionary device types require HLXI 2.1 compatibility"
-                )
-            }
-        }
-        if capabilities.contains(.localNominalsV1)
-            || capabilities.contains(.structuredErrorsV1) {
-            let requiredBytecode = Core.SemanticVersion(1, 6, 0)
-            guard compatibility.bytecode.major == requiredBytecode.major,
-                  compatibility.bytecode >= requiredBytecode
-            else {
-                throw InterfaceArchive.Error.invalidArchive(
-                    "local nominal and structured Error capabilities require HLBC 1.6 compatibility"
-                )
-            }
-        }
-        if capabilities.contains(.addressValuesV1)
-            || capabilities.contains(.borrowCallsV1) {
-            let requiredBytecode = Core.SemanticVersion(1, 7, 0)
-            guard compatibility.bytecode.major == requiredBytecode.major,
-                  compatibility.bytecode >= requiredBytecode
-            else {
-                throw InterfaceArchive.Error.invalidArchive(
-                    "address and borrowed-call capabilities require HLBC 1.7 compatibility"
-                )
-            }
-        }
-        if capabilities.contains(.closureValuesV1)
-            || capabilities.contains(.escapingClosureValuesV1)
-            || capabilities.contains(.compilerSpecializationsV1) {
-            let requiredBytecode = Core.SemanticVersion(1, 8, 0)
-            let requiredArchive = Core.SemanticVersion(2, 3, 0)
-            guard compatibility.bytecode.major == requiredBytecode.major,
-                  compatibility.bytecode >= requiredBytecode,
-                  compatibility.interfaceArchive.major == requiredArchive.major,
-                  compatibility.interfaceArchive >= requiredArchive
-            else {
-                throw InterfaceArchive.Error.invalidArchive(
-                    "closure and compiler-specialization capabilities require HLBC 1.8 and HLXI 2.3 compatibility"
-                )
-            }
-        }
-        if capabilities.contains(.asyncLeafEntriesV1) {
-            let requiredBytecode = Core.SemanticVersion(1, 9, 0)
-            let requiredArchive = Core.SemanticVersion(2, 4, 0)
-            guard compatibility.bytecode.major == requiredBytecode.major,
-                  compatibility.bytecode >= requiredBytecode,
-                  compatibility.interfaceArchive.major == requiredArchive.major,
-                  compatibility.interfaceArchive >= requiredArchive
-            else {
-                throw InterfaceArchive.Error.invalidArchive(
-                    "async leaf entries require HLBC 1.9 and HLXI 2.4 compatibility"
-                )
-            }
-        }
-        if capabilities.contains(.anyValuesV1) {
-            let requiredBytecode = Core.SemanticVersion(1, 10, 0)
-            let requiredArchive = Core.SemanticVersion(2, 5, 0)
-            guard compatibility.bytecode.major == requiredBytecode.major,
-                  compatibility.bytecode >= requiredBytecode,
-                  compatibility.interfaceArchive.major == requiredArchive.major,
-                  compatibility.interfaceArchive >= requiredArchive
-            else {
-                throw InterfaceArchive.Error.invalidArchive(
-                    "Any values require HLBC 1.10 and HLXI 2.5 compatibility"
-                )
-            }
-        }
-        if capabilities.contains(.localClassesV1)
-            || capabilities.contains(.hostedObjectiveCClassesV1) {
-            let requiredBytecode = Core.SemanticVersion(1, 11, 0)
-            let requiredArchive = Core.SemanticVersion(2, 6, 0)
-            guard compatibility.bytecode.major == requiredBytecode.major,
-                  compatibility.bytecode >= requiredBytecode,
-                  compatibility.interfaceArchive.major == requiredArchive.major,
-                  compatibility.interfaceArchive >= requiredArchive,
-                  !capabilities.contains(.hostedObjectiveCClassesV1)
-                    || capabilities.contains(.localClassesV1)
-            else {
-                throw InterfaceArchive.Error.invalidArchive(
-                    "local and hosted classes require HLBC 1.11 and HLXI 2.6 compatibility"
-                )
-            }
         }
         guard UInt32(exactly: eligible.count) == bridgeRegistrationCount else {
             throw InterfaceArchive.Error.invalidArchive("bridge registration count does not equal eligible entries")

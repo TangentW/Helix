@@ -389,7 +389,7 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
 }
 
 public enum Metadata {
-    public static let currentProtocolVersion: UInt16 = 3
+    public static let currentProtocolVersion: UInt16 = 1
     public static let version = Core.SemanticVersion(1, 0, 0)
 }
 }

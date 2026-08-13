@@ -132,7 +132,7 @@ struct Properties {
         }
     }
 
-    @Test("Seeded HLBC 1.5 conversions agree with Swift bit patterns")
+    @Test("Seeded HLBC 1.0 conversions agree with Swift bit patterns")
     func conversionsMatchSwiftBitPatterns() throws {
         let int8 = Bytecode.ValueType.integer(bitWidth: 8, signed: true)
         let truncation = Bytecode.Function(

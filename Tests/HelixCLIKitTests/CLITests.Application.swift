@@ -575,7 +575,7 @@ struct Application {
         let featureConfiguration = try #require(
             liveReceipt.configuration.modules["Feature"]
         )
-        #expect(liveReceipt.configuration.schema == 2)
+        #expect(liveReceipt.configuration.schema == 1)
         #expect(featureConfiguration.nativeImports.sourceScope?.visibility == .all)
         #expect(liveReceipt.nativeImportCandidates.map(\.canonicalCallee) == [
             "Feature.hidden(_:)",

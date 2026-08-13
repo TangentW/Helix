@@ -48,7 +48,7 @@ public struct ResolvedNativeImport: Hashable, Sendable {
         signature: Core.LoweredSignature,
         effects: Core.Effects,
         contract: Core.NativeImportContract,
-        capability: Core.Capability = .nativeImportsV2
+        capability: Core.Capability = .nativeImportsV1
     ) {
         self.id = id
         self.key = key

@@ -57,8 +57,8 @@ struct Identities {
         #expect(first.rawValue != type.rawValue)
     }
 
-    @Test("Async ABI metadata is identity-bound while legacy JSON remains canonical")
-    func asyncIdentityAndLegacyCoding() throws {
+    @Test("Async ABI metadata is identity-bound and required by the wire contract")
+    func asyncIdentityAndCoding() throws {
         let synchronous = Core.LoweredSignature(
             parameters: ["Swift.Int"],
             result: "Swift.Int"
@@ -91,15 +91,29 @@ struct Identities {
         )
         #expect(syncKey != asyncKey)
 
-        let legacyEffects = Data(
+        let incompleteEffects = Data(
             """
             {"hasExternalSideEffects":false,"mayAllocate":false,"mayThrow":false,"requiresMainActor":false}
             """.utf8
         )
-        let decoded = try JSONDecoder().decode(Core.Effects.self, from: legacyEffects)
-        #expect(!decoded.isAsync)
-        #expect(!String(decoding: try Core.CanonicalJSON.encode(decoded), as: UTF8.self)
-            .contains("isAsync"))
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(Core.Effects.self, from: incompleteEffects)
+        }
+        let incompleteSignature = Data(
+            """
+            {"isThrowing":false,"parameters":[],"result":"Swift.Void"}
+            """.utf8
+        )
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(
+                Core.LoweredSignature.self,
+                from: incompleteSignature
+            )
+        }
+        #expect(String(
+            decoding: try Core.CanonicalJSON.encode(Core.Effects()),
+            as: UTF8.self
+        ).contains("\"isAsync\":false"))
         #expect(String(
             decoding: try Core.CanonicalJSON.encode(Core.Effects(isAsync: true)),
             as: UTF8.self

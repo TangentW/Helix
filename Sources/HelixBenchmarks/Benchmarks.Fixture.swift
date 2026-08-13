@@ -490,7 +490,7 @@ struct Fixture {
             name: "BenchmarkUINativeImport",
             shellInterfaceHash: shellHash,
             compatibility: compatibility,
-            capabilities: [.baselineV1, .nativeImportsV2, .mainActorSyncV1],
+            capabilities: [.baselineV1, .nativeImportsV1, .mainActorSyncV1],
             requestedResources: .init(
                 maxWallTimeMainThreadMilliseconds: 1_000,
                 maxWallTimeBackgroundMilliseconds: 1_000
@@ -517,7 +517,7 @@ struct Fixture {
         let shell = try Verification.ShellInterface(
             interfaceHash: shellHash,
             compatibility: compatibility,
-            capabilities: [.baselineV1, .nativeImportsV2, .mainActorSyncV1],
+            capabilities: [.baselineV1, .nativeImportsV1, .mainActorSyncV1],
             entries: [
                 .init(
                     index: entry,
@@ -535,7 +535,7 @@ struct Fixture {
             policy: .init(
                 acceptedCapabilities: [
                     .baselineV1,
-                    .nativeImportsV2,
+                    .nativeImportsV1,
                     .mainActorSyncV1,
                 ],
                 resourceCeiling: .init(

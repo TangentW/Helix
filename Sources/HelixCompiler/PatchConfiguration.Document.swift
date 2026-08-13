@@ -109,25 +109,11 @@ public struct NativeImports: Codable, Hashable, Sendable {
         self.sourceScope = sourceScope
     }
 
-    /// Keeps the schema-1 programmatic shorthand (`allow` only) source compatible.
-    public var effectiveCandidateIndex: PatchConfiguration.NativeImportCandidateIndex? {
-        isLegacyAllowlistShorthand ? .explicitCatalog : candidateIndex
-    }
-
-    /// Keeps the schema-1 programmatic shorthand (`allow` only) source compatible.
-    public var effectiveEmission: PatchConfiguration.NativeImportEmission? {
-        isLegacyAllowlistShorthand ? .allowlisted : emit
-    }
-
-    private var isLegacyAllowlistShorthand: Bool {
-        candidateIndex == nil && emit == nil && !allow.isEmpty && sourceScope == nil
-    }
-
-    fileprivate func validate(schema: UInt32, moduleName: String) throws {
+    fileprivate func validate(moduleName: String) throws {
         let configured = candidateIndex != nil || emit != nil || !allow.isEmpty
             || sourceScope != nil
         guard configured else { return }
-        switch (effectiveCandidateIndex, effectiveEmission) {
+        switch (candidateIndex, emit) {
         case (.explicitCatalog?, .allowlisted?):
             guard sourceScope == nil else {
                 throw PatchConfiguration.Error.invalid(
@@ -135,9 +121,9 @@ public struct NativeImports: Codable, Hashable, Sendable {
                 )
             }
         case (.sourceAndCatalog?, .scoped?):
-            guard schema >= 2, let sourceScope else {
+            guard let sourceScope else {
                 throw PatchConfiguration.Error.invalid(
-                    "module \(moduleName) source-and-catalog discovery requires schema 2 and sourceScope"
+                    "module \(moduleName) source-and-catalog discovery requires sourceScope"
                 )
             }
             try sourceScope.validate(moduleName: moduleName)
@@ -179,14 +165,14 @@ public struct Module: Codable, Hashable, Sendable {
 }
 
 public struct Document: Codable, Hashable, Sendable {
-    public static let currentSchema: UInt32 = 2
+    public static let currentSchema: UInt32 = 1
 
     public var schema: UInt32
     public var modules: [String: PatchConfiguration.Module]
     public var language: [String: String]
 
     public init(
-        schema: UInt32 = 1,
+        schema: UInt32 = Self.currentSchema,
         modules: [String: PatchConfiguration.Module],
         language: [String: String] = [:]
     ) {
@@ -200,7 +186,7 @@ public struct Document: Codable, Hashable, Sendable {
     }
 
     public func validate() throws {
-        guard (1...Self.currentSchema).contains(schema) else {
+        guard schema == Self.currentSchema else {
             throw PatchConfiguration.Error.unsupportedSchema(schema)
         }
         guard !modules.isEmpty else {
@@ -213,7 +199,7 @@ public struct Document: Codable, Hashable, Sendable {
             else {
                 throw PatchConfiguration.Error.missingInclude(name)
             }
-            try module.nativeImports.validate(schema: schema, moduleName: name)
+            try module.nativeImports.validate(moduleName: name)
         }
     }
 }
@@ -488,7 +474,7 @@ private struct Parser {
         }
 
         let resolvedSchema = schema ?? 0
-        guard (1...PatchConfiguration.Document.currentSchema).contains(resolvedSchema) else {
+        guard resolvedSchema == PatchConfiguration.Document.currentSchema else {
             throw PatchConfiguration.Error.unsupportedSchema(resolvedSchema)
         }
         var result: [String: PatchConfiguration.Module] = [:]

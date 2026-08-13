@@ -58,8 +58,7 @@ public enum Codec {
         guard Array(data.prefix(magic.count)) == magic else { throw InterfaceArchive.Error.invalidMagic }
         var cursor = magic.count
         let schema: UInt16 = try data.readLittleEndian(at: &cursor)
-        let supportedSchemas = InterfaceArchive.Archive.minimumSupportedSchemaVersion...InterfaceArchive.Archive.currentSchemaVersion
-        guard supportedSchemas.contains(schema) else {
+        guard schema == InterfaceArchive.Archive.currentSchemaVersion else {
             throw InterfaceArchive.Error.unsupportedSchema(schema)
         }
         let flags: UInt16 = try data.readLittleEndian(at: &cursor)

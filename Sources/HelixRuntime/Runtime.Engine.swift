@@ -13,8 +13,6 @@ public protocol Observing: Sendable {
     func didActivate(generation: Runtime.GenerationID)
     /// Called after an explicit or quarantine-induced rollback.
     func didRollback(from: Runtime.GenerationID, to: Runtime.GenerationID?)
-    /// Called when patched execution traps before fallback or quarantine handling.
-    func didTrap(generation: Runtime.GenerationID, entry: Core.EntryIndex, trap: VM.RuntimeTrap)
     /// Called with the deepest known HLBC and logical Swift trap coordinate.
     func didTrap(diagnostic: Runtime.TrapDiagnostic)
     /// Called when a callback implemented by a hosted local class traps.
@@ -29,8 +27,6 @@ public struct NoopObserver: Runtime.Observing {
     public func didActivate(generation: Runtime.GenerationID) {}
     /// Discards rollback telemetry.
     public func didRollback(from: Runtime.GenerationID, to: Runtime.GenerationID?) {}
-    /// Discards trap telemetry.
-    public func didTrap(generation: Runtime.GenerationID, entry: Core.EntryIndex, trap: VM.RuntimeTrap) {}
 }
 
 /// Decision returned to generated bridges after lazy argument encoding.
@@ -299,7 +295,6 @@ public final class Engine: @unchecked Sendable {
                 : .synchronous
         )
         guard case let .trapped(trap) = result else { return .executed(result) }
-        observer.didTrap(generation: context.lease.generation.id, entry: entry, trap: trap)
 
         if isRuntimeInvariantViolation(trap) {
             let activeBeforeQuarantine = registry.snapshot().activeGenerationID

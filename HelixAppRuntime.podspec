@@ -1,6 +1,6 @@
 Pod::Spec.new do |spec|
   spec.name = 'HelixAppRuntime'
-  spec.version = '0.1.0'
+  spec.version = '1.0.0'
   spec.summary = 'Production HLBC hot-patch runtime for Helix-enabled iOS apps.'
   spec.description = <<-DESC
     The production-only Helix runtime verifies, installs, executes, rolls back,

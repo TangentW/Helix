@@ -70,7 +70,7 @@ public struct NativeImportKey: Core.DigestIdentity {
         contract: Core.NativeImportContract
     ) throws -> Self {
         try contract.validate(effects: effects)
-        var hasher = Core.StableHasher(domain: "HLX.Import.v2")
+        var hasher = Core.StableHasher(domain: "HLX.Import.v1")
         hasher.append(namespace.rawValue)
         hasher.append(canonicalCallee)
         hasher.append(try Core.CanonicalJSON.encode(signature))
@@ -125,32 +125,6 @@ public struct LoweredSignature: Codable, Hashable, Sendable {
         self.isAsync = isAsync
         self.isolation = isolation
     }
-
-    private enum CodingKeys: String, CodingKey {
-        case parameters
-        case result
-        case isThrowing
-        case isAsync
-        case isolation
-    }
-
-    public init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        parameters = try container.decode([String].self, forKey: .parameters)
-        result = try container.decode(String.self, forKey: .result)
-        isThrowing = try container.decode(Bool.self, forKey: .isThrowing)
-        isAsync = try container.decodeIfPresent(Bool.self, forKey: .isAsync) ?? false
-        isolation = try container.decodeIfPresent(String.self, forKey: .isolation)
-    }
-
-    public func encode(to encoder: any Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(parameters, forKey: .parameters)
-        try container.encode(result, forKey: .result)
-        try container.encode(isThrowing, forKey: .isThrowing)
-        if isAsync { try container.encode(true, forKey: .isAsync) }
-        try container.encodeIfPresent(isolation, forKey: .isolation)
-    }
 }
 
 public struct Effects: Codable, Hashable, Sendable {
@@ -174,32 +148,6 @@ public struct Effects: Codable, Hashable, Sendable {
         self.hasExternalSideEffects = hasExternalSideEffects
         self.requiresMainActor = requiresMainActor
         self.isAsync = isAsync
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case mayThrow
-        case mayAllocate
-        case hasExternalSideEffects
-        case requiresMainActor
-        case isAsync
-    }
-
-    public init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        mayThrow = try container.decode(Bool.self, forKey: .mayThrow)
-        mayAllocate = try container.decode(Bool.self, forKey: .mayAllocate)
-        hasExternalSideEffects = try container.decode(Bool.self, forKey: .hasExternalSideEffects)
-        requiresMainActor = try container.decode(Bool.self, forKey: .requiresMainActor)
-        isAsync = try container.decodeIfPresent(Bool.self, forKey: .isAsync) ?? false
-    }
-
-    public func encode(to encoder: any Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(mayThrow, forKey: .mayThrow)
-        try container.encode(mayAllocate, forKey: .mayAllocate)
-        try container.encode(hasExternalSideEffects, forKey: .hasExternalSideEffects)
-        try container.encode(requiresMainActor, forKey: .requiresMainActor)
-        if isAsync { try container.encode(true, forKey: .isAsync) }
     }
 }
 

@@ -116,7 +116,7 @@ extension CompilerCapabilities {
                 for field in fields { collect(field.type, into: &capabilities) }
             }
         }
-        if !imports.isEmpty { capabilities.insert(.nativeImportsV2) }
+        if !imports.isEmpty { capabilities.insert(.nativeImportsV1) }
         for requirement in imports {
             capabilities.insert(requirement.requiredCapability)
         }

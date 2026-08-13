@@ -181,7 +181,7 @@ struct StandardLibraryImports {
         let shellHash = Core.Digest.sha256("runtime-print-shell")
         let capabilities: Set<Core.Capability> = [
             .baselineV1,
-            .nativeImportsV2,
+            .nativeImportsV1,
             .anyValuesV1,
             .collectionsV1,
             .stringsV1,

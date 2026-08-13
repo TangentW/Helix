@@ -15,7 +15,7 @@ struct DemoIntegration {
         try plan.validate()
 
         #expect(try XcodeIntegration.HostPlanCodec.encode(plan) == planBytes)
-        #expect(plan.schemaVersion == 3)
+        #expect(plan.schemaVersion == 1)
         #expect(plan.features.map(\.moduleName) == [
             "HotPatchFeature", "LiveReloadFeature",
         ])

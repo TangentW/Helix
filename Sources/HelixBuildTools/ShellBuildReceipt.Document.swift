@@ -234,21 +234,16 @@ public struct GeneratedNativeType: Codable, Hashable, Sendable {
 
     public var sourceFileLogicalID: String
     public var swiftType: String
-    /// `nil` preserves schema 7/8 receipts, whose generated types were references.
-    public var representation: Representation?
+    public var representation: Representation
 
     public init(
         sourceFileLogicalID: String,
         swiftType: String,
-        representation: Representation? = nil
+        representation: Representation = .reference
     ) {
         self.sourceFileLogicalID = sourceFileLogicalID
         self.swiftType = swiftType
         self.representation = representation
-    }
-
-    var effectiveRepresentation: Representation {
-        representation ?? .reference
     }
 }
 
@@ -305,7 +300,7 @@ public struct Factory: Codable, Hashable, Sendable {
 }
 
 public struct Document: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 9
+    public static let currentSchemaVersion: UInt16 = 1
 
     public var schemaVersion: UInt16
     public var metadata: InterfaceArchive.ReleaseMetadata
@@ -370,7 +365,7 @@ public struct Document: Codable, Hashable, Sendable {
     }
 
     public func validate() throws {
-        guard (5...Self.currentSchemaVersion).contains(schemaVersion) else {
+        guard schemaVersion == Self.currentSchemaVersion else {
             throw ShellBuildReceipt.Error.unsupportedSchema(schemaVersion)
         }
         guard metadata.machOUUIDs.isEmpty else {
@@ -387,11 +382,6 @@ public struct Document: Codable, Hashable, Sendable {
         } catch {
             throw ShellBuildReceipt.Error.invalid(
                 "patchability configuration is incomplete: \(error)"
-            )
-        }
-        guard schemaVersion >= 6 || configuration.schema == 1 else {
-            throw ShellBuildReceipt.Error.invalid(
-                "source NativeImport discovery requires Shell receipt schema 6"
             )
         }
         guard capabilities == Array(Set(capabilities)).sorted(),
@@ -458,54 +448,13 @@ public struct Document: Codable, Hashable, Sendable {
                 "native import candidates or bindings are duplicated, unordered, or empty"
             )
         }
-        guard schemaVersion >= 6
-                || nativeImportBindings.allSatisfy({ $0.generated == nil })
-        else {
-            throw ShellBuildReceipt.Error.invalid(
-                "generated NativeImport bindings require Shell receipt schema 6"
-            )
-        }
-        guard schemaVersion >= 8
-                || nativeImportBindings.allSatisfy({
-                    guard let dispatch = $0.generated?.dispatch else { return true }
-                    switch dispatch {
-                    case .instanceMethod, .instanceGetter, .instanceSetter,
-                         .instanceValueSetter:
-                        return false
-                    case .globalFunction, .initializer, .staticMethod,
-                         .nativeUpcast, .staticGetter:
-                        return true
-                    }
-                })
-        else {
-            throw ShellBuildReceipt.Error.invalid(
-                "generated receiver NativeImports require Shell receipt schema 8"
-            )
-        }
-        guard schemaVersion >= 9
-                || nativeImportBindings.allSatisfy({
-                    guard let dispatch = $0.generated?.dispatch else { return true }
-                    switch dispatch {
-                    case .initializer, .nativeUpcast, .staticGetter,
-                         .instanceValueSetter:
-                        return false
-                    case .globalFunction, .staticMethod, .instanceMethod,
-                         .instanceGetter, .instanceSetter:
-                        return true
-                    }
-                })
-        else {
-            throw ShellBuildReceipt.Error.invalid(
-                "generated imported-operation NativeImports require Shell receipt schema 9"
-            )
-        }
         let entrySymbols = Set(roots.compactMap { root in
             root.bridge == nil ? nil : root.declarationMangledName
         })
         let nativeImportSymbols = Set(
             nativeImportCandidates.flatMap(\.silMangledNames)
         )
-        guard schemaVersion < 8 || entrySymbols.isDisjoint(with: nativeImportSymbols) else {
+        guard entrySymbols.isDisjoint(with: nativeImportSymbols) else {
             throw ShellBuildReceipt.Error.invalid(
                 "an exact Swift symbol cannot be both an Entry and a NativeImport"
             )
@@ -539,22 +488,6 @@ public struct Document: Codable, Hashable, Sendable {
         else {
             throw ShellBuildReceipt.Error.invalid(
                 "native types or bindings are duplicated, unordered, or empty"
-            )
-        }
-        guard schemaVersion >= 7
-                || nativeTypeBindings.allSatisfy({ $0.generated == nil })
-        else {
-            throw ShellBuildReceipt.Error.invalid(
-                "generated native type bindings require Shell receipt schema 7"
-            )
-        }
-        guard schemaVersion >= 9
-                || nativeTypeBindings.allSatisfy({
-                    $0.generated?.representation == nil
-                })
-        else {
-            throw ShellBuildReceipt.Error.invalid(
-                "generated native type representations require Shell receipt schema 9"
             )
         }
         guard superclassEdges == superclassEdges.sorted(by: { $0.orderKey < $1.orderKey }),

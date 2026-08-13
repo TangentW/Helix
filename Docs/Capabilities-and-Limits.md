@@ -13,7 +13,7 @@ current practical boundary.
 | Area | Implemented | Not yet qualified or implemented |
 | --- | --- | --- |
 | Release Shell | Exact frontend indexing, Derived Sources, interface archive, permanent bridge, NativeImport discovery, Xcode integration, bundle leakage audit | Broad real-application migration and long-running CI matrix |
-| Production HLBC | HLBC 1.11 / HLXI 2.6 compiler path, verifier, HLVM, signed package, safe installation, immutable activation, rollback and revocation; checked-in business corpus | App Store distribution approval, external top-200 corpus, long fuzz/sanitizer campaigns, real-device macro performance, and hosted UIKit-page soak |
+| Production HLBC | HLBC 1.0 / HLXI 1.0 compiler path, verifier, HLVM, signed package, safe installation, immutable activation, rollback and revocation; checked-in business corpus | App Store distribution approval, external top-200 corpus, long fuzz/sanitizer campaigns, real-device macro performance, and hosted UIKit-page soak |
 | Development Live Reload | Exact build capture, stable snapshots, body diff, session-bound verified HLBC, authenticated transfer, atomic activation, UIKit/SwiftUI refresh, logical source maps and a 128-generation in-process soak | Physical-iPhone matrix, long-duration device soak, interactive bytecode stepping, large-project latency qualification |
 | Helix Hub | SwiftUI status-bar app, project discovery, transactional Hot Patch/Live Reload onboarding, secure helper discovery, unified service, exact Build Context registry, Xcode automatic invitation, and manual four-character pairing | Distribution signing/notarization and broad third-party project migration matrix |
 | Native experiment | Explicit-only Dynamic Replacement builder, recursion/previous tests, signed dylib and loader probes | Product support; it is intentionally absent from automatic routing |
@@ -23,7 +23,7 @@ The full SwiftPM suite, warnings-as-errors build, optimized Release build, iOS
 fixtures, and checked-in Demo flows are separate evidence gates. Passing them
 does not by itself certify a physical device or distribution channel.
 
-## Production HLBC 1.11 Swift subset
+## Production HLBC 1.0 Swift subset
 
 ### Implemented
 
@@ -69,7 +69,7 @@ does not by itself certify a physical device or distribution channel.
   closure from one same-image function to its caller, and a closure capturing
   another closure. The value must be consumed inside the same pinned HLVM
   invocation; `escaping-closure-values-1` gates the return and nested-capture
-  semantics independently from the older closure capability. Compiler-emitted
+  semantics independently from the base closure capability. Compiler-emitted
   fully concrete specializations are also supported when no archetype,
   metadata, or witness dependency remains.
 - Top-level non-suspending `async`, `async throws`, and `@MainActor async`

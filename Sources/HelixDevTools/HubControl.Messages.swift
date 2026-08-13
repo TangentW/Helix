@@ -10,7 +10,7 @@ public enum HubControl {}
 extension HubControl {
 /// Private rendezvous data published by the running Helix service.
 public struct Rendezvous: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 2
+    public static let currentSchemaVersion: UInt16 = 1
 
     public var schemaVersion: UInt16
     public var processIdentifier: Int32

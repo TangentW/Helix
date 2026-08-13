@@ -14,7 +14,6 @@ enum DirectCalls {
 
         for function in archive.functions {
             let conventions = function.parameterConventions
-                ?? Array(repeating: .owned, count: function.parameterTypes.count)
             if let localID = localFunctionIDs[function.key] {
                 let loweredTypes = zip(function.parameterTypes, conventions).map {
                     type, convention in
@@ -65,7 +64,7 @@ enum DirectCalls {
                 // takes precedence over an optional native-original binding.
                 guard bindingsBySymbol[mangledName] == nil else { continue }
                 let abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter =
-                    switch item.effectiveABIAdapter {
+                    switch item.abiAdapter {
                     case .direct: .direct
                     case .mutatingValueReceiver: .mutatingValueReceiver
                     }

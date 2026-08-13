@@ -5,7 +5,7 @@ extension DevToolsTests {
 @Suite("Development tools metadata")
 struct Metadata {
     @Test func moduleHasVersion() {
-        #expect(DevTools.Metadata.version.major == 0)
+        #expect(DevTools.Metadata.version == .init(1, 0, 0))
     }
 }
 }

@@ -540,7 +540,6 @@ extension FrontendReceipt.Adapter {
             )
         }
         var result = configuration
-        result.schema = max(result.schema, 2)
         module.nativeImports = .init(
             candidateIndex: .sourceAndCatalog,
             emit: .scoped,
@@ -583,8 +582,8 @@ extension FrontendReceipt.Adapter {
             )
         }
         if !catalog.candidates.isEmpty || !catalog.nativeTypes.isEmpty {
-            guard module.nativeImports.effectiveCandidateIndex == .explicitCatalog
-                    || module.nativeImports.effectiveCandidateIndex == .sourceAndCatalog
+            guard module.nativeImports.candidateIndex == .explicitCatalog
+                    || module.nativeImports.candidateIndex == .sourceAndCatalog
             else {
                 throw FrontendReceipt.Error.invalidRequest(
                     "NativeImport Catalog requires explicit-catalog or source-and-catalog mode"
@@ -729,6 +728,13 @@ extension FrontendReceipt.Adapter {
               var module = configuration.modules[moduleName]
         else { return configuration }
         var result = configuration
+        if module.nativeImports.candidateIndex == nil,
+           module.nativeImports.emit == nil,
+           module.nativeImports.allow.isEmpty,
+           module.nativeImports.sourceScope == nil {
+            module.nativeImports.candidateIndex = .explicitCatalog
+            module.nativeImports.emit = .allowlisted
+        }
         module.nativeImports.allow = Array(
             Set(module.nativeImports.allow + discoveredCallees)
         ).sorted()
@@ -876,7 +882,7 @@ extension FrontendReceipt.Adapter {
                     canonicalName: imported.canonicalName,
                     kind: imported.kind,
                     layoutFingerprint: .sha256(
-                        "HLX.ImportedNativeType.v2:\(metadata.frontendInvocation.targetTriple):"
+                        "HLX.ImportedNativeType.v1:\(metadata.frontendInvocation.targetTriple):"
                             + "\(imported.kind.rawValue):\(imported.canonicalName)"
                     ),
                     isCopyable: true,

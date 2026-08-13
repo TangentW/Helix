@@ -33,7 +33,7 @@ public enum StandardLibraryImports {
             signature: Core.LoweredSignature,
             effects: Core.Effects,
             contract: Core.NativeImportContract,
-            capability: Core.Capability = .nativeImportsV2
+            capability: Core.Capability = .nativeImportsV1
         ) {
             self.canonicalCallee = canonicalCallee
             self.silMangledNames = silMangledNames.sorted()

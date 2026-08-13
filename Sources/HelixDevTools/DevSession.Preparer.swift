@@ -30,8 +30,8 @@ public struct PrepareRequest: Sendable {
     public var compilerURL: URL?
     /// Logical source to the file developers edit and the watcher observes.
     public var sourceMappings: [String: URL]
-    /// Logical source to the materialized file Xcode actually compiled. When
-    /// empty, `sourceMappings` serves both roles for backwards compatibility.
+    /// Logical source to the materialized file Xcode actually compiled. Leave
+    /// empty when Xcode compiled the editable source directly.
     public var compiledSourceMappings: [String: URL]
     public var linkArguments: [String]
     public var buildProducts: [DevSession.ProductInput]

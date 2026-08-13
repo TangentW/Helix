@@ -193,7 +193,7 @@ public actor ProjectStore {
     }
 
     private struct Document: Codable {
-        static let currentSchemaVersion: UInt16 = 2
+        static let currentSchemaVersion: UInt16 = 1
         var schemaVersion: UInt16 = Self.currentSchemaVersion
         var records: [Hub.ProjectRecord]
 

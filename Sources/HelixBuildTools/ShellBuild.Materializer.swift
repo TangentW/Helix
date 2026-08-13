@@ -8,7 +8,7 @@ import HelixLiveReloadAPI
 public enum ShellBuild {
     /// Changes whenever the source-to-Shell transformation changes semantics.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v2"
+        "Helix.ShellBuild.DynamicSourceTransform.v1"
     )
 }
 
@@ -516,7 +516,7 @@ public struct Materializer: Sendable {
                 importedModules: binding.importedModules,
                 generated: binding.generated.map {
                     let representation: BridgeGeneration.GeneratedNativeType.Representation =
-                        switch $0.effectiveRepresentation {
+                        switch $0.representation {
                         case .reference: .reference
                         case .rawRepresentable: .rawRepresentable
                         case .opaqueValue: .opaqueValue

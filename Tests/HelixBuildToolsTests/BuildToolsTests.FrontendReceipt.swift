@@ -192,11 +192,6 @@ struct FrontendReceiptPipeline {
         })
         #expect(screenTypeBinding.generated?.sourceFileLogicalID == "Sources/Patch.swift")
         #expect(screenTypeBinding.generated?.swiftType == "Screen")
-        var legacySchema = receipt
-        legacySchema.schemaVersion = 6
-        #expect(throws: ShellBuildReceipt.Error.self) {
-            try legacySchema.validate()
-        }
         var forgedTypeSpelling = receipt
         let bindingIndex = try #require(forgedTypeSpelling.nativeTypeBindings.firstIndex {
             $0.canonicalName == screenType.canonicalName

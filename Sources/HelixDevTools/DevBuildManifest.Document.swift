@@ -13,15 +13,15 @@ public struct SourceFile: Codable, Hashable, Sendable {
     public var contentHash: Core.Digest
     /// The basename Swift used for this source while emitting the shell module.
     /// It can differ from the editable basename when Xcode compiles a materialized
-    /// Helix source. Older manifests omit it and therefore use the logical basename.
-    public var privateImportSourceFile: String?
+    /// Helix source, so every manifest records it explicitly.
+    public var privateImportSourceFile: String
 
     public init(
         id: LiveReload.SourceFileID,
         logicalPath: String,
         absolutePath: String,
         contentHash: Core.Digest,
-        privateImportSourceFile: String? = nil
+        privateImportSourceFile: String
     ) {
         self.id = id
         self.logicalPath = logicalPath
@@ -30,9 +30,20 @@ public struct SourceFile: Codable, Hashable, Sendable {
         self.privateImportSourceFile = privateImportSourceFile
     }
 
-    public var effectivePrivateImportSourceFile: String {
-        privateImportSourceFile
-            ?? URL(fileURLWithPath: logicalPath).lastPathComponent
+    /// Creates metadata for a source that Xcode compiled without materialization.
+    public init(
+        id: LiveReload.SourceFileID,
+        logicalPath: String,
+        absolutePath: String,
+        contentHash: Core.Digest
+    ) {
+        self.init(
+            id: id,
+            logicalPath: logicalPath,
+            absolutePath: absolutePath,
+            contentHash: contentHash,
+            privateImportSourceFile: URL(fileURLWithPath: logicalPath).lastPathComponent
+        )
     }
 }
 
@@ -193,11 +204,11 @@ public struct Document: Codable, Hashable, Sendable {
                 && $0.absolutePath.hasPrefix("/")
                 && $0.absolutePath.hasSuffix(".swift")
                 && !$0.absolutePath.unicodeScalars.contains(where: { $0.value == 0 })
-                && $0.effectivePrivateImportSourceFile.hasSuffix(".swift")
-                && URL(fileURLWithPath: $0.effectivePrivateImportSourceFile).lastPathComponent
-                    == $0.effectivePrivateImportSourceFile
-                && $0.effectivePrivateImportSourceFile.utf8.count <= 1_024
-                && !$0.effectivePrivateImportSourceFile.unicodeScalars.contains(
+                && $0.privateImportSourceFile.hasSuffix(".swift")
+                && URL(fileURLWithPath: $0.privateImportSourceFile).lastPathComponent
+                    == $0.privateImportSourceFile
+                && $0.privateImportSourceFile.utf8.count <= 1_024
+                && !$0.privateImportSourceFile.unicodeScalars.contains(
                     where: { $0.value == 0 }
                 )
                 && $0.id == LiveReload.SourceFileID.derive(logicalPath: $0.logicalPath)

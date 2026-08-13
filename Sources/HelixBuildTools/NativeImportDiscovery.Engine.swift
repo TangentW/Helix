@@ -75,8 +75,8 @@ extension NativeImportDiscovery {
         ) throws -> NativeImportDiscovery.Result {
             try configuration.validate()
             guard let module = configuration.modules[metadata.frontendInvocation.moduleName],
-                  module.nativeImports.effectiveCandidateIndex == .sourceAndCatalog,
-                  module.nativeImports.effectiveEmission == .scoped,
+                  module.nativeImports.candidateIndex == .sourceAndCatalog,
+                  module.nativeImports.emit == .scoped,
                   let scope = module.nativeImports.sourceScope,
                   let profile = scope.profile
             else {
@@ -156,10 +156,9 @@ extension NativeImportDiscovery {
                             signature: declaration.signature,
                             effects: effects,
                             contract: contract,
-                            capability: .nativeImportsV2,
+                            capability: .nativeImportsV1,
                             isEmittedToDevice: true,
-                            abiAdapter: declaration.abiAdapter == .direct
-                                ? nil : declaration.abiAdapter
+                            abiAdapter: declaration.abiAdapter
                         ),
                         generatedBinding: .init(
                             declarationMangledName: declaration.mangledName,

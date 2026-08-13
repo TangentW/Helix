@@ -7,13 +7,13 @@ public enum Verification {}
 
 extension Verification {
 public enum Metadata {
-    public static let version = Core.SemanticVersion(0, 1, 0)
+    public static let version = Core.SemanticVersion(1, 0, 0)
     public static let supportedCapabilities: Set<Core.Capability> = [
         .baselineV1,
         .stringsV1,
         .collectionsV1,
         .nativeTypesV1,
-        .nativeImportsV2,
+        .nativeImportsV1,
         .untypedThrowsV1,
         .localNominalsV1,
         .structuredErrorsV1,

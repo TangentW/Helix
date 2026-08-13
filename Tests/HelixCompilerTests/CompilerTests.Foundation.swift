@@ -53,10 +53,10 @@ struct Foundation {
         }
     }
 
-    @Test("Schema 2 models a bounded source NativeImport range without weakening schema 1")
+    @Test("Schema 1 models a bounded source NativeImport range")
     func parsesNativeImportSourceScope() throws {
         let configuration = try PatchConfiguration.Document.parse(yaml: """
-        schema: 2
+        schema: 1
         modules:
           CheckoutFeature:
             include:
@@ -135,7 +135,7 @@ struct Foundation {
     func rejectsIncompleteNativeImportSourceScope() {
         #expect(throws: PatchConfiguration.Error.self) {
             try PatchConfiguration.Document.parse(yaml: """
-            schema: 2
+            schema: 1
             modules:
               UnsafeModule:
                 include:
@@ -146,14 +146,13 @@ struct Foundation {
                   sourceScope:
                     include:
                       - Sources/**
-                    maximumDurationMicroseconds: 2001
             """)
         }
         #expect(throws: PatchConfiguration.Error.self) {
             try PatchConfiguration.Document.parse(yaml: """
             schema: 1
             modules:
-              LegacyModule:
+              InvalidModule:
                 include:
                   - Sources/**
                 nativeImports:
@@ -163,7 +162,26 @@ struct Foundation {
                     include:
                       - Sources/**
                     profile: bounded-pure
+                    maximumDurationMicroseconds: 2001
             """)
+        }
+    }
+
+    @Test("NativeImport configuration requires an explicit mode")
+    func rejectsAllowOnlyShorthand() {
+        let configuration = PatchConfiguration.Document(
+            modules: [
+                "Fixture": .init(
+                    include: ["Sources/**"],
+                    nativeImports: .init(allow: ["Fixture.value()"])
+                ),
+            ]
+        )
+
+        #expect(throws: PatchConfiguration.Error.invalid(
+            "module Fixture has an incomplete or incompatible NativeImport mode"
+        )) {
+            try configuration.validate()
         }
     }
 

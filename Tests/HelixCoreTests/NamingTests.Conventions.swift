@@ -41,14 +41,14 @@ struct Conventions {
                     violations.append("\(relativePath): expected Namespace.Type.swift")
                 }
                 if prefixedFile.firstMatch(in: stem, range: stemRange) != nil {
-                    violations.append("\(relativePath): legacy prefix in Swift file name")
+                    violations.append("\(relativePath): disallowed prefix in Swift file name")
                 }
 
                 let source = try String(contentsOf: file, encoding: .utf8)
                 let sourceRange = NSRange(source.startIndex..<source.endIndex, in: source)
                 if let match = prefixedDeclaration.firstMatch(in: source, range: sourceRange),
                    let range = Range(match.range, in: source) {
-                    violations.append("\(relativePath): legacy Swift declaration '\(source[range])'")
+                    violations.append("\(relativePath): disallowed prefixed Swift declaration '\(source[range])'")
                 }
             }
         }

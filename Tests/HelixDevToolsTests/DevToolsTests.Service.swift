@@ -248,7 +248,7 @@ struct Service {
             try rendezvous.validate()
         }
         rendezvous.toolExecutablePath = "/usr/bin/true"
-        rendezvous.schemaVersion = 1
+        rendezvous.schemaVersion = 2
         #expect(throws: HubControl.Error.invalidRendezvous) {
             try rendezvous.validate()
         }

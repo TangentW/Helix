@@ -169,7 +169,7 @@ extension ReleaseCompiler {
                 throw DriverError.compilerIdentityFailed(String(describing: error))
             }
             let binaryHash = Core.Digest.sha256(binary)
-            var hasher = Core.StableHasher(domain: "HLX.SwiftToolchain.v3")
+            var hasher = Core.StableHasher(domain: "HLX.SwiftToolchain.v1")
             hasher.append(compilerVersion)
             hasher.append(targetDocument.swiftCompilerTag ?? "")
             hasher.append(
@@ -606,7 +606,6 @@ extension ReleaseCompiler {
                         : nil
                 }
                 let conventions = item.record.parameterConventions
-                    ?? Array(repeating: .owned, count: item.record.parameterTypes.count)
                 let expectedParameters = zip(item.record.parameterTypes, conventions).map {
                     type, convention in convention == .inout ? .address(type) : type
                 }
@@ -819,7 +818,7 @@ extension ReleaseCompiler {
         ) -> Bool {
             switch record.patchability.reasonCode {
             case "HLXIDX006":
-                (record.parameterConventions ?? []).contains(.inout)
+                record.parameterConventions.contains(.inout)
             case "HLXIDX022":
                 true
             default:

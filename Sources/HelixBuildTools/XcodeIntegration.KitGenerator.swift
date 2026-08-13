@@ -3,7 +3,7 @@ import HelixCore
 
 extension XcodeIntegration {
 public struct ProfileContract: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 2
+    public static let currentSchemaVersion: UInt16 = 1
 
     public var schemaVersion: UInt16
     public var profileID: String
@@ -47,7 +47,7 @@ public struct KitArtifact: Codable, Hashable, Sendable {
 }
 
 public struct KitManifest: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 3
+    public static let currentSchemaVersion: UInt16 = 1
 
     public var schemaVersion: UInt16
     public var hostPlanSHA256: Core.Digest
@@ -291,7 +291,7 @@ public struct KitGenerator: Sendable {
                 case "$record_pid" in
                     ''|*[!0-9]*) record_pid=0 ;;
                 esac
-                if [ "$record_schema" = "2" ] && [ "$record_pid" -gt 1 ] \
+                if [ "$record_schema" = "1" ] && [ "$record_pid" -gt 1 ] \
                     && /bin/kill -0 "$record_pid" 2>/dev/null; then
                     helix_executable=$(
                         /usr/bin/plutil -extract toolExecutablePath raw -o - "$service_record" 2>/dev/null || true

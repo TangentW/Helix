@@ -1,5 +1,5 @@
 extension Bytecode.ValueType {
-    /// The closed set that HLBC 1.10 may store inside its VM-owned `Any` value.
+    /// The closed set that HLBC 1.0 may store inside its VM-owned `Any` value.
     /// Native handles and other lifetime-bearing values require a separate ABI.
     public var isAnyPayloadV1: Bool {
         switch self {

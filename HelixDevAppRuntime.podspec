@@ -1,6 +1,6 @@
 Pod::Spec.new do |spec|
   spec.name = 'HelixDevAppRuntime'
-  spec.version = '0.1.0'
+  spec.version = '1.0.0'
   spec.summary = 'Authenticated HLBC Live Reload runtime for Helix iOS test apps.'
   spec.description = <<-DESC
     The development Helix runtime contains the production execution core plus

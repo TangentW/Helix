@@ -44,14 +44,6 @@ public struct Result: Sendable {
     public var crashGuardRollbackGenerationID: Runtime.GenerationID?
     /// Contained recovery issues that did not make startup fail closed.
     public var recoveryIssues: [PatchLaunch.RecoveryIssue]
-
-    /// Combined recovery detail, retained for source compatibility.
-    public var restoreFailure: String? {
-        guard !recoveryIssues.isEmpty else { return nil }
-        return recoveryIssues
-            .map { "\($0.code.rawValue): \($0.detail)" }
-            .joined(separator: "; ")
-    }
 }
 
 /// Advanced coordinator for launch restoration and crash protection.

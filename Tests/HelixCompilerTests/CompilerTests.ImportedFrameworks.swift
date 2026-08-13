@@ -629,7 +629,13 @@ struct ImportedFrameworks {
             key: .init(rawValue: .sha256("import-\(id)")),
             signature: .init(parameters: [], result: "Swift.Void"),
             effects: .init(),
-            contract: nil
+            contract: .bounded(
+                kind: .globalFunction,
+                domain: .application,
+                access: .pure,
+                maximumDurationMicroseconds: 500,
+                allowsMainThread: true
+            )
         )
     }
 }

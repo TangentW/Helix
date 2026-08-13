@@ -43,7 +43,7 @@ flowchart LR
     T --> D["Interface and transitive body diff"]
     D --> S["Canonical OSSA SIL"]
     S --> L["HLIR lowering"]
-    L --> B["HLBC 1.11 encoder"]
+    L --> B["HLBC 1.0 encoder"]
     B --> V["Independent verifier"]
     V --> P["Signed .hlxp"]
 ```
@@ -164,7 +164,7 @@ device performance qualification.
 
 ## Current language boundary
 
-The current wire versions are HLBC 1.11 and HLXI 2.6. The implemented subset
+The current wire versions are HLBC 1.0 and HLXI 1.0. The implemented subset
 includes common integer and floating-point operations and conversions, Bool,
 String operations and interpolation, one-grapheme Character literals for the
 bounded String predicate path, tuple/Optional including address projection,

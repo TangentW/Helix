@@ -280,7 +280,7 @@ struct Interpreter {
         )
     }
 
-    @Test("HLBC 1.5 numeric conversions preserve raw bits and IEEE rounding")
+    @Test("HLBC 1.0 numeric conversions preserve raw bits and IEEE rounding")
     func numericConversionSemantics() throws {
         func invoke(
             operation: Bytecode.IntegerConversionOperation,
@@ -1017,7 +1017,7 @@ struct Interpreter {
             contract: vmPureImportContract
         )
         let policy = Core.RuntimePolicy(
-            acceptedCapabilities: [.baselineV1, .nativeImportsV2],
+            acceptedCapabilities: [.baselineV1, .nativeImportsV1],
             allowedNativeImports: [.init(rawValue: 1)]
         )
         let catalog = try VM.NativeCatalog([NaNInvoker(key: importKey)])
@@ -1055,7 +1055,7 @@ struct Interpreter {
             )
             let fixture = try makeVerified(
                 function: function,
-                capabilities: [.baselineV1, .nativeImportsV2],
+                capabilities: [.baselineV1, .nativeImportsV1],
                 imports: [requirement],
                 shellImports: [descriptor],
                 policy: policy,
@@ -1261,7 +1261,7 @@ struct Interpreter {
                 ),
             ]
         )
-        let capabilities: Set<Core.Capability> = [.baselineV1, .nativeImportsV2, .nativeTypesV1]
+        let capabilities: Set<Core.Capability> = [.baselineV1, .nativeImportsV1, .nativeTypesV1]
         let nativeCatalog = try VM.NativeCatalog([
             MakePointInvoker(key: makeKey, operations: operations),
             SumPointInvoker(key: sumKey, typeID: pointType),
@@ -2332,7 +2332,7 @@ struct Interpreter {
             ]
         )
         let capabilities: Set<Core.Capability> = [
-            .baselineV1, .stringsV1, .nativeImportsV2, .untypedThrowsV1,
+            .baselineV1, .stringsV1, .nativeImportsV1, .untypedThrowsV1,
         ]
         let image = try makeVerified(
             function: function,
@@ -2858,11 +2858,11 @@ struct Interpreter {
         )
         return try makeVerified(
             function: function,
-            capabilities: [.baselineV1, .nativeImportsV2],
+            capabilities: [.baselineV1, .nativeImportsV1],
             imports: [requirement],
             shellImports: [descriptor],
             policy: .init(
-                acceptedCapabilities: [.baselineV1, .nativeImportsV2],
+                acceptedCapabilities: [.baselineV1, .nativeImportsV1],
                 allowedNativeImports: [.init(rawValue: 0)]
             )
         )

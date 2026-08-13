@@ -775,8 +775,7 @@ public struct ImportRequirement: Codable, Hashable, Sendable {
     public var key: Core.NativeImportKey
     public var signature: Core.LoweredSignature
     public var effects: Core.Effects
-    /// Absent only when decoding the historical HLBC 1.0...1.3 import shape.
-    public var contract: Core.NativeImportContract?
+    public var contract: Core.NativeImportContract
     public var requiredCapability: Core.Capability
 
     public init(
@@ -784,8 +783,8 @@ public struct ImportRequirement: Codable, Hashable, Sendable {
         key: Core.NativeImportKey,
         signature: Core.LoweredSignature,
         effects: Core.Effects,
-        contract: Core.NativeImportContract?,
-        requiredCapability: Core.Capability = .nativeImportsV2
+        contract: Core.NativeImportContract,
+        requiredCapability: Core.Capability = .nativeImportsV1
     ) {
         self.id = id
         self.key = key

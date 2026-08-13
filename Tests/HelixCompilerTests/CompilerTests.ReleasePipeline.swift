@@ -116,17 +116,9 @@ struct ReleasePipeline {
         #expect(report.diagnostics.contains(where: {
             $0.code == "HLXIDX005" && $0.message.contains("non-suspending leaf profile")
         }))
-
-        var legacy = request
-        legacy.compatibility.bytecode = .init(1, 8, 0)
-        legacy.compatibility.interfaceArchive = .init(2, 3, 0)
-        let legacyReport = try ReleaseCompiler.Indexer().index(legacy)
-        #expect(legacyReport.eligibleCount == 0)
-        #expect(!legacyReport.archive.capabilities.contains(.asyncLeafEntriesV1))
-        #expect(!legacyReport.archive.capabilities.contains(.anyValuesV1))
     }
 
-    @Test("HLXI 2.3 derives leaf fingerprints and requires generated dependency fingerprints")
+    @Test("HLXI 1.0 derives leaf fingerprints and requires generated dependency fingerprints")
     func rejectsMissingGeneratedImplementationFingerprint() throws {
         let namespace = Core.ShellNamespaceID.derive(
             bundleID: "dev.helix.missing-implementation-fingerprint",
@@ -211,24 +203,6 @@ struct ReleasePipeline {
                     symbol: leafRequest.declarations[0].mangledName,
                     loweredType: interface.loweredSILType,
                     body: leafRequest.declarations[0].canonicalSILBody
-                )
-        )
-
-        var legacyRequest = leafRequest
-        legacyRequest.compatibility.bytecode = .init(1, 7, 0)
-        legacyRequest.compatibility.interfaceArchive = .init(2, 2, 0)
-        legacyRequest.declarations[0].implementationFingerprint = .sha256("new semantics")
-        #expect(throws: ReleaseCompiler.IndexError.invalidInput(
-            "transitive implementation fingerprints require HLXI 2.3"
-        )) {
-            try ReleaseCompiler.Indexer().index(legacyRequest)
-        }
-        legacyRequest.declarations[0].implementationFingerprint = nil
-        let legacyReport = try ReleaseCompiler.Indexer().index(legacyRequest)
-        #expect(
-            legacyReport.archive.functions.first?.bodyFingerprint
-                == ReleaseCompiler.BodyFingerprint.compute(
-                    legacyRequest.declarations[0].canonicalSILBody
                 )
         )
     }

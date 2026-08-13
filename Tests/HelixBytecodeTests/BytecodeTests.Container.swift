@@ -46,262 +46,29 @@ struct Container {
         #expect(try Bytecode.Encoder.encode(module) == Bytecode.Encoder.encode(module))
     }
 
-    @Test("HLBC 1.11 decodes older canonical images and gates new contracts")
-    func minorVersionCompatibility() throws {
-        var legacyModule = try makeAddModule()
-        legacyModule.compatibility.bytecode = .init(1, 0, 0)
-        let legacyBytes = try Bytecode.Encoder.encode(legacyModule, formatMinor: 0)
-        let decoded = try Bytecode.Decoder.decode(legacyBytes)
+    @Test("Only the current HLBC format is accepted")
+    func formatVersionIsExact() throws {
+        var bytes = try Bytecode.Encoder.encode(makeAddModule())
+        bytes[10] = 1
 
-        #expect(decoded.header.formatMinor == 0)
-        #expect(decoded.module == legacyModule)
-
-        var newModule = legacyModule
-        newModule.compatibility.bytecode = .init(1, 1, 0)
-        newModule.functions[0].registerTypes.append(.float(bitWidth: 64))
-        newModule.functions[0].registerTypes.append(.float(bitWidth: 64))
-        newModule.functions[0].blocks[0].instructions.insert(
-            .floatingUnary(
-                result: .init(rawValue: 6),
-                operation: .negate,
-                operand: .init(rawValue: 5)
-            ),
-            at: 0
-        )
         #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "Float and String value types require HLBC format 1.1"
-            )
+            throws: Bytecode.CodecError.unsupportedFormat(major: 1, minor: 1)
         ) {
-            try Bytecode.Encoder.encode(newModule, formatMinor: 0)
-        }
-        #expect(
-            try Bytecode.Decoder.decode(
-                Bytecode.Encoder.encode(newModule, formatMinor: 1)
-            ).header.formatMinor == 1
-        )
-        newModule.compatibility.bytecode = Core.Versions.bytecode
-        #expect(
-            try Bytecode.Decoder.decode(Bytecode.Encoder.encode(newModule)).header.formatMinor
-                == Bytecode.Format.minorVersion
-        )
-
-        var stringModule = legacyModule
-        stringModule.functions[0].registerTypes.append(.string)
-        stringModule.functions[0].registerTypes.append(.bool)
-        stringModule.functions[0].blocks[0].instructions.insert(
-            .stringIsEmpty(result: .init(rawValue: 6), string: .init(rawValue: 5)),
-            at: 0
-        )
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "Float and String value types require HLBC format 1.1"
-            )
-        ) {
-            try Bytecode.Encoder.encode(stringModule, formatMinor: 0)
+            try Bytecode.Decoder.decode(bytes)
         }
 
-        var malformedLiteralModule = legacyModule
-        malformedLiteralModule.functions[0].blocks[0].instructions.insert(
-            .constantString(result: .init(rawValue: 0), value: "not an Int"),
-            at: 0
-        )
+        var incompatible = try makeAddModule()
+        incompatible.compatibility.bytecode = .init(1, 1, 0)
         #expect(
             throws: Bytecode.CodecError.invalidHeader(
-                "this instruction requires HLBC format 1.1"
+                "HLBC format 1.0 requires bytecode compatibility 1.0.0, not 1.1.0"
             )
         ) {
-            try Bytecode.Encoder.encode(malformedLiteralModule, formatMinor: 0)
-        }
-
-        var arrayModule = legacyModule
-        arrayModule.functions[0].registerTypes.append(.array(.int64))
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "Array value types require HLBC format 1.1"
-            )
-        ) {
-            try Bytecode.Encoder.encode(arrayModule, formatMinor: 0)
-        }
-
-        var tryModule = legacyModule
-        tryModule.compatibility.bytecode = .init(1, 1, 0)
-        tryModule.functions[0].blocks[0].instructions.insert(
-            .tryApply(
-                function: .init(rawValue: 0),
-                arguments: [.init(rawValue: 0), .init(rawValue: 1)],
-                normalTarget: .init(rawValue: 0),
-                errorTarget: .init(rawValue: 0)
-            ),
-            at: 0
-        )
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "try_apply instructions require HLBC format 1.2"
-            )
-        ) {
-            try Bytecode.Encoder.encode(tryModule, formatMinor: 1)
-        }
-        tryModule.compatibility.bytecode = Core.Versions.bytecode
-        #expect(
-            try Bytecode.Decoder.decode(Bytecode.Encoder.encode(tryModule)).header.formatMinor
-                == Bytecode.Format.minorVersion
-        )
-
-        var throwModule = legacyModule
-        throwModule.compatibility.bytecode = .init(1, 1, 0)
-        throwModule.functions[0].blocks[0].instructions.insert(
-            .throwError(.init(rawValue: 0)),
-            at: 0
-        )
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "throw_error requires HLBC format 1.2"
-            )
-        ) {
-            try Bytecode.Encoder.encode(throwModule, formatMinor: 1)
-        }
-
-        var throwingCapabilityModule = legacyModule
-        throwingCapabilityModule.compatibility.bytecode = .init(1, 1, 0)
-        throwingCapabilityModule.capabilities.insert(.untypedThrowsV1)
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "untyped-throws-v1 requires HLBC format 1.2"
-            )
-        ) {
-            try Bytecode.Encoder.encode(throwingCapabilityModule, formatMinor: 1)
-        }
-
-        var throwingEffectModule = legacyModule
-        throwingEffectModule.compatibility.bytecode = .init(1, 1, 0)
-        throwingEffectModule.functions[0].effects.mayThrow = true
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "throwing function effects require HLBC format 1.2"
-            )
-        ) {
-            try Bytecode.Encoder.encode(throwingEffectModule, formatMinor: 1)
-        }
-
-        var dictionaryTypeModule = legacyModule
-        dictionaryTypeModule.compatibility.bytecode = .init(1, 2, 0)
-        dictionaryTypeModule.functions[0].registerTypes.append(
-            .dictionary(key: .string, value: .int64)
-        )
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "Dictionary value types require HLBC format 1.3"
-            )
-        ) {
-            try Bytecode.Encoder.encode(dictionaryTypeModule, formatMinor: 2)
-        }
-
-        var dictionaryInstructionModule = legacyModule
-        dictionaryInstructionModule.compatibility.bytecode = .init(1, 2, 0)
-        dictionaryInstructionModule.functions[0].blocks[0].instructions.insert(
-            .dictionaryCount(
-                result: .init(rawValue: 0),
-                dictionary: .init(rawValue: 1)
-            ),
-            at: 0
-        )
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "Dictionary instructions require HLBC format 1.3"
-            )
-        ) {
-            try Bytecode.Encoder.encode(dictionaryInstructionModule, formatMinor: 2)
-        }
-
-        var legacyNativeImportModule = legacyModule
-        legacyNativeImportModule.compatibility.bytecode = .init(1, 3, 0)
-        legacyNativeImportModule.capabilities.insert(.nativeImportsV1)
-        legacyNativeImportModule.imports = [
-            .init(
-                id: .init(rawValue: 0),
-                key: .init(rawValue: .sha256("native-import-v1")),
-                signature: .init(parameters: [], result: "Swift.Void"),
-                effects: .init(),
-                contract: nil,
-                requiredCapability: .nativeImportsV1
-            ),
-        ]
-        let legacyNativeBytes = try Bytecode.Encoder.encode(
-            legacyNativeImportModule,
-            formatMinor: 3
-        )
-        #expect(
-            try Bytecode.Decoder.decode(legacyNativeBytes).module
-                == legacyNativeImportModule
-        )
-
-        var nativeImportModule = legacyModule
-        nativeImportModule.compatibility.bytecode = Core.Versions.bytecode
-        nativeImportModule.capabilities.insert(.nativeImportsV2)
-        nativeImportModule.imports = [
-            .init(
-                id: .init(rawValue: 0),
-                key: .init(rawValue: .sha256("native-import-v2")),
-                signature: .init(parameters: [], result: "Swift.Void"),
-                effects: .init(),
-                contract: .bounded(
-                    kind: .globalFunction,
-                    domain: .application,
-                    access: .pure,
-                    maximumDurationMicroseconds: 500,
-                    allowsMainThread: true
-                )
-            ),
-        ]
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "native import v2 contracts require HLBC format 1.4"
-            )
-        ) {
-            try Bytecode.Encoder.encode(nativeImportModule, formatMinor: 3)
-        }
-        #expect(
-            try Bytecode.Decoder.decode(
-                Bytecode.Encoder.encode(nativeImportModule)
-            ).header.formatMinor == Bytecode.Format.minorVersion
-        )
-
-        var languageExpansionModule = legacyModule
-        languageExpansionModule.compatibility.bytecode = Core.Versions.bytecode
-        languageExpansionModule.functions[0].blocks[0].instructions.insert(
-            .integerConvert(
-                result: .init(rawValue: 0),
-                operation: .reinterpret,
-                value: .init(rawValue: 0)
-            ),
-            at: 0
-        )
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "conversion, String predicate, and Array update instructions require HLBC format 1.5"
-            )
-        ) {
-            try Bytecode.Encoder.encode(languageExpansionModule, formatMinor: 4)
-        }
-        #expect(
-            try Bytecode.Decoder.decode(
-                Bytecode.Encoder.encode(languageExpansionModule, formatMinor: 5)
-            ).header.formatMinor == 5
-        )
-
-        var dishonestCompatibility = try makeAddModule()
-        dishonestCompatibility.compatibility.bytecode = .init(1, 2, 0)
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "HLBC format 1.11 exceeds declared bytecode compatibility 1.2.0"
-            )
-        ) {
-            try Bytecode.Encoder.encode(dishonestCompatibility)
+            try Bytecode.Encoder.encode(incompatible)
         }
     }
 
-    @Test("HLBC 1.6 canonically carries module-local nominal definitions")
+    @Test("HLBC 1.0 canonically carries module-local nominal definitions")
     func localNominalWireFormat() throws {
         let key = Bytecode.LocalTypeKey(rawValue: "Fixture.Mode")
         let auxiliaryKey = Bytecode.LocalTypeKey(rawValue: "Fixture.Auxiliary")
@@ -332,13 +99,6 @@ struct Container {
             at: 0
         )
 
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "local nominal values and structured errors require HLBC format 1.6"
-            )
-        ) {
-            try Bytecode.Encoder.encode(module, formatMinor: 5)
-        }
         let bytes = try Bytecode.Encoder.encode(module)
         let decoded = try Bytecode.Decoder.decode(bytes)
         var canonicalModule = module
@@ -349,7 +109,7 @@ struct Container {
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
     }
 
-    @Test("HLBC 1.11 canonically carries local classes and bounded host descriptors")
+    @Test("HLBC 1.0 canonically carries local classes and bounded host descriptors")
     func localClassWireFormat() throws {
         let key = Bytecode.LocalTypeKey(rawValue: "Fixture.Controller")
         let superclass = Core.TypeID.derive(
@@ -409,13 +169,6 @@ struct Container {
             ),
         ], at: 0)
 
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "local and hosted classes require HLBC format 1.11"
-            )
-        ) {
-            try Bytecode.Encoder.encode(module, formatMinor: 10)
-        }
         let bytes = try Bytecode.Encoder.encode(module)
         let decoded = try Bytecode.Decoder.decode(bytes)
 
@@ -424,7 +177,7 @@ struct Container {
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
     }
 
-    @Test("HLBC 1.7 canonically carries address operations and call conventions")
+    @Test("HLBC 1.0 canonically carries address operations and call conventions")
     func addressWireFormat() throws {
         var module = try makeAddModule()
         module.capabilities.formUnion([.addressValuesV1, .borrowCallsV1])
@@ -487,60 +240,7 @@ struct Container {
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
     }
 
-    @Test("HLBC 1.6 cannot encode address or borrowed-call contracts")
-    func addressWireFormatIsVersionGated() throws {
-        var capabilityModule = try makeAddModule()
-        capabilityModule.capabilities.insert(.addressValuesV1)
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "address values and borrowed calls require HLBC format 1.7"
-            )
-        ) {
-            try Bytecode.Encoder.encode(capabilityModule, formatMinor: 6)
-        }
-
-        var conventionModule = try makeAddModule()
-        conventionModule.functions[0].parameterConventions = [.borrowed]
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "address values and borrowed calls require HLBC format 1.7"
-            )
-        ) {
-            try Bytecode.Encoder.encode(conventionModule, formatMinor: 6)
-        }
-
-        var typeModule = try makeAddModule()
-        typeModule.functions[0].registerTypes.append(.address(.int64))
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "address value types require HLBC format 1.7"
-            )
-        ) {
-            try Bytecode.Encoder.encode(typeModule, formatMinor: 6)
-        }
-
-        var instructionModule = try makeAddModule()
-        instructionModule.functions[0].stackSlotTypes = [.int64]
-        instructionModule.functions[0].blocks[0].instructions.insert(
-            .stackAddress(
-                result: .init(rawValue: 0),
-                slot: .init(rawValue: 0)
-            ),
-            at: 0
-        )
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "address and access instructions require HLBC format 1.7"
-            )
-        ) {
-            try Bytecode.Encoder.encode(instructionModule, formatMinor: 6)
-        }
-
-        let legacyBytes = try Bytecode.Encoder.encode(makeAddModule(), formatMinor: 6)
-        #expect(try Bytecode.Decoder.decode(legacyBytes).module == makeAddModule())
-    }
-
-    @Test("HLBC 1.8 canonically carries closure values and function kinds")
+    @Test("HLBC 1.0 canonically carries closure values and function kinds")
     func closureWireFormat() throws {
         var module = try makeAddModule()
         let signature = Bytecode.ClosureSignature(
@@ -606,117 +306,25 @@ struct Container {
             )
         )
 
-        let bytes = try Bytecode.Encoder.encode(module, formatMinor: 8)
+        let bytes = try Bytecode.Encoder.encode(module)
         let decoded = try Bytecode.Decoder.decode(bytes)
 
-        #expect(decoded.header.formatMinor == 8)
+        #expect(decoded.header.formatMinor == Bytecode.Format.minorVersion)
         #expect(decoded.module == module)
-        #expect(try Bytecode.Encoder.encode(decoded.module, formatMinor: 8) == bytes)
+        #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
     }
 
-    @Test("HLBC 1.7 cannot encode closure or specialization contracts")
-    func closureWireFormatIsVersionGated() throws {
-        let signature = Bytecode.ClosureSignature(parameters: [.int64], result: .int64)
-
-        var capabilityModule = try makeAddModule()
-        capabilityModule.capabilities.insert(.closureValuesV1)
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "closure values and compiler specializations require HLBC format 1.8"
-            )
-        ) {
-            try Bytecode.Encoder.encode(capabilityModule, formatMinor: 7)
-        }
-
-        var escapingCapabilityModule = try makeAddModule()
-        escapingCapabilityModule.capabilities.insert(.escapingClosureValuesV1)
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "closure values and compiler specializations require HLBC format 1.8"
-            )
-        ) {
-            try Bytecode.Encoder.encode(escapingCapabilityModule, formatMinor: 7)
-        }
-
-        var kindModule = try makeAddModule()
-        kindModule.functions[0].kind = .concreteSpecialization
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "closure values and compiler specializations require HLBC format 1.8"
-            )
-        ) {
-            try Bytecode.Encoder.encode(kindModule, formatMinor: 7)
-        }
-
-        var typeModule = try makeAddModule()
-        typeModule.functions[0].registerTypes.append(.closure(signature))
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "closure value types require HLBC format 1.8"
-            )
-        ) {
-            try Bytecode.Encoder.encode(typeModule, formatMinor: 7)
-        }
-
-        var instructionModule = try makeAddModule()
-        instructionModule.functions[0].blocks[0].instructions.insert(
-            .makeClosure(
-                result: .init(rawValue: 0),
-                function: .init(rawValue: 0),
-                captures: []
-            ),
-            at: 0
-        )
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "closure instructions require HLBC format 1.8"
-            )
-        ) {
-            try Bytecode.Encoder.encode(instructionModule, formatMinor: 7)
-        }
-    }
-
-    @Test("HLBC 1.9 canonically gates the non-suspending async entry ABI")
+    @Test("HLBC 1.0 canonically carries the non-suspending async entry ABI")
     func asyncLeafWireFormat() throws {
         var module = try makeAddModule()
         module.capabilities.insert(.asyncLeafEntriesV1)
         module.functions[0].effects.isAsync = true
 
-        let bytes = try Bytecode.Encoder.encode(module, formatMinor: 9)
+        let bytes = try Bytecode.Encoder.encode(module)
         let decoded = try Bytecode.Decoder.decode(bytes)
-        #expect(decoded.header.formatMinor == 9)
+        #expect(decoded.header.formatMinor == Bytecode.Format.minorVersion)
         #expect(decoded.module == module)
-        #expect(
-            try Bytecode.Encoder.encode(decoded.module, formatMinor: 9) == bytes
-        )
-
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "non-suspending async entries require HLBC format 1.9"
-            )
-        ) {
-            try Bytecode.Encoder.encode(module, formatMinor: 8)
-        }
-
-        var capabilityOnly = try makeAddModule()
-        capabilityOnly.capabilities.insert(.asyncLeafEntriesV1)
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "non-suspending async entries require HLBC format 1.9"
-            )
-        ) {
-            try Bytecode.Encoder.encode(capabilityOnly, formatMinor: 8)
-        }
-
-        var effectOnly = try makeAddModule()
-        effectOnly.functions[0].effects.isAsync = true
-        #expect(
-            throws: Bytecode.CodecError.invalidHeader(
-                "non-suspending async entries require HLBC format 1.9"
-            )
-        ) {
-            try Bytecode.Encoder.encode(effectOnly, formatMinor: 8)
-        }
+        #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
     }
 
     @Test("Any post-encode mutation invalidates the image hash")

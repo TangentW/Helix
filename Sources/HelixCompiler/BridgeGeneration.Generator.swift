@@ -1521,7 +1521,7 @@ public struct Generator: Sendable {
                   $0 == "_" || isValidSwiftIdentifier($0)
               }),
               !record.effects.isAsync,
-              record.capability == .nativeImportsV2,
+              record.capability == .nativeImportsV1,
               record.contract.domain == .application,
               record.contract.execution.deadlineMode == .bounded
         else {
@@ -1607,7 +1607,7 @@ public struct Generator: Sendable {
             }
         case .instanceSetter:
             guard record.contract.kind == .instanceSetter,
-                  record.effectiveABIAdapter == .direct,
+                  record.abiAdapter == .direct,
                   let owner = generated.ownerType,
                   isValidGeneratedSwiftTypeSpelling(owner),
                   generated.argumentLabels == ["_"],
@@ -1621,7 +1621,7 @@ public struct Generator: Sendable {
             }
         case .instanceValueSetter:
             guard record.contract.kind == .instanceSetter,
-                  record.effectiveABIAdapter == .mutatingValueReceiver,
+                  record.abiAdapter == .mutatingValueReceiver,
                   let owner = generated.ownerType,
                   isValidGeneratedSwiftTypeSpelling(owner),
                   generated.argumentLabels == ["_"],

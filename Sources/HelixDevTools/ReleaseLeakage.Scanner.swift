@@ -59,9 +59,8 @@ public struct Report: Codable, Hashable, Sendable {
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         findings = try container.decode([ReleaseLeakage.Finding].self, forKey: .findings)
-        if let encodedPassed = try container.decodeIfPresent(Bool.self, forKey: .passed),
-           encodedPassed != passed
-        {
+        let encodedPassed = try container.decode(Bool.self, forKey: .passed)
+        if encodedPassed != passed {
             throw DecodingError.dataCorruptedError(
                 forKey: .passed,
                 in: container,

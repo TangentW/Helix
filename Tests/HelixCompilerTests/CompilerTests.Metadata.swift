@@ -5,7 +5,7 @@ extension CompilerTests {
 @Suite("Compiler metadata")
 struct Metadata {
     @Test func moduleHasVersion() {
-        #expect(Compiler.Metadata.version.major == 0)
+        #expect(Compiler.Metadata.version == .init(1, 0, 0))
     }
 
     @Test("Swift symbol module identity is bounded and fail-closed")
