@@ -22,11 +22,7 @@ struct RootView: View {
             CandidatePicker(model: model)
         }
         .alert(item: $model.notice) { notice in
-            Alert(
-                title: Text(notice.title),
-                message: Text(notice.message),
-                dismissButton: .default(Text("OK"))
-            )
+            alert(for: notice)
         }
         .toolbar {
             ToolbarItemGroup {
@@ -36,6 +32,24 @@ struct RootView: View {
                 }
             }
         }
+    }
+
+    private func alert(for notice: Notice) -> Alert {
+        guard let recovery = notice.recovery else {
+            return Alert(
+                title: Text(notice.title),
+                message: Text(notice.message),
+                dismissButton: .default(Text("OK"))
+            )
+        }
+        return Alert(
+            title: Text(notice.title),
+            message: Text(notice.message),
+            primaryButton: .default(Text("Retry")) {
+                model.recover(recovery)
+            },
+            secondaryButton: .cancel(Text("Dismiss"))
+        )
     }
 
     private var sidebar: some View {

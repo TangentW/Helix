@@ -34,6 +34,32 @@ public struct ContextStore: Sendable {
 
     /// Loads and validates a snapshot, or returns an empty list when absent.
     public func load() throws -> [DevSession.BuildContext] {
+        guard let document = try loadDocument() else { return [] }
+        try document.validate()
+        return document.contexts
+    }
+
+    /// Removes only Build Contexts written by the obsolete pre-release
+    /// protocols, then atomically persists the remaining current contexts.
+    /// Unknown versions and malformed current data still fail closed.
+    func loadRecoveringObsoleteProtocols() throws -> [DevSession.BuildContext] {
+        guard var document = try loadDocument() else { return [] }
+        try document.validateEnvelope()
+        let originalCount = document.contexts.count
+        document.contexts.removeAll {
+            Self.obsoletePreReleaseProtocolVersions.contains(
+                $0.shellIdentity.build.protocolVersion
+            )
+        }
+        try document.validate()
+        guard document.contexts.count != originalCount else { return document.contexts }
+
+        let retained = document.contexts.sorted(by: Document.newestFirst)
+        try save(retained)
+        return retained
+    }
+
+    private func loadDocument() throws -> Document? {
         let data: Data
         do {
             data = try SecureStorage.OwnerFile.read(
@@ -41,7 +67,7 @@ public struct ContextStore: Sendable {
                 maximumBytes: Self.maximumDocumentBytes
             )
         } catch SecureStorage.OwnerFile.Error.unavailable {
-            return []
+            return nil
         } catch SecureStorage.OwnerFile.Error.tooLarge {
             throw DevSession.ContextError.documentTooLarge
         } catch {
@@ -50,9 +76,7 @@ public struct ContextStore: Sendable {
             )
         }
         do {
-            let document = try JSONDecoder().decode(Document.self, from: data)
-            try document.validate()
-            return document.contexts
+            return try JSONDecoder().decode(Document.self, from: data)
         } catch let error as DevSession.ContextError {
             throw error
         } catch {
@@ -87,16 +111,25 @@ public struct ContextStore: Sendable {
         var contexts: [DevSession.BuildContext]
 
         func validate() throws {
-            guard schemaVersion == Self.currentSchemaVersion,
-                  contexts.count <= 4_096,
-                  Set(contexts.map(\.shellIdentity.shellID)).count == contexts.count,
+            try validateEnvelope()
+            guard Set(contexts.map(\.shellIdentity.shellID)).count == contexts.count,
                   Set(contexts.map(\.shellIdentity.build)).count == contexts.count
             else {
                 throw DevSession.ContextError.invalidDocument(
-                    "schema, count, or exact-build uniqueness is invalid"
+                    "shell or exact-build uniqueness is invalid"
                 )
             }
             try contexts.forEach { try $0.validate() }
+        }
+
+        func validateEnvelope() throws {
+            guard schemaVersion == Self.currentSchemaVersion,
+                  contexts.count <= 4_096
+            else {
+                throw DevSession.ContextError.invalidDocument(
+                    "schema or count is invalid"
+                )
+            }
         }
 
         static func newestFirst(
@@ -108,5 +141,9 @@ public struct ContextStore: Sendable {
                 < rhs.shellIdentity.shellID.rawValue.uuidString
         }
     }
+
+    // These identifiers shipped only in local pre-release builds. Their
+    // exact-build identities cannot be relabeled as protocol 1 safely.
+    private static let obsoletePreReleaseProtocolVersions: Set<UInt16> = [2, 3]
 }
 }

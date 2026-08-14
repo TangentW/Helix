@@ -174,6 +174,55 @@ struct ContextRegistry {
         #expect(data == reencoded)
     }
 
+    @Test("Startup recovery discards only obsolete protocol 2 and 3 contexts")
+    func obsoleteProtocolRecovery() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HelixContextRecovery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("BuildContexts.json")
+        let store = DevSession.ContextStore(url: url)
+        let current = try makeContext(index: 1, registeredAt: 100)
+        var obsoleteTwo = try makeContext(index: 2, registeredAt: 200)
+        obsoleteTwo.shellIdentity.build.protocolVersion = 2
+        var obsoleteThree = try makeContext(index: 3, registeredAt: 300)
+        obsoleteThree.shellIdentity.build.protocolVersion = 3
+        try store.save([current])
+        try writeContextDocument(
+            [obsoleteThree, obsoleteTwo, current],
+            to: url
+        )
+
+        #expect(throws: DevProtocol.Error.malformedMessage(
+            "peer build identity is invalid"
+        )) {
+            _ = try store.load()
+        }
+        let recovery = try store.loadRecoveringObsoleteProtocols()
+        #expect(recovery == [current])
+        #expect(try store.load() == [current])
+    }
+
+    @Test("Startup recovery leaves unknown protocol versions untouched and fails closed")
+    func unknownProtocolRecovery() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HelixContextUnknown-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("BuildContexts.json")
+        let store = DevSession.ContextStore(url: url)
+        var unknown = try makeContext(index: 4, registeredAt: 400)
+        unknown.shellIdentity.build.protocolVersion = 4
+        try store.save([try makeContext(index: 1, registeredAt: 100)])
+        try writeContextDocument([unknown], to: url)
+        let original = try Data(contentsOf: url)
+
+        #expect(throws: DevProtocol.Error.malformedMessage(
+            "peer build identity is invalid"
+        )) {
+            _ = try store.loadRecoveringObsoleteProtocols()
+        }
+        #expect(try Data(contentsOf: url) == original)
+    }
+
     @Test("Context persistence rejects broad permissions and symbolic links")
     func persistenceSecurity() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -279,6 +328,21 @@ private func makeContext(
     )
     try context.validate()
     return context
+}
+
+private func writeContextDocument(
+    _ contexts: [DevSession.BuildContext],
+    to url: URL
+) throws {
+    struct StoredDocument: Encodable {
+        var schemaVersion: UInt16 = 1
+        var contexts: [DevSession.BuildContext]
+    }
+
+    let data = try Core.CanonicalJSON.encode(
+        StoredDocument(contexts: contexts)
+    )
+    try data.write(to: url)
 }
 
 private func expectContextError(

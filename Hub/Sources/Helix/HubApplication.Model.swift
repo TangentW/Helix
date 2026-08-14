@@ -6,13 +6,18 @@ import HelixHubCore
 import UniformTypeIdentifiers
 
 extension HubApplication {
-struct Notice: Identifiable {
-    enum Kind { case information, error }
+struct Notice: Equatable, Identifiable {
+    enum Kind: Equatable { case information, error }
+    enum Recovery: Equatable {
+        case retryService
+        case retryPairingCode
+    }
 
     var id = UUID()
     var kind: Kind
     var title: String
     var message: String
+    var recovery: Recovery? = nil
 }
 
 @MainActor
@@ -25,12 +30,27 @@ final class Model: ObservableObject {
     @Published var isWorking = false
     @Published var operationLabel: String?
     @Published var notice: Notice?
+    @Published private(set) var isStartingService = false
     @Published private(set) var isRotatingPairingCode = false
 
     private var store: Hub.ProjectStore?
-    private var service: Hub.ServiceController?
+    private var service: (any ServiceControlling)?
     private var refreshTask: Task<Void, Never>?
-    private var didStart = false
+    private var didInitialize = false
+    private let projectStoreFactory: () throws -> Hub.ProjectStore
+    private let serviceFactory: () throws -> any ServiceControlling
+
+    init(
+        projectStoreFactory: @escaping () throws -> Hub.ProjectStore = {
+            try Hub.ProjectStore.applicationSupport()
+        },
+        serviceFactory: @escaping () throws -> any ServiceControlling = {
+            try ServiceClient()
+        }
+    ) {
+        self.projectStoreFactory = projectStoreFactory
+        self.serviceFactory = serviceFactory
+    }
 
     var selectedProject: Hub.ProjectRecord? {
         projects.first { $0.id == selectedProjectID }
@@ -63,39 +83,117 @@ final class Model: ObservableObject {
     }
 
     func run() async {
-        guard !didStart else { return }
-        didStart = true
+        guard !didInitialize else { return }
+        didInitialize = true
         do {
-            store = try Hub.ProjectStore.applicationSupport()
+            store = try projectStoreFactory()
             await reloadProjects()
         } catch {
             present(error, title: "Project Registry Unavailable")
         }
+        await startService()
+    }
+
+    func retryService() async {
+        await startService()
+    }
+
+    func recover(_ recovery: Notice.Recovery) {
+        switch recovery {
+        case .retryService:
+            Task { await retryService() }
+        case .retryPairingCode:
+            Task { await retryPairingCode() }
+        }
+    }
+
+    func dismissNotice(id: UUID) {
+        guard notice?.id == id else { return }
+        notice = nil
+    }
+
+    private func startService() async {
+        guard !isStartingService, !isRotatingPairingCode else { return }
+        isStartingService = true
+        operationLabel = "Starting the Helix service…"
+        await stopRefreshLoop()
+        if let service { await service.stop() }
+        service = nil
+        serviceState = nil
+        defer { isStartingService = false }
+
         do {
-            let controller = try Hub.ServiceController()
-            service = controller
-            serviceState = try await controller.start()
-            try await synchronizePairingCode(forceRotation: false)
+            let client = try serviceFactory()
+            do {
+                serviceState = try await client.start()
+            } catch {
+                await client.stop()
+                throw error
+            }
+            service = client
         } catch {
-            present(error, title: "Helix Service Could Not Start")
+            operationLabel = "Helix service is offline."
+            present(
+                error,
+                title: "Helix Service Could Not Start",
+                recovery: .retryService
+            )
+            return
         }
 
+        do {
+            try await synchronizePairingCode(forceRotation: false)
+            operationLabel = "Helix service is ready."
+            if notice?.recovery == .retryService {
+                notice = nil
+            }
+        } catch {
+            operationLabel = "Helix service is running, but pairing needs attention."
+            present(
+                error,
+                title: "Pairing Code Could Not Be Created",
+                recovery: .retryPairingCode
+            )
+        }
+        startRefreshLoop()
+    }
+
+    private func startRefreshLoop() {
+        guard refreshTask == nil else { return }
         refreshTask = Task { [weak self] in
             await self?.refreshLoop()
         }
+    }
+
+    private func stopRefreshLoop() async {
+        guard let refreshTask else { return }
+        refreshTask.cancel()
+        // Prevent an in-flight refresh from publishing state while another
+        // operation replaces the controller or its pairing code.
+        await refreshTask.value
+        self.refreshTask = nil
     }
 
     private func refreshLoop() async {
         while !Task.isCancelled {
             do {
                 try await Task.sleep(for: .seconds(1))
-                if service != nil, !isRotatingPairingCode {
+                if service != nil,
+                   !isRotatingPairingCode,
+                   notice?.recovery != .retryPairingCode {
                     try await synchronizePairingCode(forceRotation: false)
                 }
             } catch is CancellationError {
                 break
             } catch {
-                operationLabel = "Service refresh failed: \(Self.message(error))"
+                serviceState = nil
+                operationLabel = "Helix service needs attention."
+                present(
+                    error,
+                    title: "Helix Service Needs Attention",
+                    recovery: .retryService
+                )
+                break
             }
         }
     }
@@ -218,19 +316,41 @@ final class Model: ObservableObject {
     }
 
     func rotatePairingCode() {
-        guard service != nil, !isRotatingPairingCode else { return }
+        Task { await replacePairingCode() }
+    }
+
+    func retryPairingCode() async {
+        await replacePairingCode()
+    }
+
+    private func replacePairingCode() async {
+        guard service != nil,
+              !isStartingService,
+              !isRotatingPairingCode
+        else { return }
         isRotatingPairingCode = true
+        await stopRefreshLoop()
+        defer {
+            isRotatingPairingCode = false
+            startRefreshLoop()
+        }
         if var state = serviceState {
             state.manualInvitations = []
             serviceState = state
         }
-        Task {
-            defer { isRotatingPairingCode = false }
-            do {
-                try await synchronizePairingCode(forceRotation: true)
-            } catch {
-                present(error, title: "Pairing Code Could Not Be Created")
+        do {
+            try await synchronizePairingCode(forceRotation: true)
+            operationLabel = "Pairing code is ready."
+            if notice?.recovery == .retryPairingCode {
+                notice = nil
             }
+        } catch {
+            operationLabel = "Helix service is running, but pairing needs attention."
+            present(
+                error,
+                title: "Pairing Code Could Not Be Created",
+                recovery: .retryPairingCode
+            )
         }
     }
 
@@ -310,9 +430,12 @@ final class Model: ObservableObject {
         guard let service else { return }
         let projectURL = selectedProject?.projectURL
         var state = try await service.refresh(projectURL: projectURL)
+        try Task.checkCancellation()
         if forceRotation || !state.currentInvitationMatches(projectURL: projectURL) {
             _ = try await service.rotatePairingCode(projectURL: projectURL)
+            try Task.checkCancellation()
             state = try await service.refresh(projectURL: projectURL)
+            try Task.checkCancellation()
         }
         serviceState = state
     }
@@ -324,11 +447,16 @@ final class Model: ObservableObject {
         return "Project files were configured. Complete the \(result.requirements.count) code-level action(s) shown in Helix before running the App."
     }
 
-    private func present(_ error: any Swift.Error, title: String) {
+    private func present(
+        _ error: any Swift.Error,
+        title: String,
+        recovery: Notice.Recovery? = nil
+    ) {
         notice = .init(
             kind: .error,
             title: title,
-            message: Self.message(error)
+            message: Self.message(error),
+            recovery: recovery
         )
     }
 

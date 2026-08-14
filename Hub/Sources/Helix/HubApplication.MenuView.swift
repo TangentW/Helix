@@ -22,6 +22,14 @@ struct MenuView: View {
                 Spacer()
             }
             PairingCard(model: model, compact: true)
+            if let notice = model.notice {
+                NoticeCard(
+                    notice: notice,
+                    isRecovering: isRecovering(notice.recovery),
+                    recover: model.recover,
+                    dismiss: model.dismissNotice
+                )
+            }
             if !model.projects.isEmpty {
                 Picker("Pair for project", selection: Binding(
                     get: { model.selectedProjectID },
@@ -54,7 +62,7 @@ struct MenuView: View {
             }
             Divider()
             HStack {
-                Text(model.serviceState?.mode.rawValue.capitalized ?? "Starting")
+                Text(serviceStatus)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -68,13 +76,16 @@ struct MenuView: View {
         .padding(14)
         .frame(width: 340)
         .task { await model.run() }
-        .alert(item: $model.notice) { notice in
-            Alert(
-                title: Text(notice.title),
-                message: Text(notice.message),
-                dismissButton: .default(Text("OK"))
-            )
-        }
+    }
+
+    private var serviceStatus: String {
+        if model.isStartingService { return "Starting" }
+        return model.serviceState?.mode.rawValue.capitalized ?? "Offline"
+    }
+
+    private func isRecovering(_ recovery: Notice.Recovery?) -> Bool {
+        recovery != nil
+            && (model.isStartingService || model.isRotatingPairingCode)
     }
 }
 }

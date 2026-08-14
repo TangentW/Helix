@@ -180,7 +180,8 @@ public actor Service {
         let identityStore = try NetworkTransport.HostIdentityStore.applicationSupportStore()
         let contextStore = try DevSession.ContextStore.applicationSupportStore()
         let rendezvousStore = try HubControl.RendezvousStore.applicationSupportStore()
-        let registry = try DevSession.ContextRegistry(contexts: contextStore.load())
+        let contexts = try contextStore.loadRecoveringObsoleteProtocols()
+        let registry = try DevSession.ContextRegistry(contexts: contexts)
         let authority = try Pairing.Authority(configuration: authorityConfiguration)
         let broker = DevSession.ConnectionBroker(registry: registry, authority: authority)
         let sessionServer = DevSession.SessionHostPool { event in

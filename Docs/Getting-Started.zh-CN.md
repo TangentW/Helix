@@ -105,6 +105,10 @@ Hot Patch 与 Live Reload 必须使用不同 App target。Release target 只能�
 
 生成的 Xcode dispatcher 会从 owner-only Service rendezvous 文件找到正在运行的 Helix 发布的精确 `helix` helper；打包后的 App 把 helper 放在 `Contents/Helpers`。普通工程无需设置 `HELIX_EXECUTABLE`，也不依赖 shell `PATH`。
 
+本地 Dev Protocol 与 Service rendezvous schema 现在统一为版本 1。旧的预发布标识 2、3 已废弃，不是兼容版本。Helix 启动时只会原子清除带这些标识的 Build Context 缓存；Xcode 会在下一次已配置的构建中重新生成它们。Host Identity、已注册工程和工程文件都不会被修改。仍在发布废弃 rendezvous schema 的旧进程必须先退出，之后才能重试。
+
+Service 与配对错误会直接显示在状态栏面板内，不再用独立告警弹窗抢走面板焦点。修正提示的问题后可点击 **Retry**；重试不会终止独立启动的 headless service。
+
 ## 7. 理解生成的 Xcode 生命周期
 
 | 工作流 | Xcode 位置 | 用途 |

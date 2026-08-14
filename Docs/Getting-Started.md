@@ -155,6 +155,18 @@ the running service in an owner-only rendezvous file. A packaged Helix app ships
 that helper inside `Contents/Helpers`. Normal projects need neither
 `HELIX_EXECUTABLE` nor a shell `PATH` edit.
 
+The local Dev Protocol and service-rendezvous schema use version 1. The old
+pre-release identifiers 2 and 3 are not supported compatibility versions. On
+startup Helix atomically discards only Build Context cache entries carrying
+those identifiers, and Xcode recreates them during the next configured build.
+Host identity, registered projects, and project files are preserved. A running
+process that still publishes an obsolete rendezvous must be quit before retrying.
+
+Service and pairing failures are shown inline in the status-bar panel, so the
+panel does not disappear behind a separate alert. Use **Retry** after correcting
+the reported condition; retrying never terminates an independently launched
+headless service.
+
 ## 7. Understand the generated Xcode lifecycle
 
 | Workflow | Xcode location | Purpose |

@@ -3,6 +3,67 @@ import SwiftUI
 import HelixHubCore
 
 extension HubApplication {
+struct NoticeCard: View {
+    var notice: Notice
+    var isRecovering: Bool
+    var recover: (Notice.Recovery) -> Void
+    var dismiss: (UUID) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: icon)
+                    .foregroundStyle(color)
+                    .accessibilityHidden(true)
+                Text(notice.title)
+                    .font(.subheadline.weight(.semibold))
+                Spacer(minLength: 8)
+                Button("Dismiss", systemImage: "xmark") {
+                    dismiss(notice.id)
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.plain)
+            }
+            Text(notice.message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(5)
+                .fixedSize(horizontal: false, vertical: true)
+            if let recovery = notice.recovery {
+                HStack {
+                    Spacer()
+                    Button("Retry", systemImage: "arrow.clockwise") {
+                        recover(recovery)
+                    }
+                    .disabled(isRecovering)
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .padding(11)
+        .background(color.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(color.opacity(0.24))
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var icon: String {
+        switch notice.kind {
+        case .information: "info.circle.fill"
+        case .error: "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var color: Color {
+        switch notice.kind {
+        case .information: .blue
+        case .error: .orange
+        }
+    }
+}
+
 struct PairingCard: View {
     @ObservedObject var model: Model
     var compact = false
@@ -11,7 +72,7 @@ struct PairingCard: View {
         VStack(alignment: .leading, spacing: compact ? 8 : 12) {
             HStack {
                 StatusDot(active: model.serviceIsRunning)
-                Text(model.serviceIsRunning ? "Helix is ready" : "Helix is offline")
+                Text(statusTitle)
                     .font(.headline)
                 Spacer()
                 Text("\(model.connectedAppCount) connected")
@@ -55,17 +116,51 @@ struct PairingCard: View {
                     }
                 }
                 .buttonStyle(.borderless)
+            } else if let recovery = pairingRecovery {
+                HStack {
+                    Label(
+                        recovery == .retryService
+                            ? "Service unavailable" : "Pairing code unavailable",
+                        systemImage: "exclamationmark.circle.fill"
+                    )
+                    .foregroundStyle(.secondary)
+                    Spacer()
+                    if model.notice?.recovery == nil {
+                        Button("Retry", systemImage: "arrow.clockwise") {
+                            model.recover(recovery)
+                        }
+                        .disabled(
+                            model.isStartingService || model.isRotatingPairingCode
+                        )
+                    }
+                }
             } else {
                 HStack {
                     ProgressView()
                         .controlSize(.small)
-                    Text("Creating a secure four-character code…")
+                    Text(progressLabel)
                         .foregroundStyle(.secondary)
                 }
             }
         }
         .padding(compact ? 12 : 16)
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var statusTitle: String {
+        if model.isStartingService { return "Helix is starting" }
+        return model.serviceIsRunning ? "Helix is ready" : "Helix is offline"
+    }
+
+    private var pairingRecovery: Notice.Recovery? {
+        guard !model.isStartingService, !model.isRotatingPairingCode else { return nil }
+        return model.serviceIsRunning ? .retryPairingCode : .retryService
+    }
+
+    private var progressLabel: String {
+        model.isStartingService
+            ? "Starting the local service…"
+            : "Creating a secure four-character code…"
     }
 
     private static func remaining(_ expiry: Date, at date: Date) -> String {
