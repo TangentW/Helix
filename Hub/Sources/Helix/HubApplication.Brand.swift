@@ -1,4 +1,5 @@
 #if os(macOS)
+import AppKit
 import SwiftUI
 
 extension HubApplication {
@@ -11,80 +12,121 @@ static let azure = Color(red: 23.0 / 255.0, green: 107.0 / 255.0, blue: 1)
 static let coral = Color(red: 1, green: 107.0 / 255.0, blue: 87.0 / 255.0)
 
 struct Mark: View {
-    enum Style: Equatable {
-        case color
-        case template
-    }
-
-    var style: Style = .color
-    var disconnected = false
-
     var body: some View {
         Canvas { context, size in
-            let scale = min(size.width / 512, size.height / 320)
-            let transform = CGAffineTransform(
-                translationX: (size.width - 512 * scale) / 2,
-                y: (size.height - 320 * scale) / 2
-            ).scaledBy(x: scale, y: scale)
-            let lineWidth = 54 * scale
+            let drawing = Self.drawingTransform(for: size)
 
             func stroke(_ path: Path, color: Color) {
                 context.stroke(
-                    path.applying(transform),
+                    path.applying(drawing.transform),
                     with: .color(color),
-                    style: StrokeStyle(lineWidth: lineWidth, lineCap: .butt)
+                    style: StrokeStyle(
+                        lineWidth: drawing.lineWidth,
+                        lineCap: .butt
+                    )
                 )
             }
 
             func terminal(_ point: CGPoint, color: Color) {
-                let bounds = CGRect(
-                    x: point.x - 27,
-                    y: point.y - 27,
-                    width: 54,
-                    height: 54
-                )
                 context.fill(
-                    Path(ellipseIn: bounds).applying(transform),
+                    Path(ellipseIn: Self.terminalBounds(at: point))
+                        .applying(drawing.transform),
                     with: .color(color)
                 )
             }
 
-            let rearColor = style == .template
-                ? Color.primary : HubApplication.Brand.navy
-            let frontColor = style == .template
-                ? Color.primary : HubApplication.Brand.azure
-            let patchColor = style == .template
-                ? Color.primary : HubApplication.Brand.coral
+            let rearColor = HubApplication.Brand.navy
+            let frontColor = HubApplication.Brand.azure
+            let patchColor = HubApplication.Brand.coral
 
-            stroke(
-                style == .template ? Self.templateRearLeading : Self.rearLeading,
-                color: rearColor
-            )
-            if disconnected {
-                let offsetPatch = Self.templatePatch.applying(
-                    CGAffineTransform(translationX: 12, y: 20)
-                )
-                stroke(offsetPatch, color: patchColor)
-            } else {
-                stroke(
-                    style == .template ? Self.templatePatch : Self.patch,
-                    color: patchColor
-                )
-            }
-            stroke(
-                style == .template ? Self.templateRearTrailing : Self.rearTrailing,
-                color: style == .template ? rearColor : HubApplication.Brand.azure
-            )
+            stroke(Self.rearLeading, color: rearColor)
+            stroke(Self.patch, color: patchColor)
+            stroke(Self.rearTrailing, color: HubApplication.Brand.azure)
             stroke(Self.front, color: frontColor)
             terminal(CGPoint(x: 72, y: 102), color: rearColor)
             terminal(
                 CGPoint(x: 440, y: 225),
-                color: style == .template ? rearColor : HubApplication.Brand.azure
+                color: HubApplication.Brand.azure
             )
             terminal(CGPoint(x: 72, y: 225), color: frontColor)
             terminal(CGPoint(x: 440, y: 102), color: frontColor)
         }
         .aspectRatio(512.0 / 320.0, contentMode: .fit)
+    }
+
+    // MenuBarExtra can reserve a Canvas label's layout without transferring
+    // its pixels to the status item. Hand AppKit an image-backed alpha mask.
+    static func statusItemImage(disconnected: Bool) -> NSImage {
+        let image = NSImage(size: statusItemSize, flipped: true) { bounds in
+            guard let context = NSGraphicsContext.current?.cgContext else {
+                return false
+            }
+
+            let drawing = Self.drawingTransform(for: bounds.size)
+            context.saveGState()
+            defer { context.restoreGState() }
+            context.setShouldAntialias(true)
+            context.setStrokeColor(NSColor.black.cgColor)
+            context.setFillColor(NSColor.black.cgColor)
+            context.setLineWidth(drawing.lineWidth)
+            context.setLineCap(.butt)
+
+            for path in Self.templateStrokePaths(disconnected: disconnected) {
+                context.addPath(path.applying(drawing.transform).cgPath)
+                context.strokePath()
+            }
+            for point in Self.terminalPoints {
+                context.addPath(
+                    Path(ellipseIn: Self.terminalBounds(at: point))
+                        .applying(drawing.transform)
+                        .cgPath
+                )
+                context.fillPath()
+            }
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
+    private static let statusItemSize = NSSize(width: 22, height: 14)
+    private static let terminalPoints = [
+        CGPoint(x: 72, y: 102),
+        CGPoint(x: 440, y: 225),
+        CGPoint(x: 72, y: 225),
+        CGPoint(x: 440, y: 102),
+    ]
+
+    private static func drawingTransform(
+        for size: CGSize
+    ) -> (transform: CGAffineTransform, lineWidth: CGFloat) {
+        let scale = min(size.width / 512, size.height / 320)
+        let transform = CGAffineTransform(
+            translationX: (size.width - 512 * scale) / 2,
+            y: (size.height - 320 * scale) / 2
+        ).scaledBy(x: scale, y: scale)
+        return (transform, 54 * scale)
+    }
+
+    nonisolated private static func terminalBounds(
+        at point: CGPoint
+    ) -> CGRect {
+        let radius: CGFloat = 27
+        return CGRect(
+            x: point.x - radius,
+            y: point.y - radius,
+            width: radius * 2,
+            height: radius * 2
+        )
+    }
+
+    private static func templateStrokePaths(disconnected: Bool) -> [Path] {
+        let patch = disconnected
+            ? templatePatch.applying(
+                CGAffineTransform(translationX: 12, y: 20)
+            )
+            : templatePatch
+        return [templateRearLeading, patch, templateRearTrailing, front]
     }
 
     private static var rearLeading: Path {

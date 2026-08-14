@@ -9,11 +9,12 @@ struct HelixApplication: App {
         MenuBarExtra {
             HubApplication.MenuView(model: model)
         } label: {
-            HubApplication.Brand.Mark(
-                style: .template,
-                disconnected: !model.serviceIsRunning
+            Image(
+                nsImage: HubApplication.Brand.Mark.statusItemImage(
+                    disconnected: !model.serviceIsRunning
+                )
             )
-            .frame(width: 22, height: 14)
+            .renderingMode(.template)
             .accessibilityLabel(
                 model.serviceIsRunning ? "Helix running" : "Helix offline"
             )
