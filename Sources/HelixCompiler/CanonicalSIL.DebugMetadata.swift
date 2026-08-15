@@ -5,6 +5,7 @@ extension CanonicalSIL {
 struct DebugScope: Hashable, Sendable {
     var id: UInt32
     var location: Core.SourceLocation
+    var parentSymbol: String?
 }
 
 struct DebugLineLocation: Hashable, Sendable {
@@ -21,10 +22,12 @@ enum DebugMetadata {
     private struct RawScope {
         var location: Core.SourceLocation?
         var parentID: UInt32?
+        var parentSymbol: String?
     }
 
     private static let scopeHeaderRegex = makeRegex(#"^sil_scope ([0-9]+) \{"#)
     private static let scopeParentRegex = makeRegex(#"\bparent ([0-9]+)"#)
+    private static let scopeParentSymbolRegex = makeRegex(#"\bparent @([^\s}]+)"#)
     private static let instructionScopeRegex = makeRegex(#",\s*scope\s+([0-9]+)\s*$"#)
     private static let anchoredLocationRegex = makeRegex(
         #"(?:,\s*)?loc\s+(?:\*\s*)?\"((?:\\.|[^\"\\])*)\":([0-9]+):([0-9]+)\s*$"#
@@ -53,7 +56,8 @@ enum DebugMetadata {
             rawScopes[id] = .init(
                 location: try sourceLocation(in: line),
                 parentID: firstCapture(in: line, regex: scopeParentRegex)
-                    .flatMap(UInt32.init)
+                    .flatMap(UInt32.init),
+                parentSymbol: firstCapture(in: line, regex: scopeParentSymbolRegex)
             )
         }
 
@@ -73,7 +77,13 @@ enum DebugMetadata {
             return location
         }
         for id in rawScopes.keys { _ = try resolve(id) }
-        return resolved.map { .init(id: $0.key, location: $0.value) }
+        return resolved.map {
+            .init(
+                id: $0.key,
+                location: $0.value,
+                parentSymbol: rawScopes[$0.key]?.parentSymbol
+            )
+        }
             .sorted { $0.id < $1.id }
     }
 

@@ -62,6 +62,121 @@ struct ImportedFrameworks {
         })
     }
 
+    @Test("Borrowed linear results acquire ownership at the HLBC return boundary")
+    func ownsBorrowedNativeReturn() throws {
+        let viewType = Core.TypeID(rawValue: .sha256("UIKit.UIView"))
+        let loweredType = "@convention(objc_method) (UIView) -> ()"
+        let requirement = importRequirement(id: 27)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: CanonicalSIL.NativeBridgeSymbols.foreignCall(
+                    reference: "#UIView.setNeedsLayout!foreign",
+                    loweredType: loweredType
+                ),
+                parameterTypes: [.native(viewType)],
+                resultType: .void,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            ["UIView": viewType],
+            kinds: [viewType: .reference]
+        )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture6updateySo6UIViewCAF",
+            loweredType: "@convention(thin) (@guaranteed UIView) -> @owned UIView",
+            body: """
+            bb0(%0 : @guaranteed $UIView):
+              %1 = objc_method %0, #UIView.setNeedsLayout!foreign : (UIView) -> () -> (), $\(loweredType)
+              %2 = apply %1(%0) : $\(loweredType)
+              return %0
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+            function,
+            displayName: "Fixture.update",
+            directCalls: calls
+        )
+        let parameter = try #require(lowered.parameterRegisters.first)
+        let returned = try #require(lowered.blocks.flatMap(\.instructions).compactMap {
+            instruction -> Bytecode.Register? in
+            guard case let .returnValue(value) = instruction else { return nil }
+            return value
+        }.first)
+        #expect(returned != parameter)
+        #expect(lowered.blocks.flatMap(\.instructions).contains { instruction in
+            guard case let .copyValue(result, source) = instruction else { return false }
+            return result == returned && source == parameter
+        })
+    }
+
+    @Test("NSError-backed Objective-C throws use the logical NativeImport ABI")
+    func lowersNSErrorBackedThrowingMethod() throws {
+        let fixture = try nsErrorFixture()
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: fixture.environment
+        ).lower(
+            fixture.function,
+            displayName: "Fixture.removeItem",
+            directCalls: fixture.calls,
+            expectedEffects: fixture.effects
+        )
+        let invocation = try #require(lowered.blocks.flatMap(\.instructions).compactMap {
+            instruction -> (Core.NativeImportID, [Bytecode.Register], Bytecode.BlockID,
+                Bytecode.BlockID)? in
+            guard case let .nativeTryApply(id, arguments, normal, error) = instruction
+            else { return nil }
+            return (id, arguments, normal, error)
+        }.first)
+        #expect(invocation.0 == fixture.requirement.id)
+        let argumentTypes = invocation.1.map {
+            lowered.registerTypes[Int($0.rawValue)]
+        }
+        #expect(argumentTypes == [
+            .string,
+            .native(fixture.managerType),
+        ])
+        #expect(invocation.2 == .init(rawValue: 1))
+        #expect(invocation.3 == .init(rawValue: 2))
+        let errorBlock = try #require(lowered.blocks.first { $0.id == invocation.3 })
+        #expect(errorBlock.parameters.count == 1)
+        let errorParameter = try #require(errorBlock.parameters.first)
+        #expect(lowered.registerTypes[Int(errorParameter.rawValue)] == .string)
+        #expect(errorBlock.instructions.contains { instruction in
+            guard case let .throwError(error) = instruction else { return false }
+            return error == errorParameter
+        })
+    }
+
+    @Test("NSError bridge rejects unexpected post-call instructions")
+    func rejectsNSErrorBridgeWithEscapingCompilerState() throws {
+        let fixture = try nsErrorFixture(
+            unexpectedPostCallInstruction: "%99 = integer_literal $Builtin.Int64, 7"
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer(
+                typeEnvironment: fixture.environment
+            ).lower(
+                fixture.function,
+                displayName: "Fixture.removeItem",
+                directCalls: fixture.calls,
+                expectedEffects: fixture.effects
+            )
+        }
+    }
+
+    @Test("Throwing Void SIL cannot impersonate a non-Void logical result")
+    func rejectsNonVoidExpectationForStandaloneErrorResult() {
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer().parseFunctionType(
+                "@convention(thin) () -> @error any Error",
+                bridgingTo: (parameters: [], result: .int64)
+            )
+        }
+    }
+
     @Test("Same-type reference casts support Objective-C superclass lookup")
     func lowersSameTypeReceiverCast() throws {
         let controllerType = Core.TypeID(rawValue: .sha256("Fixture.Controller"))
@@ -809,14 +924,121 @@ struct ImportedFrameworks {
         #expect(first.hasPrefix("$hlx_native_foreign_"))
     }
 
-    private func importRequirement(id: UInt32) -> Bytecode.ImportRequirement {
+    private struct NSErrorFixture {
+        var managerType: Core.TypeID
+        var effects: Core.Effects
+        var requirement: Bytecode.ImportRequirement
+        var calls: CanonicalSIL.DirectCallTable
+        var environment: CanonicalSIL.TypeEnvironment
+        var function: CanonicalSIL.Function
+    }
+
+    private func nsErrorFixture(
+        unexpectedPostCallInstruction: String? = nil
+    ) throws -> NSErrorFixture {
+        let managerType = Core.TypeID(rawValue: .sha256("Foundation.FileManager"))
+        let effects = Core.Effects(
+            mayThrow: true,
+            mayAllocate: true,
+            hasExternalSideEffects: true
+        )
+        let physicalType = "@convention(objc_method) "
+            + "(NSString, Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>, "
+            + "FileManager) -> ObjCBool"
+        let symbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+            reference: "#FileManager.removeItem!foreign",
+            loweredType: physicalType
+        )
+        let requirement = importRequirement(
+            id: 28,
+            effects: effects,
+            kind: .instanceMethod
+        )
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.string, .native(managerType)],
+                resultType: .void,
+                effects: effects,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            ["FileManager": managerType],
+            kinds: [managerType: .reference]
+        )
+        let postCallInstruction = unexpectedPostCallInstruction.map {
+            "\n  \($0)"
+        } ?? ""
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture10removeItemyySo13NSFileManagerC_SStKF",
+            loweredType: "@convention(thin) (@guaranteed FileManager, "
+                + "@guaranteed String) -> @error any Error",
+            body: """
+            bb0(%0 : $FileManager, %1 : $String):
+              %2 = alloc_stack [dynamic_lifetime] $Optional<NSError>
+              inject_enum_addr %2, #Optional.none!enumelt
+              retain_value %1
+              %3 = function_ref @$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF : $@convention(method) (@guaranteed String) -> @owned NSString
+              %4 = apply %3(%1) : $@convention(method) (@guaranteed String) -> @owned NSString
+              release_value %1
+              %5 = objc_method %0, #FileManager.removeItem!foreign : (FileManager) -> (String) throws -> (), $\(physicalType)
+              %6 = alloc_stack $@sil_unmanaged Optional<NSError>
+              %7 = load %2
+              %8 = ref_to_unmanaged %7 to $@sil_unmanaged Optional<NSError>
+              store %8 to %6
+              %9 = address_to_pointer [stack_protection] %6 to $Builtin.RawPointer
+              %10 = struct $AutoreleasingUnsafeMutablePointer<Optional<NSError>> (%9)
+              %11 = enum $Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>, #Optional.some!enumelt, %10
+              %12 = apply %5(%4, %11, %0) : $\(physicalType)\(postCallInstruction)
+              strong_release %4
+              %13 = load %6
+              %14 = unmanaged_to_ref %13 to $Optional<NSError>
+              retain_value %14
+              %15 = mark_dependence %14 on %2
+              %16 = load %2
+              store %15 to %2
+              release_value %16
+              dealloc_stack %6
+              %17 = struct_extract %12, #ObjCBool._value
+              %18 = struct_extract %17, #Bool._value
+              cond_br %18, bb1, bb2
+            bb1:
+              dealloc_stack %2
+              %19 = tuple ()
+              return %19
+            bb2:
+              %20 = load %2
+              %21 = function_ref @$s10Foundation22_convertNSErrorToErrorys0E0_pSo0C0CSgF : $@convention(thin) (@guaranteed Optional<NSError>) -> @owned any Error
+              %22 = apply %21(%20) : $@convention(thin) (@guaranteed Optional<NSError>) -> @owned any Error
+              release_value %20
+              %23 = builtin "willThrow"(%22) : $()
+              dealloc_stack %2
+              throw %22
+            """
+        )
+        return .init(
+            managerType: managerType,
+            effects: effects,
+            requirement: requirement,
+            calls: calls,
+            environment: environment,
+            function: function
+        )
+    }
+
+    private func importRequirement(
+        id: UInt32,
+        effects: Core.Effects = .init(),
+        kind: Core.NativeImportKind = .globalFunction
+    ) -> Bytecode.ImportRequirement {
         .init(
             id: .init(rawValue: id),
             key: .init(rawValue: .sha256("import-\(id)")),
             signature: .init(parameters: [], result: "Swift.Void"),
-            effects: .init(),
+            effects: effects,
             contract: .bounded(
-                kind: .globalFunction,
+                kind: kind,
                 domain: .application,
                 access: .pure,
                 maximumDurationMicroseconds: 500,

@@ -150,10 +150,13 @@ extension FrontendReceipt.Adapter {
                 "stored property \(canonicalCallee) has no Swift accessor identity"
             )
         }
-        let mangledName = "$s" + usr.dropFirst(2)
-        guard let sil = silFile.function(mangledName: mangledName) else {
-            throw FrontendReceipt.Error.missingSILFunction(mangledName)
+        let astMangledName = "$s" + usr.dropFirst(2)
+        guard let sil = try FrontendReceipt.SILFunctionResolver(file: silFile)
+            .function(for: accessor, source: source, baseName: name)
+        else {
+            throw FrontendReceipt.Error.missingSILFunction(astMangledName)
         }
+        let mangledName = sil.mangledName
         let isSetter = dispatch == .instanceSetter
         let parameterSwiftTypes = isSetter
             ? [propertySwiftType, context.canonicalName]

@@ -9,6 +9,7 @@ public struct Function: Hashable, Sendable {
     public var mangledName: String
     public var loweredType: String
     public var body: String
+    public var declarationLocation: Core.SourceLocation?
     var debugLineLocations: [CanonicalSIL.DebugLineLocation]
     var hasStrippedDebugMetadata: Bool
 
@@ -16,6 +17,7 @@ public struct Function: Hashable, Sendable {
         self.mangledName = mangledName
         self.loweredType = loweredType
         self.body = body
+        declarationLocation = nil
         debugLineLocations = []
         hasStrippedDebugMetadata = false
     }
@@ -31,11 +33,13 @@ public struct Function: Hashable, Sendable {
         mangledName: String,
         loweredType: String,
         body: String,
+        declarationLocation: Core.SourceLocation?,
         debugLineLocations: [CanonicalSIL.DebugLineLocation]
     ) {
         self.mangledName = mangledName
         self.loweredType = loweredType
         self.body = body
+        self.declarationLocation = declarationLocation
         self.debugLineLocations = debugLineLocations
         hasStrippedDebugMetadata = true
     }
@@ -46,11 +50,25 @@ public struct File: Sendable {
     public var typeEnvironment: CanonicalSIL.TypeEnvironment
 
     public init(text: String) throws {
+        let scopes = try CanonicalSIL.DebugMetadata.scopes(in: text)
         let scopeLocations = Dictionary(
-            uniqueKeysWithValues: try CanonicalSIL.DebugMetadata.scopes(in: text)
-                .map { ($0.id, $0.location) }
+            uniqueKeysWithValues: scopes.map { ($0.id, $0.location) }
         )
-        functions = try Self.extractFunctions(text, scopeLocations: scopeLocations)
+        var declarationLocations: [String: Core.SourceLocation] = [:]
+        for scope in scopes {
+            guard let symbol = scope.parentSymbol else { continue }
+            if let existing = declarationLocations[symbol], existing != scope.location {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "function @\(symbol) has conflicting declaration locations"
+                )
+            }
+            declarationLocations[symbol] = scope.location
+        }
+        functions = try Self.extractFunctions(
+            text,
+            scopeLocations: scopeLocations,
+            declarationLocations: declarationLocations
+        )
         typeEnvironment = try .init(text: text, functions: functions)
     }
 
@@ -70,7 +88,8 @@ public struct File: Sendable {
 
     private static func extractFunctions(
         _ text: String,
-        scopeLocations: [UInt32: Core.SourceLocation]
+        scopeLocations: [UInt32: Core.SourceLocation],
+        declarationLocations: [String: Core.SourceLocation]
     ) throws -> [CanonicalSIL.Function] {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         let headerRegex = try NSRegularExpression(
@@ -121,6 +140,7 @@ public struct File: Sendable {
                     mangledName: name,
                     loweredType: type,
                     body: normalizedBody,
+                    declarationLocation: declarationLocations[name],
                     debugLineLocations: debugLineLocations
                 )
             )

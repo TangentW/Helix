@@ -40,6 +40,188 @@ struct NativeImportDiscoveryTests {
         ) == "(Bundle.Type, Bundle.Nested?)")
     }
 
+    @Test("Managed SDK probing preserves NSError-backed Swift throws")
+    func discoversManagedSDKNSErrorThrowingMethod() throws {
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let expansion = try FrontendReceipt.ManagedDebugSurface.expand(
+            importedTypes: [
+                .init(
+                    canonicalName: "FileManager",
+                    swiftType: "FileManager",
+                    kind: .reference,
+                    aliases: ["NSFileManager", "__C.NSFileManager"],
+                    representation: .reference,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["Foundation"],
+                    requiresMainActor: false
+                ),
+            ],
+            minimumOS: .init(15),
+            frontend: frontend,
+            invocation: .init(
+                moduleName: "ManagedSDKThrowingFixture",
+                targetTriple: "arm64-apple-ios15.0-simulator",
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: ["-parse-as-library"]
+            )
+        )
+        let fileManagerOperations = expansion.operations.filter {
+            $0.ownerType.contains("FileManager")
+        }
+        let operationNames = fileManagerOperations.map {
+            "\($0.ownerType).\($0.baseName)(\($0.argumentLabels.joined(separator: ":")))"
+        }
+        #expect(operationNames.contains { $0.contains(".removeItem(atPath)") })
+        let removals = fileManagerOperations.filter { $0.baseName == "removeItem" }
+        #expect(removals.count == 1)
+        #expect(removals.first?.dispatch == .instanceMethod)
+        #expect(removals.first?.argumentLabels == ["atPath"])
+        #expect(removals.first?.parameterSwiftTypes == ["Swift.String", "FileManager"])
+        #expect(removals.first?.resultSwiftType == "()")
+        #expect(removals.first?.mayThrow == true)
+    }
+
+    @Test("Imported calls retain NSError-backed Swift throwing ABI")
+    func discoversNSErrorBackedImportedCall() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-nserror-import-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Fixture.swift")
+        let source = """
+        import Foundation
+
+        public func remove(_ manager: FileManager, path: String) throws {
+            try manager.removeItem(atPath: path)
+        }
+        """
+        let contents = Data(source.utf8)
+        try contents.write(to: sourceURL)
+
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: "NSErrorImportFixture",
+            targetTriple: "arm64-apple-ios15.0-simulator",
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library"]
+        )
+        let ast = try frontend.emitTypedAST(
+            sourceFiles: [sourceURL],
+            invocation: invocation
+        )
+        let documents = try FrontendReceipt.TypedAST.parseDocuments(ast)
+        let demangled = try FrontendReceipt.Demangler(
+            compilerURL: frontend.compilerURL
+        ).demangle(FrontendReceipt.TypedAST.mangledTypes(in: documents))
+        let sil = try CanonicalSIL.File(text: frontend.emitCanonicalSIL(
+            sourceFiles: [sourceURL],
+            invocation: invocation
+        ))
+        let state = FrontendReceipt.Adapter.SourceState(
+            logicalPath: "Sources/Fixture.swift",
+            url: sourceURL,
+            contents: contents,
+            contentHash: .sha256(contents)
+        )
+        let surface = try FrontendReceipt.Adapter().discoverImportedOperationSurface(
+            documents: documents,
+            sourcesByPhysicalPath: [
+                sourceURL.resolvingSymlinksInPath().standardizedFileURL.path: state,
+            ],
+            moduleName: invocation.moduleName,
+            demangled: demangled,
+            silFile: sil
+        )
+        let operation = try #require(surface.operations.first {
+            $0.baseName == "removeItem"
+        })
+        #expect(operation.dispatch == .instanceMethod)
+        #expect(operation.argumentLabels == ["atPath"])
+        #expect(operation.parameterSwiftTypes == ["Swift.String", "FileManager"])
+        #expect(operation.resultSwiftType == "()")
+        #expect(operation.mayThrow)
+    }
+
+    @Test("Physical SIL aliases collapse to one deterministic logical import")
+    func canonicalizesPhysicalOperationAliases() throws {
+        func operation(
+            baseName: String,
+            label: String
+        ) -> FrontendReceipt.Adapter.ImportedOperation {
+            .init(
+                silReferences: ["$s8Physical5aliasyS2iF"],
+                sourceFileLogicalID: "Sources/Fixture.swift",
+                importedModules: ["Foundation"],
+                dispatch: .globalFunction,
+                ownerType: "Foundation",
+                baseName: baseName,
+                argumentLabels: [label],
+                parameterSwiftTypes: ["Swift.Int"],
+                resultSwiftType: "Swift.Int",
+                requiresMainActor: false
+            )
+        }
+
+        let declarations = try FrontendReceipt.Adapter()
+            .makeImportedOperationDeclarations(
+                [
+                    operation(baseName: "renamed", label: "value"),
+                    operation(baseName: "alias", label: "_"),
+                ],
+                moduleName: "Fixture",
+                nativeTypes: [:]
+            )
+        let declaration = try #require(declarations.first)
+        #expect(declarations.count == 1)
+        #expect(declaration.mangledName == "$s8Physical5aliasyS2iF")
+        #expect(
+            declaration.canonicalCallee
+                == "Fixture.HelixExternal.Foundation.alias(_:).call"
+        )
+    }
+
+    @Test("Physical SIL aliases reject conflicting logical ABIs")
+    func rejectsConflictingPhysicalOperationAliases() {
+        let common = FrontendReceipt.Adapter.ImportedOperation(
+            silReferences: ["$s8Physical5aliasyS2iF"],
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            importedModules: ["Foundation"],
+            dispatch: .globalFunction,
+            ownerType: "Foundation",
+            baseName: "alias",
+            argumentLabels: ["_"],
+            parameterSwiftTypes: ["Swift.Int"],
+            resultSwiftType: "Swift.Int",
+            requiresMainActor: false
+        )
+        var conflicting = common
+        conflicting.baseName = "conflicting"
+        conflicting.resultSwiftType = "Swift.Bool"
+
+        #expect(throws: FrontendReceipt.Error.self) {
+            _ = try FrontendReceipt.Adapter().makeImportedOperationDeclarations(
+                [common, conflicting],
+                moduleName: "Fixture",
+                nativeTypes: [:]
+            )
+        }
+    }
+
     @Test("Objective-C mangling distinguishes classes from imported C values")
     func distinguishesObjectiveCClassesFromCValues() {
         #expect(
@@ -790,8 +972,8 @@ struct NativeImportDiscoveryTests {
         )
     }
 
-    @Test("Managed Debug prefreezes measured SDK type properties generically")
-    func prefreezesManagedSDKTypeProperties() throws {
+    @Test("Managed Debug prefreezes measured SDK members generically")
+    func prefreezesManagedSDKMembers() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-sdk-properties-\(UUID().uuidString)",
             isDirectory: true
@@ -833,7 +1015,24 @@ struct NativeImportDiscoveryTests {
 
         @MainActor
         public func animationsEnabled(_ baselineView: UIView) -> Bool {
-            return baselineView.isHidden
+            _ = baselineView
+            return false
+        }
+
+        @MainActor
+        public func updateAlpha(_ baselineView: UIView, value: CGFloat) -> CGFloat {
+            _ = baselineView
+            return value
+        }
+
+        @MainActor
+        public func requestLayout(_ baselineView: UIView) -> UIView {
+            return baselineView
+        }
+
+        @MainActor
+        public func updateAnimations(_ enabled: Bool) -> Bool {
+            return enabled
         }
 
         public func selectedBundle(_ baselineBundle: Bundle) -> Bundle {
@@ -844,6 +1043,37 @@ struct NativeImportDiscoveryTests {
             _ baselineProcessInfo: ProcessInfo
         ) -> ProcessInfo {
             return baselineProcessInfo
+        }
+
+        public func resourcePath(
+            _ baselineBundle: Bundle,
+            name: String
+        ) -> String? {
+            _ = baselineBundle
+            _ = name
+            return nil
+        }
+
+        public func selectedCache(_ baselineCache: URLCache) -> URLCache {
+            return baselineCache
+        }
+
+        public func replaceSharedCache(_ baselineCache: URLCache) -> URLCache {
+            return baselineCache
+        }
+
+        public func selectedFileManager(
+            _ baselineManager: FileManager
+        ) -> FileManager {
+            return baselineManager
+        }
+
+        public func removeItem(
+            _ baselineManager: FileManager,
+            path: String
+        ) throws -> String {
+            _ = baselineManager
+            return path
         }
         """
         try Data(baseline.utf8).write(to: sourceURL)
@@ -921,6 +1151,18 @@ struct NativeImportDiscoveryTests {
         #expect(!configuredNames.contains(
             "\(moduleName).HelixExternal.Bundle.main.get"
         ))
+        for name in [
+            "\(moduleName).HelixExternal.UIView.isHidden.get",
+            "\(moduleName).HelixExternal.UIView.alpha.set",
+            "\(moduleName).HelixExternal.UIView.setNeedsLayout().call",
+            "\(moduleName).HelixExternal.UIView.setAnimationsEnabled(_:).call",
+            "\(moduleName).HelixExternal.UIColor.init(white:alpha:)",
+            "\(moduleName).HelixExternal.Bundle.path(forResource:ofType:).call",
+            "\(moduleName).HelixExternal.URLCache.shared.set",
+            "\(moduleName).HelixExternal.FileManager.removeItem(atPath:).call",
+        ] {
+            #expect(!configuredNames.contains(name))
+        }
 
         var managedRequest = request
         managedRequest.callingSurfacePolicy = .managedDebugModule
@@ -938,6 +1180,19 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).HelixExternal.ProcessInfo.processInfo.get",
         ]
         for name in firstUseNames {
+            #expect(managedNames.contains(name))
+        }
+        let callableNames = [
+            "\(moduleName).HelixExternal.UIView.isHidden.get",
+            "\(moduleName).HelixExternal.UIView.alpha.set",
+            "\(moduleName).HelixExternal.UIView.setNeedsLayout().call",
+            "\(moduleName).HelixExternal.UIView.setAnimationsEnabled(_:).call",
+            "\(moduleName).HelixExternal.UIColor.init(white:alpha:)",
+            "\(moduleName).HelixExternal.Bundle.path(forResource:ofType:).call",
+            "\(moduleName).HelixExternal.URLCache.shared.set",
+            "\(moduleName).HelixExternal.FileManager.removeItem(atPath:).call",
+        ]
+        for name in callableNames {
             #expect(managedNames.contains(name))
         }
         #expect(managedNames.contains(
@@ -966,6 +1221,13 @@ struct NativeImportDiscoveryTests {
             $0.canonicalCallee == firstUseNames[5]
         })
         #expect(!bundle.effects.requiresMainActor)
+        let throwingRemoval = try #require(
+            managed.receipt.nativeImportCandidates.first {
+                $0.canonicalCallee == callableNames[7]
+            }
+        )
+        #expect(throwingRemoval.effects.mayThrow)
+        #expect(throwingRemoval.contract.kind == .instanceMethod)
 
         let nativeTypes = Dictionary(uniqueKeysWithValues:
             managed.receipt.nativeTypes.map { ($0.canonicalName, $0) }
@@ -980,6 +1242,14 @@ struct NativeImportDiscoveryTests {
         })
 
         let firstUseIDs = try Dictionary(uniqueKeysWithValues: firstUseNames.map { name in
+            let candidate = try #require(
+                managed.receipt.nativeImportCandidates.first {
+                    $0.canonicalCallee == name
+                }
+            )
+            return (name, try #require(candidate.id))
+        })
+        let callableIDs = try Dictionary(uniqueKeysWithValues: callableNames.map { name in
             let candidate = try #require(
                 managed.receipt.nativeImportCandidates.first {
                     $0.canonicalCallee == name
@@ -1003,9 +1273,21 @@ struct NativeImportDiscoveryTests {
         #expect(generated.contains("UIView.areAnimationsEnabled"))
         #expect(generated.contains("Bundle.main"))
         #expect(generated.contains("ProcessInfo.processInfo"))
+        #expect(generated.contains("argument0.isHidden"))
+        #expect(generated.contains("argument1.alpha = argument0"))
+        #expect(generated.contains("argument0.setNeedsLayout()"))
+        #expect(generated.contains("UIView.setAnimationsEnabled(argument0)"))
+        #expect(generated.contains("UIColor(white: argument0, alpha: argument1)"))
+        #expect(generated.contains("argument2.path(forResource: argument0, ofType: argument1)"))
+        #expect(generated.contains("URLCache.shared = argument0"))
+        #expect(generated.contains("try argument1.removeItem(atPath: argument0)"))
 
         let changed = baseline
             .replacingOccurrences(of: ".systemBlue", with: ".black")
+            .replacingOccurrences(
+                of: "UIColor(red: 0.2, green: 0.4, blue: 0.8, alpha: 1)",
+                with: "UIColor(white: 0.2, alpha: 1)"
+            )
             .replacingOccurrences(of: "return baselineScreen", with: "return .main")
             .replacingOccurrences(of: "return baselineDevice", with: "return .current")
             .replacingOccurrences(
@@ -1013,14 +1295,51 @@ struct NativeImportDiscoveryTests {
                 with: "return .shared"
             )
             .replacingOccurrences(
-                of: "return baselineView.isHidden",
-                with: "return UIView.areAnimationsEnabled"
+                of: "_ = baselineView\n    return false",
+                with: "return baselineView.isHidden"
+            )
+            .replacingOccurrences(
+                of: "_ = baselineView\n    return value",
+                with: "baselineView.alpha = value\n    return value"
+            )
+            .replacingOccurrences(
+                of: "public func requestLayout(_ baselineView: UIView) -> UIView {\n    return baselineView",
+                with: "public func requestLayout(_ baselineView: UIView) -> UIView {\n    baselineView.setNeedsLayout()\n    return baselineView"
+            )
+            .replacingOccurrences(
+                of: "public func updateAnimations(_ enabled: Bool) -> Bool {\n    return enabled",
+                with: "public func updateAnimations(_ enabled: Bool) -> Bool {\n    UIView.setAnimationsEnabled(enabled)\n    return UIView.areAnimationsEnabled"
             )
             .replacingOccurrences(of: "return baselineBundle", with: "return .main")
             .replacingOccurrences(
                 of: "return baselineProcessInfo",
                 with: "return .processInfo"
             )
+            .replacingOccurrences(
+                of: "_ = baselineBundle\n    _ = name\n    return nil",
+                with: "return baselineBundle.path(forResource: name, ofType: nil)"
+            )
+            .replacingOccurrences(
+                of: "public func replaceSharedCache(_ baselineCache: URLCache) -> URLCache {\n    return baselineCache",
+                with: "public func replaceSharedCache(_ baselineCache: URLCache) -> URLCache {\n    URLCache.shared = baselineCache\n    return baselineCache"
+            )
+            .replacingOccurrences(
+                of: "_ = baselineManager\n    return path",
+                with: "try baselineManager.removeItem(atPath: path)\n    return path"
+            )
+        for expectedUse in [
+            "return baselineView.isHidden",
+            "baselineView.alpha = value",
+            "baselineView.setNeedsLayout()",
+            "UIView.setAnimationsEnabled(enabled)",
+            "return UIView.areAnimationsEnabled",
+            "UIColor(white: 0.2, alpha: 1)",
+            "return baselineBundle.path(forResource: name, ofType: nil)",
+            "URLCache.shared = baselineCache",
+            "try baselineManager.removeItem(atPath: path)",
+        ] {
+            #expect(changed.contains(expectedUse))
+        }
         try Data(changed.utf8).write(to: sourceURL)
         let patch = try ReleaseCompiler.Driver().build(
             .init(
@@ -1031,8 +1350,27 @@ struct NativeImportDiscoveryTests {
         )
         for name in firstUseNames {
             let id = try #require(firstUseIDs[name])
-            #expect(patch.module.imports.contains { $0.id == id })
-            #expect(patch.disassembly.contains("native_apply #\(id.rawValue)"))
+            #expect(
+                patch.module.imports.contains { $0.id == id },
+                "patch omitted \(name) (#\(id.rawValue))"
+            )
+            #expect(
+                patch.disassembly.contains("native_apply #\(id.rawValue)"),
+                "patch did not call \(name) (#\(id.rawValue))"
+            )
+        }
+        for name in callableNames {
+            let id = try #require(callableIDs[name])
+            #expect(
+                patch.module.imports.contains { $0.id == id },
+                "patch omitted \(name) (#\(id.rawValue))"
+            )
+            let opcode = name == callableNames[7]
+                ? "native_try_apply" : "native_apply"
+            #expect(
+                patch.disassembly.contains("\(opcode) #\(id.rawValue)"),
+                "patch did not call \(name) (#\(id.rawValue))"
+            )
         }
         _ = try Verification.Engine().verify(
             bytes: patch.bytecode,

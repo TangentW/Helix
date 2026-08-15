@@ -1,4 +1,5 @@
 import Foundation
+import HelixBytecode
 import HelixCompiler
 import HelixCore
 import HelixInterface
@@ -19,7 +20,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         var swiftPath: String
         var runtimeName: String?
         var requiresMainActor: Bool
-        var properties: [SwiftFrontend.SymbolGraph.Symbol]
+        var members: [SwiftFrontend.SymbolGraph.Symbol]
     }
 
     private struct OwnerMatch: Sendable {
@@ -28,14 +29,18 @@ extension FrontendReceipt.ManagedDebugSurface {
     }
 
     private struct Candidate: Hashable, Sendable {
+        var preciseIdentifier: String
         var moduleName: String
         var probeOwnerType: String
         var ownerType: String
-        var ownerAliases: [String]
+        var dispatch: NativeImportDiscovery.Dispatch
         var memberName: String
+        var argumentLabels: [String]
+        var parameterTypes: [String]
         var sourceFileLogicalID: String
         var importedModules: [String]
         var requiresMainActor: Bool
+        var mayThrow: Bool
     }
 
     /// Expands only types already frozen by the source module. Public SDK
@@ -121,8 +126,11 @@ extension FrontendReceipt.ManagedDebugSurface {
         minimumOS: Core.SemanticVersion
     ) -> [OwnerSurface] {
         let typeKinds: Set<String> = [
-            "swift.actor", "swift.class", "swift.enum", "swift.protocol",
-            "swift.struct", "swift.typealias",
+            "swift.class", "swift.enum", "swift.struct", "swift.typealias",
+        ]
+        let memberKinds: Set<String> = [
+            "swift.init", "swift.method", "swift.property",
+            "swift.type.method", "swift.type.property",
         ]
         var owners: [String: SwiftFrontend.SymbolGraph.Symbol] = [:]
         var ambiguousOwners = Set<String>()
@@ -130,6 +138,9 @@ extension FrontendReceipt.ManagedDebugSurface {
             guard typeKinds.contains(symbol.kind.identifier),
                   !symbol.pathComponents.isEmpty,
                   symbol.pathComponents.allSatisfy(isProbeIdentifier),
+                  !symbol.declarationFragments.contains(where: {
+                      $0.kind == "genericParameter"
+                  }),
                   isAvailable(symbol, minimumOS: minimumOS)
             else { continue }
             if owners[symbol.identifier.precise] != nil {
@@ -150,25 +161,23 @@ extension FrontendReceipt.ManagedDebugSurface {
             }
         }
         for precise in ambiguousMembers { memberOwner.removeValue(forKey: precise) }
-        var propertiesByOwner: [String: [SwiftFrontend.SymbolGraph.Symbol]] = [:]
-        for symbol in graph.symbols where symbol.kind.identifier == "swift.type.property" {
+        var membersByOwner: [String: [SwiftFrontend.SymbolGraph.Symbol]] = [:]
+        for symbol in graph.symbols where memberKinds.contains(symbol.kind.identifier) {
             guard symbol.accessLevel == "public" || symbol.accessLevel == "open",
                   let owner = memberOwner[symbol.identifier.precise],
                   owners[owner] != nil,
                   symbol.pathComponents.count >= 2,
-                  let member = symbol.pathComponents.last,
-                  isProbeIdentifier(member),
                   isAvailable(symbol, minimumOS: minimumOS),
                   !symbol.declarationFragments.contains(where: {
-                      $0.spelling == "async" || $0.spelling == "throws"
+                      $0.spelling == "async"
                   })
             else { continue }
-            propertiesByOwner[owner, default: []].append(symbol)
+            membersByOwner[owner, default: []].append(symbol)
         }
         return owners.keys.sorted().compactMap { precise -> OwnerSurface? in
             guard let owner = owners[precise],
-                  let properties = propertiesByOwner[precise],
-                  !properties.isEmpty
+                  let members = membersByOwner[precise],
+                  !members.isEmpty
             else { return nil }
             return OwnerSurface(
                 moduleName: graph.module.name,
@@ -176,7 +185,7 @@ extension FrontendReceipt.ManagedDebugSurface {
                 swiftPath: owner.pathComponents.joined(separator: "."),
                 runtimeName: objectiveCRuntimeName(precise),
                 requiresMainActor: requiresMainActor(owner),
-                properties: properties.sorted {
+                members: members.sorted {
                     ($0.pathComponents.joined(separator: "\u{0}"),
                      $0.identifier.precise)
                         < ($1.pathComponents.joined(separator: "\u{0}"),
@@ -265,30 +274,180 @@ extension FrontendReceipt.ManagedDebugSurface {
         surface: OwnerSurface,
         importedType: FrontendReceipt.Adapter.ImportedNativeType
     ) -> [Candidate] {
-        let ownerAliases = Array(Set(
-            [surface.swiftPath, "\(surface.moduleName).\(surface.swiftPath)",
-             importedType.canonicalName, importedType.swiftType]
-                + importedType.aliases
-                + [surface.runtimeName].compactMap { $0 }
-        )).sorted()
-        return surface.properties.compactMap { property in
-            guard let memberName = property.pathComponents.last else { return nil }
-            let isNonisolated = property.declarationFragments.contains {
-                $0.spelling == "nonisolated"
-            }
-            return Candidate(
+        surface.members.flatMap { member in
+            makeCandidates(
+                member: member,
+                surface: surface,
+                importedType: importedType
+            )
+        }
+    }
+
+    private static func makeCandidates(
+        member: SwiftFrontend.SymbolGraph.Symbol,
+        surface: OwnerSurface,
+        importedType: FrontendReceipt.Adapter.ImportedNativeType
+    ) -> [Candidate] {
+        let isNonisolated = member.declarationFragments.contains {
+            $0.spelling == "nonisolated"
+        }
+        let requiresActor = !isNonisolated && (
+            surface.requiresMainActor || requiresMainActor(member)
+        )
+        func candidate(
+            dispatch: NativeImportDiscovery.Dispatch,
+            memberName: String,
+            labels: [String] = [],
+            parameterTypes: [String] = [],
+            mayThrow: Bool = false
+        ) -> Candidate {
+            Candidate(
+                preciseIdentifier: member.identifier.precise,
                 moduleName: surface.moduleName,
                 probeOwnerType: surface.swiftPath,
                 ownerType: importedType.swiftType,
-                ownerAliases: ownerAliases,
+                dispatch: dispatch,
                 memberName: memberName,
+                argumentLabels: labels,
+                parameterTypes: parameterTypes,
                 sourceFileLogicalID: importedType.sourceFileLogicalID,
                 importedModules: importedType.importedModules,
-                requiresMainActor: !isNonisolated && (
-                    surface.requiresMainActor || requiresMainActor(property)
-                )
+                requiresMainActor: requiresActor,
+                mayThrow: mayThrow
             )
         }
+
+        switch member.kind.identifier {
+        case "swift.type.property", "swift.property":
+            guard let memberName = member.pathComponents.last,
+                  isProbeIdentifier(memberName),
+                  !member.declarationFragments.contains(where: {
+                      $0.spelling == "async" || $0.spelling == "throws"
+                          || $0.spelling == "rethrows"
+                  }),
+                  let type = propertyType(member),
+                  FrontendReceipt.SwiftTypeSpelling.isGeneratedType(type)
+            else { return [] }
+            let isStatic = member.kind.identifier == "swift.type.property"
+            var values = [candidate(
+                dispatch: isStatic ? .staticGetter : .instanceGetter,
+                memberName: memberName
+            )]
+            if member.declarationFragments.contains(where: {
+                $0.kind == "keyword" && $0.spelling == "set"
+            }) {
+                let setter: NativeImportDiscovery.Dispatch
+                if isStatic {
+                    setter = .staticSetter
+                } else {
+                    setter = importedType.representation == .reference
+                        ? .instanceSetter : .instanceValueSetter
+                }
+                values.append(candidate(
+                    dispatch: setter,
+                    memberName: memberName,
+                    labels: ["_"],
+                    parameterTypes: [type]
+                ))
+            }
+            return values
+        case "swift.init", "swift.method", "swift.type.method":
+            guard !member.declarationFragments.contains(where: {
+                $0.kind == "genericParameter"
+                    || $0.spelling == "mutating"
+                    || $0.spelling == "consuming"
+            }), let signature = callableSignature(member)
+            else { return [] }
+            let dispatch: NativeImportDiscovery.Dispatch = switch member.kind.identifier {
+            case "swift.init": .initializer
+            case "swift.type.method": .staticMethod
+            default: .instanceMethod
+            }
+            return [candidate(
+                dispatch: dispatch,
+                memberName: dispatch == .initializer ? "init" : signature.baseName,
+                labels: signature.argumentLabels,
+                parameterTypes: signature.parameterTypes,
+                mayThrow: signature.mayThrow
+            )]
+        default:
+            return []
+        }
+    }
+
+    private struct CallableSignature {
+        var baseName: String
+        var argumentLabels: [String]
+        var parameterTypes: [String]
+        var mayThrow: Bool
+    }
+
+    private static func callableSignature(
+        _ symbol: SwiftFrontend.SymbolGraph.Symbol
+    ) -> CallableSignature? {
+        let declaration = symbol.declarationFragments.map(\.spelling).joined()
+        let compactDeclaration = declaration.filter { !$0.isWhitespace }
+        guard !compactDeclaration.contains("throws("),
+              !compactDeclaration.contains("init?(") && !compactDeclaration.contains("init!("),
+              !symbol.declarationFragments.contains(where: {
+                  $0.kind == "genericParameter" || $0.spelling == "async"
+              })
+        else { return nil }
+        let labels = symbol.declarationFragments.compactMap { fragment in
+            fragment.kind == "externalParam" ? fragment.spelling : nil
+        }
+        let parameters = symbol.functionSignature?.parameters ?? []
+        guard labels.count == parameters.count,
+              labels.allSatisfy({ $0 == "_" || isProbeIdentifier($0) }),
+              parameters.count <= 16
+        else { return nil }
+        let parameterTypes = parameters.compactMap(parameterType)
+        guard parameterTypes.count == parameters.count else { return nil }
+        let baseName: String
+        if symbol.kind.identifier == "swift.init" {
+            baseName = "init"
+        } else {
+            guard let name = symbol.declarationFragments.first(where: {
+                $0.kind == "identifier"
+            })?.spelling, isProbeIdentifier(name)
+            else { return nil }
+            baseName = name
+        }
+        return .init(
+            baseName: baseName,
+            argumentLabels: labels,
+            parameterTypes: parameterTypes,
+            mayThrow: symbol.declarationFragments.contains(where: {
+                $0.kind == "keyword"
+                    && ($0.spelling == "throws" || $0.spelling == "rethrows")
+            })
+        )
+    }
+
+    private static func parameterType(
+        _ parameter: SwiftFrontend.SymbolGraph.Parameter
+    ) -> String? {
+        let value = parameter.declarationFragments.map(\.spelling).joined()
+        guard let separator = value.firstIndex(of: ":") else { return nil }
+        let type = value[value.index(after: separator)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard type.utf8.count <= 16 * 1_024,
+              FrontendReceipt.SwiftTypeSpelling.isGeneratedType(type),
+              type != "Self", !type.hasPrefix("Self.")
+        else { return nil }
+        return type
+    }
+
+    private static func propertyType(
+        _ symbol: SwiftFrontend.SymbolGraph.Symbol
+    ) -> String? {
+        let value = symbol.declarationFragments.map(\.spelling).joined()
+        guard let separator = value.firstIndex(of: ":") else { return nil }
+        let remainder = value[value.index(after: separator)...]
+        let end = remainder.range(of: " {")?.lowerBound ?? remainder.endIndex
+        let type = remainder[..<end]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return type.isEmpty ? nil : type
     }
 
     private static func probe(
@@ -386,8 +545,53 @@ extension FrontendReceipt.ManagedDebugSurface {
             contents: contents,
             contentHash: .sha256(contents)
         )
+        let resolver = FrontendReceipt.SILFunctionResolver(file: silFile)
+        var candidatesByWitness: [String: Candidate] = [:]
+        var ambiguousWitnesses = Set<String>()
+        let measuredDocuments = try documents.compactMap { document ->
+            FrontendReceipt.TypedAST.Object? in
+            guard let items = document["items"] as? [Any] else { return nil }
+            var measuredItems: [Any] = []
+            for value in items {
+                guard let item = value as? [String: Any],
+                      item["_kind"] as? String == "func_decl",
+                      let usr = item["usr"] as? String,
+                      usr.hasPrefix("s:")
+                else {
+                    measuredItems.append(value)
+                    continue
+                }
+                guard let function = try resolver.function(
+                    for: item,
+                    source: state,
+                    baseName: FrontendReceipt.Adapter().baseName(in: item)
+                ) else {
+                    // The compiler may eliminate an unreferenced private probe.
+                    continue
+                }
+                measuredItems.append(value)
+                guard let name = FrontendReceipt.Adapter().baseName(in: item),
+                      name.hasPrefix("helixManagedDebugProbe"),
+                      let index = Int(name.dropFirst("helixManagedDebugProbe".count)),
+                      candidates.indices.contains(index)
+                else { continue }
+                let candidate = candidates[index]
+                if let existing = candidatesByWitness[function.mangledName],
+                   existing != candidate {
+                    ambiguousWitnesses.insert(function.mangledName)
+                } else {
+                    candidatesByWitness[function.mangledName] = candidate
+                }
+            }
+            var filtered = document
+            filtered["items"] = measuredItems
+            return filtered
+        }
+        for witness in ambiguousWitnesses {
+            candidatesByWitness.removeValue(forKey: witness)
+        }
         let surface = try FrontendReceipt.Adapter().discoverImportedOperationSurface(
-            documents: documents,
+            documents: measuredDocuments,
             sourcesByPhysicalPath: [
                 sourceURL.resolvingSymlinksInPath().standardizedFileURL.path: state,
             ],
@@ -395,17 +599,19 @@ extension FrontendReceipt.ManagedDebugSurface {
             demangled: demangled,
             silFile: silFile
         )
-        let aliases = candidateLookup(candidates)
-        let nativeTypes = placeholderNativeTypes(importedTypes)
+        let nativeSurface = placeholderNativeTypes(importedTypes)
         let swiftAliases = try FrontendReceipt.Adapter()
             .makeImportedSwiftTypeAliases(importedTypes)
         return surface.operations.compactMap { operation in
-            guard operation.dispatch == .staticGetter,
-                  operation.parameterSwiftTypes.isEmpty,
-                  let candidate = aliases[operationIdentity(
-                      ownerType: operation.ownerType,
-                      memberName: operation.baseName
-                  )]
+            let matching = Set(operation.witnessFunctions.compactMap {
+                candidatesByWitness[$0]
+            })
+            guard matching.count == 1,
+                  let candidate = matching.first,
+                  operation.dispatch == candidate.dispatch,
+                  operation.baseName == candidate.memberName,
+                  operation.argumentLabels == candidate.argumentLabels,
+                  operation.mayThrow == candidate.mayThrow
             else { return nil }
             var measured = operation
             measured.ownerType = candidate.ownerType
@@ -420,15 +626,31 @@ extension FrontendReceipt.ManagedDebugSurface {
                     in: operation.resultSwiftType,
                     aliases: swiftAliases
                 )
-            guard FrontendReceipt.ValueTypeParser.parse(
+            let parameters = measured.parameterSwiftTypes.compactMap {
+                FrontendReceipt.ValueTypeParser.parse(
+                    $0,
+                    allowVoid: false,
+                    nativeTypes: nativeSurface.types
+                )
+            }
+            guard parameters.count == measured.parameterSwiftTypes.count,
+                  parameters.allSatisfy(isAutomaticallyBridgeable),
+                  let result = FrontendReceipt.ValueTypeParser.parse(
                       measured.resultSwiftType,
-                      allowVoid: false,
-                      nativeTypes: nativeTypes
-                  ) != nil
+                      allowVoid: true,
+                      nativeTypes: nativeSurface.types
+                  ),
+                  result == .void || isAutomaticallyBridgeable(result)
             else { return nil }
             measured.sourceFileLogicalID = candidate.sourceFileLogicalID
             measured.importedModules = candidate.importedModules
             measured.requiresMainActor = candidate.requiresMainActor
+                || (parameters + [result]).contains {
+                    containsNativeType(
+                        $0,
+                        in: nativeSurface.mainActorTypeIDs
+                    )
+                }
             measured.isolationEvidence = .importedDeclaration
             return measured
         }
@@ -437,41 +659,107 @@ extension FrontendReceipt.ManagedDebugSurface {
     private static func renderSource(_ candidates: [Candidate]) -> String {
         let imports = Set(candidates.map(\.moduleName)).sorted().map { "import \($0)" }
         let declarations = candidates.enumerated().map { index, candidate in
-            let isolation = candidate.requiresMainActor ? "@MainActor " : ""
-            let owner = escapedPath(candidate.probeOwnerType)
-            let member = escapedIdentifier(candidate.memberName)
-            return "\(isolation)private func helixManagedDebugProbe\(index)() { "
-                + "_ = \(owner).\(member) }"
+            renderProbe(index: index, candidate: candidate)
         }
         return (imports + [""] + declarations + [""]).joined(separator: "\n")
     }
 
-    private static func candidateLookup(_ candidates: [Candidate]) -> [String: Candidate] {
-        var result: [String: Candidate] = [:]
-        var ambiguous = Set<String>()
-        for candidate in candidates {
-            for owner in candidate.ownerAliases + [candidate.ownerType] {
-                let identity = operationIdentity(
-                    ownerType: owner,
-                    memberName: candidate.memberName
-                )
-                if let existing = result[identity], existing != candidate {
-                    ambiguous.insert(identity)
-                } else {
-                    result[identity] = candidate
-                }
-            }
+    private static func renderProbe(index: Int, candidate: Candidate) -> String {
+        let isolation = candidate.requiresMainActor ? "@MainActor " : ""
+        let throwing = candidate.mayThrow ? " throws" : ""
+        let tryPrefix = candidate.mayThrow ? "try " : ""
+        let owner = escapedPath(candidate.probeOwnerType)
+        let member = escapedIdentifier(candidate.memberName)
+        var parameters: [String] = []
+        if isInstanceDispatch(candidate.dispatch) {
+            parameters.append("_ receiver: \(owner)")
         }
-        for identity in ambiguous { result.removeValue(forKey: identity) }
-        return result
+        parameters += candidate.parameterTypes.enumerated().map {
+            "_ argument\($0.offset): \($0.element)"
+        }
+        let arguments = zip(
+            candidate.argumentLabels,
+            candidate.parameterTypes.indices
+        ).map { label, offset in
+            label == "_" ? "argument\(offset)" : "\(escapedIdentifier(label)): argument\(offset)"
+        }.joined(separator: ", ")
+        let call: String = switch candidate.dispatch {
+        case .initializer:
+            "\(owner)(\(arguments))"
+        case .staticMethod:
+            "\(owner).\(member)(\(arguments))"
+        case .instanceMethod:
+            "receiver.\(member)(\(arguments))"
+        case .staticGetter:
+            "\(owner).\(member)"
+        case .staticSetter:
+            "\(owner).\(member) = argument0"
+        case .instanceGetter:
+            "receiver.\(member)"
+        case .instanceSetter:
+            "receiver.\(member) = argument0"
+        case .instanceValueSetter:
+            "mutableReceiver.\(member) = argument0"
+        case .globalFunction, .nativeUpcast:
+            preconditionFailure("managed member probe has invalid dispatch")
+        }
+        let mutableReceiver = candidate.dispatch == .instanceValueSetter
+            ? "\n    var mutableReceiver = receiver" : ""
+        return "\(isolation)private func helixManagedDebugProbe\(index)("
+            + "\(parameters.joined(separator: ", ")))\(throwing) {"
+            + "\(mutableReceiver)\n    _ = \(tryPrefix)\(call)\n}"
+    }
+
+    private static func isAutomaticallyBridgeable(
+        _ type: Bytecode.ValueType
+    ) -> Bool {
+        switch type {
+        case .bool, .integer, .float, .string, .any, .native:
+            true
+        case let .array(element), let .optional(element):
+            isAutomaticallyBridgeable(element)
+        case let .dictionary(key, value):
+            isDictionaryKey(key) && isAutomaticallyBridgeable(value)
+        case let .tuple(elements):
+            !elements.isEmpty && elements.allSatisfy(isAutomaticallyBridgeable)
+        case .void, .never, .local, .error, .address, .closure:
+            false
+        }
+    }
+
+    private static func isDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
+        switch type {
+        case .bool, .integer, .string: true
+        default: false
+        }
+    }
+
+    private static func isInstanceDispatch(
+        _ dispatch: NativeImportDiscovery.Dispatch
+    ) -> Bool {
+        switch dispatch {
+        case .instanceMethod, .instanceGetter, .instanceSetter,
+             .instanceValueSetter: true
+        case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+             .staticGetter, .staticSetter: false
+        }
+    }
+
+    private struct PlaceholderNativeSurface {
+        var types: [String: Core.TypeID]
+        var mainActorTypeIDs: Set<Core.TypeID>
     }
 
     private static func placeholderNativeTypes(
         _ types: [FrontendReceipt.Adapter.ImportedNativeType]
-    ) -> [String: Core.TypeID] {
-        let placeholder = Core.TypeID(rawValue: .sha256("managed-debug-type-probe"))
+    ) -> PlaceholderNativeSurface {
         var result: [String: Core.TypeID] = [:]
+        var mainActorTypeIDs = Set<Core.TypeID>()
         for type in types {
+            let placeholder = Core.TypeID(rawValue: .sha256(
+                "managed-debug-type-probe:\(type.canonicalName)"
+            ))
+            if type.requiresMainActor { mainActorTypeIDs.insert(placeholder) }
             for name in Set(
                 [type.canonicalName, type.swiftType, "__C.\(type.canonicalName)"]
                     + type.aliases
@@ -479,14 +767,31 @@ extension FrontendReceipt.ManagedDebugSurface {
                 result[name] = placeholder
             }
         }
-        return result
+        return .init(types: result, mainActorTypeIDs: mainActorTypeIDs)
     }
 
-    private static func operationIdentity(
-        ownerType: String,
-        memberName: String
-    ) -> String {
-        normalizedTypeName(ownerType, moduleName: nil) + "|" + memberName
+    private static func containsNativeType(
+        _ type: Bytecode.ValueType,
+        in typeIDs: Set<Core.TypeID>
+    ) -> Bool {
+        switch type {
+        case let .native(typeID):
+            typeIDs.contains(typeID)
+        case let .array(element), let .optional(element), let .address(element):
+            containsNativeType(element, in: typeIDs)
+        case let .dictionary(key, value):
+            containsNativeType(key, in: typeIDs)
+                || containsNativeType(value, in: typeIDs)
+        case let .tuple(elements):
+            elements.contains { containsNativeType($0, in: typeIDs) }
+        case let .closure(signature):
+            signature.parameters.contains {
+                containsNativeType($0, in: typeIDs)
+            } || containsNativeType(signature.result, in: typeIDs)
+        case .bool, .integer, .float, .string, .any, .void, .never,
+             .local, .error:
+            false
+        }
     }
 
     private static func normalizedTypeName(
@@ -566,7 +871,18 @@ extension FrontendReceipt.ManagedDebugSurface {
     }
 
     private static func candidateOrdering(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
-        (lhs.moduleName, lhs.ownerType, lhs.memberName, lhs.sourceFileLogicalID)
-            < (rhs.moduleName, rhs.ownerType, rhs.memberName, rhs.sourceFileLogicalID)
+        let left = [
+            lhs.moduleName, lhs.ownerType, lhs.dispatch.rawValue, lhs.memberName,
+            lhs.argumentLabels.joined(separator: ":"),
+            lhs.parameterTypes.joined(separator: ","), lhs.preciseIdentifier,
+            lhs.sourceFileLogicalID,
+        ]
+        let right = [
+            rhs.moduleName, rhs.ownerType, rhs.dispatch.rawValue, rhs.memberName,
+            rhs.argumentLabels.joined(separator: ":"),
+            rhs.parameterTypes.joined(separator: ","), rhs.preciseIdentifier,
+            rhs.sourceFileLogicalID,
+        ]
+        return left.lexicographicallyPrecedes(right)
     }
 }

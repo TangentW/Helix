@@ -278,6 +278,10 @@ public struct Lowerer: Sendable {
             of: function,
             effects: effectiveEffects
         )
+        let nsErrorBridges = try CanonicalSIL.NSErrorBridgePlan.analyze(
+            body: normalizedBody,
+            directCalls: directCalls
+        )
         let rawLines = normalizedBody.split(
             separator: "\n",
             omittingEmptySubsequences: false
@@ -483,6 +487,21 @@ public struct Lowerer: Sendable {
             let copy = try allocate(type: type)
             appendInstruction(.copyValue(result: copy, source: source))
             return copy
+        }
+
+        func prepareReturnValue(
+            _ token: String,
+            line: Int
+        ) throws -> Bytecode.Register {
+            let value = try resolve(token, line: line)
+            let type = registerTypes[Int(value.rawValue)]
+            guard type.requiresLinearOwnership,
+                  borrowedValueTokens.contains(token) || isBorrowedParameter(value)
+            else { return value }
+            // HLBC return transfers ownership. SIL may return a guaranteed
+            // reference directly because ARC retains are implicit at that ABI
+            // boundary, so materialize the corresponding VM ownership edge.
+            return try copyOwnedCallArgument(value)
         }
 
         func isBorrowedParameter(_ register: Bytecode.Register) -> Bool {
@@ -2303,7 +2322,9 @@ public struct Lowerer: Sendable {
             appendInstruction(.copyValue(result: result, source: source))
         }
 
-        for (lineIndex, rawLine) in rawLines.enumerated() {
+        for (lineIndex, originalRawLine) in rawLines.enumerated() {
+            let rawLine = nsErrorBridges.replacementLines[lineIndex]
+                ?? originalRawLine
             let sourceLine = lineIndex + 1
             let parsedLine = if function.hasStrippedDebugMetadata {
                 CanonicalSIL.DebugMetadata.ParsedLine(
@@ -2317,6 +2338,7 @@ public struct Lowerer: Sendable {
             currentSourceLocation = parsedLine.location
                 ?? debugLineLocations[sourceLine]
             let line = parsedLine.instruction
+            if nsErrorBridges.skippedLines.contains(lineIndex) { continue }
             if let borrowEnd = match(
                 line,
                 pattern: #"^end_borrow (%[0-9]+)$"#
@@ -2479,6 +2501,65 @@ public struct Lowerer: Sendable {
                 continue
             }
             guard current != nil else { continue }
+
+            if let bridge = nsErrorBridges.callsByLine[lineIndex] {
+                let binding = bridge.binding
+                let resolved = try bridge.argumentTokens.map {
+                    try resolve($0, line: sourceLine)
+                }
+                let physicalConventions = zip(
+                    bridge.argumentTokens,
+                    resolved
+                ).map { token, value -> Bytecode.ParameterConvention in
+                    let type = registerTypes[Int(value.rawValue)]
+                    return type.requiresLinearOwnership
+                        && (borrowedValueTokens.contains(token)
+                            || isBorrowedParameter(value))
+                        ? .borrowed : .owned
+                }
+                guard acceptsPhysicalConventions(
+                    physicalConventions,
+                    for: binding
+                ) else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: sourceLine,
+                        mangledName: binding.mangledName,
+                        detail: "NSError bridge ownership does not match its logical ABI"
+                    )
+                }
+                let prepared = try prepareDirectCallArguments(
+                    bridge.argumentTokens,
+                    conventions: physicalConventions,
+                    line: sourceLine,
+                    allowsSynthesizedAccess: false
+                )
+                let arguments = try adaptBoundaryArguments(
+                    prepared.arguments,
+                    physicalConventions: physicalConventions,
+                    binding: binding
+                )
+                guard arguments.map({ registerTypes[Int($0.rawValue)] })
+                        == binding.parameterTypes,
+                      case let .nativeImport(requirement) = binding.target
+                else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: sourceLine,
+                        mangledName: binding.mangledName
+                    )
+                }
+                appendInstruction(
+                    .nativeTryApply(
+                        importID: requirement.id,
+                        arguments: arguments,
+                        normalTarget: bridge.normalTarget,
+                        errorTarget: bridge.errorTarget
+                    )
+                )
+                for token in bridge.argumentTokens {
+                    preservedNativeConversionValues.removeValue(forKey: token)
+                }
+                continue
+            }
 
             if line == "unreachable" {
                 appendInstruction(.trap(.explicit("Swift unreachable")))
@@ -6916,7 +6997,12 @@ public struct Lowerer: Sendable {
                     pendingArrayLiterals.removeValue(forKey: allocation)
                 } else {
                     appendInstruction(
-                        .returnValue(try resolve(returned[0], line: sourceLine))
+                        .returnValue(
+                            try prepareReturnValue(
+                                returned[0],
+                                line: sourceLine
+                            )
+                        )
                     )
                 }
                 continue
@@ -7142,8 +7228,20 @@ public struct Lowerer: Sendable {
         let resultComponents = splitTopLevelTuple(resultText)
         let parsedResult: (type: Bytecode.ValueType, isIndirect: Bool)
         let mayThrow: Bool
-        if resultComponents.count == 2,
-           resultComponents[1].trimmingCharacters(in: .whitespaces).hasPrefix("@error ") {
+        if resultComponents.count == 1,
+           try isSupportedErrorResult(resultComponents[0]) {
+            // SIL omits the normal empty-tuple result for `throws -> Void`.
+            guard physicalResultExpectation == nil
+                    || physicalResultExpectation == .void
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "throwing Void SIL cannot satisfy a non-Void logical result"
+                )
+            }
+            parsedResult = (.void, false)
+            mayThrow = true
+        } else if resultComponents.count == 2,
+                  try isSupportedErrorResult(resultComponents[1]) {
             parsedResult = try parseFunctionResult(
                 resultComponents[0],
                 bridgedTo: physicalResultExpectation
@@ -7164,6 +7262,18 @@ public struct Lowerer: Sendable {
             .init(mayThrow: mayThrow, isAsync: isAsync),
             erasedMetatypes
         )
+    }
+
+    private func isSupportedErrorResult(_ raw: String) throws -> Bool {
+        let value = raw.trimmingCharacters(in: .whitespaces)
+        guard value.hasPrefix("@error ") else { return false }
+        let spelling = String(value.dropFirst("@error ".count))
+        guard [.string, .error].contains(try parseType(spelling)) else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "throwing function has a non-Error error result"
+            )
+        }
+        return true
     }
 
     private func metatypeIdentity(_ raw: String) -> MetatypeIdentity? {

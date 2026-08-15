@@ -81,6 +81,7 @@ public struct GeneratedNativeImport: Hashable, Sendable {
         case staticMethod
         case nativeUpcast
         case staticGetter
+        case staticSetter
         case instanceMethod
         case instanceGetter
         case instanceSetter
@@ -1158,6 +1159,12 @@ public struct Generator: Sendable {
                 escapedSwiftIdentifier(String($0))
             }.joined(separator: ".")
             return owner + "." + escapedSwiftIdentifier(generated.baseName)
+        case .staticSetter:
+            let owner = generated.ownerType!.split(separator: ".").map {
+                escapedSwiftIdentifier(String($0))
+            }.joined(separator: ".")
+            return owner + "." + escapedSwiftIdentifier(generated.baseName)
+                + " = argument0"
         case .instanceMethod:
             target = "argument\(generated.parameterSwiftTypes.count - 1)."
                 + escapedSwiftIdentifier(generated.baseName)
@@ -1581,6 +1588,18 @@ public struct Generator: Sendable {
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
             }
+        case .staticSetter:
+            guard record.contract.kind == .staticSetter,
+                  let owner = generated.ownerType,
+                  isValidGeneratedSwiftTypeSpelling(owner),
+                  generated.argumentLabels == ["_"],
+                  record.parameterTypes.count == 1,
+                  isGeneratedValueType(record.parameterTypes[0]),
+                  record.resultType == .void,
+                  generated.resultSwiftType == "Swift.Void"
+            else {
+                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            }
         case .instanceMethod:
             guard record.contract.kind == .instanceMethod,
                   let owner = generated.ownerType,
@@ -1656,7 +1675,7 @@ public struct Generator: Sendable {
         case .instanceMethod, .instanceGetter, .instanceSetter,
              .instanceValueSetter: true
         case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
-             .staticGetter: false
+             .staticGetter, .staticSetter: false
         }
     }
 

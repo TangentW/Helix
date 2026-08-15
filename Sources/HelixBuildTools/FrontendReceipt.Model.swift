@@ -64,6 +64,7 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case malformedAST(String)
     case demanglingFailed(String)
     case missingSILFunction(String)
+    case ambiguousSILFunction(String, [String])
     case unsupportedDeclaration(String)
 
     public var description: String {
@@ -73,6 +74,9 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
         case let .malformedAST(reason): "malformed typed Swift AST: \(reason)"
         case let .demanglingFailed(reason): "Swift type demangling failed: \(reason)"
         case let .missingSILFunction(name): "typed AST function is absent from canonical SIL: \(name)"
+        case let .ambiguousSILFunction(name, matches):
+            "typed AST function maps ambiguously to canonical SIL: \(name) -> "
+                + matches.joined(separator: ", ")
         case let .unsupportedDeclaration(reason): "unsupported indexed declaration: \(reason)"
         }
     }

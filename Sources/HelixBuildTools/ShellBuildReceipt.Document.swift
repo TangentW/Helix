@@ -162,6 +162,7 @@ public struct GeneratedNativeImport: Codable, Hashable, Sendable {
         case staticMethod
         case nativeUpcast
         case staticGetter
+        case staticSetter
         case instanceMethod
         case instanceGetter
         case instanceSetter
@@ -651,6 +652,12 @@ public struct Document: Codable, Hashable, Sendable {
             guard let owner = generated.ownerType else { return false }
             return generated.argumentLabels.isEmpty
                 && generated.parameterSwiftTypes.isEmpty
+                && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(owner)
+        case .staticSetter:
+            guard let owner = generated.ownerType else { return false }
+            return generated.argumentLabels == ["_"]
+                && generated.parameterSwiftTypes.count == 1
+                && generated.resultSwiftType == "Swift.Void"
                 && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(owner)
         case .instanceMethod:
             guard let owner = generated.ownerType,

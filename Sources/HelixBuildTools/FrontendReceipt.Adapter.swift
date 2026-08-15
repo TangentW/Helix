@@ -788,6 +788,7 @@ extension FrontendReceipt.Adapter {
             case .staticMethod: .staticMethod
             case .nativeUpcast: .nativeUpcast
             case .staticGetter: .staticGetter
+            case .staticSetter: .staticSetter
             case .instanceMethod: .instanceMethod
             case .instanceGetter: .instanceGetter
             case .instanceSetter: .instanceSetter
@@ -1263,10 +1264,13 @@ extension FrontendReceipt.Adapter {
         else {
             return nil
         }
-        let mangledName = "$s" + usr.dropFirst(2)
-        guard let sil = silFile.function(mangledName: mangledName) else {
-            throw FrontendReceipt.Error.missingSILFunction(mangledName)
+        let astMangledName = "$s" + usr.dropFirst(2)
+        guard let sil = try FrontendReceipt.SILFunctionResolver(file: silFile)
+            .function(for: item, source: source, baseName: baseName)
+        else {
+            throw FrontendReceipt.Error.missingSILFunction(astMangledName)
         }
+        let mangledName = sil.mangledName
         let rawHeaderData = source.contents.subdata(
             in: functionRange.start..<bodyRange.start
         )

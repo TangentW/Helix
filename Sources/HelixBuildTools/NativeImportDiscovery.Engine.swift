@@ -15,6 +15,7 @@ extension NativeImportDiscovery {
         case nativeUpcast
         case instanceMethod
         case staticGetter
+        case staticSetter
         case instanceGetter
         case instanceSetter
         case instanceValueSetter
@@ -194,7 +195,7 @@ extension NativeImportDiscovery {
         ) -> (code: String, reason: String)? {
             switch declaration.dispatch {
             case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
-                 .staticGetter:
+                 .staticGetter, .staticSetter:
                 break
             case .instanceMethod, .instanceGetter, .instanceSetter:
                 guard declaration.ownerType != nil,
@@ -276,7 +277,7 @@ extension NativeImportDiscovery {
         ) -> Core.NativeImportAccess {
             switch dispatch {
             case .instanceGetter, .staticGetter: return .read
-            case .instanceSetter, .instanceValueSetter: return .write
+            case .instanceSetter, .instanceValueSetter, .staticSetter: return .write
             case .nativeUpcast: return .pure
             case .globalFunction, .initializer, .staticMethod, .instanceMethod: break
             }
@@ -295,6 +296,7 @@ extension NativeImportDiscovery {
             case .initializer: .initializer
             case .staticMethod, .nativeUpcast: .staticMethod
             case .staticGetter: .staticGetter
+            case .staticSetter: .staticSetter
             case .instanceMethod: .instanceMethod
             case .instanceGetter: .instanceGetter
             case .instanceSetter, .instanceValueSetter: .instanceSetter
@@ -306,7 +308,7 @@ extension NativeImportDiscovery {
             case .instanceMethod, .instanceGetter, .instanceSetter,
                  .instanceValueSetter: true
             case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
-                 .staticGetter: false
+                 .staticGetter, .staticSetter: false
             }
         }
 

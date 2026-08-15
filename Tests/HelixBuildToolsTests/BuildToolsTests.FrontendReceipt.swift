@@ -11,6 +11,52 @@ import Testing
 extension BuildToolsTests {
 @Suite("Real Swift frontend receipt adapter")
 struct FrontendReceiptPipeline {
+    @Test("SIL resolver falls back to an exact source declaration location")
+    func resolvesOverlayMangledFunctionByLocation() throws {
+        let physical = "$s7Fixture5probeyyF"
+        let fixture = try silResolverFixture(symbols: [physical])
+
+        let resolved = try fixture.resolver.function(
+            for: fixture.item,
+            source: fixture.source,
+            baseName: "probe"
+        )
+        #expect(resolved?.mangledName == physical)
+        #expect(resolved?.declarationLocation?.line == 1)
+        #expect(resolved?.declarationLocation?.column == 13)
+    }
+
+    @Test("SIL resolver rejects ambiguous source declaration locations")
+    func rejectsAmbiguousOverlayMangledFunctionLocation() throws {
+        let fixture = try silResolverFixture(symbols: [
+            "$s7Fixture5probeAyyF",
+            "$s7Fixture5probeByyF",
+        ])
+
+        #expect(throws: FrontendReceipt.Error.self) {
+            _ = try fixture.resolver.function(
+                for: fixture.item,
+                source: fixture.source,
+                baseName: "probe"
+            )
+        }
+    }
+
+    @Test("SIL resolver rejects a same-line declaration at another column")
+    func rejectsInexactOverlayMangledFunctionLocation() throws {
+        let fixture = try silResolverFixture(
+            symbols: ["$s7Fixture5probeyyF"],
+            declarationColumn: 14
+        )
+
+        let resolved = try fixture.resolver.function(
+            for: fixture.item,
+            source: fixture.source,
+            baseName: "probe"
+        )
+        #expect(resolved == nil)
+    }
+
     @Test("Frontend value parsing accepts synchronous escaping closure syntax")
     func parsesClosureTypes() {
         let signature = Bytecode.ClosureSignature(
@@ -529,6 +575,56 @@ struct FrontendReceiptPipeline {
         guard result.terminationStatus == 0 else {
             throw FrontendReceipt.Error.frontendFailed(result.standardError)
         }
+    }
+
+    private func silResolverFixture(
+        symbols: [String],
+        declarationColumn: Int = 13
+    ) throws -> (
+        resolver: FrontendReceipt.SILFunctionResolver,
+        source: FrontendReceipt.Adapter.SourceState,
+        item: FrontendReceipt.TypedAST.Object
+    ) {
+        let sourceURL = URL(fileURLWithPath: "/tmp/HelixResolverFixture.swift")
+        let contents = Data("public func probe() {}\n".utf8)
+        let bodyOffset = try #require(contents.firstIndex(of: UInt8(ascii: "{")))
+        let functionType = "@convention(thin) () -> ()"
+        let scopes = symbols.enumerated().map { index, symbol in
+            "sil_scope \(index + 1) { loc \"\(sourceURL.path)\":1:\(declarationColumn) "
+                + "parent @\(symbol) : $\(functionType) }"
+        }
+        let functions = symbols.map { symbol in
+            """
+            sil @\(symbol) : $\(functionType) {
+            bb0:
+              %0 = tuple ()
+              return %0
+            } // end sil function '\(symbol)'
+            """
+        }
+        let file = try CanonicalSIL.File(
+            text: (scopes + functions).joined(separator: "\n")
+        )
+        let state = FrontendReceipt.Adapter.SourceState(
+            logicalPath: "Sources/Fixture.swift",
+            url: sourceURL,
+            contents: contents,
+            contentHash: .sha256(contents)
+        )
+        let item: FrontendReceipt.TypedAST.Object = [
+            "usr": "s:7Fixture5probeyyFQO",
+            "range": [
+                "start": NSNumber(value: 0),
+                "end": NSNumber(value: contents.count),
+            ],
+            "body": [
+                "range": [
+                    "start": NSNumber(value: bodyOffset),
+                    "end": NSNumber(value: contents.count),
+                ],
+            ],
+        ]
+        return (.init(file: file), state, item)
     }
 }
 }

@@ -161,31 +161,37 @@ the save transaction with a full-build diagnostic. Cross-module public/package
 default changes also require a normal build because one module receipt cannot
 prove that every precompiled caller was replaced.
 
-A managed Debug Shell also audits public type properties for every module that
+A managed Debug Shell also audits public members for every module that
 contributes an already-frozen imported native type. Helix reads the symbol graph
 from the captured Swift toolchain and exact SDK, filters declarations against
 the Shell minimum OS and declaration isolation, then sends generated probes
 through the same typed AST and canonical SIL pipeline used for project source.
-Only uniquely measured getters whose result is representable by the existing
-Bridge type surface become separate exact NativeImports. This covers Swift and
-Objective-C APIs through one path, including `UIColor.black`, `UIScreen.main`,
-`UIDevice.current`, `UIApplication.shared`, `UIView.areAnimationsEnabled`,
-`Bundle.main`, and `ProcessInfo.processInfo` when their owner type is already
-frozen. It also derives Swift-overlay names such as `Bundle` from compiler
-identity instead of assuming Objective-C runtime spelling. This bounded
-convenience surface is not added to production Shells, does not introduce a new
-owner or result type by itself, and never performs runtime selector or symbol
-lookup.
+Only uniquely measured, Bridge-compatible initializers, synchronous instance or
+static methods, and readable or writable properties become exact NativeImports.
+This covers Swift and Objective-C APIs through one path, including
+`UIColor.black`, `UIColor.init(white:alpha:)`, `UIView.isHidden`,
+`UIView.alpha`, `UIView.setNeedsLayout()`,
+`UIView.setAnimationsEnabled(_:)`, `URLCache.shared`, `Bundle.main`, and
+`Bundle.path(forResource:ofType:)` when every boundary type is already frozen.
+The logical Swift `throws` contract is also preserved for the canonical
+Clang-importer `NSError **` bridge proven by the captured SIL, such as
+`FileManager.removeItem(atPath:)`; an unfamiliar pointer, sentinel, cleanup, or
+error-conversion shape fails closed. Swift-overlay names such as `Bundle` and
+physical aliases such as `CGFloat` are resolved from compiler identity and
+source evidence instead of guessed from Objective-C runtime spelling. This
+bounded convenience surface is not added to production Shells, does not
+introduce a new boundary type by itself, and never performs runtime selector or
+symbol lookup.
 
 For a supported source `class` instance method, the hidden Bridge carries
 `self` as a frozen reference `TypeID`. Generated `NativeTypeOperations` retain,
 identify, and validate the object without exposing a process pointer in HLBC.
 This establishes the receiver path for class methods; individual property and
 method operations still need a supported Shell entry or exact NativeImport.
-Readable imported type properties can use the measured static-getter path
-above, while struct/enum writeback, actor executors, type-property mutation, and
-arbitrary static/class method ABI are not silently approximated and currently
-require a normal build.
+The measured member path above supplies those exact imports for its proven
+shapes. Async, generic or closure-bearing SDK members, subscripts, actor
+executor hops, and any parameter/result shape outside the frozen Bridge surface
+are not silently approximated and currently require a normal build.
 
 Swift commonly spells a class receiver as `@guaranteed self` in SIL, while an
 Entry/NativeImport Bridge owns each value that crosses the device boundary.

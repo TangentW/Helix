@@ -87,15 +87,19 @@ does not by itself certify a physical device or distribution channel.
   new Shell. It supports common Bridge-compatible `Any` values,
   separator/terminator semantics, and a 64 KiB output bound without App catalog
   configuration.
-- Managed Debug measurement of public readable type properties for every
-  module contributing an already-frozen imported native type. The captured
-  toolchain's symbol graph nominates minimum-OS-valid APIs, and the same typed
-  AST/canonical SIL pipeline freezes only unique, Bridge-compatible getters.
-  The generic path covers Swift and Objective-C declarations, Swift-overlay
-  renames, and SDK isolation; examples include `UIColor.black`, `UIScreen.main`,
-  `UIView.areAnimationsEnabled`, `Bundle.main`, and `ProcessInfo.processInfo`.
+- Managed Debug measurement of public members for every module contributing an
+  already-frozen imported native type. The captured toolchain's symbol graph
+  nominates minimum-OS-valid APIs, and the same typed AST/canonical SIL pipeline
+  freezes only unique, Bridge-compatible initializers, synchronous instance or
+  static methods, and readable or writable properties. The generic path covers
+  Swift and Objective-C declarations, Swift-overlay/physical aliases, SDK
+  isolation, and the exact canonical `NSError **` bridge for an Objective-C
+  instance method imported as logical Swift `throws -> Void`. Examples include
+  `UIColor.black`, `UIColor.init(white:alpha:)`, `UIView.alpha`, `UIView.setNeedsLayout()`,
+  `UIView.setAnimationsEnabled(_:)`, `URLCache.shared`,
+  `Bundle.path(forResource:ofType:)`, and `FileManager.removeItem(atPath:)`.
   Production Shells do not receive this convenience surface, and it does not
-  introduce a new owner or result type by itself.
+  introduce a new boundary type by itself.
 - Objective-C superclass dispatch and address-form Optional control flow when
   their exact native operations are frozen. Same-type receiver casts are
   accepted only as aliases of one reference `TypeID`, and Optional payload takes
@@ -153,7 +157,7 @@ machine code.
 | Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM |
 | Change an existing Shell struct/enum/actor instance root or existing native static/class method | Rejected until Shell value writeback, executor, and native metatype ABI are implemented; this does not restrict image-local value-type accessors/helpers |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
-| First use a public readable type property in a managed Debug body | Supported when its owner and result are already representable in the frozen imported/Bridge type surface, the SDK declaration is valid at the Shell minimum OS, and the captured frontend measures one exact getter ABI; this includes common UIKit and Foundation examples such as `UIColor.black`, `UIScreen.main`, and `Bundle.main` |
+| First use a public SDK member in a managed Debug body | Supported for a uniquely measured, synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS; unfamiliar `NSError` bridges, async/generic/closure-bearing members, subscripts, and unrepresentable signatures require a full build |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |
