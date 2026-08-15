@@ -2204,6 +2204,36 @@ public struct Engine: Verification.ImageVerifying {
             guard isCopyable(element, shell: shell) else {
                 throw fail("array_next requires a copyable element type")
             }
+        case let .progressionNext(result, cursorSlot, end, stride, _):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail(
+                    "Progression iteration requires \(Core.Capability.collectionsV1)"
+                )
+            }
+            guard case let .optional(element) = type(result),
+                  function.type(of: cursorSlot) == .optional(element),
+                  type(end) == element
+            else {
+                throw fail(
+                    "progression_next needs Optional<T> result/cursor and a matching end"
+                )
+            }
+            let expectedStride: Bytecode.ValueType
+            switch element {
+            case .integer:
+                expectedStride = .int64
+            case .float:
+                expectedStride = element
+            default:
+                throw fail(
+                    "progression_next supports only fixed-width integer and floating elements"
+                )
+            }
+            guard type(stride) == expectedStride else {
+                throw fail(
+                    "progression_next stride does not match the element's Stride type"
+                )
+            }
         case let .makeDictionary(result, pairs):
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("make_dictionary requires \(Core.Capability.collectionsV1)")
@@ -2980,6 +3010,7 @@ public struct Engine: Verification.ImageVerifying {
                      let .arrayBoundary(result, _, _),
                      let .arrayAppend(result, _, _), let .arrayUpdate(result, _, _, _),
                      let .arrayNext(result, _, _),
+                     let .progressionNext(result, _, _, _, _),
                      let .makeDictionary(result, _), let .dictionaryGet(result, _, _),
                      let .dictionaryUpdate(result, _, _, _),
                      let .dictionaryNext(result, _, _):
@@ -4098,6 +4129,8 @@ public struct Engine: Verification.ImageVerifying {
                         )
                     }
                 case let .arrayNext(_, _, slot):
+                    try requireInitialized(slot: slot)
+                case let .progressionNext(_, slot, _, _, _):
                     try requireInitialized(slot: slot)
                 case let .dictionaryNext(_, _, slot):
                     try requireInitialized(slot: slot)

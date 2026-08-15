@@ -1607,6 +1607,30 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
+                case let .progressionNext(
+                    result,
+                    cursorSlot,
+                    end,
+                    stride,
+                    boundary
+                ):
+                    let step = try VM.Progression.next(
+                        cursor: read(cursorSlot, stackSlots: stackSlots),
+                        end: read(end, registers: registers),
+                        stride: read(stride, registers: registers),
+                        boundary: boundary
+                    )
+                    try store(
+                        step.cursor,
+                        in: cursorSlot,
+                        mode: .assign,
+                        stackSlots: &stackSlots
+                    )
+                    try initialize(
+                        step.result,
+                        register: result,
+                        registers: &registers
+                    )
                 case let .makeDictionary(result, pairs):
                     guard case let .dictionary(keyType, valueType) = function.type(of: result),
                           case let .array(pairValues, pairType) = try read(

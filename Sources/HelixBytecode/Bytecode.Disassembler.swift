@@ -230,6 +230,9 @@ public enum Disassembler {
             "(\(elementResult), \(arrayResult)) = array_pop_last \(array)"
         case let .arrayNext(result, array, indexSlot):
             "\(result) = array_next \(array), \(indexSlot)"
+        case let .progressionNext(result, cursorSlot, end, stride, boundary):
+            "\(result) = progression_next.\(boundary.rawValue) "
+                + "\(cursorSlot), end: \(end), stride: \(stride)"
         case let .makeDictionary(result, pairs):
             "\(result) = make_dictionary \(pairs)"
         case let .dictionaryCount(result, dictionary):

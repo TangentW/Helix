@@ -494,6 +494,16 @@ public enum Instruction: Codable, Hashable, Sendable {
         array: Bytecode.Register,
         indexSlot: Bytecode.StackSlot
     )
+    /// Advances a compiler-lowered Range or Stride sequence. The cursor is an
+    /// Optional<Element>: `nil` is the exhausted state, which also avoids a
+    /// sentinel collision at integer minima and maxima.
+    case progressionNext(
+        result: Bytecode.Register,
+        cursorSlot: Bytecode.StackSlot,
+        end: Bytecode.Register,
+        stride: Bytecode.Register,
+        boundary: Bytecode.ProgressionBoundary
+    )
     case makeDictionary(result: Bytecode.Register, pairs: Bytecode.Register)
     case dictionaryCount(result: Bytecode.Register, dictionary: Bytecode.Register)
     case dictionaryIsEmpty(result: Bytecode.Register, dictionary: Bytecode.Register)
@@ -641,6 +651,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .arrayAppend(result, _, _),
              let .arrayUpdate(result, _, _, _),
              let .arrayNext(result, _, _),
+             let .progressionNext(result, _, _, _, _),
              let .makeDictionary(result, _),
              let .dictionaryCount(result, _),
              let .dictionaryIsEmpty(result, _),
@@ -777,6 +788,8 @@ public enum Instruction: Codable, Hashable, Sendable {
             [array]
         case let .arrayNext(_, array, _):
             [array]
+        case let .progressionNext(_, _, end, stride, _):
+            [end, stride]
         case let .makeDictionary(_, pairs):
             [pairs]
         case let .dictionaryCount(_, dictionary),

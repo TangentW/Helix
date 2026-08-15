@@ -21,12 +21,12 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 
 ### 已实现
 
-- `Bool`、有/无符号定宽整数、`Float` 与 `Double`，包括已声明的算术、位运算、比较、移位和数值转换规则。完全具体化的标量 `min`/`max` 与有符号数值 `abs` 会保留 Swift 的操作数顺序、溢出、正负零和 NaN 语义。
+- `Bool`、有/无符号定宽整数、`Float`、`Double` 与 64 位 Apple 平台的 `CGFloat`，包括已声明的算术、位运算、比较、移位和数值转换规则。完全具体化的标量 `min`/`max` 与有符号数值 `abs` 会保留 Swift 的操作数顺序、溢出、正负零和 NaN 语义。
 - `String` 字面量、拼接、支持标量的插值、Unicode `uppercased`/`lowercased`、count/empty、比较以及常见 prefix/suffix/contains 判断。可变大小转换会在分配前预留已经证明的输出上界，最终只按实际 UTF-8 结果计费。常见的 `String.contains(Character)` 可以使用单 grapheme 的 `Character` 字面量，而不暴露 Swift 私有 Character 布局。
 - Tuple、`Void` 与 `Optional`，包括 `if let`、`guard let`、`??` 和 `try?` 产生的普通控制流，也包括 Dictionary semantic SIL 产生的地址型 Optional projection。
 - Array 值语义、append、`first`/`last`、`popLast`、迭代、安全下标和返回新值的更新；支持键值类型下的 Dictionary 构建、查找、更新、`removeValue(forKey:)` 与迭代。完全具体、底层来源为 Array 的 `map`、`filter`、`compactMap`、`reduce`、`forEach`、`first(where:)`、`contains(where:)` 与 `allSatisfy` 会降低成经过验证的 closure 控制流，并使用 invocation-local 的线性 Array builder，避免反复 copy-on-write append。payload 可表示为补丁内局部值时，`Optional.map`/`flatMap` 与具体 `Result.map`/`mapError`/`flatMap`/`flatMapError` 统一使用带显式 payload ownership 的选定 case 变换；`Result.get()` 会把 success/failure 投影到经过验证的 normal/error 边。局部 `Result` 当前不能嵌入 native handle。
 - 结构化分支、循环、switch、调用、递归、显式业务错误边和带 payload 的局部 Error 值。真实 frontend 语料已覆盖三元表达式、`repeat-while`、带标签的 `break`/`continue`、Tuple 与 Optional 模式匹配、`for case`、`while let`、`fallthrough`、提前返回，以及循环与返回清理路径上的 `defer`。
-- `Range<Int>` 半开区间 `for` 循环；Lowerer 会把它变成 HLBC 的强类型 cursor 控制流，不依赖 Swift 标准库 Range/Iterator ABI 对象。
+- 所有已支持有/无符号定宽整数的 `Range`/`ClosedRange` `for` 循环，以及这些整数、`Float`、`Double` 和 64 位 `CGFloat` 的 `stride(from:to:by:)`、`stride(from:through:by:)`。`Range.contains`/`ClosedRange.contains` 还支持已支持整数、浮点和 String 边界。Lowerer 统一生成以 Optional 为 cursor 的强类型 HLBC progression，不依赖标准库 Iterator ABI；零步长、非法区间边界保留 Swift trap，整数极值也不使用会碰撞的 sentinel。
 - 可在现有受监视文件中新加、且不导出到原生 ABI 的文件或 module scope 补丁内非递归 stored struct/enum；支持具体 `Result`、字段读取、enum switch、实例/静态计算 getter/setter 与受支持的 mutating helper。嵌套声明保留完整 namespace identity。它们是仅属于当前 generation 的 VM 值，不是新加载的 Swift metadata。
 - 新增普通函数、private 方法和计算属性会作为同一 image 的普通函数、getter 或 setter 被传递发现并编译，不要求它们预先出现在 Shell EntryIndex 中。patch-local `final class` 具有 HLVM 自己的引用 identity、字段 storage 和方法调用；纯 HLVM class 仍不能跨原生边界。
 - 新增 `final` class 可以选择一个 HLXI 已冻结、`NSObject` 兼容的 reference superclass。Runtime 为每个不可变 image 注册 Objective-C host，使对象能以该 superclass（包括 `UIViewController` 或项目基类）的身份交给原生代码。当前 hosted profile 仅支持继承的无参初始化、无新增 stored property，以及无参或单个 `Bool` 参数的 `Void` override；原生侧不能识别补丁新增的 Swift 具体类型。
@@ -46,7 +46,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - 真正 suspension：`await`、continuation、Task、async callee、async closure、cancellation，以及跨 suspension ownership 或 generation lease。
 - actor-isolated instance root、custom global actor 和任意 executor hop；上面的受限 `@MainActor async` leaf 是不同能力。
 - 穿过 Shell Entry 或 NativeImport 边界、持久化到 native/global/property 状态，或者存活时间超过当前 HLVM invocation/generation 的 closure。async、`@Sendable`，以及 closure 自身参数或返回值仍是 closure 的高阶签名暂不支持。捕获调用者拥有的 `inout` 参数也仍会 fail closed，因为它需要显式写回调用者；普通可变局部值与 Swift escape box 走上面的 managed-cell 路径。
-- 上述受限字面量判断以外的一般 `Character` 值/API；`ClosedRange`、非 `Int` Range、`stride`，以及函数局部 nominal type 声明。把不导出的补丁内 struct/enum 移到现有受监视文件的文件/module scope 后即可随补丁编译；只要它仍是 image 私有声明，就不要求重建 Shell。
+- 上述受限字面量判断以外的一般 `Character` 值/API；超出上述定宽整数和浮点迭代面的 progression element type、把 Range/stride 值导出到 Shell 或 NativeImport 边界，以及函数局部 nominal type 声明。把不导出的补丁内 struct/enum 移到现有受监视文件的文件/module scope 后即可随补丁编译；只要它仍是 image 私有声明，就不要求重建 Shell。
 - 任意新 Swift metadata、原生侧可识别的补丁具体 class、retroactive conformance，以及修改 Shell 已有类型的 layout、superclass 或 enum case。上面的 hosted Objective-C subclass 是冻结 superclass projection，不是动态生成任意 Swift metadata。
 - Generic 或 `inout` Shell entry、noncopyable root、任意 borrowing/consuming ABI、typed-throws root、上述具体标准库操作之外的通用 `rethrows`，以及通用 unwind cleanup。
 - 不受限 pointer、`unsafeBitCast`、任意 Objective-C selector/IMP、`dlopen`/`dlsym`、Mirror 字段修改与未知 builtin。
@@ -67,7 +67,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | 普通直接递归 | 解析到同一不可变 HLBC image 内的函数 |
 | 从源码有意调用上一代 | HLBC 不支持；应保存/激活一个恢复 generation |
 | 使用受支持的局部 closure，或调用已经索引且带 `@escaping` closure 参数的同 image helper | 降入同一 image；closure 的返回和捕获只能发生在固定的 VM invocation 内 |
-| 使用两个 `Int` 边界的 `for value in lower..<upper` | 支持，并保留 Swift 的 `lower <= upper` 前置条件；其他 Range 族需要完整构建 |
+| 使用整数 `Range`/`ClosedRange` 迭代、数值 `stride` 或标量 `contains` | 对上述具体且局部的类型族支持；边界、方向、开闭端点、零步长 trap 与整数极值均保留已验证的 Swift 语义。progression 值仍只属于 image，不能穿过 Shell/NativeImport 边界 |
 | 在受支持的 `String.contains` 中使用单 grapheme Character 字面量 | 以编译器内部 String 表示支持，不代表一般 Character 存储/API 已支持 |
 | 声明补丁内 struct 或 enum | 新增的不导出类型在文件/module scope 支持，包括 namespace 嵌套和受支持的计算 accessor；函数局部 nominal 会用精确类型诊断拒绝 |
 | 声明补丁内 pure class | `final`、非泛型、只在同一 image 内使用时支持引用 identity、stored property、private/普通方法与计算 accessor；不能传给原生代码 |

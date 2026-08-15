@@ -65,6 +65,9 @@ extension CompilerCapabilities {
                 uniquingKeysWith: { first, _ in first }
             )
             for instruction in function.blocks.flatMap(\.instructions) {
+                if case .progressionNext = instruction {
+                    capabilities.insert(.collectionsV1)
+                }
                 if case let .makeClosure(_, _, captures) = instruction,
                    captures.contains(where: { register in
                        guard function.registerTypes.indices.contains(

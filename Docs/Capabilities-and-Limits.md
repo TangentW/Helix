@@ -27,7 +27,8 @@ does not by itself certify a physical device or distribution channel.
 
 ### Implemented
 
-- `Bool`, signed and unsigned fixed-width integers, `Float`, and `Double`, with
+- `Bool`, signed and unsigned fixed-width integers, `Float`, `Double`, and
+  64-bit Apple-platform `CGFloat`, with
   the documented arithmetic, bitwise, comparison, shift, and supported numeric
   conversion rules. Fully concrete scalar `min`/`max` and signed numeric `abs`
   preserve Swift's operand-order, overflow, signed-zero, and NaN behavior.
@@ -58,8 +59,15 @@ does not by itself certify a physical device or distribution channel.
   includes ternary expressions, `repeat-while`, labeled `break`/`continue`,
   tuple and Optional pattern matching, `for case`, `while let`, `fallthrough`,
   early returns, and `defer` on loop and return cleanup paths.
-- Half-open `Range<Int>` `for` loops, lowered to typed HLBC cursor control flow
-  rather than a Swift standard-library Range/Iterator ABI object.
+- `Range` and `ClosedRange` `for` loops over every supported fixed-width signed
+  or unsigned integer, plus `stride(from:to:by:)` and
+  `stride(from:through:by:)` over those integers, `Float`, `Double`, and
+  64-bit `CGFloat`.
+  `Range.contains` and `ClosedRange.contains` also accept supported integer,
+  floating, and String bounds. Lowering uses one typed, Optional-cursor HLBC
+  progression operation rather than standard-library iterator ABI objects;
+  zero strides and invalid range bounds preserve Swift traps, and integer
+  extrema terminate without sentinel collisions.
 - Newly introduced, non-exported file- or module-scope patch-local nonrecursive
   stored struct and enum values, concrete `Result`, field extraction, enum
   switch, instance/static computed getters and setters, and supported mutating
@@ -155,10 +163,12 @@ does not by itself certify a physical device or distribution channel.
   writeback to the caller; ordinary mutable locals and Swift escape boxes use
   the managed-cell path above.
 - General `Character` values/APIs beyond the bounded literal predicate above;
-  `ClosedRange`, non-`Int` ranges, `stride`, and function-local nominal type
-  declarations. Move a non-exported patch-local struct or enum to file/module
-  scope in an existing watched source file; no Shell rebuild is needed when the
-  resulting declaration remains private to the HLBC image.
+  progression element types beyond the fixed-width integer and floating
+  iteration surface above, exporting a Range/stride value across a Shell or
+  NativeImport boundary, and function-local nominal type declarations. Move a
+  non-exported patch-local struct or enum to file/module scope in an existing
+  watched source file; no Shell rebuild is needed when the resulting
+  declaration remains private to the HLBC image.
 - Arbitrary new Swift metadata, a patch concrete class identity visible to
   native code, retroactive conformances, or changes to a Shell type's layout,
   superclass, or enum cases. The hosted Objective-C subclass above is a frozen
@@ -193,7 +203,7 @@ machine code.
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |
 | Use a supported local closure or an already indexed same-image helper with an `@escaping` closure parameter | Lowered into the same image; closure return/capture is allowed only inside the pinned VM invocation |
-| Use `for value in lower..<upper` where both bounds are `Int` | Supported with Swift's precondition that `lower <= upper`; other range families require a full build |
+| Use integer `Range`/`ClosedRange` iteration, numeric `stride`, or scalar `contains` | Supported for the concrete local families above; bounds, direction, inclusive/exclusive endpoints, zero-stride traps, and integer extrema retain their verified Swift semantics. Progression values remain image-local and cannot cross Shell/NativeImport boundaries |
 | Use a one-grapheme Character literal in supported `String.contains` | Supported as a compiler-only String representation; general Character storage/API is not implied |
 | Declare a patch-local struct or enum | A newly introduced non-exported type is supported at file/module scope, including namespace nesting and supported computed accessors; a function-local nominal is rejected with an exact type diagnostic |
 | Declare a pure patch-local class | A final, nongeneric type used only inside one image supports reference identity, stored properties, private/ordinary methods, and computed accessors; it cannot cross into native code |

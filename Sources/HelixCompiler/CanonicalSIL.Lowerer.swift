@@ -79,19 +79,6 @@ public struct Lowerer: Sendable {
         var indexSlot: Bytecode.StackSlot
     }
 
-    /// Range is a compiler-only value. HLBC represents the loop with an Int
-    /// stack cursor and ordinary typed control flow rather than a Swift ABI
-    /// object whose layout could change with the standard library.
-    private struct IntegerRangeValue {
-        var lowerBound: Bytecode.Register
-        var upperBound: Bytecode.Register
-    }
-
-    private struct IntegerRangeIteratorState {
-        var upperBound: Bytecode.Register
-        var indexSlot: Bytecode.StackSlot
-    }
-
     private struct ArrayElementMutation {
         var arrayAddress: String
         var array: Bytecode.Register
@@ -116,6 +103,11 @@ public struct Lowerer: Sendable {
     private struct TupleComponentAddress {
         var base: String
         var index: Int
+    }
+
+    private struct TupleComponentStorageKey: Hashable {
+        var root: String
+        var path: [Int]
     }
 
     private struct NativePropertyAddress {
@@ -391,6 +383,47 @@ public struct Lowerer: Sendable {
                 )
             }
         }
+        var declaredBlockParameterTypes: [
+            Bytecode.BlockID: [Bytecode.ValueType]
+        ] = [:]
+        var declaredBlockIDs = Set<Bytecode.BlockID>()
+        for rawLine in rawLines {
+            let instruction = CanonicalSIL.DebugMetadata.strippingMetadata(
+                from: rawLine
+            ).trimmingCharacters(in: .whitespaces)
+            guard let header = match(
+                instruction,
+                pattern: #"^bb([0-9]+)(?:\((.*)\))?:$"#
+            ) else { continue }
+            let id = try parseBlockID(header[0])
+            guard declaredBlockIDs.insert(id).inserted else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "duplicate basic block \(id)"
+                )
+            }
+            let parameterText = header.count > 1 ? header[1] : ""
+            var parameterTypes: [Bytecode.ValueType] = []
+            var hasOnlyStorableParameters = true
+            for component in splitTopLevel(parameterText)
+            where !component.isEmpty {
+                guard let parameter = match(
+                    component,
+                    pattern: #"^%[0-9]+\s*:\s*(.+)$"#
+                ), let type = try? parseType(parameter[0])
+                else {
+                    // Metatypes and other compiler-only block parameters are
+                    // interpreted by the authoritative block parser. This
+                    // optional prepass exists only to normalize provable
+                    // Builtin.IntN forward edges.
+                    hasOnlyStorableParameters = false
+                    break
+                }
+                parameterTypes.append(ValueRepresentation.storable(type))
+            }
+            if hasOnlyStorableParameters {
+                declaredBlockParameterTypes[id] = parameterTypes
+            }
+        }
         let maximumOriginalBlock = rawLines.compactMap(parseBlockNumber).max() ?? 0
         var nextSyntheticBlock: UInt32? = maximumOriginalBlock == UInt32.max
             ? nil
@@ -414,7 +447,7 @@ public struct Lowerer: Sendable {
         var staticStringValues: [String: String] = [:]
         var wordLiterals: [String: UInt64] = [:]
         var integerLiterals: [String: (bitWidth: UInt16, value: Int64)] = [:]
-        var retypedIntegerLiterals: [String: [Bytecode.ValueType: Bytecode.Register]] = [:]
+        var retypedIntegerOperands: [String: [Bytecode.ValueType: Bytecode.Register]] = [:]
         var boolLiterals: [String: Bool] = [:]
         var metatypeValues = Set<String>()
         var arrayMetatypeValues: [String: Bytecode.ValueType] = [:]
@@ -453,14 +486,19 @@ public struct Lowerer: Sendable {
         var pendingArrayIteratorTypes: [String: Bytecode.ValueType] = [:]
         var arrayIteratorStates: [String: ArrayIteratorState] = [:]
         var destroyedArrayIterators: [String: Set<Bytecode.BlockID>] = [:]
-        var integerRangeValues: [String: IntegerRangeValue] = [:]
-        var integerRangeAddresses = Set<String>()
-        var integerRangeAddressValues: [String: IntegerRangeValue] = [:]
-        var integerRangeIteratorAddresses = Set<String>()
-        var integerRangeIteratorStates: [String: IntegerRangeIteratorState] = [:]
-        var pendingIntegerRangeNextAddresses: [String: IntegerRangeIteratorState] = [:]
-        var pendingIntegerRangeNextValues: [String: IntegerRangeIteratorState] = [:]
-        var elidedRuntimeStorageAddresses = Set<String>()
+        var progressionValues: [String: CanonicalSIL.Progression.Value] = [:]
+        var progressionAddresses: [
+            String: CanonicalSIL.Progression.SequenceType
+        ] = [:]
+        var progressionAddressValues: [
+            String: CanonicalSIL.Progression.Value
+        ] = [:]
+        var progressionIteratorAddresses: [
+            String: CanonicalSIL.Progression.SequenceType
+        ] = [:]
+        var progressionIteratorStates: [
+            String: CanonicalSIL.Progression.IteratorState
+        ] = [:]
         var arrayElementMutations: [String: ArrayElementMutation] = [:]
         var arrayMutationYieldByToken: [String: String] = [:]
         var integerConversionResults = Set<String>()
@@ -478,6 +516,7 @@ public struct Lowerer: Sendable {
         var arrayLiteralAddresses: [String: ArrayLiteralAddress] = [:]
         var arrayLiteralComponentAddresses: [String: ArrayLiteralComponentAddress] = [:]
         var tupleComponentAddresses: [String: TupleComponentAddress] = [:]
+        var tupleComponentValues: [TupleComponentStorageKey: Bytecode.Register] = [:]
         var tupleValues: [String: (Bytecode.Register, Bytecode.Register)] = [:]
         var unpackedTuples: [String: [Bytecode.Register]] = [:]
         var onStackClosureValues = Set<String>()
@@ -522,6 +561,7 @@ public struct Lowerer: Sendable {
         var indirectTryNormalBlocks = Set<Bytecode.BlockID>()
         var blocks: [IntermediateRepresentation.Block] = []
         var current: IntermediateRepresentation.Block?
+        var unreachableTrapReasons: [Bytecode.BlockID: Bytecode.TrapReason] = [:]
         var currentSourceLocation: Core.SourceLocation?
         var currentSILLineIndex = 0
         var sourceMap: [IntermediateRepresentation.SourceMapEntry] = []
@@ -804,11 +844,84 @@ public struct Lowerer: Sendable {
             guard runtimeAddress(at: token) == nil,
                   mutableCell(at: token) == nil
             else { return nil }
+            if let key = tupleComponentStorageKey(for: token) {
+                return tupleComponentValues[key]
+            }
             return stackAddressValues[addressBase(token)]
         }
 
         func recordCompilerAddressValue(_ value: Bytecode.Register, at token: String) {
-            stackAddressValues[addressBase(token)] = value
+            if let key = tupleComponentStorageKey(for: token) {
+                // A projected write invalidates any cached aggregate snapshot
+                // containing that field, as well as nested snapshots replaced
+                // by the write. Storage itself is keyed by semantic field path
+                // so distinct SIL projections alias one value.
+                stackAddressValues.removeValue(forKey: key.root)
+                tupleComponentValues = tupleComponentValues.filter { candidate, _ in
+                    guard candidate.root == key.root else { return true }
+                    return !candidate.path.starts(with: key.path)
+                        && !key.path.starts(with: candidate.path)
+                }
+                tupleComponentValues[key] = value
+                return
+            }
+            let root = addressBase(token)
+            stackAddressValues[root] = value
+            tupleComponentValues = tupleComponentValues.filter { $0.key.root != root }
+        }
+
+        func cacheTupleComponentValue(
+            _ value: Bytecode.Register,
+            at token: String
+        ) throws {
+            guard let key = tupleComponentStorageKey(for: token) else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "tuple component cache requires a projected address"
+                )
+            }
+            tupleComponentValues[key] = value
+        }
+
+        @discardableResult
+        func removeCompilerAddressValue(at token: String) -> Bytecode.Register? {
+            if let key = tupleComponentStorageKey(for: token) {
+                let removed = tupleComponentValues[key]
+                stackAddressValues.removeValue(forKey: key.root)
+                tupleComponentValues = tupleComponentValues.filter { candidate, _ in
+                    guard candidate.root == key.root else { return true }
+                    return !candidate.path.starts(with: key.path)
+                        && !key.path.starts(with: candidate.path)
+                }
+                return removed
+            }
+            return stackAddressValues.removeValue(forKey: addressBase(token))
+        }
+
+        func tupleComponentStorageKey(
+            for token: String
+        ) -> TupleComponentStorageKey? {
+            var current = addressBase(token)
+            var reversedPath: [Int] = []
+            var visited = Set<String>()
+            while let component = tupleComponentAddresses[current],
+                  visited.insert(current).inserted {
+                reversedPath.append(component.index)
+                current = addressBase(component.base)
+            }
+            guard !reversedPath.isEmpty else { return nil }
+            return .init(root: current, path: Array(reversedPath.reversed()))
+        }
+
+        @discardableResult
+        func removeTupleComponentValues(rootedAt root: String) -> [Bytecode.Register] {
+            let canonicalRoot = addressBase(root)
+            let matching = tupleComponentValues.filter {
+                $0.key.root == canonicalRoot
+            }
+            for key in matching.keys {
+                tupleComponentValues.removeValue(forKey: key)
+            }
+            return Array(matching.values)
         }
 
         func reconstructedOptionalNone(
@@ -970,7 +1083,7 @@ public struct Lowerer: Sendable {
                   !type.requiresLinearOwnership
                     || !isBorrowedValue(token: token, register: stored)
             else { return nil }
-            stackAddressValues.removeValue(forKey: root)
+            removeCompilerAddressValue(at: token)
             return stored
         }
 
@@ -1470,7 +1583,7 @@ public struct Lowerer: Sendable {
                         at: currentSILLineIndex
                     ) || forceOwnedTokens.contains(token)
                 guard consumes else { continue }
-                guard let stored = stackAddressValues[root] else { continue }
+                guard let stored = stackValue(at: token) else { continue }
                 guard stored == argument else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "owned call argument does not match its compiler address storage"
@@ -1481,7 +1594,7 @@ public struct Lowerer: Sendable {
                 // compiler-only address into the callee. HLBC passes that same
                 // value directly, so the later dealloc_stack must not release
                 // it a second time.
-                stackAddressValues.removeValue(forKey: root)
+                removeCompilerAddressValue(at: token)
                 for key in [root, token] where values[key] == argument {
                     values.removeValue(forKey: key)
                 }
@@ -1544,8 +1657,27 @@ public struct Lowerer: Sendable {
             line: Int
         ) throws -> Bytecode.Register {
             let original = try resolve(token, line: line)
-            if registerTypes[Int(original.rawValue)] == expected { return original }
-            if let cached = retypedIntegerLiterals[token]?[expected] { return cached }
+            let originalType = registerTypes[Int(original.rawValue)]
+            if originalType == expected { return original }
+            if let cached = retypedIntegerOperands[token]?[expected] { return cached }
+            if case let .integer(expectedWidth, _) = expected,
+               case let .integer(actualWidth, _) = originalType,
+               actualWidth == expectedWidth {
+                // Swift's raw overflow builtins encode signedness at the use
+                // site. Phi values therefore cannot rely on the declaration's
+                // default literal signedness; preserving their bits is the
+                // only representation-correct conversion.
+                let result = try allocate(type: expected)
+                appendInstruction(
+                    .integerConvert(
+                        result: result,
+                        operation: .reinterpret,
+                        value: original
+                    )
+                )
+                retypedIntegerOperands[token, default: [:]][expected] = result
+                return result
+            }
             guard case let .integer(bitWidth, signed) = expected,
                   let literal = integerLiterals[token],
                   literal.bitWidth == bitWidth,
@@ -1559,7 +1691,7 @@ public struct Lowerer: Sendable {
             appendInstruction(
                 .constantInteger(result: result, value: literal.value)
             )
-            retypedIntegerLiterals[token, default: [:]][expected] = result
+            retypedIntegerOperands[token, default: [:]][expected] = result
             return result
         }
 
@@ -1594,6 +1726,53 @@ public struct Lowerer: Sendable {
         func finishCurrent() {
             if let current { blocks.append(current) }
             current = nil
+        }
+
+        func normalizeBuiltinIntegerBranchArguments(
+            _ arguments: inout [Bytecode.Register],
+            target: Bytecode.BlockID
+        ) throws {
+            let expectedTypes: [Bytecode.ValueType]
+            if let targetBlock = if current?.id == target {
+                current
+            } else {
+                blocks.last(where: { $0.id == target })
+            } {
+                expectedTypes = targetBlock.parameters.map {
+                    registerTypes[Int($0.rawValue)]
+                }
+            } else {
+                expectedTypes = (declaredBlockParameterTypes[target] ?? [])
+                    + (implicitStackValues[target] ?? []).map {
+                        registerTypes[Int($0.register.rawValue)]
+                    }
+            }
+            guard expectedTypes.count == arguments.count else { return }
+
+            for index in arguments.indices {
+                let source = arguments[index]
+                let sourceType = registerTypes[Int(source.rawValue)]
+                let destinationType = expectedTypes[index]
+                guard sourceType != destinationType,
+                      case let .integer(sourceWidth, _) = sourceType,
+                      case let .integer(destinationWidth, _) = destinationType,
+                      sourceWidth == destinationWidth
+                else { continue }
+
+                // SIL's Builtin.IntN spelling carries no signedness. HLBC
+                // does, so phi edges preserve the raw bits while adopting the
+                // target block's representation instead of rejecting a legal
+                // signed/unsigned use-site interpretation.
+                let normalized = try allocate(type: destinationType)
+                appendInstruction(
+                    .integerConvert(
+                        result: normalized,
+                        operation: .reinterpret,
+                        value: source
+                    )
+                )
+                arguments[index] = normalized
+            }
         }
 
         func appendSyntheticBlock(
@@ -1891,19 +2070,18 @@ public struct Lowerer: Sendable {
                         repeating: nil,
                         count: types.count
                     )
-                    for (componentToken, component) in tupleComponentAddresses
-                    where addressBase(component.base) == root {
-                        guard types.indices.contains(component.index),
-                              elements[component.index] == nil,
-                              let value = stackAddressValues[componentToken],
-                              registerTypes[Int(value.rawValue)]
-                                == types[component.index]
+                    for (key, value) in tupleComponentValues
+                    where key.root == root && key.path.count == 1 {
+                        let index = key.path[0]
+                        guard types.indices.contains(index),
+                              elements[index] == nil,
+                              registerTypes[Int(value.rawValue)] == types[index]
                         else {
                             throw CanonicalSIL.LoweringError.malformedSIL(
                                 "mutable tuple capture has invalid component storage"
                             )
                         }
-                        elements[component.index] = value
+                        elements[index] = value
                     }
                     let initializedElements = elements.compactMap { $0 }
                     guard initializedElements.count == types.count else {
@@ -1926,6 +2104,7 @@ public struct Lowerer: Sendable {
                 }
             }
             stackAddressValues.removeValue(forKey: root)
+            removeTupleComponentValues(rootedAt: root)
 
             let cell = try allocate(type: .mutableCell(pointee))
             appendInstruction(
@@ -2166,7 +2345,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 stackAddressTypes[token] = types[component.index]
-                stackAddressValues[token] = elements[component.index]
+                try cacheTupleComponentValue(elements[component.index], at: token)
             }
         }
 
@@ -3715,6 +3894,133 @@ public struct Lowerer: Sendable {
             )
         }
 
+        func progressionSequenceType(
+            _ raw: String
+        ) throws -> CanonicalSIL.Progression.SequenceType? {
+            try CanonicalSIL.Progression.sequenceType(raw) {
+                try parseStoredType($0)
+            }
+        }
+
+        func progressionIteratorType(
+            _ raw: String
+        ) throws -> CanonicalSIL.Progression.SequenceType? {
+            try CanonicalSIL.Progression.iteratorType(raw) {
+                try parseStoredType($0)
+            }
+        }
+
+        func progressionValue(
+            at address: String,
+            line: Int
+        ) throws -> CanonicalSIL.Progression.Value {
+            let base = addressBase(address)
+            guard let value = progressionAddressValues[base],
+                  progressionAddresses[base] == value.type
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "progression operation references uninitialized or mismatched storage at line \(line)"
+                )
+            }
+            return value
+        }
+
+        func initializeProgressionIterator(
+            type: CanonicalSIL.Progression.SequenceType,
+            outputAddress: String,
+            inputAddress: String,
+            resultToken: String,
+            line: Int
+        ) throws {
+            let output = addressBase(outputAddress)
+            let value = try progressionValue(at: inputAddress, line: line)
+            guard type.supportsIteration,
+                  value.type == type,
+                  progressionIteratorAddresses[output] == type,
+                  progressionIteratorStates[output] == nil
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "progression makeIterator types or storage do not match"
+                )
+            }
+            let stride: Bytecode.Register
+            if type.family.usesExplicitStride {
+                guard let explicit = value.stride,
+                      registerTypes[Int(explicit.rawValue)] == type.stride
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Stride progression has no matching stride value"
+                    )
+                }
+                stride = explicit
+            } else {
+                guard type.stride == .int64 else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "progression iterator element \(type.element)"
+                    )
+                }
+                stride = try allocate(type: .int64)
+                appendInstruction(.constantInteger(result: stride, value: 1))
+            }
+            let initial = try allocate(type: .optional(type.element))
+            appendInstruction(
+                .makeOptionalSome(result: initial, value: value.start)
+            )
+            let cursorSlot = try allocateStackSlot(
+                type: .optional(type.element)
+            )
+            appendInstruction(
+                .storeStack(
+                    slot: cursorSlot,
+                    source: initial,
+                    mode: .initialize
+                )
+            )
+            progressionIteratorStates[output] = .init(
+                type: type,
+                end: value.end,
+                stride: stride,
+                cursorSlot: cursorSlot
+            )
+            voidValues.insert(resultToken)
+        }
+
+        func lowerProgressionIteratorNext(
+            type: CanonicalSIL.Progression.SequenceType,
+            resultAddress: String,
+            iteratorAddress: String,
+            resultToken: String,
+            line: Int
+        ) throws {
+            let iterator = addressBase(iteratorAddress)
+            guard type.supportsIteration,
+                  stackType(at: resultAddress) == .optional(type.element),
+                  progressionIteratorAddresses[iterator] == type,
+                  let state = progressionIteratorStates[iterator],
+                  state.type == type
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "progression iterator next types or storage do not match"
+                )
+            }
+            let result = try allocate(type: .optional(type.element))
+            appendInstruction(
+                .progressionNext(
+                    result: result,
+                    cursorSlot: state.cursorSlot,
+                    end: state.end,
+                    stride: state.stride,
+                    boundary: type.family.boundary
+                )
+            )
+            try storeConstructedValue(
+                result,
+                at: resultAddress,
+                mode: .initialize
+            )
+            voidValues.insert(resultToken)
+        }
+
         func lowerSwiftCoreIntrinsic(
             _ intrinsic: SwiftCoreIntrinsic,
             resultToken: String,
@@ -3735,6 +4041,175 @@ public struct Lowerer: Sendable {
                     line: line,
                     text: "Swift intrinsic requires control-flow lowering"
                 )
+            case let .progressionConstructor(family):
+                guard arguments.count == 4,
+                      !genericArguments.isEmpty,
+                      family.usesExplicitStride
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "stride constructor has unsupported arguments"
+                    )
+                }
+                let type = CanonicalSIL.Progression.SequenceType(
+                    family: family,
+                    element: try parseStoredType(genericArguments)
+                )
+                guard type.supportsIteration,
+                      let strideType = type.stride,
+                      progressionAddresses[addressBase(arguments[0])] == type,
+                      stackType(at: arguments[1]) == type.element,
+                      stackType(at: arguments[2]) == type.element,
+                      stackType(at: arguments[3]) == strideType,
+                      let start = try copyStoredValue(
+                          at: arguments[1],
+                          line: line
+                      ),
+                      let end = try copyStoredValue(
+                          at: arguments[2],
+                          line: line
+                      ),
+                      let stride = try copyStoredValue(
+                          at: arguments[3],
+                          line: line
+                      ),
+                      registerTypes[Int(start.rawValue)] == type.element,
+                      registerTypes[Int(end.rawValue)] == type.element,
+                      registerTypes[Int(stride.rawValue)] == strideType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "stride constructor specialization does not match its storage"
+                    )
+                }
+                let zero = try allocate(type: strideType)
+                switch strideType {
+                case .integer:
+                    appendInstruction(
+                        .constantInteger(result: zero, value: 0)
+                    )
+                case .float:
+                    appendInstruction(
+                        .constantFloat(result: zero, value: 0)
+                    )
+                default:
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "stride distance \(strideType)"
+                    )
+                }
+                let isZero = try allocate(type: .bool)
+                appendInstruction(
+                    .compare(
+                        result: isZero,
+                        predicate: .equal,
+                        lhs: stride,
+                        rhs: zero
+                    )
+                )
+                try appendConditionalTrap(
+                    condition: isZero,
+                    reason: .explicit("Stride size must not be zero")
+                )
+                progressionAddressValues[addressBase(arguments[0])] = .init(
+                    type: type,
+                    start: start,
+                    end: end,
+                    stride: stride
+                )
+                voidValues.insert(resultToken)
+
+            case let .progressionMakeIterator(family):
+                guard arguments.count == 2, !genericArguments.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Stride.makeIterator has unsupported arguments"
+                    )
+                }
+                let type = CanonicalSIL.Progression.SequenceType(
+                    family: family,
+                    element: try parseStoredType(genericArguments)
+                )
+                try initializeProgressionIterator(
+                    type: type,
+                    outputAddress: arguments[0],
+                    inputAddress: arguments[1],
+                    resultToken: resultToken,
+                    line: line
+                )
+
+            case let .progressionIteratorNext(family):
+                guard arguments.count == 2, !genericArguments.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Stride iterator next has unsupported arguments"
+                    )
+                }
+                let type = CanonicalSIL.Progression.SequenceType(
+                    family: family,
+                    element: try parseStoredType(genericArguments)
+                )
+                try lowerProgressionIteratorNext(
+                    type: type,
+                    resultAddress: arguments[0],
+                    iteratorAddress: arguments[1],
+                    resultToken: resultToken,
+                    line: line
+                )
+
+            case let .rangeContains(family):
+                guard arguments.count == 2,
+                      !genericArguments.isEmpty,
+                      family == .range || family == .closedRange
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Range.contains has unsupported arguments"
+                    )
+                }
+                let element = try parseStoredType(genericArguments)
+                let value = try progressionValue(
+                    at: arguments[1],
+                    line: line
+                )
+                guard value.type == .init(family: family, element: element),
+                      let needle = try copyStoredValue(
+                          at: arguments[0],
+                          line: line
+                      ),
+                      registerTypes[Int(needle.rawValue)] == element,
+                      registerTypes[Int(value.start.rawValue)] == element,
+                      registerTypes[Int(value.end.rawValue)] == element
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Range.contains specialization does not match its operands"
+                    )
+                }
+                let meetsLower = try allocate(type: .bool)
+                appendInstruction(
+                    .compare(
+                        result: meetsLower,
+                        predicate: .lessThanOrEqual,
+                        lhs: value.start,
+                        rhs: needle
+                    )
+                )
+                let meetsUpper = try allocate(type: .bool)
+                appendInstruction(
+                    .compare(
+                        result: meetsUpper,
+                        predicate: family == .closedRange
+                            ? .lessThanOrEqual
+                            : .lessThan,
+                        lhs: needle,
+                        rhs: value.end
+                    )
+                )
+                let result = try allocate(type: .bool)
+                values[resultToken] = result
+                appendInstruction(
+                    .booleanBinary(
+                        result: result,
+                        operation: .and,
+                        lhs: meetsLower,
+                        rhs: meetsUpper
+                    )
+                )
+
             case .minimum, .maximum:
                 guard arguments.count == 3, !genericArguments.isEmpty else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -3877,14 +4352,18 @@ public struct Lowerer: Sendable {
                       values[arguments[3]] != nil,
                       values[arguments[4]] != nil,
                       !prefix.isEmpty,
-                      !message.isEmpty
+                      !message.isEmpty,
+                      let blockID = current?.id,
+                      unreachableTrapReasons[blockID] == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Swift assertion failure has unsupported metadata"
                     )
                 }
-                // The following `unreachable` becomes the VM trap terminator.
-                // StaticString pointer layout remains compiler-only.
+                // Assertion metadata stays compiler-only, but retain its
+                // diagnostic in the trap emitted by the following canonical
+                // `unreachable` terminator.
+                unreachableTrapReasons[blockID] = trapReason(for: message)
                 voidValues.insert(resultToken)
 
             case .stringLiteral, .characterLiteral:
@@ -4441,31 +4920,19 @@ public struct Lowerer: Sendable {
                 voidValues.insert(resultToken)
 
             case .collectionMakeIterator:
-                if isIntegerRangeType(genericArguments), arguments.count == 2 {
-                    let iteratorAddress = addressBase(arguments[0])
-                    let rangeAddress = addressBase(arguments[1])
-                    guard integerRangeIteratorAddresses.contains(iteratorAddress),
-                          integerRangeIteratorStates[iteratorAddress] == nil,
-                          integerRangeAddresses.contains(rangeAddress),
-                          let range = integerRangeAddressValues[rangeAddress]
-                    else {
+                if let type = try progressionSequenceType(genericArguments) {
+                    guard arguments.count == 2 else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Range<Int>.makeIterator has unsupported arguments"
+                            "Range.makeIterator has unsupported arguments"
                         )
                     }
-                    let slot = try allocateStackSlot(type: .int64)
-                    appendInstruction(
-                        .storeStack(
-                            slot: slot,
-                            source: range.lowerBound,
-                            mode: .initialize
-                        )
+                    try initializeProgressionIterator(
+                        type: type,
+                        outputAddress: arguments[0],
+                        inputAddress: arguments[1],
+                        resultToken: resultToken,
+                        line: line
                     )
-                    integerRangeIteratorStates[iteratorAddress] = .init(
-                        upperBound: range.upperBound,
-                        indexSlot: slot
-                    )
-                    voidValues.insert(resultToken)
                     return
                 }
                 guard arguments.count == 2,
@@ -4505,23 +4972,19 @@ public struct Lowerer: Sendable {
                 voidValues.insert(resultToken)
 
             case .indexingIteratorNext:
-                if isIntegerRangeType(genericArguments), arguments.count == 2 {
-                    let resultAddress = addressBase(arguments[0])
-                    let iteratorAddress = addressBase(arguments[1])
-                    guard stackType(at: resultAddress) == .optional(.int64),
-                          let state = integerRangeIteratorStates[iteratorAddress],
-                          pendingIntegerRangeNextAddresses[resultAddress] == nil
-                    else {
+                if let type = try progressionSequenceType(genericArguments) {
+                    guard arguments.count == 2 else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "IndexingIterator<Range<Int>>.next has unsupported arguments"
+                            "Range iterator next has unsupported arguments"
                         )
                     }
-                    pendingIntegerRangeNextAddresses[resultAddress] = state
-                    // Range iteration is lowered directly to the iterator's
-                    // cursor slot; its SIL Optional out-buffer is never
-                    // materialized and must remain uninitialized in HLBC.
-                    elidedRuntimeStorageAddresses.insert(resultAddress)
-                    voidValues.insert(resultToken)
+                    try lowerProgressionIteratorNext(
+                        type: type,
+                        resultAddress: arguments[0],
+                        iteratorAddress: arguments[1],
+                        resultToken: resultToken,
+                        line: line
+                    )
                     return
                 }
                 guard arguments.count == 2,
@@ -5251,7 +5714,10 @@ public struct Lowerer: Sendable {
             }
 
             if line == "unreachable" {
-                appendInstruction(.trap(.explicit("Swift unreachable")))
+                let reason = current.flatMap {
+                    unreachableTrapReasons.removeValue(forKey: $0.id)
+                } ?? .explicit("Swift unreachable")
+                appendInstruction(.trap(reason))
                 continue
             }
 
@@ -5447,12 +5913,12 @@ public struct Lowerer: Sendable {
                     pendingStringInterpolationAddresses.insert(stack[0])
                     continue
                 }
-                if isIntegerRangeIteratorType(stack[1]) {
-                    integerRangeIteratorAddresses.insert(stack[0])
+                if let type = try progressionIteratorType(stack[1]) {
+                    progressionIteratorAddresses[stack[0]] = type
                     continue
                 }
-                if isIntegerRangeType(stack[1]) {
-                    integerRangeAddresses.insert(stack[0])
+                if let type = try progressionSequenceType(stack[1]) {
+                    progressionAddresses[stack[0]] = type
                     continue
                 }
                 if isCharacterType(stack[1]) {
@@ -5559,6 +6025,28 @@ public struct Lowerer: Sendable {
                 addressAliases[projection[0]] = projection[1]
                 values[projection[0]] = cell
                 continue
+            }
+
+            if let copy = match(
+                line,
+                pattern: #"^copy_addr(?: \[(take)\])? (%[0-9]+) to (?:\[(init|assign)\] )?(%[0-9]+)$"#
+            ) {
+                let source = addressBase(copy[1])
+                let destination = addressBase(copy[3])
+                if let progression = progressionAddressValues[source] {
+                    guard progressionAddresses[source] == progression.type,
+                          progressionAddresses[destination] == progression.type
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "progression copy_addr requires matching storage"
+                        )
+                    }
+                    progressionAddressValues[destination] = progression
+                    if copy[0] == "take" {
+                        progressionAddressValues.removeValue(forKey: source)
+                    }
+                    continue
+                }
             }
 
             if let copy = match(
@@ -5738,7 +6226,8 @@ public struct Lowerer: Sendable {
                 }
                 guard stackAddressTypes[base] != nil
                         || pendingArrayIteratorTypes[base] != nil
-                        || integerRangeIteratorAddresses.contains(base)
+                        || progressionAddresses[base] != nil
+                        || progressionIteratorAddresses[base] != nil
                         || pendingDictionaryIteratorTypes[base] != nil
                         || pendingStringInterpolationAddresses.contains(base)
                         || nativePropertyAddresses[base] != nil
@@ -5806,35 +6295,29 @@ public struct Lowerer: Sendable {
                    runtimeStackSlots[address] == nil {
                     continue
                 }
-                if elidedRuntimeStorageAddresses.contains(address) {
-                    if isFinalLexicalUse {
-                        elidedRuntimeStorageAddresses.remove(address)
-                    }
-                    continue
-                }
-                if integerRangeAddresses.contains(address) {
-                    guard integerRangeAddressValues[address] != nil else {
+                if progressionAddresses[address] != nil {
+                    guard progressionAddressValues[address] != nil else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Range<Int> storage is deallocated before initialization"
+                            "progression storage is deallocated before initialization"
                         )
                     }
                     if isFinalLexicalUse {
-                        integerRangeAddresses.remove(address)
-                        integerRangeAddressValues.removeValue(forKey: address)
+                        progressionAddresses.removeValue(forKey: address)
+                        progressionAddressValues.removeValue(forKey: address)
                     }
                     continue
                 }
-                if integerRangeIteratorAddresses.contains(address) {
-                    guard let state = integerRangeIteratorStates[address]
+                if progressionIteratorAddresses[address] != nil {
+                    guard let state = progressionIteratorStates[address]
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Range<Int> iterator storage is deallocated before initialization"
+                            "progression iterator storage is deallocated before initialization"
                         )
                     }
-                    appendInstruction(.destroyStack(state.indexSlot))
+                    appendInstruction(.destroyStack(state.cursorSlot))
                     if isFinalLexicalUse {
-                        integerRangeIteratorAddresses.remove(address)
-                        integerRangeIteratorStates.removeValue(forKey: address)
+                        progressionIteratorAddresses.removeValue(forKey: address)
+                        progressionIteratorStates.removeValue(forKey: address)
                     }
                     continue
                 }
@@ -5918,8 +6401,12 @@ public struct Lowerer: Sendable {
                 // HLBC represents them with an owned native box. Release any
                 // compiler-only storage that SIL legitimately deallocates
                 // without a preceding destroy_addr.
-                if let value = stackAddressValues.removeValue(forKey: address),
-                   registerTypes[Int(value.rawValue)].requiresLinearOwnership {
+                var storedValues = removeTupleComponentValues(rootedAt: address)
+                if let aggregate = stackAddressValues.removeValue(forKey: address) {
+                    storedValues.append(aggregate)
+                }
+                for value in Set(storedValues)
+                where registerTypes[Int(value.rawValue)].requiresLinearOwnership {
                     appendInstruction(.destroyValue(value))
                 }
                 continue
@@ -5957,10 +6444,12 @@ public struct Lowerer: Sendable {
                         "floating-point literal has an invalid bit width"
                     )
                 }
-                let expectedDigits = width == 32 ? 8 : 16
-                guard literal[2].count == expectedDigits else {
+                let maximumDigits = width == 32 ? 8 : 16
+                guard !literal[2].isEmpty,
+                      literal[2].count <= maximumDigits
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Float\(width) literal must contain \(expectedDigits) hexadecimal digits"
+                        "Float\(width) literal exceeds its hexadecimal bit width"
                     )
                 }
                 let value: Double
@@ -6590,42 +7079,51 @@ public struct Lowerer: Sendable {
 
             if let alias = match(
                 line,
-                pattern: #"^(%[0-9]+) = struct_extract (%[0-9]+), #(?:Int|Int8|Int16|Int32|Int64|UInt|UInt8|UInt16|UInt32|UInt64|Bool|Float|Double|CGFloat)\._value$"#
+                pattern: #"^(%[0-9]+) = struct_extract (%[0-9]+), #(.+)\.([^.]+)$"#
+            ), let wrapper = try CanonicalSIL.TransparentScalarWrapper.descriptor(
+                for: alias[2],
+                resolve: parseStoredType
             ) {
-                values[alias[0]] = try resolve(alias[1], line: sourceLine)
+                guard wrapper.fieldNames.contains(alias[3]) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "transparent scalar wrapper has an unknown stored field"
+                    )
+                }
+                let operand = try resolve(alias[1], line: sourceLine)
+                guard registerTypes[Int(operand.rawValue)] == wrapper.valueType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "transparent scalar extraction has the wrong representation"
+                    )
+                }
+                values[alias[0]] = operand
                 continue
             }
             if let alias = match(
                 line,
-                pattern: #"^(%[0-9]+) = struct \$(Int|Int8|Int16|Int32|Int64|UInt|UInt8|UInt16|UInt32|UInt64|Bool|Float|Double|CGFloat) \((%[0-9]+)\)$"#
+                pattern: #"^(%[0-9]+) = struct \$(.+) \((%[0-9]+)\)$"#
+            ), let wrapper = try CanonicalSIL.TransparentScalarWrapper.descriptor(
+                for: alias[1],
+                resolve: parseStoredType
             ) {
-                let operand = try resolve(alias[2], line: sourceLine)
-                if let unsignedWidth = unsignedIntegerWidth(of: alias[1]) {
-                    let expected = Bytecode.ValueType.integer(
-                        bitWidth: unsignedWidth,
-                        signed: false
+                switch wrapper.valueType {
+                case .integer:
+                    values[alias[0]] = try materializeIntegerOperand(
+                        alias[2],
+                        expected: wrapper.valueType,
+                        line: sourceLine
                     )
-                    if integerConversionResults.contains(alias[2]),
-                       registerTypes[Int(operand.rawValue)]
-                        == .integer(bitWidth: unsignedWidth, signed: true) {
-                        let result = try allocate(type: expected)
-                        appendInstruction(
-                            .integerConvert(
-                                result: result,
-                                operation: .reinterpret,
-                                value: operand
-                            )
-                        )
-                        values[alias[0]] = result
-                    } else {
-                        values[alias[0]] = try materializeIntegerOperand(
-                            alias[2],
-                            expected: expected,
-                            line: sourceLine
+                case .bool, .float:
+                    let operand = try resolve(alias[2], line: sourceLine)
+                    guard registerTypes[Int(operand.rawValue)] == wrapper.valueType else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "transparent scalar construction has the wrong representation"
                         )
                     }
-                } else {
                     values[alias[0]] = operand
+                default:
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "transparent scalar construction is not scalar"
+                    )
                 }
                 continue
             }
@@ -6812,29 +7310,33 @@ public struct Lowerer: Sendable {
 
             if let construction = match(
                 line,
-                pattern: #"^(%[0-9]+) = struct \$((?:Swift\.)?Range<(?:Swift\.)?Int>) \((.*)\)$"#
-            ) {
+                pattern: #"^(%[0-9]+) = struct \$((?:Swift\.)?(?:Range|ClosedRange)<.+>) \((.*)\)$"#
+            ), let type = try progressionSequenceType(construction[1]) {
                 let operands = try parseApplyValueTokens(
                     construction[2],
                     line: sourceLine
                 )
-                guard operands.count == 2 else {
+                guard type.family == .range || type.family == .closedRange,
+                      operands.count == 2
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Range<Int> construction requires lower and upper bounds"
+                        "Range construction requires lower and upper bounds"
                     )
                 }
                 let lower = try resolve(operands[0], line: sourceLine)
                 let upper = try resolve(operands[1], line: sourceLine)
-                guard registerTypes[Int(lower.rawValue)] == .int64,
-                      registerTypes[Int(upper.rawValue)] == .int64
+                guard registerTypes[Int(lower.rawValue)] == type.element,
+                      registerTypes[Int(upper.rawValue)] == type.element
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Range<Int> bounds must both be Int"
+                        "Range bounds do not match the concrete Bound type"
                     )
                 }
-                integerRangeValues[construction[0]] = .init(
-                    lowerBound: lower,
-                    upperBound: upper
+                progressionValues[construction[0]] = .init(
+                    type: type,
+                    start: lower,
+                    end: upper,
+                    stride: nil
                 )
                 continue
             }
@@ -9054,16 +9556,21 @@ public struct Lowerer: Sendable {
             if let store = match(
                 line,
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
-            ), let range = integerRangeValues.removeValue(forKey: store[0]) {
+            ), let progression = progressionValues[store[0]] {
                 let address = addressBase(store[1])
-                guard integerRangeAddresses.contains(address),
-                      integerRangeAddressValues[address] == nil
+                guard progressionAddresses[address] == progression.type
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Range<Int> storage is unsupported or initialized more than once"
+                        "progression value does not match its destination storage"
                     )
                 }
-                integerRangeAddressValues[address] = range
+                progressionAddressValues[address] = progression
+                if !hasFutureSemanticUse(
+                    of: store[0],
+                    after: currentSILLineIndex
+                ) {
+                    progressionValues.removeValue(forKey: store[0])
+                }
                 continue
             }
 
@@ -9314,15 +9821,18 @@ public struct Lowerer: Sendable {
                     stringInterpolationValues[load[0]] = accumulator
                     continue
                 }
-                if let state = pendingIntegerRangeNextAddresses.removeValue(
-                    forKey: address
-                ) {
-                    guard stackType(at: load[2]) == .optional(.int64) else {
+                if let progression = progressionAddressValues[address] {
+                    guard progressionAddresses[address] == progression.type,
+                          progressionValues[load[0]] == nil
+                    else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Range iterator result storage is not Optional<Int>"
+                            "progression load references mismatched storage"
                         )
                     }
-                    pendingIntegerRangeNextValues[load[0]] = state
+                    if mode == "take" {
+                        progressionAddressValues.removeValue(forKey: address)
+                    }
+                    progressionValues[load[0]] = progression
                     continue
                 }
                 if let cell = mutableCell(at: load[2]),
@@ -9400,7 +9910,7 @@ public struct Lowerer: Sendable {
                             "taking load cannot consume borrowed storage"
                         )
                     }
-                    stackAddressValues.removeValue(forKey: address)
+                    removeCompilerAddressValue(at: load[2])
                     values[load[0]] = value
                 } else if mode == "copy"
                             || (mode.isEmpty
@@ -9442,9 +9952,6 @@ public struct Lowerer: Sendable {
                 }
                 if catchScratchAddresses.contains(address),
                    runtimeStackSlots[address] == nil {
-                    continue
-                }
-                if elidedRuntimeStorageAddresses.contains(address) {
                     continue
                 }
                 if let iterator = arrayIteratorStates[address] {
@@ -9490,7 +9997,7 @@ public struct Lowerer: Sendable {
                 // Compiler-only storage owns the SSA value transferred into
                 // it. Native boxes need an explicit HLBC destroy even when the
                 // physical Swift value has trivial SIL ownership.
-                if let value = stackAddressValues.removeValue(forKey: address),
+                if let value = removeCompilerAddressValue(at: destroy[0]),
                    registerTypes[Int(value.rawValue)].requiresLinearOwnership {
                     appendInstruction(.destroyValue(value))
                 }
@@ -9716,6 +10223,10 @@ public struct Lowerer: Sendable {
             }
 
             if let copy = match(line, pattern: #"^(%[0-9]+) = copy_value (%[0-9]+)$"#) {
+                if let progression = progressionValues[copy[1]] {
+                    progressionValues[copy[0]] = progression
+                    continue
+                }
                 if let reference = functionReferences[copy[1]] {
                     functionReferences[copy[0]] = reference
                     continue
@@ -9768,6 +10279,16 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = move_value(?: \[[^\]]+\])* (%[0-9]+)$"#
             ) {
+                if let progression = progressionValues[move[1]] {
+                    progressionValues[move[0]] = progression
+                    if !hasFutureSemanticUse(
+                        of: move[1],
+                        after: currentSILLineIndex
+                    ) {
+                        progressionValues.removeValue(forKey: move[1])
+                    }
+                    continue
+                }
                 if let reference = functionReferences.removeValue(forKey: move[1]) {
                     functionReferences[move[0]] = reference
                     continue
@@ -9817,6 +10338,15 @@ public struct Lowerer: Sendable {
                 continue
             }
             if let destroy = match(line, pattern: #"^destroy_value (%[0-9]+)$"#) {
+                if progressionValues[destroy[0]] != nil {
+                    if !hasFutureSemanticUse(
+                        of: destroy[0],
+                        after: currentSILLineIndex
+                    ) {
+                        progressionValues.removeValue(forKey: destroy[0])
+                    }
+                    continue
+                }
                 if functionReferences.removeValue(forKey: destroy[0]) != nil { continue }
                 if deferredForeignReferences.removeValue(forKey: destroy[0]) != nil {
                     continue
@@ -9848,6 +10378,16 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(retain_value|release_value) (%[0-9]+)$"#
             ) {
+                if progressionValues[ownership[1]] != nil {
+                    if ownership[0] == "release_value",
+                       !hasFutureSemanticUse(
+                            of: ownership[1],
+                            after: currentSILLineIndex
+                       ) {
+                        progressionValues.removeValue(forKey: ownership[1])
+                    }
+                    continue
+                }
                 let value = try resolve(ownership[1], line: sourceLine)
                 if registerTypes[Int(value.rawValue)].requiresLinearOwnership {
                     if ownership[0] == "retain_value" {
@@ -10047,78 +10587,6 @@ public struct Lowerer: Sendable {
                 let secondTarget = try parseBlockID(branch[4])
                 let someTarget = branch[1] == "some" ? firstTarget : secondTarget
                 let noneTarget = branch[1] == "none" ? firstTarget : secondTarget
-                if let state = pendingIntegerRangeNextValues.removeValue(
-                    forKey: branch[0]
-                ) {
-                    let cursor = try allocate(type: .int64)
-                    appendInstruction(
-                        .loadStack(
-                            result: cursor,
-                            slot: state.indexSlot,
-                            mode: .copy
-                        )
-                    )
-                    let hasNext = try allocate(type: .bool)
-                    appendInstruction(
-                        .compare(
-                            result: hasNext,
-                            predicate: .lessThan,
-                            lhs: cursor,
-                            rhs: state.upperBound
-                        )
-                    )
-                    let somePreparation = try allocateSyntheticBlockID()
-                    appendInstruction(
-                        .conditionalBranch(
-                            condition: hasNext,
-                            trueTarget: somePreparation,
-                            trueArguments: [],
-                            falseTarget: noneTarget,
-                            falseArguments: []
-                        )
-                    )
-                    finishCurrent()
-
-                    let one = try allocate(type: .int64)
-                    let next = try allocate(type: .int64)
-                    let overflow = try allocate(type: .bool)
-                    let preparationInstructions: [IntermediateRepresentation.Instruction] = [
-                        .constantInteger(result: one, value: 1),
-                        .checkedBinary(
-                            result: next,
-                            overflow: overflow,
-                            operation: .add,
-                            lhs: cursor,
-                            rhs: one
-                        ),
-                        .storeStack(
-                            slot: state.indexSlot,
-                            source: next,
-                            mode: .assign
-                        ),
-                        .branch(target: someTarget, arguments: [cursor]),
-                    ]
-                    blocks.append(
-                        .init(
-                            id: somePreparation,
-                            parameters: [],
-                            instructions: preparationInstructions
-                        )
-                    )
-                    if let currentSourceLocation {
-                        for offset in preparationInstructions.indices {
-                            guard let instructionOffset = UInt32(exactly: offset) else { break }
-                            sourceMap.append(
-                                .init(
-                                    blockID: somePreparation,
-                                    instructionOffset: instructionOffset,
-                                    location: currentSourceLocation
-                                )
-                            )
-                        }
-                    }
-                    continue
-                }
                 let optional = try resolve(branch[0], line: sourceLine)
                 guard case .optional = registerTypes[Int(optional.rawValue)] else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -10217,6 +10685,10 @@ public struct Lowerer: Sendable {
                     target: target,
                     arguments: &arguments
                 )
+                try normalizeBuiltinIntegerBranchArguments(
+                    &arguments,
+                    target: target
+                )
                 appendInstruction(
                     .branch(target: target, arguments: arguments)
                 )
@@ -10296,6 +10768,14 @@ public struct Lowerer: Sendable {
                 try appendCompilerAddressMergeArguments(
                     target: falseTarget,
                     arguments: &falseArguments
+                )
+                try normalizeBuiltinIntegerBranchArguments(
+                    &trueArguments,
+                    target: trueTarget
+                )
+                try normalizeBuiltinIntegerBranchArguments(
+                    &falseArguments,
+                    target: falseTarget
                 )
                 appendInstruction(
                     .conditionalBranch(
@@ -10432,15 +10912,16 @@ public struct Lowerer: Sendable {
                 + destroyedArrayIterators.count
         )
         recordIncompleteLifetime(
-            "integer-range",
-            count: integerRangeValues.count
-                + integerRangeAddresses.count
-                + integerRangeAddressValues.count
-                + integerRangeIteratorAddresses.count
-                + integerRangeIteratorStates.count
-                + pendingIntegerRangeNextAddresses.count
-                + pendingIntegerRangeNextValues.count
-                + elidedRuntimeStorageAddresses.count
+            "progression",
+            count: progressionValues.count
+                + progressionAddresses.count
+                + progressionAddressValues.count
+                + progressionIteratorAddresses.count
+                + progressionIteratorStates.count
+        )
+        recordIncompleteLifetime(
+            "assertion-trap",
+            count: unreachableTrapReasons.count
         )
         recordIncompleteLifetime(
             "array-mutation",
@@ -10957,27 +11438,6 @@ public struct Lowerer: Sendable {
         ValueRepresentation.storable(try parseType(raw))
     }
 
-    private func isIntegerRangeType(_ raw: String) -> Bool {
-        let type = raw.replacingOccurrences(of: " ", with: "")
-        return [
-            "Range<Int>",
-            "Range<Swift.Int>",
-            "Swift.Range<Int>",
-            "Swift.Range<Swift.Int>",
-        ].contains(type)
-    }
-
-    private func isIntegerRangeIteratorType(_ raw: String) -> Bool {
-        let type = raw.replacingOccurrences(of: " ", with: "")
-        let prefixes = ["IndexingIterator<", "Swift.IndexingIterator<"]
-        guard let prefix = prefixes.first(where: { type.hasPrefix($0) }),
-              type.hasSuffix(">")
-        else { return false }
-        let start = type.index(type.startIndex, offsetBy: prefix.count)
-        let end = type.index(before: type.endIndex)
-        return isIntegerRangeType(String(type[start..<end]))
-    }
-
     private func isCharacterType(_ raw: String) -> Bool {
         let type = raw.trimmingCharacters(in: .whitespaces)
         return type == "Character" || type == "Swift.Character"
@@ -11412,17 +11872,6 @@ public struct Lowerer: Sendable {
     private func parseBlockNumber(_ line: String) -> UInt32? {
         guard let values = match(line.trimmingCharacters(in: .whitespaces), pattern: #"^bb([0-9]+)"#) else { return nil }
         return UInt32(values[0])
-    }
-
-    private func unsignedIntegerWidth(of nominalType: String) -> UInt16? {
-        switch nominalType {
-        case "UInt": 64
-        case "UInt8": 8
-        case "UInt16": 16
-        case "UInt32": 32
-        case "UInt64": 64
-        default: nil
-        }
     }
 
     private func parseBlockID(_ raw: String) throws -> Bytecode.BlockID {

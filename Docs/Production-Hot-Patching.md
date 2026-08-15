@@ -173,8 +173,8 @@ Dictionary removal value semantics, common fully concrete Array-backed
 `map`/`filter`/`compactMap`/`reduce`/predicate operations,
 `Optional.map`/`flatMap`, concrete `Result` payload transforms and
 `Result.get()` for patch-local value payloads, VM-owned `Any`, and common
-dynamic casts,
-half-open `Range<Int>` loops, structured
+dynamic casts, fixed-width integer `Range`/`ClosedRange` iteration,
+integer and floating-point `stride`, scalar Range containment, structured
 control flow, newly introduced non-exported ordinary/private helpers, computed
 accessors, file- or module-scope patch-local struct/enum, pure HLVM classes, and
 concrete `Result` values,

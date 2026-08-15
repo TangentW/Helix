@@ -33,6 +33,10 @@ enum SwiftCoreIntrinsic: Equatable {
     case arrayPopLast
     case collectionMakeIterator
     case indexingIteratorNext
+    case progressionConstructor(CanonicalSIL.Progression.Family)
+    case progressionMakeIterator(CanonicalSIL.Progression.Family)
+    case progressionIteratorNext(CanonicalSIL.Progression.Family)
+    case rangeContains(CanonicalSIL.Progression.Family)
     case dictionaryCount
     case dictionaryIsEmpty
     case dictionarySubscriptGet
@@ -126,6 +130,20 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .collectionMakeIterator
         case "$ss16IndexingIteratorV4next7ElementQzSgyF":
             self = .indexingIteratorNext
+        case "$ss6stride4from2to2bys8StrideToVyxGx_x0E0QztSxRzlF":
+            self = .progressionConstructor(.strideTo)
+        case "$ss6stride4from7through2bys13StrideThroughVyxGx_x0E0QztSxRzlF":
+            self = .progressionConstructor(.strideThrough)
+        case "$ss8StrideToV12makeIterators0abD0VyxGyF":
+            self = .progressionMakeIterator(.strideTo)
+        case "$ss13StrideThroughV12makeIterators0abD0VyxGyF":
+            self = .progressionMakeIterator(.strideThrough)
+        case "$ss16StrideToIteratorV4nextxSgyF":
+            self = .progressionIteratorNext(.strideTo)
+        case "$ss21StrideThroughIteratorV4nextxSgyF":
+            self = .progressionIteratorNext(.strideThrough)
+        case "$sSn8containsySbxF": self = .rangeContains(.range)
+        case "$sSN8containsySbxF": self = .rangeContains(.closedRange)
         case "$sSD5countSivg": self = .dictionaryCount
         case "$sSD7isEmptySbvg": self = .dictionaryIsEmpty
         case "$sSDyq_Sgxcig": self = .dictionarySubscriptGet
