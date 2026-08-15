@@ -337,7 +337,7 @@ struct SetSemanticsMatrix {
                 """,
                 scenarios: [
                     .init(
-                        arguments: [.float(-0.0, bitWidth: 64)],
+                        arguments: [.float64(-0.0)],
                         expected: .returned(.tuple([try integer(2), .bool(true)]))
                     ),
                 ]
@@ -426,17 +426,17 @@ struct SetSemanticsMatrix {
                         arguments: [
                             .set(
                                 VM.SetValue(
-                                    elements: [.float(.nan, bitWidth: 64)],
+                                    elements: [.float64(.nan)],
                                     elementType: .float(bitWidth: 64)
                                 )
                             ),
                             .set(
                                 VM.SetValue(
-                                    elements: [.float(.nan, bitWidth: 64)],
+                                    elements: [.float64(.nan)],
                                     elementType: .float(bitWidth: 64)
                                 )
                             ),
-                            .float(.nan, bitWidth: 64),
+                            .float64(.nan),
                         ],
                         expected: .returned(
                             .tuple([.bool(true), .bool(false), try integer(2)])

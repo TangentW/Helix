@@ -64,7 +64,7 @@ public struct Integer: Hashable, Sendable, CustomStringConvertible {
 public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
     case bool(Bool)
     case integer(VM.Integer)
-    case float(Double, bitWidth: UInt16)
+    case float(VM.FloatingValue)
     case string(String)
     case any(VM.AnyValue)
     case array([VM.Value], elementType: Bytecode.ValueType)
@@ -94,7 +94,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         switch self {
         case .bool: .bool
         case let .integer(value): .integer(bitWidth: value.bitWidth, signed: value.isSigned)
-        case let .float(_, bitWidth): .float(bitWidth: bitWidth)
+        case let .float(value): .float(bitWidth: value.bitWidth)
         case .string: .string
         case .any: .any
         case let .array(_, elementType): .array(elementType)
@@ -118,7 +118,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         switch self {
         case let .bool(value): String(value)
         case let .integer(value): value.description
-        case let .float(value, _): String(value)
+        case let .float(value): value.description
         case let .string(value): String(reflecting: value)
         case let .any(value): value.payload.description
         case let .array(values, _): "[\(values.map(\.description).joined(separator: ", "))]"
@@ -261,8 +261,8 @@ extension VM.Value {
             closure.signature == signature
         case let (.integer(value), .integer(width, signed)):
             value.bitWidth == width && value.isSigned == signed
-        case let (.float(_, actual), .float(expected)):
-            actual == expected
+        case let (.float(value), .float(expected)):
+            value.bitWidth == expected
         case let (.tuple(values), .tuple(types)):
             values.count == types.count
                 && zip(values, types).allSatisfy {
@@ -275,5 +275,16 @@ extension VM.Value {
         default:
             false
         }
+    }
+
+    /// Constructs an exact binary32 VM scalar without exposing an invalid
+    /// width parameter or routing the payload through binary64 storage.
+    public static func float32(_ value: Float) -> Self {
+        .float(VM.FloatingValue(value))
+    }
+
+    /// Constructs an exact binary64 VM scalar.
+    public static func float64(_ value: Double) -> Self {
+        .float(VM.FloatingValue(value))
     }
 }

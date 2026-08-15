@@ -1566,29 +1566,22 @@ public struct Engine: Verification.ImageVerifying {
             }
         }
         switch instruction {
-        case let .constantInteger(result, value):
-            guard case let .integer(width, signed) = type(result) else {
+        case let .constantInteger(result, bitPattern):
+            guard case let .integer(width, _) = type(result) else {
                 throw fail("const_int result must be an integer")
             }
-            if signed {
-                let minimum = width == 64 ? Int64.min : -(Int64(1) << (width - 1))
-                let maximum = width == 64 ? Int64.max : (Int64(1) << (width - 1)) - 1
-                guard value >= minimum, value <= maximum else {
-                    throw fail("integer literal does not fit Int\(width)")
-                }
-            } else {
-                let maximum = width == 64 ? UInt64.max : (UInt64(1) << width) - 1
-                guard value >= 0, UInt64(value) <= maximum else {
-                    throw fail("integer literal does not fit UInt\(width)")
-                }
+            let mask = width == 64 ? UInt64.max : (UInt64(1) << width) - 1
+            guard bitPattern & ~mask == 0 else {
+                throw fail("integer bit pattern does not fit \(width) bits")
             }
         case let .constantBool(result, _):
             guard type(result) == .bool else { throw fail("const_bool result must be Bool") }
-        case let .constantFloat(result, value):
-            guard case .float = type(result) else { throw fail("const_float result must be a float") }
-            guard value.isFinite else { throw fail("const_float must be finite") }
-            if case .float(bitWidth: 32) = type(result) {
-                guard Float(value).isFinite else { throw fail("const_float does not fit Float32") }
+        case let .constantFloat(result, bitPattern):
+            guard case let .float(width) = type(result) else {
+                throw fail("const_float result must be a float")
+            }
+            if width == 32, bitPattern > UInt64(UInt32.max) {
+                throw fail("floating bit pattern does not fit binary32")
             }
         case let .constantString(result, value):
             guard capabilities.contains(.stringsV1) else {

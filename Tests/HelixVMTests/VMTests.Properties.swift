@@ -110,17 +110,19 @@ struct Properties {
                     entry: .init(rawValue: 0),
                     image: image,
                     arguments: [
-                        .float(Double(lhs), bitWidth: 32),
-                        .float(Double(rhs), bitWidth: 32),
+                        .float32(lhs),
+                        .float32(rhs),
                     ]
                 )
-                guard case let .returned(.some(.float(actual, bitWidth: 32))) = result else {
+                guard case let .returned(.some(.float(actual))) = result,
+                      actual.bitWidth == 32
+                else {
                     Issue.record("unexpected Float32 result for \(operation): \(result)")
                     accepted += 1
                     continue
                 }
                 #expect(
-                    Float(actual).bitPattern == expected.bitPattern,
+                    actual.floatValue.bitPattern == expected.bitPattern,
                     Comment(
                         rawValue: "Float32 \(operation) mismatch for "
                             + "0x\(String(lhs.bitPattern, radix: 16)) and "
@@ -129,6 +131,87 @@ struct Properties {
                 )
                 accepted += 1
             }
+        }
+    }
+
+    @Test("HLVM constants retain non-finite payloads at their native width")
+    func scalarConstantsRetainRawBits() throws {
+        let cases: [(width: UInt16, bitPattern: UInt64)] = [
+            (32, 0x7FA1_2345),
+            (32, UInt64(Float.infinity.bitPattern)),
+            (32, UInt64((-0.0 as Float).bitPattern)),
+            (64, 0x7FF0_0000_0000_1234),
+            (64, Double.infinity.bitPattern),
+            (64, (-0.0 as Double).bitPattern),
+        ]
+        for (index, item) in cases.enumerated() {
+            let type = Bytecode.ValueType.float(bitWidth: item.width)
+            let function = Bytecode.Function(
+                id: .init(rawValue: 0),
+                name: "float_constant_\(index)",
+                parameterRegisters: [],
+                resultType: type,
+                registerTypes: [type],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        instructions: [
+                            .constantFloat(
+                                result: .init(rawValue: 0),
+                                bitPattern: item.bitPattern
+                            ),
+                            .returnValue(.init(rawValue: 0)),
+                        ]
+                    ),
+                ]
+            )
+            let image = try makeVerified(
+                function: function,
+                signature: .init(
+                    parameters: [],
+                    result: item.width == 32 ? "Swift.Float" : "Swift.Double"
+                ),
+                parameterTypes: [],
+                resultType: type,
+                capabilities: [.baselineV1]
+            )
+            guard case let .returned(.some(.float(value))) = VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: []
+            ) else {
+                Issue.record("floating constant did not return its VM scalar")
+                continue
+            }
+            #expect(value.bitWidth == item.width)
+            #expect(value.bitPattern == item.bitPattern)
+            if item.width == 32 {
+                #expect(
+                    value.floatValue.isSignalingNaN
+                        == Float(bitPattern: UInt32(item.bitPattern)).isSignalingNaN
+                )
+            } else {
+                #expect(
+                    value.doubleValue.isSignalingNaN
+                        == Double(bitPattern: item.bitPattern).isSignalingNaN
+                )
+            }
+        }
+
+        #expect(throws: VM.RuntimeTrap.invalidFloatingPointWidth(16)) {
+            _ = try VM.FloatingValue(bitPattern: 0, bitWidth: 16)
+        }
+        #expect(
+            throws: VM.RuntimeTrap.invalidFloatingPointBitPattern(
+                UInt64(UInt32.max) + 1,
+                bitWidth: 32
+            )
+        ) {
+            _ = try VM.FloatingValue(
+                bitPattern: UInt64(UInt32.max) + 1,
+                bitWidth: 32
+            )
         }
     }
 
@@ -219,14 +302,16 @@ struct Properties {
             let result = VM.Interpreter().invoke(
                 entry: .init(rawValue: 0),
                 image: floatImage,
-                arguments: [.float(input, bitWidth: 64)]
+                arguments: [.float64(input)]
             )
-            guard case let .returned(.some(.float(actual, 32))) = result else {
+            guard case let .returned(.some(.float(actual))) = result,
+                  actual.bitWidth == 32
+            else {
                 Issue.record("unexpected Float conversion result for case \(caseID): \(result)")
                 continue
             }
             #expect(
-                Float(actual).bitPattern == expected.bitPattern,
+                actual.floatValue.bitPattern == expected.bitPattern,
                 Comment(rawValue: "floating truncation mismatch for case \(caseID)")
             )
         }
@@ -591,7 +676,12 @@ struct Properties {
                 operation = .multiply
                 expected *= literalValue
             }
-            instructions.append(.constantInteger(result: literal, value: literalValue))
+            instructions.append(
+                .constantInteger(
+                    result: literal,
+                    bitPattern: UInt64(bitPattern: literalValue)
+                )
+            )
             instructions.append(
                 .checkedBinary(
                     result: result,

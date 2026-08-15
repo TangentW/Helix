@@ -49,7 +49,6 @@ public enum Encoder {
                     + "not \(declaredBytecode)"
             )
         }
-        try validateFloatingPointConstants(in: module)
         let wire = try makeWireSections(module)
         let sortedSections = wire.sorted { $0.key < $1.key }
         guard sortedSections.count <= Int(UInt32.max) else {
@@ -107,22 +106,6 @@ public enum Encoder {
         let imageHash = Core.Digest.sha256(writer.data)
         writer.data.replaceSubrange(Bytecode.Header.imageHashRange, with: imageHash.data)
         return writer.data
-    }
-
-    private static func validateFloatingPointConstants(in module: Bytecode.Module) throws {
-        for function in module.functions {
-            for block in function.blocks {
-                for instruction in block.instructions {
-                    guard case let .constantFloat(_, value) = instruction else { continue }
-                    guard value.isFinite else {
-                        throw Bytecode.CodecError.malformedSection(
-                            kind: .code,
-                            reason: "non-finite floating-point constants are not canonical JSON"
-                        )
-                    }
-                }
-            }
-        }
     }
 
     private static func makeWireSections(

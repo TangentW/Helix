@@ -99,9 +99,11 @@ public enum Disassembler {
 
     private static func format(_ instruction: Bytecode.Instruction) -> String {
         switch instruction {
-        case let .constantInteger(result, value): "\(result) = const_int \(value)"
+        case let .constantInteger(result, bitPattern):
+            "\(result) = const_int_bits \(hex(bitPattern))"
         case let .constantBool(result, value): "\(result) = const_bool \(value)"
-        case let .constantFloat(result, value): "\(result) = const_float \(value)"
+        case let .constantFloat(result, bitPattern):
+            "\(result) = const_float_bits \(hex(bitPattern))"
         case let .constantString(result, value): "\(result) = const_string \(quoted(value))"
         case let .copyValue(result, source): "\(result) = copy_value \(source)"
         case let .moveValue(result, source): "\(result) = move_value \(source)"
@@ -305,6 +307,10 @@ public enum Disassembler {
         case let .throwError(error): "throw_error \(error)"
         case let .trap(reason): "trap \(quoted(reason.description))"
         }
+    }
+
+    private static func hex(_ value: UInt64) -> String {
+        "0x" + String(value, radix: 16, uppercase: true)
     }
 
     private static func assignment(_ result: Bytecode.Register?) -> String {

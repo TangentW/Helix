@@ -395,40 +395,48 @@ struct Container {
         }
     }
 
-    @Test("Non-finite floating-point constants cannot enter canonical HLBC")
-    func nonFiniteFloatIsRejected() throws {
+    @Test("Canonical scalar literals preserve every raw payload bit")
+    func specialScalarBitPatternsRoundTrip() throws {
         var module = try makeAddModule()
-        module.functions[0].registerTypes.append(.float(bitWidth: 64))
-        module.functions[0].blocks[2].instructions.insert(
-            .constantFloat(result: .init(rawValue: 5), value: .infinity),
-            at: 0
-        )
-
-        #expect(throws: Bytecode.CodecError.self) {
-            try Bytecode.Encoder.encode(module)
-        }
-    }
-
-    @Test("Canonical floating literals preserve signed zero")
-    func signedZeroRoundTrip() throws {
-        var module = try makeAddModule()
-        module.functions[0].registerTypes.append(.float(bitWidth: 64))
-        module.functions[0].blocks[0].instructions.insert(
-            .constantFloat(result: .init(rawValue: 5), value: -0.0),
-            at: 0
-        )
+        module.functions[0].registerTypes.append(contentsOf: [
+            .float(bitWidth: 32),
+            .float(bitWidth: 64),
+            .float(bitWidth: 64),
+            .integer(bitWidth: 64, signed: false),
+        ])
+        let expected: [UInt64] = [
+            0x7FA1_2345,
+            Double.infinity.bitPattern,
+            (-0.0 as Double).bitPattern,
+        ]
+        module.functions[0].blocks[0].instructions.insert(contentsOf: [
+            .constantFloat(result: .init(rawValue: 5), bitPattern: expected[0]),
+            .constantFloat(result: .init(rawValue: 6), bitPattern: expected[1]),
+            .constantFloat(result: .init(rawValue: 7), bitPattern: expected[2]),
+            .constantInteger(result: .init(rawValue: 8), bitPattern: .max),
+        ], at: 0)
 
         let decoded = try Bytecode.Decoder.decode(Bytecode.Encoder.encode(module)).module
         let constants = decoded.functions
             .flatMap(\.blocks)
             .flatMap(\.instructions)
-            .compactMap { instruction -> Double? in
-                guard case let .constantFloat(_, value) = instruction else { return nil }
-                return value
+            .compactMap { instruction -> UInt64? in
+                guard case let .constantFloat(_, bitPattern) = instruction else {
+                    return nil
+                }
+                return bitPattern
             }
-        let value = try #require(constants.first)
-        #expect(value == 0)
-        #expect(value.sign == .minus)
+        #expect(constants == expected)
+        let integers = decoded.functions
+            .flatMap(\.blocks)
+            .flatMap(\.instructions)
+            .compactMap { instruction -> UInt64? in
+                guard case let .constantInteger(_, bitPattern) = instruction else {
+                    return nil
+                }
+                return bitPattern
+            }
+        #expect(integers.contains(UInt64.max))
     }
 
     @Test("Disassembly retains blocks and checked operations")
@@ -474,7 +482,7 @@ struct Container {
                     id: .init(rawValue: 0),
                     parameters: [.init(rawValue: 0)],
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 1), value: 27),
+                        .constantInteger(result: .init(rawValue: 1), bitPattern: 27),
                         .checkedBinary(
                             result: .init(rawValue: 2),
                             overflow: .init(rawValue: 3),

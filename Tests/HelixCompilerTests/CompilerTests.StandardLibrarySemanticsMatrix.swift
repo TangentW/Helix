@@ -116,12 +116,12 @@ struct StandardLibrarySemanticsMatrix {
                 source: "public func absoluteDouble(_ value: Double) -> Double { abs(value) }",
                 scenarios: [
                     .init(
-                        arguments: [.float(-3.5, bitWidth: 64)],
-                        expected: .returned(.float(3.5, bitWidth: 64))
+                        arguments: [.float64(-3.5)],
+                        expected: .returned(.float64(3.5))
                     ),
                     .init(
-                        arguments: [.float(-0.0, bitWidth: 64)],
-                        expected: .returned(.float(0.0, bitWidth: 64))
+                        arguments: [.float64(-0.0)],
+                        expected: .returned(.float64(0.0))
                     ),
                 ]
             ),
@@ -291,8 +291,8 @@ struct StandardLibrarySemanticsMatrix {
             entry: fixture.entry,
             image: fixture.image,
             arguments: [
-                .float(0.0, bitWidth: 64),
-                .float(-0.0, bitWidth: 64),
+                .float64(0.0),
+                .float64(-0.0),
             ]
         )
         let zeroValues = try tupleResult(zeroResult)
@@ -304,8 +304,8 @@ struct StandardLibrarySemanticsMatrix {
             entry: fixture.entry,
             image: fixture.image,
             arguments: [
-                .float(.nan, bitWidth: 64),
-                .float(1, bitWidth: 64),
+                .float64(.nan),
+                .float64(1),
             ]
         )
         let leftNaNValues = try tupleResult(leftNaNResult)
@@ -317,8 +317,8 @@ struct StandardLibrarySemanticsMatrix {
             entry: fixture.entry,
             image: fixture.image,
             arguments: [
-                .float(1, bitWidth: 64),
-                .float(.nan, bitWidth: 64),
+                .float64(1),
+                .float64(.nan),
             ]
         )
         let rightNaNValues = try tupleResult(rightNaNResult)
@@ -372,11 +372,11 @@ struct StandardLibrarySemanticsMatrix {
     }
 
     private func float(_ value: VM.Value) throws -> Double {
-        guard case let .float(number, bitWidth: 64) = value else {
+        guard case let .float(number) = value, number.bitWidth == 64 else {
             Issue.record("expected Float64, got \(value)")
             throw HarnessError.unexpectedResult
         }
-        return number
+        return number.doubleValue
     }
 }
 }

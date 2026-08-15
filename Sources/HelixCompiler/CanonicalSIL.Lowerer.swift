@@ -452,7 +452,7 @@ public struct Lowerer: Sendable {
         var staticStringPointers: [String: String] = [:]
         var staticStringValues: [String: String] = [:]
         var wordLiterals: [String: UInt64] = [:]
-        var integerLiterals: [String: (bitWidth: UInt16, value: Int64)] = [:]
+        var integerLiterals: [String: (bitWidth: UInt16, bitPattern: UInt64)] = [:]
         var retypedIntegerOperands: [String: [Bytecode.ValueType: Bytecode.Register]] = [:]
         var boolLiterals: [String: Bool] = [:]
         var metatypeValues = Set<String>()
@@ -1701,10 +1701,9 @@ public struct Lowerer: Sendable {
                 retypedIntegerOperands[token, default: [:]][expected] = result
                 return result
             }
-            guard case let .integer(bitWidth, signed) = expected,
+            guard case let .integer(bitWidth, _) = expected,
                   let literal = integerLiterals[token],
-                  literal.bitWidth == bitWidth,
-                  signed || literal.value >= 0
+                  literal.bitWidth == bitWidth
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "integer literal does not match its builtin signedness"
@@ -1712,7 +1711,7 @@ public struct Lowerer: Sendable {
             }
             let result = try allocate(type: expected)
             appendInstruction(
-                .constantInteger(result: result, value: literal.value)
+                .constantInteger(result: result, bitPattern: literal.bitPattern)
             )
             retypedIntegerOperands[token, default: [:]][expected] = result
             return result
@@ -2568,7 +2567,7 @@ public struct Lowerer: Sendable {
 
             let indexSlot = try allocateStackSlot(type: .int64)
             let zero = try allocate(type: .int64)
-            appendInstruction(.constantInteger(result: zero, value: 0))
+            appendInstruction(.constantInteger(result: zero, bitPattern: 0))
             appendInstruction(
                 .storeStack(slot: indexSlot, source: zero, mode: .initialize)
             )
@@ -3983,7 +3982,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 stride = try allocate(type: .int64)
-                appendInstruction(.constantInteger(result: stride, value: 1))
+                appendInstruction(.constantInteger(result: stride, bitPattern: 1))
             }
             let initial = try allocate(type: .optional(type.element))
             appendInstruction(
@@ -4133,11 +4132,11 @@ public struct Lowerer: Sendable {
                 switch strideType {
                 case .integer:
                     appendInstruction(
-                        .constantInteger(result: zero, value: 0)
+                        .constantInteger(result: zero, bitPattern: 0)
                     )
                 case .float:
                     appendInstruction(
-                        .constantFloat(result: zero, value: 0)
+                        .constantFloat(result: zero, bitPattern: 0)
                     )
                 default:
                     throw CanonicalSIL.LoweringError.unsupportedType(
@@ -4337,7 +4336,7 @@ public struct Lowerer: Sendable {
                 switch type {
                 case .integer(_, signed: true):
                     let zero = try allocate(type: type)
-                    appendInstruction(.constantInteger(result: zero, value: 0))
+                    appendInstruction(.constantInteger(result: zero, bitPattern: 0))
                     let isNegative = try allocate(type: .bool)
                     appendInstruction(
                         .compare(
@@ -4852,7 +4851,7 @@ public struct Lowerer: Sendable {
                         )
                     }
                     let zero = try allocate(type: .int64)
-                    appendInstruction(.constantInteger(result: zero, value: 0))
+                    appendInstruction(.constantInteger(result: zero, bitPattern: 0))
                     let slot = try allocateStackSlot(type: .int64)
                     appendInstruction(
                         .storeStack(slot: slot, source: zero, mode: .initialize)
@@ -5036,7 +5035,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let zero = try allocate(type: .int64)
-                appendInstruction(.constantInteger(result: zero, value: 0))
+                appendInstruction(.constantInteger(result: zero, bitPattern: 0))
                 let slot = try allocateStackSlot(type: .int64)
                 appendInstruction(
                     .storeStack(slot: slot, source: zero, mode: .initialize)
@@ -5297,7 +5296,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let zero = try allocate(type: .int64)
-                appendInstruction(.constantInteger(result: zero, value: 0))
+                appendInstruction(.constantInteger(result: zero, bitPattern: 0))
                 let slot = try allocateStackSlot(type: .int64)
                 appendInstruction(
                     .storeStack(slot: slot, source: zero, mode: .initialize)
@@ -5589,7 +5588,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let zero = try allocate(type: .int64)
-                appendInstruction(.constantInteger(result: zero, value: 0))
+                appendInstruction(.constantInteger(result: zero, bitPattern: 0))
                 let isNegative = try allocate(type: .bool)
                 appendInstruction(
                     .compare(
@@ -5646,7 +5645,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let zero = try allocate(type: .int64)
-                appendInstruction(.constantInteger(result: zero, value: 0))
+                appendInstruction(.constantInteger(result: zero, bitPattern: 0))
                 let slot = try allocateStackSlot(type: .int64)
                 appendInstruction(
                     .storeStack(slot: slot, source: zero, mode: .initialize)
@@ -6313,7 +6312,7 @@ public struct Lowerer: Sendable {
                let expectedCount = wordLiterals[construction[2]],
                let flag = integerLiterals[construction[3]],
                flag.bitWidth == 8,
-               [0, 2].contains(flag.value),
+               [0, 2].contains(flag.bitPattern),
                UInt64(literal.utf8.count) == expectedCount {
                 staticStringValues[construction[0]] = literal
                 continue
@@ -7010,23 +7009,31 @@ public struct Lowerer: Sendable {
 
             if let literal = match(line, pattern: #"^(%[0-9]+) = integer_literal \$Builtin\.Int(1|8|16|32|64), (-?[0-9]+)$"#) {
                 guard let width = UInt16(literal[1]),
-                      let value = Int64(literal[2])
+                      let bitPattern = Self.integerLiteralBitPattern(
+                          literal[2],
+                          bitWidth: width
+                      )
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "integer literal is outside its supported representation"
                     )
                 }
-                integerLiterals[literal[0]] = (width, value)
+                integerLiterals[literal[0]] = (width, bitPattern)
                 if width == 1 {
                     let register = try allocate(type: .bool)
                     values[literal[0]] = register
-                    let bool = value != 0
+                    let bool = bitPattern != 0
                     boolLiterals[literal[0]] = bool
                     appendInstruction(.constantBool(result: register, value: bool))
                 } else {
                     let register = try allocate(type: .integer(bitWidth: width, signed: true))
                     values[literal[0]] = register
-                    appendInstruction(.constantInteger(result: register, value: value))
+                    appendInstruction(
+                        .constantInteger(
+                            result: register,
+                            bitPattern: bitPattern
+                        )
+                    )
                 }
                 continue
             }
@@ -7048,19 +7055,18 @@ public struct Lowerer: Sendable {
                         "Float\(width) literal exceeds its hexadecimal bit width"
                     )
                 }
-                let value: Double
-                if width == 32, let bits = UInt32(literal[2], radix: 16) {
-                    value = Double(Float(bitPattern: bits))
-                } else if width == 64, let bits = UInt64(literal[2], radix: 16) {
-                    value = Double(bitPattern: bits)
-                } else {
+                guard let bitPattern = UInt64(literal[2], radix: 16),
+                      width == 64 || bitPattern <= UInt32.max
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "floating-point literal has an invalid bit pattern"
                     )
                 }
                 let result = try allocate(type: .float(bitWidth: width))
                 values[literal[0]] = result
-                appendInstruction(.constantFloat(result: result, value: value))
+                appendInstruction(
+                    .constantFloat(result: result, bitPattern: bitPattern)
+                )
                 continue
             }
 
@@ -12763,6 +12769,29 @@ public struct Lowerer: Sendable {
         case 0x61...0x66: byte - 0x61 + 10
         default: nil
         }
+    }
+
+    /// SIL integer literals are fixed-width APInt payloads. Negative decimal
+    /// spellings are sign-extended text for those same bits; they are not proof
+    /// that the eventual Swift value is signed.
+    private static func integerLiteralBitPattern(
+        _ spelling: String,
+        bitWidth: UInt16
+    ) -> UInt64? {
+        guard [1, 8, 16, 32, 64].contains(bitWidth) else { return nil }
+        let mask = bitWidth == 64
+            ? UInt64.max
+            : (UInt64(1) << bitWidth) - 1
+        if spelling.hasPrefix("-") {
+            guard let value = Int64(spelling) else { return nil }
+            let minimum = bitWidth == 64
+                ? Int64.min
+                : -(Int64(1) << (bitWidth - 1))
+            guard value >= minimum else { return nil }
+            return UInt64(bitPattern: value) & mask
+        }
+        guard let value = UInt64(spelling), value <= mask else { return nil }
+        return value
     }
 
     private func splitTopLevel(_ text: String) -> [String] {

@@ -74,55 +74,57 @@ struct Progression {
     func floatingProgressions() throws {
         #expect(
             try collect(
-                start: .float(0, bitWidth: 64),
-                end: .float(1, bitWidth: 64),
-                stride: .float(0.25, bitWidth: 64),
+                start: .float64(0),
+                end: .float64(1),
+                stride: .float64(0.25),
                 boundary: .exclusive
             ) == [0.0, 0.25, 0.5, 0.75].map {
-                .float($0, bitWidth: 64)
+                .float64($0)
             }
         )
         #expect(
             try collect(
-                start: .float(1, bitWidth: 32),
-                end: .float(0, bitWidth: 32),
-                stride: .float(-0.5, bitWidth: 32),
+                start: .float32(1),
+                end: .float32(0),
+                stride: .float32(-0.5),
                 boundary: .inclusive
             ) == [1.0, 0.5, 0.0].map {
-                .float($0, bitWidth: 32)
+                .float32($0)
             }
         )
         #expect(
             try collect(
-                start: .float(0, bitWidth: 64),
-                end: .float(1, bitWidth: 64),
-                stride: .float(.nan, bitWidth: 64),
+                start: .float64(0),
+                end: .float64(1),
+                stride: .float64(.nan),
                 boundary: .exclusive
             ).isEmpty
         )
 
         var reverseNaNCursor = VM.Value.optional(
-            .float(1, bitWidth: 64)
+            .float64(1)
         )
         let first = try VM.Progression.next(
             cursor: reverseNaNCursor,
-            end: .float(0, bitWidth: 64),
-            stride: .float(.nan, bitWidth: 64),
+            end: .float64(0),
+            stride: .float64(.nan),
             boundary: .exclusive
         )
         reverseNaNCursor = first.cursor
-        #expect(first.result == .optional(.float(1, bitWidth: 64)))
+        #expect(first.result == .optional(.float64(1)))
         let second = try VM.Progression.next(
             cursor: reverseNaNCursor,
-            end: .float(0, bitWidth: 64),
-            stride: .float(.nan, bitWidth: 64),
+            end: .float64(0),
+            stride: .float64(.nan),
             boundary: .exclusive
         )
-        guard case let .optional(.some(.float(value, 64))) = second.result else {
+        guard case let .optional(.some(.float(value))) = second.result,
+              value.bitWidth == 64
+        else {
             Issue.record("descending NaN stride did not preserve Swift's live cursor")
             return
         }
-        #expect(value.isNaN)
+        #expect(value.doubleValue.isNaN)
     }
 
     @Test("A zero stride fails closed")
@@ -155,9 +157,15 @@ struct Progression {
                 .init(
                     id: .init(rawValue: 0),
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 0), value: .max - 1),
-                        .constantInteger(result: .init(rawValue: 1), value: .max),
-                        .constantInteger(result: .init(rawValue: 2), value: 2),
+                        .constantInteger(
+                            result: .init(rawValue: 0),
+                            bitPattern: UInt64(Int64.max - 1)
+                        ),
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            bitPattern: UInt64(Int64.max)
+                        ),
+                        .constantInteger(result: .init(rawValue: 2), bitPattern: 2),
                         .makeOptionalSome(
                             result: .init(rawValue: 3),
                             value: .init(rawValue: 0)

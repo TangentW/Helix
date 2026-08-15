@@ -93,9 +93,9 @@ struct Progression {
                 .init(
                     id: .init(rawValue: 0),
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 0), value: 0),
-                        .constantInteger(result: .init(rawValue: 1), value: 3),
-                        .constantInteger(result: .init(rawValue: 2), value: 1),
+                        .constantInteger(result: .init(rawValue: 0), bitPattern: 0),
+                        .constantInteger(result: .init(rawValue: 1), bitPattern: 3),
+                        .constantInteger(result: .init(rawValue: 2), bitPattern: 1),
                         .makeOptionalSome(
                             result: .init(rawValue: 3),
                             value: .init(rawValue: 0)

@@ -474,19 +474,37 @@ public struct Interpreter: Sendable {
                 trace.programCounter = programCounter
                 try budget.consumeInstruction()
                 switch instruction {
-                case let .constantInteger(result, value):
+                case let .constantInteger(result, bitPattern):
                     guard case let .integer(width, signed) = function.type(of: result)! else {
                         throw VM.RuntimeTrap.typeMismatch(expected: .int64, actual: function.type(of: result))
                     }
-                    try initialize(.integer(VM.Integer(signed: value, bitWidth: width, isSigned: signed)), register: result, registers: &registers)
+                    try initialize(
+                        .integer(
+                            VM.Integer(
+                                rawBits: bitPattern,
+                                bitWidth: width,
+                                isSigned: signed
+                            )
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .constantBool(result, value):
                     try initialize(.bool(value), register: result, registers: &registers)
-                case let .constantFloat(result, value):
+                case let .constantFloat(result, bitPattern):
                     guard case let .float(width) = function.type(of: result)! else {
                         throw VM.RuntimeTrap.typeMismatch(expected: .float(bitWidth: 64), actual: function.type(of: result))
                     }
-                    let normalized = width == 32 ? Double(Float(value)) : value
-                    try initialize(.float(normalized, bitWidth: width), register: result, registers: &registers)
+                    try initialize(
+                        .float(
+                            VM.FloatingValue(
+                                bitPattern: bitPattern,
+                                bitWidth: width
+                            )
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .constantString(result, value):
                     try budget.consumeVMHeap(bytes: UInt64(value.utf8.count))
                     try initialize(.string(value), register: result, registers: &registers)
@@ -1096,44 +1114,44 @@ public struct Interpreter: Sendable {
                             actual: .float(bitWidth: rhsValue.bitWidth)
                         )
                     }
-                    let value: VM.Value
+                    let value: VM.FloatingValue
                     if lhsValue.bitWidth == 32 {
-                        let left = Float(lhsValue.value)
-                        let right = Float(rhsValue.value)
+                        let left = lhsValue.floatValue
+                        let right = rhsValue.floatValue
                         let result: Float = switch operation {
                         case .add: left + right
                         case .subtract: left - right
                         case .multiply: left * right
                         case .divide: left / right
                         }
-                        value = .float(Double(result), bitWidth: 32)
+                        value = .init(result)
                     } else {
                         let result: Double = switch operation {
-                        case .add: lhsValue.value + rhsValue.value
-                        case .subtract: lhsValue.value - rhsValue.value
-                        case .multiply: lhsValue.value * rhsValue.value
-                        case .divide: lhsValue.value / rhsValue.value
+                        case .add: lhsValue.doubleValue + rhsValue.doubleValue
+                        case .subtract: lhsValue.doubleValue - rhsValue.doubleValue
+                        case .multiply: lhsValue.doubleValue * rhsValue.doubleValue
+                        case .divide: lhsValue.doubleValue / rhsValue.doubleValue
                         }
-                        value = .float(result, bitWidth: 64)
+                        value = .init(result)
                     }
-                    try initialize(value, register: result, registers: &registers)
+                    try initialize(.float(value), register: result, registers: &registers)
                 case let .floatingUnary(result, operation, operand):
                     let operandValue = try floating(operand, registers: registers)
-                    let value: VM.Value
+                    let value: VM.FloatingValue
                     if operandValue.bitWidth == 32 {
                         let result: Float = switch operation {
-                        case .negate: -Float(operandValue.value)
-                        case .absolute: abs(Float(operandValue.value))
+                        case .negate: -operandValue.floatValue
+                        case .absolute: abs(operandValue.floatValue)
                         }
-                        value = .float(Double(result), bitWidth: 32)
+                        value = .init(result)
                     } else {
                         let result: Double = switch operation {
-                        case .negate: -operandValue.value
-                        case .absolute: abs(operandValue.value)
+                        case .negate: -operandValue.doubleValue
+                        case .absolute: abs(operandValue.doubleValue)
                         }
-                        value = .float(result, bitWidth: 64)
+                        value = .init(result)
                     }
-                    try initialize(value, register: result, registers: &registers)
+                    try initialize(.float(value), register: result, registers: &registers)
                 case let .integerConvert(result, operation, operand):
                     let source = try integer(operand, registers: registers)
                     guard case let .integer(targetWidth, targetSigned) = function.type(of: result)!
@@ -1169,39 +1187,41 @@ public struct Interpreter: Sendable {
                             actual: function.type(of: result)
                         )
                     }
-                    let converted: Double
+                    let converted: VM.FloatingValue
                     switch operation {
                     case .truncate:
-                        guard case let .float(value, 64) = try read(operand, registers: registers)
+                        guard case let .float(value) = try read(operand, registers: registers),
+                              value.bitWidth == 64
                         else {
                             throw VM.RuntimeTrap.typeMismatch(
                                 expected: .float(bitWidth: 64),
                                 actual: try read(operand, registers: registers).type
                             )
                         }
-                        converted = Double(Float(value))
+                        converted = .init(value.floatValue)
                     case .extend:
-                        guard case let .float(value, 32) = try read(operand, registers: registers)
+                        guard case let .float(value) = try read(operand, registers: registers),
+                              value.bitWidth == 32
                         else {
                             throw VM.RuntimeTrap.typeMismatch(
                                 expected: .float(bitWidth: 32),
                                 actual: try read(operand, registers: registers).type
                             )
                         }
-                        converted = value
+                        converted = .init(value.doubleValue)
                     case .signedIntegerToFloat:
                         let value = try integer(operand, registers: registers)
                         converted = targetWidth == 32
-                            ? Double(Float(value.signedValue))
-                            : Double(value.signedValue)
+                            ? .init(Float(value.signedValue))
+                            : .init(Double(value.signedValue))
                     case .unsignedIntegerToFloat:
                         let value = try integer(operand, registers: registers)
                         converted = targetWidth == 32
-                            ? Double(Float(value.unsignedValue))
-                            : Double(value.unsignedValue)
+                            ? .init(Float(value.unsignedValue))
+                            : .init(Double(value.unsignedValue))
                     }
                     try initialize(
-                        .float(converted, bitWidth: targetWidth),
+                        .float(converted),
                         register: result,
                         registers: &registers
                     )
@@ -2773,8 +2793,8 @@ public struct Interpreter: Sendable {
             guard integer.bitWidth == bitWidth, integer.isSigned == signed else {
                 throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
             }
-        case let (.float(_, actualBitWidth), .float(expectedBitWidth)):
-            guard actualBitWidth == expectedBitWidth else {
+        case let (.float(floating), .float(expectedBitWidth)):
+            guard floating.bitWidth == expectedBitWidth else {
                 throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
             }
         case let (.native(native), .native(id)):
@@ -3596,15 +3616,15 @@ public struct Interpreter: Sendable {
     private func floating(
         _ register: Bytecode.Register,
         registers: [VM.Value?]
-    ) throws -> (value: Double, bitWidth: UInt16) {
+    ) throws -> VM.FloatingValue {
         let value = try read(register, registers: registers)
-        guard case let .float(number, bitWidth) = value else {
+        guard case let .float(number) = value else {
             throw VM.RuntimeTrap.typeMismatch(
                 expected: .float(bitWidth: 64),
                 actual: value.type
             )
         }
-        return (bitWidth == 32 ? Double(Float(number)) : number, bitWidth)
+        return number
     }
 
     private func string(
@@ -3944,19 +3964,21 @@ public struct Interpreter: Sendable {
         budget: VM.InvocationBudget
     ) throws -> Bool {
         guard lhs.type == rhs.type else { throw VM.RuntimeTrap.typeMismatch(expected: lhs.type, actual: rhs.type) }
-        if case let (.float(rawLeft, bitWidth), .float(rawRight, _)) = (lhs, rhs) {
-            let left = bitWidth == 32 ? Double(Float(rawLeft)) : rawLeft
-            let right = bitWidth == 32 ? Double(Float(rawRight)) : rawRight
+        if case let (.float(rawLeft), .float(rawRight)) = (lhs, rhs) {
             // Preserve Swift/IEEE-754 unordered semantics. Mapping NaN to a total
             // ComparisonResult would incorrectly make it greater than every value.
-            return switch predicate {
-            case .equal: left == right
-            case .notEqual: left != right
-            case .lessThan: left < right
-            case .lessThanOrEqual: left <= right
-            case .greaterThan: left > right
-            case .greaterThanOrEqual: left >= right
+            if rawLeft.bitWidth == 32 {
+                return compareFloating(
+                    predicate,
+                    lhs: rawLeft.floatValue,
+                    rhs: rawRight.floatValue
+                )
             }
+            return compareFloating(
+                predicate,
+                lhs: rawLeft.doubleValue,
+                rhs: rawRight.doubleValue
+            )
         }
         if case let (.string(left), .string(right)) = (lhs, rhs) {
             try chargeComparisonWork(lhs: lhs, rhs: rhs, budget: budget)
@@ -3991,6 +4013,21 @@ public struct Interpreter: Sendable {
         case .lessThanOrEqual: ordering != .orderedDescending
         case .greaterThan: ordering == .orderedDescending
         case .greaterThanOrEqual: ordering != .orderedAscending
+        }
+    }
+
+    private func compareFloating<Value: BinaryFloatingPoint>(
+        _ predicate: Bytecode.ComparisonPredicate,
+        lhs: Value,
+        rhs: Value
+    ) -> Bool {
+        switch predicate {
+        case .equal: lhs == rhs
+        case .notEqual: lhs != rhs
+        case .lessThan: lhs < rhs
+        case .lessThanOrEqual: lhs <= rhs
+        case .greaterThan: lhs > rhs
+        case .greaterThanOrEqual: lhs >= rhs
         }
     }
 

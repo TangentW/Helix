@@ -24,8 +24,8 @@ struct HashableValue: Hashable, Sendable {
             return lhs == rhs
         case let (.integer(lhs), .integer(rhs)):
             return lhs == rhs
-        case let (.float(lhs, lhsWidth), .float(rhs, rhsWidth)):
-            return lhsWidth == rhsWidth && lhs == rhs
+        case let (.float(lhs), .float(rhs)):
+            return lhs == rhs
         case let (.string(lhs), .string(rhs)):
             return lhs == rhs
         case let (.optional(lhs), .optional(rhs)):
@@ -75,9 +75,8 @@ struct HashableValue: Hashable, Sendable {
         case let .integer(value):
             hasher.combine(1 as UInt8)
             hasher.combine(value)
-        case let .float(value, bitWidth):
+        case let .float(value):
             hasher.combine(2 as UInt8)
-            hasher.combine(bitWidth)
             hasher.combine(value)
         case let .string(value):
             hasher.combine(3 as UInt8)

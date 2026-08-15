@@ -142,7 +142,7 @@ struct SemanticVerifier {
     func rejectsMissingTerminator() throws {
         let fixture = try makeFixture { function in
             function.registerTypes.append(.int64)
-            function.blocks[0].instructions = [.constantInteger(result: .init(rawValue: 1), value: 1)]
+            function.blocks[0].instructions = [.constantInteger(result: .init(rawValue: 1), bitPattern: 1)]
         }
 
         #expect(throws: Verification.Error.self) {
@@ -202,8 +202,11 @@ struct SemanticVerifier {
             function.registerTypes.append(.float(bitWidth: 64))
             function.registerTypes.append(.float(bitWidth: 32))
             function.blocks[0].instructions = [
-                .constantFloat(result: .init(rawValue: 1), value: 1),
-                .constantFloat(result: .init(rawValue: 2), value: 2),
+                .constantFloat(
+                    result: .init(rawValue: 1),
+                    bitPattern: UInt64(Float(1).bitPattern)
+                ),
+                .constantFloat(result: .init(rawValue: 2), bitPattern: Double(2).bitPattern),
                 .floatingBinary(
                     result: .init(rawValue: 3),
                     operation: .add,
@@ -226,6 +229,121 @@ struct SemanticVerifier {
                 bytes: Bytecode.Encoder.encode(fixture.module),
                 shell: fixture.shell,
                 policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("Scalar constants must fit their destination bit width")
+    func rejectsOversizedScalarBitPatterns() throws {
+        let integerFixture = try makeFixture { function in
+            function.registerTypes.append(.integer(bitWidth: 8, signed: true))
+            function.blocks[0].instructions = [
+                .constantInteger(
+                    result: .init(rawValue: 1),
+                    bitPattern: 0x100
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "integer bit pattern does not fit 8 bits"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(integerFixture.module),
+                shell: integerFixture.shell,
+                policy: integerFixture.policy
+            )
+        }
+
+        let floatFixture = try makeFixture { function in
+            function.registerTypes.append(.float(bitWidth: 32))
+            function.blocks[0].instructions = [
+                .constantFloat(
+                    result: .init(rawValue: 1),
+                    bitPattern: UInt64(UInt32.max) + 1
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "floating bit pattern does not fit binary32"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(floatFixture.module),
+                shell: floatFixture.shell,
+                policy: floatFixture.policy
+            )
+        }
+    }
+
+    @Test("UInt64 constants admit the complete fixed-width domain")
+    func acceptsUInt64MaximumConstant() throws {
+        let fixture = try makeFixture { function in
+            function.registerTypes.append(.integer(bitWidth: 64, signed: false))
+            function.blocks[0].instructions.insert(
+                .constantInteger(
+                    result: .init(rawValue: 1),
+                    bitPattern: .max
+                ),
+                at: 0
+            )
+        }
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+    }
+
+    @Test("Scalar type widths are rejected before constant payload validation")
+    func rejectsUnsupportedScalarWidthsBeforeConstants() throws {
+        let integerFixture = try makeFixture { function in
+            function.registerTypes.append(.integer(bitWidth: 1, signed: false))
+            function.blocks[0].instructions = [
+                .constantInteger(result: .init(rawValue: 1), bitPattern: 1),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidFunction(
+                function: .init(rawValue: 0),
+                reason: "unsupported integer width 1"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(integerFixture.module),
+                shell: integerFixture.shell,
+                policy: integerFixture.policy
+            )
+        }
+
+        let floatFixture = try makeFixture { function in
+            function.registerTypes.append(.float(bitWidth: 16))
+            function.blocks[0].instructions = [
+                .constantFloat(result: .init(rawValue: 1), bitPattern: 0),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidFunction(
+                function: .init(rawValue: 0),
+                reason: "unsupported float width 16"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(floatFixture.module),
+                shell: floatFixture.shell,
+                policy: floatFixture.policy
             )
         }
     }
@@ -633,8 +751,8 @@ struct SemanticVerifier {
         let fixture = try makeFixture { function in
             function.registerTypes.append(.int64)
             function.blocks[0].instructions = [
-                .constantInteger(result: .init(rawValue: 1), value: 1),
-                .constantInteger(result: .init(rawValue: 1), value: 2),
+                .constantInteger(result: .init(rawValue: 1), bitPattern: 1),
+                .constantInteger(result: .init(rawValue: 1), bitPattern: 2),
                 .returnValue(.init(rawValue: 1)),
             ]
         }
@@ -765,7 +883,7 @@ struct SemanticVerifier {
             function.blocks[0].instructions = [
                 .copyValue(result: .init(rawValue: 1), source: .init(rawValue: 0)),
                 .destroyValue(.init(rawValue: 1)),
-                .constantInteger(result: .init(rawValue: 2), value: 7),
+                .constantInteger(result: .init(rawValue: 2), bitPattern: 7),
                 .returnValue(.init(rawValue: 2)),
             ]
         }
@@ -840,7 +958,7 @@ struct SemanticVerifier {
                     id: .init(rawValue: 2),
                     instructions: [
                         .destroyValue(.init(rawValue: 0)),
-                        .constantInteger(result: .init(rawValue: 3), value: 0),
+                        .constantInteger(result: .init(rawValue: 3), bitPattern: 0),
                         .returnValue(.init(rawValue: 3)),
                     ]
                 ),
@@ -1263,14 +1381,14 @@ struct SemanticVerifier {
                 .init(
                     id: .init(rawValue: 1),
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 1), value: 1),
+                        .constantInteger(result: .init(rawValue: 1), bitPattern: 1),
                         .returnValue(.init(rawValue: 1)),
                     ]
                 ),
                 .init(
                     id: .init(rawValue: 2),
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 2), value: 0),
+                        .constantInteger(result: .init(rawValue: 2), bitPattern: 0),
                         .returnValue(.init(rawValue: 2)),
                     ]
                 ),
@@ -2100,7 +2218,7 @@ struct SemanticVerifier {
                         instructions: [
                             .constantInteger(
                                 result: .init(rawValue: 1),
-                                value: 1
+                                bitPattern: 1
                             ),
                             .returnValue(.init(rawValue: 1)),
                         ]

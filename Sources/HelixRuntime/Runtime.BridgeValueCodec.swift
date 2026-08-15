@@ -59,41 +59,41 @@ public enum BridgeValueCodec {
 
     /// Encodes a Swift `Float` while preserving its 32-bit VM type identity.
     public static func encode(_ value: Float) throws -> VM.Value {
-        .float(Double(value), bitWidth: 32)
+        .float(VM.FloatingValue(value))
     }
 
     /// Decodes a 32-bit VM floating-point value as `Float`.
     public static func decode(_ value: VM.Value, as type: Float.Type) throws -> Float {
-        guard case let .float(result, bitWidth: 32) = value else {
+        guard case let .float(result) = value, result.bitWidth == 32 else {
             throw VM.RuntimeTrap.typeMismatch(expected: .float(bitWidth: 32), actual: value.type)
         }
-        return Float(result)
+        return result.floatValue
     }
 
     /// Encodes a Swift `Double` as a 64-bit VM floating-point value.
     public static func encode(_ value: Double) throws -> VM.Value {
-        .float(value, bitWidth: 64)
+        .float(VM.FloatingValue(value))
     }
 
     /// Decodes a 64-bit VM floating-point value as `Double`.
     public static func decode(_ value: VM.Value, as type: Double.Type) throws -> Double {
-        guard case let .float(result, bitWidth: 64) = value else {
+        guard case let .float(result) = value, result.bitWidth == 64 else {
             throw VM.RuntimeTrap.typeMismatch(expected: .float(bitWidth: 64), actual: value.type)
         }
-        return result
+        return result.doubleValue
     }
 
     /// Encodes the 64-bit `CGFloat` used by Helix's supported Apple targets.
     public static func encode(_ value: CGFloat) throws -> VM.Value {
-        .float(Double(value), bitWidth: 64)
+        .float(VM.FloatingValue(Double(value)))
     }
 
     /// Decodes a 64-bit VM floating-point value as `CGFloat`.
     public static func decode(_ value: VM.Value, as type: CGFloat.Type) throws -> CGFloat {
-        guard case let .float(result, bitWidth: 64) = value else {
+        guard case let .float(result) = value, result.bitWidth == 64 else {
             throw VM.RuntimeTrap.typeMismatch(expected: .float(bitWidth: 64), actual: value.type)
         }
-        return CGFloat(result)
+        return CGFloat(result.doubleValue)
     }
 
     /// Encodes a Swift string as an owned VM string value.

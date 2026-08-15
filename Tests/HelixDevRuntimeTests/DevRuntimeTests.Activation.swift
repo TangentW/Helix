@@ -662,7 +662,10 @@ private struct DevRuntimeFixture {
                     id: .init(rawValue: 0),
                     parameters: [.init(rawValue: 0)],
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 1), value: value),
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            bitPattern: UInt64(bitPattern: value)
+                        ),
                         .returnValue(.init(rawValue: 1)),
                     ]
                 ),

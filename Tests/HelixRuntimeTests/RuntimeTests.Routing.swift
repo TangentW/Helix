@@ -239,7 +239,7 @@ struct Routing {
                     id: .init(rawValue: 0),
                     parameters: [.init(rawValue: 0)],
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 1), value: 41),
+                        .constantInteger(result: .init(rawValue: 1), bitPattern: 41),
                         .returnValue(.init(rawValue: 1)),
                     ]
                 ),
@@ -347,6 +347,30 @@ struct Routing {
         let unsigned = try Runtime.BridgeValueCodec.encode(UInt64.max)
         #expect(try Runtime.BridgeValueCodec.decode(signed, as: Int16.self) == -42)
         #expect(try Runtime.BridgeValueCodec.decode(unsigned, as: UInt64.self) == .max)
+
+        let floatPayload = Float(bitPattern: 0x7FA1_2345)
+        let encodedFloat = try Runtime.BridgeValueCodec.encode(floatPayload)
+        guard case let .float(storedFloat) = encodedFloat else {
+            Issue.record("Float bridge did not produce a floating VM value")
+            return
+        }
+        #expect(storedFloat.bitPattern == UInt64(floatPayload.bitPattern))
+        #expect(
+            try Runtime.BridgeValueCodec.decode(encodedFloat, as: Float.self)
+                .bitPattern == floatPayload.bitPattern
+        )
+
+        let doublePayload = Double(bitPattern: 0x7FF0_0000_0000_1234)
+        let encodedDouble = try Runtime.BridgeValueCodec.encode(doublePayload)
+        guard case let .float(storedDouble) = encodedDouble else {
+            Issue.record("Double bridge did not produce a floating VM value")
+            return
+        }
+        #expect(storedDouble.bitPattern == doublePayload.bitPattern)
+        #expect(
+            try Runtime.BridgeValueCodec.decode(encodedDouble, as: Double.self)
+                .bitPattern == doublePayload.bitPattern
+        )
 
         let optional = try Runtime.BridgeValueCodec.encodeOptional(Int32(7)) {
             try Runtime.BridgeValueCodec.encode($0)
@@ -1187,7 +1211,10 @@ struct Routing {
                         id: .init(rawValue: 0),
                         parameters: [.init(rawValue: 0)],
                         instructions: [
-                            .constantInteger(result: .init(rawValue: 1), value: constant),
+                            .constantInteger(
+                                result: .init(rawValue: 1),
+                                bitPattern: UInt64(bitPattern: constant)
+                            ),
                             .returnValue(.init(rawValue: 1)),
                         ]
                     ),

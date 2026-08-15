@@ -27,7 +27,7 @@ enum StringAllocation {
             5
         case .integer:
             20
-        case let .float(_, bitWidth) where bitWidth == 32 || bitWidth == 64:
+        case let .float(number) where number.bitWidth == 32 || number.bitWidth == 64:
             64
         default:
             throw VM.RuntimeTrap.nativeFailure(
@@ -42,10 +42,10 @@ enum StringAllocation {
             String(boolean)
         case let .integer(integer):
             integer.description
-        case let .float(number, bitWidth) where bitWidth == 32:
-            String(Float(number))
-        case let .float(number, bitWidth) where bitWidth == 64:
-            String(number)
+        case let .float(number) where number.bitWidth == 32:
+            String(number.floatValue)
+        case let .float(number) where number.bitWidth == 64:
+            String(number.doubleValue)
         default:
             throw VM.RuntimeTrap.nativeFailure(
                 "stringify is unsupported for \(value.type)"

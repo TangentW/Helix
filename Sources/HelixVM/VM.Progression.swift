@@ -59,20 +59,22 @@ enum Progression {
                 : nil
 
         case let (
-            .float(currentValue, currentWidth),
-            .float(endValue, endWidth),
-            .float(strideValue, strideWidth)
+            .float(currentValue),
+            .float(endValue),
+            .float(strideValue)
         ):
-            guard currentWidth == endWidth, currentWidth == strideWidth else {
+            guard currentValue.bitWidth == endValue.bitWidth,
+                  currentValue.bitWidth == strideValue.bitWidth
+            else {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: current.type,
                     actual: stride.type
                 )
             }
-            if currentWidth == 32 {
-                let current = Float(currentValue)
-                let end = Float(endValue)
-                let stride = Float(strideValue)
+            if currentValue.bitWidth == 32 {
+                let current = currentValue.floatValue
+                let end = endValue.floatValue
+                let stride = strideValue.floatValue
                 guard stride != 0 else {
                     throw VM.RuntimeTrap.explicit("Stride size must not be zero")
                 }
@@ -84,21 +86,24 @@ enum Progression {
                     boundary: boundary
                 )
                 advance = hasCurrent
-                    ? .float(Double(current + stride), bitWidth: 32)
+                    ? .float(VM.FloatingValue(current + stride))
                     : nil
             } else {
-                guard strideValue != 0 else {
+                let current = currentValue.doubleValue
+                let end = endValue.doubleValue
+                let stride = strideValue.doubleValue
+                guard stride != 0 else {
                     throw VM.RuntimeTrap.explicit("Stride size must not be zero")
                 }
-                let isAscending = strideValue > 0
+                let isAscending = stride > 0
                 hasCurrent = containsFloating(
-                    currentValue,
-                    before: endValue,
+                    current,
+                    before: end,
                     ascending: isAscending,
                     boundary: boundary
                 )
                 advance = hasCurrent
-                    ? .float(currentValue + strideValue, bitWidth: 64)
+                    ? .float(VM.FloatingValue(current + stride))
                     : nil
             }
 

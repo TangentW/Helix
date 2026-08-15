@@ -142,7 +142,7 @@ struct Pipeline {
                     id: .init(rawValue: 0),
                     parameters: [],
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 0), value: 1),
+                        .constantInteger(result: .init(rawValue: 0), bitPattern: 1),
                         .returnValue(.init(rawValue: 0)),
                     ]
                 ),
@@ -554,7 +554,7 @@ struct Pipeline {
             loweredType: "@convention(thin) () -> Int64",
             body: """
             bb0:
-              %0 = integer_literal $Builtin.Int64, 9223372036854775808
+              %0 = integer_literal $Builtin.Int64, 18446744073709551616
               return %0
             """
         )
@@ -569,6 +569,76 @@ struct Pipeline {
         } catch {
             Issue.record("unexpected error type: \(error)")
         }
+    }
+
+    @Test("SIL scalar literals retain APInt and IEEE payload bits")
+    func scalarLiteralBitsAreExact() throws {
+        let integer = try CanonicalSIL.Lowerer().lower(
+            .init(
+                mangledName: "$sIntegerBits",
+                loweredType: "@convention(thin) () -> UInt64",
+                body: """
+                bb0:
+                  %0 = integer_literal $Builtin.Int64, 18446744073709551615
+                  return %0
+                """
+            ),
+            displayName: "integerBits"
+        )
+        #expect(
+            integer.blocks.flatMap(\.instructions).contains {
+                guard case let .constantInteger(_, bitPattern) = $0 else {
+                    return false
+                }
+                return bitPattern == UInt64.max
+            }
+        )
+
+        let floating = try CanonicalSIL.Lowerer().lower(
+            .init(
+                mangledName: "$sFloatingBits",
+                loweredType: "@convention(thin) () -> Float",
+                body: """
+                bb0:
+                  %0 = float_literal $Builtin.FPIEEE32, 0x7FA12345
+                  return %0
+                """
+            ),
+            displayName: "floatingBits"
+        )
+        #expect(
+            floating.blocks.flatMap(\.instructions).contains {
+                guard case let .constantFloat(_, bitPattern) = $0 else {
+                    return false
+                }
+                return bitPattern == 0x7FA1_2345
+            }
+        )
+
+        let frontend = try compileFixture(
+            source: """
+            @inline(never)
+            public func uint64Literal() -> UInt64 {
+                18_446_744_073_709_551_615
+            }
+            """,
+            functionName: "uint64Literal",
+            signature: .init(parameters: [], result: "Swift.UInt64"),
+            parameterTypes: [],
+            resultType: .integer(bitWidth: 64, signed: false)
+        )
+        let maximum = try VM.Integer(
+            rawBits: .max,
+            bitWidth: 64,
+            isSigned: false
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: frontend.image,
+                arguments: []
+            ) == .returned(.integer(maximum))
+        )
     }
 
     @Test("Real Swift Optional control flow and construction execute as HLBC")
@@ -1733,10 +1803,10 @@ struct Pipeline {
                 entry: .init(rawValue: 0),
                 image: floatMath.image,
                 arguments: [
-                    .float(Double(lhs), bitWidth: 32),
-                    .float(Double(rhs), bitWidth: 32),
+                    .float32(lhs),
+                    .float32(rhs),
                 ]
-            ) == .returned(.float(Double(expected), bitWidth: 32))
+            ) == .returned(.float32(expected))
         )
         #expect(floatMath.compiled.disassembly.contains("float_add"))
         #expect(floatMath.compiled.disassembly.contains("float_divide"))
@@ -1753,8 +1823,8 @@ struct Pipeline {
             VM.Interpreter().invoke(
                 entry: .init(rawValue: 0),
                 image: doubleMath.image,
-                arguments: [.float(4, bitWidth: 64), .float(2, bitWidth: 64)]
-            ) == .returned(.float(10, bitWidth: 64))
+                arguments: [.float64(4), .float64(2)]
+            ) == .returned(.float64(10))
         )
 
         let doubleLiteral = try compileFixture(
@@ -1769,14 +1839,14 @@ struct Pipeline {
                 entry: .init(rawValue: 0),
                 image: doubleLiteral.image,
                 arguments: [.bool(true)]
-            ) == .returned(.float(-2.25, bitWidth: 64))
+            ) == .returned(.float64(-2.25))
         )
         #expect(
             VM.Interpreter().invoke(
                 entry: .init(rawValue: 0),
                 image: doubleLiteral.image,
                 arguments: [.bool(false)]
-            ) == .returned(.float(0.125, bitWidth: 64))
+            ) == .returned(.float64(0.125))
         )
 
         for (name, expected) in [
@@ -1795,7 +1865,7 @@ struct Pipeline {
                 VM.Interpreter().invoke(
                     entry: .init(rawValue: 0),
                     image: comparison.image,
-                    arguments: [.float(.nan, bitWidth: 32), .float(1, bitWidth: 32)]
+                    arguments: [.float32(.nan), .float32(1)]
                 ) == .returned(.bool(expected))
             )
         }
@@ -1807,16 +1877,16 @@ struct Pipeline {
             parameterTypes: [floatType],
             resultType: floatType
         )
-        guard case let .returned(.some(.float(negatedZero, 32))) = VM.Interpreter().invoke(
+        guard case let .returned(.some(.float(negatedZero))) = VM.Interpreter().invoke(
             entry: .init(rawValue: 0),
             image: negate.image,
-            arguments: [.float(-0.0, bitWidth: 32)]
-        ) else {
+            arguments: [.float32(-0.0)]
+        ), negatedZero.bitWidth == 32 else {
             Issue.record("Float negation did not return Float32")
             return
         }
-        #expect(negatedZero == 0)
-        #expect(negatedZero.sign == .plus)
+        #expect(negatedZero.floatValue == 0)
+        #expect(negatedZero.floatValue.sign == .plus)
 
         let divide = try compileFixture(
             source: source,
@@ -1825,15 +1895,15 @@ struct Pipeline {
             parameterTypes: [floatType, floatType],
             resultType: floatType
         )
-        guard case let .returned(.some(.float(infinity, 32))) = VM.Interpreter().invoke(
+        guard case let .returned(.some(.float(infinity))) = VM.Interpreter().invoke(
             entry: .init(rawValue: 0),
             image: divide.image,
-            arguments: [.float(1, bitWidth: 32), .float(0, bitWidth: 32)]
-        ) else {
+            arguments: [.float32(1), .float32(0)]
+        ), infinity.bitWidth == 32 else {
             Issue.record("Float division did not return Float32")
             return
         }
-        #expect(infinity == .infinity)
+        #expect(infinity.floatValue == .infinity)
     }
 
     @Test("Common integer and floating-point conversions preserve Swift semantics")
@@ -1976,8 +2046,8 @@ struct Pipeline {
             VM.Interpreter().invoke(
                 entry: .init(rawValue: 0),
                 image: truncate.image,
-                arguments: [.float(unrepresentable, bitWidth: 64)]
-            ) == .returned(.float(Double(Float(unrepresentable)), bitWidth: 32))
+                arguments: [.float64(unrepresentable)]
+            ) == .returned(.float32(Float(unrepresentable)))
         )
 
         let extend = try compileFixture(
@@ -1991,8 +2061,8 @@ struct Pipeline {
             VM.Interpreter().invoke(
                 entry: .init(rawValue: 0),
                 image: extend.image,
-                arguments: [.float(Double(Float.pi), bitWidth: 32)]
-            ) == .returned(.float(Double(Float.pi), bitWidth: 64))
+                arguments: [.float32(.pi)]
+            ) == .returned(.float64(Double(Float.pi)))
         )
 
         let signedInteger = try VM.Integer(
@@ -2037,7 +2107,7 @@ struct Pipeline {
                     entry: .init(rawValue: 0),
                     image: fixture.image,
                     arguments: [.integer(argument)]
-                ) == .returned(.float(expected, bitWidth: 64))
+                ) == .returned(.float64(expected))
             )
         }
     }
@@ -2278,7 +2348,7 @@ struct Pipeline {
                     .string("Helix🧬"),
                     .integer(try VM.Integer(signed: -7, bitWidth: 64, isSigned: true)),
                     .bool(true),
-                    .float(1.25, bitWidth: 64),
+                    .float64(1.25),
                 ]
             ) == .returned(.string("Helix🧬:-7:true:1.25"))
         )
@@ -2303,7 +2373,7 @@ struct Pipeline {
                             )
                         ),
                         .bool(boolean),
-                        .float(floating, bitWidth: 64),
+                        .float64(floating),
                     ]
                 ) == .returned(.string(expected)),
                 Comment(rawValue: "String interpolation mismatch for case \(caseID)")

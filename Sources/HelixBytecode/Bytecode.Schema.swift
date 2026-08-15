@@ -292,9 +292,13 @@ public enum TrapReason: Codable, Hashable, Sendable, CustomStringConvertible {
 }
 
 public enum Instruction: Codable, Hashable, Sendable {
-    case constantInteger(result: Bytecode.Register, value: Int64)
+    /// Materializes the low `ValueType.integer` bits exactly. Signedness is a
+    /// property of the destination register, not of Swift's SIL literal node.
+    case constantInteger(result: Bytecode.Register, bitPattern: UInt64)
     case constantBool(result: Bytecode.Register, value: Bool)
-    case constantFloat(result: Bytecode.Register, value: Double)
+    /// Materializes an IEEE-754 binary32 or binary64 payload without routing
+    /// it through JSON floating-point numbers or another floating width.
+    case constantFloat(result: Bytecode.Register, bitPattern: UInt64)
     case constantString(result: Bytecode.Register, value: String)
     case copyValue(result: Bytecode.Register, source: Bytecode.Register)
     case moveValue(result: Bytecode.Register, source: Bytecode.Register)

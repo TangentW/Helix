@@ -30,7 +30,7 @@ struct SetSemantics {
 
     @Test("Copied NaN Sets remain reflexive without equating independent storage")
     func preservesSwiftCopyIdentityForNaN() {
-        let nan = VM.Value.float(.nan, bitWidth: 64)
+        let nan = VM.Value.float64(.nan)
         let original = VM.SetValue(
             elements: [nan],
             elementType: .float(bitWidth: 64)

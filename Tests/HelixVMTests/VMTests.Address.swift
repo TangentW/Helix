@@ -127,7 +127,7 @@ struct AddressExecution {
                             address: .init(rawValue: 1),
                             kind: .modify
                         ),
-                        .constantInteger(result: .init(rawValue: 3), value: 41),
+                        .constantInteger(result: .init(rawValue: 3), bitPattern: 41),
                         .apply(
                             result: nil,
                             function: .init(rawValue: 1),
@@ -209,7 +209,7 @@ struct AddressExecution {
                             base: .init(rawValue: 4),
                             fieldIndex: 0
                         ),
-                        .constantInteger(result: .init(rawValue: 6), value: 73),
+                        .constantInteger(result: .init(rawValue: 6), bitPattern: 73),
                         .apply(
                             result: nil,
                             function: .init(rawValue: 1),

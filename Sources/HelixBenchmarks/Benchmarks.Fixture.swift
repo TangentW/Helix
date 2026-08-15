@@ -267,7 +267,7 @@ struct Fixture {
                     id: .init(rawValue: 0),
                     parameters: [.init(rawValue: 0)],
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 1), value: 27),
+                        .constantInteger(result: .init(rawValue: 1), bitPattern: 27),
                         .checkedBinary(
                             result: .init(rawValue: 2),
                             overflow: .init(rawValue: 3),
@@ -329,7 +329,7 @@ struct Fixture {
                     id: .init(rawValue: 0),
                     parameters: [.init(rawValue: 0)],
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 1), value: 27),
+                        .constantInteger(result: .init(rawValue: 1), bitPattern: 27),
                         .makeClosure(
                             result: .init(rawValue: 2),
                             function: .init(rawValue: 1),

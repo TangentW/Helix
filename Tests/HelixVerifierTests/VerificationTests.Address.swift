@@ -84,7 +84,7 @@ struct AddressSemantics {
                             base: .init(rawValue: 4),
                             fieldIndex: 0
                         ),
-                        .constantInteger(result: .init(rawValue: 6), value: 41),
+                        .constantInteger(result: .init(rawValue: 6), bitPattern: 41),
                         .apply(
                             result: nil,
                             function: .init(rawValue: 1),
@@ -285,7 +285,7 @@ struct AddressSemantics {
                 .init(
                     id: .init(rawValue: 0),
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 0), value: 1),
+                        .constantInteger(result: .init(rawValue: 0), bitPattern: 1),
                         .storeStack(
                             slot: .init(rawValue: 0),
                             source: .init(rawValue: 0),
@@ -437,7 +437,7 @@ struct AddressSemantics {
             )
         }
         let prefix: [Bytecode.Instruction] = [
-            .constantInteger(result: .init(rawValue: 0), value: 1),
+            .constantInteger(result: .init(rawValue: 0), bitPattern: 1),
             .makeTuple(
                 result: .init(rawValue: 1),
                 elements: [.init(rawValue: 0), .init(rawValue: 0)]
@@ -565,7 +565,7 @@ struct AddressSemantics {
         let store = addressFunction(
             id: 1,
             instructions: [
-                .constantInteger(result: .init(rawValue: 0), value: 1),
+                .constantInteger(result: .init(rawValue: 0), bitPattern: 1),
                 .stackAddress(
                     result: .init(rawValue: 1),
                     slot: .init(rawValue: 0)
@@ -609,7 +609,7 @@ struct AddressSemantics {
                 .init(
                     id: .init(rawValue: 0),
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 0), value: 1),
+                        .constantInteger(result: .init(rawValue: 0), bitPattern: 1),
                         .stackAddress(
                             result: .init(rawValue: 1),
                             slot: .init(rawValue: 0)
@@ -656,7 +656,7 @@ struct AddressSemantics {
 
     private var initializedPrefix: [Bytecode.Instruction] {
         [
-            .constantInteger(result: .init(rawValue: 0), value: 1),
+            .constantInteger(result: .init(rawValue: 0), bitPattern: 1),
             .storeStack(
                 slot: .init(rawValue: 0),
                 source: .init(rawValue: 0),

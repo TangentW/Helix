@@ -641,8 +641,8 @@ struct HigherOrderSemanticsMatrix {
                 """,
                 scenarios: [
                     .init(
-                        arguments: [.float(1.5, bitWidth: 64)],
-                        expected: .returned(.float(3, bitWidth: 64))
+                        arguments: [.float64(1.5)],
+                        expected: .returned(.float64(3))
                     ),
                 ]
             ),

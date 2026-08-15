@@ -571,7 +571,9 @@ public final class Engine: @unchecked Sendable {
 
     private func isRuntimeInvariantViolation(_ trap: VM.RuntimeTrap) -> Bool {
         switch trap {
-        case .invalidIntegerWidth, .undefinedRegister, .registerAlreadyInitialized,
+        case .invalidIntegerWidth, .invalidFloatingPointWidth,
+             .invalidFloatingPointBitPattern,
+             .undefinedRegister, .registerAlreadyInitialized,
              .consumedRegister, .unknownStackSlot, .uninitializedStackSlot,
              .stackSlotAlreadyInitialized, .unknownFunction, .invalidProgramCounter,
              .typeMismatch, .unknownNativeImport, .nativeImportDescriptorMismatch,

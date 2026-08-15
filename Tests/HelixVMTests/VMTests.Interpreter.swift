@@ -97,7 +97,7 @@ struct Interpreter {
                 .init(
                     id: .init(rawValue: 4),
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 5), value: -1),
+                        .constantInteger(result: .init(rawValue: 5), bitPattern: UInt64.max),
                         .returnValue(.init(rawValue: 5)),
                     ]
                 ),
@@ -230,7 +230,7 @@ struct Interpreter {
         var instructions = elementRegisters.enumerated().map { index, register in
             Bytecode.Instruction.constantInteger(
                 result: register,
-                value: Int64(index)
+                bitPattern: UInt64(index)
             )
         }
         instructions.append(
@@ -422,8 +422,8 @@ struct Interpreter {
                 operation: .truncate,
                 sourceType: .float(bitWidth: 64),
                 resultType: .float(bitWidth: 32),
-                argument: .float(unrepresentable, bitWidth: 64)
-            ) == .returned(.float(Double(Float(unrepresentable)), bitWidth: 32))
+                argument: .float64(unrepresentable)
+            ) == .returned(.float32(Float(unrepresentable)))
         )
         #expect(
             try floating(
@@ -433,7 +433,7 @@ struct Interpreter {
                 argument: .integer(
                     try .init(rawBits: UInt64.max, bitWidth: 64, isSigned: false)
                 )
-            ) == .returned(.float(Double(UInt64.max), bitWidth: 64))
+            ) == .returned(.float64(Double(UInt64.max)))
         )
     }
 
@@ -1056,7 +1056,10 @@ struct Interpreter {
                         id: .init(rawValue: 0),
                         instructions: [
                             .nativeApply(result: .init(rawValue: 0), importID: .init(rawValue: 1), arguments: []),
-                            .constantFloat(result: .init(rawValue: 1), value: 1),
+                            .constantFloat(
+                                result: .init(rawValue: 1),
+                                bitPattern: Double(1).bitPattern
+                            ),
                             .compare(
                                 result: .init(rawValue: 2),
                                 predicate: predicate,
@@ -1886,10 +1889,10 @@ struct Interpreter {
             .bool(false),
             .integer(try VM.Integer(signed: .min, bitWidth: 64, isSigned: true)),
             .integer(try VM.Integer(rawBits: .max, bitWidth: 64, isSigned: false)),
-            .float(-Double.greatestFiniteMagnitude, bitWidth: 64),
-            .float(-Double(Float.greatestFiniteMagnitude), bitWidth: 32),
-            .float(.nan, bitWidth: 64),
-            .float(-.infinity, bitWidth: 64),
+            .float64(-Double.greatestFiniteMagnitude),
+            .float32(-Float.greatestFiniteMagnitude),
+            .float64(.nan),
+            .float64(-.infinity),
         ]
         for scalar in boundedScalars {
             let text = try VM.StringAllocation.stringify(scalar)
@@ -1986,13 +1989,13 @@ struct Interpreter {
                     id: .init(rawValue: 0),
                     instructions: [
                         .constantString(result: .init(rawValue: 0), value: "duplicate"),
-                        .constantInteger(result: .init(rawValue: 1), value: 1),
+                        .constantInteger(result: .init(rawValue: 1), bitPattern: 1),
                         .makeTuple(
                             result: .init(rawValue: 2),
                             elements: [.init(rawValue: 0), .init(rawValue: 1)]
                         ),
                         .constantString(result: .init(rawValue: 3), value: "duplicate"),
-                        .constantInteger(result: .init(rawValue: 4), value: 2),
+                        .constantInteger(result: .init(rawValue: 4), bitPattern: 2),
                         .makeTuple(
                             result: .init(rawValue: 5),
                             elements: [.init(rawValue: 3), .init(rawValue: 4)]
@@ -2317,7 +2320,7 @@ struct Interpreter {
                     parameters: [.init(rawValue: 2)],
                     instructions: [
                         .destroyValue(.init(rawValue: 2)),
-                        .constantInteger(result: .init(rawValue: 3), value: -1),
+                        .constantInteger(result: .init(rawValue: 3), bitPattern: UInt64.max),
                         .returnValue(.init(rawValue: 3)),
                     ]
                 ),
@@ -2390,7 +2393,7 @@ struct Interpreter {
                     .init(
                         id: .init(rawValue: 2),
                         instructions: [
-                            .constantInteger(result: .init(rawValue: 2), value: 7),
+                            .constantInteger(result: .init(rawValue: 2), bitPattern: 7),
                             .returnValue(.init(rawValue: 2)),
                         ]
                     ),
@@ -2509,7 +2512,7 @@ struct Interpreter {
                     parameters: [.init(rawValue: 2)],
                     instructions: [
                         .destroyValue(.init(rawValue: 2)),
-                        .constantInteger(result: .init(rawValue: 3), value: -1),
+                        .constantInteger(result: .init(rawValue: 3), bitPattern: UInt64.max),
                         .returnValue(.init(rawValue: 3)),
                     ]
                 ),
@@ -2579,7 +2582,7 @@ struct Interpreter {
                     instructions: [
                         .constantInteger(
                             result: .init(rawValue: 1),
-                            value: 7
+                            bitPattern: 7
                         ),
                         .makeClosure(
                             result: .init(rawValue: 2),
@@ -2606,7 +2609,7 @@ struct Interpreter {
                         .destroyValue(.init(rawValue: 4)),
                         .constantInteger(
                             result: .init(rawValue: 5),
-                            value: -1
+                            bitPattern: UInt64.max
                         ),
                         .returnValue(.init(rawValue: 5)),
                     ]
@@ -2755,7 +2758,7 @@ struct Interpreter {
                             result: .init(rawValue: 1),
                             cell: .init(rawValue: 0)
                         ),
-                        .constantInteger(result: .init(rawValue: 2), value: 1),
+                        .constantInteger(result: .init(rawValue: 2), bitPattern: 1),
                         .checkedBinary(
                             result: .init(rawValue: 3),
                             overflow: .init(rawValue: 4),
@@ -2932,7 +2935,7 @@ struct Interpreter {
                     id: .init(rawValue: 0),
                     parameters: [.init(rawValue: 0)],
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 1), value: 2),
+                        .constantInteger(result: .init(rawValue: 1), bitPattern: 2),
                         .makeStruct(
                             result: .init(rawValue: 2),
                             fields: [.init(rawValue: 0), .init(rawValue: 1)]
@@ -2946,7 +2949,7 @@ struct Interpreter {
                             cell: .init(rawValue: 3),
                             fieldIndex: 0
                         ),
-                        .constantInteger(result: .init(rawValue: 5), value: 9),
+                        .constantInteger(result: .init(rawValue: 5), bitPattern: 9),
                         .storeMutableCell(
                             cell: .init(rawValue: 4),
                             source: .init(rawValue: 5),
@@ -3015,7 +3018,7 @@ struct Interpreter {
                     id: .init(rawValue: 0),
                     parameters: [.init(rawValue: 0)],
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 1), value: 2),
+                        .constantInteger(result: .init(rawValue: 1), bitPattern: 2),
                         .makeTuple(
                             result: .init(rawValue: 2),
                             elements: [.init(rawValue: 0), .init(rawValue: 1)]
@@ -3029,7 +3032,7 @@ struct Interpreter {
                             cell: .init(rawValue: 3),
                             fieldIndex: 1
                         ),
-                        .constantInteger(result: .init(rawValue: 5), value: 11),
+                        .constantInteger(result: .init(rawValue: 5), bitPattern: 11),
                         .storeMutableCell(
                             cell: .init(rawValue: 4),
                             source: .init(rawValue: 5),
@@ -3103,7 +3106,7 @@ struct Interpreter {
                         ),
                         .constantInteger(
                             result: .init(rawValue: 4),
-                            value: 10
+                            bitPattern: 10
                         ),
                         .storeMutableCell(
                             cell: .init(rawValue: 3),
@@ -3163,7 +3166,7 @@ struct Interpreter {
                     id: .init(rawValue: 0),
                     parameters: [.init(rawValue: 0)],
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 1), value: 3),
+                        .constantInteger(result: .init(rawValue: 1), bitPattern: 3),
                         .makeClosure(
                             result: .init(rawValue: 2),
                             function: .init(rawValue: 2),
@@ -3491,7 +3494,7 @@ struct Interpreter {
             arguments: [VM.Value],
             context: VM.NativeInvocationContext
         ) -> VM.NativeInvocationResult {
-            .returned(.float(.nan, bitWidth: 64))
+            .returned(.float64(.nan))
         }
     }
 
@@ -3530,7 +3533,7 @@ struct Interpreter {
                     id: .init(rawValue: 0),
                     parameters: [.init(rawValue: 0)],
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 1), value: 27),
+                        .constantInteger(result: .init(rawValue: 1), bitPattern: 27),
                         .checkedBinary(
                             result: .init(rawValue: 2),
                             overflow: .init(rawValue: 3),
@@ -3573,7 +3576,10 @@ struct Interpreter {
                     id: .init(rawValue: 0),
                     parameters: [.init(rawValue: 0)],
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 1), value: amount),
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            bitPattern: UInt64(bitPattern: amount)
+                        ),
                         .checkedBinary(
                             result: .init(rawValue: 2),
                             overflow: .init(rawValue: 3),

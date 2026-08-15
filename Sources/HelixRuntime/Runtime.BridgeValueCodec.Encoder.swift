@@ -49,19 +49,19 @@ public final class Encoder {
     /// Encodes one 32-bit floating-point leaf and charges it to the graph.
     public func encode(_ value: Float) throws -> VM.Value {
         try reserveLeaf()
-        return .float(Double(value), bitWidth: 32)
+        return .float(VM.FloatingValue(value))
     }
 
     /// Encodes one 64-bit floating-point leaf and charges it to the graph.
     public func encode(_ value: Double) throws -> VM.Value {
         try reserveLeaf()
-        return .float(value, bitWidth: 64)
+        return .float(VM.FloatingValue(value))
     }
 
     /// Encodes a 64-bit `CGFloat` leaf and charges it to the graph.
     public func encode(_ value: CGFloat) throws -> VM.Value {
         try reserveLeaf()
-        return .float(Double(value), bitWidth: 64)
+        return .float(VM.FloatingValue(Double(value)))
     }
 
     /// Encodes a string after reserving its UTF-8 storage and polling the deadline.

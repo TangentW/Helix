@@ -193,7 +193,7 @@ struct SetSemantics {
                             setResult: .init(rawValue: 5),
                             set: .init(rawValue: 1)
                         ),
-                        .constantInteger(result: .init(rawValue: 2), value: 0),
+                        .constantInteger(result: .init(rawValue: 2), bitPattern: 0),
                         .storeStack(
                             slot: .init(rawValue: 0),
                             source: .init(rawValue: 2),

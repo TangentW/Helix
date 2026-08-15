@@ -7,6 +7,8 @@ import HelixCore
 extension VM {
 public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
     case invalidIntegerWidth(UInt16)
+    case invalidFloatingPointWidth(UInt16)
+    case invalidFloatingPointBitPattern(UInt64, bitWidth: UInt16)
     case integerOverflow
     case divisionByZero
     case typeMismatch(expected: Bytecode.ValueType, actual: Bytecode.ValueType?)
@@ -51,6 +53,10 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
     public var description: String {
         switch self {
         case let .invalidIntegerWidth(width): "invalid integer width \(width)"
+        case let .invalidFloatingPointWidth(width):
+            "invalid floating-point width \(width)"
+        case let .invalidFloatingPointBitPattern(bitPattern, width):
+            "floating-point bit pattern 0x\(String(bitPattern, radix: 16)) does not fit \(width) bits"
         case .integerOverflow: "integer overflow"
         case .divisionByZero: "division by zero"
         case let .typeMismatch(expected, actual): "type mismatch: expected \(expected), got \(actual?.description ?? "no value")"

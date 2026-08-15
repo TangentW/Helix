@@ -271,19 +271,19 @@ struct ProgressionSemanticsMatrix {
                 scenarios: [
                     .init(
                         arguments: [
-                            .float(0, bitWidth: 64),
-                            .float(1, bitWidth: 64),
-                            .float(0.25, bitWidth: 64),
+                            .float64(0),
+                            .float64(1),
+                            .float64(0.25),
                         ],
-                        expected: .returned(.float(1.5, bitWidth: 64))
+                        expected: .returned(.float64(1.5))
                     ),
                     .init(
                         arguments: [
-                            .float(0, bitWidth: 64),
-                            .float(1, bitWidth: 64),
-                            .float(.nan, bitWidth: 64),
+                            .float64(0),
+                            .float64(1),
+                            .float64(.nan),
                         ],
-                        expected: .returned(.float(0, bitWidth: 64))
+                        expected: .returned(.float64(0))
                     ),
                 ]
             ),
@@ -305,25 +305,25 @@ struct ProgressionSemanticsMatrix {
                 scenarios: [
                     .init(
                         arguments: [
-                            .float(1, bitWidth: 32),
-                            .float(0, bitWidth: 32),
-                            .float(-0.25, bitWidth: 32),
+                            .float32(1),
+                            .float32(0),
+                            .float32(-0.25),
                         ],
-                        expected: .returned(.float(2.5, bitWidth: 32))
+                        expected: .returned(.float32(2.5))
                     ),
                     .init(
                         arguments: [
-                            .float(1, bitWidth: 32),
-                            .float(10, bitWidth: 32),
-                            .float(.infinity, bitWidth: 32),
+                            .float32(1),
+                            .float32(10),
+                            .float32(.infinity),
                         ],
-                        expected: .returned(.float(1, bitWidth: 32))
+                        expected: .returned(.float32(1))
                     ),
                     .init(
                         arguments: [
-                            .float(1, bitWidth: 32),
-                            .float(10, bitWidth: 32),
-                            .float(0, bitWidth: 32),
+                            .float32(1),
+                            .float32(10),
+                            .float32(0),
                         ],
                         expected: .trapped(
                             .explicit("Stride size must not be zero")
@@ -351,11 +351,11 @@ struct ProgressionSemanticsMatrix {
                 scenarios: [
                     .init(
                         arguments: [
-                            .float(0, bitWidth: 64),
-                            .float(1, bitWidth: 64),
-                            .float(0.5, bitWidth: 64),
+                            .float64(0),
+                            .float64(1),
+                            .float64(0.5),
                         ],
-                        expected: .returned(.float(1.5, bitWidth: 64))
+                        expected: .returned(.float64(1.5))
                     ),
                 ]
             ),
@@ -403,17 +403,17 @@ struct ProgressionSemanticsMatrix {
                 scenarios: [
                     .init(
                         arguments: [
-                            .float(-1, bitWidth: 64),
-                            .float(1, bitWidth: 64),
-                            .float(1, bitWidth: 64),
+                            .float64(-1),
+                            .float64(1),
+                            .float64(1),
                         ],
                         expected: .returned(.bool(true))
                     ),
                     .init(
                         arguments: [
-                            .float(-1, bitWidth: 64),
-                            .float(1, bitWidth: 64),
-                            .float(.nan, bitWidth: 64),
+                            .float64(-1),
+                            .float64(1),
+                            .float64(.nan),
                         ],
                         expected: .returned(.bool(false))
                     ),

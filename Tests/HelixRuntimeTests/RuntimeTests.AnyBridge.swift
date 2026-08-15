@@ -71,6 +71,22 @@ struct AnyBridge {
             )
         }
 
+        let floatPayload = Float(bitPattern: 0x7FA1_2345)
+        let decodedFloat = try #require(
+            Runtime.BridgeValueCodec.decodeAny(
+                Runtime.BridgeValueCodec.encodeAny(floatPayload)
+            ) as? Float
+        )
+        #expect(decodedFloat.bitPattern == floatPayload.bitPattern)
+
+        let doublePayload = Double(bitPattern: 0x7FF0_0000_0000_1234)
+        let decodedDouble = try #require(
+            Runtime.BridgeValueCodec.decodeAny(
+                Runtime.BridgeValueCodec.encodeAny(doublePayload)
+            ) as? Double
+        )
+        #expect(decodedDouble.bitPattern == doublePayload.bitPattern)
+
         // HLBC deliberately gives Int and Int64 one 64-bit signed identity.
         let canonicalInt = try Runtime.BridgeValueCodec.decodeAny(
             Runtime.BridgeValueCodec.encodeAny(Int64(64))

@@ -87,9 +87,9 @@ enum DynamicAny {
         case let .float(bitWidth):
             let encoded: VM.Value
             if bitWidth == 32, let value = value as? Float {
-                encoded = .float(Double(value), bitWidth: 32)
+                encoded = .float(VM.FloatingValue(value))
             } else if bitWidth == 64, let value = value as? Double {
-                encoded = .float(value, bitWidth: 64)
+                encoded = .float(VM.FloatingValue(value))
             } else {
                 throw mismatch(expected: type, value: value)
             }
