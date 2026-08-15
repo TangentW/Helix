@@ -25,12 +25,12 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - `String` 字面量、拼接、支持标量的插值、count/empty、比较以及常见 prefix/suffix/contains 判断。常见的 `String.contains(Character)` 可以使用单 grapheme 的 `Character` 字面量，而不暴露 Swift 私有 Character 布局。
 - Tuple、`Void` 与 `Optional`，包括 `if let`、`guard let`、`??` 和 `try?` 产生的普通控制流，也包括 Dictionary semantic SIL 产生的地址型 Optional projection。
 - Array 值语义、append、迭代、安全下标和返回新值的更新；支持键值类型下的 Dictionary 构建、查找、更新与迭代。
-- 结构化分支、循环、switch、调用、递归、显式业务错误边和带 payload 的局部 Error 值。
+- 结构化分支、循环、switch、调用、递归、显式业务错误边和带 payload 的局部 Error 值。真实 frontend 语料已覆盖三元表达式、`repeat-while`、带标签的 `break`/`continue`、Tuple 与 Optional 模式匹配、`for case`、`while let`、`fallthrough`、提前返回，以及循环与返回清理路径上的 `defer`。
 - `Range<Int>` 半开区间 `for` 循环；Lowerer 会把它变成 HLBC 的强类型 cursor 控制流，不依赖 Swift 标准库 Range/Iterator ABI 对象。
 - 可在现有受监视文件中新加、且不导出到原生 ABI 的文件或 module scope 补丁内非递归 stored struct/enum；支持具体 `Result`、字段读取、enum switch、实例/静态计算 getter/setter 与受支持的 mutating helper。嵌套声明保留完整 namespace identity。它们是仅属于当前 generation 的 VM 值，不是新加载的 Swift metadata。
 - 新增普通函数、private 方法和计算属性会作为同一 image 的普通函数、getter 或 setter 被传递发现并编译，不要求它们预先出现在 Shell EntryIndex 中。patch-local `final class` 具有 HLVM 自己的引用 identity、字段 storage 和方法调用；纯 HLVM class 仍不能跨原生边界。
 - 新增 `final` class 可以选择一个 HLXI 已冻结、`NSObject` 兼容的 reference superclass。Runtime 为每个不可变 image 注册 Objective-C host，使对象能以该 superclass（包括 `UIViewController` 或项目基类）的身份交给原生代码。当前 hosted profile 仅支持继承的无参初始化、无新增 stored property，以及无参或单个 `Bool` 参数的 `Void` override；原生侧不能识别补丁新增的 Swift 具体类型。
-- 同步补丁内 `inout` 与 `mutating` helper，并受 Address、access、alias、ownership、同 frame/同 block 规则验证。
+- 同步补丁内 `inout` 与 `mutating` helper，并受 Address、access、alias、ownership、同 frame/同 block 规则验证；其中包括编译器为捕获可变局部变量的 `defer` helper 生成的 `@inout_aliasable` / `@closureCapture $*T` 物理 convention。
 - 捕获 copyable VM-managed 值的同步补丁内 closure。它包括同 image helper 的 `@escaping` 参数、从同 image 函数把 closure 返回给调用者，以及 closure 再捕获另一个 closure；该值必须在同一次固定 generation 的 HLVM invocation 内用完。返回与嵌套捕获语义由 `escaping-closure-values-1` 独立门禁，不能因为基础 closure capability 存在就默认放行。另支持不再包含 archetype、metadata 或 witness 依赖的编译器完全具体化 specialization。
 - 顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` entry。生成的精确 Swift wrapper 保留 ABI，HLVM 只执行已经证明不会挂起的 body。
 - VM-owned `Any`、`is`、`as?`、`as!`，以及受支持 Optional/Array/Dictionary 的递归动态转换；Swift existential metadata、native object 和线性生命周期不会进入下载字节码。

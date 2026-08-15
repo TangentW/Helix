@@ -286,6 +286,19 @@ public struct Lowerer: Sendable {
             separator: "\n",
             omittingEmptySubsequences: false
         ).map(String.init)
+        var remainingDeallocStackUses: [String: Int] = [:]
+        for (index, rawLine) in rawLines.enumerated()
+        where !nsErrorBridges.skippedLines.contains(index) {
+            let instruction = CanonicalSIL.DebugMetadata.strippingMetadata(
+                from: rawLine
+            ).trimmingCharacters(in: .whitespaces)
+            if let deallocation = match(
+                instruction,
+                pattern: #"^dealloc_stack (%[0-9]+)$"#
+            ) {
+                remainingDeallocStackUses[deallocation[0], default: 0] += 1
+            }
+        }
         // Reject a forbidden existential payload before incidental SIL such
         // as a closure reabstraction thunk obscures the actionable cause.
         for rawLine in rawLines {
@@ -358,7 +371,7 @@ public struct Lowerer: Sendable {
         var nativePropertyAddresses: [String: NativePropertyAddress] = [:]
         var pendingArrayIteratorTypes: [String: Bytecode.ValueType] = [:]
         var arrayIteratorStates: [String: ArrayIteratorState] = [:]
-        var destroyedArrayIterators = Set<String>()
+        var destroyedArrayIterators: [String: Set<Bytecode.BlockID>] = [:]
         var integerRangeValues: [String: IntegerRangeValue] = [:]
         var integerRangeAddresses = Set<String>()
         var integerRangeAddressValues: [String: IntegerRangeValue] = [:]
@@ -372,7 +385,7 @@ public struct Lowerer: Sendable {
         var pendingDictionaryIteratorTypes: [String: (Bytecode.ValueType, Bytecode.ValueType)] = [:]
         var pendingDictionaryIteratorValues: [String: DictionaryIteratorState] = [:]
         var dictionaryIteratorStates: [String: DictionaryIteratorState] = [:]
-        var destroyedDictionaryIterators = Set<String>()
+        var destroyedDictionaryIterators: [String: Set<Bytecode.BlockID>] = [:]
         var pendingStringInterpolationAddresses = Set<String>()
         var stringInterpolationAddressValues: [String: Bytecode.Register] = [:]
         var stringInterpolationValues: [String: Bytecode.Register] = [:]
@@ -648,7 +661,7 @@ public struct Lowerer: Sendable {
             stackAddressValues[addressBase(token)]
         }
 
-        func assignStackValue(_ value: Bytecode.Register, at token: String) {
+        func recordCompilerAddressValue(_ value: Bytecode.Register, at token: String) {
             stackAddressValues[addressBase(token)] = value
         }
 
@@ -701,6 +714,9 @@ public struct Lowerer: Sendable {
             return stackValue(at: token)
         }
 
+        // Materialized values must cross this single sink so compiler-only
+        // storage, runtime stack slots, scoped accesses, and projected
+        // addresses preserve the same SIL initialization semantics.
         func storeVMValue(
             _ value: Bytecode.Register,
             at token: String,
@@ -726,9 +742,8 @@ public struct Lowerer: Sendable {
                         )
                     )
                 } else if let slot = runtimeStackSlots[root], token == root {
-                    let mode: Bytecode.StackStoreMode = stackAddressValues[root] == nil
-                        ? .initialize
-                        : .assign
+                    let mode = requestedMode
+                        ?? (stackAddressValues[root] == nil ? .initialize : .assign)
                     appendInstruction(
                         .storeStack(slot: slot, source: value, mode: mode)
                     )
@@ -753,7 +768,7 @@ public struct Lowerer: Sendable {
                 stackAddressValues[root] = value
                 return
             }
-            assignStackValue(value, at: token)
+            recordCompilerAddressValue(value, at: token)
             values[token] = value
             values[addressBase(token)] = value
         }
@@ -1184,7 +1199,8 @@ public struct Lowerer: Sendable {
 
         func storeConstructedValue(
             _ value: Bytecode.Register,
-            at token: String
+            at token: String,
+            mode: Bytecode.StackStoreMode? = nil
         ) throws {
             let type = registerTypes[Int(value.rawValue)]
             guard compilerAddressType(token) == type else {
@@ -1211,10 +1227,10 @@ public struct Lowerer: Sendable {
                         "taken Optional payload no longer matches its source storage"
                     )
                 }
-                assignStackValue(value, at: token)
+                recordCompilerAddressValue(value, at: token)
                 let optional = try allocate(type: .optional(wrapped))
                 appendInstruction(.makeOptionalSome(result: optional, value: value))
-                try storeVMValue(optional, at: root)
+                try storeVMValue(optional, at: root, requestedMode: mode)
                 return
             }
             if let root = optionalPayloadAddressRoots[token],
@@ -1230,7 +1246,7 @@ public struct Lowerer: Sendable {
                 optionalAddressInitializations[root] = initialization
                 return
             }
-            try storeVMValue(value, at: token)
+            try storeVMValue(value, at: token, requestedMode: mode)
         }
 
         func lowerMutatingValueReceiverApply(
@@ -1798,8 +1814,8 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let result = try allocate(type: element)
-                assignStackValue(result, at: arguments[0])
                 appendInstruction(.arrayGet(result: result, array: array, index: index))
+                try storeConstructedValue(result, at: arguments[0], mode: .initialize)
                 voidValues.insert(resultToken)
 
             case .arraySubscriptModify:
@@ -1826,8 +1842,8 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let result = try allocate(type: .optional(element))
-                assignStackValue(result, at: arguments[0])
                 appendInstruction(.arrayFirst(result: result, array: array))
+                try storeConstructedValue(result, at: arguments[0], mode: .initialize)
                 voidValues.insert(resultToken)
 
             case .sequenceContains:
@@ -1895,7 +1911,7 @@ public struct Lowerer: Sendable {
                 appendInstruction(
                     .arrayAppend(result: result, array: array, value: value)
                 )
-                assignStackValue(result, at: arguments[1])
+                try storeConstructedValue(result, at: arguments[1], mode: .assign)
                 voidValues.insert(resultToken)
 
             case .collectionMakeIterator:
@@ -1996,7 +2012,7 @@ public struct Lowerer: Sendable {
                         indexSlot: state.indexSlot
                     )
                 )
-                assignStackValue(result, at: arguments[0])
+                try storeConstructedValue(result, at: arguments[0], mode: .initialize)
                 voidValues.insert(resultToken)
 
             case .dictionaryCount, .dictionaryIsEmpty:
@@ -2049,7 +2065,7 @@ public struct Lowerer: Sendable {
                 appendInstruction(
                     .dictionaryGet(result: result, dictionary: dictionary, key: key)
                 )
-                assignStackValue(result, at: arguments[0])
+                try storeConstructedValue(result, at: arguments[0], mode: .initialize)
                 voidValues.insert(resultToken)
 
             case .dictionarySubscriptSet:
@@ -2090,7 +2106,7 @@ public struct Lowerer: Sendable {
                         value: update
                     )
                 )
-                assignStackValue(result, at: arguments[2])
+                try storeConstructedValue(result, at: arguments[2], mode: .assign)
                 voidValues.insert(resultToken)
 
             case .dictionaryLiteral:
@@ -2175,7 +2191,7 @@ public struct Lowerer: Sendable {
                         indexSlot: state.indexSlot
                     )
                 )
-                assignStackValue(result, at: arguments[0])
+                try storeConstructedValue(result, at: arguments[0], mode: .initialize)
                 voidValues.insert(resultToken)
 
             case .allocateUninitializedArray:
@@ -2959,56 +2975,94 @@ public struct Lowerer: Sendable {
             }
 
             if let deallocation = match(line, pattern: #"^dealloc_stack (%[0-9]+)$"#) {
-                let address = addressBase(deallocation[0])
-                if onStackClosureValues.remove(address) != nil {
+                let token = deallocation[0]
+                let address = addressBase(token)
+                guard let remainingUses = remainingDeallocStackUses[token],
+                      remainingUses > 0
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "dealloc_stack is absent from the lexical cleanup inventory"
+                    )
+                }
+                let isFinalLexicalUse = remainingUses == 1
+                if isFinalLexicalUse {
+                    remainingDeallocStackUses.removeValue(forKey: token)
+                } else {
+                    remainingDeallocStackUses[token] = remainingUses - 1
+                }
+                if onStackClosureValues.contains(address) {
                     // SIL models an on-stack partial_apply as storage. The VM owns the
                     // corresponding closure value for the lifetime of its frame.
+                    if isFinalLexicalUse { onStackClosureValues.remove(address) }
                     continue
                 }
                 if catchScratchAddresses.contains(address) { continue }
-                if integerRangeAddresses.remove(address) != nil {
-                    guard integerRangeAddressValues.removeValue(forKey: address) != nil else {
+                if integerRangeAddresses.contains(address) {
+                    guard integerRangeAddressValues[address] != nil else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Range<Int> storage is deallocated before initialization"
                         )
                     }
+                    if isFinalLexicalUse {
+                        integerRangeAddresses.remove(address)
+                        integerRangeAddressValues.removeValue(forKey: address)
+                    }
                     continue
                 }
-                if integerRangeIteratorAddresses.remove(address) != nil {
-                    guard let state = integerRangeIteratorStates.removeValue(forKey: address)
+                if integerRangeIteratorAddresses.contains(address) {
+                    guard let state = integerRangeIteratorStates[address]
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Range<Int> iterator storage is deallocated before initialization"
                         )
                     }
                     appendInstruction(.destroyStack(state.indexSlot))
+                    if isFinalLexicalUse {
+                        integerRangeIteratorAddresses.remove(address)
+                        integerRangeIteratorStates.removeValue(forKey: address)
+                    }
                     continue
                 }
-                if pendingStringInterpolationAddresses.remove(address) != nil {
-                    guard stringInterpolationAddressValues.removeValue(forKey: address) == nil else {
+                if pendingStringInterpolationAddresses.contains(address) {
+                    guard stringInterpolationAddressValues[address] == nil else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "String interpolation storage is deallocated before take"
                         )
                     }
+                    if isFinalLexicalUse {
+                        pendingStringInterpolationAddresses.remove(address)
+                    }
                     continue
                 }
-                if pendingArrayIteratorTypes.removeValue(forKey: address) != nil {
-                    guard arrayIteratorStates[address] == nil,
-                          destroyedArrayIterators.remove(address) != nil
+                if pendingArrayIteratorTypes[address] != nil {
+                    guard let block = current?.id,
+                          arrayIteratorStates[address] != nil,
+                          destroyedArrayIterators[address]?.contains(block) == true
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Array iterator is deallocated before destroy_addr"
                         )
                     }
+                    if isFinalLexicalUse {
+                        pendingArrayIteratorTypes.removeValue(forKey: address)
+                        arrayIteratorStates.removeValue(forKey: address)
+                        destroyedArrayIterators.removeValue(forKey: address)
+                    }
                     continue
                 }
-                if pendingDictionaryIteratorTypes.removeValue(forKey: address) != nil {
-                    guard dictionaryIteratorStates[address] == nil,
-                          destroyedDictionaryIterators.remove(address) != nil
+                if pendingDictionaryIteratorTypes[address] != nil {
+                    guard let block = current?.id,
+                          dictionaryIteratorStates[address] != nil,
+                          destroyedDictionaryIterators[address]?.contains(block) == true
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Dictionary iterator is deallocated before destroy_addr"
                         )
+                    }
+                    if isFinalLexicalUse {
+                        pendingDictionaryIteratorTypes.removeValue(forKey: address)
+                        dictionaryIteratorStates.removeValue(forKey: address)
+                        destroyedDictionaryIterators.removeValue(forKey: address)
                     }
                     continue
                 }
@@ -5768,7 +5822,11 @@ public struct Lowerer: Sendable {
                         value: value
                     )
                 )
-                assignStackValue(result, at: mutation.arrayAddress)
+                try storeConstructedValue(
+                    result,
+                    at: mutation.arrayAddress,
+                    mode: .assign
+                )
                 mutation.didStore = true
                 arrayElementMutations[store[1]] = mutation
                 continue
@@ -6091,14 +6149,28 @@ public struct Lowerer: Sendable {
                     continue
                 }
                 if catchScratchAddresses.contains(address) { continue }
-                if let iterator = arrayIteratorStates.removeValue(forKey: address) {
+                if let iterator = arrayIteratorStates[address] {
+                    guard let block = current?.id,
+                          destroyedArrayIterators[address, default: []]
+                            .insert(block).inserted
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array iterator is destroyed twice in one block"
+                        )
+                    }
                     appendInstruction(.destroyStack(iterator.indexSlot))
-                    destroyedArrayIterators.insert(address)
                     continue
                 }
-                if let iterator = dictionaryIteratorStates.removeValue(forKey: address) {
+                if let iterator = dictionaryIteratorStates[address] {
+                    guard let block = current?.id,
+                          destroyedDictionaryIterators[address, default: []]
+                            .insert(block).inserted
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Dictionary iterator is destroyed twice in one block"
+                        )
+                    }
                     appendInstruction(.destroyStack(iterator.indexSlot))
-                    destroyedDictionaryIterators.insert(address)
                     continue
                 }
                 if let slot = runtimeStackSlots[address] {
@@ -7079,6 +7151,10 @@ public struct Lowerer: Sendable {
             "borrow",
             count: borrowedValueTokens.count
         )
+        recordIncompleteLifetime(
+            "lexical-dealloc",
+            count: remainingDeallocStackUses.values.reduce(0, +)
+        )
         let nativeConversionTokens = preservedNativeConversionValues.keys.sorted()
         recordIncompleteLifetime(
             "native-conversion[\(nativeConversionTokens.joined(separator: "|"))]",
@@ -7424,7 +7500,11 @@ public struct Lowerer: Sendable {
             raw, type -> Bytecode.ParameterConvention in
             let value = raw.trimmingCharacters(in: .whitespaces)
                 .trimmingPrefix("$")
-            if value.hasPrefix("@inout ") || value.hasPrefix("*") { return .inout }
+            if value.hasPrefix("@inout ")
+                || value.hasPrefix("@inout_aliasable ")
+                || value.hasPrefix("*") {
+                return .inout
+            }
             // Copyable VM values do not need SIL's borrow distinction. Linear
             // native handles do. Objective-C method parameters are +0 unless
             // SIL explicitly marks them @owned, even when the printed type has

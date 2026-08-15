@@ -413,18 +413,11 @@ public struct TypeEnvironment: Sendable {
         relativeTo parentScope: String?
     ) throws -> Bytecode.ValueType {
         var type = raw.trimmingCharacters(in: .whitespaces)
-        if type.hasPrefix("$*") {
-            return .address(
-                try resolve(String(type.dropFirst(2)), relativeTo: parentScope)
-            )
-        }
-        if type.hasPrefix("@inout ") {
-            return .address(
-                try resolve(
-                    String(type.dropFirst("@inout ".count)),
-                    relativeTo: parentScope
-                )
-            )
+        if let pointee = explicitAddressPointee(in: type) {
+            return .address(try resolve(
+                pointee,
+                relativeTo: parentScope
+            ))
         }
         var removedPrefix = true
         while removedPrefix {
@@ -448,6 +441,16 @@ public struct TypeEnvironment: Sendable {
                 type.removeFirst(ownership.count)
                 removedPrefix = true
             }
+        }
+
+        // Captured mutable locals are printed as `@closureCapture $*T`.
+        // Ownership decoration is orthogonal to the pointee identity, so
+        // recognize the address again after removing those decorations.
+        if let pointee = explicitAddressPointee(in: type) {
+            return .address(try resolve(
+                pointee,
+                relativeTo: parentScope
+            ))
         }
 
         if type.contains(" -> ") {
@@ -585,6 +588,15 @@ public struct TypeEnvironment: Sendable {
             spellings.insert(String(canonicalName[canonicalName.index(after: separator)...]))
         }
         return rawDefinitions.keys.filter { spellings.contains($0.rawValue) }.sorted()
+    }
+
+    private func explicitAddressPointee(in type: String) -> String? {
+        if type.hasPrefix("$*") { return String(type.dropFirst(2)) }
+        for convention in ["@inout ", "@inout_aliasable "]
+        where type.hasPrefix(convention) {
+            return String(type.dropFirst(convention.count))
+        }
+        return nil
     }
 
     private func resolveClosureSignature(

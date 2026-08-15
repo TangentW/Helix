@@ -42,7 +42,10 @@ does not by itself certify a physical device or distribution channel.
   value-returning updates; Dictionary construction, lookup, update, and
   iteration for supported key and value types.
 - Structured branches, loops, switches, calls, recursion, checked business
-  error edges, and local payload-carrying Error values.
+  error edges, and local payload-carrying Error values. Real-frontend coverage
+  includes ternary expressions, `repeat-while`, labeled `break`/`continue`,
+  tuple and Optional pattern matching, `for case`, `while let`, `fallthrough`,
+  early returns, and `defer` on loop and return cleanup paths.
 - Half-open `Range<Int>` `for` loops, lowered to typed HLBC cursor control flow
   rather than a Swift standard-library Range/Iterator ABI object.
 - Newly introduced, non-exported file- or module-scope patch-local nonrecursive
@@ -63,7 +66,9 @@ does not by itself certify a physical device or distribution channel.
   overrides with either no arguments or one `Bool`; native code cannot identify
   the patch's concrete Swift type.
 - Synchronous patch-local `inout` and `mutating` helpers under verified address,
-  access, aliasing, ownership, and same-frame/same-block restrictions.
+  access, aliasing, ownership, and same-frame/same-block restrictions. This
+  includes the `@inout_aliasable`/`@closureCapture $*T` physical conventions
+  emitted for mutable locals captured by compiler-generated `defer` helpers.
 - Synchronous patch-local closure values with copyable VM-managed captures.
   This includes `@escaping` parameters on same-image helpers, returning a
   closure from one same-image function to its caller, and a closure capturing
