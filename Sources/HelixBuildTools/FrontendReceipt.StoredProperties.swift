@@ -13,7 +13,8 @@ extension FrontendReceipt.Adapter {
         configuration: PatchConfiguration.Document,
         demangled: [String: String],
         silFile: CanonicalSIL.File,
-        nativeTypes: [String: Core.TypeID]
+        nativeTypes: [String: Core.TypeID],
+        importedSwiftTypeAliases: [String: String]
     ) throws -> [Draft] {
         guard let context,
               context.kind == .reference,
@@ -39,9 +40,11 @@ extension FrontendReceipt.Adapter {
         let isolation = propertyRequiresMainActor(item, demangled: demangled)
             ? "MainActor" : nil
         let effects = Core.Effects(requiresMainActor: isolation != nil)
-        let generatedPropertySwiftType = Self.generatedSwiftTypeSpelling(
-            propertySwiftType
-        )
+        let generatedPropertySwiftType = FrontendReceipt.SwiftTypeSpelling
+            .replacingNominalAliases(
+                in: propertySwiftType,
+                aliases: importedSwiftTypeAliases
+            )
         var drafts: [Draft] = []
 
         if let getter = accessors.first(where: { $0["get"] as? Bool == true }) {

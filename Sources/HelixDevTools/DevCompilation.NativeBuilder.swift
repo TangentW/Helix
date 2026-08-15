@@ -549,7 +549,8 @@ public actor NativeBuilder {
                     nextAction: "restore the exact Xcode, SDK, and Swift compiler used by the Dev Shell"
                 )
             )
-        case .launchFailed, .invalidUTF8Output, .sdkResolutionFailed:
+        case .launchFailed, .invalidUTF8Output, .symbolGraphFailed,
+             .invalidSymbolGraph, .sdkResolutionFailed:
             throw diagnostic(
                 code: "HLXLR203",
                 message: error.description,

@@ -18,6 +18,14 @@ extension FrontendReceipt.Adapter {
             case nativeUpcast
         }
 
+        enum IsolationEvidence: Hashable, Sendable {
+            /// The declaration was unavailable, so isolation is conservatively
+            /// inherited from the source context that performed the call.
+            case enclosingContext
+            /// The captured SDK declaration supplied the isolation contract.
+            case importedDeclaration
+        }
+
         var silReferences: [String]
         var sourceFileLogicalID: String
         var importedModules: [String]
@@ -29,6 +37,7 @@ extension FrontendReceipt.Adapter {
         var resultSwiftType: String
         var requiresMainActor: Bool
         var compilerOperation: CompilerOperation? = nil
+        var isolationEvidence: IsolationEvidence = .enclosingContext
     }
 
     func discoverImportedOperationSurface(
@@ -513,16 +522,34 @@ extension FrontendReceipt.Adapter {
         guard !isStatic || accessor == .instanceGetter else { return }
 
         let marker = accessor == .instanceSetter ? "setter" : "getter"
-        let references: [String]
+        var references: [String]
         let isObjectiveCProperty = usr.hasPrefix("c:")
             && (usr.contains("(py)") || usr.contains("(cpy)"))
         if isObjectiveCProperty {
-            references = Self.foreignMemberReferences(
-                in: function.body,
-                ownerType: receiverType,
-                baseName: baseName,
-                marker: marker
+            let physicalOwner = objectiveCPropertyOwner(usr)
+            let ownerTypes = Set(
+                [receiverType, nominalBaseName(receiverType)]
+                    + [physicalOwner].compactMap { $0 }
             )
+            references = Array(Set(ownerTypes.flatMap { ownerType in
+                Self.foreignMemberReferences(
+                    in: function.body,
+                    ownerType: ownerType,
+                    baseName: baseName,
+                    marker: marker
+                )
+            })).sorted()
+            if references.isEmpty {
+                let expectedLocation = sourceRange(in: expression).flatMap {
+                    sourceLocation(atUTF8Offset: $0.start, in: source)
+                }
+                references = renamedForeignMemberReferences(
+                    in: function,
+                    baseName: baseName,
+                    marker: marker,
+                    sourceLocation: expectedLocation
+                )
+            }
         } else if let reference = swiftPropertyReference(
             usr: usr,
             accessor: accessor,
@@ -1626,6 +1653,20 @@ extension FrontendReceipt.Adapter {
         return body.contains("function_ref @\(symbol) ") ? symbol : nil
     }
 
+    private func objectiveCPropertyOwner(_ usr: String) -> String? {
+        guard usr.hasPrefix("c:objc"),
+              let propertyMarker = ["(cpy)", "(py)"].compactMap({
+                  usr.range(of: $0)
+              }).min(by: { $0.lowerBound < $1.lowerBound }),
+              let ownerMarker = ["(cs)", "(pl)"].compactMap({
+                  usr.range(of: $0)
+              }).filter({ $0.upperBound <= propertyMarker.lowerBound })
+                .min(by: { $0.lowerBound < $1.lowerBound })
+        else { return nil }
+        let ownerType = String(usr[ownerMarker.upperBound..<propertyMarker.lowerBound])
+        return Self.isSwiftIdentifier(ownerType) ? ownerType : nil
+    }
+
     private func importedMetatypeInstanceType(
         _ rawType: Any?,
         demangled: [String: String]
@@ -1820,6 +1861,57 @@ extension FrontendReceipt.Adapter {
         })).sorted()
     }
 
+    private func renamedForeignMemberReferences(
+        in function: CanonicalSIL.Function,
+        baseName: String,
+        marker: String,
+        sourceLocation: Core.SourceLocation?
+    ) -> [String] {
+        struct Candidate: Hashable {
+            var symbol: String
+            var location: Core.SourceLocation?
+        }
+
+        let candidates = Array(Set(function.body
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .enumerated().compactMap { offset, rawLine -> Candidate? in
+            let line = String(rawLine)
+            guard line.contains("_method "),
+                  let hash = line.firstIndex(of: "#"),
+                  let separator = line[hash...].range(of: " : "),
+                  let loweredMarker = line.range(of: ", $", options: .backwards)
+            else { return nil }
+            let reference = String(line[hash..<separator.lowerBound])
+            guard reference.contains(".\(baseName)!"),
+                  reference.contains("!\(marker)"),
+                  reference.hasSuffix(".foreign")
+            else { return nil }
+            return Candidate(
+                symbol: CanonicalSIL.NativeBridgeSymbols.foreignCall(
+                    reference: reference,
+                    loweredType: String(line[loweredMarker.upperBound...])
+                ),
+                location: function.sourceLocation(atBodyLine: offset + 1)
+            )
+        }))
+        if let sourceLocation {
+            let exact = Set(candidates.compactMap { candidate -> String? in
+                guard candidate.location?.line == sourceLocation.line,
+                      candidate.location?.column == sourceLocation.column
+                else { return nil }
+                return candidate.symbol
+            })
+            if exact.count == 1 { return exact.sorted() }
+            let lineMatches = Set(candidates.compactMap { candidate -> String? in
+                candidate.location?.line == sourceLocation.line
+                    ? candidate.symbol : nil
+            })
+            if lineMatches.count == 1 { return lineMatches.sorted() }
+        }
+        let symbols = Set(candidates.map(\.symbol))
+        return symbols.count == 1 ? symbols.sorted() : []
+    }
+
     private func mergeOperationTypes(
         _ values: [ImportedNativeType]
     ) throws -> [ImportedNativeType] {
@@ -1840,13 +1932,29 @@ extension FrontendReceipt.Adapter {
             ].joined(separator: "|")
             if var existing = byIdentity[identity] {
                 guard existing.argumentLabels == value.argumentLabels,
-                      existing.requiresMainActor == value.requiresMainActor,
                       existing.compilerOperation == value.compilerOperation
                 else {
                     throw FrontendReceipt.Error.invalidRequest(
                         "imported operation \(value.ownerType).\(value.baseName) "
                             + "has conflicting typed call sites"
                     )
+                }
+                switch (existing.isolationEvidence, value.isolationEvidence) {
+                case (.importedDeclaration, .importedDeclaration):
+                    guard existing.requiresMainActor == value.requiresMainActor else {
+                        throw FrontendReceipt.Error.invalidRequest(
+                            "imported operation \(value.ownerType).\(value.baseName) "
+                                + "has conflicting declaration isolation"
+                        )
+                    }
+                case (.importedDeclaration, .enclosingContext):
+                    break
+                case (.enclosingContext, .importedDeclaration):
+                    existing.requiresMainActor = value.requiresMainActor
+                    existing.isolationEvidence = .importedDeclaration
+                case (.enclosingContext, .enclosingContext):
+                    existing.requiresMainActor = existing.requiresMainActor
+                        || value.requiresMainActor
                 }
                 existing.silReferences = Array(Set(
                     existing.silReferences + value.silReferences
@@ -1875,5 +1983,26 @@ extension FrontendReceipt.Adapter {
                        $1.sourceFileLogicalID)
             return lhs < rhs
         }
+    }
+
+    func applyingSwiftTypeAliases(
+        _ operation: ImportedOperation,
+        aliases: [String: String]
+    ) -> ImportedOperation {
+        var result = operation
+        result.ownerType = FrontendReceipt.SwiftTypeSpelling
+            .replacingNominalAliases(in: operation.ownerType, aliases: aliases)
+        result.parameterSwiftTypes = operation.parameterSwiftTypes.map {
+            FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
+                in: $0,
+                aliases: aliases
+            )
+        }
+        result.resultSwiftType = FrontendReceipt.SwiftTypeSpelling
+            .replacingNominalAliases(
+                in: operation.resultSwiftType,
+                aliases: aliases
+            )
+        return result
     }
 }

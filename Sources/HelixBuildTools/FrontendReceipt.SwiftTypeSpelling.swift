@@ -4,6 +4,45 @@ import Foundation
 /// boundary, not a semantic resolver; frozen ValueType checks remain separate.
 extension FrontendReceipt {
 enum SwiftTypeSpelling {
+    /// Rewrites only complete nominal tokens, preserving the surrounding
+    /// optional, collection, tuple, generic, and function-type syntax.
+    static func replacingNominalAliases(
+        in raw: String,
+        aliases: [String: String]
+    ) -> String {
+        guard !aliases.isEmpty else { return raw }
+        var result = ""
+        var token = ""
+        func replacement(for value: String) -> String {
+            if let exact = aliases[value] { return exact }
+            var end = value.endIndex
+            while let separator = value[..<end].lastIndex(of: ".") {
+                let prefix = String(value[..<separator])
+                if let replacement = aliases[prefix] {
+                    return replacement + value[separator...]
+                }
+                end = separator
+            }
+            return value
+        }
+        func appendToken() {
+            guard !token.isEmpty else { return }
+            result += replacement(for: token)
+            token.removeAll(keepingCapacity: true)
+        }
+        for character in raw {
+            if character == "." || character == "_"
+                || character.isLetter || character.isNumber {
+                token.append(character)
+            } else {
+                appendToken()
+                result.append(character)
+            }
+        }
+        appendToken()
+        return result
+    }
+
     static func isGeneratedType(_ raw: String) -> Bool {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return !value.isEmpty

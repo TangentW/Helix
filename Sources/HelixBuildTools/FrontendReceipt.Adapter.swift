@@ -70,19 +70,20 @@ public struct Adapter: Sendable {
             demangled: demangled,
             silFile: silFile
         )
-        let importedTypes = try mergeImportedNativeTypes(
+        var importedTypes = try mergeImportedNativeTypes(
             references: importedReferences,
             operationTypes: importedOperationSurface.types
         )
         if request.callingSurfacePolicy == .managedDebugModule {
-            let managedOperations = try FrontendReceipt.ManagedDebugSurface
-                .importedOperations(
-                    for: importedTypes,
-                    frontend: frontend,
-                    invocation: request.metadata.frontendInvocation
-                )
+            let managedSurface = try FrontendReceipt.ManagedDebugSurface.expand(
+                importedTypes: importedTypes,
+                minimumOS: request.metadata.minimumOS,
+                frontend: frontend,
+                invocation: request.metadata.frontendInvocation
+            )
+            importedTypes = managedSurface.importedTypes
             importedOperationSurface.operations = try mergeImportedOperations(
-                importedOperationSurface.operations + managedOperations
+                importedOperationSurface.operations + managedSurface.operations
             )
         }
         let provisionalNativeTypes = try makeNativeTypes(
@@ -96,6 +97,14 @@ public struct Adapter: Sendable {
             records: provisionalNativeTypes,
             importedTypes: importedTypes,
             sourceNominals: sourceNominals
+        )
+        let importedSwiftTypeAliases = try makeImportedSwiftTypeAliases(
+            importedTypes
+        )
+        importedOperationSurface.operations = try mergeImportedOperations(
+            importedOperationSurface.operations.map {
+                applyingSwiftTypeAliases($0, aliases: importedSwiftTypeAliases)
+            }
         )
         let importedOperationDeclarations = try makeImportedOperationDeclarations(
             importedOperationSurface.operations,
@@ -126,6 +135,7 @@ public struct Adapter: Sendable {
                 demangled: demangled,
                 silFile: silFile,
                 nativeTypes: nativeTypeIDs,
+                importedSwiftTypeAliases: importedSwiftTypeAliases,
                 sourceNominals: sourceNominalsByName,
                 drafts: &drafts
             )
@@ -1124,6 +1134,7 @@ extension FrontendReceipt.Adapter {
         demangled: [String: String],
         silFile: CanonicalSIL.File,
         nativeTypes: [String: Core.TypeID],
+        importedSwiftTypeAliases: [String: String],
         sourceNominals: [String: SourceNominal],
         drafts: inout [Draft]
     ) throws {
@@ -1142,7 +1153,8 @@ extension FrontendReceipt.Adapter {
                     configuration: configuration,
                     demangled: demangled,
                     silFile: silFile,
-                    nativeTypes: nativeTypes
+                    nativeTypes: nativeTypes,
+                    importedSwiftTypeAliases: importedSwiftTypeAliases
                 ) {
                     drafts.append(draft)
                 }
@@ -1156,7 +1168,8 @@ extension FrontendReceipt.Adapter {
                     configuration: configuration,
                     demangled: demangled,
                     silFile: silFile,
-                    nativeTypes: nativeTypes
+                    nativeTypes: nativeTypes,
+                    importedSwiftTypeAliases: importedSwiftTypeAliases
                 ))
             case "class_decl", "struct_decl", "enum_decl", "actor_decl":
                 guard let name = baseName(in: item),
@@ -1182,6 +1195,7 @@ extension FrontendReceipt.Adapter {
                     demangled: demangled,
                     silFile: silFile,
                     nativeTypes: nativeTypes,
+                    importedSwiftTypeAliases: importedSwiftTypeAliases,
                     sourceNominals: sourceNominals,
                     drafts: &drafts
                 )
@@ -1213,6 +1227,7 @@ extension FrontendReceipt.Adapter {
                     demangled: demangled,
                     silFile: silFile,
                     nativeTypes: nativeTypes,
+                    importedSwiftTypeAliases: importedSwiftTypeAliases,
                     sourceNominals: sourceNominals,
                     drafts: &drafts
                 )
@@ -1231,7 +1246,8 @@ extension FrontendReceipt.Adapter {
         configuration: PatchConfiguration.Document,
         demangled: [String: String],
         silFile: CanonicalSIL.File,
-        nativeTypes: [String: Core.TypeID]
+        nativeTypes: [String: Core.TypeID],
+        importedSwiftTypeAliases: [String: String]
     ) throws -> Draft? {
         guard item["implicit"] as? Bool != true,
               let usr = item["usr"] as? String,
@@ -1293,6 +1309,17 @@ extension FrontendReceipt.Adapter {
             try demangledType($0["interface_type"], using: demangled)
         }
         let resultType = try demangledType(item["result"], using: demangled)
+        let generatedParameterTypes = parameterTypes.map {
+            FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
+                in: $0,
+                aliases: importedSwiftTypeAliases
+            )
+        }
+        let generatedResultType = FrontendReceipt.SwiftTypeSpelling
+            .replacingNominalAliases(
+                in: resultType,
+                aliases: importedSwiftTypeAliases
+            )
         let labels = argumentLabels(in: item)
         guard labels.count == parameterNames.count else {
             throw FrontendReceipt.Error.malformedAST(
@@ -1490,12 +1517,11 @@ extension FrontendReceipt.Adapter {
         )
         let nativeImportSignatureSwiftTypes = parameterTypes
             + (referenceReceiverID.flatMap { _ in context?.canonicalName }.map { [$0] } ?? [])
-        let nativeImportParameterSwiftTypes = parameterTypes.map(
-            Self.generatedSwiftTypeSpelling
-        ) + (referenceReceiverID.flatMap { _ in context?.canonicalName }.map { [$0] } ?? [])
+        let nativeImportParameterSwiftTypes = generatedParameterTypes
+            + (referenceReceiverID.flatMap { _ in context?.canonicalName }.map { [$0] } ?? [])
         let nativeImportModules = nativeImportSignatureSwiftTypes
             == nativeImportParameterSwiftTypes
-            && resultType == Self.generatedSwiftTypeSpelling(resultType)
+            && resultType == generatedResultType
             ? [] : imports
         let nativeImportSignature = Core.LoweredSignature(
             parameters: nativeImportSignatureSwiftTypes,
@@ -1518,7 +1544,7 @@ extension FrontendReceipt.Adapter {
             baseName: baseName,
             argumentLabels: normalizedLabels,
             parameterSwiftTypes: nativeImportParameterSwiftTypes,
-            resultSwiftType: Self.generatedSwiftTypeSpelling(resultType),
+            resultSwiftType: generatedResultType,
             importedModules: nativeImportModules,
             parameterTypes: bridgedParameterTypes,
             resultType: valueResultType,
@@ -1587,9 +1613,7 @@ extension FrontendReceipt.Adapter {
             let receiverOffset = parameterNames.count
             let bridgeParameterExpressions = parameterNames
                 + (referenceReceiverID.map { _ in ["self"] } ?? [])
-            let bridgeParameterSwiftTypes = parameterTypes.map(
-                Self.generatedSwiftTypeSpelling
-            )
+            let bridgeParameterSwiftTypes = generatedParameterTypes
                 + (referenceReceiverID.flatMap { _ in context?.canonicalName }
                     .map { [$0] } ?? [])
             let bridgedInvocation: String
@@ -1604,7 +1628,7 @@ extension FrontendReceipt.Adapter {
                 replacementDeclaration: replacementDeclaration,
                 parameterExpressions: bridgeParameterExpressions,
                 parameterSwiftTypes: bridgeParameterSwiftTypes,
-                resultSwiftType: Self.generatedSwiftTypeSpelling(resultType),
+                resultSwiftType: generatedResultType,
                 originalInvocation: "\(baseName)(\(originalArguments))",
                 bridgeInvocation: bridgedInvocation,
                 enclosingPrefix: enclosure?.0 ?? "",

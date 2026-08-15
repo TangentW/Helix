@@ -161,22 +161,29 @@ the save transaction with a full-build diagnostic. Cross-module public/package
 default changes also require a normal build because one module receipt cannot
 prove that every precompiled caller was replaced.
 
-A managed Debug Shell also measures UIKit Objective-C class-property getters
-with the captured Xcode frontend. When `UIColor` is already part of the module's
-imported type surface, Helix prefreezes the standard iOS 15 color palette as
-separate exact NativeImports. An edit such as `.systemBlue` to `.black`, or the
-first use of another color in that palette, therefore needs no rebuild. This is
-a bounded Live Reload convenience surface: it is not added to production
-Shells, does not authorize arbitrary UIKit members, and never performs runtime
-selector or symbol lookup.
+A managed Debug Shell also audits public type properties for every module that
+contributes an already-frozen imported native type. Helix reads the symbol graph
+from the captured Swift toolchain and exact SDK, filters declarations against
+the Shell minimum OS and declaration isolation, then sends generated probes
+through the same typed AST and canonical SIL pipeline used for project source.
+Only uniquely measured getters whose result is representable by the existing
+Bridge type surface become separate exact NativeImports. This covers Swift and
+Objective-C APIs through one path, including `UIColor.black`, `UIScreen.main`,
+`UIDevice.current`, `UIApplication.shared`, `UIView.areAnimationsEnabled`,
+`Bundle.main`, and `ProcessInfo.processInfo` when their owner type is already
+frozen. It also derives Swift-overlay names such as `Bundle` from compiler
+identity instead of assuming Objective-C runtime spelling. This bounded
+convenience surface is not added to production Shells, does not introduce a new
+owner or result type by itself, and never performs runtime selector or symbol
+lookup.
 
 For a supported source `class` instance method, the hidden Bridge carries
 `self` as a frozen reference `TypeID`. Generated `NativeTypeOperations` retain,
 identify, and validate the object without exposing a process pointer in HLBC.
 This establishes the receiver path for class methods; individual property and
 method operations still need a supported Shell entry or exact NativeImport.
-Objective-C class-property reads can use the measured static-getter path above,
-while struct/enum writeback, actor executors, class-property mutation, and
+Readable imported type properties can use the measured static-getter path
+above, while struct/enum writeback, actor executors, type-property mutation, and
 arbitrary static/class method ABI are not silently approximated and currently
 require a normal build.
 

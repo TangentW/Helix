@@ -316,4 +316,32 @@ extension FrontendReceipt.Adapter {
         }
         return result
     }
+
+    func makeImportedSwiftTypeAliases(
+        _ importedTypes: [ImportedNativeType]
+    ) throws -> [String: String] {
+        var result: [String: String] = [:]
+        for imported in importedTypes {
+            guard FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+                imported.swiftType
+            ) else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "imported type \(imported.canonicalName) has an unsafe Swift spelling"
+                )
+            }
+            let aliases = Set(
+                [imported.canonicalName, imported.swiftType,
+                 "__C.\(imported.canonicalName)"] + imported.aliases
+            )
+            for alias in aliases {
+                if let existing = result[alias], existing != imported.swiftType {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "imported Swift type alias \(alias) is ambiguous"
+                    )
+                }
+                result[alias] = imported.swiftType
+            }
+        }
+        return result
+    }
 }

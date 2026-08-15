@@ -22,6 +22,8 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case launchFailed(String)
     case compilationFailed(status: Int32, diagnostics: String)
     case invalidUTF8Output
+    case symbolGraphFailed(module: String, diagnostics: String)
+    case invalidSymbolGraph(String)
     case sdkResolutionFailed(String)
     case sdkBuildMismatch(expected: String, actual: String)
 
@@ -31,6 +33,9 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
         case let .launchFailed(reason): "failed to launch Swift compiler: \(reason)"
         case let .compilationFailed(status, diagnostics): "Swift compilation failed (\(status)): \(diagnostics)"
         case .invalidUTF8Output: "Swift frontend emitted non-UTF-8 output"
+        case let .symbolGraphFailed(module, diagnostics):
+            "Swift frontend could not extract the \(module) symbol graph: \(diagnostics)"
+        case let .invalidSymbolGraph(reason): "Swift frontend emitted an invalid symbol graph: \(reason)"
         case let .sdkResolutionFailed(reason): "failed to resolve Apple SDK: \(reason)"
         case let .sdkBuildMismatch(expected, actual):
             "Apple SDK build mismatch; HLXI requires \(expected), installed SDK is \(actual)"
@@ -194,7 +199,7 @@ public struct Driver: Sendable {
 
     /// Frontend invocations consume the value wrapped by each driver-level
     /// `-Xfrontend` directly.
-    private func directFrontendArguments(_ arguments: [String]) throws -> [String] {
+    func directFrontendArguments(_ arguments: [String]) throws -> [String] {
         var result: [String] = []
         var index = 0
         while index < arguments.count {

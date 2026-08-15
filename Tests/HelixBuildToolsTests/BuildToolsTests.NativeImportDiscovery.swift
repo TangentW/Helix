@@ -21,6 +21,23 @@ struct NativeImportDiscoveryTests {
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("UIKit.UIView; fatalError()"))
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("[Swift.String:]"))
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("Swift.Array<UIKit.UIView"))
+        let aliases = [
+            "NSBundle": "Bundle",
+            "NSProcessInfo": "ProcessInfo",
+            "__C.NSBundle": "Bundle",
+        ]
+        #expect(FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
+            in: "[Swift.String: Swift.Array<NSBundle?>]",
+            aliases: aliases
+        ) == "[Swift.String: Swift.Array<Bundle?>]")
+        #expect(FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
+            in: "(value: NSBundle, transform: (NSProcessInfo) -> NSBundle?)",
+            aliases: aliases
+        ) == "(value: Bundle, transform: (ProcessInfo) -> Bundle?)")
+        #expect(FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
+            in: "(__C.NSBundle.Type, NSBundle.Nested?)",
+            aliases: aliases
+        ) == "(Bundle.Type, Bundle.Nested?)")
     }
 
     @Test("Objective-C mangling distinguishes classes from imported C values")
@@ -773,10 +790,10 @@ struct NativeImportDiscoveryTests {
         )
     }
 
-    @Test("Managed Debug prefreezes measured UIColor class properties")
-    func prefreezesManagedUIColorProperties() throws {
+    @Test("Managed Debug prefreezes measured SDK type properties generically")
+    func prefreezesManagedSDKTypeProperties() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "helix-managed-uicolor-\(UUID().uuidString)",
+            "helix-managed-sdk-properties-\(UUID().uuidString)",
             isDirectory: true
         )
         let sourceDirectory = directory.appendingPathComponent("Sources", isDirectory: true)
@@ -789,11 +806,44 @@ struct NativeImportDiscoveryTests {
         let sourceURL = sourceDirectory.appendingPathComponent("Color.swift")
         let baseline = """
         import UIKit
+        import Foundation
 
         @MainActor
         public func selectedColor(_ preferred: Bool) -> UIColor {
             if preferred { return .systemBlue }
             return UIColor(red: 0.2, green: 0.4, blue: 0.8, alpha: 1)
+        }
+
+        @MainActor
+        public func selectedScreen(_ baselineScreen: UIScreen) -> UIScreen {
+            return baselineScreen
+        }
+
+        @MainActor
+        public func selectedDevice(_ baselineDevice: UIDevice) -> UIDevice {
+            return baselineDevice
+        }
+
+        @MainActor
+        public func selectedApplication(
+            _ baselineApplication: UIApplication
+        ) -> UIApplication {
+            return baselineApplication
+        }
+
+        @MainActor
+        public func animationsEnabled(_ baselineView: UIView) -> Bool {
+            return baselineView.isHidden
+        }
+
+        public func selectedBundle(_ baselineBundle: Bundle) -> Bundle {
+            return baselineBundle
+        }
+
+        public func selectedProcessInfo(
+            _ baselineProcessInfo: ProcessInfo
+        ) -> ProcessInfo {
+            return baselineProcessInfo
         }
         """
         try Data(baseline.utf8).write(to: sourceURL)
@@ -801,7 +851,7 @@ struct NativeImportDiscoveryTests {
         let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
         let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
         let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
-        let moduleName = "ManagedUIColorFixture"
+        let moduleName = "ManagedSDKPropertyFixture"
         let target = "arm64-apple-ios15.0-simulator"
         let configuration = try PatchConfiguration.Document.parse(yaml: """
         schema: 1
@@ -832,10 +882,10 @@ struct NativeImportDiscoveryTests {
             semanticArguments: ["-parse-as-library"]
         )
         let metadata = InterfaceArchive.ReleaseMetadata(
-            bundleID: "dev.helix.managed-uicolor",
+            bundleID: "dev.helix.managed-sdk-properties",
             buildNumber: "1",
             shellNamespaceID: .derive(
-                bundleID: "dev.helix.managed-uicolor",
+                bundleID: "dev.helix.managed-sdk-properties",
                 buildNumber: "1",
                 seed: "fixture"
             ),
@@ -865,6 +915,12 @@ struct NativeImportDiscoveryTests {
         #expect(!configuredNames.contains(
             "\(moduleName).HelixExternal.UIColor.black.get"
         ))
+        #expect(!configuredNames.contains(
+            "\(moduleName).HelixExternal.UIScreen.main.get"
+        ))
+        #expect(!configuredNames.contains(
+            "\(moduleName).HelixExternal.Bundle.main.get"
+        ))
 
         var managedRequest = request
         managedRequest.callingSurfacePolicy = .managedDebugModule
@@ -872,34 +928,99 @@ struct NativeImportDiscoveryTests {
         let managedNames = Set(
             managed.receipt.nativeImportCandidates.map(\.canonicalCallee)
         )
-        let blackName = "\(moduleName).HelixExternal.UIColor.black.get"
-        #expect(managedNames.contains(blackName))
+        let firstUseNames = [
+            "\(moduleName).HelixExternal.UIColor.black.get",
+            "\(moduleName).HelixExternal.UIScreen.main.get",
+            "\(moduleName).HelixExternal.UIDevice.current.get",
+            "\(moduleName).HelixExternal.UIApplication.shared.get",
+            "\(moduleName).HelixExternal.UIView.areAnimationsEnabled.get",
+            "\(moduleName).HelixExternal.Bundle.main.get",
+            "\(moduleName).HelixExternal.ProcessInfo.processInfo.get",
+        ]
+        for name in firstUseNames {
+            #expect(managedNames.contains(name))
+        }
         #expect(managedNames.contains(
             "\(moduleName).HelixExternal.UIColor.systemMint.get"
         ))
-        #expect(managedNames.contains(
-            "\(moduleName).HelixExternal.UIColor.tintColor.get"
+        #expect(!managedNames.contains(
+            "\(moduleName).HelixExternal.UIApplication."
+                + "openDefaultApplicationsSettingsURLString.get"
         ))
+        let blackName = firstUseNames[0]
         let black = try #require(managed.receipt.nativeImportCandidates.first {
             $0.canonicalCallee == blackName
         })
-        let blackID = try #require(black.id)
         #expect(black.contract.kind == .staticGetter)
-        #expect(black.effects.requiresMainActor)
+        #expect(!black.effects.requiresMainActor)
+        let systemBlue = try #require(managed.receipt.nativeImportCandidates.first {
+            $0.canonicalCallee
+                == "\(moduleName).HelixExternal.UIColor.systemBlue.get"
+        })
+        #expect(!systemBlue.effects.requiresMainActor)
+        let screen = try #require(managed.receipt.nativeImportCandidates.first {
+            $0.canonicalCallee == firstUseNames[1]
+        })
+        #expect(screen.effects.requiresMainActor)
+        let bundle = try #require(managed.receipt.nativeImportCandidates.first {
+            $0.canonicalCallee == firstUseNames[5]
+        })
+        #expect(!bundle.effects.requiresMainActor)
+
+        let nativeTypes = Dictionary(uniqueKeysWithValues:
+            managed.receipt.nativeTypes.map { ($0.canonicalName, $0) }
+        )
+        #expect(nativeTypes["UIColor"]?.requiresMainActor == false)
+        #expect(nativeTypes["UIScreen"]?.requiresMainActor == true)
+        let generatedTypes = managed.receipt.nativeTypeBindings.compactMap(\.generated)
+        #expect(generatedTypes.contains { $0.swiftType == "Bundle" })
+        #expect(generatedTypes.contains { $0.swiftType == "ProcessInfo" })
+        #expect(!generatedTypes.contains {
+            $0.swiftType == "NSBundle" || $0.swiftType == "NSProcessInfo"
+        })
+
+        let firstUseIDs = try Dictionary(uniqueKeysWithValues: firstUseNames.map { name in
+            let candidate = try #require(
+                managed.receipt.nativeImportCandidates.first {
+                    $0.canonicalCallee == name
+                }
+            )
+            return (name, try #require(candidate.id))
+        })
 
         let shell = try ShellBuild.Materializer().materialize(
             receipt: managed.receipt,
             sourceRoot: directory
         )
         let generated = shell.bridge.sourceFiles.values.joined(separator: "\n")
+        #expect(!generated.contains("NSBundle"))
+        #expect(!generated.contains("NSProcessInfo"))
         #expect(generated.contains("UIColor.black"))
         #expect(generated.contains("UIColor.systemMint"))
-        #expect(generated.contains("UIColor.tintColor"))
+        #expect(generated.contains("UIScreen.main"))
+        #expect(generated.contains("UIDevice.current"))
+        #expect(generated.contains("UIApplication.shared"))
+        #expect(generated.contains("UIView.areAnimationsEnabled"))
+        #expect(generated.contains("Bundle.main"))
+        #expect(generated.contains("ProcessInfo.processInfo"))
 
-        let changed = baseline.replacingOccurrences(
-            of: ".systemBlue",
-            with: ".black"
-        )
+        let changed = baseline
+            .replacingOccurrences(of: ".systemBlue", with: ".black")
+            .replacingOccurrences(of: "return baselineScreen", with: "return .main")
+            .replacingOccurrences(of: "return baselineDevice", with: "return .current")
+            .replacingOccurrences(
+                of: "return baselineApplication",
+                with: "return .shared"
+            )
+            .replacingOccurrences(
+                of: "return baselineView.isHidden",
+                with: "return UIView.areAnimationsEnabled"
+            )
+            .replacingOccurrences(of: "return baselineBundle", with: "return .main")
+            .replacingOccurrences(
+                of: "return baselineProcessInfo",
+                with: "return .processInfo"
+            )
         try Data(changed.utf8).write(to: sourceURL)
         let patch = try ReleaseCompiler.Driver().build(
             .init(
@@ -908,8 +1029,11 @@ struct NativeImportDiscoveryTests {
                 compilerURL: compilerURL
             )
         )
-        #expect(patch.module.imports.contains { $0.id == blackID })
-        #expect(patch.disassembly.contains("native_apply #\(blackID.rawValue)"))
+        for name in firstUseNames {
+            let id = try #require(firstUseIDs[name])
+            #expect(patch.module.imports.contains { $0.id == id })
+            #expect(patch.disassembly.contains("native_apply #\(id.rawValue)"))
+        }
         _ = try Verification.Engine().verify(
             bytes: patch.bytecode,
             shell: Verification.ShellInterface(archive: shell.archive),
