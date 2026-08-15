@@ -39,26 +39,6 @@ public struct ContextStore: Sendable {
         return document.contexts
     }
 
-    /// Removes only Build Contexts written by the obsolete pre-release
-    /// protocols, then atomically persists the remaining current contexts.
-    /// Unknown versions and malformed current data still fail closed.
-    func loadRecoveringObsoleteProtocols() throws -> [DevSession.BuildContext] {
-        guard var document = try loadDocument() else { return [] }
-        try document.validateEnvelope()
-        let originalCount = document.contexts.count
-        document.contexts.removeAll {
-            Self.obsoletePreReleaseProtocolVersions.contains(
-                $0.shellIdentity.build.protocolVersion
-            )
-        }
-        try document.validate()
-        guard document.contexts.count != originalCount else { return document.contexts }
-
-        let retained = document.contexts.sorted(by: Document.newestFirst)
-        try save(retained)
-        return retained
-    }
-
     private func loadDocument() throws -> Document? {
         let data: Data
         do {
@@ -111,7 +91,13 @@ public struct ContextStore: Sendable {
         var contexts: [DevSession.BuildContext]
 
         func validate() throws {
-            try validateEnvelope()
+            guard schemaVersion == Self.currentSchemaVersion,
+                  contexts.count <= 4_096
+            else {
+                throw DevSession.ContextError.invalidDocument(
+                    "schema or count is invalid"
+                )
+            }
             guard Set(contexts.map(\.shellIdentity.shellID)).count == contexts.count,
                   Set(contexts.map(\.shellIdentity.build)).count == contexts.count
             else {
@@ -120,16 +106,6 @@ public struct ContextStore: Sendable {
                 )
             }
             try contexts.forEach { try $0.validate() }
-        }
-
-        func validateEnvelope() throws {
-            guard schemaVersion == Self.currentSchemaVersion,
-                  contexts.count <= 4_096
-            else {
-                throw DevSession.ContextError.invalidDocument(
-                    "schema or count is invalid"
-                )
-            }
         }
 
         static func newestFirst(
@@ -141,9 +117,5 @@ public struct ContextStore: Sendable {
                 < rhs.shellIdentity.shellID.rawValue.uuidString
         }
     }
-
-    // These identifiers shipped only in local pre-release builds. Their
-    // exact-build identities cannot be relabeled as protocol 1 safely.
-    private static let obsoletePreReleaseProtocolVersions: Set<UInt16> = [2, 3]
 }
 }

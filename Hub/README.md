@@ -41,12 +41,11 @@ process. Generated Xcode phases discover the exact CLI through an owner-only
 rendezvous record; normal projects do not configure `HELIX_EXECUTABLE` or
 depend on shell `PATH`.
 
-The current local Dev Protocol and service-rendezvous schema are both version
-1. Pre-release identifiers 2 and 3 are obsolete, not compatibility versions.
-At startup Helix atomically removes only cached Build Contexts carrying those
-identifiers; Xcode recreates them on the next configured build. Host identity,
-project registration, and project files are left unchanged. Helix never adopts
-a still-running service that publishes an obsolete rendezvous schema.
+The local Dev Protocol and service-rendezvous schema are both version 1. Helix
+accepts exactly that version and fails closed on every other value. It does not
+migrate, reinterpret, or selectively delete local state based on historical
+version numbers. Invalid pre-release artifacts must be removed and regenerated
+by the configured Xcode build.
 
 Recoverable service and pairing failures appear inside the status-bar panel
 instead of in a separate modal alert. The panel stays open while the message is

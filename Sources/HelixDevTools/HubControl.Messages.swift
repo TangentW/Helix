@@ -39,9 +39,6 @@ public struct Rendezvous: Codable, Hashable, Sendable {
     }
 
     public func validate() throws {
-        if Self.obsoletePreReleaseSchemaVersions.contains(schemaVersion) {
-            throw HubControl.Error.obsoleteRendezvous(schemaVersion: schemaVersion)
-        }
         guard schemaVersion == Self.currentSchemaVersion,
               processIdentifier > 1,
               port > 0,
@@ -58,8 +55,6 @@ public struct Rendezvous: Codable, Hashable, Sendable {
             throw HubControl.Error.invalidRendezvous
         }
     }
-
-    private static let obsoletePreReleaseSchemaVersions: Set<UInt16> = [2, 3]
 }
 
 /// The minimal set of mutations Xcode is allowed to request.
@@ -253,7 +248,6 @@ public enum Response: Codable, Hashable, Sendable {
 public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case invalidConfiguration
     case invalidRendezvous
-    case obsoleteRendezvous(schemaVersion: UInt16)
     case invalidMessage
     case invalidCredential
     case nonCanonicalMessage
@@ -269,9 +263,6 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
             "Helix local control configuration is invalid"
         case .invalidRendezvous:
             "Helix local control rendezvous is invalid"
-        case let .obsoleteRendezvous(schemaVersion):
-            "Helix local control rendezvous uses obsolete pre-release "
-                + "schema \(schemaVersion); quit older Helix processes and retry"
         case .invalidMessage:
             "Helix local control message is invalid"
         case .invalidCredential:
