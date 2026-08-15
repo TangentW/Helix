@@ -61,6 +61,7 @@ struct FrontendReceiptPipeline {
     func parsesClosureTypes() {
         let signature = Bytecode.ClosureSignature(
             parameters: [.int64],
+            parameterConventions: [.owned],
             result: .int64
         )
         #expect(
@@ -70,6 +71,7 @@ struct FrontendReceiptPipeline {
             ) == Bytecode.ValueType.closure(
                     Bytecode.ClosureSignature(
                         parameters: [.int64, .string],
+                        parameterConventions: [.owned, .owned],
                         result: .int64
                     )
                 )
@@ -77,7 +79,11 @@ struct FrontendReceiptPipeline {
         #expect(
             FrontendReceipt.ValueTypeParser.parse("() -> Void", allowVoid: false)
                 == Bytecode.ValueType.closure(
-                    Bytecode.ClosureSignature(parameters: [], result: .void)
+                    Bytecode.ClosureSignature(
+                        parameters: [],
+                        parameterConventions: [],
+                        result: .void
+                    )
                 )
         )
         #expect(
@@ -199,6 +205,7 @@ struct FrontendReceiptPipeline {
         let receipt = output.receipt
         let forwardingSignature = Bytecode.ClosureSignature(
             parameters: [.int64],
+            parameterConventions: [.owned],
             result: .int64
         )
         #expect(receipt.declarations.count == 4)

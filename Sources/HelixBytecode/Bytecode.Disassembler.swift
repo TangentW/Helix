@@ -147,10 +147,21 @@ public enum Disassembler {
             "\(result) = load_stack.\(mode.rawValue) \(slot)"
         case let .destroyStack(slot):
             "destroy_stack \(slot)"
+        case let .destroyStackIfInitialized(slot):
+            "destroy_stack_if_initialized \(slot)"
         case let .stackAddress(result, slot):
             "\(result) = stack_address \(slot)"
-        case let .projectStructAddress(result, base, fieldIndex):
-            "\(result) = project_struct_address \(base), #\(fieldIndex)"
+        case let .projectAggregateAddress(result, base, fieldIndex):
+            "\(result) = project_aggregate_address \(base), #\(fieldIndex)"
+        case let .makeMutableCell(result, initialValue):
+            initialValue.map { "\(result) = make_mutable_cell \($0)" }
+                ?? "\(result) = make_mutable_cell.uninitialized"
+        case let .projectMutableCell(result, cell, fieldIndex):
+            "\(result) = project_mutable_cell \(cell), #\(fieldIndex)"
+        case let .loadMutableCell(result, cell):
+            "\(result) = load_mutable_cell \(cell)"
+        case let .storeMutableCell(cell, source, mode):
+            "store_mutable_cell.\(mode.rawValue) \(source) to \(cell)"
         case let .allocateObject(result):
             "\(result) = allocate_object"
         case let .projectObjectAddress(result, object, fieldIndex):
@@ -207,6 +218,12 @@ public enum Disassembler {
             "\(result) = array_contains \(array), \(value)"
         case let .arrayAppend(result, array, value):
             "\(result) = array_append \(array), \(value)"
+        case let .makeArrayBuilder(result):
+            "\(result) = make_array_builder"
+        case let .arrayBuilderAppend(builder, value):
+            "array_builder_append \(value) to \(builder)"
+        case let .finishArrayBuilder(result, builder):
+            "\(result) = finish_array_builder \(builder)"
         case let .arrayUpdate(result, array, index, value):
             "\(result) = array_update \(array)[\(index)] = \(value)"
         case let .arrayPopLast(elementResult, arrayResult, array):
@@ -246,6 +263,10 @@ public enum Disassembler {
         case let .closureApply(result, closure, arguments):
             "\(assignment(result))closure_apply \(closure)"
                 + "(\(arguments.map(\.description).joined(separator: ", ")))"
+        case let .closureTryApply(closure, arguments, normalTarget, errorTarget):
+            "closure_try_apply \(closure)"
+                + "(\(arguments.map(\.description).joined(separator: ", "))), "
+                + "normal: \(normalTarget), error: \(errorTarget)"
         case let .tryApply(function, arguments, normalTarget, errorTarget):
             "try_apply @\(function)(\(arguments.map(\.description).joined(separator: ", "))), "
                 + "normal: \(normalTarget), error: \(errorTarget)"

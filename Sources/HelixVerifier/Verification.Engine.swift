@@ -346,6 +346,14 @@ public struct Engine: Verification.ImageVerifying {
                 throw Verification.Error.invalidModule(
                     "local type members cannot contain address values"
                 )
+            case .mutableCell:
+                throw Verification.Error.invalidModule(
+                    "local type members cannot contain mutable capture cells"
+                )
+            case .arrayBuilder:
+                throw Verification.Error.invalidModule(
+                    "local type members cannot contain Array builders"
+                )
             case .closure:
                 throw Verification.Error.invalidModule(
                     "local type members cannot contain closure values"
@@ -475,7 +483,8 @@ public struct Engine: Verification.ImageVerifying {
                         depths: &depths
                     )
                 }
-            case let .array(element), let .optional(element):
+            case let .array(element), let .optional(element),
+                 let .mutableCell(element), let .arrayBuilder(element):
                 try typeDepth(element) + 1
             case let .dictionary(key, value):
                 try max(typeDepth(key), typeDepth(value)) + 1
@@ -517,7 +526,8 @@ public struct Engine: Verification.ImageVerifying {
                 }
             case let .array(element), let .optional(element):
                 try visit(element)
-            case let .address(pointee):
+            case let .address(pointee), let .mutableCell(pointee),
+                 let .arrayBuilder(pointee):
                 try visit(pointee)
             case let .closure(signature):
                 for component in signature.parameters + [signature.result] {
@@ -828,7 +838,8 @@ public struct Engine: Verification.ImageVerifying {
     ) -> Bool {
         switch type {
         case let .native(id): shell.types[id]?.requiresMainActor == true
-        case let .array(element), let .optional(element), let .address(element):
+        case let .array(element), let .optional(element), let .address(element),
+             let .mutableCell(element), let .arrayBuilder(element):
             usesMainActorNativeType(element, shell: shell)
         case let .dictionary(key, value):
             usesMainActorNativeType(key, shell: shell)
@@ -851,7 +862,8 @@ public struct Engine: Verification.ImageVerifying {
             guard shell.types[id] != nil else { throw Verification.Error.unknownNativeType(id) }
         case let .tuple(elements):
             for element in elements { try verifyNativeTypes(element, shell: shell) }
-        case let .optional(wrapped), let .address(wrapped):
+        case let .optional(wrapped), let .address(wrapped),
+             let .mutableCell(wrapped), let .arrayBuilder(wrapped):
             try verifyNativeTypes(wrapped, shell: shell)
         case let .array(element):
             try verifyNativeTypes(element, shell: shell)
@@ -900,6 +912,16 @@ public struct Engine: Verification.ImageVerifying {
                     throw Verification.Error.capabilityDenied(.addressValuesV1)
                 }
                 try visit(pointee)
+            case let .mutableCell(pointee):
+                guard capabilities.contains(.mutableCapturesV1) else {
+                    throw Verification.Error.capabilityDenied(.mutableCapturesV1)
+                }
+                try visit(pointee)
+            case let .arrayBuilder(element):
+                guard capabilities.contains(.collectionsV1) else {
+                    throw Verification.Error.capabilityDenied(.collectionsV1)
+                }
+                try visit(element)
             case let .closure(signature):
                 guard capabilities.contains(.closureValuesV1) else {
                     throw Verification.Error.capabilityDenied(.closureValuesV1)
@@ -1063,13 +1085,15 @@ public struct Engine: Verification.ImageVerifying {
         for block in function.blocks where block.id != function.entryBlock {
             guard !block.parameters.contains(where: {
                 guard let type = function.type(of: $0) else { return false }
-                if case .address = type { return true }
-                return false
+                return switch type {
+                case .address, .mutableCell: true
+                default: false
+                }
             }) else {
                 throw Verification.Error.invalidBlock(
                     function: function.id,
                     block: block.id,
-                    reason: "address values cannot be HLBC block parameters"
+                    reason: "address and mutable-cell values cannot be HLBC block parameters"
                 )
             }
         }
@@ -1117,6 +1141,13 @@ public struct Engine: Verification.ImageVerifying {
         }
 
         let predecessors = try buildPredecessors(function: function, blocks: blocks)
+        guard predecessors[function.entryBlock]?.isEmpty == true else {
+            throw Verification.Error.invalidBlock(
+                function: function.id,
+                block: function.entryBlock,
+                reason: "entry block cannot have predecessors"
+            )
+        }
         let reachable = computeReachable(entry: function.entryBlock, predecessors: predecessors)
         guard reachable.count == blocks.count else {
             let missing = Set(blocks.keys).subtracting(reachable).sorted()
@@ -1175,7 +1206,17 @@ public struct Engine: Verification.ImageVerifying {
             functions: functions,
             shell: shell
         )
-        try verifyStackLifecycle(function: function, blocks: blocks)
+        try verifyMutableCellLifecycle(
+            function: function,
+            blocks: blocks,
+            dominators: dominators,
+            localTypes: localTypes
+        )
+        try verifyStackLifecycle(
+            function: function,
+            blocks: blocks,
+            localTypes: localTypes
+        )
         try verifyAddressLifecycle(function: function, functions: functions)
     }
 
@@ -1227,13 +1268,48 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 }
                 switch pointee {
-                case .void, .never, .address:
+                case .void, .never, .address, .mutableCell, .arrayBuilder,
+                     .closure:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "address pointee must be a concrete non-address value type"
                     )
                 default:
                     try verify(pointee, depth: depth + 1, isRegister: false)
+                }
+            case let .mutableCell(pointee):
+                guard isRegister, depth == 0 else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "mutable cells must be top-level registers"
+                    )
+                }
+                switch pointee {
+                case .void, .never, .address, .mutableCell, .arrayBuilder,
+                     .closure:
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "mutable-cell pointee must be a concrete value type"
+                    )
+                default:
+                    try verify(pointee, depth: depth + 1, isRegister: false)
+                }
+            case let .arrayBuilder(element):
+                guard isRegister, depth == 0 else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "Array builders must be top-level registers"
+                    )
+                }
+                switch element {
+                case .void, .never, .address, .mutableCell, .arrayBuilder,
+                     .closure:
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "Array-builder element must be a concrete value type"
+                    )
+                default:
+                    try verify(element, depth: depth + 1, isRegister: false)
                 }
             case let .closure(signature):
                 guard depth == 0 else {
@@ -1248,15 +1324,25 @@ public struct Engine: Verification.ImageVerifying {
                         reason: "closure signature contains more than 64 parameters"
                     )
                 }
-                guard !signature.effects.mayThrow, !signature.effects.isAsync else {
+                guard signature.parameterConventions.count
+                        == signature.parameters.count,
+                      !signature.parameterConventions.contains(.inout)
+                else {
                     throw Verification.Error.invalidFunction(
                         function: function.id,
-                        reason: "throwing or async closures require a future suspension-aware closure contract"
+                        reason: "closure signature has invalid parameter ownership"
+                    )
+                }
+                guard !signature.effects.isAsync else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "async closures require a suspension-aware closure contract"
                     )
                 }
                 for parameter in signature.parameters {
                     switch parameter {
-                    case .void, .never, .address, .closure:
+                    case .void, .never, .address, .mutableCell, .arrayBuilder,
+                         .closure:
                         throw Verification.Error.invalidFunction(
                             function: function.id,
                             reason: "closure parameters must be concrete non-address values"
@@ -1266,7 +1352,7 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 }
                 switch signature.result {
-                case .never, .address, .closure:
+                case .never, .address, .mutableCell, .arrayBuilder, .closure:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "closure result must be Void or a concrete non-address value"
@@ -1301,12 +1387,46 @@ public struct Engine: Verification.ImageVerifying {
                     reason: "HLBC closure values cannot be stored in stack slots"
                 )
             }
+            if case .mutableCell = type {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "mutable cells cannot be stored in stack slots"
+                )
+            }
+            if case .arrayBuilder = type {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "Array builders cannot be stored in stack slots"
+                )
+            }
             try verify(type, depth: 0, isRegister: true)
         }
         if case .address = function.resultType {
             throw Verification.Error.invalidFunction(
                 function: function.id,
                 reason: "address values cannot be returned"
+            )
+        }
+        if case .mutableCell = function.resultType {
+            throw Verification.Error.invalidFunction(
+                function: function.id,
+                reason: "mutable cells cannot be returned"
+            )
+        }
+        if case .arrayBuilder = function.resultType {
+            throw Verification.Error.invalidFunction(
+                function: function.id,
+                reason: "Array builders cannot be returned"
+            )
+        }
+        if function.parameterRegisters.contains(where: { parameter in
+            guard let type = function.type(of: parameter) else { return false }
+            if case .arrayBuilder = type { return true }
+            return false
+        }) {
+            throw Verification.Error.invalidFunction(
+                function: function.id,
+                reason: "Array builders cannot be function parameters"
             )
         }
         try verify(function.resultType, depth: 0, isRegister: false)
@@ -1342,7 +1462,8 @@ public struct Engine: Verification.ImageVerifying {
             cases.map(\.target) + (defaultTarget.map { [$0] } ?? [])
         case let .tryApply(_, _, normalTarget, errorTarget),
              let .entryTryApply(_, _, normalTarget, errorTarget),
-             let .nativeTryApply(_, _, normalTarget, errorTarget):
+             let .nativeTryApply(_, _, normalTarget, errorTarget),
+             let .closureTryApply(_, _, normalTarget, errorTarget):
             [normalTarget, errorTarget]
         default: []
         }
@@ -1635,9 +1756,10 @@ public struct Engine: Verification.ImageVerifying {
             if mode == .copy, !isCopyable(slotType, shell: shell) {
                 throw fail("load_stack.copy requires a copyable slot type")
             }
-        case let .destroyStack(slot):
+        case let .destroyStack(slot),
+             let .destroyStackIfInitialized(slot):
             guard function.type(of: slot) != nil else {
-                throw fail("destroy_stack references an unknown slot")
+                throw fail("stack destroy references an unknown slot")
             }
         case let .stackAddress(result, slot):
             guard capabilities.contains(.addressValuesV1),
@@ -1646,16 +1768,80 @@ public struct Engine: Verification.ImageVerifying {
             else {
                 throw fail("stack_address result must address its declared stack slot")
             }
-        case let .projectStructAddress(result, base, fieldIndex):
+        case let .projectAggregateAddress(result, base, fieldIndex):
+            let fieldType: Bytecode.ValueType? = if let index = Int(
+                exactly: fieldIndex
+            ) {
+                switch type(base) {
+                case let .address(.tuple(elements))
+                    where elements.indices.contains(index):
+                    elements[index]
+                case let .address(.local(key)):
+                    if let definition = localTypes[key],
+                       case let .structure(fields) = definition.kind,
+                       fields.indices.contains(index) {
+                        fields[index].type
+                    } else {
+                        nil
+                    }
+                default:
+                    nil
+                }
+            } else {
+                nil
+            }
             guard capabilities.contains(.addressValuesV1),
-                  case let .address(.local(key)) = type(base),
-                  let definition = localTypes[key],
-                  case let .structure(fields) = definition.kind,
-                  let index = Int(exactly: fieldIndex),
-                  fields.indices.contains(index),
-                  type(result) == .address(fields[index].type)
+                  let fieldType,
+                  type(result) == .address(fieldType)
             else {
-                throw fail("project_struct_address must reference a valid local struct field")
+                throw fail(
+                    "project_aggregate_address must reference a valid aggregate field"
+                )
+            }
+        case let .makeMutableCell(result, initialValue):
+            guard capabilities.contains(.mutableCapturesV1),
+                  case let .mutableCell(pointee) = type(result),
+                  initialValue.map(type) == nil
+                    || initialValue.map(type) == pointee,
+                  isCopyable(pointee, shell: shell)
+            else {
+                throw fail(
+                    "make_mutable_cell requires a copyable matching pointee"
+                )
+            }
+        case let .projectMutableCell(result, cell, fieldIndex):
+            guard capabilities.contains(.mutableCapturesV1),
+                  case let .mutableCell(aggregate) = type(cell),
+                  let fieldType = mutableCellFieldType(
+                    aggregate,
+                    fieldIndex: fieldIndex,
+                    localTypes: localTypes
+                  ),
+                  type(result) == .mutableCell(fieldType)
+            else {
+                throw fail(
+                    "project_mutable_cell must reference a valid aggregate field"
+                )
+            }
+        case let .loadMutableCell(result, cell):
+            guard capabilities.contains(.mutableCapturesV1),
+                  case let .mutableCell(pointee) = type(cell),
+                  type(result) == pointee,
+                  isCopyable(pointee, shell: shell)
+            else {
+                throw fail(
+                    "load_mutable_cell result must match a copyable pointee"
+                )
+            }
+        case let .storeMutableCell(cell, source, _):
+            guard capabilities.contains(.mutableCapturesV1),
+                  case let .mutableCell(pointee) = type(cell),
+                  type(source) == pointee,
+                  isCopyable(pointee, shell: shell)
+            else {
+                throw fail(
+                    "store_mutable_cell source must match a copyable pointee"
+                )
             }
         case let .allocateObject(result):
             guard capabilities.contains(.localClassesV1),
@@ -1729,16 +1915,15 @@ public struct Engine: Verification.ImageVerifying {
             guard mode == .copy, isCopyable(type(result), shell: shell) else {
                 throw fail("HLBC load_address requires copy mode and a copyable pointee")
             }
-        case let .storeAddress(address, source, mode):
+        case let .storeAddress(address, source, _):
             guard capabilities.contains(.addressValuesV1),
                   case let .address(pointee) = type(address),
                   type(source) == pointee
             else {
                 throw fail("store_address source must match its address pointee")
             }
-            guard mode == .assign || mode == .initialize else {
-                throw fail("store_address requires assign or initialize mode")
-            }
+            // All StackStoreMode cases are memory-safe after lifecycle
+            // verification; replace is reserved for conditional initialization.
         case let .checkedBinary(result, overflow, operation, lhs, rhs):
             guard type(result) == type(lhs), type(lhs) == type(rhs), case .integer = type(lhs) else {
                 throw fail("checked binary operands and result must use one integer type")
@@ -1946,6 +2131,39 @@ public struct Engine: Verification.ImageVerifying {
             guard isCopyable(element, shell: shell) else {
                 throw fail("array_append requires a copyable element type")
             }
+        case let .makeArrayBuilder(result):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail(
+                    "make_array_builder requires \(Core.Capability.collectionsV1)"
+                )
+            }
+            guard case let .arrayBuilder(element) = type(result),
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "make_array_builder requires a copyable element type"
+                )
+            }
+        case let .arrayBuilderAppend(builder, value):
+            guard capabilities.contains(.collectionsV1),
+                  case let .arrayBuilder(element) = type(builder),
+                  type(value) == element,
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_builder_append requires a matching copyable element"
+                )
+            }
+        case let .finishArrayBuilder(result, builder):
+            guard capabilities.contains(.collectionsV1),
+                  case let .arrayBuilder(element) = type(builder),
+                  type(result) == .array(element),
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "finish_array_builder must produce its matching Array"
+                )
+            }
         case let .arrayUpdate(result, array, index, value):
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("Array subscript update requires \(Core.Capability.collectionsV1)")
@@ -2089,9 +2307,6 @@ public struct Engine: Verification.ImageVerifying {
             try verifyBranchArguments(falseArguments, target: falseTarget, function: function, block: block, offset: offset, blocks: blocks)
         case let .apply(result, calleeID, arguments):
             guard let callee = functions[calleeID] else { throw fail("unknown HLBC function \(calleeID)") }
-            guard callee.kind != .closureBody else {
-                throw fail("closure bodies must be invoked through closure_apply")
-            }
             try verifyEffects(
                 callee.effects,
                 allowedBy: function.effects,
@@ -2154,21 +2369,15 @@ public struct Engine: Verification.ImageVerifying {
             guard calleeParameters == signature.parameters + captureTypes else {
                 throw fail("closure body parameters must equal invocation parameters followed by captures")
             }
+            guard Array(
+                callee.parameterConventions.prefix(signature.parameters.count)
+            ) == signature.parameterConventions else {
+                throw fail(
+                    "closure body invocation ownership does not match its closure signature"
+                )
+            }
             guard callee.parameterConventions.allSatisfy({ $0 != .inout }) else {
                 throw fail("HLBC closure bodies cannot carry inout parameters")
-            }
-            let invocationConventions = callee.parameterConventions
-                .prefix(signature.parameters.count)
-            for (parameterType, convention) in zip(
-                signature.parameters,
-                invocationConventions
-            ) where convention == .borrowed && parameterType.requiresLinearOwnership {
-                // ClosureSignature v1 does not encode conventions. Restrict
-                // borrowed invocation parameters to VM value types so the
-                // ownership dataflow remains independent of dynamic targets.
-                throw fail(
-                    "HLBC borrowed closure parameters cannot require linear ownership"
-                )
             }
             for captureType in captureTypes {
                 if case .address = captureType {
@@ -2207,6 +2416,47 @@ public struct Engine: Verification.ImageVerifying {
                 function: function,
                 block: block,
                 offset: offset
+            )
+        case let .closureTryApply(
+            closure,
+            arguments,
+            normalTarget,
+            errorTarget
+        ):
+            guard capabilities.contains(.closureValuesV1) else {
+                throw fail(
+                    "closure_try_apply requires \(Core.Capability.closureValuesV1)"
+                )
+            }
+            guard capabilities.contains(.untypedThrowsV1)
+                    || capabilities.contains(.structuredErrorsV1)
+            else {
+                throw fail("closure_try_apply requires an Error capability")
+            }
+            guard case let .closure(signature) = type(closure) else {
+                throw fail("closure_try_apply operand must have a closure type")
+            }
+            guard signature.effects.mayThrow else {
+                throw fail("closure_try_apply requires a throwing closure")
+            }
+            try verifyEffects(
+                signature.effects,
+                allowedBy: function.effects,
+                operation: "closure_try_apply",
+                catchesError: true,
+                fail: fail
+            )
+            try verifyTryCall(
+                arguments: arguments,
+                parameterTypes: signature.parameters,
+                resultType: signature.result,
+                normalTarget: normalTarget,
+                errorTarget: errorTarget,
+                function: function,
+                block: block,
+                offset: offset,
+                blocks: blocks,
+                capabilities: capabilities
             )
         case let .tryApply(calleeID, arguments, normalTarget, errorTarget):
             guard capabilities.contains(.untypedThrowsV1)
@@ -2344,8 +2594,10 @@ public struct Engine: Verification.ImageVerifying {
         switch type {
         case let .native(id):
             shell.types[id]?.isCopyable == true
-        case .closure:
+        case .closure, .mutableCell:
             true
+        case .arrayBuilder:
+            false
         case let .tuple(elements):
             elements.allSatisfy { isCopyable($0, shell: shell) }
         case let .optional(wrapped):
@@ -2358,6 +2610,27 @@ public struct Engine: Verification.ImageVerifying {
             false
         case .bool, .integer, .float, .string, .any, .local, .error:
             true
+        }
+    }
+
+    private func mutableCellFieldType(
+        _ aggregate: Bytecode.ValueType,
+        fieldIndex: UInt32,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
+    ) -> Bytecode.ValueType? {
+        guard let index = Int(exactly: fieldIndex) else { return nil }
+        switch aggregate {
+        case let .tuple(elements):
+            guard elements.indices.contains(index) else { return nil }
+            return elements[index]
+        case let .local(key):
+            guard let definition = localTypes[key],
+                  case let .structure(fields) = definition.kind,
+                  fields.indices.contains(index)
+            else { return nil }
+            return fields[index].type
+        default:
+            return nil
         }
     }
 
@@ -2604,8 +2877,9 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 case .makeStruct, .structExtract, .makeEnum, .makeError, .castError,
                      .eraseToAny, .checkedCastAny, .forceCastAny, .stackAddress,
-                     .projectStructAddress, .allocateObject, .projectObjectAddress,
-                     .hostedSuperApply, .beginAccess, .endAccess:
+                     .projectAggregateAddress, .projectMutableCell, .allocateObject,
+                     .projectObjectAddress, .hostedSuperApply, .beginAccess,
+                     .endAccess:
                     // Allocation and address projection do not transfer a
                     // native handle. A local class field load/store is tracked
                     // by the corresponding address instruction instead.
@@ -2647,11 +2921,45 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 case let .loadStack(result, _, _):
                     if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
-                case .destroyStack:
+                case .destroyStack, .destroyStackIfInitialized:
                     break
+                case let .makeArrayBuilder(result):
+                    live.insert(result)
+                case .arrayBuilderAppend:
+                    break
+                case let .finishArrayBuilder(result, builder):
+                    guard live.remove(builder) != nil else {
+                        throw fail(
+                            "finish_array_builder consumes a non-live builder"
+                        )
+                    }
+                    if function.type(of: result)?.requiresLinearOwnership
+                        == true {
+                        live.insert(result)
+                    }
                 case let .loadAddress(result, _, _):
                     if function.type(of: result)?.requiresLinearOwnership == true {
                         live.insert(result)
+                    }
+                case let .makeMutableCell(_, initialValue):
+                    if let initialValue,
+                       function.type(of: initialValue)?.requiresLinearOwnership
+                        == true,
+                       live.remove(initialValue) == nil {
+                        throw fail(
+                            "make_mutable_cell consumes a non-live value"
+                        )
+                    }
+                case let .loadMutableCell(result, _):
+                    if function.type(of: result)?.requiresLinearOwnership == true {
+                        live.insert(result)
+                    }
+                case let .storeMutableCell(_, source, _):
+                    if function.type(of: source)?.requiresLinearOwnership == true,
+                       live.remove(source) == nil {
+                        throw fail(
+                            "store_mutable_cell consumes a non-live value"
+                        )
                     }
                 case let .storeAddress(_, source, _):
                     if function.type(of: source)?.requiresLinearOwnership == true {
@@ -2737,7 +3045,8 @@ public struct Engine: Verification.ImageVerifying {
                         = function.type(of: closure) { value } else { nil }
                     try consumeOwnedCallArguments(
                         arguments,
-                        conventions: Array(repeating: .owned, count: arguments.count),
+                        conventions: signature?.parameterConventions
+                            ?? Array(repeating: .owned, count: arguments.count),
                         live: &live,
                         function: function,
                         fail: fail
@@ -2746,6 +3055,24 @@ public struct Engine: Verification.ImageVerifying {
                        signature?.result.requiresLinearOwnership == true {
                         live.insert(result)
                     }
+                case let .closureTryApply(
+                    closure,
+                    arguments,
+                    normalTarget,
+                    errorTarget
+                ):
+                    let signature: Bytecode.ClosureSignature? = if case let .closure(value)
+                        = function.type(of: closure) { value } else { nil }
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: signature?.parameterConventions
+                            ?? Array(repeating: .owned, count: arguments.count),
+                        live: &live,
+                        function: function,
+                        fail: fail
+                    )
+                    try forward(live, to: normalTarget)
+                    try forward(live, to: errorTarget)
                 case let .tryApply(callee, arguments, normalTarget, errorTarget):
                     try consumeOwnedCallArguments(
                         arguments,
@@ -2984,7 +3311,7 @@ public struct Engine: Verification.ImageVerifying {
             switch instruction {
             case let .stackAddress(_, slot):
                 provenance = .init(root: .stack(slot), path: [], scope: nil)
-            case let .projectStructAddress(_, base, fieldIndex):
+            case let .projectAggregateAddress(_, base, fieldIndex):
                 var base = try resolve(base)
                 base.path.append(fieldIndex)
                 provenance = base
@@ -3112,14 +3439,17 @@ public struct Engine: Verification.ImageVerifying {
                     _ = try requireScoped(address)
                 case let .storeAddress(address, _, mode):
                     let destination = try requireScoped(address, modify: true)
-                    if mode == .initialize,
-                       case .object = destination.root {
-                        break
+                    if mode == .initialize {
+                        switch destination.root {
+                        case .object, .stack:
+                            break
+                        case .parameter:
+                            throw fail(
+                                "initialize store cannot target caller-owned inout storage"
+                            )
+                        }
                     }
-                    guard mode == .assign else {
-                        throw fail("initialize store requires local object field storage")
-                    }
-                case let .projectStructAddress(_, base, _):
+                case let .projectAggregateAddress(_, base, _):
                     let baseProvenance = try checked(base)
                     if baseProvenance.scope != nil {
                         _ = try requireScoped(base)
@@ -3152,6 +3482,22 @@ public struct Engine: Verification.ImageVerifying {
                     let root = AddressProvenance(root: .stack(slot), path: [], scope: nil)
                     guard active.values.allSatisfy({ !$0.provenance.overlaps(root) }) else {
                         throw fail("direct stack access overlaps an active address access")
+                    }
+                case let .destroyStackIfInitialized(slot):
+                    let root = AddressProvenance(
+                        root: .stack(slot),
+                        path: [],
+                        scope: nil
+                    )
+                    guard active.values.allSatisfy({
+                        !$0.provenance.overlaps(root)
+                            || ($0.kind == .modify
+                                && $0.provenance.root == root.root
+                                && $0.provenance.path.isEmpty)
+                    }) else {
+                        throw fail(
+                            "conditional stack destroy requires a root modify access"
+                        )
                     }
                 case .entryApply, .nativeApply, .entryTryApply, .nativeTryApply:
                     for operand in instruction.operandRegisters
@@ -3205,22 +3551,429 @@ public struct Engine: Verification.ImageVerifying {
         }
     }
 
-    /// Stack slots never escape an HLBC frame. Requiring an identical
-    /// initialized-slot set on every incoming edge keeps their ownership
-    /// decidable, including loops, without trusting runtime address state.
+    private struct LeafInitializationState: Equatable {
+        var definitelyInitialized: Set<[UInt32]>
+        var possiblyInitialized: Set<[UInt32]>
+
+        static let empty = Self(
+            definitelyInitialized: [],
+            possiblyInitialized: []
+        )
+
+        mutating func markInitialized(_ leaves: Set<[UInt32]>) {
+            definitelyInitialized.formUnion(leaves)
+            possiblyInitialized.formUnion(leaves)
+        }
+
+        mutating func markUninitialized(_ leaves: Set<[UInt32]>) {
+            definitelyInitialized.subtract(leaves)
+            possiblyInitialized.subtract(leaves)
+        }
+
+        func merged(with other: Self) -> Self {
+            .init(
+                definitelyInitialized: definitelyInitialized.intersection(
+                    other.definitelyInitialized
+                ),
+                possiblyInitialized: possiblyInitialized.union(
+                    other.possiblyInitialized
+                )
+            )
+        }
+    }
+
+    private func storageLeafPaths(
+        of type: Bytecode.ValueType,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        function: Bytecode.FunctionID,
+        path: [UInt32] = [],
+        depth: Int = 0,
+        visiting: Set<Bytecode.LocalTypeKey> = []
+    ) throws -> Set<[UInt32]> {
+        guard depth <= 32 else {
+            throw Verification.Error.invalidFunction(
+                function: function,
+                reason: "storage aggregate nesting exceeds 32 levels"
+            )
+        }
+        let children: [Bytecode.ValueType]?
+        var nextVisiting = visiting
+        switch type {
+        case let .tuple(elements):
+            children = elements
+        case let .local(key):
+            guard !visiting.contains(key),
+                  let definition = localTypes[key]
+            else {
+                throw Verification.Error.invalidFunction(
+                    function: function,
+                    reason: "storage references an invalid local value type"
+                )
+            }
+            switch definition.kind {
+            case let .structure(fields):
+                nextVisiting.insert(key)
+                children = fields.map(\.type)
+            case .enumeration, .class:
+                children = nil
+            }
+        default:
+            children = nil
+        }
+        guard let children, !children.isEmpty else { return [path] }
+
+        var result = Set<[UInt32]>()
+        for (index, child) in children.enumerated() {
+            guard let field = UInt32(exactly: index) else {
+                throw Verification.Error.invalidFunction(
+                    function: function,
+                    reason: "storage aggregate field count exceeds UInt32"
+                )
+            }
+            result.formUnion(
+                try storageLeafPaths(
+                    of: child,
+                    localTypes: localTypes,
+                    function: function,
+                    path: path + [field],
+                    depth: depth + 1,
+                    visiting: nextVisiting
+                )
+            )
+        }
+        return result
+    }
+
+    /// Proves field-sensitive initialization for shared closure cells. A cell
+    /// identity may be projected before its payload is complete, which is how
+    /// Swift initializes tuples and local structs field-by-field. Reads,
+    /// captures, calls, and assignments still require every leaf beneath the
+    /// referenced projection to be initialized on every incoming edge.
+    private func verifyMutableCellLifecycle(
+        function: Bytecode.Function,
+        blocks: [Bytecode.BlockID: Bytecode.Block],
+        dominators: [Bytecode.BlockID: Set<Bytecode.BlockID>],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
+    ) throws {
+        let cellRegisters = Set(
+            function.registerTypes.indices.compactMap { index -> Bytecode.Register? in
+                guard case .mutableCell = function.registerTypes[index],
+                      let raw = UInt32(exactly: index)
+                else { return nil }
+                return .init(rawValue: raw)
+            }
+        )
+        guard !cellRegisters.isEmpty else { return }
+        let predecessors = try buildPredecessors(
+            function: function,
+            blocks: blocks
+        )
+
+        struct Provenance: Equatable {
+            var root: Bytecode.Register
+            var path: [UInt32]
+        }
+
+        var definingInstruction: [Bytecode.Register: Bytecode.Instruction] = [:]
+        for block in function.blocks {
+            for instruction in block.instructions {
+                for result in instruction.resultRegisters
+                where cellRegisters.contains(result) {
+                    definingInstruction[result] = instruction
+                }
+            }
+        }
+        let parameters = Set(
+            function.parameterRegisters.filter(cellRegisters.contains)
+        )
+        var provenanceCache: [Bytecode.Register: Provenance] = [:]
+        var resolving = Set<Bytecode.Register>()
+
+        func provenance(
+            of register: Bytecode.Register
+        ) throws -> Provenance {
+            if let cached = provenanceCache[register] { return cached }
+            guard resolving.insert(register).inserted else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "mutable-cell provenance contains a cycle"
+                )
+            }
+            defer { resolving.remove(register) }
+
+            let result: Provenance
+            if parameters.contains(register) {
+                result = .init(root: register, path: [])
+            } else {
+                guard let instruction = definingInstruction[register] else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "mutable-cell register has no supported definition"
+                    )
+                }
+                switch instruction {
+                case let .makeMutableCell(defined, _) where defined == register:
+                    result = .init(root: register, path: [])
+                case let .copyValue(defined, source) where defined == register:
+                    result = try provenance(of: source)
+                case let .moveValue(defined, source) where defined == register:
+                    result = try provenance(of: source)
+                case let .projectMutableCell(defined, cell, fieldIndex)
+                    where defined == register:
+                    let parent = try provenance(of: cell)
+                    result = .init(
+                        root: parent.root,
+                        path: parent.path + [fieldIndex]
+                    )
+                default:
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "mutable-cell register has an invalid defining instruction"
+                    )
+                }
+            }
+            provenanceCache[register] = result
+            return result
+        }
+
+        var leavesByRoot: [Bytecode.Register: Set<[UInt32]>] = [:]
+        for register in cellRegisters {
+            let origin = try provenance(of: register)
+            guard leavesByRoot[origin.root] == nil,
+                  case let .mutableCell(pointee) = function.type(of: origin.root)
+            else { continue }
+            leavesByRoot[origin.root] = try storageLeafPaths(
+                of: pointee,
+                localTypes: localTypes,
+                function: function.id
+            )
+        }
+
+        func targetLeaves(
+            for register: Bytecode.Register
+        ) throws -> (root: Bytecode.Register, leaves: Set<[UInt32]>) {
+            let origin = try provenance(of: register)
+            let leaves = Set((leavesByRoot[origin.root] ?? []).filter {
+                $0.starts(with: origin.path)
+            })
+            guard !leaves.isEmpty else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "mutable-cell projection has no valid aggregate field"
+                )
+            }
+            return (origin.root, leaves)
+        }
+
+        var definitionBlock: [Bytecode.Register: Bytecode.BlockID] = [:]
+        for block in function.blocks {
+            for parameter in block.parameters where cellRegisters.contains(parameter) {
+                definitionBlock[parameter] = block.id
+            }
+            for instruction in block.instructions {
+                for result in instruction.resultRegisters
+                where cellRegisters.contains(result) {
+                    definitionBlock[result] = block.id
+                }
+            }
+        }
+
+        typealias State = [
+            Bytecode.Register: LeafInitializationState
+        ]
+        var parameterState: State = [:]
+        for parameter in parameters {
+            let target = try targetLeaves(for: parameter)
+            parameterState[target.root, default: .empty]
+                .markInitialized(target.leaves)
+        }
+
+        func merge(_ lhs: State, _ rhs: State) -> State {
+            var result: State = [:]
+            for root in Set(lhs.keys).union(rhs.keys) {
+                result[root] = (lhs[root] ?? .empty).merged(
+                    with: rhs[root] ?? .empty
+                )
+            }
+            return result
+        }
+
+        var incoming: [Bytecode.BlockID: State] = [
+            function.entryBlock: parameterState,
+        ]
+        var outgoing: [Bytecode.BlockID: State] = [:]
+        var worklist = [function.entryBlock]
+        var queued: Set<Bytecode.BlockID> = [function.entryBlock]
+
+        while let blockID = worklist.popLast() {
+            queued.remove(blockID)
+            guard let block = blocks[blockID],
+                  var initialized = incoming[blockID]
+            else { continue }
+            for (offset, instruction) in block.instructions.enumerated() {
+                func fail(_ reason: String) -> Verification.Error {
+                    .invalidInstruction(
+                        function: function.id,
+                        block: block.id,
+                        offset: offset,
+                        reason: reason
+                    )
+                }
+                func requireInitialized(_ cell: Bytecode.Register) throws {
+                    let target = try targetLeaves(for: cell)
+                    guard target.leaves.isSubset(
+                        of: initialized[target.root]?
+                            .definitelyInitialized ?? []
+                    ) else {
+                        throw fail("mutable cell is used before initialization")
+                    }
+                }
+
+                switch instruction {
+                case let .makeMutableCell(result, initialValue):
+                    let target = try targetLeaves(for: result)
+                    initialized[target.root] = initialValue == nil
+                        ? .empty
+                        : .init(
+                            definitelyInitialized: target.leaves,
+                            possiblyInitialized: target.leaves
+                        )
+                    if let initialValue,
+                       cellRegisters.contains(initialValue) {
+                        try requireInitialized(initialValue)
+                    }
+                case let .copyValue(result, _)
+                    where cellRegisters.contains(result):
+                    break
+                case let .moveValue(result, _)
+                    where cellRegisters.contains(result):
+                    break
+                case .projectMutableCell:
+                    break
+                case let .loadMutableCell(_, cell):
+                    try requireInitialized(cell)
+                case let .storeMutableCell(cell, source, mode):
+                    if cellRegisters.contains(source) {
+                        try requireInitialized(source)
+                    }
+                    let target = try targetLeaves(for: cell)
+                    let current = initialized[target.root] ?? .empty
+                    switch mode {
+                    case .initialize:
+                        guard target.leaves.isDisjoint(
+                            with: current.possiblyInitialized
+                        ) else {
+                            throw fail(
+                                "store_mutable_cell.initialize targets an initialized cell"
+                            )
+                        }
+                    case .assign:
+                        try requireInitialized(cell)
+                    case .replace:
+                        break
+                    }
+                    initialized[target.root, default: .empty]
+                        .markInitialized(target.leaves)
+                case let .destroyValue(register)
+                    where cellRegisters.contains(register):
+                    break
+                default:
+                    for operand in instruction.operandRegisters
+                    where cellRegisters.contains(operand) {
+                        try requireInitialized(operand)
+                    }
+                }
+            }
+
+            guard let terminator = block.instructions.last else { continue }
+            guard outgoing[blockID] != initialized else { continue }
+            outgoing[blockID] = initialized
+            for successor in successors(of: terminator) {
+                let edgeStates = (predecessors[successor] ?? []).compactMap {
+                    predecessor -> State? in
+                    outgoing[predecessor].map { state in
+                        state.filter { root, _ in
+                            guard let definition = definitionBlock[root] else {
+                                return false
+                            }
+                            return definition == successor
+                                || dominators[successor]?.contains(definition)
+                                    == true
+                        }
+                    }
+                }
+                guard var next = edgeStates.first else { continue }
+                for state in edgeStates.dropFirst() {
+                    next = merge(next, state)
+                }
+                guard incoming[successor] != next else { continue }
+                incoming[successor] = next
+                if queued.insert(successor).inserted {
+                    worklist.append(successor)
+                }
+            }
+        }
+    }
+
+    /// Stack slots never escape an HLBC frame. CFG joins retain the intersection
+    /// of definitely initialized leaves and the union of possibly initialized
+    /// leaves. Only explicit replace/conditional-destroy operations may resolve
+    /// the latter; reads and assignments still require definite initialization.
     private func verifyStackLifecycle(
         function: Bytecode.Function,
-        blocks: [Bytecode.BlockID: Bytecode.Block]
+        blocks: [Bytecode.BlockID: Bytecode.Block],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
     ) throws {
         guard !function.stackSlotTypes.isEmpty else { return }
         let addresses = try addressProvenance(function: function)
-        var incoming: [Bytecode.BlockID: Set<Bytecode.StackSlot>] = [
-            function.entryBlock: [],
+        let predecessors = try buildPredecessors(
+            function: function,
+            blocks: blocks
+        )
+
+        var leavesBySlot: [Bytecode.StackSlot: Set<[UInt32]>] = [:]
+        for (index, type) in function.stackSlotTypes.enumerated() {
+            guard let raw = UInt32(exactly: index) else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "stack-slot table exceeds UInt32"
+                )
+            }
+            leavesBySlot[.init(rawValue: raw)] = try storageLeafPaths(
+                of: type,
+                localTypes: localTypes,
+                function: function.id
+            )
+        }
+        typealias State = [
+            Bytecode.StackSlot: LeafInitializationState
         ]
+        let emptyState = leavesBySlot.mapValues { _ in
+            LeafInitializationState.empty
+        }
+
+        func merge(_ lhs: State, _ rhs: State) -> State {
+            var result: State = [:]
+            for slot in Set(lhs.keys).union(rhs.keys) {
+                result[slot] = (lhs[slot] ?? .empty).merged(
+                    with: rhs[slot] ?? .empty
+                )
+            }
+            return result
+        }
+
+        var incoming: [Bytecode.BlockID: State] = [
+            function.entryBlock: emptyState,
+        ]
+        var outgoing: [Bytecode.BlockID: State] = [:]
         var worklist = [function.entryBlock]
+        var queued: Set<Bytecode.BlockID> = [function.entryBlock]
 
         while let blockID = worklist.popLast() {
-            guard let block = blocks[blockID], var initialized = incoming[blockID] else {
+            queued.remove(blockID)
+            guard let block = blocks[blockID],
+                  var initialized = incoming[blockID]
+            else {
                 throw Verification.Error.invalidFunction(
                     function: function.id,
                     reason: "stack-state analysis reached an unknown block"
@@ -3235,69 +3988,147 @@ public struct Engine: Verification.ImageVerifying {
                         reason: reason
                     )
                 }
-                switch instruction {
-                case let .storeStack(slot, _, mode):
+                func targetLeaves(
+                    slot: Bytecode.StackSlot,
+                    path: [UInt32] = []
+                ) throws -> Set<[UInt32]> {
+                    let result = Set((leavesBySlot[slot] ?? []).filter {
+                        $0.starts(with: path)
+                    })
+                    guard !result.isEmpty else {
+                        throw fail(
+                            "stack address projection has no valid aggregate field"
+                        )
+                    }
+                    return result
+                }
+                func requireInitialized(
+                    slot: Bytecode.StackSlot,
+                    path: [UInt32] = []
+                ) throws {
+                    let target = try targetLeaves(slot: slot, path: path)
+                    guard target.isSubset(
+                        of: initialized[slot]?.definitelyInitialized ?? []
+                    ) else {
+                        throw fail(
+                            "stack storage \(slot) is used before initialization"
+                        )
+                    }
+                }
+                func store(
+                    _ target: Set<[UInt32]>,
+                    in slot: Bytecode.StackSlot,
+                    mode: Bytecode.StackStoreMode,
+                    operation: String
+                ) throws {
+                    let current = initialized[slot] ?? .empty
                     switch mode {
                     case .initialize:
-                        guard initialized.insert(slot).inserted else {
-                            throw fail("store_stack.initialize targets an initialized slot")
+                        guard target.isDisjoint(
+                            with: current.possiblyInitialized
+                        ) else {
+                            throw fail(
+                                "\(operation).initialize targets initialized stack storage"
+                            )
                         }
                     case .assign:
-                        guard initialized.contains(slot) else {
-                            throw fail("store_stack.assign targets an uninitialized slot")
+                        guard target.isSubset(
+                            of: current.definitelyInitialized
+                        ) else {
+                            throw fail(
+                                "\(operation).assign targets uninitialized stack storage"
+                            )
                         }
+                    case .replace:
+                        break
                     }
+                    initialized[slot, default: .empty]
+                        .markInitialized(target)
+                }
+
+                switch instruction {
+                case let .storeStack(slot, _, mode):
+                    try store(
+                        targetLeaves(slot: slot),
+                        in: slot,
+                        mode: mode,
+                        operation: "store_stack"
+                    )
                 case let .loadStack(_, slot, mode):
-                    guard initialized.contains(slot) else {
-                        throw fail("load_stack reads an uninitialized slot")
+                    let target = try targetLeaves(slot: slot)
+                    try requireInitialized(slot: slot)
+                    if mode == .take {
+                        initialized[slot, default: .empty]
+                            .markUninitialized(target)
                     }
-                    if mode == .take { initialized.remove(slot) }
                 case let .destroyStack(slot):
-                    guard initialized.remove(slot) != nil else {
-                        throw fail("destroy_stack targets an uninitialized slot")
+                    let target = try targetLeaves(slot: slot)
+                    guard target.isSubset(
+                        of: initialized[slot]?.definitelyInitialized ?? []
+                    ) else {
+                        throw fail(
+                            "destroy_stack targets uninitialized stack storage"
+                        )
                     }
+                    initialized[slot, default: .empty]
+                        .markUninitialized(target)
+                case let .destroyStackIfInitialized(slot):
+                    initialized[slot, default: .empty].markUninitialized(
+                        try targetLeaves(slot: slot)
+                    )
                 case let .loadAddress(_, address, _):
-                    if case let .stack(slot)? = addresses[address]?.root,
-                       !initialized.contains(slot) {
-                        throw fail("load_address reads an uninitialized stack slot")
+                    if let provenance = addresses[address],
+                       case let .stack(slot) = provenance.root {
+                        try requireInitialized(
+                            slot: slot,
+                            path: provenance.path
+                        )
                     }
-                case let .storeAddress(address, _, _):
-                    if case let .stack(slot)? = addresses[address]?.root,
-                       !initialized.contains(slot) {
-                        throw fail("store_address assigns an uninitialized stack slot")
+                case let .storeAddress(address, _, mode):
+                    if let provenance = addresses[address],
+                       case let .stack(slot) = provenance.root {
+                        try store(
+                            targetLeaves(
+                                slot: slot,
+                                path: provenance.path
+                            ),
+                            in: slot,
+                            mode: mode,
+                            operation: "store_address"
+                        )
                     }
                 case let .arrayNext(_, _, slot):
-                    guard initialized.contains(slot) else {
-                        throw fail("array_next uses an uninitialized index slot")
-                    }
+                    try requireInitialized(slot: slot)
                 case let .dictionaryNext(_, _, slot):
-                    guard initialized.contains(slot) else {
-                        throw fail("dictionary_next uses an uninitialized index slot")
-                    }
+                    try requireInitialized(slot: slot)
                 case .returnValue, .throwError:
-                    guard initialized.isEmpty else {
+                    guard initialized.values.allSatisfy({
+                        $0.possiblyInitialized.isEmpty
+                    }) else {
                         throw fail("initialized stack slots remain at function exit")
                     }
                 case .trap:
                     // Runtime unwinding releases the entire verified frame.
-                    initialized.removeAll()
+                    initialized = emptyState
                 default:
                     break
                 }
             }
 
             guard let terminator = block.instructions.last else { continue }
+            guard outgoing[blockID] != initialized else { continue }
+            outgoing[blockID] = initialized
             for successor in successors(of: terminator) {
-                if let existing = incoming[successor] {
-                    guard existing == initialized else {
-                        throw Verification.Error.invalidBlock(
-                            function: function.id,
-                            block: successor,
-                            reason: "incoming stack-slot initialization states disagree"
-                        )
-                    }
-                } else {
-                    incoming[successor] = initialized
+                let edgeStates = (predecessors[successor] ?? []).compactMap {
+                    outgoing[$0]
+                }
+                guard var next = edgeStates.first else { continue }
+                for state in edgeStates.dropFirst() {
+                    next = merge(next, state)
+                }
+                guard incoming[successor] != next else { continue }
+                incoming[successor] = next
+                if queued.insert(successor).inserted {
                     worklist.append(successor)
                 }
             }

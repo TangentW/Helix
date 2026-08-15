@@ -4,8 +4,9 @@ import HelixBytecode
 #endif
 
 extension VM {
-/// A frame-owned mutable cell. Its initializer is intentionally internal so
-/// host code cannot manufacture an address that crosses the VM boundary.
+/// Shape-aware mutable storage shared by frame-owned addresses and
+/// heap-promoted closure cells. Construction remains internal so host code
+/// cannot manufacture a VM storage capability.
 public final class MemoryCell: @unchecked Sendable, Hashable {
     private struct Access {
         var path: [UInt32]
@@ -14,10 +15,16 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
 
     private let lock = NSLock()
     private var storage: VM.Value?
+    private let storageShape: VM.StorageShape?
+    private var partialStorage: [[UInt32]: VM.Value] = [:]
     private var accesses: [UUID: Access] = [:]
 
-    init(_ value: VM.Value? = nil) {
+    init(
+        _ value: VM.Value? = nil,
+        storageShape: VM.StorageShape? = nil
+    ) {
         storage = value
+        self.storageShape = storageShape
     }
 
     public static func == (lhs: VM.MemoryCell, rhs: VM.MemoryCell) -> Bool {
@@ -31,30 +38,60 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
     func directRead() throws -> VM.Value {
         try lock.withLock {
             guard accesses.isEmpty else { throw VM.RuntimeTrap.exclusivityViolation }
-            guard let storage else { throw VM.RuntimeTrap.uninitializedAddress }
-            return storage
+            return try storedValue(at: [])
         }
     }
 
     func directTake() throws -> VM.Value {
         try lock.withLock {
             guard accesses.isEmpty else { throw VM.RuntimeTrap.exclusivityViolation }
-            guard let storage else { throw VM.RuntimeTrap.uninitializedAddress }
+            let value = try storedValue(at: [])
             self.storage = nil
-            return storage
+            partialStorage.removeAll(keepingCapacity: true)
+            return value
         }
     }
 
     func directStore(_ value: VM.Value, mode: Bytecode.StackStoreMode) throws {
         try lock.withLock {
             guard accesses.isEmpty else { throw VM.RuntimeTrap.exclusivityViolation }
-            switch mode {
-            case .initialize:
-                guard storage == nil else { throw VM.RuntimeTrap.addressAlreadyInitialized }
-            case .assign:
-                guard storage != nil else { throw VM.RuntimeTrap.uninitializedAddress }
+            try storeValue(value, at: [], mode: mode)
+        }
+    }
+
+    func directDestroyIfInitialized() throws {
+        try lock.withLock {
+            guard accesses.isEmpty
+                    || (accesses.count == 1
+                        && accesses.values.first?.kind == .modify
+                        && accesses.values.first?.path.isEmpty == true)
+            else {
+                throw VM.RuntimeTrap.exclusivityViolation
             }
-            storage = value
+            storage = nil
+            partialStorage.removeAll(keepingCapacity: true)
+        }
+    }
+
+    func unscopedRead(path: [UInt32]) throws -> VM.Value {
+        try lock.withLock {
+            guard accesses.isEmpty else {
+                throw VM.RuntimeTrap.exclusivityViolation
+            }
+            return try storedValue(at: path)
+        }
+    }
+
+    func unscopedStore(
+        _ value: VM.Value,
+        path: [UInt32],
+        mode: Bytecode.StackStoreMode
+    ) throws {
+        try lock.withLock {
+            guard accesses.isEmpty else {
+                throw VM.RuntimeTrap.exclusivityViolation
+            }
+            try storeValue(value, at: path, mode: mode)
         }
     }
 
@@ -82,8 +119,7 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
     func read(path: [UInt32], token: UUID) throws -> VM.Value {
         try lock.withLock {
             _ = try activeAccess(token: token, path: path, requiresModify: false)
-            guard let storage else { throw VM.RuntimeTrap.uninitializedAddress }
-            return try Self.project(storage, path: path[...])
+            return try storedValue(at: path)
         }
     }
 
@@ -95,25 +131,7 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
     ) throws {
         try lock.withLock {
             _ = try activeAccess(token: token, path: path, requiresModify: true)
-            if path.isEmpty {
-                switch mode {
-                case .initialize:
-                    guard storage == nil else {
-                        throw VM.RuntimeTrap.addressAlreadyInitialized
-                    }
-                case .assign:
-                    guard storage != nil else {
-                        throw VM.RuntimeTrap.uninitializedAddress
-                    }
-                }
-                storage = value
-                return
-            }
-            guard mode == .assign, var storage else {
-                throw VM.RuntimeTrap.uninitializedAddress
-            }
-            try Self.assign(value, into: &storage, path: path[...])
-            self.storage = storage
+            try storeValue(value, at: path, mode: mode)
         }
     }
 
@@ -124,6 +142,131 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
                 path: path,
                 requiresModify: requiresModify
             )) != nil
+        }
+    }
+
+    /// Called only while `lock` is held.
+    private func storedValue(at path: [UInt32]) throws -> VM.Value {
+        if let storage {
+            return try Self.project(storage, path: path[...])
+        }
+        guard let storageShape else {
+            throw VM.RuntimeTrap.uninitializedAddress
+        }
+        if let ancestor = Self.closestStoredAncestor(
+            of: path,
+            values: partialStorage
+        ), let value = partialStorage[ancestor] {
+            return try Self.project(
+                value,
+                path: path.dropFirst(ancestor.count)
+            )
+        }
+        return try Self.materializeValue(
+            shape: try Self.storageShape(
+                at: path[...],
+                in: storageShape
+            ),
+            path: path,
+            values: partialStorage
+        )
+    }
+
+    /// Called only while `lock` is held.
+    private func storeValue(
+        _ value: VM.Value,
+        at path: [UInt32],
+        mode: Bytecode.StackStoreMode
+    ) throws {
+        if var storage {
+            guard mode != .initialize else {
+                throw VM.RuntimeTrap.addressAlreadyInitialized
+            }
+            try Self.assign(value, into: &storage, path: path[...])
+            self.storage = storage
+            return
+        }
+        guard let storageShape else {
+            guard path.isEmpty, mode != .assign else {
+                throw VM.RuntimeTrap.uninitializedAddress
+            }
+            storage = value
+            return
+        }
+        let shape = try Self.storageShape(
+            at: path[...],
+            in: storageShape
+        )
+        switch mode {
+        case .initialize:
+            guard !Self.hasStoredAncestor(
+                of: path,
+                values: partialStorage
+            ), !Self.hasStoredDescendant(
+                of: path,
+                values: partialStorage
+            ), (try? Self.materializeValue(
+                shape: shape,
+                path: path,
+                values: partialStorage
+            )) == nil
+            else {
+                throw VM.RuntimeTrap.addressAlreadyInitialized
+            }
+            partialStorage[path] = value
+        case .assign:
+            if let ancestor = Self.closestStoredAncestor(
+                of: path,
+                values: partialStorage
+            ) {
+                guard var ancestorValue = partialStorage[ancestor] else {
+                    throw VM.RuntimeTrap.uninitializedAddress
+                }
+                try Self.assign(
+                    value,
+                    into: &ancestorValue,
+                    path: path.dropFirst(ancestor.count)
+                )
+                partialStorage[ancestor] = ancestorValue
+            } else {
+                _ = try Self.materializeValue(
+                    shape: shape,
+                    path: path,
+                    values: partialStorage
+                )
+                partialStorage = partialStorage.filter {
+                    !$0.key.starts(with: path)
+                }
+                partialStorage[path] = value
+            }
+        case .replace:
+            if let ancestor = Self.closestStoredAncestor(
+                of: path,
+                values: partialStorage
+            ) {
+                guard var ancestorValue = partialStorage[ancestor] else {
+                    throw VM.RuntimeTrap.uninitializedAddress
+                }
+                try Self.assign(
+                    value,
+                    into: &ancestorValue,
+                    path: path.dropFirst(ancestor.count)
+                )
+                partialStorage[ancestor] = ancestorValue
+            } else {
+                partialStorage = partialStorage.filter {
+                    !$0.key.starts(with: path)
+                }
+                partialStorage[path] = value
+            }
+        }
+        if let completed = try? Self.materializeValue(
+            shape: storageShape,
+            path: [],
+            values: partialStorage
+        ) {
+            storage = completed
+            partialStorage.removeAll(keepingCapacity: false)
         }
     }
 
@@ -151,18 +294,108 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
         return Array(lhs.prefix(shared)) == Array(rhs.prefix(shared))
     }
 
+    private static func storageShape(
+        at path: ArraySlice<UInt32>,
+        in shape: VM.StorageShape
+    ) throws -> VM.StorageShape {
+        guard let field = path.first else { return shape }
+        guard let index = Int(exactly: field) else {
+            throw VM.RuntimeTrap.invalidAddressProjection
+        }
+        let child: VM.StorageShape = switch shape {
+        case let .tuple(elements) where elements.indices.contains(index):
+            elements[index]
+        case let .structure(_, fields) where fields.indices.contains(index):
+            fields[index]
+        default:
+            throw VM.RuntimeTrap.invalidAddressProjection
+        }
+        return try storageShape(at: path.dropFirst(), in: child)
+    }
+
+    private static func materializeValue(
+        shape: VM.StorageShape,
+        path: [UInt32],
+        values: [[UInt32]: VM.Value]
+    ) throws -> VM.Value {
+        if let value = values[path] { return value }
+        switch shape {
+        case .leaf:
+            throw VM.RuntimeTrap.uninitializedAddress
+        case let .tuple(elements):
+            return .tuple(
+                try elements.enumerated().map { index, child in
+                    guard let field = UInt32(exactly: index) else {
+                        throw VM.RuntimeTrap.invalidAddressProjection
+                    }
+                    return try materializeValue(
+                        shape: child,
+                        path: path + [field],
+                        values: values
+                    )
+                }
+            )
+        case let .structure(key, fields):
+            return .structure(
+                type: key,
+                fields: try fields.enumerated().map { index, child in
+                    guard let field = UInt32(exactly: index) else {
+                        throw VM.RuntimeTrap.invalidAddressProjection
+                    }
+                    return try materializeValue(
+                        shape: child,
+                        path: path + [field],
+                        values: values
+                    )
+                }
+            )
+        }
+    }
+
+    private static func closestStoredAncestor(
+        of path: [UInt32],
+        values: [[UInt32]: VM.Value]
+    ) -> [UInt32]? {
+        for count in stride(from: path.count, through: 0, by: -1) {
+            let prefix = Array(path.prefix(count))
+            if values[prefix] != nil { return prefix }
+        }
+        return nil
+    }
+
+    private static func hasStoredAncestor(
+        of path: [UInt32],
+        values: [[UInt32]: VM.Value]
+    ) -> Bool {
+        closestStoredAncestor(of: path, values: values) != nil
+    }
+
+    private static func hasStoredDescendant(
+        of path: [UInt32],
+        values: [[UInt32]: VM.Value]
+    ) -> Bool {
+        values.keys.contains {
+            $0.count > path.count && $0.starts(with: path)
+        }
+    }
+
     private static func project(
         _ value: VM.Value,
         path: ArraySlice<UInt32>
     ) throws -> VM.Value {
         guard let field = path.first else { return value }
-        guard case let .structure(_, fields) = value,
-              let index = Int(exactly: field),
-              fields.indices.contains(index)
-        else {
+        guard let index = Int(exactly: field) else {
             throw VM.RuntimeTrap.invalidAddressProjection
         }
-        return try project(fields[index], path: path.dropFirst())
+        let element: VM.Value = switch value {
+        case let .structure(_, fields) where fields.indices.contains(index):
+            fields[index]
+        case let .tuple(elements) where elements.indices.contains(index):
+            elements[index]
+        default:
+            throw VM.RuntimeTrap.invalidAddressProjection
+        }
+        return try project(element, path: path.dropFirst())
     }
 
     private static func assign(
@@ -174,15 +407,22 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
             destination = value
             return
         }
-        guard case let .structure(type, oldFields) = destination,
-              let index = Int(exactly: field),
-              oldFields.indices.contains(index)
-        else {
+        guard let index = Int(exactly: field) else {
             throw VM.RuntimeTrap.invalidAddressProjection
         }
-        var fields = oldFields
-        try assign(value, into: &fields[index], path: path.dropFirst())
-        destination = .structure(type: type, fields: fields)
+        switch destination {
+        case let .structure(type, oldFields)
+            where oldFields.indices.contains(index):
+            var fields = oldFields
+            try assign(value, into: &fields[index], path: path.dropFirst())
+            destination = .structure(type: type, fields: fields)
+        case let .tuple(oldElements) where oldElements.indices.contains(index):
+            var elements = oldElements
+            try assign(value, into: &elements[index], path: path.dropFirst())
+            destination = .tuple(elements)
+        default:
+            throw VM.RuntimeTrap.invalidAddressProjection
+        }
     }
 }
 

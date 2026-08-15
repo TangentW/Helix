@@ -79,7 +79,7 @@ struct AddressSemantics {
                             address: .init(rawValue: 3),
                             kind: .modify
                         ),
-                        .projectStructAddress(
+                        .projectAggregateAddress(
                             result: .init(rawValue: 5),
                             base: .init(rawValue: 4),
                             fieldIndex: 0
@@ -395,6 +395,146 @@ struct AddressSemantics {
         }
     }
 
+    @Test("Conditional root destroy admits only its unique root modify scope")
+    func validatesConditionalDestroyAccessScope() throws {
+        let rootRead = addressFunction(
+            id: 1,
+            instructions: initializedPrefix + [
+                .beginAccess(
+                    result: .init(rawValue: 2),
+                    address: .init(rawValue: 1),
+                    kind: .read
+                ),
+                .destroyStackIfInitialized(.init(rawValue: 0)),
+                .endAccess(.init(rawValue: 2)),
+                .returnValue(nil),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [rootRead])
+        }
+
+        let tuple = Bytecode.ValueType.tuple([.int64, .int64])
+        func fixture(
+            name: String,
+            instructions: [Bytecode.Instruction],
+            registerTypes: [Bytecode.ValueType]
+        ) -> Bytecode.Function {
+            .init(
+                id: .init(rawValue: 1),
+                name: name,
+                parameterRegisters: [],
+                resultType: .void,
+                registerTypes: registerTypes,
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        instructions: instructions
+                    ),
+                ],
+                stackSlotTypes: [tuple]
+            )
+        }
+        let prefix: [Bytecode.Instruction] = [
+            .constantInteger(result: .init(rawValue: 0), value: 1),
+            .makeTuple(
+                result: .init(rawValue: 1),
+                elements: [.init(rawValue: 0), .init(rawValue: 0)]
+            ),
+            .storeStack(
+                slot: .init(rawValue: 0),
+                source: .init(rawValue: 1),
+                mode: .initialize
+            ),
+            .stackAddress(
+                result: .init(rawValue: 2),
+                slot: .init(rawValue: 0)
+            ),
+        ]
+        let rootModify = fixture(
+            name: "conditionalDestroyRootModify",
+            instructions: prefix + [
+                .beginAccess(
+                    result: .init(rawValue: 3),
+                    address: .init(rawValue: 2),
+                    kind: .modify
+                ),
+                .destroyStackIfInitialized(.init(rawValue: 0)),
+                .endAccess(.init(rawValue: 3)),
+                .returnValue(nil),
+            ],
+            registerTypes: [
+                .int64, tuple, .address(tuple), .address(tuple),
+            ]
+        )
+        _ = try verify(additionalFunctions: [rootModify])
+
+        let childModify = fixture(
+            name: "conditionalDestroyChildModify",
+            instructions: prefix + [
+                .projectAggregateAddress(
+                    result: .init(rawValue: 3),
+                    base: .init(rawValue: 2),
+                    fieldIndex: 0
+                ),
+                .beginAccess(
+                    result: .init(rawValue: 4),
+                    address: .init(rawValue: 3),
+                    kind: .modify
+                ),
+                .destroyStackIfInitialized(.init(rawValue: 0)),
+                .endAccess(.init(rawValue: 4)),
+                .returnValue(nil),
+            ],
+            registerTypes: [
+                .int64, tuple, .address(tuple),
+                .address(.int64), .address(.int64),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [childModify])
+        }
+
+        let disjointChildren = fixture(
+            name: "conditionalDestroyDisjointChildren",
+            instructions: prefix + [
+                .projectAggregateAddress(
+                    result: .init(rawValue: 3),
+                    base: .init(rawValue: 2),
+                    fieldIndex: 0
+                ),
+                .projectAggregateAddress(
+                    result: .init(rawValue: 4),
+                    base: .init(rawValue: 2),
+                    fieldIndex: 1
+                ),
+                .beginAccess(
+                    result: .init(rawValue: 5),
+                    address: .init(rawValue: 3),
+                    kind: .modify
+                ),
+                .beginAccess(
+                    result: .init(rawValue: 6),
+                    address: .init(rawValue: 4),
+                    kind: .modify
+                ),
+                .destroyStackIfInitialized(.init(rawValue: 0)),
+                .endAccess(.init(rawValue: 6)),
+                .endAccess(.init(rawValue: 5)),
+                .returnValue(nil),
+            ],
+            registerTypes: [
+                .int64, tuple, .address(tuple),
+                .address(.int64), .address(.int64),
+                .address(.int64), .address(.int64),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [disjointChildren])
+        }
+    }
+
     @Test("Address loads and assignments require initialized storage")
     func rejectsUninitializedAddressStorage() throws {
         let load = addressFunction(
@@ -446,6 +586,71 @@ struct AddressSemantics {
         )
         #expect(throws: Verification.Error.self) {
             try verify(additionalFunctions: [store])
+        }
+    }
+
+    @Test("A partially initialized aggregate stack slot cannot be loaded")
+    func rejectsPartiallyInitializedAggregateLoad() throws {
+        let tuple = Bytecode.ValueType.tuple([.int64, .int64])
+        let function = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "partialTuple",
+            parameterRegisters: [],
+            resultType: .void,
+            registerTypes: [
+                .int64,
+                .address(tuple),
+                .address(tuple),
+                .address(.int64),
+                tuple,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    instructions: [
+                        .constantInteger(result: .init(rawValue: 0), value: 1),
+                        .stackAddress(
+                            result: .init(rawValue: 1),
+                            slot: .init(rawValue: 0)
+                        ),
+                        .beginAccess(
+                            result: .init(rawValue: 2),
+                            address: .init(rawValue: 1),
+                            kind: .modify
+                        ),
+                        .projectAggregateAddress(
+                            result: .init(rawValue: 3),
+                            base: .init(rawValue: 2),
+                            fieldIndex: 0
+                        ),
+                        .storeAddress(
+                            address: .init(rawValue: 3),
+                            source: .init(rawValue: 0),
+                            mode: .initialize
+                        ),
+                        .endAccess(.init(rawValue: 2)),
+                        .loadStack(
+                            result: .init(rawValue: 4),
+                            slot: .init(rawValue: 0),
+                            mode: .take
+                        ),
+                        .returnValue(nil),
+                    ]
+                ),
+            ],
+            stackSlotTypes: [tuple]
+        )
+
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 1),
+                block: .init(rawValue: 0),
+                offset: 6,
+                reason: "stack storage $0 is used before initialization"
+            )
+        ) {
+            try verify(additionalFunctions: [function])
         }
     }
 

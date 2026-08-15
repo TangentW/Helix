@@ -33,7 +33,7 @@ struct SemanticVerifier {
 
         #expect(
             throws: Verification.Error.invalidShellInterface(
-                "patch-local nominal, Error, address, and closure values cannot appear in entry 0 signature"
+                "patch-local nominal, Error, internal storage, and closure values cannot appear in entry 0 signature"
             )
         ) {
             try Verification.ShellInterface(
@@ -48,7 +48,7 @@ struct SemanticVerifier {
         mutatedShell.entries[index]?.resultType = .error
         #expect(
             throws: Verification.Error.invalidShellInterface(
-                "patch-local nominal, Error, address, and closure values cannot appear in entry 0 signature"
+                "patch-local nominal, Error, internal storage, and closure values cannot appear in entry 0 signature"
             )
         ) {
             try Verification.Engine().verify(
@@ -135,6 +135,7 @@ struct SemanticVerifier {
                 policy: fixture.policy
             )
         }
+
     }
 
     @Test("A block without a terminator is rejected")
@@ -145,6 +146,47 @@ struct SemanticVerifier {
         }
 
         #expect(throws: Verification.Error.self) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("The function entry block has no control-flow predecessors")
+    func rejectsBackedgeToEntryBlock() throws {
+        let fixture = try makeFixture { function in
+            function.blocks = [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .branch(
+                            target: .init(rawValue: 1),
+                            arguments: []
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    instructions: [
+                        .branch(
+                            target: .init(rawValue: 0),
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                    ]
+                ),
+            ]
+        }
+
+        #expect(
+            throws: Verification.Error.invalidBlock(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                reason: "entry block cannot have predecessors"
+            )
+        ) {
             try Verification.Engine().verify(
                 bytes: Bytecode.Encoder.encode(fixture.module),
                 shell: fixture.shell,
@@ -451,7 +493,6 @@ struct SemanticVerifier {
         fixture.module.capabilities.insert(.collectionsV1)
         fixture.shell.capabilities.insert(.collectionsV1)
         fixture.policy.acceptedCapabilities.insert(.collectionsV1)
-
         #expect(
             throws: Verification.Error.invalidInstruction(
                 function: .init(rawValue: 0),
@@ -576,7 +617,7 @@ struct SemanticVerifier {
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
                 offset: 2,
-                reason: "dictionary_next uses an uninitialized index slot"
+                reason: "stack storage $0 is used before initialization"
             )
         ) {
             try Verification.Engine().verify(
@@ -987,8 +1028,8 @@ struct SemanticVerifier {
         }
     }
 
-    @Test("Stack initialization state must agree at a CFG merge")
-    func rejectsMismatchedStackStateAtMerge() throws {
+    @Test("Possible stack initialization must be resolved before exit")
+    func rejectsPossibleStackStateAtExit() throws {
         let fixture = try makeFixture { function in
             function.registerTypes.append(.bool)
             function.stackSlotTypes = [.int64]
@@ -1030,10 +1071,11 @@ struct SemanticVerifier {
         }
 
         #expect(
-            throws: Verification.Error.invalidBlock(
+            throws: Verification.Error.invalidInstruction(
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 3),
-                reason: "incoming stack-slot initialization states disagree"
+                offset: 0,
+                reason: "initialized stack slots remain at function exit"
             )
         ) {
             try Verification.Engine().verify(
@@ -1041,6 +1083,132 @@ struct SemanticVerifier {
                 shell: fixture.shell,
                 policy: fixture.policy
             )
+        }
+
+        var strictDestroy = fixture.module
+        strictDestroy.functions[0].blocks[3].instructions.insert(
+            .destroyStack(.init(rawValue: 0)),
+            at: 0
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 3),
+                offset: 0,
+                reason: "destroy_stack targets uninitialized stack storage"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(strictDestroy),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var conditionalDestroy = fixture.module
+        conditionalDestroy.functions[0].blocks[3].instructions.insert(
+            .destroyStackIfInitialized(.init(rawValue: 0)),
+            at: 0
+        )
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(conditionalDestroy),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+    }
+
+    @Test("Replace resolves a maybe-initialized stack state at a CFG merge")
+    func validatesConditionalStackReplacement() throws {
+        let fixture = try makeFixture { function in
+            function.registerTypes.append(contentsOf: [.bool, .int64])
+            function.stackSlotTypes = [.int64]
+            function.blocks = [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantBool(result: .init(rawValue: 1), value: true),
+                        .conditionalBranch(
+                            condition: .init(rawValue: 1),
+                            trueTarget: .init(rawValue: 1),
+                            trueArguments: [],
+                            falseTarget: .init(rawValue: 2),
+                            falseArguments: []
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    instructions: [
+                        .storeStack(
+                            slot: .init(rawValue: 0),
+                            source: .init(rawValue: 0),
+                            mode: .initialize
+                        ),
+                        .branch(target: .init(rawValue: 3), arguments: []),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    instructions: [
+                        .branch(target: .init(rawValue: 3), arguments: []),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 3),
+                    instructions: [
+                        .storeStack(
+                            slot: .init(rawValue: 0),
+                            source: .init(rawValue: 0),
+                            mode: .replace
+                        ),
+                        .loadStack(
+                            result: .init(rawValue: 2),
+                            slot: .init(rawValue: 0),
+                            mode: .take
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        }
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        for (mode, reason) in [
+            (
+                Bytecode.StackStoreMode.initialize,
+                "store_stack.initialize targets initialized stack storage"
+            ),
+            (
+                Bytecode.StackStoreMode.assign,
+                "store_stack.assign targets uninitialized stack storage"
+            ),
+        ] {
+            var invalid = fixture.module
+            invalid.functions[0].blocks[3].instructions[0] = .storeStack(
+                slot: .init(rawValue: 0),
+                source: .init(rawValue: 0),
+                mode: mode
+            )
+            #expect(
+                throws: Verification.Error.invalidInstruction(
+                    function: .init(rawValue: 0),
+                    block: .init(rawValue: 3),
+                    offset: 0,
+                    reason: reason
+                )
+            ) {
+                try Verification.Engine().verify(
+                    bytes: Bytecode.Encoder.encode(invalid),
+                    shell: fixture.shell,
+                    policy: fixture.policy
+                )
+            }
         }
     }
 
@@ -1458,6 +1626,13 @@ struct SemanticVerifier {
     @Test("A nonescaping closure body with copyable captures is accepted")
     func acceptsClosureContract() throws {
         var fixture = try makeClosureFixture()
+        fixture.module.functions[0].registerTypes[1] = .closure(
+            .init(
+                parameters: [.int64],
+                parameterConventions: [.borrowed],
+                result: .int64
+            )
+        )
         fixture.module.functions[1].parameterConventions = [.borrowed, .borrowed]
         fixture.module.capabilities.insert(.borrowCallsV1)
         fixture.shell.capabilities.insert(.borrowCallsV1)
@@ -1473,9 +1648,411 @@ struct SemanticVerifier {
         #expect(image.module.capabilities.contains(.closureValuesV1))
     }
 
-    @Test("Borrowed closure parameters cannot hide linear Native ownership")
-    func rejectsBorrowedLinearClosureParameter() throws {
+    @Test("A synchronous throwing closure has verified normal and error edges")
+    func validatesThrowingClosureControlFlow() throws {
         var fixture = try makeClosureFixture()
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64,
+            effects: .init(mayThrow: true)
+        )
+        fixture.module.functions[0].registerTypes = [
+            .int64,
+            .closure(signature),
+            .int64,
+            .string,
+        ]
+        fixture.module.functions[0].blocks = [
+            .init(
+                id: .init(rawValue: 0),
+                parameters: [.init(rawValue: 0)],
+                instructions: [
+                    .makeClosure(
+                        result: .init(rawValue: 1),
+                        function: .init(rawValue: 1),
+                        captures: [.init(rawValue: 0)]
+                    ),
+                    .closureTryApply(
+                        closure: .init(rawValue: 1),
+                        arguments: [.init(rawValue: 0)],
+                        normalTarget: .init(rawValue: 1),
+                        errorTarget: .init(rawValue: 2)
+                    ),
+                ]
+            ),
+            .init(
+                id: .init(rawValue: 1),
+                parameters: [.init(rawValue: 2)],
+                instructions: [.returnValue(.init(rawValue: 2))]
+            ),
+            .init(
+                id: .init(rawValue: 2),
+                parameters: [.init(rawValue: 3)],
+                instructions: [.returnValue(.init(rawValue: 0))]
+            ),
+        ]
+        fixture.module.functions[1].effects = .init(mayThrow: true)
+        fixture.module.capabilities.formUnion([.untypedThrowsV1, .stringsV1])
+        fixture.shell.capabilities.formUnion([.untypedThrowsV1, .stringsV1])
+        fixture.policy.acceptedCapabilities.formUnion([
+            .untypedThrowsV1, .stringsV1,
+        ])
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var nonthrowing = fixture.module
+        let nonthrowingSignature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64
+        )
+        nonthrowing.functions[0].registerTypes[1] = .closure(
+            nonthrowingSignature
+        )
+        nonthrowing.functions[1].effects = .init()
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "closure_try_apply requires a throwing closure"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(nonthrowing),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("Mutable closure cells require their capability and exact pointee types")
+    func validatesMutableClosureCells() throws {
+        let cellType = Bytecode.ValueType.mutableCell(.int64)
+        let signature = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .int64
+        )
+        var fixture = try makeFixture { function in
+            function.registerTypes = [
+                .int64, cellType, .closure(signature), .int64,
+            ]
+            function.blocks[0].instructions = [
+                .makeMutableCell(
+                    result: .init(rawValue: 1),
+                    initialValue: .init(rawValue: 0)
+                ),
+                .makeClosure(
+                    result: .init(rawValue: 2),
+                    function: .init(rawValue: 1),
+                    captures: [.init(rawValue: 1)]
+                ),
+                .closureApply(
+                    result: .init(rawValue: 3),
+                    closure: .init(rawValue: 2),
+                    arguments: []
+                ),
+                .returnValue(.init(rawValue: 3)),
+            ]
+        }
+        fixture.module.functions.append(
+            .init(
+                id: .init(rawValue: 1),
+                name: "mutableClosureBody",
+                kind: .closureBody,
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: .int64,
+                registerTypes: [cellType, .int64],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .loadMutableCell(
+                                result: .init(rawValue: 1),
+                                cell: .init(rawValue: 0)
+                            ),
+                            .returnValue(.init(rawValue: 1)),
+                        ]
+                    ),
+                ]
+            )
+        )
+        fixture.module.capabilities.formUnion([
+            .closureValuesV1, .mutableCapturesV1,
+        ])
+        fixture.shell.capabilities.formUnion([
+            .closureValuesV1, .mutableCapturesV1,
+        ])
+        fixture.policy.acceptedCapabilities.formUnion([
+            .closureValuesV1, .mutableCapturesV1,
+        ])
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var missingCapability = fixture.module
+        missingCapability.capabilities.remove(.mutableCapturesV1)
+        #expect(
+            throws: Verification.Error.capabilityDenied(.mutableCapturesV1)
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(missingCapability),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var mismatchedPointee = fixture.module
+        mismatchedPointee.functions[1].registerTypes[1] = .bool
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 1),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "load_mutable_cell result must match a copyable pointee"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(mismatchedPointee),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("Mutable cells verify field-sensitive initialization")
+    func validatesFieldSensitiveMutableCellInitialization() throws {
+        let tupleType = Bytecode.ValueType.tuple([.int64, .int64])
+        let tupleCell = Bytecode.ValueType.mutableCell(tupleType)
+        let fieldCell = Bytecode.ValueType.mutableCell(.int64)
+        var fixture = try makeFixture { function in
+            function.registerTypes = [
+                .int64, tupleCell, fieldCell, fieldCell, tupleType,
+                .int64, .int64,
+            ]
+            function.blocks[0].instructions = [
+                .makeMutableCell(
+                    result: .init(rawValue: 1),
+                    initialValue: nil
+                ),
+                .projectMutableCell(
+                    result: .init(rawValue: 2),
+                    cell: .init(rawValue: 1),
+                    fieldIndex: 0
+                ),
+                .projectMutableCell(
+                    result: .init(rawValue: 3),
+                    cell: .init(rawValue: 1),
+                    fieldIndex: 1
+                ),
+                .storeMutableCell(
+                    cell: .init(rawValue: 2),
+                    source: .init(rawValue: 0),
+                    mode: .initialize
+                ),
+                .storeMutableCell(
+                    cell: .init(rawValue: 3),
+                    source: .init(rawValue: 0),
+                    mode: .initialize
+                ),
+                .loadMutableCell(
+                    result: .init(rawValue: 4),
+                    cell: .init(rawValue: 1)
+                ),
+                .unpackTuple(
+                    results: [.init(rawValue: 5), .init(rawValue: 6)],
+                    tuple: .init(rawValue: 4)
+                ),
+                .returnValue(.init(rawValue: 5)),
+            ]
+        }
+        fixture.module.capabilities.insert(.mutableCapturesV1)
+        fixture.shell.capabilities.insert(.mutableCapturesV1)
+        fixture.policy.acceptedCapabilities.insert(.mutableCapturesV1)
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var incomplete = fixture.module
+        incomplete.functions[0].blocks[0].instructions.remove(at: 4)
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 4,
+                reason: "mutable cell is used before initialization"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(incomplete),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var duplicate = fixture.module
+        duplicate.functions[0].blocks[0].instructions.insert(
+            .storeMutableCell(
+                cell: .init(rawValue: 2),
+                source: .init(rawValue: 0),
+                mode: .initialize
+            ),
+            at: 4
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 4,
+                reason: "store_mutable_cell.initialize targets an initialized cell"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(duplicate),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("Array builders are linear invocation-local implementation values")
+    func validatesLinearArrayBuilders() throws {
+        let builderType = Bytecode.ValueType.arrayBuilder(.int64)
+        var fixture = try makeFixture { function in
+            function.resultType = .array(.int64)
+            function.registerTypes = [
+                .int64, builderType, .array(.int64),
+            ]
+            function.blocks[0].instructions = [
+                .makeArrayBuilder(result: .init(rawValue: 1)),
+                .arrayBuilderAppend(
+                    builder: .init(rawValue: 1),
+                    value: .init(rawValue: 0)
+                ),
+                .finishArrayBuilder(
+                    result: .init(rawValue: 2),
+                    builder: .init(rawValue: 1)
+                ),
+                .returnValue(.init(rawValue: 2)),
+            ]
+        }
+        fixture.module.capabilities.insert(.collectionsV1)
+        fixture.shell.capabilities.insert(.collectionsV1)
+        fixture.policy.acceptedCapabilities.insert(.collectionsV1)
+        let entry = try #require(fixture.shell.entries[.init(rawValue: 0)])
+        fixture.shell.entries[entry.index] = .init(
+            index: entry.index,
+            key: entry.key,
+            parameterTypes: entry.parameterTypes,
+            resultType: .array(.int64),
+            effects: entry.effects
+        )
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var copied = fixture.module
+        copied.functions[0].registerTypes.append(builderType)
+        copied.functions[0].blocks[0].instructions.insert(
+            .copyValue(
+                result: .init(rawValue: 3),
+                source: .init(rawValue: 1)
+            ),
+            at: 1
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "copy_value requires a copyable type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(copied),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var unfinished = fixture.module
+        unfinished.functions[0].blocks[0].instructions = [
+            .makeArrayBuilder(result: .init(rawValue: 1)),
+            .makeArray(result: .init(rawValue: 2), elements: []),
+            .returnValue(.init(rawValue: 2)),
+        ]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "owned values remain live at return"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(unfinished),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var finishedTwice = fixture.module
+        finishedTwice.functions[0].registerTypes.append(.array(.int64))
+        finishedTwice.functions[0].blocks[0].instructions.insert(
+            .finishArrayBuilder(
+                result: .init(rawValue: 3),
+                builder: .init(rawValue: 1)
+            ),
+            at: 3
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 3,
+                reason: "instruction uses a consumed owned value"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(finishedTwice),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var parameter = fixture.module
+        parameter.functions[0].parameterRegisters = [.init(rawValue: 1)]
+        parameter.functions[0].parameterConventions = [.owned]
+        parameter.functions[0].blocks[0].parameters = [.init(rawValue: 1)]
+        #expect(throws: Verification.Error.self) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(parameter),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("Borrowed closure ownership is explicit and exact")
+    func validatesBorrowedLinearClosureParameter() throws {
+        var fixture = try makeFixture { _ in }
         let typeID = Core.TypeID.derive(
             namespace: .derive(
                 bundleID: "dev.helix.verifier",
@@ -1486,14 +2063,57 @@ struct SemanticVerifier {
         )
         let signature = Bytecode.ClosureSignature(
             parameters: [.native(typeID)],
+            parameterConventions: [.borrowed],
             result: .int64
         )
-        fixture.module.functions[0].registerTypes[1] = .closure(signature)
-        fixture.module.functions[1].registerTypes[0] = .native(typeID)
-        fixture.module.functions[1].parameterConventions = [.borrowed, .borrowed]
-        fixture.module.capabilities.formUnion([.borrowCallsV1, .nativeTypesV1])
-        fixture.shell.capabilities.formUnion([.borrowCallsV1, .nativeTypesV1])
-        fixture.policy.acceptedCapabilities.formUnion([.borrowCallsV1, .nativeTypesV1])
+        fixture.module.functions[0].registerTypes = [
+            .native(typeID), .closure(signature), .int64,
+        ]
+        fixture.module.functions[0].blocks[0].instructions = [
+            .makeClosure(
+                result: .init(rawValue: 1),
+                function: .init(rawValue: 1),
+                captures: []
+            ),
+            .closureApply(
+                result: .init(rawValue: 2),
+                closure: .init(rawValue: 1),
+                arguments: [.init(rawValue: 0)]
+            ),
+            .destroyValue(.init(rawValue: 0)),
+            .returnValue(.init(rawValue: 2)),
+        ]
+        fixture.module.functions.append(
+            .init(
+                id: .init(rawValue: 1),
+                name: "borrowedNativeClosureBody",
+                kind: .closureBody,
+                parameterRegisters: [.init(rawValue: 0)],
+                parameterConventions: [.borrowed],
+                resultType: .int64,
+                registerTypes: [.native(typeID), .int64],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .constantInteger(
+                                result: .init(rawValue: 1),
+                                value: 1
+                            ),
+                            .returnValue(.init(rawValue: 1)),
+                        ]
+                    ),
+                ]
+            )
+        )
+        let capabilities: Set<Core.Capability> = [
+            .borrowCallsV1, .closureValuesV1, .nativeTypesV1,
+        ]
+        fixture.module.capabilities.formUnion(capabilities)
+        fixture.shell.capabilities.formUnion(capabilities)
+        fixture.policy.acceptedCapabilities.formUnion(capabilities)
         fixture.shell.types[typeID] = .init(
             id: typeID,
             canonicalName: "Fixture.Reference",
@@ -1502,17 +2122,41 @@ struct SemanticVerifier {
             isCopyable: true,
             estimatedSize: 8
         )
+        let entry = try #require(
+            fixture.shell.entries[.init(rawValue: 0)]
+        )
+        fixture.shell.entries[entry.index] = .init(
+            index: entry.index,
+            key: entry.key,
+            parameterTypes: [.native(typeID)],
+            resultType: entry.resultType,
+            effects: entry.effects
+        )
 
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var mismatched = fixture.module
+        mismatched.functions[0].registerTypes[1] = .closure(
+            .init(
+                parameters: [.native(typeID)],
+                parameterConventions: [.owned],
+                result: .int64
+            )
+        )
         #expect(
             throws: Verification.Error.invalidInstruction(
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
                 offset: 0,
-                reason: "HLBC borrowed closure parameters cannot require linear ownership"
+                reason: "closure body invocation ownership does not match its closure signature"
             )
         ) {
             try Verification.Engine().verify(
-                bytes: Bytecode.Encoder.encode(fixture.module),
+                bytes: Bytecode.Encoder.encode(mismatched),
                 shell: fixture.shell,
                 policy: fixture.policy
             )
@@ -1556,7 +2200,7 @@ struct SemanticVerifier {
         }
     }
 
-    @Test("Closure bodies require dynamic calls and internal closure returns require capability")
+    @Test("Closure bodies permit static calls and internal closure returns require capability")
     func validatesClosureEscapeAndDirectCall() throws {
         var directCall = try makeClosureFixture()
         directCall.module.functions[0].blocks[0].instructions = [
@@ -1567,23 +2211,18 @@ struct SemanticVerifier {
             ),
             .returnValue(.init(rawValue: 2)),
         ]
-        #expect(
-            throws: Verification.Error.invalidInstruction(
-                function: .init(rawValue: 0),
-                block: .init(rawValue: 0),
-                offset: 0,
-                reason: "closure bodies must be invoked through closure_apply"
-            )
-        ) {
-            try Verification.Engine().verify(
-                bytes: Bytecode.Encoder.encode(directCall.module),
-                shell: directCall.shell,
-                policy: directCall.policy
-            )
-        }
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(directCall.module),
+            shell: directCall.shell,
+            policy: directCall.policy
+        )
 
         var escaping = try makeClosureFixture()
-        let signature = Bytecode.ClosureSignature(parameters: [.int64], result: .int64)
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64
+        )
         escaping.module.functions.append(
             .init(
                 id: .init(rawValue: 2),
@@ -1633,6 +2272,7 @@ struct SemanticVerifier {
         var fixture = try makeClosureFixture()
         let signature = Bytecode.ClosureSignature(
             parameters: [.int64],
+            parameterConventions: [.owned],
             result: .int64
         )
         fixture.module.functions[0].registerTypes.append(contentsOf: [
@@ -1802,7 +2442,12 @@ struct SemanticVerifier {
     func rejectsAsyncClosureSignature() throws {
         var fixture = try makeClosureFixture()
         fixture.module.functions[0].registerTypes[1] = .closure(
-            .init(parameters: [.int64], result: .int64, effects: .init(isAsync: true))
+            .init(
+                parameters: [.int64],
+                parameterConventions: [.owned],
+                result: .int64,
+                effects: .init(isAsync: true)
+            )
         )
         fixture.module.capabilities.insert(.asyncLeafEntriesV1)
         fixture.shell.capabilities.insert(.asyncLeafEntriesV1)
@@ -1811,7 +2456,7 @@ struct SemanticVerifier {
         #expect(
             throws: Verification.Error.invalidFunction(
                 function: .init(rawValue: 0),
-                reason: "throwing or async closures require a future suspension-aware closure contract"
+                reason: "async closures require a suspension-aware closure contract"
             )
         ) {
             try Verification.Engine().verify(
@@ -1891,7 +2536,11 @@ struct SemanticVerifier {
     }
 
     private func makeClosureFixture() throws -> Fixture {
-        let signature = Bytecode.ClosureSignature(parameters: [.int64], result: .int64)
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64
+        )
         var fixture = try makeFixture { function in
             function.registerTypes.append(contentsOf: [.closure(signature), .int64])
             function.blocks[0].instructions = [

@@ -428,6 +428,15 @@ public final class InvocationBudget: @unchecked Sendable {
         try consumeVMHeap(bytes: bytes.partialValue)
     }
 
+    func consumeAggregateElementStorage(elementCount: Int) throws {
+        guard elementCount >= 0 else { throw VM.RuntimeTrap.vmHeapLimitExceeded }
+        let bytes = UInt64(elementCount).multipliedReportingOverflow(by: 16)
+        guard !bytes.overflow else {
+            throw VM.RuntimeTrap.vmHeapLimitExceeded
+        }
+        try consumeVMHeap(bytes: bytes.partialValue)
+    }
+
     /// Charges values created by a trusted Shell boundary before they become
     /// owned by the VM. HLBC-internal values are charged where they allocate.
     public func consumeBoundaryValue(_ value: VM.Value) throws {
@@ -490,6 +499,14 @@ public final class InvocationBudget: @unchecked Sendable {
             try consumeBoundaryValue(erased.payload, depth: depth + 1)
         case .address:
             throw VM.RuntimeTrap.explicit("address values cannot cross a VM boundary")
+        case .mutableCell:
+            throw VM.RuntimeTrap.explicit(
+                "mutable capture cells cannot cross a VM boundary"
+            )
+        case .arrayBuilder:
+            throw VM.RuntimeTrap.explicit(
+                "Array builders cannot cross a VM boundary"
+            )
         case .closure:
             throw VM.RuntimeTrap.explicit("closure values cannot cross a VM boundary")
         case .bool, .integer, .float:

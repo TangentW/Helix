@@ -1717,7 +1717,11 @@ struct ReleaseDriver {
         try Data(baseline.utf8).write(to: sourceURL)
         let driver = ReleaseCompiler.Driver()
         let closureType = Bytecode.ValueType.closure(
-            .init(parameters: [.int64], result: .int64)
+            .init(
+                parameters: [.int64],
+                parameterConventions: [.owned],
+                result: .int64
+            )
         )
         let archive = try makeArchive(
             sourceURL: sourceURL,
@@ -1750,8 +1754,11 @@ struct ReleaseDriver {
         }
         @inline(never)
         public func transform(_ value: Int) -> Int {
-            let offset = 3
-            return helper(value) { $0 + offset }
+            var offset = 3
+            return helper(value) {
+                offset += 1
+                return $0 + offset
+            }
         }
         """
         try Data(changed.utf8).write(to: sourceURL)
@@ -1762,7 +1769,10 @@ struct ReleaseDriver {
         #expect(result.module.functions.count == 3)
         #expect(result.module.functions.contains { $0.kind == .closureBody })
         #expect(result.module.capabilities.contains(.closureValuesV1))
+        #expect(result.module.capabilities.contains(.mutableCapturesV1))
+        #expect(archive.capabilities.contains(.mutableCapturesV1))
         #expect(result.disassembly.contains("make_closure"))
+        #expect(result.disassembly.contains("make_mutable_cell"))
         #expect(result.disassembly.contains("closure_apply"))
         #expect(!result.module.entries.contains { entryPoint in
             result.module.functions.first(where: {
@@ -1783,7 +1793,7 @@ struct ReleaseDriver {
                     .integer(try VM.Integer(signed: 4, bitWidth: 64, isSigned: true)),
                 ]
             ) == .returned(
-                .integer(try VM.Integer(signed: 10, bitWidth: 64, isSigned: true))
+                .integer(try VM.Integer(signed: 13, bitWidth: 64, isSigned: true))
             )
         )
     }
@@ -1818,7 +1828,11 @@ struct ReleaseDriver {
         try Data(baseline.utf8).write(to: sourceURL)
         let driver = ReleaseCompiler.Driver()
         let closureType = Bytecode.ValueType.closure(
-            .init(parameters: [.int64], result: .int64)
+            .init(
+                parameters: [.int64],
+                parameterConventions: [.owned],
+                result: .int64
+            )
         )
         let archive = try makeArchive(
             sourceURL: sourceURL,
@@ -1923,7 +1937,11 @@ struct ReleaseDriver {
         try Data(baseline.utf8).write(to: sourceURL)
         let driver = ReleaseCompiler.Driver()
         let closureType = Bytecode.ValueType.closure(
-            .init(parameters: [.string], result: .string)
+            .init(
+                parameters: [.string],
+                parameterConventions: [.owned],
+                result: .string
+            )
         )
         let archive = try makeArchive(
             sourceURL: sourceURL,
@@ -2017,7 +2035,11 @@ struct ReleaseDriver {
         try Data(baseline.utf8).write(to: sourceURL)
         let driver = ReleaseCompiler.Driver()
         let closureType = Bytecode.ValueType.closure(
-            .init(parameters: [.int64], result: .int64)
+            .init(
+                parameters: [.int64],
+                parameterConventions: [.owned],
+                result: .int64
+            )
         )
         let archive = try makeArchive(
             sourceURL: sourceURL,
@@ -2121,7 +2143,11 @@ struct ReleaseDriver {
         try Data(baseline.utf8).write(to: sourceURL)
         let driver = ReleaseCompiler.Driver()
         let closureType = Bytecode.ValueType.closure(
-            .init(parameters: [.int64], result: .int64)
+            .init(
+                parameters: [.int64],
+                parameterConventions: [.owned],
+                result: .int64
+            )
         )
         let archive = try makeArchive(
             sourceURL: sourceURL,

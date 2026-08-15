@@ -111,6 +111,88 @@ struct ImportedFrameworks {
         })
     }
 
+    @Test("Runtime stack borrows retain one native owner through both try continuations")
+    func ownsRuntimeStackBorrowAcrossTryApply() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let callee = Bytecode.FunctionID(rawValue: 1)
+        let effects = Core.Effects(mayThrow: true)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: "$s7Fixture7inspectyySo8NSObjectCKF",
+                parameterTypes: [.native(objectType)],
+                parameterConventions: [.borrowed],
+                resultType: .void,
+                effects: effects,
+                target: .function(callee)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            ["NSObject": objectType],
+            kinds: [objectType: .reference]
+        )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture11inspectOnceyySo8NSObjectC_SbtF",
+            loweredType: "@convention(thin) (@owned NSObject, Bool) -> ()",
+            body: """
+            bb0(%0 : @owned $NSObject, %1 : $Bool):
+              %2 = alloc_stack $NSObject
+              store %0 to [init] %2
+              cond_br %1, bb1, bb2
+            bb1:
+              br bb3
+            bb2:
+              br bb3
+            bb3:
+              %3 = function_ref @$s7Fixture7inspectyySo8NSObjectCKF : $@convention(thin) (@in_guaranteed NSObject) -> @error any Error
+              try_apply %3(%2) : $@convention(thin) (@in_guaranteed NSObject) -> @error any Error, normal bb4, error bb5
+            bb4:
+              destroy_addr %2
+              dealloc_stack %2
+              %4 = tuple ()
+              return %4
+            bb5(%5 : $any Error):
+              destroy_addr %2
+              dealloc_stack %2
+              %6 = tuple ()
+              return %6
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+            function,
+            displayName: "Fixture.inspectOnce",
+            directCalls: calls
+        )
+        let invocation = try #require(lowered.blocks.flatMap(\.instructions).compactMap {
+            instruction -> (Bytecode.Register, Bytecode.BlockID, Bytecode.BlockID)? in
+            guard case let .tryApply(id, arguments, normal, error) = instruction,
+                  id == callee,
+                  let argument = arguments.first,
+                  arguments.count == 1
+            else { return nil }
+            return (argument, normal, error)
+        }.first)
+        let temporaryOwner = invocation.0
+        #expect(
+            lowered.registerTypes[Int(temporaryOwner.rawValue)]
+                == Bytecode.ValueType.native(objectType)
+        )
+        #expect(lowered.blocks.flatMap(\.instructions).contains { instruction in
+            guard case let .loadAddress(result, _, mode) = instruction else {
+                return false
+            }
+            return result == temporaryOwner && mode == .copy
+        })
+        for target in [invocation.1, invocation.2] {
+            let block = try #require(lowered.blocks.first { $0.id == target })
+            guard case let .destroyValue(value) = block.instructions.first else {
+                Issue.record("try continuation does not begin by releasing its borrowed owner")
+                continue
+            }
+            #expect(value == temporaryOwner)
+        }
+    }
+
     @Test("NSError-backed Objective-C throws use the logical NativeImport ABI")
     func lowersNSErrorBackedThrowingMethod() throws {
         let fixture = try nsErrorFixture()
@@ -795,7 +877,9 @@ struct ImportedFrameworks {
             return true
         })
         #expect(noneInstructions.contains { instruction in
-            guard case .copyValue = instruction else { return false }
+            guard case .loadAddress(_, _, .copy) = instruction else {
+                return false
+            }
             return true
         })
         #expect(!lowered.blocks.flatMap(\.instructions).contains { instruction in
@@ -850,7 +934,9 @@ struct ImportedFrameworks {
         })
         let copiedOptional = try #require(some.compactMap {
             instruction -> Bytecode.Register? in
-            guard case let .copyValue(result, _) = instruction else { return nil }
+            guard case let .loadAddress(result, _, .copy) = instruction else {
+                return nil
+            }
             return result
         }.first)
         #expect(some.contains { instruction in

@@ -24,14 +24,14 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - `Bool`、有/无符号定宽整数、`Float` 与 `Double`，包括已声明的算术、位运算、比较、移位和数值转换规则。完全具体化的标量 `min`/`max` 与有符号数值 `abs` 会保留 Swift 的操作数顺序、溢出、正负零和 NaN 语义。
 - `String` 字面量、拼接、支持标量的插值、Unicode `uppercased`/`lowercased`、count/empty、比较以及常见 prefix/suffix/contains 判断。可变大小转换会在分配前预留已经证明的输出上界，最终只按实际 UTF-8 结果计费。常见的 `String.contains(Character)` 可以使用单 grapheme 的 `Character` 字面量，而不暴露 Swift 私有 Character 布局。
 - Tuple、`Void` 与 `Optional`，包括 `if let`、`guard let`、`??` 和 `try?` 产生的普通控制流，也包括 Dictionary semantic SIL 产生的地址型 Optional projection。
-- Array 值语义、append、`first`/`last`、`popLast`、迭代、安全下标和返回新值的更新；支持键值类型下的 Dictionary 构建、查找、更新、`removeValue(forKey:)` 与迭代。
+- Array 值语义、append、`first`/`last`、`popLast`、迭代、安全下标和返回新值的更新；支持键值类型下的 Dictionary 构建、查找、更新、`removeValue(forKey:)` 与迭代。完全具体、底层来源为 Array 的 `map`、`filter`、`compactMap`、`reduce`、`forEach`、`first(where:)`、`contains(where:)` 与 `allSatisfy` 会降低成经过验证的 closure 控制流，并使用 invocation-local 的线性 Array builder，避免反复 copy-on-write append；payload 可表示为补丁内局部值时，`Optional.map` 与具体 `Result.map` 复用同一 closure 路径；局部 `Result` 当前不能嵌入 native handle。
 - 结构化分支、循环、switch、调用、递归、显式业务错误边和带 payload 的局部 Error 值。真实 frontend 语料已覆盖三元表达式、`repeat-while`、带标签的 `break`/`continue`、Tuple 与 Optional 模式匹配、`for case`、`while let`、`fallthrough`、提前返回，以及循环与返回清理路径上的 `defer`。
 - `Range<Int>` 半开区间 `for` 循环；Lowerer 会把它变成 HLBC 的强类型 cursor 控制流，不依赖 Swift 标准库 Range/Iterator ABI 对象。
 - 可在现有受监视文件中新加、且不导出到原生 ABI 的文件或 module scope 补丁内非递归 stored struct/enum；支持具体 `Result`、字段读取、enum switch、实例/静态计算 getter/setter 与受支持的 mutating helper。嵌套声明保留完整 namespace identity。它们是仅属于当前 generation 的 VM 值，不是新加载的 Swift metadata。
 - 新增普通函数、private 方法和计算属性会作为同一 image 的普通函数、getter 或 setter 被传递发现并编译，不要求它们预先出现在 Shell EntryIndex 中。patch-local `final class` 具有 HLVM 自己的引用 identity、字段 storage 和方法调用；纯 HLVM class 仍不能跨原生边界。
 - 新增 `final` class 可以选择一个 HLXI 已冻结、`NSObject` 兼容的 reference superclass。Runtime 为每个不可变 image 注册 Objective-C host，使对象能以该 superclass（包括 `UIViewController` 或项目基类）的身份交给原生代码。当前 hosted profile 仅支持继承的无参初始化、无新增 stored property，以及无参或单个 `Bool` 参数的 `Void` override；原生侧不能识别补丁新增的 Swift 具体类型。
 - 同步补丁内 `inout` 与 `mutating` helper，并受 Address、access、alias、ownership、同 frame/同 block 规则验证；其中包括编译器为捕获可变局部变量的 `defer` helper 生成的 `@inout_aliasable` / `@closureCapture $*T` 物理 convention。
-- 捕获 copyable VM-managed 值的同步补丁内 closure。它包括同 image helper 的 `@escaping` 参数、从同 image 函数把 closure 返回给调用者，以及 closure 再捕获另一个 closure；该值必须在同一次固定 generation 的 HLVM invocation 内用完。返回与嵌套捕获语义由 `escaping-closure-values-1` 独立门禁，不能因为基础 closure capability 存在就默认放行。另支持不再包含 archetype、metadata 或 witness 依赖的编译器完全具体化 specialization。
+- 捕获 copyable VM-managed 值的同步补丁内 closure，包括 nonthrowing 与 throwing 调用路径。可变局部值统一提升为与具体类型无关的 VM cell，可覆盖标量、String、Optional、Array、Dictionary、Tuple、补丁内 struct、字段投影、嵌套捕获，以及 Swift 为 escaping closure 生成的 `{ var T }` box。字段敏感的“确定/可能初始化”分析还覆盖分支初始化、条件覆盖与清理，但不会把可能初始化的值当成可读值。它包括同 image helper 的 `@escaping` 参数、从同 image 函数把 closure 返回给调用者，以及 closure 再捕获另一个 closure。具体 closure ABI 会保留每个参数的 owned/borrowed convention，包括受支持高阶操作中的 `@in_guaranteed` Optional 与 imported SDK reference value。closure 值必须在同一次固定 generation 的 HLVM invocation 内用完。返回与嵌套捕获由 `escaping-closure-values-1` 门禁，managed cell 由 `mutable-captures-1` 门禁。另支持不再包含 archetype、metadata 或 witness 依赖的编译器完全具体化 specialization。
 - 顶层无 suspension 的 `async`、`async throws` 和 `@MainActor async` entry。生成的精确 Swift wrapper 保留 ABI，HLVM 只执行已经证明不会挂起的 body。
 - VM-owned `Any`、`is`、`as?`、`as!`，以及受支持 Optional/Array/Dictionary 的递归动态转换；Swift existential metadata、native object 和线性生命周期不会进入下载字节码。
 - 完全具体的默认参数 generator。生产与开发编译器会把可达 `fA...` thunk 一起链接并纳入传递实现指纹；当前只承诺一个完整 module source set 内的 eligible 调用点。跨 module 的 public/package 默认值、非 eligible 调用点或仍需泛型 metadata 时要求完整构建。
@@ -45,10 +45,10 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - generic root，以及仍需要运行时 generic metadata、witness table、reabstraction 或动态 specialization 的执行。
 - 真正 suspension：`await`、continuation、Task、async callee、async closure、cancellation，以及跨 suspension ownership 或 generation lease。
 - actor-isolated instance root、custom global actor 和任意 executor hop；上面的受限 `@MainActor async` leaf 是不同能力。
-- 穿过 Shell Entry 或 NativeImport 边界、持久化到 native/global/property 状态，或者存活时间超过当前 HLVM invocation/generation 的 closure。throwing、async、`@Sendable`，以及 closure 自身参数或返回值仍是 closure 的高阶签名也暂不支持。
+- 穿过 Shell Entry 或 NativeImport 边界、持久化到 native/global/property 状态，或者存活时间超过当前 HLVM invocation/generation 的 closure。async、`@Sendable`，以及 closure 自身参数或返回值仍是 closure 的高阶签名暂不支持。捕获调用者拥有的 `inout` 参数也仍会 fail closed，因为它需要显式写回调用者；普通可变局部值与 Swift escape box 走上面的 managed-cell 路径。
 - 上述受限字面量判断以外的一般 `Character` 值/API；`ClosedRange`、非 `Int` Range、`stride`，以及函数局部 nominal type 声明。把不导出的补丁内 struct/enum 移到现有受监视文件的文件/module scope 后即可随补丁编译；只要它仍是 image 私有声明，就不要求重建 Shell。
 - 任意新 Swift metadata、原生侧可识别的补丁具体 class、retroactive conformance，以及修改 Shell 已有类型的 layout、superclass 或 enum case。上面的 hosted Objective-C subclass 是冻结 superclass projection，不是动态生成任意 Swift metadata。
-- Generic 或 `inout` Shell entry、noncopyable root、任意 borrowing/consuming ABI、typed-throws root、`rethrows` 与通用 unwind cleanup。
+- Generic 或 `inout` Shell entry、noncopyable root、任意 borrowing/consuming ABI、typed-throws root、上述具体标准库操作之外的通用 `rethrows`，以及通用 unwind cleanup。
 - 不受限 pointer、`unsafeBitCast`、任意 Objective-C selector/IMP、`dlopen`/`dlsym`、Mirror 字段修改与未知 builtin。
 - 目标 Shell 中没有精确 `NativeImportID` 的原生调用，即使 App 中存在名字相似的 Swift 函数。生产补丁也不能给旧 Shell 新增 framework，或首次使用发布时未冻结的 SDK 操作。上面的受管 Debug 调色板之所以可用，正是因为正常 Debug Build 已经逐项冻结了这些 ID。
 

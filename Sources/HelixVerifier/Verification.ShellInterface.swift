@@ -155,11 +155,11 @@ public struct ShellInterface: Sendable {
                     "Any in \(owner) signature requires \(Core.Capability.anyValuesV1)"
                 )
             }
-        case .local, .error, .address, .closure:
+        case .local, .error, .address, .mutableCell, .arrayBuilder, .closure:
             // Local nominal identities exist only inside one verified image and
             // therefore cannot be frozen into a Shell ABI or NativeImport catalog.
             throw Verification.Error.invalidShellInterface(
-                "patch-local nominal, Error, address, and closure values cannot appear in \(owner) signature"
+                "patch-local nominal, Error, internal storage, and closure values cannot appear in \(owner) signature"
             )
         case let .array(element), let .optional(element):
             try validateBoundaryType(

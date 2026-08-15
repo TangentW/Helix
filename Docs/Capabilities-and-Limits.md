@@ -44,7 +44,12 @@ does not by itself certify a physical device or distribution channel.
 - Array value semantics, append, `first`/`last`, `popLast`, iteration, checked
   subscript access, and value-returning updates; Dictionary construction,
   lookup, update, `removeValue(forKey:)`, and iteration for supported key and
-  value types.
+  value types. Fully concrete Array-backed `map`, `filter`, `compactMap`,
+  `reduce`, `forEach`, `first(where:)`, `contains(where:)`, and `allSatisfy`
+  use verified closure control flow and a linear, invocation-local Array
+  builder instead of repeated copy-on-write append. `Optional.map` and
+  concrete `Result.map` whose payloads are valid patch-local values use the
+  same closure path; a local `Result` cannot currently embed a native handle.
 - Structured branches, loops, switches, calls, recursion, checked business
   error edges, and local payload-carrying Error values. Real-frontend coverage
   includes ternary expressions, `repeat-while`, labeled `break`/`continue`,
@@ -73,14 +78,24 @@ does not by itself certify a physical device or distribution channel.
   access, aliasing, ownership, and same-frame/same-block restrictions. This
   includes the `@inout_aliasable`/`@closureCapture $*T` physical conventions
   emitted for mutable locals captured by compiler-generated `defer` helpers.
-- Synchronous patch-local closure values with copyable VM-managed captures.
-  This includes `@escaping` parameters on same-image helpers, returning a
-  closure from one same-image function to its caller, and a closure capturing
-  another closure. The value must be consumed inside the same pinned HLVM
-  invocation; `escaping-closure-values-1` gates the return and nested-capture
-  semantics independently from the base closure capability. Compiler-emitted
-  fully concrete specializations are also supported when no archetype,
-  metadata, or witness dependency remains.
+- Synchronous patch-local closure values with copyable VM-managed captures,
+  including nonthrowing and throwing invocation paths. Mutable local values
+  are promoted through one type-independent VM cell model, covering scalar,
+  String, Optional, Array, Dictionary, tuple, and patch-local struct storage,
+  projected fields, nested captures, and the `{ var T }` boxes emitted for
+  escaping Swift closures. Field-sensitive definite/possible initialization
+  also covers branch initialization, conditional replacement, and cleanup
+  without treating a maybe-initialized value as readable. This includes
+  `@escaping` parameters on same-image
+  helpers, returning a closure from one same-image function to its caller, and
+  a closure capturing another closure. Concrete closure ABIs preserve
+  per-parameter owned/borrowed conventions, including `@in_guaranteed`
+  Optional and imported SDK reference values used by the supported higher-order
+  operations. The value must be consumed inside the
+  same pinned HLVM invocation; `escaping-closure-values-1` gates return and
+  nested-capture semantics, while `mutable-captures-1` gates managed cells.
+  Compiler-emitted fully concrete specializations are also supported when no
+  archetype, metadata, or witness dependency remains.
 - Top-level non-suspending `async`, `async throws`, and `@MainActor async`
   entries. Exact generated Swift wrappers preserve their ABI while HLVM runs a
   body proven not to suspend.
@@ -131,8 +146,11 @@ does not by itself certify a physical device or distribution channel.
   hops. The limited `@MainActor async` leaf case above is distinct.
 - A closure crossing a Shell Entry or NativeImport boundary, being persisted in
   native/global/property state, or outliving its pinned HLVM invocation or
-  generation. Throwing, async, `@Sendable`, and closure signatures whose own
-  parameter or result is another closure also remain unsupported.
+  generation. Async, `@Sendable`, and closure signatures whose own parameter
+  or result is another closure remain unsupported. Capturing a caller-owned
+  `inout` parameter also remains fail-closed because it requires explicit
+  writeback to the caller; ordinary mutable locals and Swift escape boxes use
+  the managed-cell path above.
 - General `Character` values/APIs beyond the bounded literal predicate above;
   `ClosedRange`, non-`Int` ranges, `stride`, and function-local nominal type
   declarations. Move a non-exported patch-local struct or enum to file/module
@@ -143,7 +161,8 @@ does not by itself certify a physical device or distribution channel.
   superclass, or enum cases. The hosted Objective-C subclass above is a frozen
   superclass projection, not arbitrary Swift metadata generation.
 - Generic or `inout` Shell entries, noncopyable roots, arbitrary borrowing and
-  consuming ABI, typed-throws roots, `rethrows`, and general unwind cleanup.
+  consuming ABI, typed-throws roots, general `rethrows` outside the concrete
+  standard-library operations listed above, and general unwind cleanup.
 - Unrestricted pointers, `unsafeBitCast`, arbitrary Objective-C selector/IMP,
   `dlopen`/`dlsym`, Mirror-driven field mutation, and unknown builtins.
 - A native call that does not have an exact `NativeImportID` in the target

@@ -45,21 +45,40 @@ public enum AccessKind: String, Codable, Hashable, Sendable {
 
 public struct ClosureSignature: Codable, Hashable, Sendable, CustomStringConvertible {
     public var parameters: [Bytecode.ValueType]
+    /// Invocation ownership is part of a closure's callable ABI. In
+    /// particular, generic Swift callbacks commonly borrow nontrivial values;
+    /// treating every dynamic call as consuming would either reject those
+    /// callbacks or force type-specific copies in each higher-order lowering.
+    public var parameterConventions: [Bytecode.ParameterConvention]
     public var result: Bytecode.ValueType
     public var effects: Core.Effects
 
     public init(
         parameters: [Bytecode.ValueType],
+        parameterConventions: [Bytecode.ParameterConvention],
         result: Bytecode.ValueType,
         effects: Core.Effects = .init()
     ) {
         self.parameters = parameters
+        self.parameterConventions = parameterConventions
         self.result = result
         self.effects = effects
     }
 
     public var description: String {
-        let arguments = parameters.map(\.description).joined(separator: ", ")
+        guard parameterConventions.count == parameters.count else {
+            return "<invalid closure signature: \(parameters.count) parameters, "
+                + "\(parameterConventions.count) conventions>"
+        }
+        let arguments = zip(parameters, parameterConventions).map {
+            parameter, convention in
+            let prefix = switch convention {
+            case .owned: ""
+            case .borrowed: "@borrowed "
+            case .inout: "@inout "
+            }
+            return prefix + parameter.description
+        }.joined(separator: ", ")
         return "(\(arguments)) -> \(result)"
     }
 }
@@ -84,6 +103,8 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
     case local(Bytecode.LocalTypeKey)
     case error
     case address(Bytecode.ValueType)
+    case mutableCell(Bytecode.ValueType)
+    case arrayBuilder(Bytecode.ValueType)
     case closure(Bytecode.ClosureSignature)
     case tuple([Bytecode.ValueType])
     case optional(Bytecode.ValueType)
@@ -98,14 +119,14 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
             elements.allSatisfy(\.isTrivial)
         case let .optional(wrapped):
             wrapped.isTrivial
-        case .string, .any, .array, .dictionary, .native, .local, .error, .address,
-             .closure:
+        case .string, .any, .array, .dictionary, .native, .local, .error,
+             .address, .mutableCell, .arrayBuilder, .closure:
             false
         }
     }
 
-    /// Only native values need explicit linear lifetime proof. Swift-managed
-    /// values stored inside `VM.Value` release themselves with their register.
+    /// Native values and invocation-local builders need explicit linear
+    /// lifetime proof. Other Swift-managed values release with their register.
     public var requiresLinearOwnership: Bool {
         switch self {
         case .native:
@@ -118,8 +139,10 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
             element.requiresLinearOwnership
         case let .dictionary(key, value):
             key.requiresLinearOwnership || value.requiresLinearOwnership
-        case .void, .never, .bool, .integer, .float, .string, .any, .local, .error,
-             .address, .closure:
+        case .arrayBuilder:
+            true
+        case .void, .never, .bool, .integer, .float, .string, .any, .local,
+             .error, .address, .mutableCell, .closure:
             false
         }
     }
@@ -139,6 +162,8 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case let .local(key): key.description
         case .error: "any Error"
         case let .address(pointee): "@address<\(pointee)>"
+        case let .mutableCell(pointee): "@mutableCell<\(pointee)>"
+        case let .arrayBuilder(element): "@arrayBuilder<\(element)>"
         case let .closure(signature): "@closure\(signature)"
         case let .tuple(elements): "(\(elements.map(\.description).joined(separator: ", ")))"
         case let .optional(wrapped): "Optional<\(wrapped)>"
@@ -219,6 +244,10 @@ public enum ComparisonPredicate: String, Codable, Hashable, Sendable {
 public enum StackStoreMode: String, Codable, Hashable, Sendable {
     case initialize
     case assign
+    /// Stores a complete value whether the destination is currently
+    /// initialized or not. This models Swift's conditional-initialization
+    /// cleanup without exposing unchecked memory operations.
+    case replace
 }
 
 public enum StackLoadMode: String, Codable, Hashable, Sendable {
@@ -297,11 +326,30 @@ public enum Instruction: Codable, Hashable, Sendable {
         mode: Bytecode.StackLoadMode
     )
     case destroyStack(Bytecode.StackSlot)
+    case destroyStackIfInitialized(Bytecode.StackSlot)
     case stackAddress(result: Bytecode.Register, slot: Bytecode.StackSlot)
-    case projectStructAddress(
+    case projectAggregateAddress(
         result: Bytecode.Register,
         base: Bytecode.Register,
         fieldIndex: UInt32
+    )
+    case makeMutableCell(
+        result: Bytecode.Register,
+        initialValue: Bytecode.Register?
+    )
+    case projectMutableCell(
+        result: Bytecode.Register,
+        cell: Bytecode.Register,
+        fieldIndex: UInt32
+    )
+    case loadMutableCell(
+        result: Bytecode.Register,
+        cell: Bytecode.Register
+    )
+    case storeMutableCell(
+        cell: Bytecode.Register,
+        source: Bytecode.Register,
+        mode: Bytecode.StackStoreMode
     )
     case allocateObject(result: Bytecode.Register)
     case projectObjectAddress(
@@ -421,6 +469,15 @@ public enum Instruction: Codable, Hashable, Sendable {
         array: Bytecode.Register,
         value: Bytecode.Register
     )
+    case makeArrayBuilder(result: Bytecode.Register)
+    case arrayBuilderAppend(
+        builder: Bytecode.Register,
+        value: Bytecode.Register
+    )
+    case finishArrayBuilder(
+        result: Bytecode.Register,
+        builder: Bytecode.Register
+    )
     case arrayUpdate(
         result: Bytecode.Register,
         array: Bytecode.Register,
@@ -501,6 +558,12 @@ public enum Instruction: Codable, Hashable, Sendable {
         closure: Bytecode.Register,
         arguments: [Bytecode.Register]
     )
+    case closureTryApply(
+        closure: Bytecode.Register,
+        arguments: [Bytecode.Register],
+        normalTarget: Bytecode.BlockID,
+        errorTarget: Bytecode.BlockID
+    )
     case tryApply(
         function: Bytecode.FunctionID,
         arguments: [Bytecode.Register],
@@ -546,7 +609,12 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .unwrapOptional(result, _),
              let .loadStack(result, _, _),
              let .stackAddress(result, _),
-             let .projectStructAddress(result, _, _),
+             let .projectAggregateAddress(result, _, _),
+             let .makeMutableCell(result, _),
+             let .projectMutableCell(result, _, _),
+             let .loadMutableCell(result, _),
+             let .makeArrayBuilder(result),
+             let .finishArrayBuilder(result, _),
              let .allocateObject(result),
              let .projectObjectAddress(result, _, _),
              let .projectHostedObject(result, _),
@@ -596,9 +664,12 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .closureApply(result, _, _):
             result.map { [$0] } ?? []
         case .destroyValue, .switchEnum, .storeStack, .destroyStack,
+             .destroyStackIfInitialized,
+             .storeMutableCell, .arrayBuilderAppend,
              .hostedSuperApply, .endAccess,
              .storeAddress, .switchOptional, .branch,
-             .conditionalBranch, .tryApply, .entryTryApply, .nativeTryApply,
+             .conditionalBranch, .closureTryApply, .tryApply,
+             .entryTryApply, .nativeTryApply,
              .returnValue, .throwError, .trap:
             []
         }
@@ -607,7 +678,8 @@ public enum Instruction: Codable, Hashable, Sendable {
     public var operandRegisters: [Bytecode.Register] {
         switch self {
         case .constantInteger, .constantBool, .constantFloat, .constantString,
-             .makeOptionalNone, .loadStack, .destroyStack, .stackAddress,
+             .makeOptionalNone, .loadStack, .destroyStack,
+             .destroyStackIfInitialized, .stackAddress,
              .allocateObject, .trap:
             []
         case let .copyValue(_, source), let .moveValue(_, source), let .destroyValue(source):
@@ -640,8 +712,15 @@ public enum Instruction: Codable, Hashable, Sendable {
             [optional]
         case let .storeStack(_, source, _):
             [source]
-        case let .projectStructAddress(_, base, _):
+        case let .projectAggregateAddress(_, base, _):
             [base]
+        case let .makeMutableCell(_, initialValue):
+            initialValue.map { [$0] } ?? []
+        case let .projectMutableCell(_, cell, _),
+             let .loadMutableCell(_, cell):
+            [cell]
+        case let .storeMutableCell(cell, source, _):
+            [cell, source]
         case let .projectObjectAddress(_, object, _):
             [object]
         case let .projectHostedObject(_, object):
@@ -686,6 +765,12 @@ public enum Instruction: Codable, Hashable, Sendable {
             [array, value]
         case let .arrayAppend(_, array, value):
             [array, value]
+        case .makeArrayBuilder:
+            []
+        case let .arrayBuilderAppend(builder, value):
+            [builder, value]
+        case let .finishArrayBuilder(_, builder):
+            [builder]
         case let .arrayUpdate(_, array, index, value):
             [array, index, value]
         case let .arrayPopLast(_, _, array):
@@ -716,6 +801,8 @@ public enum Instruction: Codable, Hashable, Sendable {
             captures
         case let .closureApply(_, closure, arguments):
             [closure] + arguments
+        case let .closureTryApply(closure, arguments, _, _):
+            [closure] + arguments
         case let .tryApply(_, arguments, _, _),
              let .entryTryApply(_, arguments, _, _),
              let .nativeTryApply(_, arguments, _, _):
@@ -729,8 +816,9 @@ public enum Instruction: Codable, Hashable, Sendable {
 
     public var isTerminator: Bool {
         switch self {
-        case .switchOptional, .switchEnum, .branch, .conditionalBranch, .tryApply,
-             .entryTryApply, .nativeTryApply, .returnValue, .throwError, .trap:
+        case .switchOptional, .switchEnum, .branch, .conditionalBranch,
+             .closureTryApply, .tryApply, .entryTryApply, .nativeTryApply,
+             .returnValue, .throwError, .trap:
             true
         default: false
         }

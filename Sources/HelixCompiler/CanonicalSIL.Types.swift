@@ -5,6 +5,28 @@ import HelixInterface
 
 extension CanonicalSIL {
 public struct TypeEnvironment: Sendable {
+    indirect enum StructFieldPlan: Sendable {
+        case parameter(index: Int, type: Bytecode.ValueType)
+        case tuple(
+            type: Bytecode.ValueType,
+            elements: [StructFieldPlan]
+        )
+    }
+
+    struct StructFactory: Sendable {
+        var key: Bytecode.LocalTypeKey
+        var fieldPlans: [StructFieldPlan]
+        var physicalParameterTypes: [Bytecode.ValueType]
+    }
+
+    enum ZeroSizedAggregate: Sendable {
+        case tuple([Bytecode.ValueType])
+        case structure(
+            key: Bytecode.LocalTypeKey,
+            fields: [Bytecode.LocalStructField]
+        )
+    }
+
     private struct RawField: Sendable {
         var name: String
         var type: String
@@ -222,7 +244,7 @@ public struct TypeEnvironment: Sendable {
     }
 
     private var rawDefinitions: [Bytecode.LocalTypeKey: RawDefinition]
-    private var structFactories: [String: Bytecode.LocalTypeKey]
+    private var structFactories: [String: StructFactory]
     private var classAllocators: [String: Bytecode.LocalTypeKey]
     private var requiresTypedErrors: Bool
     private var nativeTypes: [String: Core.TypeID]
@@ -270,8 +292,8 @@ public struct TypeEnvironment: Sendable {
             || text.contains("Result<")
             || rawDefinitions.values.contains(where: Self.hasStoredErrorPayload)
         for function in functions {
-            if let key = try detectStructFactory(function) {
-                structFactories[function.mangledName] = key
+            if let factory = try detectStructFactory(function) {
+                structFactories[function.mangledName] = factory
             }
             if let key = try detectClassAllocator(function) {
                 classAllocators[function.mangledName] = key
@@ -314,7 +336,9 @@ public struct TypeEnvironment: Sendable {
             }
             if let local = localMatches.first {
                 result.rawDefinitions.removeValue(forKey: local)
-                result.structFactories = result.structFactories.filter { $0.value != local }
+                result.structFactories = result.structFactories.filter {
+                    $0.value.key != local
+                }
                 result.classAllocators = result.classAllocators.filter { $0.value != local }
             }
             var aliases = [canonicalName]
@@ -344,6 +368,10 @@ public struct TypeEnvironment: Sendable {
             nativeTypeKinds[id] == .reference
         case let .optional(wrapped):
             containsReferenceNativeValue(wrapped)
+        case let .mutableCell(pointee):
+            containsReferenceNativeValue(pointee)
+        case let .arrayBuilder(element):
+            containsReferenceNativeValue(element)
         case let .tuple(elements):
             elements.contains(where: containsReferenceNativeValue)
         case .array, .dictionary:
@@ -414,10 +442,11 @@ public struct TypeEnvironment: Sendable {
     ) throws -> Bytecode.ValueType {
         var type = raw.trimmingCharacters(in: .whitespaces)
         if let pointee = explicitAddressPointee(in: type) {
-            return .address(try resolve(
-                pointee,
-                relativeTo: parentScope
-            ))
+            return .address(
+                ValueRepresentation.storable(
+                    try resolve(pointee, relativeTo: parentScope)
+                )
+            )
         }
         var removedPrefix = true
         while removedPrefix {
@@ -447,10 +476,27 @@ public struct TypeEnvironment: Sendable {
         // Ownership decoration is orthogonal to the pointee identity, so
         // recognize the address again after removing those decorations.
         if let pointee = explicitAddressPointee(in: type) {
-            return .address(try resolve(
-                pointee,
-                relativeTo: parentScope
-            ))
+            return .address(
+                ValueRepresentation.storable(
+                    try resolve(pointee, relativeTo: parentScope)
+                )
+            )
+        }
+
+        if type.hasPrefix("{ "), type.hasSuffix(" }") {
+            let contents = String(type.dropFirst(2).dropLast(2))
+                .trimmingCharacters(in: .whitespaces)
+            guard contents.hasPrefix("var ") else {
+                throw CanonicalSIL.LoweringError.unsupportedType(raw)
+            }
+            return .mutableCell(
+                ValueRepresentation.storable(
+                    try resolve(
+                        String(contents.dropFirst("var ".count)),
+                        relativeTo: parentScope
+                    )
+                )
+            )
         }
 
         if type.contains(" -> ") {
@@ -462,18 +508,22 @@ public struct TypeEnvironment: Sendable {
         for optionalPrefix in ["Optional<", "Swift.Optional<"]
         where type.hasPrefix(optionalPrefix) && type.hasSuffix(">") {
             return .optional(
-                try resolve(
-                    genericBody(type, prefix: optionalPrefix),
-                    relativeTo: parentScope
+                ValueRepresentation.storable(
+                    try resolve(
+                        genericBody(type, prefix: optionalPrefix),
+                        relativeTo: parentScope
+                    )
                 )
             )
         }
         for arrayPrefix in ["Array<", "Swift.Array<"]
         where type.hasPrefix(arrayPrefix) && type.hasSuffix(">") {
             return .array(
-                try resolve(
-                    genericBody(type, prefix: arrayPrefix),
-                    relativeTo: parentScope
+                ValueRepresentation.storable(
+                    try resolve(
+                        genericBody(type, prefix: arrayPrefix),
+                        relativeTo: parentScope
+                    )
                 )
             )
         }
@@ -485,7 +535,9 @@ public struct TypeEnvironment: Sendable {
                     "Dictionary generic arguments must contain Key and Value"
                 )
             }
-            let key = try resolve(components[0], relativeTo: parentScope)
+            let key = ValueRepresentation.storable(
+                try resolve(components[0], relativeTo: parentScope)
+            )
             guard Self.isSupportedDictionaryKey(key) else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
                     "Dictionary key \(key)"
@@ -493,7 +545,9 @@ public struct TypeEnvironment: Sendable {
             }
             return .dictionary(
                 key: key,
-                value: try resolve(components[1], relativeTo: parentScope)
+                value: ValueRepresentation.storable(
+                    try resolve(components[1], relativeTo: parentScope)
+                )
             )
         }
         for resultPrefix in ["Result<", "Swift.Result<"]
@@ -504,8 +558,12 @@ public struct TypeEnvironment: Sendable {
                     "Result generic arguments must contain Success and Failure"
                 )
             }
-            let success = try resolve(components[0], relativeTo: parentScope)
-            let failure = try resolve(components[1], relativeTo: parentScope)
+            let success = ValueRepresentation.storable(
+                try resolve(components[0], relativeTo: parentScope)
+            )
+            let failure = ValueRepresentation.storable(
+                try resolve(components[1], relativeTo: parentScope)
+            )
             return .local(resultKey(success: success, failure: failure))
         }
         if type.hasPrefix("("), type.hasSuffix(")") {
@@ -513,7 +571,12 @@ public struct TypeEnvironment: Sendable {
             if elements.count == 1, elements[0].isEmpty { return .void }
             return .tuple(
                 try elements.map {
-                    try resolve(removeTupleLabel($0), relativeTo: parentScope)
+                    ValueRepresentation.storable(
+                        try resolve(
+                            removeTupleLabel($0),
+                            relativeTo: parentScope
+                        )
+                    )
                 }
             )
         }
@@ -535,13 +598,16 @@ public struct TypeEnvironment: Sendable {
         case "UInt64", "Swift.UInt64": return .integer(bitWidth: 64, signed: false)
         case "Builtin.Int1": return .bool
         case "Bool", "Swift.Bool": return .bool
-        case "Float", "Swift.Float", "Builtin.FPIEEE32": return .float(bitWidth: 32)
-        case "Double", "Swift.Double", "Builtin.FPIEEE64": return .float(bitWidth: 64)
+        case "Float", "Swift.Float", "Float32", "Builtin.FPIEEE32":
+            return .float(bitWidth: 32)
+        case "Double", "Swift.Double", "Float64", "Builtin.FPIEEE64":
+            return .float(bitWidth: 64)
         case "CGFloat", "CoreFoundation.CGFloat", "CoreGraphics.CGFloat":
             return .float(bitWidth: 64)
         case "String", "Swift.String": return .string
         case "Any", "Swift.Any": return .any
         case "any Error", "Swift.Error": return preservesTypedErrors ? .error : .string
+        case "Void", "Swift.Void": return .void
         case "Never", "Swift.Never": return .never
         default:
             if let id = nativeTypes[type] { return .native(id) }
@@ -603,7 +669,9 @@ public struct TypeEnvironment: Sendable {
         _ raw: String,
         relativeTo parentScope: String?
     ) throws -> Bytecode.ClosureSignature {
-        var type = raw.trimmingCharacters(in: .whitespaces)
+        var type = try CanonicalSIL.SubstitutedFunctionType
+            .specialize(raw)
+            .trimmingCharacters(in: .whitespaces)
         var removedAttribute = true
         while removedAttribute {
             removedAttribute = false
@@ -619,9 +687,7 @@ public struct TypeEnvironment: Sendable {
         guard !type.hasPrefix("@convention("),
               !type.hasPrefix("@async "),
               !type.contains(" @async "),
-              !type.hasPrefix("@error "),
-              !type.contains(" @error "),
-              let arrow = type.range(of: " -> ", options: .backwards)
+              let arrow = outerClosureArrow(in: type)
         else {
             throw CanonicalSIL.LoweringError.unsupportedType(raw)
         }
@@ -634,21 +700,137 @@ public struct TypeEnvironment: Sendable {
         }
         let components = splitTopLevelTuple(parameterTuple)
         let parameters: [Bytecode.ValueType]
+        let parameterConventions: [Bytecode.ParameterConvention]
         if components.count == 1, components[0].isEmpty {
             parameters = []
+            parameterConventions = []
         } else {
-            parameters = try components.map {
-                try resolve(removeTupleLabel($0), relativeTo: parentScope)
+            let spellings = components.map(removeTupleLabel)
+            parameters = try spellings.map {
+                ValueRepresentation.storable(
+                    try resolve($0, relativeTo: parentScope)
+                )
+            }
+            parameterConventions = zip(spellings, parameters).map {
+                spelling, parameter in
+                closureParameterConvention(
+                    spelling,
+                    parameter: parameter
+                )
             }
         }
-        let result = try resolve(
-            String(type[arrow.upperBound...]),
+        let resultText = String(type[arrow.upperBound...])
+            .trimmingCharacters(in: .whitespaces)
+        let resultComponents = splitTopLevelTuple(resultText)
+        let result: Bytecode.ValueType
+        let mayThrow: Bool
+        if resultComponents.count == 1,
+           let error = try closureErrorChannel(
+            resultComponents[0],
             relativeTo: parentScope
+           ) {
+            result = .void
+            mayThrow = error
+        } else if resultComponents.count == 2,
+                  let error = try closureErrorChannel(
+                    resultComponents[1],
+                    relativeTo: parentScope
+                  ) {
+            result = try resolve(
+                resultComponents[0],
+                relativeTo: parentScope
+            )
+            mayThrow = error
+        } else {
+            result = try resolve(resultText, relativeTo: parentScope)
+            mayThrow = false
+        }
+        return .init(
+            parameters: parameters,
+            parameterConventions: parameterConventions,
+            result: result,
+            effects: .init(mayThrow: mayThrow)
         )
-        return .init(parameters: parameters, result: result)
     }
 
-    func structFactory(_ mangledName: String) -> Bytecode.LocalTypeKey? {
+    private func closureParameterConvention(
+        _ raw: String,
+        parameter: Bytecode.ValueType
+    ) -> Bytecode.ParameterConvention {
+        let spelling = raw.trimmingCharacters(in: .whitespaces)
+            .trimmingPrefix("$")
+        let explicitlyBorrowed = spelling.hasPrefix("@guaranteed ")
+            || spelling.hasPrefix("@unowned ")
+            || spelling.hasPrefix("@in_guaranteed ")
+        return parameter.requiresLinearOwnership && explicitlyBorrowed
+            ? .borrowed
+            : .owned
+    }
+
+    private func closureErrorChannel(
+        _ raw: String,
+        relativeTo parentScope: String?
+    ) throws -> Bool? {
+        let value = raw.trimmingCharacters(in: .whitespaces)
+        let prefixes = ["@error_indirect ", "@error "]
+        guard let prefix = prefixes.first(where: value.hasPrefix) else {
+            return nil
+        }
+        let type = try resolve(
+            String(value.dropFirst(prefix.count)),
+            relativeTo: parentScope
+        )
+        switch type {
+        case .never:
+            return false
+        case .string, .error:
+            return true
+        default:
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "closure has a non-Error error result"
+            )
+        }
+    }
+
+    private func outerClosureArrow(
+        in text: String
+    ) -> Range<String.Index>? {
+        var parenthesisDepth = 0
+        var angleDepth = 0
+        var bracketDepth = 0
+        var index = text.startIndex
+        while index < text.endIndex {
+            switch text[index] {
+            case "(": parenthesisDepth += 1
+            case ")": parenthesisDepth -= 1
+            case "<": angleDepth += 1
+            case ">":
+                let previous = index > text.startIndex
+                    ? text[text.index(before: index)]
+                    : nil
+                if previous != "-" { angleDepth -= 1 }
+            case "[": bracketDepth += 1
+            case "]": bracketDepth -= 1
+            case "-" where parenthesisDepth == 0
+                    && angleDepth == 0
+                    && bracketDepth == 0:
+                let next = text.index(after: index)
+                if next < text.endIndex, text[next] == ">" {
+                    return index..<text.index(after: next)
+                }
+            default:
+                break
+            }
+            guard parenthesisDepth >= 0,
+                  angleDepth >= 0,
+                  bracketDepth >= 0
+            else { return nil }
+            index = text.index(after: index)
+        }
+        return nil
+    }
+
+    func structFactory(_ mangledName: String) -> StructFactory? {
         structFactories[mangledName]
     }
 
@@ -682,9 +864,11 @@ public struct TypeEnvironment: Sendable {
                     fields: try fields.map {
                         .init(
                             name: $0.name,
-                            type: try resolve(
-                                $0.type,
-                                relativeTo: raw.parentScope
+                            type: ValueRepresentation.storable(
+                                try resolve(
+                                    $0.type,
+                                    relativeTo: raw.parentScope
+                                )
                             )
                         )
                     }
@@ -697,16 +881,20 @@ public struct TypeEnvironment: Sendable {
                         case 0:
                             payload = nil
                         case 1:
-                            payload = try resolve(
-                                removeTupleLabel(item.associatedTypes[0]),
-                                relativeTo: raw.parentScope
+                            payload = ValueRepresentation.storable(
+                                try resolve(
+                                    removeTupleLabel(item.associatedTypes[0]),
+                                    relativeTo: raw.parentScope
+                                )
                             )
                         default:
                             payload = .tuple(
                                 try item.associatedTypes.map {
-                                    try resolve(
-                                        removeTupleLabel($0),
-                                        relativeTo: raw.parentScope
+                                    ValueRepresentation.storable(
+                                        try resolve(
+                                            removeTupleLabel($0),
+                                            relativeTo: raw.parentScope
+                                        )
                                     )
                                 }
                             )
@@ -744,9 +932,11 @@ public struct TypeEnvironment: Sendable {
                     fields: try fields.map {
                         .init(
                             name: $0.name,
-                            type: try resolve(
-                                $0.type,
-                                relativeTo: raw.parentScope
+                            type: ValueRepresentation.storable(
+                                try resolve(
+                                    $0.type,
+                                    relativeTo: raw.parentScope
+                                )
                             )
                         )
                     },
@@ -772,8 +962,18 @@ public struct TypeEnvironment: Sendable {
                 key: key,
                 kind: .enumeration(
                     cases: [
-                        .init(name: "success", payloadType: try resolve(arguments[0])),
-                        .init(name: "failure", payloadType: try resolve(arguments[1])),
+                        .init(
+                            name: "success",
+                            payloadType: ValueRepresentation.storable(
+                                try resolve(arguments[0])
+                            )
+                        ),
+                        .init(
+                            name: "failure",
+                            payloadType: ValueRepresentation.storable(
+                                try resolve(arguments[1])
+                            )
+                        ),
                     ]
                 )
             )
@@ -791,7 +991,9 @@ public struct TypeEnvironment: Sendable {
             switch type {
             case let .local(key):
                 if seen.insert(key).inserted { pending.append(key) }
-            case let .array(element), let .optional(element), let .address(element):
+            case let .array(element), let .optional(element),
+                 let .address(element), let .mutableCell(element),
+                 let .arrayBuilder(element):
                 collect(element)
             case let .dictionary(key, value):
                 collect(key)
@@ -885,7 +1087,9 @@ public struct TypeEnvironment: Sendable {
                         depths: &depths
                     )
                 }
-            case let .array(element), let .optional(element), let .address(element):
+            case let .array(element), let .optional(element),
+                 let .address(element), let .mutableCell(element),
+                 let .arrayBuilder(element):
                 try typeDepth(element) + 1
             case let .dictionary(key, value):
                 try max(typeDepth(key), typeDepth(value)) + 1
@@ -924,6 +1128,61 @@ public struct TypeEnvironment: Sendable {
             throw CanonicalSIL.LoweringError.malformedSIL("\(key) is not a struct")
         }
         return fields
+    }
+
+    /// Returns the recursively known aggregate shape only when Swift can
+    /// erase every stored component from its physical calling convention.
+    /// Enums still carry a discriminator and classes still carry identity, so
+    /// neither is zero-sized even when its declared payload is empty.
+    func zeroSizedAggregate(
+        for type: Bytecode.ValueType
+    ) throws -> ZeroSizedAggregate? {
+        var visiting = Set<Bytecode.LocalTypeKey>()
+        guard try isStaticallyZeroSized(type, visiting: &visiting) else {
+            return nil
+        }
+        switch type {
+        case let .tuple(elements):
+            return .tuple(elements)
+        case let .local(key):
+            return .structure(key: key, fields: try structFields(for: key))
+        default:
+            return nil
+        }
+    }
+
+    func isStaticallyZeroSized(
+        _ type: Bytecode.ValueType
+    ) throws -> Bool {
+        var visiting = Set<Bytecode.LocalTypeKey>()
+        return try isStaticallyZeroSized(type, visiting: &visiting)
+    }
+
+    private func isStaticallyZeroSized(
+        _ type: Bytecode.ValueType,
+        visiting: inout Set<Bytecode.LocalTypeKey>
+    ) throws -> Bool {
+        switch type {
+        case let .tuple(elements):
+            for element in elements
+            where try !isStaticallyZeroSized(element, visiting: &visiting) {
+                return false
+            }
+            return true
+        case let .local(key):
+            guard visiting.insert(key).inserted else { return false }
+            defer { visiting.remove(key) }
+            guard case let .structure(fields) = try definition(for: key).kind else {
+                return false
+            }
+            for field in fields
+            where try !isStaticallyZeroSized(field.type, visiting: &visiting) {
+                return false
+            }
+            return true
+        default:
+            return false
+        }
     }
 
     func classFields(for key: Bytecode.LocalTypeKey) throws -> [Bytecode.LocalStructField] {
@@ -1123,11 +1382,13 @@ public struct TypeEnvironment: Sendable {
 
     private func detectStructFactory(
         _ function: CanonicalSIL.Function
-    ) throws -> Bytecode.LocalTypeKey? {
+    ) throws -> StructFactory? {
         guard let shape = try structFactoryShape(function) else { return nil }
         let key = shape.key
         let fields = shape.fields
         let rawResult = shape.rawResult
+        let fieldPlans = shape.fieldPlans
+        let physicalParameterTypes = shape.physicalParameterTypes
 
         let semanticLines = function.body.split(separator: "\n").map { rawLine in
             CanonicalSIL.DebugMetadata.strippingComment(from: String(rawLine))
@@ -1135,53 +1396,163 @@ public struct TypeEnvironment: Sendable {
         }.filter {
             !$0.isEmpty && !$0.hasPrefix("bb") && !$0.hasPrefix("debug_value")
         }
-        if semanticLines.count == 2,
-           let construction = captures(
+
+        // A synthesized initializer for a fieldless struct reads its
+        // uninitialized `self` stack slot. This is valid only because the type
+        // has a single possible value. Accept that exact side-effect-free SIL
+        // shape rather than treating arbitrary zero-argument factories as
+        // constructors.
+        if fields.isEmpty, !rawResult.hasPrefix("@out "),
+           semanticLines.count == 4,
+           let allocation = captures(
             semanticLines[0],
-            pattern: #"^(%[0-9]+) = struct \$([^ ]+) \((.*)\)$"#
-           ), construction[1] == key.rawValue,
-           let returned = captures(
+            pattern: #"^(%[0-9]+) = alloc_stack(?: \[[^]]+\])? \$([^,]+)(?:,.*)?$"#
+           ), localKey(for: allocation[1]) == key,
+           let load = captures(
             semanticLines[1],
+            pattern: #"^(%[0-9]+) = load(?: \[(?:trivial|copy|take)\])? (%[0-9]+)$"#
+           ), load[1] == allocation[0],
+           let deallocation = captures(
+            semanticLines[2],
+            pattern: #"^dealloc_stack (%[0-9]+)$"#
+           ), deallocation[0] == allocation[0],
+           let returned = captures(
+            semanticLines[3],
             pattern: #"^return (%[0-9]+)$"#
-           ), returned[0] == construction[0],
-           splitTopLevel(construction[2]) == fields.indices.map({ "%\($0)" }) {
-            return key
+           ), returned[0] == load[0] {
+            return .init(
+                key: key,
+                fieldPlans: fieldPlans,
+                physicalParameterTypes: physicalParameterTypes
+            )
         }
 
-        guard rawResult.hasPrefix("@out "),
-              semanticLines.count == fields.count * 2 + 2
-        else { return nil }
-        var lineIndex = 0
-        for (fieldIndex, field) in fields.enumerated() {
-            guard let projection = captures(
-                semanticLines[lineIndex],
-                pattern: #"^(%[0-9]+) = struct_element_addr %0, #(.+)\.([^.]+)$"#
-            ), projection[1] == key.rawValue,
-               projection[2] == field.name
-            else { return nil }
-            let source = "%\(fieldIndex + 1)"
-            let destination = projection[0]
-            let initialization = semanticLines[lineIndex + 1]
-            let copiesAddress = captures(
-                initialization,
-                pattern: #"^copy_addr(?: \[take\])? (%[0-9]+) to \[init\] (%[0-9]+)$"#
-            ).map { $0 == [source, destination] } ?? false
-            let storesValue = captures(
-                initialization,
-                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init)\] )?(%[0-9]+)$"#
-            ).map { $0 == [source, destination] } ?? false
-            guard copiesAddress || storesValue else { return nil }
-            lineIndex += 2
+        if !rawResult.hasPrefix("@out "), semanticLines.count >= 2,
+           let construction = captures(
+            semanticLines[semanticLines.count - 2],
+            pattern: #"^(%[0-9]+) = struct \$([^ ]+) \((.*)\)$"#
+           ), localKey(for: construction[1]) == key,
+           let returned = captures(
+            semanticLines[semanticLines.count - 1],
+            pattern: #"^return (%[0-9]+)$"#
+           ), returned[0] == construction[0] {
+            var tupleDefinitions: [String: [String]] = [:]
+            for line in semanticLines.dropLast(2) {
+                guard let tuple = captures(
+                    line,
+                    pattern: #"^(%[0-9]+) = tuple(?: \$\([^\n]*\))? \((.*)\)$"#
+                ) else { return nil }
+                let operands = splitTopLevel(tuple[1]).compactMap { component in
+                    component.split(separator: ":", maxSplits: 1).first.map {
+                        $0.trimmingCharacters(in: .whitespaces)
+                    }
+                }
+                tupleDefinitions[tuple[0]] = operands
+            }
+
+            func matches(
+                _ token: String,
+                plan: StructFieldPlan
+            ) -> Bool {
+                switch plan {
+                case let .parameter(index, _):
+                    return token == "%\(index)"
+                case let .tuple(_, elements):
+                    guard let operands = tupleDefinitions[token],
+                          operands.count == elements.count
+                    else { return false }
+                    return zip(operands, elements).allSatisfy(matches)
+                }
+            }
+
+            let operands = splitTopLevel(construction[2]).compactMap {
+                $0.split(separator: ":", maxSplits: 1).first.map {
+                    $0.trimmingCharacters(in: .whitespaces)
+                }
+            }
+            guard operands.count == fields.count else { return nil }
+            guard zip(operands, fieldPlans).allSatisfy(matches) else {
+                return nil
+            }
+            return .init(
+                key: key,
+                fieldPlans: fieldPlans,
+                physicalParameterTypes: physicalParameterTypes
+            )
         }
-        guard let emptyTuple = captures(
-            semanticLines[lineIndex],
+
+        guard rawResult.hasPrefix("@out "), semanticLines.count >= 2,
+              let emptyTuple = captures(
+            semanticLines[semanticLines.count - 2],
             pattern: #"^(%[0-9]+) = tuple \(\)$"#
         ), let returned = captures(
-            semanticLines[lineIndex + 1],
+            semanticLines[semanticLines.count - 1],
             pattern: #"^return (%[0-9]+)$"#
         ), returned[0] == emptyTuple[0]
         else { return nil }
-        return key
+
+        var expectedPaths: [Int: [Int]] = [:]
+        func recordExpectedPaths(
+            _ plan: StructFieldPlan,
+            path: [Int]
+        ) {
+            switch plan {
+            case let .parameter(index, _):
+                expectedPaths[index] = path
+            case let .tuple(_, elements):
+                for (index, element) in elements.enumerated() {
+                    recordExpectedPaths(element, path: path + [index])
+                }
+            }
+        }
+        for (fieldIndex, plan) in fieldPlans.enumerated() {
+            recordExpectedPaths(plan, path: [fieldIndex])
+        }
+
+        var addressPaths: [String: [Int]] = ["%0": []]
+        var initializedParameters = Set<Int>()
+        for line in semanticLines.dropLast(2) {
+            if let projection = captures(
+                line,
+                pattern: #"^(%[0-9]+) = struct_element_addr (%[0-9]+), #(.+)\.([^.]+)$"#
+            ), projection[1] == "%0", localKey(for: projection[2]) == key,
+               let fieldIndex = fields.firstIndex(where: {
+                   $0.name == projection[3]
+               }) {
+                addressPaths[projection[0]] = [fieldIndex]
+                continue
+            }
+            if let projection = captures(
+                line,
+                pattern: #"^(%[0-9]+) = tuple_element_addr (%[0-9]+), ([0-9]+)$"#
+            ), let base = addressPaths[projection[1]],
+               let index = Int(projection[2]) {
+                addressPaths[projection[0]] = base + [index]
+                continue
+            }
+            let initialization = captures(
+                line,
+                pattern: #"^copy_addr(?: \[take\])? (%[0-9]+) to \[init\] (%[0-9]+)$"#
+            ) ?? captures(
+                line,
+                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init)\] )?(%[0-9]+)$"#
+            )
+            guard let initialization,
+                  let rawParameter = Int(initialization[0].dropFirst()),
+                  rawParameter > 0,
+                  let destinationPath = addressPaths[initialization[1]],
+                  expectedPaths[rawParameter - 1] == destinationPath,
+                  initializedParameters.insert(rawParameter - 1).inserted
+            else { return nil }
+        }
+        guard initializedParameters == Set(expectedPaths.keys) else {
+            return nil
+        }
+        return .init(
+            key: key,
+            fieldPlans: fieldPlans,
+            physicalParameterTypes: physicalParameterTypes
+        )
     }
 
     private func detectClassAllocator(
@@ -1204,7 +1575,13 @@ public struct TypeEnvironment: Sendable {
 
     private func structFactoryShape(
         _ function: CanonicalSIL.Function
-    ) throws -> (key: Bytecode.LocalTypeKey, fields: [Bytecode.LocalStructField], rawResult: String)? {
+    ) throws -> (
+        key: Bytecode.LocalTypeKey,
+        fields: [Bytecode.LocalStructField],
+        fieldPlans: [StructFieldPlan],
+        physicalParameterTypes: [Bytecode.ValueType],
+        rawResult: String
+    )? {
         guard let arrow = function.loweredType.range(of: " -> ", options: .backwards) else {
             return nil
         }
@@ -1219,14 +1596,40 @@ public struct TypeEnvironment: Sendable {
               open < close
         else { return nil }
         let parameters = splitTopLevel(String(prefix[prefix.index(after: open)..<close]))
-        guard parameters.count == fields.count + 1,
+
+        var physicalParameterTypes: [Bytecode.ValueType] = []
+        func makePlan(_ type: Bytecode.ValueType) -> StructFieldPlan {
+            if case let .tuple(elements) = type {
+                return .tuple(
+                    type: type,
+                    elements: elements.map(makePlan)
+                )
+            }
+            let index = physicalParameterTypes.count
+            physicalParameterTypes.append(type)
+            return .parameter(index: index, type: type)
+        }
+        let fieldPlans = fields.map { makePlan($0.type) }
+
+        guard parameters.count == physicalParameterTypes.count + 1,
               parameters.last?.trimmingCharacters(in: .whitespaces)
                 == "@thin \(key.rawValue).Type"
         else { return nil }
-        for (parameter, field) in zip(parameters.dropLast(), fields) {
-            guard try resolve(parameter) == field.type else { return nil }
+        for (parameter, expectedType) in zip(
+            parameters.dropLast(),
+            physicalParameterTypes
+        ) {
+            guard ValueRepresentation.storable(try resolve(parameter))
+                    == expectedType
+            else { return nil }
         }
-        return (key, fields, rawResult)
+        return (
+            key,
+            fields,
+            fieldPlans,
+            physicalParameterTypes,
+            rawResult
+        )
     }
 
     private func resultKey(

@@ -722,7 +722,8 @@ extension FrontendReceipt.ManagedDebugSurface {
             isDictionaryKey(key) && isAutomaticallyBridgeable(value)
         case let .tuple(elements):
             !elements.isEmpty && elements.allSatisfy(isAutomaticallyBridgeable)
-        case .void, .never, .local, .error, .address, .closure:
+        case .void, .never, .local, .error, .address, .mutableCell,
+             .arrayBuilder, .closure:
             false
         }
     }
@@ -777,7 +778,8 @@ extension FrontendReceipt.ManagedDebugSurface {
         switch type {
         case let .native(typeID):
             typeIDs.contains(typeID)
-        case let .array(element), let .optional(element), let .address(element):
+        case let .array(element), let .optional(element), let .address(element),
+             let .mutableCell(element), let .arrayBuilder(element):
             containsNativeType(element, in: typeIDs)
         case let .dictionary(key, value):
             containsNativeType(key, in: typeIDs)

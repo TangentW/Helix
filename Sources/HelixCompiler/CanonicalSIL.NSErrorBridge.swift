@@ -6,7 +6,7 @@ extension CanonicalSIL {
 /// A fail-closed description of Clang Importer's `NSError **` thunk around a
 /// Swift-throwing Objective-C method. The physical pointer and sentinel values
 /// are compiler details; HLBC consumes the frozen logical throwing ABI.
-struct NSErrorBridgePlan {
+struct NSErrorBridgePlan: Sendable {
     struct Call: Sendable {
         var binding: CanonicalSIL.DirectCallBinding
         var argumentTokens: [String]

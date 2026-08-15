@@ -2,6 +2,7 @@ import HelixBytecode
 
 extension CanonicalSIL {
 enum SwiftCoreIntrinsic: Equatable {
+    case higherOrder(CanonicalSIL.HigherOrderIntrinsic)
     case minimum
     case maximum
     case absoluteValue
@@ -10,6 +11,7 @@ enum SwiftCoreIntrinsic: Equatable {
     case stringEqual
     case stringLess
     case stringConcat
+    case stringAppend
     case stringCount
     case stringIsEmpty
     case stringTransform(Bytecode.StringTransformOperation)
@@ -44,6 +46,26 @@ enum SwiftCoreIntrinsic: Equatable {
 
     init?(mangledName: String) {
         switch mangledName {
+        case "$sSlsE3mapySayqd__Gqd__7ElementQzqd_0_YKXEqd_0_YKs5ErrorRd_0_r0_lF":
+            self = .higherOrder(.map)
+        case "$ss14_ArrayProtocolPsE6filterySay7ElementQzGSbAEKXEKF":
+            self = .higherOrder(.filter)
+        case "$sSTsE10compactMapySayqd__Gqd__Sg7ElementQzKXEKlF":
+            self = .higherOrder(.compactMap)
+        case "$sSTsE6reduceyqd__qd___qd__qd___7ElementQztKXEtKlF":
+            self = .higherOrder(.reduce)
+        case "$sSTsE7forEachyyy7ElementQzKXEKF":
+            self = .higherOrder(.forEach)
+        case "$sSTsE5first5where7ElementQzSgSbADKXE_tKF":
+            self = .higherOrder(.firstWhere)
+        case "$sSTsE8contains5whereS2b7ElementQzKXE_tKF":
+            self = .higherOrder(.containsWhere)
+        case "$sSTsE10allSatisfyyS2b7ElementQzKXEKF":
+            self = .higherOrder(.allSatisfy)
+        case "$sSq3mapyqd_0_Sgqd_0_xqd__YKXEqd__YKs5ErrorRd__Ri_d_0_r0_lF":
+            self = .higherOrder(.optionalMap)
+        case "$ss6ResultO3mapyAByqd__q_Gqd__xXERi_d__lF":
+            self = .higherOrder(.resultMap)
         case "$ss3minyxx_xtSLRzlF": self = .minimum
         case "$ss3maxyxx_xtSLRzlF": self = .maximum
         case "$ss3absyxxSLRzs13SignedNumericRzlF": self = .absoluteValue
@@ -54,6 +76,7 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sSS2eeoiySbSS_SStFZ": self = .stringEqual
         case "$sSS1loiySbSS_SStFZ": self = .stringLess
         case "$sSS1poiyS2S_SStFZ": self = .stringConcat
+        case "$sSS2peoiyySSz_SStFZ": self = .stringAppend
         case "$sSS5countSivg": self = .stringCount
         case "$sSS7isEmptySbvg": self = .stringIsEmpty
         case "$sSS10uppercasedSSyF": self = .stringTransform(.uppercase)

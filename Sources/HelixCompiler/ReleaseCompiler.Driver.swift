@@ -520,14 +520,16 @@ extension ReleaseCompiler {
                     try generatedSignature(
                         of: $0.function,
                         environment: silTypeEnvironment,
-                        symbol: symbol
+                        symbol: symbol,
+                        kind: $0.kind
                     )
                 }
                 let semanticSignature = try semantic.map {
                     try generatedSignature(
                         of: $0.function,
                         environment: loweringTypeEnvironment,
-                        symbol: symbol
+                        symbol: symbol,
+                        kind: $0.kind
                     )
                 }
                 if let optimizedSignature, let semanticSignature,
@@ -894,13 +896,15 @@ extension ReleaseCompiler {
         private func generatedSignature(
             of function: CanonicalSIL.Function,
             environment: CanonicalSIL.TypeEnvironment,
-            symbol: String
+            symbol: String,
+            kind: Bytecode.FunctionKind
         ) throws -> ImageSignature {
             do {
                 return try CanonicalSIL.ImageFunctions.signature(
                     of: function,
                     environment: environment,
-                    symbol: symbol
+                    symbol: symbol,
+                    kind: kind
                 )
             } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
                 switch error {

@@ -69,7 +69,8 @@ enum ImageFunctions {
                 signature = try CanonicalSIL.ImageFunctions.signature(
                     of: item.function,
                     environment: typeEnvironment,
-                    symbol: symbol
+                    symbol: symbol,
+                    kind: item.kind
                 )
             } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
                 throw map(error)

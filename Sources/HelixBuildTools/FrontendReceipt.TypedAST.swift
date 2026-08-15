@@ -117,7 +117,16 @@ enum ValueTypeParser {
                       nativeTypes: nativeTypes
                   )
             else { return nil }
-            return .closure(.init(parameters: parameters, result: result))
+            return .closure(
+                .init(
+                    parameters: parameters,
+                    parameterConventions: Array(
+                        repeating: .owned,
+                        count: parameters.count
+                    ),
+                    result: result
+                )
+            )
         }
         if isEscapingClosure { return nil }
         if let wrapped = optionalWrappedType(value) {

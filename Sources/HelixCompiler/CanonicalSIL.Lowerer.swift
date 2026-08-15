@@ -57,8 +57,15 @@ public struct Lowerer: Sendable {
     private struct PendingArrayLiteral {
         var elementType: Bytecode.ValueType
         var count: Int
-        var elements: [Int: Bytecode.Register] = [:]
-        var elementComponents: [Int: [Int: Bytecode.Register]] = [:]
+        var elements: [Int: Bytecode.Register]
+        var elementComponents: [Int: [Int: Bytecode.Register]]
+
+        init(elementType: Bytecode.ValueType, count: Int) {
+            self.elementType = elementType
+            self.count = count
+            elements = [:]
+            elementComponents = [:]
+        }
     }
 
     private struct ArrayLiteralAddress {
@@ -120,12 +127,12 @@ public struct Lowerer: Sendable {
         var unavailableSetter: CanonicalSIL.UnavailableDirectCall?
     }
 
-    enum MetatypeIdentity: Equatable {
+    enum MetatypeIdentity: Equatable, Sendable {
         case native(Core.TypeID)
         case local(Bytecode.LocalTypeKey)
     }
 
-    struct ErasedMetatype: Equatable {
+    struct ErasedMetatype: Equatable, Sendable {
         var physicalIndex: Int
         var identity: MetatypeIdentity
     }
@@ -136,6 +143,7 @@ public struct Lowerer: Sendable {
         var binding: CanonicalSIL.DirectCallBinding
         var physicalParameterConventions: [Bytecode.ParameterConvention]
         var hasIndirectResult: Bool
+        var indirectErrorType: Bytecode.ValueType?
         var erasedMetatypes: [ErasedMetatype]
         var usesObjectiveCBridge: Bool
     }
@@ -148,7 +156,13 @@ public struct Lowerer: Sendable {
     private struct ExistentialProjection {
         var destination: String
         var concreteType: Bytecode.ValueType
-        var components: [Int: Bytecode.Register] = [:]
+        var components: [Int: Bytecode.Register]
+
+        init(destination: String, concreteType: Bytecode.ValueType) {
+            self.destination = destination
+            self.concreteType = concreteType
+            components = [:]
+        }
     }
 
     private struct ExistentialComponentAddress {
@@ -159,6 +173,73 @@ public struct Lowerer: Sendable {
     private struct OptionalAddressInitialization {
         var wrappedType: Bytecode.ValueType
         var payload: Bytecode.Register?
+    }
+
+    /// Lowering represents a destructive enum-payload projection as a value
+    /// take followed by writeback. The first reconstructed enum must therefore
+    /// initialize the VM storage even when the original SIL expresses an
+    /// in-place payload mutation.
+    private struct TakenOptionalPayload {
+        var root: String
+        var requiresInitialization = true
+    }
+
+    private struct ArrayHigherOrderPlan {
+        var operation: CanonicalSIL.HigherOrderIntrinsic
+        var sourceToken: String
+        var closureToken: String
+        var initialToken: String?
+        var resultDestination: String?
+        var errorDestination: String?
+        var inputType: Bytecode.ValueType
+        var closureResultType: Bytecode.ValueType
+        var callResultType: Bytecode.ValueType
+    }
+
+    private struct PreparedDirectCallArguments {
+        var arguments: [Bytecode.Register]
+        var accesses: [Bytecode.Register]
+        var temporaryOwners: [Bytecode.Register]
+    }
+
+    /// A compiler-only address can expose its SSA owner directly, while a VM
+    /// address must materialize an owned copy for a non-consuming read. Keep
+    /// that distinction explicit so callers close only the synthetic lifetime.
+    private struct BorrowedStoredValue {
+        var register: Bytecode.Register
+        var temporaryOwner: Bytecode.Register?
+    }
+
+    /// Swift places address-only normal and error results before ordinary call
+    /// arguments. HLBC keeps value continuations, so lowering removes these
+    /// compiler ABI addresses and re-materializes their writes on the matching
+    /// control-flow edge.
+    private struct IndirectCallDestinations {
+        var result: String?
+        var error: String?
+    }
+
+    /// Keeps semantic preparation out of the instruction-emission stack
+    /// frame. Swift Testing runs compiler work on cooperative threads with a
+    /// much smaller stack than a pthread; performing whole-function analyses
+    /// before entering the broad emission dispatcher avoids compounding their
+    /// frames while retaining a single source of truth for normalization.
+    private struct PreparedLowering: Sendable {
+        var signature: (
+            parameters: [Bytecode.ValueType],
+            parameterConventions: [Bytecode.ParameterConvention],
+            result: Bytecode.ValueType,
+            hasIndirectResult: Bool,
+            indirectErrorType: Bytecode.ValueType?,
+            effects: Core.Effects,
+            erasedMetatypes: [ErasedMetatype]
+        )
+        var hostedMethodContext: CanonicalSIL.TypeEnvironment.HostedMethodContext?
+        var effectiveEffects: Core.Effects
+        var usesRuntimeAddresses: Bool
+        var normalizedBody: String
+        var storageInitializationPlan: CanonicalSIL.StorageInitialization.Plan
+        var nsErrorBridges: CanonicalSIL.NSErrorBridgePlan
     }
 
     public init(typeEnvironment: CanonicalSIL.TypeEnvironment = .empty) {
@@ -172,7 +253,43 @@ public struct Lowerer: Sendable {
         directCalls: CanonicalSIL.DirectCallTable = .empty,
         expectedEffects: Core.Effects? = nil
     ) throws -> IntermediateRepresentation.Function {
-        let signature = try parseFunctionType(function.loweredType)
+        return try CanonicalSIL.LoweringStack.run {
+            let preparation = try prepareLowering(
+                function,
+                kind: kind,
+                directCalls: directCalls,
+                expectedEffects: expectedEffects
+            )
+            return try lowerPrepared(
+                function,
+                displayName: displayName,
+                kind: kind,
+                directCalls: directCalls,
+                preparation: preparation
+            )
+        }
+    }
+
+    private func prepareLowering(
+        _ function: CanonicalSIL.Function,
+        kind: Bytecode.FunctionKind,
+        directCalls: CanonicalSIL.DirectCallTable,
+        expectedEffects: Core.Effects?
+    ) throws -> PreparedLowering {
+        var signature = try parseFunctionType(function.loweredType)
+        let mutableCaptures = try CanonicalSIL.MutableCaptures.normalize(
+            body: function.body,
+            role: kind,
+            parameters: signature.parameters,
+            parameterConventions: signature.parameterConventions,
+            erasedPhysicalIndices: Set(
+                signature.erasedMetatypes.map(\.physicalIndex)
+            ),
+            hasIndirectResult: signature.hasIndirectResult,
+            hasIndirectError: signature.indirectErrorType != nil
+        )
+        signature.parameters = mutableCaptures.parameters
+        signature.parameterConventions = mutableCaptures.parameterConventions
         let hostedMethodContext = try typeEnvironment.hostedMethodContext(
             for: function
         )
@@ -190,10 +307,48 @@ public struct Lowerer: Sendable {
             of: function,
             effects: effectiveEffects
         )
+        let storageInitializationPlan = try CanonicalSIL.StorageInitialization
+            .analyze(
+                body: normalizedBody,
+                directCalls: directCalls,
+                typeEnvironment: typeEnvironment
+            )
         let nsErrorBridges = try CanonicalSIL.NSErrorBridgePlan.analyze(
             body: normalizedBody,
             directCalls: directCalls
         )
+        return .init(
+            signature: signature,
+            hostedMethodContext: hostedMethodContext,
+            effectiveEffects: effectiveEffects,
+            usesRuntimeAddresses: usesRuntimeAddresses,
+            normalizedBody: normalizedBody,
+            storageInitializationPlan: storageInitializationPlan,
+            nsErrorBridges: nsErrorBridges
+        )
+    }
+
+    // The frontend invokes lowering from cooperative workers whose stacks are
+    // substantially smaller than pthread defaults. Keep debug spill slots
+    // compact in addition to the explicit stack boundary used by `lower`;
+    // semantic checks remain in extracted helpers and run in every build mode.
+    @_optimize(size)
+    private func lowerPrepared(
+        _ function: CanonicalSIL.Function,
+        displayName: String,
+        kind: Bytecode.FunctionKind,
+        directCalls: CanonicalSIL.DirectCallTable,
+        preparation: PreparedLowering
+    ) throws -> IntermediateRepresentation.Function {
+        let signature = preparation.signature
+        let hostedMethodContext = preparation.hostedMethodContext
+        let effectiveEffects = preparation.effectiveEffects
+        let usesRuntimeAddresses = preparation.usesRuntimeAddresses
+        let normalizedBody = preparation.normalizedBody
+        let storageInitializationPlan = preparation.storageInitializationPlan
+        let mutableCapturePointees =
+            storageInitializationPlan.mutableCapturePointees
+        let nsErrorBridges = preparation.nsErrorBridges
         let rawLines = normalizedBody.split(
             separator: "\n",
             omittingEmptySubsequences: false
@@ -241,7 +396,9 @@ public struct Lowerer: Sendable {
         var swiftCoreReferences: [String: SwiftCoreIntrinsic] = [:]
         var objectiveCBridgeReferences: [String: ObjectiveCBridgeIntrinsic] = [:]
         var optionSetArrayLiteralReferences: [String: String] = [:]
-        var localFactoryReferences: [String: Bytecode.LocalTypeKey] = [:]
+        var localFactoryReferences: [
+            String: CanonicalSIL.TypeEnvironment.StructFactory
+        ] = [:]
         var stringLiterals: [String: String] = [:]
         var selectorLiterals: [String: String] = [:]
         var selectorOpaquePointers: [String: String] = [:]
@@ -272,12 +429,16 @@ public struct Lowerer: Sendable {
         var runtimeStackSlots: [String: Bytecode.StackSlot] = [:]
         var runtimeAddressValues: [String: Bytecode.Register] = [:]
         var runtimeAddressPointees: [String: Bytecode.ValueType] = [:]
+        let mutableCaptureState = CanonicalSIL.MutableCaptures.LoweringState()
+        var pendingMutableBoxes: [String: Bytecode.ValueType] = [:]
+        var mutableBoxProjectionRoots: [String: String] = [:]
         var scopedRuntimeAddresses = Set<String>()
         var initializingRuntimeAccesses = Set<String>()
         var inoutParameterAddressBases = Set<String>()
         var passthroughRuntimeAccesses = Set<String>()
         var borrowedAddressValues: [String: Bytecode.Register] = [:]
         var borrowedValueTokens = Set<String>()
+        var borrowedLoadTokens = Set<String>()
         var preservedNativeConversionValues: [String: Bytecode.Register] = [:]
         var addressAliases: [String: String] = [:]
         var nativePropertyAddresses: [String: NativePropertyAddress] = [:]
@@ -291,6 +452,7 @@ public struct Lowerer: Sendable {
         var integerRangeIteratorStates: [String: IntegerRangeIteratorState] = [:]
         var pendingIntegerRangeNextAddresses: [String: IntegerRangeIteratorState] = [:]
         var pendingIntegerRangeNextValues: [String: IntegerRangeIteratorState] = [:]
+        var elidedRuntimeStorageAddresses = Set<String>()
         var arrayElementMutations: [String: ArrayElementMutation] = [:]
         var arrayMutationYieldByToken: [String: String] = [:]
         var integerConversionResults = Set<String>()
@@ -312,7 +474,6 @@ public struct Lowerer: Sendable {
         var unpackedTuples: [String: [Bytecode.Register]] = [:]
         var onStackClosureValues = Set<String>()
         var voidValues = Set<String>()
-        var compilerOptionalVoidValues = Set<String>()
         var optionalSourceBySomeBlock: [Bytecode.BlockID: String] = [:]
         var optionalSourceByNoneBlock: [Bytecode.BlockID: String] = [:]
         var knownSomeOptionalAddresses: [Bytecode.BlockID: Set<String>] = [:]
@@ -330,15 +491,19 @@ public struct Lowerer: Sendable {
         var existentialComponentAddresses: [String: ExistentialComponentAddress] = [:]
         var optionalAddressInitializations: [String: OptionalAddressInitialization] = [:]
         var optionalPayloadAddressRoots: [String: String] = [:]
-        var takenOptionalPayloadRoots: [String: String] = [:]
+        var takenOptionalPayloads: [String: TakenOptionalPayload] = [:]
         var indirectResultAddress: String?
         var indirectResultSlot: Bytecode.StackSlot?
+        var indirectErrorAddress: String?
         var typedErrorBoxTypes: [String: Bytecode.LocalTypeKey] = [:]
         var projectedBoxByAddress: [String: String] = [:]
         var errorMessageByBox: [String: String] = [:]
         var catchScratchAddresses = Set<String>()
         var implicitStackValues: [
             Bytecode.BlockID: [(address: String, register: Bytecode.Register)]
+        ] = [:]
+        var implicitOwnerCleanups: [
+            Bytecode.BlockID: [Bytecode.Register]
         ] = [:]
         var compilerAddressWrites: [
             Bytecode.BlockID: [String: Bytecode.Register]
@@ -350,6 +515,7 @@ public struct Lowerer: Sendable {
         var blocks: [IntermediateRepresentation.Block] = []
         var current: IntermediateRepresentation.Block?
         var currentSourceLocation: Core.SourceLocation?
+        var currentSILLineIndex = 0
         var sourceMap: [IntermediateRepresentation.SourceMapEntry] = []
         var entryBlock: Bytecode.BlockID?
         var parameterRegisters: [Bytecode.Register] = []
@@ -421,7 +587,7 @@ public struct Lowerer: Sendable {
             let value = try resolve(token, line: line)
             let type = registerTypes[Int(value.rawValue)]
             guard type.requiresLinearOwnership,
-                  borrowedValueTokens.contains(token) || isBorrowedParameter(value)
+                  isBorrowedValue(token: token, register: value)
             else { return value }
             // HLBC return transfers ownership. SIL may return a guaranteed
             // reference directly because ARC retains are implicit at that ABI
@@ -429,10 +595,54 @@ public struct Lowerer: Sendable {
             return try copyOwnedCallArgument(value)
         }
 
+        func prepareStoredValue(
+            _ token: String,
+            expectedType: Bytecode.ValueType,
+            line: Int
+        ) throws -> Bytecode.Register {
+            let value = try resolveStorableValue(
+                token,
+                expectedType: expectedType,
+                line: line
+            )
+            let type = registerTypes[Int(value.rawValue)]
+            guard type.requiresLinearOwnership,
+                  isBorrowedValue(token: token, register: value)
+            else { return value }
+            // Compiler and runtime addresses have one uniform invariant: a
+            // materialized linear value is owned by its storage. Canonical SIL
+            // may use a borrowed loadable value as temporary `@in_guaranteed`
+            // storage, so create the VM ownership edge at that boundary.
+            return try copyOwnedCallArgument(value)
+        }
+
+        func materializeRetain(
+            of token: String,
+            value: Bytecode.Register
+        ) throws {
+            let type = registerTypes[Int(value.rawValue)]
+            guard type.requiresLinearOwnership,
+                  isBorrowedValue(token: token, register: value)
+            else { return }
+            let retained = try copyOwnedCallArgument(value)
+            values[token] = retained
+            borrowedValueTokens.remove(token)
+            borrowedLoadTokens.remove(token)
+        }
+
         func isBorrowedParameter(_ register: Bytecode.Register) -> Bool {
             zip(parameterRegisters, signature.parameterConventions).contains {
                 $0.0 == register && $0.1 == .borrowed
             }
+        }
+
+        func isBorrowedValue(
+            token: String,
+            register: Bytecode.Register
+        ) -> Bool {
+            borrowedValueTokens.contains(token)
+                || borrowedLoadTokens.contains(token)
+                || isBorrowedParameter(register)
         }
 
         func lineContainsSILValue(_ token: String, line: String) -> Bool {
@@ -467,8 +677,10 @@ public struct Lowerer: Sendable {
             // Native bridge calls consume their argument. Preserve a borrowed
             // or subsequently reused SIL source and own the conversion result
             // as a compiler-generated temporary until its final semantic use.
-            let sourceIsBorrowed = borrowedValueTokens.contains(sourceToken)
-                || isBorrowedParameter(source)
+            let sourceIsBorrowed = isBorrowedValue(
+                token: sourceToken,
+                register: source
+            )
             let preservesSource = sourceIsBorrowed
                 || hasFutureSemanticUse(of: sourceToken, after: lineIndex)
             return (
@@ -534,6 +746,16 @@ public struct Lowerer: Sendable {
             return current
         }
 
+        func mutableCell(at token: String) -> Bytecode.Register? {
+            (mutableCaptureState.addresses[token]
+                ?? mutableCaptureState.addresses[addressBase(token)])?.register
+        }
+
+        func mutableCellPointee(at token: String) -> Bytecode.ValueType? {
+            (mutableCaptureState.addresses[token]
+                ?? mutableCaptureState.addresses[addressBase(token)])?.pointee
+        }
+
         func isKnownSomeOptionalAddress(
             _ token: String,
             in blockID: Bytecode.BlockID?
@@ -556,7 +778,8 @@ public struct Lowerer: Sendable {
         }
 
         func stackType(at token: String) -> Bytecode.ValueType? {
-            runtimeAddressPointees[token]
+            mutableCellPointee(at: token)
+                ?? runtimeAddressPointees[token]
                 ?? stackAddressTypes[addressBase(token)]
         }
 
@@ -570,7 +793,10 @@ public struct Lowerer: Sendable {
         }
 
         func stackValue(at token: String) -> Bytecode.Register? {
-            stackAddressValues[addressBase(token)]
+            guard runtimeAddress(at: token) == nil,
+                  mutableCell(at: token) == nil
+            else { return nil }
+            return stackAddressValues[addressBase(token)]
         }
 
         func recordCompilerAddressValue(_ value: Bytecode.Register, at token: String) {
@@ -626,6 +852,120 @@ public struct Lowerer: Sendable {
             return stackValue(at: token)
         }
 
+        func copyStoredValue(
+            at token: String,
+            line: Int
+        ) throws -> Bytecode.Register? {
+            guard let type = stackType(at: token) else { return nil }
+            if let cell = mutableCell(at: token) {
+                let result = try allocate(type: type)
+                appendInstruction(
+                    .loadMutableCell(result: result, cell: cell)
+                )
+                return result
+            }
+            if let address = runtimeAddress(at: token) {
+                let result = try allocate(type: type)
+                if isScopedRuntimeAddress(token) {
+                    appendInstruction(
+                        .loadAddress(result: result, address: address, mode: .copy)
+                    )
+                } else {
+                    let access = try allocate(type: .address(type))
+                    appendInstruction(
+                        .beginAccess(result: access, address: address, kind: .read)
+                    )
+                    appendInstruction(
+                        .loadAddress(result: result, address: access, mode: .copy)
+                    )
+                    appendInstruction(.endAccess(access))
+                }
+                return result
+            }
+            guard let stored = try resolvedStackValue(at: token, line: line),
+                  registerTypes[Int(stored.rawValue)] == type
+            else { return nil }
+            guard !type.isTrivial else { return stored }
+            let result = try allocate(type: type)
+            appendInstruction(.copyValue(result: result, source: stored))
+            return result
+        }
+
+        func borrowStoredValue(
+            at token: String,
+            line: Int
+        ) throws -> BorrowedStoredValue? {
+            guard let type = stackType(at: token) else { return nil }
+            if runtimeAddress(at: token) != nil || mutableCell(at: token) != nil {
+                guard let copy = try copyStoredValue(at: token, line: line) else {
+                    return nil
+                }
+                return .init(
+                    register: copy,
+                    temporaryOwner: type.requiresLinearOwnership ? copy : nil
+                )
+            }
+            guard let stored = try resolvedStackValue(at: token, line: line),
+                  registerTypes[Int(stored.rawValue)] == type
+            else { return nil }
+            return .init(register: stored, temporaryOwner: nil)
+        }
+
+        /// Produces a value that a consuming operation may transfer. Storage
+        /// retains its own lifetime; direct linear values are copied for the
+        /// same reason, while non-linear direct values may be reused.
+        func materializeOwnedValue(
+            at token: String,
+            line: Int
+        ) throws -> Bytecode.Register {
+            if stackType(at: token) != nil {
+                guard let copy = try copyStoredValue(at: token, line: line) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "address-backed value is uninitialized"
+                    )
+                }
+                return copy
+            }
+            let value = try resolve(token, line: line)
+            return registerTypes[Int(value.rawValue)].requiresLinearOwnership
+                ? try copyOwnedCallArgument(value)
+                : value
+        }
+
+        func takeStoredValue(
+            at token: String,
+            line: Int
+        ) throws -> Bytecode.Register? {
+            guard let type = stackType(at: token),
+                  mutableCell(at: token) == nil
+            else { return nil }
+            let root = addressBase(token)
+            if runtimeAddress(at: token) != nil {
+                guard let slot = runtimeStackSlots[root],
+                      runtimeAddressValues[token] == nil
+                        || runtimeAddressValues[token]
+                            == runtimeAddressValues[root]
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: line,
+                        text: "taking copy_addr through projected or caller-owned storage"
+                    )
+                }
+                let result = try allocate(type: type)
+                appendInstruction(
+                    .loadStack(result: result, slot: slot, mode: .take)
+                )
+                stackAddressValues.removeValue(forKey: root)
+                return result
+            }
+            guard let stored = try resolvedStackValue(at: token, line: line),
+                  !type.requiresLinearOwnership
+                    || !isBorrowedValue(token: token, register: stored)
+            else { return nil }
+            stackAddressValues.removeValue(forKey: root)
+            return stored
+        }
+
         // Materialized values must cross this single sink so compiler-only
         // storage, runtime stack slots, scoped accesses, and projected
         // addresses preserve the same SIL initialization semantics.
@@ -643,6 +983,9 @@ public struct Lowerer: Sendable {
             }
             if let addressRegister = runtimeAddress(at: token) {
                 let root = addressBase(token)
+                let inferredMode = storageInitializationPlan.storeMode(
+                    at: currentSILLineIndex
+                )
                 if isScopedRuntimeAddress(token) {
                     appendInstruction(
                         .storeAddress(
@@ -650,14 +993,16 @@ public struct Lowerer: Sendable {
                             source: value,
                             mode: requestedMode
                                 ?? (initializingRuntimeAccesses.contains(token)
-                                    ? .initialize : .assign)
+                                    ? .initialize : inferredMode)
                         )
                     )
                 } else if let slot = runtimeStackSlots[root], token == root {
-                    let mode = requestedMode
-                        ?? (stackAddressValues[root] == nil ? .initialize : .assign)
                     appendInstruction(
-                        .storeStack(slot: slot, source: value, mode: mode)
+                        .storeStack(
+                            slot: slot,
+                            source: value,
+                            mode: requestedMode ?? inferredMode
+                        )
                     )
                 } else {
                     let access = try allocate(type: .address(addressType))
@@ -672,12 +1017,15 @@ public struct Lowerer: Sendable {
                         .storeAddress(
                             address: access,
                             source: value,
-                            mode: requestedMode ?? .assign
+                            mode: requestedMode ?? inferredMode
                         )
                     )
                     appendInstruction(.endAccess(access))
                 }
-                stackAddressValues[root] = value
+                // Runtime storage owns the consumed source. Never retain that
+                // register as a compiler-address value: doing so would let a
+                // later read bypass load/copy semantics after ownership moved.
+                stackAddressValues.removeValue(forKey: root)
                 return
             }
             recordCompilerAddressValue(value, at: token)
@@ -698,22 +1046,177 @@ public struct Lowerer: Sendable {
             return register
         }
 
+        func materializeUnitValue() throws -> Bytecode.Register {
+            try materializeZeroSizedValue(type: ValueRepresentation.unit)
+        }
+
+        func materializeZeroSizedValue(
+            type: Bytecode.ValueType
+        ) throws -> Bytecode.Register {
+            guard let aggregate = try typeEnvironment.zeroSizedAggregate(
+                for: type
+            ) else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "value type is not statically zero-sized"
+                )
+            }
+            switch aggregate {
+            case let .tuple(elementTypes):
+                let elements = try elementTypes.map {
+                    try materializeZeroSizedValue(type: $0)
+                }
+                let result = try allocate(type: type)
+                appendInstruction(.makeTuple(result: result, elements: elements))
+                return result
+            case let .structure(key, fields):
+                let values = try fields.map {
+                    try materializeZeroSizedValue(type: $0.type)
+                }
+                let result = try allocate(type: .local(key))
+                appendInstruction(.makeStruct(result: result, fields: values))
+                return result
+            }
+        }
+
+        func materializeStructFactoryValue(
+            plan: CanonicalSIL.TypeEnvironment.StructFieldPlan,
+            physicalValues: [Bytecode.Register]
+        ) throws -> Bytecode.Register {
+            switch plan {
+            case let .parameter(index, type):
+                guard physicalValues.indices.contains(index),
+                      registerTypes[Int(physicalValues[index].rawValue)] == type
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "local struct initializer physical parameter does not match its plan"
+                    )
+                }
+                return physicalValues[index]
+            case let .tuple(type, elementPlans):
+                guard case let .tuple(elementTypes) = type,
+                      elementTypes.count == elementPlans.count
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "local struct initializer has an invalid tuple reconstruction plan"
+                    )
+                }
+                let elements = try elementPlans.map {
+                    try materializeStructFactoryValue(
+                        plan: $0,
+                        physicalValues: physicalValues
+                    )
+                }
+                guard zip(elements, elementTypes).allSatisfy({ value, expected in
+                    registerTypes[Int(value.rawValue)] == expected
+                }) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "local struct initializer tuple elements do not match their plan"
+                    )
+                }
+                let result = try allocate(type: type)
+                appendInstruction(.makeTuple(result: result, elements: elements))
+                return result
+            }
+        }
+
+        func resolveStorableValue(
+            _ token: String,
+            expectedType: Bytecode.ValueType? = nil,
+            line: Int
+        ) throws -> Bytecode.Register {
+            if voidValues.contains(token) {
+                let materializedType = expectedType ?? ValueRepresentation.unit
+                guard materializedType == ValueRepresentation.unit else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Void value does not match its materialized storage type"
+                    )
+                }
+                return try materializeUnitValue()
+            }
+            let value = try resolve(token, line: line)
+            if let expectedType,
+               registerTypes[Int(value.rawValue)] != expectedType {
+                let actualType = registerTypes[Int(value.rawValue)]
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "stored value \(token) at SIL line \(line) has type "
+                        + "\(actualType), expected "
+                        + "\(expectedType)"
+                )
+            }
+            return value
+        }
+
         func prepareDirectCallArguments(
             _ tokens: [String],
-            conventions: [Bytecode.ParameterConvention],
+            physicalConventions: [Bytecode.ParameterConvention],
+            logicalTypes: [Bytecode.ValueType],
             line: Int,
             allowsSynthesizedAccess: Bool
-        ) throws -> (arguments: [Bytecode.Register], accesses: [Bytecode.Register]) {
-            guard tokens.count == conventions.count else {
+        ) throws -> PreparedDirectCallArguments {
+            guard tokens.count == physicalConventions.count,
+                  tokens.count == logicalTypes.count
+            else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "direct call argument and convention counts disagree"
+                    "direct call physical and logical argument counts disagree"
                 )
             }
             var arguments: [Bytecode.Register] = []
             var accesses: [Bytecode.Register] = []
+            var temporaryOwners: [Bytecode.Register] = []
             arguments.reserveCapacity(tokens.count)
-            for (token, convention) in zip(tokens, conventions) {
-                let value = try resolve(token, line: line)
+            for ((token, convention), logicalType) in zip(
+                zip(tokens, physicalConventions),
+                logicalTypes
+            ) {
+                let value: Bytecode.Register
+                if case let .mutableCell(pointee) = logicalType {
+                    guard let existing = mutableCell(at: token),
+                          mutableCellPointee(at: token) == pointee
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "managed mutable argument is not backed by a matching cell"
+                        )
+                    }
+                    value = existing
+                    arguments.append(value)
+                    continue
+                }
+                if convention == .inout {
+                    value = try resolve(token, line: line)
+                } else if stackType(at: token) == logicalType {
+                    let consumes = storageInitializationPlan
+                        .consumesApplicationArgument(
+                            token,
+                            at: currentSILLineIndex
+                        )
+                    let stored: Bytecode.Register?
+                    if consumes {
+                        stored = try takeStoredValue(at: token, line: line)
+                    } else if convention == .borrowed,
+                              logicalType.requiresLinearOwnership,
+                              runtimeAddress(at: token) == nil {
+                        stored = try resolvedStackValue(at: token, line: line)
+                    } else {
+                        stored = try copyStoredValue(at: token, line: line)
+                        if convention == .borrowed,
+                           logicalType.requiresLinearOwnership,
+                           let stored {
+                            temporaryOwners.append(stored)
+                        }
+                    }
+                    guard let stored else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "address-backed call argument is uninitialized"
+                        )
+                    }
+                    value = stored
+                } else {
+                    value = try resolveStorableValue(
+                        token,
+                        expectedType: logicalType,
+                        line: line
+                    )
+                }
                 guard convention == .inout else {
                     arguments.append(value)
                     continue
@@ -740,7 +1243,37 @@ public struct Lowerer: Sendable {
                 arguments.append(access)
                 accesses.append(access)
             }
-            return (arguments, accesses)
+            return .init(
+                arguments: arguments,
+                accesses: accesses,
+                temporaryOwners: temporaryOwners
+            )
+        }
+
+        func appendPreparedOwnerCleanups(
+            _ prepared: PreparedDirectCallArguments
+        ) {
+            for owner in prepared.temporaryOwners {
+                appendInstruction(.destroyValue(owner))
+            }
+        }
+
+        func schedulePreparedOwnerCleanups(
+            _ prepared: PreparedDirectCallArguments,
+            in targets: [Bytecode.BlockID]
+        ) throws {
+            for target in targets {
+                for owner in prepared.temporaryOwners {
+                    guard !implicitOwnerCleanups[target, default: []]
+                        .contains(owner)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "one borrowed call owner is cleaned twice on a successor"
+                        )
+                    }
+                    implicitOwnerCleanups[target, default: []].append(owner)
+                }
+            }
         }
 
         func acceptsPhysicalConventions(
@@ -754,7 +1287,16 @@ public struct Lowerer: Sendable {
             case .direct:
                 switch binding.target {
                 case .function:
-                    return physical == binding.parameterConventions
+                    return zip(
+                        zip(physical, binding.parameterConventions),
+                        binding.parameterTypes
+                    ).allSatisfy { pair, type in
+                        if case .mutableCell = type {
+                            return pair.1 == .owned
+                                && [.owned, .borrowed, .inout].contains(pair.0)
+                        }
+                        return pair.0 == pair.1
+                    }
                 case .entry, .nativeImport:
                     // Device boundaries own values. A guaranteed physical
                     // parameter is adapted with an explicit VM copy.
@@ -829,6 +1371,7 @@ public struct Lowerer: Sendable {
                 binding: binding,
                 physicalParameterConventions: callee.parameterConventions,
                 hasIndirectResult: callee.hasIndirectResult,
+                indirectErrorType: callee.indirectErrorType,
                 erasedMetatypes: callee.erasedMetatypes,
                 usesObjectiveCBridge: true
             )
@@ -895,7 +1438,8 @@ public struct Lowerer: Sendable {
         func transferOwnedCompilerAddressArguments(
             tokens: [String],
             resolvedArguments: [Bytecode.Register],
-            conventions: [Bytecode.ParameterConvention]
+            conventions: [Bytecode.ParameterConvention],
+            forceOwnedTokens: Set<String> = []
         ) throws {
             guard tokens.count == resolvedArguments.count,
                   tokens.count == conventions.count
@@ -909,6 +1453,15 @@ public struct Lowerer: Sendable {
                 conventions
             ) where convention == .owned {
                 let root = addressBase(token)
+                guard runtimeAddress(at: token) == nil,
+                      mutableCell(at: token) == nil
+                else { continue }
+                let consumes = storageInitializationPlan
+                    .consumesApplicationArgument(
+                        token,
+                        at: currentSILLineIndex
+                    ) || forceOwnedTokens.contains(token)
+                guard consumes else { continue }
                 guard let stored = stackAddressValues[root] else { continue }
                 guard stored == argument else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -1035,6 +1588,34 @@ public struct Lowerer: Sendable {
             current = nil
         }
 
+        func appendSyntheticBlock(
+            id: Bytecode.BlockID,
+            parameters: [Bytecode.Register] = [],
+            instructions: [IntermediateRepresentation.Instruction]
+        ) {
+            blocks.append(
+                .init(
+                    id: id,
+                    parameters: parameters,
+                    instructions: instructions
+                )
+            )
+            if let currentSourceLocation {
+                for offset in instructions.indices {
+                    guard let instructionOffset = UInt32(exactly: offset) else {
+                        break
+                    }
+                    sourceMap.append(
+                        .init(
+                            blockID: id,
+                            instructionOffset: instructionOffset,
+                            location: currentSourceLocation
+                        )
+                    )
+                }
+            }
+        }
+
         func appendConditionalTrap(
             condition: Bytecode.Register,
             reason: Bytecode.TrapReason
@@ -1056,22 +1637,7 @@ public struct Lowerer: Sendable {
                 )
             )
             finishCurrent()
-            blocks.append(
-                IntermediateRepresentation.Block(
-                    id: trapID,
-                    parameters: [],
-                    instructions: [.trap(reason)]
-                )
-            )
-            if let currentSourceLocation {
-                sourceMap.append(
-                    .init(
-                        blockID: trapID,
-                        instructionOffset: 0,
-                        location: currentSourceLocation
-                    )
-                )
-            }
+            appendSyntheticBlock(id: trapID, instructions: [.trap(reason)])
             current = IntermediateRepresentation.Block(
                 id: continuationID,
                 parameters: [],
@@ -1094,24 +1660,43 @@ public struct Lowerer: Sendable {
                     result.append(element)
                     continue
                 }
-                guard case let .tuple(types) = pending.elementType,
-                      let components = pending.elementComponents[index],
-                      components.count == types.count,
-                      types.indices.allSatisfy({ components[$0] != nil })
+                if try typeEnvironment.isStaticallyZeroSized(
+                    pending.elementType
+                ) {
+                    guard pending.elementComponents[index] == nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "zero-sized Array literal element has component stores"
+                        )
+                    }
+                    result.append(
+                        try materializeZeroSizedValue(type: pending.elementType)
+                    )
+                    continue
+                }
+                guard case let .tuple(types) = pending.elementType
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Array literal element is incomplete"
                     )
                 }
+                let components = pending.elementComponents[index] ?? [:]
                 var registers: [Bytecode.Register] = []
                 registers.reserveCapacity(types.count)
                 for index in types.indices {
-                    guard let component = components[index] else {
+                    if let component = components[index] {
+                        registers.append(component)
+                        continue
+                    }
+                    guard try typeEnvironment.isStaticallyZeroSized(
+                        types[index]
+                    ) else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Array literal tuple component is missing"
                         )
                     }
-                    registers.append(component)
+                    registers.append(
+                        try materializeZeroSizedValue(type: types[index])
+                    )
                 }
                 let tuple = try allocate(type: pending.elementType)
                 appendInstruction(.makeTuple(result: tuple, elements: registers))
@@ -1122,6 +1707,9 @@ public struct Lowerer: Sendable {
 
         func compilerAddressType(_ token: String) -> Bytecode.ValueType? {
             if token == indirectResultAddress { return signature.result }
+            if token == indirectErrorAddress {
+                return signature.indirectErrorType
+            }
             if let component = tupleComponentAddresses[token],
                case let .tuple(types) = stackType(at: component.base),
                types.indices.contains(component.index) {
@@ -1153,6 +1741,196 @@ public struct Lowerer: Sendable {
             return stackType(at: token)
         }
 
+        func consumeIndirectCallDestinations(
+            from argumentTokens: inout [String],
+            resultType: Bytecode.ValueType,
+            hasIndirectResult: Bool,
+            indirectErrorType: Bytecode.ValueType?,
+            physicalArgumentCount: Int
+        ) throws -> IndirectCallDestinations {
+            let hiddenCount = (hasIndirectResult ? 1 : 0)
+                + (indirectErrorType == nil ? 0 : 1)
+            let expectedCount = physicalArgumentCount.addingReportingOverflow(
+                hiddenCount
+            )
+            guard !expectedCount.overflow,
+                  argumentTokens.count == expectedCount.partialValue
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "call argument count does not match its physical result ABI"
+                )
+            }
+
+            var resultDestination: String?
+            if hasIndirectResult {
+                guard resultType == .void || supportsIndirectResult(resultType) else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "indirect call result \(resultType)"
+                    )
+                }
+                let destination = argumentTokens.removeFirst()
+                let destinationType = compilerAddressType(destination)
+                guard destinationType == resultType
+                        || destinationType
+                            == ValueRepresentation.storable(resultType)
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "indirect call result address does not match its result type"
+                    )
+                }
+                resultDestination = destination
+            }
+
+            var errorDestination: String?
+            if let indirectErrorType {
+                let destination = argumentTokens.removeFirst()
+                guard compilerAddressType(destination) == indirectErrorType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "indirect call Error address does not match its error type"
+                    )
+                }
+                errorDestination = destination
+            }
+            return .init(result: resultDestination, error: errorDestination)
+        }
+
+        func bindIndirectTryCallDestinations(
+            _ destinations: IndirectCallDestinations,
+            resultType: Bytecode.ValueType,
+            indirectErrorType: Bytecode.ValueType?,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID
+        ) throws {
+            if let destination = destinations.result {
+                guard implicitStackValues[normalTarget] == nil,
+                      indirectTryNormalBlocks.insert(normalTarget).inserted
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "indirect call normal continuation is shared"
+                    )
+                }
+                if resultType != .void {
+                    let result = try allocate(type: resultType)
+                    implicitStackValues[normalTarget] = [(destination, result)]
+                }
+            }
+
+            if let destination = destinations.error {
+                let runtimeErrorType: Bytecode.ValueType = typeEnvironment
+                    .preservesTypedErrors ? .error : .string
+                guard indirectErrorType == runtimeErrorType,
+                      implicitStackValues[errorTarget] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "indirect call Error continuation does not match its image"
+                    )
+                }
+                let error = try allocate(type: runtimeErrorType)
+                implicitStackValues[errorTarget] = [(destination, error)]
+            }
+        }
+
+        func materializeMutableCapture(
+            at token: String,
+            pointee: Bytecode.ValueType,
+            line: Int
+        ) throws -> Bytecode.Register {
+            if let existing = mutableCell(at: token) {
+                guard mutableCellPointee(at: token) == pointee else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: line,
+                        mangledName: "mutable closure capture"
+                    )
+                }
+                return existing
+            }
+            let root = addressBase(token)
+            guard !inoutParameterAddressBases.contains(root) else {
+                throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                    line: line,
+                    text: "capturing an inout parameter requires caller writeback"
+                )
+            }
+            guard token == root,
+                  stackAddressTypes[root] == pointee
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "mutable closure capture must reference matching local storage"
+                )
+            }
+
+            let initialValue: Bytecode.Register
+            if let slot = runtimeStackSlots[root] {
+                initialValue = try allocate(type: pointee)
+                appendInstruction(
+                    .loadStack(result: initialValue, slot: slot, mode: .take)
+                )
+            } else {
+                guard runtimeAddress(at: root) == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "mutable closure capture references unsupported storage"
+                    )
+                }
+                if let value = stackAddressValues[root] {
+                    guard registerTypes[Int(value.rawValue)] == pointee else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "mutable closure capture storage has the wrong type"
+                        )
+                    }
+                    initialValue = value
+                } else if case let .tuple(types) = pointee {
+                    var elements = [Bytecode.Register?](
+                        repeating: nil,
+                        count: types.count
+                    )
+                    for (componentToken, component) in tupleComponentAddresses
+                    where addressBase(component.base) == root {
+                        guard types.indices.contains(component.index),
+                              elements[component.index] == nil,
+                              let value = stackAddressValues[componentToken],
+                              registerTypes[Int(value.rawValue)]
+                                == types[component.index]
+                        else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "mutable tuple capture has invalid component storage"
+                            )
+                        }
+                        elements[component.index] = value
+                    }
+                    let initializedElements = elements.compactMap { $0 }
+                    guard initializedElements.count == types.count else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "mutable tuple capture references uninitialized storage"
+                        )
+                    }
+                    let tuple = try allocate(type: pointee)
+                    appendInstruction(
+                        .makeTuple(
+                            result: tuple,
+                            elements: initializedElements
+                        )
+                    )
+                    initialValue = tuple
+                } else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "mutable closure capture references unsupported storage"
+                    )
+                }
+            }
+            stackAddressValues.removeValue(forKey: root)
+
+            let cell = try allocate(type: .mutableCell(pointee))
+            appendInstruction(
+                .makeMutableCell(result: cell, initialValue: initialValue)
+            )
+            mutableCaptureState.addresses[root] = .init(
+                register: cell,
+                pointee: pointee
+            )
+            values[root] = cell
+            return cell
+        }
+
         func storeConstructedValue(
             _ value: Bytecode.Register,
             at token: String,
@@ -1163,6 +1941,20 @@ public struct Lowerer: Sendable {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "constructed value does not match its SIL address"
                 )
+            }
+            if let cell = mutableCell(at: token) {
+                let storeMode = mode
+                    ?? storageInitializationPlan.storeMode(
+                        at: currentSILLineIndex
+                    )
+                appendInstruction(
+                    .storeMutableCell(
+                        cell: cell,
+                        source: value,
+                        mode: storeMode
+                    )
+                )
+                return
             }
             if token == indirectResultAddress {
                 guard let slot = indirectResultSlot else {
@@ -1175,8 +1967,10 @@ public struct Lowerer: Sendable {
                 )
                 return
             }
-            if let root = takenOptionalPayloadRoots[token] {
-                guard case let .optional(wrapped) = compilerAddressType(root),
+            if var payload = takenOptionalPayloads[token] {
+                guard case let .optional(wrapped) = compilerAddressType(
+                    payload.root
+                ),
                       wrapped == type
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -1186,7 +1980,14 @@ public struct Lowerer: Sendable {
                 recordCompilerAddressValue(value, at: token)
                 let optional = try allocate(type: .optional(wrapped))
                 appendInstruction(.makeOptionalSome(result: optional, value: value))
-                try storeVMValue(optional, at: root, requestedMode: mode)
+                try storeVMValue(
+                    optional,
+                    at: payload.root,
+                    requestedMode: payload.requiresInitialization
+                        ? .initialize : mode
+                )
+                payload.requiresInitialization = false
+                takenOptionalPayloads[token] = payload
                 return
             }
             if let root = optionalPayloadAddressRoots[token],
@@ -1203,6 +2004,23 @@ public struct Lowerer: Sendable {
                 return
             }
             try storeVMValue(value, at: token, requestedMode: mode)
+        }
+
+        func materializeErrorValue(
+            from token: String
+        ) throws -> Bytecode.Register? {
+            if let value = values[token],
+               [.string, .error].contains(
+                   registerTypes[Int(value.rawValue)]
+               ) {
+                return value
+            }
+            guard let message = errorMessageByBox[token] else { return nil }
+            let value = try allocate(type: .string)
+            appendInstruction(
+                .constantString(result: value, value: message)
+            )
+            return value
         }
 
         func lowerMutatingValueReceiverApply(
@@ -1238,7 +2056,8 @@ public struct Lowerer: Sendable {
             )
             let prepared = try prepareDirectCallArguments(
                 valueTokens,
-                conventions: valueConventions,
+                physicalConventions: valueConventions,
+                logicalTypes: Array(binding.parameterTypes.dropLast()),
                 line: line,
                 allowsSynthesizedAccess: true
             )
@@ -1249,25 +2068,22 @@ public struct Lowerer: Sendable {
                     : argument
             }
             let receiver: Bytecode.Register
-            if let stored = stackValue(at: receiverToken) {
-                receiver = stored
-            } else if let address = runtimeAddress(at: receiverToken) {
-                let loaded = try allocate(type: receiverType)
-                if isScopedRuntimeAddress(receiverToken) {
-                    appendInstruction(
-                        .loadAddress(result: loaded, address: address, mode: .copy)
+            if runtimeAddress(at: receiverToken) != nil
+                || mutableCell(at: receiverToken) != nil {
+                guard let copied = try copyStoredValue(
+                    at: receiverToken,
+                    line: line
+                ) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "mutating value receiver references uninitialized storage"
                     )
-                } else {
-                    let access = try allocate(type: .address(receiverType))
-                    appendInstruction(
-                        .beginAccess(result: access, address: address, kind: .read)
-                    )
-                    appendInstruction(
-                        .loadAddress(result: loaded, address: access, mode: .copy)
-                    )
-                    appendInstruction(.endAccess(access))
                 }
-                receiver = loaded
+                receiver = copied
+            } else if let taken = try takeStoredValue(
+                at: receiverToken,
+                line: line
+            ) {
+                receiver = taken
             } else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "mutating value receiver references uninitialized storage"
@@ -1278,10 +2094,9 @@ public struct Lowerer: Sendable {
                     "mutating value receiver storage has the wrong VM type"
                 )
             }
-            // The adapter consumes the current value and returns its mutated
-            // replacement. Passing the original register keeps the HLBC
-            // lifetime aligned with Swift's inout writeback instead of
-            // leaving the pre-mutation value live beside the replacement.
+            // The adapter consumes a value snapshot and returns its mutated
+            // replacement. Compiler-only storage transfers its owner; runtime
+            // storage keeps the old value until the replacement is assigned.
             arguments.append(receiver)
             guard arguments.map({ registerTypes[Int($0.rawValue)] })
                     == binding.parameterTypes
@@ -1307,8 +2122,10 @@ public struct Lowerer: Sendable {
             try transferOwnedCompilerAddressArguments(
                 tokens: [receiverToken],
                 resolvedArguments: [receiver],
-                conventions: [.owned]
+                conventions: [.owned],
+                forceOwnedTokens: [receiverToken]
             )
+            appendPreparedOwnerCleanups(prepared)
             try storeConstructedValue(mutated, at: receiverToken)
             for access in prepared.accesses.reversed() {
                 appendInstruction(.endAccess(access))
@@ -1410,6 +2227,1036 @@ public struct Lowerer: Sendable {
             try storeExistential(erased, at: projection.destination)
         }
 
+        func lowerArrayHigherOrderTryApply(
+            operation: CanonicalSIL.HigherOrderIntrinsic,
+            genericArguments: String,
+            argumentText: String,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            let plan = try parseArrayHigherOrderPlan(
+                operation: operation,
+                genericArguments: genericArguments,
+                argumentText: argumentText,
+                line: line
+            )
+            func requiredRegister(
+                _ register: Bytecode.Register?,
+                _ role: String
+            ) throws -> Bytecode.Register {
+                guard let register else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "higher-order lowering omitted its \(role) register"
+                    )
+                }
+                return register
+            }
+            let borrowedSource = try borrowStoredValue(
+                at: plan.sourceToken,
+                line: line
+            )
+            let source = try borrowedSource?.register
+                ?? resolve(plan.sourceToken, line: line)
+            guard registerTypes[Int(source.rawValue)]
+                    == .array(plan.inputType)
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "higher-order source does not match its Array specialization"
+                )
+            }
+            let closure = try resolve(plan.closureToken, line: line)
+            guard case let .closure(closureSignature) = registerTypes[
+                Int(closure.rawValue)
+            ], !closureSignature.effects.isAsync,
+               closureSignature.result == plan.closureResultType
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<higher-order closure>"
+                )
+            }
+            let expectedClosureParameters: [Bytecode.ValueType] = plan.operation
+                == .reduce
+                ? [plan.callResultType, plan.inputType]
+                : [plan.inputType]
+            guard closureSignature.parameters == expectedClosureParameters,
+                  closureSignature.parameterConventions.count
+                    == expectedClosureParameters.count,
+                  !closureSignature.parameterConventions.contains(.inout)
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<higher-order closure>"
+                )
+            }
+
+            let isThrowing = closureSignature.effects.mayThrow
+            if plan.operation == .map {
+                let genericTypes = try splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                    .map(parseType)
+                guard genericTypes.count == 3,
+                      (genericTypes[2] == .never) == !isThrowing,
+                      plan.errorDestination.map({
+                        compilerAddressType($0) == genericTypes[2]
+                      }) == true
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Collection.map error specialization does not match its closure"
+                    )
+                }
+            } else {
+                guard isThrowing else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "higher-order rethrows ABI lost its Error channel"
+                    )
+                }
+            }
+
+            if let destination = plan.resultDestination {
+                guard compilerAddressType(destination) == plan.callResultType,
+                      implicitStackValues[normalTarget] == nil,
+                      indirectTryNormalBlocks.insert(normalTarget).inserted
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "higher-order indirect result destination is invalid"
+                    )
+                }
+                let parameter = try allocate(type: plan.callResultType)
+                implicitStackValues[normalTarget] = [(destination, parameter)]
+            } else if plan.callResultType == .void {
+                guard indirectTryNormalBlocks.insert(normalTarget).inserted else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "higher-order Void continuation is shared"
+                    )
+                }
+            }
+
+            let errorValueType: Bytecode.ValueType = typeEnvironment
+                .preservesTypedErrors ? .error : .string
+            let errorCleanup = try allocateSyntheticBlockID()
+            let errorParameter: Bytecode.Register?
+            if isThrowing {
+                errorParameter = try allocate(type: errorValueType)
+                if let destination = plan.errorDestination {
+                    guard compilerAddressType(destination) == errorValueType,
+                          implicitStackValues[errorTarget] == nil
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "higher-order indirect Error destination is invalid"
+                        )
+                    }
+                    let propagated = try allocate(type: errorValueType)
+                    implicitStackValues[errorTarget] = [
+                        (destination, propagated),
+                    ]
+                }
+            } else {
+                errorParameter = nil
+            }
+
+            let indexSlot = try allocateStackSlot(type: .int64)
+            let zero = try allocate(type: .int64)
+            appendInstruction(.constantInteger(result: zero, value: 0))
+            appendInstruction(
+                .storeStack(slot: indexSlot, source: zero, mode: .initialize)
+            )
+
+            let usesArrayBuilder: Bool
+            switch plan.operation {
+            case .map, .filter, .compactMap:
+                usesArrayBuilder = true
+            case .reduce, .forEach, .firstWhere, .containsWhere,
+                 .allSatisfy:
+                usesArrayBuilder = false
+            case .optionalMap, .resultMap:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "non-Array operation entered Array higher-order lowering"
+                )
+            }
+            let builder: Bytecode.Register?
+            if usesArrayBuilder {
+                guard case let .array(element) = plan.callResultType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "higher-order Array builder has a non-Array result"
+                    )
+                }
+                let register = try allocate(type: .arrayBuilder(element))
+                appendInstruction(.makeArrayBuilder(result: register))
+                builder = register
+            } else {
+                builder = nil
+            }
+            let accumulatorType: Bytecode.ValueType? = plan.operation == .reduce
+                ? plan.callResultType : nil
+            let initialAccumulator: Bytecode.Register?
+            if plan.operation == .reduce {
+                guard let initialToken = plan.initialToken
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Sequence.reduce initial value does not match its result"
+                    )
+                }
+                let storedInitial = try materializeOwnedValue(
+                    at: initialToken,
+                    line: line
+                )
+                guard registerTypes[Int(storedInitial.rawValue)]
+                        == plan.callResultType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Sequence.reduce initial value does not match its result"
+                    )
+                }
+                initialAccumulator = storedInitial
+            } else {
+                initialAccumulator = nil
+            }
+
+            let loop = try allocateSyntheticBlockID()
+            let some = try allocateSyntheticBlockID()
+            let empty = try allocateSyntheticBlockID()
+            let closureContinuation = try allocateSyntheticBlockID()
+            let loopAccumulator = try accumulatorType.map(allocate)
+            let next = try allocate(type: .optional(plan.inputType))
+            let element = try allocate(type: plan.inputType)
+            let directClosureResult = try isThrowing
+                || plan.closureResultType == .void
+                ? nil
+                : allocate(type: plan.closureResultType)
+
+            let inputConvention = closureSignature.parameterConventions[
+                plan.operation == .reduce ? 1 : 0
+            ]
+            let retainsInputAfterCall = plan.operation == .filter
+                || plan.operation == .firstWhere
+            let closureInput: Bytecode.Register
+            var closureArgumentPreparation: [
+                IntermediateRepresentation.Instruction
+            ] = []
+            if plan.inputType.requiresLinearOwnership,
+               inputConvention == .owned,
+               retainsInputAfterCall {
+                let copy = try allocate(type: plan.inputType)
+                closureArgumentPreparation.append(
+                    .copyValue(result: copy, source: element)
+                )
+                closureInput = copy
+            } else {
+                closureInput = element
+            }
+            let inputNeedsCleanup = plan.inputType.requiresLinearOwnership
+                && (inputConvention == .borrowed || retainsInputAfterCall)
+            let accumulatorNeedsCleanup = plan.operation == .reduce
+                && plan.callResultType.requiresLinearOwnership
+                && closureSignature.parameterConventions[0] == .borrowed
+            let sourceCleanup: [IntermediateRepresentation.Instruction] =
+                borrowedSource?.temporaryOwner.map {
+                    [.destroyValue($0)]
+                } ?? []
+
+            let loopArguments = initialAccumulator.map { [$0] } ?? []
+            if isThrowing {
+                appendInstruction(.branch(target: loop, arguments: loopArguments))
+            } else {
+                let mustSucceed = try allocate(type: .bool)
+                appendInstruction(.constantBool(result: mustSucceed, value: true))
+                appendInstruction(
+                    .conditionalBranch(
+                        condition: mustSucceed,
+                        trueTarget: loop,
+                        trueArguments: loopArguments,
+                        falseTarget: errorCleanup,
+                        falseArguments: []
+                    )
+                )
+            }
+            finishCurrent()
+
+            appendSyntheticBlock(
+                id: loop,
+                parameters: loopAccumulator.map { [$0] } ?? [],
+                instructions: [
+                    .arrayNext(result: next, array: source, indexSlot: indexSlot),
+                    .switchOptional(
+                        optional: next,
+                        someTarget: some,
+                        noneTarget: empty
+                    ),
+                ]
+            )
+
+            let closureArguments: [Bytecode.Register]
+            if plan.operation == .reduce {
+                closureArguments = [
+                    try requiredRegister(loopAccumulator, "loop accumulator"),
+                    closureInput,
+                ]
+            } else {
+                closureArguments = [closureInput]
+            }
+            let closureContinuationArguments = directClosureResult.map {
+                [$0]
+            } ?? []
+            let closureInstructions: [IntermediateRepresentation.Instruction]
+            if isThrowing {
+                closureInstructions = closureArgumentPreparation + [
+                    .closureTryApply(
+                        closure: closure,
+                        arguments: closureArguments,
+                        normalTarget: closureContinuation,
+                        errorTarget: errorCleanup
+                    ),
+                ]
+            } else {
+                closureInstructions = closureArgumentPreparation + [
+                    .closureApply(
+                        result: directClosureResult,
+                        closure: closure,
+                        arguments: closureArguments
+                    ),
+                    .branch(
+                        target: closureContinuation,
+                        arguments: closureContinuationArguments
+                    ),
+                ]
+            }
+            appendSyntheticBlock(
+                id: some,
+                parameters: [element],
+                instructions: closureInstructions
+            )
+
+            let continuationResult = try plan.closureResultType == .void
+                ? nil
+                : allocate(type: plan.closureResultType)
+            let continuationParameters = continuationResult.map { [$0] } ?? []
+            let materializedContinuationResult: Bytecode.Register?
+            let resultMaterialization: [IntermediateRepresentation.Instruction]
+            if [.map, .reduce].contains(plan.operation),
+               plan.closureResultType == .void {
+                let unit = try allocate(type: ValueRepresentation.unit)
+                materializedContinuationResult = unit
+                resultMaterialization = [
+                    .makeTuple(result: unit, elements: []),
+                ]
+            } else {
+                materializedContinuationResult = continuationResult
+                resultMaterialization = []
+            }
+            var closureArgumentCleanup: [
+                IntermediateRepresentation.Instruction
+            ] = []
+            if accumulatorNeedsCleanup {
+                closureArgumentCleanup.append(
+                    .destroyValue(
+                        try requiredRegister(
+                            loopAccumulator,
+                            "borrowed loop accumulator"
+                        )
+                    )
+                )
+            }
+            if inputNeedsCleanup {
+                closureArgumentCleanup.append(.destroyValue(element))
+            }
+            switch plan.operation {
+            case .map:
+                let result = try requiredRegister(
+                    materializedContinuationResult,
+                    "map result"
+                )
+                var instructions = resultMaterialization + [
+                    .arrayBuilderAppend(
+                        builder: try requiredRegister(builder, "Array builder"),
+                        value: result
+                    ),
+                ]
+                if plan.callResultType.requiresLinearOwnership {
+                    instructions.append(.destroyValue(result))
+                }
+                instructions.append(contentsOf: closureArgumentCleanup)
+                instructions.append(.branch(target: loop, arguments: []))
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: instructions
+                )
+            case .filter:
+                let predicate = try requiredRegister(
+                    continuationResult,
+                    "filter predicate"
+                )
+                let builder = try requiredRegister(builder, "Array builder")
+                let append = try allocateSyntheticBlockID()
+                let skip = inputNeedsCleanup
+                    ? try allocateSyntheticBlockID()
+                    : loop
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: [
+                        .conditionalBranch(
+                            condition: predicate,
+                            trueTarget: append,
+                            trueArguments: [],
+                            falseTarget: skip,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: append,
+                    instructions: [
+                        .arrayBuilderAppend(
+                            builder: builder,
+                            value: element
+                        ),
+                    ] + (inputNeedsCleanup
+                        ? [.destroyValue(element)] : [])
+                        + [.branch(target: loop, arguments: [])]
+                )
+                if inputNeedsCleanup {
+                    appendSyntheticBlock(
+                        id: skip,
+                        instructions: [
+                            .destroyValue(element),
+                            .branch(target: loop, arguments: []),
+                        ]
+                    )
+                }
+            case .compactMap:
+                let optional = try requiredRegister(
+                    continuationResult,
+                    "compactMap result"
+                )
+                let builder = try requiredRegister(builder, "Array builder")
+                let append = try allocateSyntheticBlockID()
+                let skip = try allocateSyntheticBlockID()
+                guard case let .array(mappedType) = plan.callResultType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "compactMap result is not an Array"
+                    )
+                }
+                let mapped = try allocate(type: mappedType)
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: closureArgumentCleanup + [
+                        .switchOptional(
+                            optional: optional,
+                            someTarget: append,
+                            noneTarget: skip
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: append,
+                    parameters: [mapped],
+                    instructions: [
+                        .arrayBuilderAppend(
+                            builder: builder,
+                            value: mapped
+                        ),
+                    ] + (mappedType.requiresLinearOwnership
+                        ? [.destroyValue(mapped)] : [])
+                        + [.branch(target: loop, arguments: [])]
+                )
+                appendSyntheticBlock(
+                    id: skip,
+                    instructions: [
+                        .branch(target: loop, arguments: []),
+                    ]
+                )
+            case .reduce:
+                let result = try requiredRegister(
+                    materializedContinuationResult,
+                    "reduce result"
+                )
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: resultMaterialization
+                        + closureArgumentCleanup + [
+                        .branch(
+                            target: loop,
+                            arguments: [result]
+                        ),
+                    ]
+                )
+            case .forEach:
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    instructions: closureArgumentCleanup
+                        + [.branch(target: loop, arguments: [])]
+                )
+            case .firstWhere:
+                let predicate = try requiredRegister(
+                    continuationResult,
+                    "first(where:) predicate"
+                )
+                let matched = try allocateSyntheticBlockID()
+                let skipped = try allocateSyntheticBlockID()
+                let result = try allocate(type: plan.callResultType)
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: [
+                        .conditionalBranch(
+                            condition: predicate,
+                            trueTarget: matched,
+                            trueArguments: [],
+                            falseTarget: skipped,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: matched,
+                    instructions: [
+                        .makeOptionalSome(result: result, value: element),
+                        .destroyStack(indexSlot),
+                    ] + sourceCleanup + [
+                        .branch(target: normalTarget, arguments: [result]),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: skipped,
+                    instructions: (inputNeedsCleanup
+                        ? [.destroyValue(element)] : [])
+                        + [.branch(target: loop, arguments: [])]
+                )
+            case .containsWhere, .allSatisfy:
+                let predicate = try requiredRegister(
+                    continuationResult,
+                    "predicate result"
+                )
+                let finished = try allocateSyntheticBlockID()
+                let continued = try allocateSyntheticBlockID()
+                let finishesWhenTrue = plan.operation == .containsWhere
+                let result = try allocate(type: .bool)
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: closureArgumentCleanup + [
+                        .conditionalBranch(
+                            condition: predicate,
+                            trueTarget: finishesWhenTrue ? finished : continued,
+                            trueArguments: [],
+                            falseTarget: finishesWhenTrue ? continued : finished,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: finished,
+                    instructions: [
+                        .constantBool(
+                            result: result,
+                            value: finishesWhenTrue
+                        ),
+                        .destroyStack(indexSlot),
+                    ] + sourceCleanup + [
+                        .branch(target: normalTarget, arguments: [result]),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: continued,
+                    instructions: [.branch(target: loop, arguments: [])]
+                )
+            case .optionalMap, .resultMap:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "non-Array operation entered Array higher-order lowering"
+                )
+            }
+
+            let emptyInstructions: [IntermediateRepresentation.Instruction]
+            switch plan.operation {
+            case .map, .filter, .compactMap:
+                let result = try allocate(type: plan.callResultType)
+                emptyInstructions = [
+                    .finishArrayBuilder(
+                        result: result,
+                        builder: try requiredRegister(builder, "Array builder")
+                    ),
+                    .destroyStack(indexSlot),
+                ] + sourceCleanup + [
+                    .branch(target: normalTarget, arguments: [result]),
+                ]
+            case .reduce:
+                emptyInstructions = [
+                    .destroyStack(indexSlot),
+                ] + sourceCleanup + [
+                    .branch(
+                        target: normalTarget,
+                        arguments: [
+                            try requiredRegister(
+                                loopAccumulator,
+                                "final reduce accumulator"
+                            ),
+                        ]
+                    ),
+                ]
+            case .forEach:
+                emptyInstructions = [
+                    .destroyStack(indexSlot),
+                ] + sourceCleanup + [
+                    .branch(target: normalTarget, arguments: []),
+                ]
+            case .firstWhere:
+                let result = try allocate(type: plan.callResultType)
+                emptyInstructions = [
+                    .makeOptionalNone(result: result),
+                    .destroyStack(indexSlot),
+                ] + sourceCleanup + [
+                    .branch(target: normalTarget, arguments: [result]),
+                ]
+            case .containsWhere, .allSatisfy:
+                let result = try allocate(type: .bool)
+                emptyInstructions = [
+                    .constantBool(
+                        result: result,
+                        value: plan.operation == .allSatisfy
+                    ),
+                    .destroyStack(indexSlot),
+                ] + sourceCleanup + [
+                    .branch(target: normalTarget, arguments: [result]),
+                ]
+            case .optionalMap, .resultMap:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "non-Array operation entered Array higher-order lowering"
+                )
+            }
+            appendSyntheticBlock(id: empty, instructions: emptyInstructions)
+
+            let propagatedArguments = errorParameter.map { [$0] } ?? []
+            var cleanupInstructions: [IntermediateRepresentation.Instruction] = []
+            if isThrowing {
+                cleanupInstructions.append(contentsOf: closureArgumentCleanup)
+            }
+            if let builder {
+                cleanupInstructions.append(.destroyValue(builder))
+            }
+            cleanupInstructions.append(.destroyStack(indexSlot))
+            cleanupInstructions.append(contentsOf: sourceCleanup)
+            cleanupInstructions.append(
+                .branch(
+                    target: errorTarget,
+                    arguments: propagatedArguments
+                )
+            )
+            appendSyntheticBlock(
+                id: errorCleanup,
+                parameters: errorParameter.map { [$0] } ?? [],
+                instructions: cleanupInstructions
+            )
+        }
+
+        func lowerOptionalMapTryApply(
+            genericArguments: String,
+            argumentText: String,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            let genericTypes = try splitTopLevel(genericArguments)
+                .filter { !$0.isEmpty }
+                .map(parseType)
+            let arguments = try parseApplyValueTokens(
+                argumentText,
+                line: line
+            )
+            guard genericTypes.count == 3, arguments.count == 4 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Optional.map has an unsupported specialization"
+                )
+            }
+            let wrappedType = ValueRepresentation.storable(genericTypes[0])
+            let errorType = genericTypes[1]
+            let closureResultType = genericTypes[2]
+            let mappedType = ValueRepresentation.storable(closureResultType)
+            let resultType = Bytecode.ValueType.optional(mappedType)
+            let resultDestination = arguments[0]
+            let errorDestination = arguments[1]
+            let closure = try resolve(arguments[2], line: line)
+            let source = try materializeOwnedValue(
+                at: arguments[3],
+                line: line
+            )
+            guard compilerAddressType(resultDestination) == resultType,
+                  compilerAddressType(errorDestination) == errorType,
+                  registerTypes[Int(source.rawValue)] == .optional(wrappedType),
+                  case let .closure(signature) = registerTypes[
+                    Int(closure.rawValue)
+                  ],
+                  signature.parameters == [wrappedType],
+                  signature.parameterConventions.count == 1,
+                  signature.parameterConventions[0] != .inout,
+                  signature.result == closureResultType,
+                  !signature.effects.isAsync,
+                  signature.effects.mayThrow == (errorType != .never),
+                  implicitStackValues[normalTarget] == nil,
+                  indirectTryNormalBlocks.insert(normalTarget).inserted
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "Optional.map"
+                )
+            }
+
+            let dispatchSource = source
+            let payloadNeedsCleanup = wrappedType.requiresLinearOwnership
+                && signature.parameterConventions[0] == .borrowed
+
+            let propagatedResult = try allocate(type: resultType)
+            implicitStackValues[normalTarget] = [
+                (resultDestination, propagatedResult),
+            ]
+
+            let isThrowing = signature.effects.mayThrow
+            let errorCleanup = try allocateSyntheticBlockID()
+            let errorParameter: Bytecode.Register?
+            if isThrowing {
+                let expectedErrorType: Bytecode.ValueType = typeEnvironment
+                    .preservesTypedErrors ? .error : .string
+                guard errorType == expectedErrorType,
+                      implicitStackValues[errorTarget] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional.map Error specialization does not match its image"
+                    )
+                }
+                errorParameter = try allocate(type: errorType)
+                let propagatedError = try allocate(type: errorType)
+                implicitStackValues[errorTarget] = [
+                    (errorDestination, propagatedError),
+                ]
+            } else {
+                errorParameter = nil
+            }
+
+            let dispatch = try allocateSyntheticBlockID()
+            let some = try allocateSyntheticBlockID()
+            let none = try allocateSyntheticBlockID()
+            let closureContinuation = try allocateSyntheticBlockID()
+            if isThrowing {
+                appendInstruction(.branch(target: dispatch, arguments: []))
+            } else {
+                // The frontend still emits a Never error continuation. Keep it
+                // in the verified CFG with an explicitly impossible edge.
+                let mustSucceed = try allocate(type: .bool)
+                appendInstruction(.constantBool(result: mustSucceed, value: true))
+                appendInstruction(
+                    .conditionalBranch(
+                        condition: mustSucceed,
+                        trueTarget: dispatch,
+                        trueArguments: [],
+                        falseTarget: errorCleanup,
+                        falseArguments: []
+                    )
+                )
+            }
+            finishCurrent()
+
+            appendSyntheticBlock(
+                id: dispatch,
+                instructions: [
+                    .switchOptional(
+                        optional: dispatchSource,
+                        someTarget: some,
+                        noneTarget: none
+                    ),
+                ]
+            )
+            let payload = try allocate(type: wrappedType)
+            let closureResult = try closureResultType == .void
+                ? nil
+                : allocate(type: closureResultType)
+            let closureInstructions: [IntermediateRepresentation.Instruction]
+            if isThrowing {
+                closureInstructions = [
+                    .closureTryApply(
+                        closure: closure,
+                        arguments: [payload],
+                        normalTarget: closureContinuation,
+                        errorTarget: errorCleanup
+                    ),
+                ]
+            } else {
+                closureInstructions = [
+                    .closureApply(
+                        result: closureResult,
+                        closure: closure,
+                        arguments: [payload]
+                    ),
+                    .branch(
+                        target: closureContinuation,
+                        arguments: closureResult.map { [$0] } ?? []
+                    ),
+                ]
+            }
+            appendSyntheticBlock(
+                id: some,
+                parameters: [payload],
+                instructions: closureInstructions
+            )
+
+            let mapped = try closureResultType == .void
+                ? nil
+                : allocate(type: mappedType)
+            let materializedMapped: Bytecode.Register
+            let resultMaterialization: [IntermediateRepresentation.Instruction]
+            if let mapped {
+                materializedMapped = mapped
+                resultMaterialization = []
+            } else {
+                materializedMapped = try allocate(type: ValueRepresentation.unit)
+                resultMaterialization = [
+                    .makeTuple(result: materializedMapped, elements: []),
+                ]
+            }
+            let someResult = try allocate(type: resultType)
+            appendSyntheticBlock(
+                id: closureContinuation,
+                parameters: mapped.map { [$0] } ?? [],
+                instructions: resultMaterialization + [
+                    .makeOptionalSome(
+                        result: someResult,
+                        value: materializedMapped
+                    ),
+                ] + (payloadNeedsCleanup
+                    ? [.destroyValue(payload)] : [])
+                    + [
+                    .branch(
+                        target: normalTarget,
+                        arguments: [someResult]
+                    ),
+                ]
+            )
+            let noneResult = try allocate(type: resultType)
+            appendSyntheticBlock(
+                id: none,
+                instructions: [
+                    .makeOptionalNone(result: noneResult),
+                    .branch(
+                        target: normalTarget,
+                        arguments: [noneResult]
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: errorCleanup,
+                parameters: errorParameter.map { [$0] } ?? [],
+                instructions: (!isThrowing
+                    && registerTypes[Int(dispatchSource.rawValue)]
+                        .requiresLinearOwnership
+                    ? [.destroyValue(dispatchSource)] : [])
+                    + (isThrowing && payloadNeedsCleanup
+                        ? [.destroyValue(payload)] : [])
+                    + [
+                    .branch(
+                        target: errorTarget,
+                        arguments: errorParameter.map { [$0] } ?? []
+                    ),
+                ]
+            )
+        }
+
+        func lowerResultMapApply(
+            resultToken: String,
+            genericArguments: String,
+            argumentText: String,
+            line: Int
+        ) throws {
+            let genericSpellings = splitTopLevel(genericArguments)
+                .filter { !$0.isEmpty }
+            guard genericSpellings.count == 3 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Result.map has an unsupported specialization"
+                )
+            }
+            let genericTypes = try genericSpellings.map(parseType)
+            let inputPayloadType = ValueRepresentation.storable(
+                genericTypes[0]
+            )
+            let closureResultType = genericTypes[2]
+            let outputPayloadType = ValueRepresentation.storable(
+                closureResultType
+            )
+            let inputType = try parseType(
+                "Result<\(genericSpellings[0]), \(genericSpellings[1])>"
+            )
+            let outputType = try parseType(
+                "Result<\(genericSpellings[2]), \(genericSpellings[1])>"
+            )
+            guard case let .local(inputKey) = inputType,
+                  case let .local(outputKey) = outputType
+            else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "Result.map concrete container"
+                )
+            }
+            let arguments = try parseApplyValueTokens(
+                argumentText,
+                line: line
+            )
+            guard arguments.count == 3,
+                  !resultToken.isEmpty,
+                  compilerAddressType(arguments[0]) == outputType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Result.map arguments do not match its specialization"
+                )
+            }
+            let source = try materializeOwnedValue(
+                at: arguments[2],
+                line: line
+            )
+            guard registerTypes[Int(source.rawValue)] == inputType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Result.map source does not match its specialization"
+                )
+            }
+            let closure = try resolve(arguments[1], line: line)
+            guard case let .closure(signature) = registerTypes[
+                Int(closure.rawValue)
+            ], signature.parameters == [inputPayloadType],
+               signature.parameterConventions.count == 1,
+               signature.parameterConventions[0] != .inout,
+               signature.result == closureResultType,
+               !signature.effects.mayThrow,
+               !signature.effects.isAsync
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "Result.map"
+                )
+            }
+
+            func caseIndex(
+                _ name: String,
+                in key: Bytecode.LocalTypeKey
+            ) throws -> UInt32 {
+                let index = try typeEnvironment.enumCaseIndex(
+                    type: key,
+                    name: name
+                )
+                guard let exact = UInt32(exactly: index) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Result.\(name) case index exceeds UInt32"
+                    )
+                }
+                return exact
+            }
+
+            let inputSuccess = try caseIndex("success", in: inputKey)
+            let inputFailure = try caseIndex("failure", in: inputKey)
+            let outputSuccess = try caseIndex("success", in: outputKey)
+            let outputFailure = try caseIndex("failure", in: outputKey)
+            let success = try allocateSyntheticBlockID()
+            let failure = try allocateSyntheticBlockID()
+            let closureContinuation = try allocateSyntheticBlockID()
+            let continuation = try allocateSyntheticBlockID()
+            appendInstruction(
+                .switchEnum(
+                    enumeration: source,
+                    cases: [
+                        .init(caseIndex: inputSuccess, target: success),
+                        .init(caseIndex: inputFailure, target: failure),
+                    ],
+                    defaultTarget: nil
+                )
+            )
+            finishCurrent()
+
+            let successPayload = try allocate(type: inputPayloadType)
+            let mappedValue = try closureResultType == .void
+                ? nil
+                : allocate(type: outputPayloadType)
+            let successPayloadNeedsCleanup = inputPayloadType
+                .requiresLinearOwnership
+                && signature.parameterConventions[0] == .borrowed
+            appendSyntheticBlock(
+                id: success,
+                parameters: [successPayload],
+                instructions: [
+                    .closureApply(
+                        result: mappedValue,
+                        closure: closure,
+                        arguments: [successPayload]
+                    ),
+                ] + (successPayloadNeedsCleanup
+                    ? [.destroyValue(successPayload)] : []) + [
+                    .branch(
+                        target: closureContinuation,
+                        arguments: mappedValue.map { [$0] } ?? []
+                    ),
+                ]
+            )
+            let mappedPayload = try closureResultType == .void
+                ? nil
+                : allocate(type: outputPayloadType)
+            let materializedPayload: Bytecode.Register
+            let resultMaterialization: [IntermediateRepresentation.Instruction]
+            if let mappedPayload {
+                materializedPayload = mappedPayload
+                resultMaterialization = []
+            } else {
+                materializedPayload = try allocate(type: ValueRepresentation.unit)
+                resultMaterialization = [
+                    .makeTuple(result: materializedPayload, elements: []),
+                ]
+            }
+            let successResult = try allocate(type: outputType)
+            appendSyntheticBlock(
+                id: closureContinuation,
+                parameters: mappedPayload.map { [$0] } ?? [],
+                instructions: resultMaterialization + [
+                    .makeEnum(
+                        result: successResult,
+                        caseIndex: outputSuccess,
+                        payload: materializedPayload
+                    ),
+                    .branch(
+                        target: continuation,
+                        arguments: [successResult]
+                    ),
+                ]
+            )
+            let failurePayload = try allocate(type: genericTypes[1])
+            let failureResult = try allocate(type: outputType)
+            appendSyntheticBlock(
+                id: failure,
+                parameters: [failurePayload],
+                instructions: [
+                    .makeEnum(
+                        result: failureResult,
+                        caseIndex: outputFailure,
+                        payload: failurePayload
+                    ),
+                    .branch(
+                        target: continuation,
+                        arguments: [failureResult]
+                    ),
+                ]
+            )
+            let mergedResult = try allocate(type: outputType)
+            current = .init(
+                id: continuation,
+                parameters: [mergedResult],
+                instructions: []
+            )
+            // Result.map's first physical argument is an `@out` destination;
+            // the synthesized merge initializes it exactly once.
+            try storeConstructedValue(
+                mergedResult,
+                at: arguments[0],
+                mode: .initialize
+            )
+            voidValues.insert(resultToken)
+        }
+
         func lowerSwiftCoreIntrinsic(
             _ intrinsic: SwiftCoreIntrinsic,
             resultToken: String,
@@ -1425,6 +3272,11 @@ public struct Lowerer: Sendable {
             }
 
             switch intrinsic {
+            case .higherOrder:
+                throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                    line: line,
+                    text: "higher-order Swift intrinsic requires control-flow lowering"
+                )
             case .minimum, .maximum:
                 guard arguments.count == 3, !genericArguments.isEmpty else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -1443,8 +3295,8 @@ public struct Lowerer: Sendable {
                 guard compilerAddressType(arguments[0]) == type,
                       stackType(at: arguments[1]) == type,
                       stackType(at: arguments[2]) == type,
-                      let lhs = try resolvedStackValue(at: arguments[1], line: line),
-                      let rhs = try resolvedStackValue(at: arguments[2], line: line),
+                      let lhs = try copyStoredValue(at: arguments[1], line: line),
+                      let rhs = try copyStoredValue(at: arguments[2], line: line),
                       registerTypes[Int(lhs.rawValue)] == type,
                       registerTypes[Int(rhs.rawValue)] == type
                 else {
@@ -1489,7 +3341,7 @@ public struct Lowerer: Sendable {
                 let type = try parseType(genericArguments)
                 guard compilerAddressType(arguments[0]) == type,
                       stackType(at: arguments[1]) == type,
-                      let operand = try resolvedStackValue(
+                      let operand = try copyStoredValue(
                         at: arguments[1],
                         line: line
                       ),
@@ -1665,6 +3517,39 @@ public struct Lowerer: Sendable {
                 values[resultToken] = result
                 appendInstruction(.stringConcat(result: result, lhs: lhs, rhs: rhs))
 
+            case .stringAppend:
+                guard genericArguments.isEmpty,
+                      arguments.count == 3,
+                      metatypeValues.contains(arguments[2]),
+                      compilerAddressType(arguments[0]) == .string,
+                      let lhs = try copyStoredValue(
+                          at: arguments[0],
+                          line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String mutation has unsupported arguments"
+                    )
+                }
+                let rhs = try resolve(arguments[1], line: line)
+                guard registerTypes[Int(lhs.rawValue)] == .string,
+                      registerTypes[Int(rhs.rawValue)] == .string
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String mutation operands must both be String"
+                    )
+                }
+                let result = try allocate(type: .string)
+                appendInstruction(
+                    .stringConcat(result: result, lhs: lhs, rhs: rhs)
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .assign
+                )
+                voidValues.insert(resultToken)
+
             case .stringCount, .stringIsEmpty:
                 guard genericArguments.isEmpty else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -1748,7 +3633,10 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let pattern = try resolve(arguments[0], line: line)
-                guard let string = stackValue(at: arguments[1]) ?? values[arguments[1]],
+                guard let string = try copyStoredValue(
+                    at: arguments[1],
+                    line: line
+                ) ?? values[arguments[1]],
                       registerTypes[Int(pattern.rawValue)] == .string,
                       registerTypes[Int(string.rawValue)] == .string
                 else {
@@ -1826,7 +3714,10 @@ public struct Lowerer: Sendable {
                         "appendInterpolation has unsupported arguments"
                     )
                 }
-                guard let value = stackValue(at: arguments[0]) ?? values[arguments[0]] else {
+                guard let value = try copyStoredValue(
+                    at: arguments[0],
+                    line: line
+                ) ?? values[arguments[0]] else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "appendInterpolation value is unavailable"
                     )
@@ -1887,7 +3778,9 @@ public struct Lowerer: Sendable {
                         "Array property getter operand must be Array"
                     )
                 }
-                let genericType = try parseType(genericArguments)
+                let genericType = try intrinsic == .arrayCount
+                    ? parseStoredType(genericArguments)
+                    : parseType(genericArguments)
                 let expectedGeneric: Bytecode.ValueType = intrinsic == .arrayCount
                     ? element
                     : .array(element)
@@ -1915,7 +3808,7 @@ public struct Lowerer: Sendable {
                 }
                 let index = try resolve(arguments[1], line: line)
                 let array = try resolve(arguments[2], line: line)
-                let element = try parseType(genericArguments)
+                let element = try parseStoredType(genericArguments)
                 guard registerTypes[Int(index.rawValue)] == .int64,
                       registerTypes[Int(array.rawValue)] == .array(element),
                       outputType == element
@@ -2005,15 +3898,24 @@ public struct Lowerer: Sendable {
                 guard arguments.count == 2,
                       !genericArguments.isEmpty,
                       let valueType = stackType(at: arguments[0]),
-                      let value = stackValue(at: arguments[0]),
-                      let arrayType = stackType(at: arguments[1]),
-                      let array = stackValue(at: arguments[1])
+                      let arrayType = stackType(at: arguments[1])
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Array.append has unsupported inout arguments"
                     )
                 }
-                let element = try parseType(genericArguments)
+                guard let value = try copyStoredValue(
+                    at: arguments[0],
+                    line: line
+                ), let array = try copyStoredValue(
+                    at: arguments[1],
+                    line: line
+                ) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array.append references uninitialized storage"
+                    )
+                }
+                let element = try parseStoredType(genericArguments)
                 guard valueType == element,
                       registerTypes[Int(value.rawValue)] == element,
                       arrayType == .array(element),
@@ -2035,11 +3937,18 @@ public struct Lowerer: Sendable {
                 guard arguments.count == 2,
                       !genericArguments.isEmpty,
                       let outputType = compilerAddressType(arguments[0]),
-                      let arrayType = compilerAddressType(arguments[1]),
-                      let array = stackValue(at: arguments[1])
+                      let arrayType = compilerAddressType(arguments[1])
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Array.popLast has unsupported inout arguments"
+                    )
+                }
+                guard let array = try copyStoredValue(
+                    at: arguments[1],
+                    line: line
+                ) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array.popLast references uninitialized storage"
                     )
                 }
                 let collectionType = try parseType(genericArguments)
@@ -2107,7 +4016,10 @@ public struct Lowerer: Sendable {
                       case let .array(element) = collectionType,
                       pendingArrayIteratorTypes[addressBase(arguments[0])] == element,
                       stackType(at: arguments[1]) == collectionType,
-                      let array = stackValue(at: arguments[1]),
+                      let array = try takeStoredValue(
+                        at: arguments[1],
+                        line: line
+                      ),
                       registerTypes[Int(array.rawValue)] == collectionType,
                       !element.requiresLinearOwnership
                 else {
@@ -2147,6 +4059,10 @@ public struct Lowerer: Sendable {
                         )
                     }
                     pendingIntegerRangeNextAddresses[resultAddress] = state
+                    // Range iteration is lowered directly to the iterator's
+                    // cursor slot; its SIL Optional out-buffer is never
+                    // materialized and must remain uninitialized in HLBC.
+                    elidedRuntimeStorageAddresses.insert(resultAddress)
                     voidValues.insert(resultToken)
                     return
                 }
@@ -2203,7 +4119,10 @@ public struct Lowerer: Sendable {
             case .dictionarySubscriptGet:
                 guard arguments.count == 3,
                       let outputType = stackType(at: arguments[0]),
-                      let key = stackValue(at: arguments[1])
+                      let key = try copyStoredValue(
+                        at: arguments[1],
+                        line: line
+                      )
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Dictionary subscript getter has unsupported arguments"
@@ -2230,14 +4149,25 @@ public struct Lowerer: Sendable {
             case .dictionarySubscriptSet:
                 guard arguments.count == 3,
                       let updateType = stackType(at: arguments[0]),
-                      let update = stackValue(at: arguments[0]),
                       let keyType = stackType(at: arguments[1]),
-                      let key = stackValue(at: arguments[1]),
-                      let dictionaryType = stackType(at: arguments[2]),
-                      let dictionary = stackValue(at: arguments[2])
+                      let dictionaryType = stackType(at: arguments[2])
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Dictionary subscript setter has unsupported arguments"
+                    )
+                }
+                guard let update = try copyStoredValue(
+                    at: arguments[0],
+                    line: line
+                ), let key = try copyStoredValue(
+                    at: arguments[1],
+                    line: line
+                ), let dictionary = try copyStoredValue(
+                    at: arguments[2],
+                    line: line
+                ) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary subscript setter references uninitialized storage"
                     )
                 }
                 let types = try parseDictionaryGenericArguments(genericArguments)
@@ -2272,12 +4202,21 @@ public struct Lowerer: Sendable {
                 guard arguments.count == 3,
                       let outputType = compilerAddressType(arguments[0]),
                       let keyType = compilerAddressType(arguments[1]),
-                      let key = stackValue(at: arguments[1]),
-                      let dictionaryType = compilerAddressType(arguments[2]),
-                      let dictionary = stackValue(at: arguments[2])
+                      let dictionaryType = compilerAddressType(arguments[2])
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Dictionary.removeValue has unsupported arguments"
+                    )
+                }
+                guard let key = try copyStoredValue(
+                    at: arguments[1],
+                    line: line
+                ), let dictionary = try copyStoredValue(
+                    at: arguments[2],
+                    line: line
+                ) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary.removeValue references uninitialized storage"
                     )
                 }
                 let types = try parseDictionaryGenericArguments(genericArguments)
@@ -2413,7 +4352,7 @@ public struct Lowerer: Sendable {
                         "Array literal allocation has unsupported arguments"
                     )
                 }
-                let element = try parseType(genericArguments)
+                let element = try parseStoredType(genericArguments)
                 pendingArrayLiterals[resultToken] = .init(
                     elementType: element,
                     count: count
@@ -2429,7 +4368,7 @@ public struct Lowerer: Sendable {
                         "Array literal finalization has unsupported arguments"
                     )
                 }
-                let element = try parseType(genericArguments)
+                let element = try parseStoredType(genericArguments)
                 guard element == pending.elementType else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Array literal finalization is incomplete or has a mismatched element type"
@@ -2547,6 +4486,7 @@ public struct Lowerer: Sendable {
         }
 
         for (lineIndex, originalRawLine) in rawLines.enumerated() {
+            currentSILLineIndex = lineIndex
             let rawLine = nsErrorBridges.replacementLines[lineIndex]
                 ?? originalRawLine
             let sourceLine = lineIndex + 1
@@ -2568,6 +4508,11 @@ public struct Lowerer: Sendable {
                 pattern: #"^end_borrow (%[0-9]+)$"#
             ) {
                 borrowedValueTokens.remove(borrowEnd[0])
+                if let value = mutableCaptureState.temporaryBorrowOwners.removeValue(
+                    forKey: borrowEnd[0]
+                ), registerTypes[Int(value.rawValue)].requiresLinearOwnership {
+                    appendInstruction(.destroyValue(value))
+                }
                 if let value = preservedNativeConversionValues.removeValue(
                     forKey: borrowEnd[0]
                 ) {
@@ -2603,6 +4548,9 @@ public struct Lowerer: Sendable {
                 bridgedParameterTypes: bridgedBlockParameterTypes,
                 indirectResultType: entryBlock == nil && signature.hasIndirectResult
                     ? signature.result
+                    : nil,
+                indirectErrorType: entryBlock == nil
+                    ? signature.indirectErrorType
                     : nil,
                 suppressVoidParameter: parseBlockNumber(line).map {
                     indirectTryNormalBlocks.contains(.init(rawValue: $0))
@@ -2640,6 +4588,13 @@ public struct Lowerer: Sendable {
                     }
                 }
                 current = loweredBlock
+                if let owners = implicitOwnerCleanups.removeValue(
+                    forKey: loweredBlock.id
+                ) {
+                    for owner in owners {
+                        appendInstruction(.destroyValue(owner))
+                    }
+                }
                 for (token, identity) in block.erasedMetatypeParameters {
                     switch identity {
                     case let .native(typeID):
@@ -2651,11 +4606,21 @@ public struct Lowerer: Sendable {
                 for (silValue, register) in explicitParameters {
                     values[silValue] = register
                 }
-                compilerOptionalVoidValues.formUnion(
-                    block.compilerOptionalVoidParameters
-                )
                 if let implicit = implicitStackValues[block.block.id] {
                     for item in implicit {
+                        if runtimeAddress(at: item.address) != nil
+                            || item.address == indirectResultAddress {
+                            // An indirect call initializes its destination on
+                            // one continuation edge. Preserve that write when
+                            // storage is runtime-backed or forwards the current
+                            // function's own `@out` result slot.
+                            try storeConstructedValue(
+                                item.register,
+                                at: item.address,
+                                mode: .initialize
+                            )
+                            continue
+                        }
                         if optionalPayloadAddressRoots[item.address] != nil {
                             try storeConstructedValue(
                                 item.register,
@@ -2680,23 +4645,61 @@ public struct Lowerer: Sendable {
                     stackAddressTypes[token] = type
                     stackAddressValues[token] = register
                 }
+                for (token, pointee) in block.mutableCellParameters {
+                    guard let register = values[token],
+                          registerTypes[Int(register.rawValue)]
+                            == .mutableCell(pointee)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "mutable capture parameter has no matching VM cell"
+                        )
+                    }
+                    mutableCaptureState.addresses[token] = .init(
+                        register: register,
+                        pointee: pointee
+                    )
+                }
                 if entryBlock == nil {
                     entryBlock = loweredBlock.id
                     if signature.hasIndirectResult {
-                        guard supportsIndirectResult(signature.result),
-                              let address = block.indirectResultAddress
-                        else {
+                        guard let address = block.indirectResultAddress else {
                             throw CanonicalSIL.LoweringError.unsupportedType(
                                 "indirect result \(signature.result)"
                             )
                         }
-                        indirectResultAddress = address
-                        indirectResultSlot = try allocateStackSlot(
-                            type: signature.result
-                        )
+                        if signature.result == .void {
+                            // A fully specialized generic closure may retain
+                            // an `@out ()` parameter even though `()` is its
+                            // logical no-result ABI. The pointer is zero-sized
+                            // compiler metadata and never enters HLBC.
+                            _ = address
+                        } else {
+                            guard supportsIndirectResult(signature.result) else {
+                                throw CanonicalSIL.LoweringError.unsupportedType(
+                                    "indirect result \(signature.result)"
+                                )
+                            }
+                            indirectResultAddress = address
+                            indirectResultSlot = try allocateStackSlot(
+                                type: signature.result
+                            )
+                        }
                     } else if block.indirectResultAddress != nil {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "entry block contains an unexpected indirect result"
+                        )
+                    }
+                    if let errorType = signature.indirectErrorType {
+                        guard let address = block.indirectErrorAddress else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "entry block omits its indirect error result"
+                            )
+                        }
+                        indirectErrorAddress = address
+                        stackAddressTypes[address] = errorType
+                    } else if block.indirectErrorAddress != nil {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "entry block contains an unexpected indirect error result"
                         )
                     }
                     parameterRegisters = loweredBlock.parameters
@@ -2737,8 +4740,7 @@ public struct Lowerer: Sendable {
                 ).map { token, value -> Bytecode.ParameterConvention in
                     let type = registerTypes[Int(value.rawValue)]
                     return type.requiresLinearOwnership
-                        && (borrowedValueTokens.contains(token)
-                            || isBorrowedParameter(value))
+                        && isBorrowedValue(token: token, register: value)
                         ? .borrowed : .owned
                 }
                 guard acceptsPhysicalConventions(
@@ -2753,7 +4755,8 @@ public struct Lowerer: Sendable {
                 }
                 let prepared = try prepareDirectCallArguments(
                     bridge.argumentTokens,
-                    conventions: physicalConventions,
+                    physicalConventions: physicalConventions,
+                    logicalTypes: binding.parameterTypes,
                     line: sourceLine,
                     allowsSynthesizedAccess: false
                 )
@@ -2778,6 +4781,10 @@ public struct Lowerer: Sendable {
                         normalTarget: bridge.normalTarget,
                         errorTarget: bridge.errorTarget
                     )
+                )
+                try schedulePreparedOwnerCleanups(
+                    prepared,
+                    in: [bridge.normalTarget, bridge.errorTarget]
                 )
                 for token in bridge.argumentTokens {
                     preservedNativeConversionValues.removeValue(forKey: token)
@@ -3004,9 +5011,27 @@ public struct Lowerer: Sendable {
                     pendingDictionaryIteratorTypes[stack[0]] = (types.key, types.value)
                     continue
                 }
-                let type = try parseType(stack[1])
+                let type = try parseStoredType(stack[1])
                 stackAddressTypes[stack[0]] = type
-                if usesRuntimeAddresses {
+                if let capturedType = mutableCapturePointees[stack[0]] {
+                    guard capturedType == type else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "planned mutable capture does not match its allocation"
+                        )
+                    }
+                    let cell = try allocate(type: .mutableCell(type))
+                    appendInstruction(
+                        .makeMutableCell(result: cell, initialValue: nil)
+                    )
+                    mutableCaptureState.addresses[stack[0]] = .init(
+                        register: cell,
+                        pointee: type
+                    )
+                    values[stack[0]] = cell
+                } else if usesRuntimeAddresses
+                            || storageInitializationPlan.runtimeStorageRoots.contains(
+                                stack[0]
+                            ) {
                     let slot = try allocateStackSlot(type: type)
                     let address = try allocate(type: .address(type))
                     runtimeStackSlots[stack[0]] = slot
@@ -3015,6 +5040,66 @@ public struct Lowerer: Sendable {
                     values[stack[0]] = address
                     appendInstruction(.stackAddress(result: address, slot: slot))
                 }
+                continue
+            }
+
+            if let box = match(
+                line,
+                pattern: #"^(%[0-9]+) = alloc_box \$\{ var (.+) \}(?:, .*)?$"#
+            ) {
+                let pointee = try parseType(box[1])
+                guard pendingMutableBoxes.updateValue(
+                    pointee,
+                    forKey: box[0]
+                ) == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "mutable box is allocated more than once"
+                    )
+                }
+                continue
+            }
+
+            if let projection = match(
+                line,
+                pattern: #"^(%[0-9]+) = project_box (%[0-9]+), ([0-9]+)$"#
+            ) {
+                guard projection[2] == "0" else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: "multi-field mutable box projection"
+                    )
+                }
+                if let pointee = pendingMutableBoxes[projection[1]] {
+                    guard mutableBoxProjectionRoots.updateValue(
+                        projection[1],
+                        forKey: projection[0]
+                    ) == nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "mutable box projection is defined more than once"
+                        )
+                    }
+                    stackAddressTypes[projection[0]] = pointee
+                    continue
+                }
+                guard let cell = values[projection[1]],
+                      case let .mutableCell(pointee) = registerTypes[
+                        Int(cell.rawValue)
+                      ]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "project_box references an unknown mutable capture"
+                    )
+                }
+                mutableCaptureState.addresses[projection[1]] = .init(
+                    register: cell,
+                    pointee: pointee
+                )
+                mutableCaptureState.addresses[projection[0]] = .init(
+                    register: cell,
+                    pointee: pointee
+                )
+                addressAliases[projection[0]] = projection[1]
+                values[projection[0]] = cell
                 continue
             }
 
@@ -3029,25 +5114,41 @@ public struct Lowerer: Sendable {
                 )
                 let sourceType = stackType(at: copy[1])
                 let destinationType = compilerAddressType(copy[3])
-                guard let source = try resolvedStackValue(
-                    at: copy[1],
-                    line: sourceLine
-                ),
-                      sourceType == destinationType
-                else {
+                guard let sourceType, sourceType == destinationType else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "copy_addr at line \(sourceLine) requires initialized matching storage; "
                             + "source \(copy[1]) is \(String(describing: sourceType)), "
                             + "destination \(copy[3]) is \(String(describing: destinationType))"
                     )
                 }
-                let value: Bytecode.Register
-                let type = registerTypes[Int(source.rawValue)]
-                if type.isTrivial || copy[0] == "take" {
-                    value = source
+                let value: Bytecode.Register?
+                if copy[0] == "take" {
+                    guard mutableCell(at: copy[1]) == nil else {
+                        throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                            line: sourceLine,
+                            text: "taking copy_addr through a mutable closure capture"
+                        )
+                    }
+                    value = try takeStoredValue(
+                        at: copy[1],
+                        line: sourceLine
+                    )
                 } else {
-                    value = try allocate(type: type)
-                    appendInstruction(.copyValue(result: value, source: source))
+                    value = try copyStoredValue(
+                        at: copy[1],
+                        line: sourceLine
+                    )
+                }
+                guard let value else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "copy_addr references uninitialized source storage"
+                    )
+                }
+                let type = registerTypes[Int(value.rawValue)]
+                guard type == sourceType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "copy_addr materialized a value with the wrong type"
+                    )
                 }
                 if type == .any {
                     try storeExistential(value, at: copy[3])
@@ -3067,9 +5168,6 @@ public struct Lowerer: Sendable {
                             isKnownSome: false
                         )
                     }
-                }
-                if copy[0] == "take" {
-                    stackAddressValues.removeValue(forKey: addressBase(copy[1]))
                 }
                 continue
             }
@@ -3093,6 +5191,36 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = load_borrow (%[0-9]+)$"#
             ) {
+                if let cell = mutableCell(at: borrow[1]),
+                   let pointee = mutableCellPointee(at: borrow[1]) {
+                    let value = try allocate(type: pointee)
+                    appendInstruction(
+                        .loadMutableCell(result: value, cell: cell)
+                    )
+                    values[borrow[0]] = value
+                    borrowedValueTokens.insert(borrow[0])
+                    mutableCaptureState.temporaryBorrowOwners[borrow[0]] = value
+                    continue
+                }
+                if runtimeAddress(at: borrow[1]) != nil {
+                    guard let pointee = stackType(at: borrow[1]),
+                          let value = try copyStoredValue(
+                            at: borrow[1],
+                            line: sourceLine
+                          ),
+                          registerTypes[Int(value.rawValue)] == pointee
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "load_borrow references uninitialized runtime storage"
+                        )
+                    }
+                    values[borrow[0]] = value
+                    borrowedValueTokens.insert(borrow[0])
+                    if pointee.requiresLinearOwnership {
+                        mutableCaptureState.temporaryBorrowOwners[borrow[0]] = value
+                    }
+                    continue
+                }
                 guard let value = borrowedAddressValues[borrow[1]]
                     ?? stackValue(at: borrow[1])
                 else {
@@ -3111,6 +5239,16 @@ public struct Lowerer: Sendable {
             ) {
                 let source = access[2]
                 let base = addressBase(source)
+                if let cell = mutableCell(at: source),
+                   let pointee = mutableCellPointee(at: source) {
+                    addressAliases[access[0]] = base
+                    mutableCaptureState.addresses[access[0]] = .init(
+                        register: cell,
+                        pointee: pointee
+                    )
+                    values[access[0]] = cell
+                    continue
+                }
                 if let sourceAddress = runtimeAddress(at: source),
                    let pointee = stackType(at: source) {
                     if isScopedRuntimeAddress(source),
@@ -3179,6 +5317,8 @@ public struct Lowerer: Sendable {
                         "end_access references an unsupported access"
                     )
                 }
+                mutableCaptureState.addresses.removeValue(forKey: access[0])
+                values.removeValue(forKey: access[0])
                 continue
             }
 
@@ -3204,7 +5344,16 @@ public struct Lowerer: Sendable {
                     if isFinalLexicalUse { onStackClosureValues.remove(address) }
                     continue
                 }
-                if catchScratchAddresses.contains(address) { continue }
+                if catchScratchAddresses.contains(address),
+                   runtimeStackSlots[address] == nil {
+                    continue
+                }
+                if elidedRuntimeStorageAddresses.contains(address) {
+                    if isFinalLexicalUse {
+                        elidedRuntimeStorageAddresses.remove(address)
+                    }
+                    continue
+                }
                 if integerRangeAddresses.contains(address) {
                     guard integerRangeAddressValues[address] != nil else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -3275,8 +5424,17 @@ public struct Lowerer: Sendable {
                     continue
                 }
                 if let slot = runtimeStackSlots[address] {
-                    if stackAddressValues[address] != nil {
+                    switch storageInitializationPlan.deallocationMode(
+                        at: currentSILLineIndex
+                    ) {
+                    case .none:
+                        break
+                    case .destroy:
                         appendInstruction(.destroyStack(slot))
+                    case .destroyIfInitialized:
+                        appendInstruction(
+                            .destroyStackIfInitialized(slot)
+                        )
                     }
                     guard stackAddressTypes[address] != nil else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -3295,8 +5453,8 @@ public struct Lowerer: Sendable {
                         "dealloc_stack references an unsupported address"
                     )
                 }
-                takenOptionalPayloadRoots = takenOptionalPayloadRoots.filter {
-                    addressBase($0.value) != address
+                takenOptionalPayloads = takenOptionalPayloads.filter {
+                    addressBase($0.value.root) != address
                 }
                 // Swift treats some imported C values as trivial even though
                 // HLBC represents them with an owned native box. Release any
@@ -3791,6 +5949,52 @@ public struct Lowerer: Sendable {
                     "UInt", "UInt8", "UInt16", "UInt32", "UInt64",
                     "Bool", "Float", "Double", "CGFloat",
                 ]
+                if let cell = mutableCell(at: projection[1]),
+                   let basePointee = mutableCellPointee(at: projection[1]) {
+                    if scalarWrappers.contains(projection[2]),
+                       projection[3] == "_value" {
+                        mutableCaptureState.addresses[projection[0]] = .init(
+                            register: cell,
+                            pointee: basePointee
+                        )
+                        addressAliases[projection[0]] = addressBase(projection[1])
+                        values[projection[0]] = cell
+                        continue
+                    }
+                    guard case let .local(key) = basePointee,
+                          typeEnvironment.localKey(for: projection[2]) == key
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "struct_element_addr mutable cell is not its declared local struct"
+                        )
+                    }
+                    let index = try typeEnvironment.structFieldIndex(
+                        type: key,
+                        name: projection[3]
+                    )
+                    let fields = try typeEnvironment.structFields(for: key)
+                    guard let fieldIndex = UInt32(exactly: index) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "local struct field index exceeds UInt32"
+                        )
+                    }
+                    let pointee = fields[index].type
+                    let result = try allocate(type: .mutableCell(pointee))
+                    appendInstruction(
+                        .projectMutableCell(
+                            result: result,
+                            cell: cell,
+                            fieldIndex: fieldIndex
+                        )
+                    )
+                    mutableCaptureState.addresses[projection[0]] = .init(
+                        register: result,
+                        pointee: pointee
+                    )
+                    addressAliases[projection[0]] = addressBase(projection[1])
+                    values[projection[0]] = result
+                    continue
+                }
                 if scalarWrappers.contains(projection[2]),
                    projection[3] == "_value",
                    let property = nativePropertyAddresses[addressBase(projection[1])] {
@@ -3798,7 +6002,19 @@ public struct Lowerer: Sendable {
                     addressAliases[projection[0]] = addressBase(projection[1])
                     continue
                 }
-                if let structure = stackValue(at: projection[1]),
+                if scalarWrappers.contains(projection[2]),
+                   projection[3] == "_value",
+                   runtimeAddress(at: projection[1]) == nil,
+                   let stored = stackValue(at: projection[1]),
+                   let pointee = stackType(at: projection[1]),
+                   registerTypes[Int(stored.rawValue)] == pointee {
+                    stackAddressTypes[projection[0]] = pointee
+                    stackAddressValues[projection[0]] = stored
+                    addressAliases[projection[0]] = addressBase(projection[1])
+                    continue
+                }
+                if runtimeAddress(at: projection[1]) == nil,
+                   let structure = stackValue(at: projection[1]),
                    case let .local(key) = stackType(at: projection[1]),
                    typeEnvironment.localKey(for: projection[2]) == key {
                     let index = try typeEnvironment.structFieldIndex(
@@ -3858,7 +6074,11 @@ public struct Lowerer: Sendable {
                 let pointee = fields[index].type
                 let result = try allocate(type: .address(pointee))
                 appendInstruction(
-                    .projectStructAddress(result: result, base: base, fieldIndex: fieldIndex)
+                    .projectAggregateAddress(
+                        result: result,
+                        base: base,
+                        fieldIndex: fieldIndex
+                    )
                 )
                 runtimeAddressValues[projection[0]] = result
                 runtimeAddressPointees[projection[0]] = pointee
@@ -4175,8 +6395,13 @@ public struct Lowerer: Sendable {
                         "local struct \(key) field count does not match its declaration"
                     )
                 }
-                let registers = try operands.map {
-                    try resolve($0, line: sourceLine)
+                let registers = try zip(operands, fields).map {
+                    operand, field in
+                    try resolveStorableValue(
+                        operand,
+                        expectedType: field.type,
+                        line: sourceLine
+                    )
                 }
                 guard zip(registers, fields).allSatisfy({ register, field in
                     registerTypes[Int(register.rawValue)] == field.type
@@ -4351,6 +6576,7 @@ public struct Lowerer: Sendable {
                     binding: binding,
                     physicalParameterConventions: callee.parameterConventions,
                     hasIndirectResult: callee.hasIndirectResult,
+                    indirectErrorType: callee.indirectErrorType,
                     erasedMetatypes: callee.erasedMetatypes,
                     usesObjectiveCBridge: usesObjectiveCBridge
                 )
@@ -4377,8 +6603,8 @@ public struct Lowerer: Sendable {
                     optionSetArrayLiteralReferences[reference[0]] = reference[2]
                     continue
                 }
-                if let key = typeEnvironment.structFactory(reference[1]) {
-                    localFactoryReferences[reference[0]] = key
+                if let factory = typeEnvironment.structFactory(reference[1]) {
+                    localFactoryReferences[reference[0]] = factory
                     continue
                 }
                 if let key = typeEnvironment.classAllocator(reference[1]),
@@ -4435,6 +6661,7 @@ public struct Lowerer: Sendable {
                     binding: binding,
                     physicalParameterConventions: callee.parameterConventions,
                     hasIndirectResult: callee.hasIndirectResult,
+                    indirectErrorType: callee.indirectErrorType,
                     erasedMetatypes: callee.erasedMetatypes,
                     usesObjectiveCBridge: false
                 )
@@ -4455,10 +6682,11 @@ public struct Lowerer: Sendable {
                 }
                 let binding = reference.binding
                 guard
-                      !binding.effects.mayThrow,
                       !binding.effects.isAsync,
                       case let .closure(signature) = try parseType(conversion[2]),
                       signature.parameters == binding.parameterTypes,
+                      signature.parameterConventions
+                        == binding.parameterConventions,
                       signature.result == binding.resultType,
                       signature.effects == binding.effects
                 else {
@@ -4489,7 +6717,6 @@ public struct Lowerer: Sendable {
                 }
                 let binding = reference.binding
                 guard
-                      !binding.effects.mayThrow,
                       !binding.effects.isAsync
                 else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
@@ -4497,12 +6724,21 @@ public struct Lowerer: Sendable {
                         text: line
                     )
                 }
-                let physicalType = try parseFunctionType(closure[3])
+                let physicalType = try parseFunctionType(
+                    closure[3],
+                    bridgingTo: (
+                        binding.parameterTypes,
+                        binding.resultType
+                    ),
+                    abiAdapter: binding.abiAdapter
+                )
                 guard physicalType.parameters == binding.parameterTypes,
                       physicalType.parameterConventions
                         == reference.physicalParameterConventions,
                       physicalType.result == binding.resultType,
                       physicalType.hasIndirectResult == reference.hasIndirectResult,
+                      physicalType.indirectErrorType
+                        == reference.indirectErrorType,
                       physicalType.effects.mayThrow == binding.effects.mayThrow,
                       physicalType.effects.isAsync == binding.effects.isAsync
                 else {
@@ -4515,18 +6751,34 @@ public struct Lowerer: Sendable {
                     closure[2],
                     line: sourceLine
                 )
-                let captures = try captureTokens.map {
-                    try resolve($0, line: sourceLine)
-                }
-                guard captures.count <= binding.parameterTypes.count else {
+                guard captureTokens.count <= binding.parameterTypes.count else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "partial_apply captures more values than its callee accepts"
                     )
                 }
-                let invocationCount = binding.parameterTypes.count - captures.count
+                let invocationCount = binding.parameterTypes.count
+                    - captureTokens.count
                 let invocationTypes = Array(binding.parameterTypes.prefix(invocationCount))
+                let expectedCaptureTypes = Array(
+                    binding.parameterTypes.suffix(captureTokens.count)
+                )
+                let captures = try zip(captureTokens, expectedCaptureTypes).map {
+                    token, type in
+                    if case let .mutableCell(pointee) = type {
+                        return try materializeMutableCapture(
+                            at: token,
+                            pointee: pointee,
+                            line: sourceLine
+                        )
+                    }
+                    return try resolveStorableValue(
+                        token,
+                        expectedType: type,
+                        line: sourceLine
+                    )
+                }
                 let captureTypes = captures.map { registerTypes[Int($0.rawValue)] }
-                guard captureTypes == Array(binding.parameterTypes.suffix(captures.count)) else {
+                guard captureTypes == expectedCaptureTypes else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
                         line: sourceLine,
                         mangledName: binding.mangledName
@@ -4534,6 +6786,9 @@ public struct Lowerer: Sendable {
                 }
                 let signature = Bytecode.ClosureSignature(
                     parameters: invocationTypes,
+                    parameterConventions: Array(
+                        binding.parameterConventions.prefix(invocationCount)
+                    ),
                     result: binding.resultType,
                     effects: binding.effects
                 )
@@ -4554,7 +6809,7 @@ public struct Lowerer: Sendable {
 
             if let dependence = match(
                 line,
-                pattern: #"^(%[0-9]+) = mark_dependence (%[0-9]+) on (%[0-9]+)$"#
+                pattern: #"^(%[0-9]+) = mark_dependence(?: \[[^\]]+\])* (%[0-9]+) on (%[0-9]+)$"#
             ) {
                 let source = try resolve(dependence[1], line: sourceLine)
                 guard case .closure = registerTypes[Int(source.rawValue)] else {
@@ -4639,7 +6894,10 @@ public struct Lowerer: Sendable {
                 let arrayAddress = addressBase(arguments[1])
                 guard registerTypes[Int(index.rawValue)] == .int64,
                       stackType(at: arguments[1]) == .array(element),
-                      let array = stackValue(at: arguments[1]),
+                      let array = try copyStoredValue(
+                        at: arguments[1],
+                        line: sourceLine
+                      ),
                       registerTypes[Int(array.rawValue)] == .array(element),
                       !element.requiresLinearOwnership,
                       arrayElementMutations[call[0]] == nil,
@@ -4649,6 +6907,16 @@ public struct Lowerer: Sendable {
                         "Array.subscript.modify types or access scope do not match"
                     )
                 }
+                let currentElement = try allocate(type: element)
+                appendInstruction(
+                    .arrayGet(
+                        result: currentElement,
+                        array: array,
+                        index: index
+                    )
+                )
+                stackAddressTypes[call[0]] = element
+                stackAddressValues[call[0]] = currentElement
                 arrayElementMutations[call[0]] = .init(
                     arrayAddress: arrayAddress,
                     array: array,
@@ -4680,6 +6948,112 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^try_apply (%[0-9]+)(?:<(.+)>)?\((.*)\) : \$(.+), normal bb([0-9]+), error bb([0-9]+)$"#
             ) {
+                if let closure = values[call[0]],
+                   case let .closure(signature) = registerTypes[
+                    Int(closure.rawValue)
+                   ] {
+                    let appliedType = try parseFunctionType(call[3])
+                    guard call[1].isEmpty,
+                          signature.effects.mayThrow,
+                          !signature.effects.isAsync,
+                          appliedType.parameters == signature.parameters,
+                          appliedType.parameterConventions
+                            == signature.parameterConventions,
+                          appliedType.result == signature.result,
+                          appliedType.effects.mayThrow,
+                          !appliedType.effects.isAsync
+                    else {
+                        throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                            line: sourceLine,
+                            mangledName: "<closure>"
+                        )
+                    }
+                    let normalTarget = try parseBlockID(call[4])
+                    let errorTarget = try parseBlockID(call[5])
+                    var argumentTokens = try parseApplyValueTokens(
+                        call[2],
+                        line: sourceLine
+                    )
+                    let destinations = try consumeIndirectCallDestinations(
+                        from: &argumentTokens,
+                        resultType: signature.result,
+                        hasIndirectResult: appliedType.hasIndirectResult,
+                        indirectErrorType: appliedType.indirectErrorType,
+                        physicalArgumentCount: signature.parameters.count
+                    )
+                    try bindIndirectTryCallDestinations(
+                        destinations,
+                        resultType: signature.result,
+                        indirectErrorType: appliedType.indirectErrorType,
+                        normalTarget: normalTarget,
+                        errorTarget: errorTarget
+                    )
+                    let prepared = try prepareDirectCallArguments(
+                        argumentTokens,
+                        physicalConventions: appliedType.parameterConventions,
+                        logicalTypes: signature.parameters,
+                        line: sourceLine,
+                        allowsSynthesizedAccess: false
+                    )
+                    let arguments = prepared.arguments
+                    guard arguments.map({
+                        registerTypes[Int($0.rawValue)]
+                    }) == signature.parameters else {
+                        throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                            line: sourceLine,
+                            mangledName: "<closure>"
+                        )
+                    }
+                    appendInstruction(
+                        .closureTryApply(
+                            closure: closure,
+                            arguments: arguments,
+                            normalTarget: normalTarget,
+                            errorTarget: errorTarget
+                        )
+                    )
+                    try transferOwnedCompilerAddressArguments(
+                        tokens: argumentTokens,
+                        resolvedArguments: prepared.arguments,
+                        conventions: appliedType.parameterConventions
+                    )
+                    try schedulePreparedOwnerCleanups(
+                        prepared,
+                        in: [normalTarget, errorTarget]
+                    )
+                    continue
+                }
+                if case let .higherOrder(operation)? = swiftCoreReferences[
+                    call[0]
+                ] {
+                    let normalTarget = try parseBlockID(call[4])
+                    let errorTarget = try parseBlockID(call[5])
+                    switch operation {
+                    case .optionalMap:
+                        try lowerOptionalMapTryApply(
+                            genericArguments: call[1],
+                            argumentText: call[2],
+                            normalTarget: normalTarget,
+                            errorTarget: errorTarget,
+                            line: sourceLine
+                        )
+                    case .resultMap:
+                        throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                            line: sourceLine,
+                            text: "throwing Result.map ABI"
+                        )
+                    default:
+                        try lowerArrayHigherOrderTryApply(
+                            operation: operation,
+                            genericArguments: call[1],
+                            argumentText: call[2],
+                            normalTarget: normalTarget,
+                            errorTarget: errorTarget,
+                            line: sourceLine
+                        )
+                    }
+                    continue
+                }
                 guard swiftCoreReferences[call[0]] == nil else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
@@ -4721,6 +7095,8 @@ public struct Lowerer: Sendable {
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
                       appliedType.hasIndirectResult == reference.hasIndirectResult,
+                      appliedType.indirectErrorType
+                        == reference.indirectErrorType,
                       appliedType.erasedMetatypes == reference.erasedMetatypes,
                       appliedType.effects.mayThrow,
                       !appliedType.effects.isAsync,
@@ -4737,31 +7113,21 @@ public struct Lowerer: Sendable {
                     call[2],
                     line: sourceLine
                 )
-                if reference.hasIndirectResult {
-                    guard supportsIndirectResult(binding.resultType),
-                          argumentTokens.count
-                            == reference.physicalParameterConventions.count
-                                + reference.erasedMetatypes.count + 1
-                    else {
-                        throw CanonicalSIL.LoweringError.unsupportedType(
-                            "indirect throwing call result \(binding.resultType)"
-                        )
-                    }
-                    let destination = argumentTokens.removeFirst()
-                    guard compilerAddressType(destination) == binding.resultType,
-                          runtimeAddress(at: destination) == nil,
-                          implicitStackValues[normalTarget] == nil,
-                          indirectTryNormalBlocks.insert(normalTarget).inserted
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "indirect try_apply result or normal block is invalid"
-                        )
-                    }
-                    let result = try allocate(type: binding.resultType)
-                    implicitStackValues[normalTarget] = [
-                        (destination, result),
-                    ]
-                }
+                let destinations = try consumeIndirectCallDestinations(
+                    from: &argumentTokens,
+                    resultType: binding.resultType,
+                    hasIndirectResult: reference.hasIndirectResult,
+                    indirectErrorType: reference.indirectErrorType,
+                    physicalArgumentCount: reference.physicalParameterConventions.count
+                        + reference.erasedMetatypes.count
+                )
+                try bindIndirectTryCallDestinations(
+                    destinations,
+                    resultType: binding.resultType,
+                    indirectErrorType: reference.indirectErrorType,
+                    normalTarget: normalTarget,
+                    errorTarget: errorTarget
+                )
                 argumentTokens = try eraseMetatypeArguments(
                     argumentTokens,
                     for: reference,
@@ -4769,7 +7135,8 @@ public struct Lowerer: Sendable {
                 )
                 let prepared = try prepareDirectCallArguments(
                     argumentTokens,
-                    conventions: reference.physicalParameterConventions,
+                    physicalConventions: reference.physicalParameterConventions,
+                    logicalTypes: binding.parameterTypes,
                     line: sourceLine,
                     allowsSynthesizedAccess: false
                 )
@@ -4812,6 +7179,10 @@ public struct Lowerer: Sendable {
                     tokens: argumentTokens,
                     resolvedArguments: prepared.arguments,
                     conventions: reference.physicalParameterConventions
+                )
+                try schedulePreparedOwnerCleanups(
+                    prepared,
+                    in: [normalTarget, errorTarget]
                 )
                 continue
             }
@@ -4925,6 +7296,8 @@ public struct Lowerer: Sendable {
                     }
                     let appliedType = try parseFunctionType(call[4])
                     guard appliedType.parameters == signature.parameters,
+                          appliedType.parameterConventions
+                            == signature.parameterConventions,
                           appliedType.result == signature.result,
                           appliedType.effects.mayThrow == signature.effects.mayThrow,
                           appliedType.effects.isAsync == signature.effects.isAsync,
@@ -4939,28 +7312,27 @@ public struct Lowerer: Sendable {
                         call[3],
                         line: sourceLine
                     )
-                    let indirectResultDestination: String?
-                    if appliedType.hasIndirectResult {
-                        guard supportsIndirectResult(signature.result),
-                              argumentTokens.count == signature.parameters.count + 1
-                        else {
-                            throw CanonicalSIL.LoweringError.unsupportedType(
-                                "indirect closure result \(signature.result)"
-                            )
-                        }
-                        let destination = argumentTokens.removeFirst()
-                        guard compilerAddressType(destination) == signature.result else {
-                            throw CanonicalSIL.LoweringError.malformedSIL(
-                                "indirect closure result address does not match its result type"
-                            )
-                        }
-                        indirectResultDestination = destination
-                    } else {
-                        indirectResultDestination = nil
+                    let destinations = try consumeIndirectCallDestinations(
+                        from: &argumentTokens,
+                        resultType: signature.result,
+                        hasIndirectResult: appliedType.hasIndirectResult,
+                        indirectErrorType: appliedType.indirectErrorType,
+                        physicalArgumentCount: signature.parameters.count
+                    )
+                    guard destinations.error == nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "ordinary closure apply carries an indirect Error result"
+                        )
                     }
-                    let arguments = try argumentTokens.map {
-                        try resolve($0, line: sourceLine)
-                    }
+                    let indirectResultDestination = destinations.result
+                    let prepared = try prepareDirectCallArguments(
+                        argumentTokens,
+                        physicalConventions: appliedType.parameterConventions,
+                        logicalTypes: signature.parameters,
+                        line: sourceLine,
+                        allowsSynthesizedAccess: true
+                    )
+                    let arguments = prepared.arguments
                     guard arguments.map({ registerTypes[Int($0.rawValue)] })
                             == signature.parameters
                     else {
@@ -4998,6 +7370,12 @@ public struct Lowerer: Sendable {
                             arguments: arguments
                         )
                     )
+                    try transferOwnedCompilerAddressArguments(
+                        tokens: argumentTokens,
+                        resolvedArguments: prepared.arguments,
+                        conventions: appliedType.parameterConventions
+                    )
+                    appendPreparedOwnerCleanups(prepared)
                     if let indirectResultDestination, let result {
                         if signature.result == .any {
                             try storeExistential(result, at: indirectResultDestination)
@@ -5008,9 +7386,13 @@ public struct Lowerer: Sendable {
                             )
                         }
                     }
+                    for access in prepared.accesses.reversed() {
+                        appendInstruction(.endAccess(access))
+                    }
                     continue
                 }
-                if let key = localFactoryReferences[call[1]] {
+                if let factory = localFactoryReferences[call[1]] {
+                    let key = factory.key
                     guard call[2].isEmpty, !call[0].isEmpty else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "local struct initializer has unsupported generic arguments or result"
@@ -5022,7 +7404,8 @@ public struct Lowerer: Sendable {
                         line: sourceLine
                     )
                     let indirectDestination: String?
-                    if argumentTokens.count == fields.count + 2 {
+                    if argumentTokens.count
+                        == factory.physicalParameterTypes.count + 2 {
                         let destination = argumentTokens.removeFirst()
                         guard compilerAddressType(destination) == .local(key) else {
                             throw CanonicalSIL.LoweringError.malformedSIL(
@@ -5033,7 +7416,8 @@ public struct Lowerer: Sendable {
                     } else {
                         indirectDestination = nil
                     }
-                    guard argumentTokens.count == fields.count + 1,
+                    guard argumentTokens.count
+                            == factory.physicalParameterTypes.count + 1,
                           let metatypeToken = argumentTokens.last,
                           localMetatypeValues[metatypeToken] == key
                     else {
@@ -5041,9 +7425,27 @@ public struct Lowerer: Sendable {
                             "local struct initializer arguments do not match \(key)"
                         )
                     }
-                    let fieldTokens = argumentTokens.dropLast()
-                    let fieldRegisters = try fieldTokens.map {
-                        try resolve($0, line: sourceLine)
+                    let physicalTokens = Array(argumentTokens.dropLast())
+                    let physicalValues = try zip(
+                        physicalTokens,
+                        factory.physicalParameterTypes
+                    ).map { token, expectedType in
+                        try resolveStorableValue(
+                            token,
+                            expectedType: expectedType,
+                            line: sourceLine
+                        )
+                    }
+                    guard factory.fieldPlans.count == fields.count else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "local struct initializer plan does not match \(key)"
+                        )
+                    }
+                    let fieldRegisters = try factory.fieldPlans.map {
+                        try materializeStructFactoryValue(
+                            plan: $0,
+                            physicalValues: physicalValues
+                        )
                     }
                     guard zip(fieldRegisters, fields).allSatisfy({ register, field in
                         registerTypes[Int(register.rawValue)] == field.type
@@ -5072,6 +7474,15 @@ public struct Lowerer: Sendable {
                     } else {
                         values[call[0]] = result
                     }
+                    continue
+                }
+                if swiftCoreReferences[call[1]] == .higherOrder(.resultMap) {
+                    try lowerResultMapApply(
+                        resultToken: call[0],
+                        genericArguments: call[2],
+                        argumentText: call[3],
+                        line: sourceLine
+                    )
                     continue
                 }
                 if let intrinsic = swiftCoreReferences[call[1]] {
@@ -5181,6 +7592,7 @@ public struct Lowerer: Sendable {
                         binding: binding,
                         physicalParameterConventions: callee.parameterConventions,
                         hasIndirectResult: callee.hasIndirectResult,
+                        indirectErrorType: callee.indirectErrorType,
                         erasedMetatypes: callee.erasedMetatypes,
                         usesObjectiveCBridge: false
                     )
@@ -5201,6 +7613,8 @@ public struct Lowerer: Sendable {
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
                       appliedType.hasIndirectResult == reference.hasIndirectResult,
+                      appliedType.indirectErrorType
+                        == reference.indirectErrorType,
                       appliedType.erasedMetatypes == reference.erasedMetatypes,
                       appliedType.effects.mayThrow == binding.effects.mayThrow,
                       appliedType.effects.isAsync == binding.effects.isAsync,
@@ -5215,27 +7629,20 @@ public struct Lowerer: Sendable {
                     call[3],
                     line: sourceLine
                 )
-                let indirectResultDestination: String?
-                if reference.hasIndirectResult {
-                    guard supportsIndirectResult(binding.resultType),
-                          argumentTokens.count
-                            == reference.physicalParameterConventions.count
-                                + reference.erasedMetatypes.count + 1
-                    else {
-                        throw CanonicalSIL.LoweringError.unsupportedType(
-                            "indirect call result \(binding.resultType)"
-                        )
-                    }
-                    let destination = argumentTokens.removeFirst()
-                    guard compilerAddressType(destination) == binding.resultType else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "indirect call result address does not match its result type"
-                        )
-                    }
-                    indirectResultDestination = destination
-                } else {
-                    indirectResultDestination = nil
+                let destinations = try consumeIndirectCallDestinations(
+                    from: &argumentTokens,
+                    resultType: binding.resultType,
+                    hasIndirectResult: reference.hasIndirectResult,
+                    indirectErrorType: reference.indirectErrorType,
+                    physicalArgumentCount: reference.physicalParameterConventions.count
+                        + reference.erasedMetatypes.count
+                )
+                guard destinations.error == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "ordinary apply carries an indirect Error result"
+                    )
                 }
+                let indirectResultDestination = destinations.result
                 argumentTokens = try eraseMetatypeArguments(
                     argumentTokens,
                     for: reference,
@@ -5257,7 +7664,8 @@ public struct Lowerer: Sendable {
                 }
                 let prepared = try prepareDirectCallArguments(
                     argumentTokens,
-                    conventions: reference.physicalParameterConventions,
+                    physicalConventions: reference.physicalParameterConventions,
+                    logicalTypes: binding.parameterTypes,
                     line: sourceLine,
                     allowsSynthesizedAccess: true
                 )
@@ -5311,6 +7719,7 @@ public struct Lowerer: Sendable {
                     resolvedArguments: prepared.arguments,
                     conventions: reference.physicalParameterConventions
                 )
+                appendPreparedOwnerCleanups(prepared)
                 if let indirectResultDestination, let result {
                     if binding.resultType == .any {
                         try storeExistential(result, at: indirectResultDestination)
@@ -5504,7 +7913,7 @@ public struct Lowerer: Sendable {
                 pattern: #"^(%[0-9]+) = ref_tail_addr (%[0-9]+), \$(.+)$"#
             ), let allocation = arrayLiteralStorageTokens[address[1]],
                let pending = pendingArrayLiterals[allocation] {
-                guard try parseType(address[2]) == pending.elementType else {
+                guard try parseStoredType(address[2]) == pending.elementType else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Array literal tail address has a mismatched element type"
                     )
@@ -5538,6 +7947,32 @@ public struct Lowerer: Sendable {
             if let component = match(
                 line,
                 pattern: #"^(%[0-9]+) = tuple_element_addr (%[0-9]+), ([0-9]+)$"#
+            ), let cell = mutableCell(at: component[1]),
+               case let .tuple(types) = mutableCellPointee(at: component[1]),
+               let index = Int(component[2]),
+               types.indices.contains(index),
+               let fieldIndex = UInt32(exactly: index) {
+                let pointee = types[index]
+                let result = try allocate(type: .mutableCell(pointee))
+                appendInstruction(
+                    .projectMutableCell(
+                        result: result,
+                        cell: cell,
+                        fieldIndex: fieldIndex
+                    )
+                )
+                mutableCaptureState.addresses[component[0]] = .init(
+                    register: result,
+                    pointee: pointee
+                )
+                addressAliases[component[0]] = addressBase(component[1])
+                values[component[0]] = result
+                continue
+            }
+
+            if let component = match(
+                line,
+                pattern: #"^(%[0-9]+) = tuple_element_addr (%[0-9]+), ([0-9]+)$"#
             ), let projection = existentialProjections[component[1]],
                case let .tuple(types) = projection.concreteType,
                let index = Int(component[2]),
@@ -5562,6 +7997,33 @@ public struct Lowerer: Sendable {
                     index: base.index,
                     component: index
                 )
+                continue
+            }
+
+            if let component = match(
+                line,
+                pattern: #"^(%[0-9]+) = tuple_element_addr (%[0-9]+), ([0-9]+)$"#
+            ), let base = runtimeAddress(at: component[1]),
+               case let .tuple(types) = stackType(at: component[1]),
+               let index = Int(component[2]),
+               types.indices.contains(index),
+               let fieldIndex = UInt32(exactly: index) {
+                let pointee = types[index]
+                let result = try allocate(type: .address(pointee))
+                appendInstruction(
+                    .projectAggregateAddress(
+                        result: result,
+                        base: base,
+                        fieldIndex: fieldIndex
+                    )
+                )
+                runtimeAddressValues[component[0]] = result
+                runtimeAddressPointees[component[0]] = pointee
+                addressAliases[component[0]] = addressBase(component[1])
+                if isScopedRuntimeAddress(component[1]) {
+                    scopedRuntimeAddresses.insert(component[0])
+                }
+                values[component[0]] = result
                 continue
             }
 
@@ -5608,9 +8070,15 @@ public struct Lowerer: Sendable {
             ) {
                 guard let blockID = current?.id,
                       isKnownSomeOptionalAddress(extraction[1], in: blockID),
-                      let optional = stackValue(at: extraction[1]),
-                      case let .optional(wrapped) = registerTypes[Int(optional.rawValue)],
-                      compilerAddressType(extraction[1]) == .optional(wrapped)
+                      case let .optional(wrapped) = compilerAddressType(
+                        extraction[1]
+                      ),
+                      let optional = try takeStoredValue(
+                        at: extraction[1],
+                        line: sourceLine
+                      ),
+                      registerTypes[Int(optional.rawValue)]
+                        == .optional(wrapped)
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "unchecked Optional address payload is not dominated by its some edge"
@@ -5621,7 +8089,6 @@ public struct Lowerer: Sendable {
                     .unwrapOptional(result: payload, optional: optional)
                 )
                 let root = addressBase(extraction[1])
-                stackAddressValues.removeValue(forKey: root)
                 for token in [root, extraction[1]] where values[token] == optional {
                     values.removeValue(forKey: token)
                 }
@@ -5632,7 +8099,7 @@ public struct Lowerer: Sendable {
                 )
                 stackAddressTypes[extraction[0]] = wrapped
                 stackAddressValues[extraction[0]] = payload
-                takenOptionalPayloadRoots[extraction[0]] = root
+                takenOptionalPayloads[extraction[0]] = .init(root: root)
                 continue
             }
 
@@ -5640,20 +8107,25 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = enum \$Optional<(.+)>, #Optional\.some!enumelt, (%[0-9]+)$"#
             ) {
-                if voidValues.contains(optional[2]),
-                   (try? parseType(optional[1])) == .void {
-                    let result = try allocate(type: .bool)
-                    values[optional[0]] = result
-                    compilerOptionalVoidValues.insert(optional[0])
-                    appendInstruction(.constantBool(result: result, value: true))
-                    continue
+                let payload: Bytecode.Register
+                let wrapped: Bytecode.ValueType
+                if voidValues.contains(optional[2]) {
+                    wrapped = try parseStoredType(optional[1])
+                    payload = try resolveStorableValue(
+                        optional[2],
+                        expectedType: wrapped,
+                        line: sourceLine
+                    )
+                } else {
+                    payload = try resolve(optional[2], line: sourceLine)
+                    let payloadType = registerTypes[Int(payload.rawValue)]
+                    wrapped = ValueRepresentation.storable(
+                        try parsePhysicalType(
+                            optional[1],
+                            bridgedTo: payloadType
+                        )
+                    )
                 }
-                let payload = try resolve(optional[2], line: sourceLine)
-                let payloadType = registerTypes[Int(payload.rawValue)]
-                let wrapped = try parsePhysicalType(
-                    optional[1],
-                    bridgedTo: payloadType
-                )
                 guard registerTypes[Int(payload.rawValue)] == wrapped else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Optional.some payload does not match its SIL type"
@@ -5676,24 +8148,18 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = enum \$Optional<(.+)>, #Optional\.none!enumelt$"#
             ) {
-                let wrapped: Bytecode.ValueType
+                let resolvedWrapped: Bytecode.ValueType
                 if let resolved = try? parseType(optional[1]) {
-                    wrapped = resolved
+                    resolvedWrapped = resolved
                 } else if isSupportedObjectiveCBridgeSpelling(
                     optional[1],
                     to: .string
                 ) {
-                    wrapped = .string
+                    resolvedWrapped = .string
                 } else {
                     throw CanonicalSIL.LoweringError.unsupportedType(optional[1])
                 }
-                if wrapped == .void {
-                    let result = try allocate(type: .bool)
-                    values[optional[0]] = result
-                    compilerOptionalVoidValues.insert(optional[0])
-                    appendInstruction(.constantBool(result: result, value: false))
-                    continue
-                }
+                let wrapped = ValueRepresentation.storable(resolvedWrapped)
                 let result = try allocate(type: .optional(wrapped))
                 values[optional[0]] = result
                 appendInstruction(.makeOptionalNone(result: result))
@@ -5758,9 +8224,21 @@ public struct Lowerer: Sendable {
                         "local enum \(key) case index exceeds UInt32"
                     )
                 }
-                let payload = try enumeration[3].isEmpty
-                    ? nil
-                    : resolve(enumeration[3], line: sourceLine)
+                let expectedPayload = cases[index].payloadType
+                let payload: Bytecode.Register?
+                if enumeration[3].isEmpty {
+                    payload = nil
+                } else if let expectedPayload {
+                    payload = try resolveStorableValue(
+                        enumeration[3],
+                        expectedType: expectedPayload,
+                        line: sourceLine
+                    )
+                } else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "payload-free local enum case carries a SIL value"
+                    )
+                }
                 guard cases[index].payloadType
                     == payload.map({ registerTypes[Int($0.rawValue)] })
                 else {
@@ -5851,7 +8329,15 @@ public struct Lowerer: Sendable {
                 optionalPayloadAddressRoots = optionalPayloadAddressRoots.filter {
                     $0.value != injection[0]
                 }
-                try storeConstructedValue(optional, at: injection[0])
+                // The projected payload remains compiler-side until the enum
+                // tag is injected. This is therefore the first complete
+                // value stored in a runtime slot even when field-sensitive
+                // SIL analysis has already observed the successful edge.
+                try storeConstructedValue(
+                    optional,
+                    at: injection[0],
+                    mode: .initialize
+                )
                 let root = addressBase(injection[0])
                 if injection[0] != indirectResultAddress,
                    stackAddressTypes[root] != nil,
@@ -5967,6 +8453,37 @@ public struct Lowerer: Sendable {
             if let store = match(
                 line,
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
+            ), let box = mutableBoxProjectionRoots.removeValue(
+                forKey: store[1]
+            ), let pointee = pendingMutableBoxes.removeValue(forKey: box) {
+                let initialValue = try resolve(store[0], line: sourceLine)
+                guard registerTypes[Int(initialValue.rawValue)] == pointee,
+                      values[box] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "mutable box initializer does not match its pointee"
+                    )
+                }
+                let cell = try allocate(type: .mutableCell(pointee))
+                appendInstruction(
+                    .makeMutableCell(
+                        result: cell,
+                        initialValue: initialValue
+                    )
+                )
+                for token in [box, store[1]] {
+                    mutableCaptureState.addresses[token] = .init(
+                        register: cell,
+                        pointee: pointee
+                    )
+                    values[token] = cell
+                }
+                continue
+            }
+
+            if let store = match(
+                line,
+                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
             ), let property = nativePropertyAddresses[addressBase(store[1])] {
                 guard let binding = property.setter else {
                     if let unavailable = property.unavailableSetter {
@@ -6009,7 +8526,8 @@ public struct Lowerer: Sendable {
             if let store = match(
                 line,
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
-            ), var mutation = arrayElementMutations[store[1]] {
+            ), var mutation = arrayElementMutations[addressBase(store[1])] {
+                let mutationRoot = addressBase(store[1])
                 guard !mutation.didStore else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Array.subscript.modify stores more than once"
@@ -6036,7 +8554,7 @@ public struct Lowerer: Sendable {
                     mode: .assign
                 )
                 mutation.didStore = true
-                arrayElementMutations[store[1]] = mutation
+                arrayElementMutations[mutationRoot] = mutation
                 continue
             }
 
@@ -6129,10 +8647,20 @@ public struct Lowerer: Sendable {
             ), let address = arrayLiteralComponentAddresses[store[1]],
                var pending = pendingArrayLiterals[address.allocation],
                case let .tuple(types) = pending.elementType {
-                let value = try resolve(store[0], line: sourceLine)
                 guard address.index >= 0,
                       address.index < pending.count,
-                      types.indices.contains(address.component),
+                      types.indices.contains(address.component)
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array tuple component store is out of bounds"
+                    )
+                }
+                let value = try resolveStorableValue(
+                    store[0],
+                    expectedType: types[address.component],
+                    line: sourceLine
+                )
+                guard
                       registerTypes[Int(value.rawValue)] == types[address.component],
                       pending.elements[address.index] == nil,
                       pending.elementComponents[address.index]?[address.component] == nil
@@ -6151,7 +8679,11 @@ public struct Lowerer: Sendable {
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
             ), let address = arrayLiteralAddresses[store[1]],
                var pending = pendingArrayLiterals[address.allocation] {
-                let value = try resolve(store[0], line: sourceLine)
+                let value = try resolveStorableValue(
+                    store[0],
+                    expectedType: pending.elementType,
+                    line: sourceLine
+                )
                 guard address.index >= 0,
                       address.index < pending.count,
                       pending.elements[address.index] == nil,
@@ -6169,14 +8701,35 @@ public struct Lowerer: Sendable {
             if let store = match(
                 line,
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
-            ), let addressType = stackType(at: store[1]) {
-                let value = try resolve(store[0], line: sourceLine)
+            ), existentialBoxes.contains(store[0]),
+               let destinationType = compilerAddressType(store[1]),
+               [.string, .error].contains(destinationType) {
+                guard let value = try materializeErrorValue(from: store[0]),
+                      registerTypes[Int(value.rawValue)] == destinationType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Error existential box does not match its destination"
+                    )
+                }
+                try storeConstructedValue(value, at: store[1])
+                continue
+            }
+
+            if let store = match(
+                line,
+                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
+            ), let addressType = compilerAddressType(store[1]) {
+                let value = try prepareStoredValue(
+                    store[0],
+                    expectedType: addressType,
+                    line: sourceLine
+                )
                 guard registerTypes[Int(value.rawValue)] == addressType else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "store value does not match its stack address"
                     )
                 }
-                try storeVMValue(value, at: store[1])
+                try storeConstructedValue(value, at: store[1])
                 continue
             }
 
@@ -6279,6 +8832,21 @@ public struct Lowerer: Sendable {
                     pendingIntegerRangeNextValues[load[0]] = state
                     continue
                 }
+                if let cell = mutableCell(at: load[2]),
+                   let pointee = mutableCellPointee(at: load[2]) {
+                    guard mode != "take" else {
+                        throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                            line: sourceLine,
+                            text: "taking load through a mutable closure capture"
+                        )
+                    }
+                    let result = try allocate(type: pointee)
+                    appendInstruction(
+                        .loadMutableCell(result: result, cell: cell)
+                    )
+                    values[load[0]] = result
+                    continue
+                }
                 if let addressRegister = runtimeAddress(at: load[2]),
                    let addressType = stackType(at: load[2]) {
                     let result = try allocate(type: addressType)
@@ -6293,11 +8861,6 @@ public struct Lowerer: Sendable {
                             .loadAddress(result: result, address: addressRegister, mode: .copy)
                         )
                     } else if let slot = runtimeStackSlots[address], load[2] == address {
-                        guard stackAddressValues[address] != nil else {
-                            throw CanonicalSIL.LoweringError.malformedSIL(
-                                "load references an uninitialized runtime stack address"
-                            )
-                        }
                         let loadMode: Bytecode.StackLoadMode = mode == "take" ? .take : .copy
                         appendInstruction(
                             .loadStack(result: result, slot: slot, mode: loadMode)
@@ -6334,20 +8897,48 @@ public struct Lowerer: Sendable {
                     )
                 }
                 if mode == "take" {
+                    guard !addressType.requiresLinearOwnership
+                            || !isBorrowedValue(
+                                token: load[2],
+                                register: value
+                            )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "taking load cannot consume borrowed storage"
+                        )
+                    }
                     stackAddressValues.removeValue(forKey: address)
                     values[load[0]] = value
-                } else if mode == "copy" || (mode.isEmpty && !addressType.isTrivial) {
+                } else if mode == "copy"
+                            || (mode.isEmpty
+                                && !addressType.isTrivial
+                                && !isBorrowedValue(
+                                    token: load[2],
+                                    register: value
+                                )) {
                     let copy = try allocate(type: addressType)
                     appendInstruction(.copyValue(result: copy, source: value))
                     values[load[0]] = copy
                 } else {
                     values[load[0]] = value
+                    if addressType.requiresLinearOwnership {
+                        // An unqualified canonical-SIL load is a +0 view. Its
+                        // retain, return, store, or owned-call use materializes
+                        // a distinct VM owner at the actual ownership edge.
+                        borrowedLoadTokens.insert(load[0])
+                    }
                 }
                 continue
             }
 
             if let destroy = match(line, pattern: #"^destroy_addr (%[0-9]+)$"#) {
                 let address = addressBase(destroy[0])
+                if mutableCell(at: destroy[0]) != nil {
+                    // The cell owns its payload until every closure/context
+                    // reference is released; SIL's stack destroy must not
+                    // invalidate an independently escaping capture.
+                    continue
+                }
                 if pendingStringInterpolationAddresses.contains(address) {
                     guard stringInterpolationAddressValues.removeValue(forKey: address) != nil else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -6356,7 +8947,13 @@ public struct Lowerer: Sendable {
                     }
                     continue
                 }
-                if catchScratchAddresses.contains(address) { continue }
+                if catchScratchAddresses.contains(address),
+                   runtimeStackSlots[address] == nil {
+                    continue
+                }
+                if elidedRuntimeStorageAddresses.contains(address) {
+                    continue
+                }
                 if let iterator = arrayIteratorStates[address] {
                     guard let block = current?.id,
                           destroyedArrayIterators[address, default: []]
@@ -6382,12 +8979,14 @@ public struct Lowerer: Sendable {
                     continue
                 }
                 if let slot = runtimeStackSlots[address] {
-                    guard stackAddressValues.removeValue(forKey: address) != nil else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "destroy_addr references uninitialized runtime storage"
-                        )
-                    }
-                    appendInstruction(.destroyStack(slot))
+                    let isConditional = storageInitializationPlan
+                        .conditionalDestroyLines.contains(currentSILLineIndex)
+                    stackAddressValues.removeValue(forKey: address)
+                    appendInstruction(
+                        isConditional
+                            ? .destroyStackIfInitialized(slot)
+                            : .destroyStack(slot)
+                    )
                     continue
                 }
                 guard stackAddressTypes[address] != nil else {
@@ -6411,7 +9010,10 @@ public struct Lowerer: Sendable {
             ) {
                 let targetType = try parseType(cast[1])
                 guard stackType(at: cast[0]) == .any,
-                      let source = stackValue(at: cast[0]),
+                      let source = try copyStoredValue(
+                        at: cast[0],
+                        line: sourceLine
+                      ),
                       registerTypes[Int(source.rawValue)] == .any,
                       compilerAddressType(cast[2]) == targetType,
                       targetType.isAnyCastTargetV1,
@@ -6450,7 +9052,10 @@ public struct Lowerer: Sendable {
             ) {
                 let targetType = try parseType(cast[1])
                 guard stackType(at: cast[0]) == .any,
-                      let source = stackValue(at: cast[0]),
+                      let source = try copyStoredValue(
+                        at: cast[0],
+                        line: sourceLine
+                      ),
                       registerTypes[Int(source.rawValue)] == .any,
                       compilerAddressType(cast[2]) == targetType,
                       targetType.isAnyCastTargetV1
@@ -6472,7 +9077,10 @@ public struct Lowerer: Sendable {
                 let sourceAddress = addressBase(cast[0])
                 let destinationAddress = addressBase(cast[2])
                 guard stackType(at: cast[0]) == .error,
-                      let error = stackValue(at: cast[0]),
+                      let error = try copyStoredValue(
+                        at: cast[0],
+                        line: sourceLine
+                      ),
                       registerTypes[Int(error.rawValue)] == .error,
                       let key = typeEnvironment.localKey(for: cast[1]),
                       try typeEnvironment.definition(for: key).conformsToError,
@@ -6526,7 +9134,7 @@ public struct Lowerer: Sendable {
                 let elements = try components.map { component in
                     let token = component.split(separator: ":", maxSplits: 1)[0]
                         .trimmingCharacters(in: .whitespaces)
-                    return try resolve(token, line: sourceLine)
+                    return try resolveStorableValue(token, line: sourceLine)
                 }
                 let result = try allocate(
                     type: .tuple(elements.map { registerTypes[Int($0.rawValue)] })
@@ -6656,9 +9264,6 @@ public struct Lowerer: Sendable {
                 if let selection = optionalAddressSelectionConditions[copy[1]] {
                     optionalAddressSelectionConditions[copy[0]] = selection
                 }
-                if compilerOptionalVoidValues.contains(copy[1]) {
-                    compilerOptionalVoidValues.insert(copy[0])
-                }
                 appendInstruction(.copyValue(result: result, source: source))
                 releasePreservedNativeConversionsAfterLastUse(
                     [copy[1]],
@@ -6715,9 +9320,6 @@ public struct Lowerer: Sendable {
                 ) {
                     optionalAddressSelectionConditions[move[0]] = selection
                 }
-                if compilerOptionalVoidValues.remove(move[1]) != nil {
-                    compilerOptionalVoidValues.insert(move[0])
-                }
                 appendInstruction(.moveValue(result: result, source: source))
                 continue
             }
@@ -6740,7 +9342,6 @@ public struct Lowerer: Sendable {
                 if localFactoryReferences.removeValue(forKey: destroy[0]) != nil { continue }
                 knownOptionalSomePayloads.removeValue(forKey: destroy[0])
                 optionalAddressSelectionConditions.removeValue(forKey: destroy[0])
-                compilerOptionalVoidValues.remove(destroy[0])
                 let value = try resolve(destroy[0], line: sourceLine)
                 try closePreservedNativeConversionLifetime(
                     for: destroy[0],
@@ -6756,11 +9357,12 @@ public struct Lowerer: Sendable {
             ) {
                 let value = try resolve(ownership[1], line: sourceLine)
                 if registerTypes[Int(value.rawValue)].requiresLinearOwnership {
-                    // A NativeImport result is already an owned VM handle. The
-                    // retain paired with a Swift +0 load is therefore implicit;
-                    // its release remains an explicit linear consume.
-                    if ownership[0] == "release_value",
-                       !isBorrowedParameter(value) {
+                    if ownership[0] == "retain_value" {
+                        try materializeRetain(of: ownership[1], value: value)
+                    } else if !isBorrowedValue(
+                        token: ownership[1],
+                        register: value
+                    ) {
                         try closePreservedNativeConversionLifetime(
                             for: ownership[1],
                             resolved: value
@@ -6777,6 +9379,7 @@ public struct Lowerer: Sendable {
                 let value = try resolve(ownership[1], line: sourceLine)
                 let type = registerTypes[Int(value.rawValue)]
                 if case .closure = type { continue }
+                if case .mutableCell = type { continue }
                 if case let .local(key) = type, typeEnvironment.isClass(key) {
                     // VM.Value retains one shared object identity; Swift ARC
                     // traffic does not become explicit HLBC instructions.
@@ -6790,7 +9393,12 @@ public struct Lowerer: Sendable {
                         text: line
                     )
                 }
-                if ownership[0] == "release", !isBorrowedParameter(value) {
+                if ownership[0] == "retain" {
+                    try materializeRetain(of: ownership[1], value: value)
+                } else if !isBorrowedValue(
+                    token: ownership[1],
+                    register: value
+                ) {
                     try closePreservedNativeConversionLifetime(
                         for: ownership[1],
                         resolved: value
@@ -6820,7 +9428,16 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = select_enum_addr (%[0-9]+), case #Optional\.(some|none)!enumelt: (%[0-9]+), default (%[0-9]+) : \$Builtin\.Int1$"#
             ) {
-                guard let optional = stackValue(at: selection[1]),
+                guard let borrowed = try borrowStoredValue(
+                    at: selection[1],
+                    line: sourceLine
+                ) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "select_enum_addr requires initialized Optional storage"
+                    )
+                }
+                let optional = borrowed.register
+                guard
                       case .optional = registerTypes[Int(optional.rawValue)],
                       let caseValue = boolLiterals[selection[3]],
                       let defaultValue = boolLiterals[selection[4]],
@@ -6857,6 +9474,9 @@ public struct Lowerer: Sendable {
                         )
                     )
                 }
+                if let temporaryOwner = borrowed.temporaryOwner {
+                    appendInstruction(.destroyValue(temporaryOwner))
+                }
                 continue
             }
 
@@ -6865,13 +9485,19 @@ public struct Lowerer: Sendable {
                 pattern: #"^switch_enum_addr (%[0-9]+), case #Optional\.(some|none)!enumelt: bb([0-9]+), case #Optional\.(some|none)!enumelt: bb([0-9]+)$"#
             ) {
                 guard branch[1] != branch[3],
-                      let optional = stackValue(at: branch[0]),
-                      case .optional = registerTypes[Int(optional.rawValue)]
+                      let borrowed = try borrowStoredValue(
+                        at: branch[0],
+                        line: sourceLine
+                      ),
+                      case .optional = registerTypes[
+                        Int(borrowed.register.rawValue)
+                      ]
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "switch_enum_addr requires initialized Optional storage and distinct cases"
                     )
                 }
+                let optional = borrowed.register
                 let firstTarget = try parseBlockID(branch[2])
                 let secondTarget = try parseBlockID(branch[4])
                 let someTarget = branch[1] == "some" ? firstTarget : secondTarget
@@ -6888,43 +9514,24 @@ public struct Lowerer: Sendable {
                     in: someTarget,
                     isKnownSome: true
                 )
-                try inheritCompilerAddressValue(
-                    optional,
-                    at: branch[0],
-                    into: [someTarget, noneTarget]
-                )
+                if runtimeAddress(at: branch[0]) == nil,
+                   mutableCell(at: branch[0]) == nil {
+                    try inheritCompilerAddressValue(
+                        optional,
+                        at: branch[0],
+                        into: [someTarget, noneTarget]
+                    )
+                }
                 let isSome = try allocate(type: .bool)
                 appendInstruction(
                     .optionalIsSome(result: isSome, optional: optional)
                 )
+                if let temporaryOwner = borrowed.temporaryOwner {
+                    appendInstruction(.destroyValue(temporaryOwner))
+                }
                 appendInstruction(
                     .conditionalBranch(
                         condition: isSome,
-                        trueTarget: someTarget,
-                        trueArguments: [],
-                        falseTarget: noneTarget,
-                        falseArguments: []
-                    )
-                )
-                continue
-            }
-
-            if let branch = match(
-                line,
-                pattern: #"^switch_enum (%[0-9]+), case #Optional\.(some|none)!enumelt: bb([0-9]+), case #Optional\.(some|none)!enumelt: bb([0-9]+)$"#
-            ), compilerOptionalVoidValues.contains(branch[0]) {
-                guard branch[1] != branch[3] else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Optional<Void> switch must contain distinct cases"
-                    )
-                }
-                let firstTarget = try parseBlockID(branch[2])
-                let secondTarget = try parseBlockID(branch[4])
-                let someTarget = branch[1] == "some" ? firstTarget : secondTarget
-                let noneTarget = branch[1] == "none" ? firstTarget : secondTarget
-                appendInstruction(
-                    .conditionalBranch(
-                        condition: try resolve(branch[0], line: sourceLine),
                         trueTarget: someTarget,
                         trueArguments: [],
                         falseTarget: noneTarget,
@@ -7109,7 +9716,9 @@ public struct Lowerer: Sendable {
                 var arguments = try parseBranchArguments(
                     branch.count > 1 ? branch[1] : "",
                     line: sourceLine,
-                    resolve: resolve
+                    resolve: { token, line in
+                        try resolveStorableValue(token, line: line)
+                    }
                 )
                 try appendCompilerAddressMergeArguments(
                     target: target,
@@ -7130,8 +9739,7 @@ public struct Lowerer: Sendable {
                 let falseTarget = try parseBlockID(branch[2])
                 let someTarget = selection.someWhenTrue ? trueTarget : falseTarget
                 let noneTarget = selection.someWhenTrue ? falseTarget : trueTarget
-                guard let optional = stackValue(at: selection.address),
-                      case .optional = registerTypes[Int(optional.rawValue)],
+                guard case .optional = stackType(at: selection.address),
                       knownSomeOptionalAddresses[someTarget] == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -7143,11 +9751,19 @@ public struct Lowerer: Sendable {
                     in: someTarget,
                     isKnownSome: true
                 )
-                try inheritCompilerAddressValue(
-                    optional,
-                    at: selection.address,
-                    into: [someTarget, noneTarget]
-                )
+                if runtimeAddress(at: selection.address) == nil,
+                   mutableCell(at: selection.address) == nil {
+                    guard let optional = stackValue(at: selection.address) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Optional address condition lost its stored value"
+                        )
+                    }
+                    try inheritCompilerAddressValue(
+                        optional,
+                        at: selection.address,
+                        into: [someTarget, noneTarget]
+                    )
+                }
                 appendInstruction(
                     .conditionalBranch(
                         condition: try resolve(branch[0], line: sourceLine),
@@ -7169,12 +9785,16 @@ public struct Lowerer: Sendable {
                 var trueArguments = try parseBranchArguments(
                     branch[2],
                     line: sourceLine,
-                    resolve: resolve
+                    resolve: { token, line in
+                        try resolveStorableValue(token, line: line)
+                    }
                 )
                 var falseArguments = try parseBranchArguments(
                     branch[4],
                     line: sourceLine,
-                    resolve: resolve
+                    resolve: { token, line in
+                        try resolveStorableValue(token, line: line)
+                    }
                 )
                 try appendCompilerAddressMergeArguments(
                     target: trueTarget,
@@ -7201,14 +9821,7 @@ public struct Lowerer: Sendable {
                         "non-throwing function contains throw"
                     )
                 }
-                if let error = values[thrown[0]],
-                   [.string, .error].contains(registerTypes[Int(error.rawValue)]) {
-                    appendInstruction(.throwError(error))
-                } else if let message = errorMessageByBox[thrown[0]] {
-                    let error = try allocate(type: .string)
-                    appendInstruction(
-                        .constantString(result: error, value: message)
-                    )
+                if let error = try materializeErrorValue(from: thrown[0]) {
                     appendInstruction(.throwError(error))
                 } else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -7217,9 +9830,31 @@ public struct Lowerer: Sendable {
                 }
                 continue
             }
+            if line == "throw_addr" {
+                guard signature.effects.mayThrow,
+                      let address = indirectErrorAddress,
+                      let error = try copyStoredValue(
+                        at: address,
+                        line: sourceLine
+                      ),
+                      [.string, .error].contains(
+                        registerTypes[Int(error.rawValue)]
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "throw_addr has no initialized indirect Error value"
+                    )
+                }
+                appendInstruction(.throwError(error))
+                continue
+            }
             if let returned = match(line, pattern: #"^return (%[0-9]+)$"#) {
                 if voidValues.contains(returned[0]) {
                     if signature.hasIndirectResult {
+                        if signature.result == .void {
+                            appendInstruction(.returnValue(nil))
+                            continue
+                        }
                         guard let slot = indirectResultSlot else {
                             throw CanonicalSIL.LoweringError.malformedSIL(
                                 "indirect result returns before initialization"
@@ -7312,10 +9947,15 @@ public struct Lowerer: Sendable {
                 + integerRangeIteratorStates.count
                 + pendingIntegerRangeNextAddresses.count
                 + pendingIntegerRangeNextValues.count
+                + elidedRuntimeStorageAddresses.count
         )
         recordIncompleteLifetime(
             "array-mutation",
             count: arrayElementMutations.count + arrayMutationYieldByToken.count
+        )
+        recordIncompleteLifetime(
+            "mutable-box",
+            count: pendingMutableBoxes.count + mutableBoxProjectionRoots.count
         )
         recordIncompleteLifetime(
             "dictionary-iterator",
@@ -7337,6 +9977,12 @@ public struct Lowerer: Sendable {
         recordIncompleteLifetime(
             "lexical-dealloc",
             count: remainingDeallocStackUses.values.reduce(0, +)
+        )
+        recordIncompleteLifetime(
+            "borrowed-call-cleanup",
+            count: implicitOwnerCleanups.values.reduce(0) {
+                $0 + $1.count
+            }
         )
         let nativeConversionTokens = preservedNativeConversionValues.keys.sorted()
         recordIncompleteLifetime(
@@ -7373,6 +10019,7 @@ public struct Lowerer: Sendable {
         _ text: String,
         parameterTypes: [Bytecode.ValueType]
     ) throws -> [Bytecode.ParameterConvention] {
+        let text = try CanonicalSIL.SubstitutedFunctionType.specialize(text)
         guard let arrow = outerFunctionArrow(in: text) else {
             throw CanonicalSIL.LoweringError.malformedSIL("function type has no result arrow")
         }
@@ -7408,9 +10055,11 @@ public struct Lowerer: Sendable {
         parameterConventions: [Bytecode.ParameterConvention],
         result: Bytecode.ValueType,
         hasIndirectResult: Bool,
+        indirectErrorType: Bytecode.ValueType?,
         effects: Core.Effects,
         erasedMetatypes: [ErasedMetatype]
     ) {
+        let text = try CanonicalSIL.SubstitutedFunctionType.specialize(text)
         guard let arrow = outerFunctionArrow(in: text) else {
             throw CanonicalSIL.LoweringError.malformedSIL("function type has no result arrow")
         }
@@ -7472,7 +10121,7 @@ public struct Lowerer: Sendable {
                 implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix)
             )
         } else {
-            parameters = try valueSpellings.map(parseType)
+            parameters = try valueSpellings.map(parseStoredType)
             parameterConventions = self.parameterConventions(
                 rawParameters: valueSpellings,
                 parameterTypes: parameters,
@@ -7487,8 +10136,9 @@ public struct Lowerer: Sendable {
         let resultComponents = splitTopLevelTuple(resultText)
         let parsedResult: (type: Bytecode.ValueType, isIndirect: Bool)
         let mayThrow: Bool
+        let indirectErrorType: Bytecode.ValueType?
         if resultComponents.count == 1,
-           try isSupportedErrorResult(resultComponents[0]) {
+           let error = try supportedErrorResult(resultComponents[0]) {
             // SIL omits the normal empty-tuple result for `throws -> Void`.
             guard physicalResultExpectation == nil
                     || physicalResultExpectation == .void
@@ -7498,41 +10148,67 @@ public struct Lowerer: Sendable {
                 )
             }
             parsedResult = (.void, false)
-            mayThrow = true
+            mayThrow = error.isPossible
+            indirectErrorType = error.isIndirect ? error.type : nil
         } else if resultComponents.count == 2,
-                  try isSupportedErrorResult(resultComponents[1]) {
+                  let error = try supportedErrorResult(resultComponents[1]) {
             parsedResult = try parseFunctionResult(
                 resultComponents[0],
                 bridgedTo: physicalResultExpectation
             )
-            mayThrow = true
+            mayThrow = error.isPossible
+            indirectErrorType = error.isIndirect ? error.type : nil
         } else {
             parsedResult = try parseFunctionResult(
                 resultText,
                 bridgedTo: physicalResultExpectation
             )
             mayThrow = false
+            indirectErrorType = nil
         }
         return (
             parameters,
             parameterConventions,
             expected?.result ?? parsedResult.type,
             parsedResult.isIndirect,
+            indirectErrorType,
             .init(mayThrow: mayThrow, isAsync: isAsync),
             erasedMetatypes
         )
     }
 
-    private func isSupportedErrorResult(_ raw: String) throws -> Bool {
+    private struct SupportedErrorResult {
+        var type: Bytecode.ValueType
+        var isIndirect: Bool
+
+        var isPossible: Bool { type != .never }
+    }
+
+    private func supportedErrorResult(
+        _ raw: String
+    ) throws -> SupportedErrorResult? {
         let value = raw.trimmingCharacters(in: .whitespaces)
-        guard value.hasPrefix("@error ") else { return false }
-        let spelling = String(value.dropFirst("@error ".count))
-        guard [.string, .error].contains(try parseType(spelling)) else {
+        let prefixes = [
+            (spelling: "@error_indirect ", isIndirect: true),
+            (spelling: "@error ", isIndirect: false),
+        ]
+        guard let prefix = prefixes.first(where: {
+            value.hasPrefix($0.spelling)
+        }) else {
+            return nil
+        }
+        let type = try parseType(
+            String(value.dropFirst(prefix.spelling.count))
+        )
+        if type == .never {
+            return .init(type: type, isIndirect: prefix.isIndirect)
+        }
+        guard [.string, .error].contains(type) else {
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "throwing function has a non-Error error result"
             )
         }
-        return true
+        return .init(type: type, isIndirect: prefix.isIndirect)
     }
 
     private func metatypeIdentity(_ raw: String) -> MetatypeIdentity? {
@@ -7573,7 +10249,7 @@ public struct Lowerer: Sendable {
 
     private func supportsIndirectResult(_ type: Bytecode.ValueType) -> Bool {
         switch type {
-        case .void, .never, .address:
+        case .void, .never, .address, .mutableCell, .arrayBuilder:
             false
         case .bool, .integer, .float, .string, .any, .array, .dictionary,
              .tuple, .native, .local, .error, .closure, .optional:
@@ -7606,7 +10282,14 @@ public struct Lowerer: Sendable {
         bridgedTo expected: Bytecode.ValueType
     ) throws -> Bytecode.ValueType {
         do {
-            let actual = try parseType(raw)
+            let parsed = try parseType(raw)
+            let actual = expected == .void
+                ? parsed
+                : ValueRepresentation.storable(parsed)
+            if case let .mutableCell(pointee) = expected,
+               actual == .address(pointee) {
+                return expected
+            }
             guard actual == expected else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "foreign physical type \(actual) differs from Swift NativeImport type \(expected)"
@@ -7775,6 +10458,12 @@ public struct Lowerer: Sendable {
         try typeEnvironment.resolve(raw)
     }
 
+    private func parseStoredType(
+        _ raw: String
+    ) throws -> Bytecode.ValueType {
+        ValueRepresentation.storable(try parseType(raw))
+    }
+
     private func isIntegerRangeType(_ raw: String) -> Bool {
         let type = raw.replacingOccurrences(of: " ", with: "")
         return [
@@ -7851,7 +10540,10 @@ public struct Lowerer: Sendable {
                 "Dictionary generic arguments must contain Key and Value"
             )
         }
-        return (try parseType(components[0]), try parseType(components[1]))
+        return (
+            try parseStoredType(components[0]),
+            try parseStoredType(components[1])
+        )
     }
 
     private func isSupportedDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
@@ -7889,15 +10581,17 @@ public struct Lowerer: Sendable {
         erasedMetatypes: [ErasedMetatype],
         bridgedParameterTypes: [Bytecode.ValueType]?,
         indirectResultType: Bytecode.ValueType?,
+        indirectErrorType: Bytecode.ValueType?,
         suppressVoidParameter: Bool,
         allocate: (Bytecode.ValueType) throws -> Bytecode.Register
     ) throws -> (
         block: IntermediateRepresentation.Block,
         parameters: [(String, Bytecode.Register)],
         indirectResultAddress: String?,
+        indirectErrorAddress: String?,
         indirectValueParameters: [String: Bytecode.ValueType],
+        mutableCellParameters: [String: Bytecode.ValueType],
         suppressedVoidParameter: String?,
-        compilerOptionalVoidParameters: Set<String>,
         erasedMetatypeParameters: [(String, MetatypeIdentity)]
     )? {
         guard let match = match(line, pattern: #"^bb([0-9]+)(?:\((.*)\))?:$"#) else { return nil }
@@ -7905,9 +10599,10 @@ public struct Lowerer: Sendable {
         let parameterText = match.count > 1 ? match[1] : ""
         var parameters: [(String, Bytecode.Register)] = []
         var indirectResultAddress: String?
+        var indirectErrorAddress: String?
         var indirectValueParameters: [String: Bytecode.ValueType] = [:]
+        var mutableCellParameters: [String: Bytecode.ValueType] = [:]
         var suppressedVoidParameter: String?
-        var compilerOptionalVoidParameters = Set<String>()
         var erasedMetatypeParameters: [(String, MetatypeIdentity)] = []
         let erasedByIndex = Dictionary(
             uniqueKeysWithValues: erasedMetatypes.map {
@@ -7916,6 +10611,15 @@ public struct Lowerer: Sendable {
         )
         if !parameterText.isEmpty {
             let components = splitTopLevel(parameterText)
+            let leadingAddressCount = (indirectResultType == nil ? 0 : 1)
+                + (indirectErrorType == nil ? 0 : 1)
+            if let entryParameterTypes,
+               components.count != entryParameterTypes.count
+                    + erasedMetatypes.count + leadingAddressCount {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "entry block parameter count differs from its function ABI"
+                )
+            }
             if let bridgedParameterTypes,
                bridgedParameterTypes.count != components.count {
                 throw CanonicalSIL.LoweringError.malformedSIL(
@@ -7931,7 +10635,41 @@ public struct Lowerer: Sendable {
                 guard let value = self.match(component, pattern: #"^(%[0-9]+)\s*:\s*(.+)$"#) else {
                     throw CanonicalSIL.LoweringError.malformedSIL("invalid block parameter \(component)")
                 }
-                if let identity = erasedByIndex[physicalIndex] {
+                if physicalIndex == 0, let indirectResultType {
+                    guard try parseType(value[1])
+                            == .address(
+                                ValueRepresentation.storable(
+                                    indirectResultType
+                                )
+                            )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect result address does not match the function result"
+                        )
+                    }
+                    indirectResultAddress = value[0]
+                    continue
+                }
+                let indirectErrorIndex = indirectResultType == nil ? 0 : 1
+                if let indirectErrorType,
+                   physicalIndex == indirectErrorIndex {
+                    guard try parseType(value[1])
+                            == .address(indirectErrorType)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect error address does not match the function error result"
+                        )
+                    }
+                    indirectErrorAddress = value[0]
+                    continue
+                }
+                let logicalPhysicalIndex = physicalIndex - leadingAddressCount
+                guard logicalPhysicalIndex >= 0 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "entry block contains an unrecognized ABI address parameter"
+                    )
+                }
+                if let identity = erasedByIndex[logicalPhysicalIndex] {
                     guard metatypeIdentity(value[1]) == identity else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "entry metatype parameter does not match its concrete type"
@@ -7944,16 +10682,13 @@ public struct Lowerer: Sendable {
                 if let bridgedParameterTypes {
                     physicalType = try parsePhysicalType(
                         value[1],
-                        bridgedTo: bridgedParameterTypes[physicalIndex]
+                        bridgedTo: bridgedParameterTypes[logicalPhysicalIndex]
                     )
                 } else {
                     let parsed = try parseType(value[1])
-                    if entryParameterTypes == nil, parsed == .optional(.void) {
-                        physicalType = .bool
-                        compilerOptionalVoidParameters.insert(value[0])
-                    } else {
-                        physicalType = parsed
-                    }
+                    physicalType = suppressVoidParameter
+                        ? parsed
+                        : ValueRepresentation.storable(parsed)
                 }
                 if suppressVoidParameter {
                     guard physicalIndex == 0, physicalType == .void else {
@@ -7964,20 +10699,18 @@ public struct Lowerer: Sendable {
                     suppressedVoidParameter = value[0]
                     continue
                 }
-                if physicalIndex == 0, let indirectResultType {
-                    guard physicalType == .address(indirectResultType) else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "indirect result address does not match the function result"
-                        )
-                    }
-                    indirectResultAddress = value[0]
-                    continue
-                }
                 let logicalIndex = parameters.count
                 let loweredType: Bytecode.ValueType
                 if let entryParameterTypes,
                    entryParameterTypes.indices.contains(logicalIndex),
-                   physicalType == .address(entryParameterTypes[logicalIndex]) {
+                   case let .mutableCell(pointee) = entryParameterTypes[logicalIndex],
+                   physicalType == .address(pointee),
+                   component.contains("@closureCapture") {
+                    loweredType = .mutableCell(pointee)
+                    mutableCellParameters[value[0]] = pointee
+                } else if let entryParameterTypes,
+                          entryParameterTypes.indices.contains(logicalIndex),
+                          physicalType == .address(entryParameterTypes[logicalIndex]) {
                     loweredType = entryParameterTypes[logicalIndex]
                     indirectValueParameters[value[0]] = loweredType
                 } else {
@@ -7990,9 +10723,10 @@ public struct Lowerer: Sendable {
             IntermediateRepresentation.Block(id: id, parameters: parameters.map(\.1), instructions: []),
             parameters,
             indirectResultAddress,
+            indirectErrorAddress,
             indirectValueParameters,
+            mutableCellParameters,
             suppressedVoidParameter,
-            compilerOptionalVoidParameters,
             erasedMetatypeParameters
         )
     }
@@ -8045,6 +10779,146 @@ public struct Lowerer: Sendable {
                 )
             }
             return value[1]
+        }
+    }
+
+    private func parseArrayHigherOrderPlan(
+        operation: CanonicalSIL.HigherOrderIntrinsic,
+        genericArguments: String,
+        argumentText: String,
+        line: Int
+    ) throws -> ArrayHigherOrderPlan {
+        let genericTypes = try splitTopLevel(genericArguments)
+            .filter { !$0.isEmpty }
+            .map(parseType)
+        let arguments = try parseApplyValueTokens(argumentText, line: line)
+
+        func arrayElement(
+            _ type: Bytecode.ValueType
+        ) throws -> Bytecode.ValueType {
+            guard case let .array(element) = type else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "higher-order collection \(type)"
+                )
+            }
+            return element
+        }
+
+        switch operation {
+        case .map:
+            guard genericTypes.count == 3, arguments.count == 3 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Collection.map has an unsupported specialization"
+                )
+            }
+            let input = try arrayElement(genericTypes[0])
+            let mapped = ValueRepresentation.storable(genericTypes[1])
+            return .init(
+                operation: operation,
+                sourceToken: arguments[2],
+                closureToken: arguments[1],
+                initialToken: nil,
+                resultDestination: nil,
+                errorDestination: arguments[0],
+                inputType: input,
+                closureResultType: genericTypes[1],
+                callResultType: .array(mapped)
+            )
+        case .filter:
+            guard genericTypes.count == 1, arguments.count == 2 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Array.filter has an unsupported specialization"
+                )
+            }
+            let input = try arrayElement(genericTypes[0])
+            return .init(
+                operation: operation,
+                sourceToken: arguments[1],
+                closureToken: arguments[0],
+                initialToken: nil,
+                resultDestination: nil,
+                errorDestination: nil,
+                inputType: input,
+                closureResultType: .bool,
+                callResultType: .array(input)
+            )
+        case .compactMap:
+            guard genericTypes.count == 2, arguments.count == 2 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Sequence.compactMap has an unsupported specialization"
+                )
+            }
+            let input = try arrayElement(genericTypes[0])
+            let mapped = ValueRepresentation.storable(genericTypes[1])
+            return .init(
+                operation: operation,
+                sourceToken: arguments[1],
+                closureToken: arguments[0],
+                initialToken: nil,
+                resultDestination: nil,
+                errorDestination: nil,
+                inputType: input,
+                closureResultType: .optional(mapped),
+                callResultType: .array(mapped)
+            )
+        case .reduce:
+            guard genericTypes.count == 2, arguments.count == 4 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Sequence.reduce has an unsupported specialization"
+                )
+            }
+            let input = try arrayElement(genericTypes[0])
+            let accumulator = ValueRepresentation.storable(genericTypes[1])
+            return .init(
+                operation: operation,
+                sourceToken: arguments[3],
+                closureToken: arguments[2],
+                initialToken: arguments[1],
+                resultDestination: arguments[0],
+                errorDestination: nil,
+                inputType: input,
+                closureResultType: genericTypes[1],
+                callResultType: accumulator
+            )
+        case .forEach, .firstWhere, .containsWhere, .allSatisfy:
+            let hasIndirectResult = operation == .firstWhere
+            let expectedArgumentCount = hasIndirectResult ? 3 : 2
+            guard genericTypes.count == 1,
+                  arguments.count == expectedArgumentCount
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Sequence predicate operation has an unsupported specialization"
+                )
+            }
+            let input = try arrayElement(genericTypes[0])
+            let closureResult: Bytecode.ValueType = operation == .forEach
+                ? .void : .bool
+            let callResult: Bytecode.ValueType = switch operation {
+            case .forEach: .void
+            case .firstWhere: .optional(input)
+            case .containsWhere, .allSatisfy: .bool
+            case .map, .filter, .compactMap, .reduce, .optionalMap,
+                 .resultMap:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "predicate operation dispatch is inconsistent"
+                )
+            }
+            return .init(
+                operation: operation,
+                sourceToken: arguments[expectedArgumentCount - 1],
+                closureToken: arguments[expectedArgumentCount - 2],
+                initialToken: nil,
+                resultDestination: hasIndirectResult ? arguments[0] : nil,
+                errorDestination: nil,
+                inputType: input,
+                closureResultType: closureResult,
+                callResultType: callResult
+            )
+        case .optionalMap, .resultMap:
+            throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                line: line,
+                text: "non-Array higher-order intrinsic"
+            )
         }
     }
 

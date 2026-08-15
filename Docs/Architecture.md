@@ -9,7 +9,7 @@ share compiler facts and identity contracts; they do not share a delivery
 channel.
 
 This document describes the implementation available in the repository as of
-August 11, 2026. It does not turn unfinished qualification work into a product
+August 16, 2026. It does not turn unfinished qualification work into a product
 claim.
 
 ## The two workflows
@@ -60,6 +60,23 @@ Both workflows depend on stable, build-specific identities:
 - An immutable `Runtime.Generation` makes all routes in one activation visible
   atomically. A call chain pins one generation so it cannot observe a mixture
   during concurrent activation or rollback.
+- Mutable closure captures and collection transforms use verifier-private
+  storage values rather than Swift runtime layout: managed cells may be shared
+  only by same-image closures, while Array builders are linear and must be
+  finished or destroyed on every control-flow path. Neither form can enter a
+  Shell/Native boundary, local value layout, stack slot, or function result.
+- A closure signature carries an ownership convention for every invocation
+  parameter. The compiler preserves concrete Swift `@in_guaranteed` inputs as
+  borrowed VM values, materializes copies only at owned boundaries, and the
+  Verifier requires the signature to match the closure-body prefix exactly.
+  This rule is type-directed and also covers linear imported SDK values; it is
+  not a list of API- or framework-specific exceptions.
+- Frame-local and heap-promoted storage share one field-sensitive aggregate
+  shape. The compiler promotes multi-block lifetimes, classifies
+  initialize/assign/replace and conditional cleanup, and the Verifier computes
+  definitely-versus-possibly initialized leaves at CFG joins. Reads remain
+  definite-only; runtime shape allocation and partial storage are charged to
+  the invocation budget.
 - Activation materializes inherited routes into a self-contained snapshot. The
   registry normally retains only the active snapshot and its direct rollback
   predecessor; older snapshots remain alive only while a lease pins them. A

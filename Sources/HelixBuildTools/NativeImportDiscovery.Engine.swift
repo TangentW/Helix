@@ -327,7 +327,8 @@ extension NativeImportDiscovery {
                 isDictionaryKey(key) && isAutomaticallyBridgeable(value)
             case let .tuple(elements):
                 !elements.isEmpty && elements.allSatisfy(isAutomaticallyBridgeable)
-            case .void, .never, .local, .error, .address, .closure:
+            case .void, .never, .local, .error, .address, .mutableCell,
+                 .arrayBuilder, .closure:
                 false
             }
         }

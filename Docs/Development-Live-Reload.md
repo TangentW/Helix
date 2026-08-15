@@ -335,9 +335,15 @@ in the Dev Shell. Original Swift access control is preserved, but lexical
 visibility alone does not create a VM capability: every native operation must
 also resolve through an eligible Entry or exact NativeImport. Supported local
 closures and already indexed same-image helpers may use synchronous `@escaping`
-parameters, internal closure returns, and nested closure captures. The closure
-still cannot cross the Shell/Native boundary or survive the current pinned VM
-invocation.
+parameters, internal closure returns, nested closure captures, and synchronous
+throwing paths. Mutable captures use the same VM-managed cell for scalar,
+collection, tuple, and patch-local struct storage, including Swift escape
+boxes; common fully concrete Array-backed higher-order operations use verified
+closure CFGs and a linear builder. Multi-branch local initialization uses
+field-sensitive definite/possible state, so conditional replacement and
+cleanup are supported while reads remain fail-closed until every field is
+definitely initialized. The closure still cannot cross the
+Shell/Native boundary or survive the current pinned VM invocation.
 
 The current generator collects reachable ordinary functions, private class
 instance methods, computed accessors, and their non-exported patch-local types

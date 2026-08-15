@@ -78,7 +78,8 @@ enum ImageFunctions {
     static func signature(
         of function: CanonicalSIL.Function,
         environment: CanonicalSIL.TypeEnvironment,
-        symbol: String
+        symbol: String,
+        kind: Bytecode.FunctionKind
     ) throws -> Signature {
         do {
             let parsed = try CanonicalSIL.Lowerer(
@@ -95,9 +96,20 @@ enum ImageFunctions {
                try environment.hostedMethodRequiresMainActor(context) {
                 effects.requiresMainActor = true
             }
-            return .init(
+            let normalized = try CanonicalSIL.MutableCaptures.normalize(
+                body: function.body,
+                role: kind,
                 parameters: parsed.parameters,
                 parameterConventions: parsed.parameterConventions,
+                erasedPhysicalIndices: Set(
+                    parsed.erasedMetatypes.map(\.physicalIndex)
+                ),
+                hasIndirectResult: parsed.hasIndirectResult,
+                hasIndirectError: parsed.indirectErrorType != nil
+            )
+            return .init(
+                parameters: normalized.parameters,
+                parameterConventions: normalized.parameterConventions,
                 result: parsed.result,
                 effects: effects
             )
@@ -154,21 +166,17 @@ enum ImageFunctions {
             }
         }
 
-        return try ReleaseCompiler.ImplementationFingerprint
+        return ReleaseCompiler.ImplementationFingerprint
             .referencedSymbols(in: body).sorted().compactMap { symbol in
                 guard let fallback = kindForSymbol(symbol) else { return nil }
                 let usages = usageBySymbol[symbol, default: []]
-                guard usages.count <= 1 else {
-                    throw DiscoveryError.unsupported(
-                        symbol: symbol,
-                        reason: "it is both directly called and used as a closure body"
-                    )
-                }
-                let kind: Bytecode.FunctionKind = switch usages.first {
-                case .closureConstruction: .closureBody
-                case .directCall: fallback
-                case nil: fallback
-                }
+                // Swift routinely materializes a no-capture closure for
+                // lifetime/debug semantics while devirtualizing its actual
+                // invocation to the same function_ref. Closure eligibility is
+                // therefore additive, not an exclusive invocation mode.
+                let kind: Bytecode.FunctionKind = usages.contains(
+                    .closureConstruction
+                ) ? .closureBody : fallback
                 return (symbol, kind)
             }
     }

@@ -40,7 +40,11 @@ struct AnyWireContract {
         #expect(!Bytecode.ValueType.address(.int64).isAnyPayloadV1)
         #expect(
             !Bytecode.ValueType.closure(
-                .init(parameters: [], result: .void)
+                .init(
+                    parameters: [],
+                    parameterConventions: [],
+                    result: .void
+                )
             ).isAnyPayloadV1
         )
     }

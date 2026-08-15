@@ -133,12 +133,14 @@ public struct Interpreter: Sendable {
             guard !rootFunction.parameterConventions.contains(.inout),
                   !rootFunction.parameterRegisters.contains(where: {
                       guard let type = rootFunction.type(of: $0) else { return false }
-                      if case .address = type { return true }
-                      return false
+                      return switch type {
+                      case .address, .mutableCell, .arrayBuilder: true
+                      default: false
+                      }
                   })
             else {
                 throw VM.RuntimeTrap.explicit(
-                    "address values cannot cross the root invocation boundary"
+                    "internal storage values cannot cross the root invocation boundary"
                 )
             }
             guard arguments.count == rootFunction.parameterRegisters.count else {
@@ -239,7 +241,8 @@ public struct Interpreter: Sendable {
                 result.insert(id)
             case let .tuple(elements):
                 elements.forEach(visit)
-            case let .optional(wrapped), let .address(wrapped):
+            case let .optional(wrapped), let .address(wrapped),
+                 let .mutableCell(wrapped), let .arrayBuilder(wrapped):
                 visit(wrapped)
             case let .array(element):
                 visit(element)
@@ -402,7 +405,17 @@ public struct Interpreter: Sendable {
             guard !frameBytes.overflow else { throw VM.RuntimeTrap.vmHeapLimitExceeded }
             try budget.consumeVMHeap(bytes: frameBytes.partialValue)
             var registers = Array<VM.Value?>(repeating: nil, count: function.registerTypes.count)
-            let stackSlots = (0..<function.stackSlotTypes.count).map { _ in VM.MemoryCell() }
+            let stackSlots = try function.stackSlotTypes.map { type in
+                let shape = try storageShape(type, localTypes: localTypes)
+                guard let nodeCount = shape.nodeCount else {
+                    throw VM.RuntimeTrap.vmHeapLimitExceeded
+                }
+                try budget.consumeLinearWork(elementCount: nodeCount)
+                try chargeAggregate(elementCount: nodeCount, budget: budget)
+                return VM.MemoryCell(
+                    storageShape: shape
+                )
+            }
             for ((register, convention), value) in zip(
                 zip(function.parameterRegisters, function.parameterConventions),
                 arguments
@@ -882,6 +895,13 @@ public struct Interpreter: Sendable {
                     try initialize(value, register: result, registers: &registers)
                 case let .destroyStack(slot):
                     _ = try take(slot, stackSlots: &stackSlots)
+                case let .destroyStackIfInitialized(slot):
+                    guard let index = Int(exactly: slot.rawValue),
+                          stackSlots.indices.contains(index)
+                    else {
+                        throw VM.RuntimeTrap.unknownStackSlot(slot)
+                    }
+                    try stackSlots[index].directDestroyIfInitialized()
                 case let .stackAddress(result, slot):
                     guard let index = Int(exactly: slot.rawValue),
                           stackSlots.indices.contains(index),
@@ -894,7 +914,7 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
-                case let .projectStructAddress(result, base, fieldIndex):
+                case let .projectAggregateAddress(result, base, fieldIndex):
                     guard case let .address(address) = try read(base, registers: registers),
                           case let .address(pointee) = function.type(of: result)
                     else {
@@ -908,6 +928,114 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
+                case let .makeMutableCell(result, initialValue):
+                    guard case let .mutableCell(pointee) = function.type(of: result)
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .mutableCell(
+                                initialValue.flatMap {
+                                    function.type(of: $0)
+                                } ?? .never
+                            ),
+                            actual: function.type(of: result)
+                        )
+                    }
+                    let value = try initialValue.map {
+                        try consume(
+                            $0,
+                            type: pointee,
+                            registers: &registers
+                        )
+                    }
+                    let shape = try storageShape(
+                        pointee,
+                        localTypes: localTypes
+                    )
+                    guard let nodeCount = shape.nodeCount else {
+                        throw VM.RuntimeTrap.vmHeapLimitExceeded
+                    }
+                    try budget.consumeLinearWork(elementCount: nodeCount)
+                    try chargeAggregate(
+                        elementCount: nodeCount,
+                        budget: budget
+                    )
+                    try initialize(
+                        .mutableCell(
+                            .init(
+                                initialValue: value,
+                                pointee: pointee,
+                                shape: shape
+                            )
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .projectMutableCell(result, cellRegister, fieldIndex):
+                    guard case let .mutableCell(cell) = try read(
+                        cellRegister,
+                        registers: registers
+                    ), case let .mutableCell(aggregate) = function.type(
+                        of: cellRegister
+                    ), let fieldType = mutableCellFieldType(
+                        aggregate,
+                        fieldIndex: fieldIndex,
+                        localTypes: localTypes
+                    ),
+                       function.type(of: result)
+                        == .mutableCell(fieldType)
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: function.type(of: cellRegister)
+                        )
+                    }
+                    try initialize(
+                        .mutableCell(
+                            cell.projected(
+                                field: fieldIndex,
+                                pointee: fieldType
+                            )
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .loadMutableCell(result, cellRegister):
+                    guard case let .mutableCell(cell) = try read(
+                        cellRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: cellRegister) ?? .never,
+                            actual: try read(
+                                cellRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    try initialize(
+                        try copyCharging(cell.read(), budget: budget),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .storeMutableCell(cellRegister, source, mode):
+                    guard case let .mutableCell(cell) = try read(
+                        cellRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: cellRegister) ?? .never,
+                            actual: try read(
+                                cellRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    let value = try consume(
+                        source,
+                        type: cell.pointee,
+                        registers: &registers
+                    )
+                    try cell.store(value, mode: mode)
                 case let .beginAccess(result, base, kind):
                     guard case let .address(address) = try read(base, registers: registers) else {
                         throw VM.RuntimeTrap.typeMismatch(
@@ -1298,6 +1426,64 @@ public struct Interpreter: Sendable {
                     try budget.checkDeadline()
                     try initialize(
                         .array(appended, elementType: elementType),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .makeArrayBuilder(result):
+                    guard case let .arrayBuilder(element) = function.type(
+                        of: result
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .arrayBuilder(.never),
+                            actual: function.type(of: result)
+                        )
+                    }
+                    try chargeAggregate(elementCount: 0, budget: budget)
+                    try initialize(
+                        .arrayBuilder(.init(elementType: element)),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arrayBuilderAppend(builderRegister, value):
+                    guard case let .arrayBuilder(builder) = try read(
+                        builderRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: builderRegister)
+                                ?? .never,
+                            actual: try read(
+                                builderRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    let sourceElement = try read(value, registers: registers)
+                    try budget.consumeLinearWork(elementCount: 1)
+                    try budget.consumeAggregateElementStorage(elementCount: 1)
+                    try prepareCopy(sourceElement, budget: budget)
+                    try builder.append(copy(sourceElement))
+                    try budget.checkDeadline()
+                case let .finishArrayBuilder(result, builderRegister):
+                    guard case let .arrayBuilder(element) = function.type(
+                        of: builderRegister
+                    ), function.type(of: result) == .array(element),
+                       case let .arrayBuilder(builder) = try consume(
+                        builderRegister,
+                        type: .arrayBuilder(element),
+                        registers: &registers
+                       )
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: function.type(of: builderRegister)
+                        )
+                    }
+                    try initialize(
+                        .array(
+                            try builder.finish(),
+                            elementType: element
+                        ),
                         register: result,
                         registers: &registers
                     )
@@ -1828,7 +2014,13 @@ public struct Interpreter: Sendable {
                 case let .makeClosure(result, callee, captures):
                     guard case let .closure(signature) = function.type(of: result) else {
                         throw VM.RuntimeTrap.typeMismatch(
-                            expected: .closure(.init(parameters: [], result: .void)),
+                            expected: .closure(
+                                .init(
+                                    parameters: [],
+                                    parameterConventions: [],
+                                    result: .void
+                                )
+                            ),
                             actual: function.type(of: result)
                         )
                     }
@@ -1890,6 +2082,70 @@ public struct Interpreter: Sendable {
                             arguments: callValues,
                             continuation: .returning(
                                 result: result,
+                                programCounter: programCounter
+                            )
+                        )
+                    )
+                case let .closureTryApply(
+                    closureRegister,
+                    arguments,
+                    normalTarget,
+                    errorTarget
+                ):
+                    guard case let .closure(closure) = try read(
+                        closureRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .closure(
+                                .init(
+                                    parameters: [],
+                                    parameterConventions: [],
+                                    result: .void
+                                )
+                            ),
+                            actual: try read(
+                                closureRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    guard let calleeFunction = functions[closure.functionID],
+                          calleeFunction.parameterConventions.count
+                            >= arguments.count
+                    else {
+                        throw VM.RuntimeTrap.unknownFunction(closure.functionID)
+                    }
+                    let values = try arguments.map {
+                        try read($0, registers: registers)
+                    }
+                    let callValues = values + closure.captures
+                    try chargeCallShape(callValues, budget: budget)
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: Array(
+                            calleeFunction.parameterConventions.prefix(
+                                arguments.count
+                            )
+                        ),
+                        function: function,
+                        registers: &registers
+                    )
+                    persist(
+                        frame,
+                        registers: registers,
+                        stackSlots: stackSlots,
+                        currentBlock: currentBlock,
+                        nextInstruction: instructionIndex + 1
+                    )
+                    try budget.checkDeadline()
+                    return .call(
+                        FrameCall(
+                            functionID: closure.functionID,
+                            arguments: callValues,
+                            continuation: .throwing(
+                                normalTarget: normalTarget,
+                                errorTarget: errorTarget,
                                 programCounter: programCounter
                             )
                         )
@@ -2124,6 +2380,20 @@ public struct Interpreter: Sendable {
         case let (.address(address), .address(pointee)):
             guard address.pointee == pointee, address.isScoped else {
                 throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
+            }
+        case let (.mutableCell(cell), .mutableCell(pointee)):
+            guard cell.pointee == pointee else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: expected,
+                    actual: value.type
+                )
+            }
+        case let (.arrayBuilder(builder), .arrayBuilder(element)):
+            guard builder.elementType == element else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: expected,
+                    actual: value.type
+                )
             }
         case let (.closure(closure), .closure(signature)):
             guard closure.signature == signature else {
@@ -2426,10 +2696,90 @@ public struct Interpreter: Sendable {
                     captures: try closure.captures.map(copy)
                 )
             )
+        case .mutableCell:
+            value
+        case .arrayBuilder:
+            throw VM.RuntimeTrap.explicit("Array builders cannot be copied")
         case .address:
             throw VM.RuntimeTrap.inactiveAddressAccess
         case .bool, .integer, .float, .string:
             value
+        }
+    }
+
+    private func mutableCellFieldType(
+        _ aggregate: Bytecode.ValueType,
+        fieldIndex: UInt32,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
+    ) -> Bytecode.ValueType? {
+        guard let index = Int(exactly: fieldIndex) else { return nil }
+        switch aggregate {
+        case let .tuple(elements):
+            guard elements.indices.contains(index) else { return nil }
+            return elements[index]
+        case let .local(key):
+            guard let definition = localTypes[key],
+                  case let .structure(fields) = definition.kind,
+                  fields.indices.contains(index)
+            else { return nil }
+            return fields[index].type
+        default:
+            return nil
+        }
+    }
+
+    private func storageShape(
+        _ type: Bytecode.ValueType,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        depth: Int = 0,
+        visiting: Set<Bytecode.LocalTypeKey> = []
+    ) throws -> VM.StorageShape {
+        guard depth <= VM.ValueLimits.maximumNestingDepth else {
+            throw VM.RuntimeTrap.valueNestingDepthExceeded(
+                maximum: VM.ValueLimits.maximumNestingDepth
+            )
+        }
+        switch type {
+        case .tuple([]):
+            // Empty products still require an explicit Swift initialization;
+            // model them as a leaf so runtime and verifier state agree.
+            return .leaf
+        case let .tuple(elements):
+            return .tuple(
+                try elements.map {
+                    try storageShape(
+                        $0,
+                        localTypes: localTypes,
+                        depth: depth + 1,
+                        visiting: visiting
+                    )
+                }
+            )
+        case let .local(key):
+            guard !visiting.contains(key),
+                  let definition = localTypes[key]
+            else {
+                throw VM.RuntimeTrap.typeMismatch(expected: type, actual: nil)
+            }
+            guard case let .structure(fields) = definition.kind else {
+                return .leaf
+            }
+            guard !fields.isEmpty else { return .leaf }
+            var nextVisiting = visiting
+            nextVisiting.insert(key)
+            return .structure(
+                key,
+                try fields.map {
+                    try storageShape(
+                        $0.type,
+                        localTypes: localTypes,
+                        depth: depth + 1,
+                        visiting: nextVisiting
+                    )
+                }
+            )
+        default:
+            return .leaf
         }
     }
 
@@ -2514,7 +2864,8 @@ public struct Interpreter: Sendable {
             for capture in closure.captures {
                 try chargeCopiedValue(capture, budget: budget, depth: depth + 1)
             }
-        case .bool, .integer, .float, .string, .address:
+        case .bool, .integer, .float, .string, .address, .mutableCell,
+             .arrayBuilder:
             break
         }
     }
@@ -2569,7 +2920,8 @@ public struct Interpreter: Sendable {
             for capture in closure.captures {
                 try chargeValueTraversal(capture, budget: budget, depth: depth + 1)
             }
-        case .optional(nil), .native, .bool, .integer, .float, .address:
+        case .optional(nil), .native, .bool, .integer, .float, .address,
+             .mutableCell, .arrayBuilder:
             break
         }
     }
@@ -2633,7 +2985,8 @@ public struct Interpreter: Sendable {
             for capture in closure.captures {
                 try chargeShapeValidation(capture, budget: budget, depth: depth + 1)
             }
-        case .optional(nil), .native, .bool, .integer, .float, .string, .address:
+        case .optional(nil), .native, .bool, .integer, .float, .string,
+             .address, .mutableCell, .arrayBuilder:
             break
         }
     }

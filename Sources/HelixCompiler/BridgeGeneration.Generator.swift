@@ -1689,7 +1689,8 @@ public struct Generator: Sendable {
             isGeneratedDictionaryKey(key) && isGeneratedValueType(value)
         case let .tuple(elements):
             !elements.isEmpty && elements.allSatisfy(isGeneratedValueType)
-        case .void, .never, .local, .error, .address, .closure:
+        case .void, .never, .local, .error, .address, .mutableCell,
+             .arrayBuilder, .closure:
             false
         }
     }
@@ -1967,9 +1968,13 @@ public struct Generator: Sendable {
             ".local(Bytecode.LocalTypeKey(rawValue: \(quoted(key.rawValue))))"
         case .error: ".error"
         case let .address(pointee): ".address(\(render(pointee)))"
+        case let .mutableCell(pointee): ".mutableCell(\(render(pointee)))"
+        case let .arrayBuilder(element): ".arrayBuilder(\(render(element)))"
         case let .closure(signature):
             ".closure(Bytecode.ClosureSignature(parameters: "
-                + "\(renderValueTypes(signature.parameters)), result: \(render(signature.result)), "
+                + "\(renderValueTypes(signature.parameters)), parameterConventions: "
+                + "\(renderParameterConventions(signature.parameterConventions)), "
+                + "result: \(render(signature.result)), "
                 + "effects: \(render(signature.effects))))"
         case let .tuple(elements): ".tuple(\(renderValueTypes(elements)))"
         case let .optional(wrapped): ".optional(\(render(wrapped)))"
@@ -1978,6 +1983,12 @@ public struct Generator: Sendable {
 
     private func renderValueTypes(_ types: [Bytecode.ValueType]) -> String {
         "[\(types.map(render).joined(separator: ", "))]"
+    }
+
+    private func renderParameterConventions(
+        _ conventions: [Bytecode.ParameterConvention]
+    ) -> String {
+        "[\(conventions.map { ".\($0.rawValue)" }.joined(separator: ", "))]"
     }
 
     private func renderCapabilities(_ capabilities: [Core.Capability]) -> String {

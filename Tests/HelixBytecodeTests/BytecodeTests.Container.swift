@@ -245,6 +245,7 @@ struct Container {
         var module = try makeAddModule()
         let signature = Bytecode.ClosureSignature(
             parameters: [.int64],
+            parameterConventions: [.owned],
             result: .int64
         )
         module.capabilities.formUnion([
@@ -312,6 +313,25 @@ struct Container {
         #expect(decoded.header.formatMinor == Bytecode.Format.minorVersion)
         #expect(decoded.module == module)
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
+    }
+
+    @Test("Closure descriptions preserve ownership and expose malformed ABI")
+    func closureSignatureDescription() {
+        var signature = Bytecode.ClosureSignature(
+            parameters: [.int64, .string, .bool],
+            parameterConventions: [.owned, .borrowed, .inout],
+            result: .void
+        )
+        #expect(
+            signature.description
+                == "(Int64, @borrowed String, @inout Bool) -> Void"
+        )
+
+        signature.parameterConventions.removeLast()
+        #expect(
+            signature.description
+                == "<invalid closure signature: 3 parameters, 2 conventions>"
+        )
     }
 
     @Test("HLBC 1.0 canonically carries the non-suspending async entry ABI")

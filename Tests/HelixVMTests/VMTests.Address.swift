@@ -7,6 +7,92 @@ import Testing
 extension VMTests {
 @Suite("HLVM address and call-convention execution")
 struct AddressExecution {
+    @Test("Empty aggregate storage still requires explicit initialization")
+    func requiresEmptyAggregateInitialization() throws {
+        let cell = VM.MemoryCell(storageShape: .leaf)
+
+        #expect(throws: VM.RuntimeTrap.uninitializedAddress) {
+            try cell.directRead()
+        }
+        try cell.directStore(.tuple([]), mode: .initialize)
+        #expect(try cell.directTake() == .tuple([]))
+        #expect(throws: VM.RuntimeTrap.uninitializedAddress) {
+            try cell.directRead()
+        }
+    }
+
+    @Test("Replace stores and conditional destroy cover dynamic storage state")
+    func executesDynamicStorageTransitions() throws {
+        let first = VM.Value.integer(try int(1))
+        let second = VM.Value.integer(try int(2))
+        let replacement = VM.Value.integer(try int(3))
+        let cell = VM.MemoryCell(
+            storageShape: .tuple([.leaf, .leaf])
+        )
+
+        try cell.unscopedStore(
+            first,
+            path: [0],
+            mode: .initialize
+        )
+        try cell.unscopedStore(
+            second,
+            path: [1],
+            mode: .replace
+        )
+        #expect(try cell.directRead() == .tuple([first, second]))
+
+        try cell.unscopedStore(
+            replacement,
+            path: [0],
+            mode: .replace
+        )
+        #expect(try cell.directRead() == .tuple([replacement, second]))
+
+        try cell.directDestroyIfInitialized()
+        try cell.directDestroyIfInitialized()
+        #expect(throws: VM.RuntimeTrap.uninitializedAddress) {
+            try cell.directRead()
+        }
+    }
+
+    @Test("Conditional root destruction respects active access scope shape")
+    func enforcesConditionalDestroyExclusivity() throws {
+        let first = VM.Value.integer(try int(1))
+        let second = VM.Value.integer(try int(2))
+        let cell = VM.MemoryCell(
+            .tuple([first, second]),
+            storageShape: .tuple([.leaf, .leaf])
+        )
+
+        let read = try cell.begin(path: [], kind: .read)
+        #expect(throws: VM.RuntimeTrap.exclusivityViolation) {
+            try cell.directDestroyIfInitialized()
+        }
+        try cell.end(token: read)
+
+        let child = try cell.begin(path: [0], kind: .modify)
+        #expect(throws: VM.RuntimeTrap.exclusivityViolation) {
+            try cell.directDestroyIfInitialized()
+        }
+        try cell.end(token: child)
+
+        let left = try cell.begin(path: [0], kind: .modify)
+        let right = try cell.begin(path: [1], kind: .modify)
+        #expect(throws: VM.RuntimeTrap.exclusivityViolation) {
+            try cell.directDestroyIfInitialized()
+        }
+        try cell.end(token: right)
+        try cell.end(token: left)
+
+        let root = try cell.begin(path: [], kind: .modify)
+        try cell.directDestroyIfInitialized()
+        try cell.end(token: root)
+        #expect(throws: VM.RuntimeTrap.uninitializedAddress) {
+            try cell.directRead()
+        }
+    }
+
     @Test("A scalar stack value is mutated through an inout helper")
     func executesScalarInoutMutation() throws {
         let root = Bytecode.Function(
@@ -118,7 +204,7 @@ struct AddressExecution {
                             address: .init(rawValue: 3),
                             kind: .modify
                         ),
-                        .projectStructAddress(
+                        .projectAggregateAddress(
                             result: .init(rawValue: 5),
                             base: .init(rawValue: 4),
                             fieldIndex: 0

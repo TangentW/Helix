@@ -4011,7 +4011,11 @@ struct Pipeline {
         })
         let applyTwice = try file.uniqueFunction(mangledNameContaining: "applyTwice")
         let closureBody = try file.uniqueFunction(mangledNameContaining: "cfU_")
-        let signature = Bytecode.ClosureSignature(parameters: [.int64], result: .int64)
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64
+        )
         let directCalls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: applyTwice.mangledName,
@@ -4213,7 +4217,7 @@ struct Pipeline {
         #expect(loweredIncrement.parameterConventions == [.inout, .owned])
         #expect(loweredBump.parameterConventions == [.owned, .inout])
         #expect(updateInstructions.contains { instruction in
-            if case .projectStructAddress = instruction { return true }
+            if case .projectAggregateAddress = instruction { return true }
             return false
         })
         #expect(updateInstructions.contains { instruction in

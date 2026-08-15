@@ -224,7 +224,7 @@ public struct Document: Codable, Hashable, Sendable {
         switch type {
         case .void: allowVoid
         case .never: false
-        case .address, .closure: false
+        case .address, .mutableCell, .arrayBuilder, .closure: false
         case .bool, .integer, .float, .string, .any, .native: true
         case .local, .error: false
         case let .array(element): isSupported(element, allowVoid: false)
@@ -249,7 +249,8 @@ public struct Document: Codable, Hashable, Sendable {
     ) -> Bool {
         switch type {
         case let .native(id): ids.contains(id)
-        case let .array(element), let .optional(element), let .address(element):
+        case let .array(element), let .optional(element), let .address(element),
+             let .mutableCell(element), let .arrayBuilder(element):
             containsNativeType(element, ids: ids)
         case let .dictionary(key, value):
             containsNativeType(key, ids: ids) || containsNativeType(value, ids: ids)

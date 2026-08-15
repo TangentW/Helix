@@ -314,6 +314,7 @@ struct Fixture {
         )
         let signature = Bytecode.ClosureSignature(
             parameters: [.int64],
+            parameterConventions: [.owned],
             result: .int64
         )
         let root = Bytecode.Function(

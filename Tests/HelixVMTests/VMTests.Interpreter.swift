@@ -188,13 +188,28 @@ struct Interpreter {
             name: "loop",
             parameterRegisters: [.init(rawValue: 0)],
             resultType: .int64,
-            registerTypes: [.int64],
+            registerTypes: [.int64, .int64],
             entryBlock: .init(rawValue: 0),
             blocks: [
                 .init(
                     id: .init(rawValue: 0),
                     parameters: [.init(rawValue: 0)],
-                    instructions: [.branch(target: .init(rawValue: 0), arguments: [.init(rawValue: 0)])]
+                    instructions: [
+                        .branch(
+                            target: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 1)],
+                    instructions: [
+                        .branch(
+                            target: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 1)]
+                        ),
+                    ]
                 ),
             ]
         )
@@ -2539,10 +2554,602 @@ struct Interpreter {
         )
     }
 
+    @Test("Throwing closures resume through normal and error continuations")
+    func executesThrowingClosureControlFlow() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.bool],
+            parameterConventions: [.owned],
+            result: .int64,
+            effects: .init(mayThrow: true)
+        )
+        let closureType = Bytecode.ValueType.closure(signature)
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "throwingClosureRoot",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .bool, .int64, closureType, .int64, .string, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            value: 7
+                        ),
+                        .makeClosure(
+                            result: .init(rawValue: 2),
+                            function: .init(rawValue: 1),
+                            captures: [.init(rawValue: 1)]
+                        ),
+                        .closureTryApply(
+                            closure: .init(rawValue: 2),
+                            arguments: [.init(rawValue: 0)],
+                            normalTarget: .init(rawValue: 1),
+                            errorTarget: .init(rawValue: 2)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 3)],
+                    instructions: [.returnValue(.init(rawValue: 3))]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 4)],
+                    instructions: [
+                        .destroyValue(.init(rawValue: 4)),
+                        .constantInteger(
+                            result: .init(rawValue: 5),
+                            value: -1
+                        ),
+                        .returnValue(.init(rawValue: 5)),
+                    ]
+                ),
+            ]
+        )
+        let body = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "throwingClosureBody",
+            kind: .closureBody,
+            parameterRegisters: [
+                .init(rawValue: 0), .init(rawValue: 1),
+            ],
+            resultType: .int64,
+            registerTypes: [.bool, .int64, .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                    ],
+                    instructions: [
+                        .conditionalBranch(
+                            condition: .init(rawValue: 0),
+                            trueTarget: .init(rawValue: 1),
+                            trueArguments: [],
+                            falseTarget: .init(rawValue: 2),
+                            falseArguments: []
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    instructions: [.returnValue(.init(rawValue: 1))]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    instructions: [
+                        .constantString(
+                            result: .init(rawValue: 2),
+                            value: "closure failure"
+                        ),
+                        .throwError(.init(rawValue: 2)),
+                    ]
+                ),
+            ],
+            effects: .init(mayThrow: true)
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .stringsV1, .closureValuesV1, .untypedThrowsV1,
+        ]
+        let image = try makeVerified(
+            function: root,
+            capabilities: capabilities,
+            signature: .init(
+                parameters: ["Swift.Bool"],
+                result: "Swift.Int"
+            ),
+            parameterTypes: [.bool],
+            additionalFunctions: [body]
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.bool(true)]
+            ) == .returned(
+                .integer(try .init(signed: 7, bitWidth: 64, isSigned: true))
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.bool(false)]
+            ) == .returned(
+                .integer(try .init(signed: -1, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
+    @Test("Mutable capture cells share updates across closure invocations")
+    func executesMutableClosureCaptures() throws {
+        let cellType = Bytecode.ValueType.mutableCell(.int64)
+        let closureType = Bytecode.ValueType.closure(
+            .init(
+                parameters: [],
+                parameterConventions: [],
+                result: .int64
+            )
+        )
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "mutableCaptureRoot",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64, cellType, closureType, .int64, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeMutableCell(
+                            result: .init(rawValue: 1),
+                            initialValue: .init(rawValue: 0)
+                        ),
+                        .makeClosure(
+                            result: .init(rawValue: 2),
+                            function: .init(rawValue: 1),
+                            captures: [.init(rawValue: 1)]
+                        ),
+                        .closureApply(
+                            result: .init(rawValue: 3),
+                            closure: .init(rawValue: 2),
+                            arguments: []
+                        ),
+                        .closureApply(
+                            result: .init(rawValue: 4),
+                            closure: .init(rawValue: 2),
+                            arguments: []
+                        ),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ]
+        )
+        let body = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "mutableCaptureBody",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                cellType, .int64, .int64, .int64, .bool, .int64, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .loadMutableCell(
+                            result: .init(rawValue: 1),
+                            cell: .init(rawValue: 0)
+                        ),
+                        .constantInteger(result: .init(rawValue: 2), value: 1),
+                        .checkedBinary(
+                            result: .init(rawValue: 3),
+                            overflow: .init(rawValue: 4),
+                            operation: .add,
+                            lhs: .init(rawValue: 1),
+                            rhs: .init(rawValue: 2)
+                        ),
+                        .conditionalBranch(
+                            condition: .init(rawValue: 4),
+                            trueTarget: .init(rawValue: 1),
+                            trueArguments: [],
+                            falseTarget: .init(rawValue: 2),
+                            falseArguments: [.init(rawValue: 3)]
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    instructions: [.trap(.integerOverflow)]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 5)],
+                    instructions: [
+                        .storeMutableCell(
+                            cell: .init(rawValue: 0),
+                            source: .init(rawValue: 5),
+                            mode: .assign
+                        ),
+                        .loadMutableCell(
+                            result: .init(rawValue: 6),
+                            cell: .init(rawValue: 0)
+                        ),
+                        .returnValue(.init(rawValue: 6)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [
+                .baselineV1, .closureValuesV1, .mutableCapturesV1,
+            ],
+            additionalFunctions: [body]
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    .integer(
+                        try .init(signed: 4, bitWidth: 64, isSigned: true)
+                    ),
+                ]
+            ) == .returned(
+                .integer(try .init(signed: 6, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
+    @Test("Linear Array builders accumulate and finish exactly once")
+    func executesLinearArrayBuilder() throws {
+        let builderType = Bytecode.ValueType.arrayBuilder(.int64)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "linearArrayBuilder",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .array(.int64),
+            registerTypes: [.int64, builderType, .array(.int64)],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeArrayBuilder(result: .init(rawValue: 1)),
+                        .arrayBuilderAppend(
+                            builder: .init(rawValue: 1),
+                            value: .init(rawValue: 0)
+                        ),
+                        .arrayBuilderAppend(
+                            builder: .init(rawValue: 1),
+                            value: .init(rawValue: 0)
+                        ),
+                        .finishArrayBuilder(
+                            result: .init(rawValue: 2),
+                            builder: .init(rawValue: 1)
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .collectionsV1],
+            resultType: .array(.int64)
+        )
+        let value = VM.Value.integer(
+            try .init(signed: 7, bitWidth: 64, isSigned: true)
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [value]
+            ) == .returned(.array([value, value], elementType: .int64))
+        )
+        let frameBytes = UInt64(
+            function.registerTypes.count * MemoryLayout<VM.Value?>.stride
+        )
+        let builderBytes: UInt64 = 48
+        let exactHeapBytes = frameBytes + builderBytes
+        let exactBudget = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: exactHeapBytes,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [value],
+                budget: exactBudget
+            ) == .returned(.array([value, value], elementType: .int64))
+        )
+        let insufficientBudget = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: exactHeapBytes - 1,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [value],
+                budget: insufficientBudget
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+
+        let directBuilder = VM.ArrayBuilder(elementType: .int64)
+        try directBuilder.append(value)
+        #expect(try directBuilder.finish() == [value])
+        #expect(throws: VM.RuntimeTrap.self) {
+            try directBuilder.append(value)
+        }
+        #expect(throws: VM.RuntimeTrap.self) {
+            _ = try directBuilder.finish()
+        }
+    }
+
+    @Test("Mutable capture projections update their enclosing local value")
+    func executesProjectedMutableCapture() throws {
+        let key = Bytecode.LocalTypeKey(rawValue: "Fixture.Pair")
+        let pairType = Bytecode.ValueType.local(key)
+        let cellType = Bytecode.ValueType.mutableCell(pairType)
+        let fieldCellType = Bytecode.ValueType.mutableCell(.int64)
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "projectedMutableCapture",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64, .int64, pairType, cellType, fieldCellType, .int64,
+                pairType, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(result: .init(rawValue: 1), value: 2),
+                        .makeStruct(
+                            result: .init(rawValue: 2),
+                            fields: [.init(rawValue: 0), .init(rawValue: 1)]
+                        ),
+                        .makeMutableCell(
+                            result: .init(rawValue: 3),
+                            initialValue: .init(rawValue: 2)
+                        ),
+                        .projectMutableCell(
+                            result: .init(rawValue: 4),
+                            cell: .init(rawValue: 3),
+                            fieldIndex: 0
+                        ),
+                        .constantInteger(result: .init(rawValue: 5), value: 9),
+                        .storeMutableCell(
+                            cell: .init(rawValue: 4),
+                            source: .init(rawValue: 5),
+                            mode: .assign
+                        ),
+                        .loadMutableCell(
+                            result: .init(rawValue: 6),
+                            cell: .init(rawValue: 3)
+                        ),
+                        .structExtract(
+                            result: .init(rawValue: 7),
+                            structure: .init(rawValue: 6),
+                            fieldIndex: 0
+                        ),
+                        .returnValue(.init(rawValue: 7)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [
+                .baselineV1, .localNominalsV1, .mutableCapturesV1,
+            ],
+            localTypes: [
+                .init(
+                    key: key,
+                    kind: .structure(
+                        fields: [
+                            .init(name: "first", type: .int64),
+                            .init(name: "second", type: .int64),
+                        ]
+                    )
+                ),
+            ]
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    .integer(
+                        try .init(signed: 1, bitWidth: 64, isSigned: true)
+                    ),
+                ]
+            ) == .returned(
+                .integer(try .init(signed: 9, bitWidth: 64, isSigned: true))
+            )
+        )
+
+        let tupleType = Bytecode.ValueType.tuple([.int64, .int64])
+        let tupleCellType = Bytecode.ValueType.mutableCell(tupleType)
+        let tupleRoot = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "projectedMutableTuple",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64, .int64, tupleType, tupleCellType, fieldCellType,
+                .int64, tupleType, .int64, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(result: .init(rawValue: 1), value: 2),
+                        .makeTuple(
+                            result: .init(rawValue: 2),
+                            elements: [.init(rawValue: 0), .init(rawValue: 1)]
+                        ),
+                        .makeMutableCell(
+                            result: .init(rawValue: 3),
+                            initialValue: .init(rawValue: 2)
+                        ),
+                        .projectMutableCell(
+                            result: .init(rawValue: 4),
+                            cell: .init(rawValue: 3),
+                            fieldIndex: 1
+                        ),
+                        .constantInteger(result: .init(rawValue: 5), value: 11),
+                        .storeMutableCell(
+                            cell: .init(rawValue: 4),
+                            source: .init(rawValue: 5),
+                            mode: .assign
+                        ),
+                        .loadMutableCell(
+                            result: .init(rawValue: 6),
+                            cell: .init(rawValue: 3)
+                        ),
+                        .unpackTuple(
+                            results: [.init(rawValue: 7), .init(rawValue: 8)],
+                            tuple: .init(rawValue: 6)
+                        ),
+                        .returnValue(.init(rawValue: 8)),
+                    ]
+                ),
+            ]
+        )
+        let tupleImage = try makeVerified(
+            function: tupleRoot,
+            capabilities: [.baselineV1, .mutableCapturesV1]
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: tupleImage,
+                arguments: [
+                    .integer(
+                        try .init(signed: 1, bitWidth: 64, isSigned: true)
+                    ),
+                ]
+            ) == .returned(
+                .integer(try .init(signed: 11, bitWidth: 64, isSigned: true))
+            )
+        )
+
+        let partiallyInitialized = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "partiallyInitializedMutableTuple",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64, tupleCellType, fieldCellType, fieldCellType, .int64,
+                tupleType, .int64, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeMutableCell(
+                            result: .init(rawValue: 1),
+                            initialValue: nil
+                        ),
+                        .projectMutableCell(
+                            result: .init(rawValue: 2),
+                            cell: .init(rawValue: 1),
+                            fieldIndex: 0
+                        ),
+                        .projectMutableCell(
+                            result: .init(rawValue: 3),
+                            cell: .init(rawValue: 1),
+                            fieldIndex: 1
+                        ),
+                        .storeMutableCell(
+                            cell: .init(rawValue: 2),
+                            source: .init(rawValue: 0),
+                            mode: .initialize
+                        ),
+                        .constantInteger(
+                            result: .init(rawValue: 4),
+                            value: 10
+                        ),
+                        .storeMutableCell(
+                            cell: .init(rawValue: 3),
+                            source: .init(rawValue: 4),
+                            mode: .initialize
+                        ),
+                        .loadMutableCell(
+                            result: .init(rawValue: 5),
+                            cell: .init(rawValue: 1)
+                        ),
+                        .unpackTuple(
+                            results: [.init(rawValue: 6), .init(rawValue: 7)],
+                            tuple: .init(rawValue: 5)
+                        ),
+                        .returnValue(.init(rawValue: 6)),
+                    ]
+                ),
+            ]
+        )
+        let partiallyInitializedImage = try makeVerified(
+            function: partiallyInitialized,
+            capabilities: [.baselineV1, .mutableCapturesV1]
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: partiallyInitializedImage,
+                arguments: [
+                    .integer(
+                        try .init(signed: 7, bitWidth: 64, isSigned: true)
+                    ),
+                ]
+            ) == .returned(
+                .integer(try .init(signed: 7, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
     @Test("Nonescaping closures execute captured Swift value semantics")
     func executesNonescapingClosure() throws {
         let closureType = Bytecode.ValueType.closure(
-            .init(parameters: [.int64], result: .int64)
+            .init(
+                parameters: [.int64],
+                parameterConventions: [.owned],
+                result: .int64
+            )
         )
         let root = Bytecode.Function(
             id: .init(rawValue: 0),
@@ -2667,6 +3274,7 @@ struct Interpreter {
     func preservesBorrowedClosureArguments() throws {
         let signature = Bytecode.ClosureSignature(
             parameters: [.string],
+            parameterConventions: [.borrowed],
             result: .string
         )
         let closureType = Bytecode.ValueType.closure(signature)
@@ -2751,7 +3359,11 @@ struct Interpreter {
 
     @Test("Closure values cannot cross a VM boundary")
     func rejectsClosureBoundaryValue() throws {
-        let signature = Bytecode.ClosureSignature(parameters: [.int64], result: .int64)
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64
+        )
         let value = VM.Value.closure(
             .init(functionID: .init(rawValue: 1), signature: signature, captures: [])
         )

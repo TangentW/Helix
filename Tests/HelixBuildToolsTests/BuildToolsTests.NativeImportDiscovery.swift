@@ -1605,7 +1605,13 @@ struct NativeImportDiscoveryTests {
         closure.canonicalCallee = "ScopeFixture.invoke(_:)"
         closure.mangledName = "$s12ScopeFixture6invokeyyS2icF"
         closure.parameterTypes = [
-            .closure(.init(parameters: [.int64], result: .int64)),
+            .closure(
+                .init(
+                    parameters: [.int64],
+                    parameterConventions: [.owned],
+                    result: .int64
+                )
+            ),
         ]
         closure.signature = .init(
             parameters: ["(Swift.Int) -> Swift.Int"],

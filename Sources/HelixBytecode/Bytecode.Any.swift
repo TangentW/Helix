@@ -12,7 +12,8 @@ extension Bytecode.ValueType {
         case let .tuple(elements):
             !elements.isEmpty
                 && elements.allSatisfy(\.isAnyPayloadOrExistentialV1)
-        case .void, .never, .any, .native, .error, .address, .closure:
+        case .void, .never, .any, .native, .error, .address, .mutableCell,
+             .arrayBuilder, .closure:
             false
         }
     }

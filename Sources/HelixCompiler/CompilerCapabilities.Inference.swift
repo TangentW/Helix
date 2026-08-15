@@ -80,7 +80,8 @@ extension CompilerCapabilities {
                 let errorTarget: Bytecode.BlockID? = switch instruction {
                 case let .tryApply(_, _, _, target),
                      let .entryTryApply(_, _, _, target),
-                     let .nativeTryApply(_, _, _, target):
+                     let .nativeTryApply(_, _, _, target),
+                     let .closureTryApply(_, _, _, target):
                     target
                 default:
                     nil
@@ -146,6 +147,12 @@ extension CompilerCapabilities {
         case let .address(pointee):
             capabilities.insert(.addressValuesV1)
             collect(pointee, into: &capabilities)
+        case let .mutableCell(pointee):
+            capabilities.insert(.mutableCapturesV1)
+            collect(pointee, into: &capabilities)
+        case let .arrayBuilder(element):
+            capabilities.insert(.collectionsV1)
+            collect(element, into: &capabilities)
         case let .array(element):
             capabilities.insert(.collectionsV1)
             collect(element, into: &capabilities)

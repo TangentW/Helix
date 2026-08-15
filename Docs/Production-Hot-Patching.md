@@ -169,14 +169,18 @@ includes common integer and floating-point operations and conversions,
 `min`/`max`/`abs`, Bool, Unicode String transforms and interpolation,
 one-grapheme Character literals for the bounded String predicate path,
 tuple/Optional including address projection, Array boundary/mutation and
-Dictionary removal value semantics, VM-owned `Any` and common dynamic casts,
+Dictionary removal value semantics, common fully concrete Array-backed
+`map`/`filter`/`compactMap`/`reduce`/predicate operations, `Optional.map`,
+concrete `Result.map` for patch-local value payloads, VM-owned `Any`, and
+common dynamic casts,
 half-open `Range<Int>` loops, structured
 control flow, newly introduced non-exported ordinary/private helpers, computed
 accessors, file- or module-scope patch-local struct/enum, pure HLVM classes, and
 concrete `Result` values,
 payload-carrying local errors, scoped patch-local `inout`/`mutating` helpers,
-synchronous patch-local closures including
-same-image `@escaping` return/capture flows, fully concrete compiler
+synchronous nonthrowing or throwing patch-local closures, type-independent
+managed mutable captures, and same-image `@escaping` return/capture flows,
+fully concrete compiler
 specializations and default-argument generators, an automatically frozen
 `Swift.print` NativeImport, and top-level non-suspending `async`, `async throws`,
 and `@MainActor async` entries. A new `final` class may also inherit an
@@ -189,7 +193,7 @@ It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch, a
 patch concrete Swift type identity visible to native code, function-local
 nominal declarations, hosted stored properties/custom initializers/arbitrary
 callback ABIs, changes to existing native stored layout, closure persistence or native/Shell boundary crossing,
-throwing/async closures, true `await`/continuations, actor-isolated `self`,
+async closures, caller-owned `inout` capture, true `await`/continuations, actor-isolated `self`,
 custom global actors, unrestricted pointers, reflection-based field access, and
 unregistered native APIs are rejected. See
 [Capabilities and Limits](Capabilities-and-Limits.md) for the practical matrix.
