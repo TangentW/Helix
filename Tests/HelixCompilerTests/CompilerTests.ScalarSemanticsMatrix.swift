@@ -522,6 +522,264 @@ struct ScalarSemanticsMatrix {
         ])
     }
 
+    @Test("Integer representation, clamping, endian, and full-width APIs execute")
+    func lowersIntegerRepresentationMatrix() throws {
+        let signedValue: Int32 = -0x1234_567
+        let unsignedValue: UInt32 = 97
+        let product = signedValue.multipliedFullWidth(by: 7)
+        let division = unsignedValue.dividingFullWidth((
+            high: 0,
+            low: 123_456
+        ))
+        try run([
+            Probe(
+                name: "integerRepresentation",
+                source: """
+                public func integerRepresentation(
+                    _ signed: Int32,
+                    _ unsigned: UInt32
+                ) -> (
+                    Int32, Int32, UInt32, UInt32,
+                    Int32, UInt32, UInt32, UInt32
+                ) {
+                    let product = signed.multipliedFullWidth(by: 7)
+                    let division = unsigned.dividingFullWidth((
+                        high: 0,
+                        low: 123_456
+                    ))
+                    return (
+                        signed.bigEndian,
+                        signed.littleEndian,
+                        unsigned.bigEndian,
+                        unsigned.littleEndian,
+                        product.high,
+                        product.low,
+                        division.quotient,
+                        division.remainder
+                    )
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try signed(Int64(signedValue), width: 32),
+                            try unsigned(UInt64(unsignedValue), width: 32),
+                        ],
+                        expected: .returned(
+                            .tuple([
+                                try signed(
+                                    Int64(signedValue.bigEndian),
+                                    width: 32
+                                ),
+                                try signed(
+                                    Int64(signedValue.littleEndian),
+                                    width: 32
+                                ),
+                                try unsigned(
+                                    UInt64(unsignedValue.bigEndian),
+                                    width: 32
+                                ),
+                                try unsigned(
+                                    UInt64(unsignedValue.littleEndian),
+                                    width: 32
+                                ),
+                                try signed(Int64(product.high), width: 32),
+                                try unsigned(UInt64(product.low), width: 32),
+                                try unsigned(
+                                    UInt64(division.quotient),
+                                    width: 32
+                                ),
+                                try unsigned(
+                                    UInt64(division.remainder),
+                                    width: 32
+                                ),
+                            ])
+                        )
+                    ),
+                ]
+            ),
+            Probe(
+                name: "integerClamping",
+                source: """
+                public func integerClamping(
+                    _ signed: Int64,
+                    _ unsigned: UInt64
+                ) -> (UInt8, Int16, Int32, UInt32, Int64, UInt64) {
+                    (
+                        UInt8(clamping: signed),
+                        Int16(clamping: unsigned),
+                        Int32(clamping: signed),
+                        UInt32(clamping: signed),
+                        Int64(clamping: unsigned),
+                        UInt64(clamping: signed)
+                    )
+                }
+                """,
+                scenarios: [
+                    try clampingScenario(signed: .min, unsigned: .max),
+                    try clampingScenario(signed: -1, unsigned: 127),
+                    try clampingScenario(signed: 42, unsigned: 42),
+                    try clampingScenario(
+                        signed: .max,
+                        unsigned: UInt64(Int64.max)
+                    ),
+                ]
+            ),
+            Probe(
+                name: "signedFullWidthDivision",
+                source: """
+                public func signedFullWidthDivision(
+                    _ divisor: Int64,
+                    _ high: Int64,
+                    _ low: UInt64
+                ) -> (Int64, Int64) {
+                    let result = divisor.dividingFullWidth((
+                        high: high,
+                        low: low
+                    ))
+                    return (result.quotient, result.remainder)
+                }
+                """,
+                scenarios: [
+                    try signedFullWidthDivisionScenario(
+                        divisor: .max,
+                        high: 1,
+                        low: 0
+                    ),
+                    try signedFullWidthDivisionScenario(
+                        divisor: .max,
+                        high: -1,
+                        low: 0
+                    ),
+                    .init(
+                        arguments: [
+                            try signed(0),
+                            try signed(0),
+                            try unsigned(1),
+                        ],
+                        expected: .trapped(.divisionByZero)
+                    ),
+                    .init(
+                        arguments: [
+                            try signed(1),
+                            try signed(1),
+                            try unsigned(0),
+                        ],
+                        expected: .trapped(.integerOverflow)
+                    ),
+                ]
+            ),
+        ])
+    }
+
+    @Test("Floating representation and advanced IEEE operations preserve bits")
+    func lowersFloatingRepresentationMatrix() throws {
+        let floatValues: [Float] = [
+            -0.0,
+            .leastNonzeroMagnitude,
+            6.25,
+            .infinity,
+            Float(bitPattern: 0x7F80_1234),
+        ]
+        let doubleValues: [Double] = [
+            -0.0,
+            .leastNonzeroMagnitude,
+            20.25,
+            .infinity,
+            Double(bitPattern: 0x7FF0_0000_0000_1234),
+        ]
+        try run([
+            Probe(
+                name: "floatRepresentation",
+                source: """
+                public func floatRepresentation(_ value: Float) -> (
+                    UInt32, UInt32, Int, UInt, UInt32, Int, Bool
+                ) {
+                    let roundTrip = Float(bitPattern: value.bitPattern)
+                    return (
+                        value.bitPattern,
+                        roundTrip.bitPattern,
+                        value.exponent,
+                        value.exponentBitPattern,
+                        value.significandBitPattern,
+                        value.significandWidth,
+                        value.isCanonical
+                    )
+                }
+                """,
+                scenarios: try floatValues.map(floatRepresentationScenario)
+            ),
+            Probe(
+                name: "doubleRepresentation",
+                source: """
+                public func doubleRepresentation(_ value: Double) -> (
+                    UInt64, UInt64, Int, UInt, UInt64, Int, Bool
+                ) {
+                    let roundTrip = Double(bitPattern: value.bitPattern)
+                    return (
+                        value.bitPattern,
+                        roundTrip.bitPattern,
+                        value.exponent,
+                        value.exponentBitPattern,
+                        value.significandBitPattern,
+                        value.significandWidth,
+                        value.isCanonical
+                    )
+                }
+                """,
+                scenarios: try doubleValues.map(doubleRepresentationScenario)
+            ),
+            Probe(
+                name: "floatingArithmeticBits",
+                source: """
+                public func floatingArithmeticBits(
+                    _ lhs: Double,
+                    _ rhs: Double
+                ) -> (
+                    UInt64, UInt64, UInt64, Bool,
+                    UInt64, UInt64, UInt64, UInt64
+                ) {
+                    (
+                        lhs.remainder(dividingBy: rhs).bitPattern,
+                        lhs.truncatingRemainder(dividingBy: rhs).bitPattern,
+                        lhs.addingProduct(rhs, 2).bitPattern,
+                        lhs.isTotallyOrdered(belowOrEqualTo: rhs),
+                        Double.minimum(lhs, rhs).bitPattern,
+                        Double.maximum(lhs, rhs).bitPattern,
+                        Double.minimumMagnitude(lhs, rhs).bitPattern,
+                        Double.maximumMagnitude(lhs, rhs).bitPattern
+                    )
+                }
+                """,
+                scenarios: [
+                    try floatingArithmeticScenario(5.5, 2),
+                    try floatingArithmeticScenario(-0.0, 0.0),
+                    try floatingArithmeticScenario(
+                        Double(bitPattern: 0x7FF0_0000_0000_1234),
+                        1
+                    ),
+                ]
+            ),
+            Probe(
+                name: "mutatingFloatingBits",
+                source: """
+                public func mutatingFloatingBits(_ input: Double) -> UInt64 {
+                    var value = input
+                    value.formSquareRoot()
+                    value.round(.towardZero)
+                    value.addProduct(2, 3)
+                    value.formRemainder(dividingBy: 5)
+                    value.formTruncatingRemainder(dividingBy: 2)
+                    return value.bitPattern
+                }
+                """,
+                scenarios: try [4.0, 20.25, .infinity].map(
+                    mutatingFloatingScenario
+                )
+            ),
+        ])
+    }
+
     @Test("Undefined-zero count builtins fail closed")
     func rejectsUndefinedZeroCountBuiltin() {
         let function = CanonicalSIL.Function(
@@ -563,7 +821,31 @@ struct ScalarSemanticsMatrix {
             ),
             ("$sSf6nextUpSfvg", .floatingUnary(.nextUp)),
             ("$sSd8isFiniteSbvg", .floatingPredicate(.isFinite)),
+            (
+                "$sSd10bitPatterns6UInt64Vvg",
+                .floatingBitPattern(.extract)
+            ),
+            (
+                "$sSf18exponentBitPatternSuvg",
+                .floatingIntegerProperty(.exponentBitPattern)
+            ),
+            (
+                "$sSFsE19truncatingRemainder10dividingByxx_tF",
+                .floatingBinary(.truncatingRemainder, form: .instance)
+            ),
+            (
+                "$sSBsE16isTotallyOrdered14belowOrEqualToSbx_tF",
+                .floatingBinaryPredicate(.isTotallyOrderedBelowOrEqual)
+            ),
             ("$sSzsE10isMultiple2ofSbx_tF", .integerIsMultiple),
+            (
+                "$ss17FixedWidthIntegerPsE8clampingxqd___tcSzRd__lufC",
+                .integerClampingConversion
+            ),
+            (
+                "$ss5Int64V19multipliedFullWidth2byAB4high_s6UInt64V3lowtAB_tF",
+                .integerFullWidthMultiply
+            ),
             (
                 "$sSi23addingReportingOverflowySi12partialValue_Sb8overflowtSiF",
                 .integerReportingOverflow(.add)
@@ -710,6 +992,148 @@ struct ScalarSemanticsMatrix {
                     try signed(divided.partialValue), .bool(divided.overflow),
                     try signed(remainder.partialValue), .bool(remainder.overflow),
                 ])
+            )
+        )
+    }
+
+    private func clampingScenario(
+        signed signedValue: Int64,
+        unsigned unsignedValue: UInt64
+    ) throws -> Scenario {
+        .init(
+            arguments: [
+                try signed(signedValue),
+                try unsigned(unsignedValue),
+            ],
+            expected: .returned(
+                .tuple([
+                    try unsigned(
+                        UInt64(UInt8(clamping: signedValue)),
+                        width: 8
+                    ),
+                    try signed(
+                        Int64(Int16(clamping: unsignedValue)),
+                        width: 16
+                    ),
+                    try signed(
+                        Int64(Int32(clamping: signedValue)),
+                        width: 32
+                    ),
+                    try unsigned(
+                        UInt64(UInt32(clamping: signedValue)),
+                        width: 32
+                    ),
+                    try signed(Int64(clamping: unsignedValue)),
+                    try unsigned(UInt64(clamping: signedValue)),
+                ])
+            )
+        )
+    }
+
+    private func signedFullWidthDivisionScenario(
+        divisor: Int64,
+        high: Int64,
+        low: UInt64
+    ) throws -> Scenario {
+        let result = divisor.dividingFullWidth((high: high, low: low))
+        return .init(
+            arguments: [
+                try signed(divisor),
+                try signed(high),
+                try unsigned(low),
+            ],
+            expected: .returned(
+                .tuple([
+                    try signed(result.quotient),
+                    try signed(result.remainder),
+                ])
+            )
+        )
+    }
+
+    private func floatRepresentationScenario(
+        _ value: Float
+    ) throws -> Scenario {
+        .init(
+            arguments: [.float32(value)],
+            expected: .returned(
+                .tuple([
+                    try unsigned(UInt64(value.bitPattern), width: 32),
+                    try unsigned(UInt64(value.bitPattern), width: 32),
+                    try signed(Int64(value.exponent)),
+                    try unsigned(UInt64(value.exponentBitPattern)),
+                    try unsigned(
+                        UInt64(value.significandBitPattern),
+                        width: 32
+                    ),
+                    try signed(Int64(value.significandWidth)),
+                    .bool(value.isCanonical),
+                ])
+            )
+        )
+    }
+
+    private func doubleRepresentationScenario(
+        _ value: Double
+    ) throws -> Scenario {
+        .init(
+            arguments: [.float64(value)],
+            expected: .returned(
+                .tuple([
+                    try unsigned(value.bitPattern),
+                    try unsigned(value.bitPattern),
+                    try signed(Int64(value.exponent)),
+                    try unsigned(UInt64(value.exponentBitPattern)),
+                    try unsigned(value.significandBitPattern),
+                    try signed(Int64(value.significandWidth)),
+                    .bool(value.isCanonical),
+                ])
+            )
+        )
+    }
+
+    private func floatingArithmeticScenario(
+        _ lhs: Double,
+        _ rhs: Double
+    ) throws -> Scenario {
+        .init(
+            arguments: [.float64(lhs), .float64(rhs)],
+            expected: .returned(
+                .tuple([
+                    try unsigned(
+                        lhs.remainder(dividingBy: rhs).bitPattern
+                    ),
+                    try unsigned(
+                        lhs.truncatingRemainder(dividingBy: rhs).bitPattern
+                    ),
+                    try unsigned(lhs.addingProduct(rhs, 2).bitPattern),
+                    .bool(lhs.isTotallyOrdered(belowOrEqualTo: rhs)),
+                    try unsigned(Double.minimum(lhs, rhs).bitPattern),
+                    try unsigned(Double.maximum(lhs, rhs).bitPattern),
+                    try unsigned(
+                        Double.minimumMagnitude(lhs, rhs).bitPattern
+                    ),
+                    try unsigned(
+                        Double.maximumMagnitude(lhs, rhs).bitPattern
+                    ),
+                ])
+            )
+        )
+    }
+
+    private func mutatingFloatingScenario(
+        _ input: Double
+    ) throws -> Scenario {
+        var value = input
+        value.formSquareRoot()
+        value.round(.towardZero)
+        value.addProduct(2, 3)
+        value.formRemainder(dividingBy: 5)
+        value.formTruncatingRemainder(dividingBy: 2)
+        return .init(
+            arguments: [.float64(input)],
+            expected: .returned(
+                try unsigned(value.bitPattern)
             )
         )
     }

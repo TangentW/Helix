@@ -4,6 +4,17 @@ extension CanonicalSIL {
 /// Type-independent descriptions of scalar standard-library operations that
 /// survive into SIL either as calls or as mandatory-inlined builtins.
 enum ScalarIntrinsic: Equatable {
+    enum FloatingBinaryForm: Equatable {
+        case instance
+        case mutating
+        case staticMember
+    }
+
+    enum FloatingBitPatternDirection: Equatable {
+        case extract
+        case initialize
+    }
+
     enum StaticValue: Equatable {
         case minimum
         case maximum
@@ -103,7 +114,14 @@ enum ScalarIntrinsic: Equatable {
 
     case staticValue(StaticValue)
     case floatingUnary(Bytecode.FloatUnaryOperation)
+    case floatingBinary(
+        Bytecode.FloatBinaryOperation,
+        form: FloatingBinaryForm
+    )
     case floatingPredicate(Bytecode.FloatPredicateOperation)
+    case floatingBinaryPredicate(Bytecode.FloatBinaryPredicateOperation)
+    case floatingIntegerProperty(Bytecode.FloatIntegerPropertyOperation)
+    case floatingBitPattern(FloatingBitPatternDirection)
     case floatingSign
     case floatingRoundDefault
     case floatingRoundRule
@@ -112,6 +130,9 @@ enum ScalarIntrinsic: Equatable {
     case integerIsMultiple
     case integerQuotientAndRemainder
     case integerReportingOverflow(Bytecode.BinaryOperation)
+    case integerClampingConversion
+    case integerFullWidthMultiply
+    case integerFullWidthDivide
 
     init?(mangledName: String) {
         switch mangledName {
@@ -143,6 +164,22 @@ enum ScalarIntrinsic: Equatable {
         case "$sSf8ulpOfOneSfvgZ", "$sSd8ulpOfOneSdvgZ":
             self = .staticValue(.ulpOfOne)
 
+        case "$sSf10bitPatterns6UInt32Vvg", "$sSd10bitPatterns6UInt64Vvg":
+            self = .floatingBitPattern(.extract)
+        case "$sSf10bitPatternSfs6UInt32V_tcfC",
+             "$sSd10bitPatternSds6UInt64V_tcfC":
+            self = .floatingBitPattern(.initialize)
+        case "$sSf8exponentSivg", "$sSd8exponentSivg":
+            self = .floatingIntegerProperty(.exponent)
+        case "$sSf18exponentBitPatternSuvg",
+             "$sSd18exponentBitPatternSuvg":
+            self = .floatingIntegerProperty(.exponentBitPattern)
+        case "$sSf21significandBitPatterns6UInt32Vvg",
+             "$sSd21significandBitPatterns6UInt64Vvg":
+            self = .floatingIntegerProperty(.significandBitPattern)
+        case "$sSf16significandWidthSivg", "$sSd16significandWidthSivg":
+            self = .floatingIntegerProperty(.significandWidth)
+
         case "$sSf9magnitudeSfvg", "$sSd9magnitudeSdvg":
             self = .floatingUnary(.absolute)
         case "$sSf3ulpSfvg", "$sSd3ulpSdvg": self = .floatingUnary(.ulp)
@@ -160,6 +197,27 @@ enum ScalarIntrinsic: Equatable {
              "$sSd14_roundSlowPathyys25FloatingPointRoundingRuleOF":
             self = .floatingRoundSlowPath
 
+        case "$sSFsE9remainder10dividingByxx_tF":
+            self = .floatingBinary(.remainder, form: .instance)
+        case "$sSFsE19truncatingRemainder10dividingByxx_tF":
+            self = .floatingBinary(.truncatingRemainder, form: .instance)
+        case "$sSf13formRemainder10dividingByySf_tF",
+             "$sSd13formRemainder10dividingByySd_tF":
+            self = .floatingBinary(.remainder, form: .mutating)
+        case "$sSf23formTruncatingRemainder10dividingByySf_tF",
+             "$sSd23formTruncatingRemainder10dividingByySd_tF":
+            self = .floatingBinary(.truncatingRemainder, form: .mutating)
+        case "$sSFsE7minimumyxx_xtFZ":
+            self = .floatingBinary(.minimum, form: .staticMember)
+        case "$sSFsE7maximumyxx_xtFZ":
+            self = .floatingBinary(.maximum, form: .staticMember)
+        case "$sSFsE16minimumMagnitudeyxx_xtFZ":
+            self = .floatingBinary(.minimumMagnitude, form: .staticMember)
+        case "$sSFsE16maximumMagnitudeyxx_xtFZ":
+            self = .floatingBinary(.maximumMagnitude, form: .staticMember)
+        case "$sSBsE16isTotallyOrdered14belowOrEqualToSbx_tF":
+            self = .floatingBinaryPredicate(.isTotallyOrderedBelowOrEqual)
+
         case "$sSf8isFiniteSbvg", "$sSd8isFiniteSbvg":
             self = .floatingPredicate(.isFinite)
         case "$sSf10isInfiniteSbvg", "$sSd10isInfiniteSbvg":
@@ -174,6 +232,8 @@ enum ScalarIntrinsic: Equatable {
             self = .floatingPredicate(.isSubnormal)
         case "$sSf6isZeroSbvg", "$sSd6isZeroSbvg":
             self = .floatingPredicate(.isZero)
+        case "$sSf11isCanonicalSbvg", "$sSd11isCanonicalSbvg":
+            self = .floatingPredicate(.isCanonical)
         case "$sSf4signs17FloatingPointSignOvg", "$sSd4signs17FloatingPointSignOvg":
             self = .floatingSign
 
@@ -183,9 +243,19 @@ enum ScalarIntrinsic: Equatable {
             self = .integerIsMultiple
         case "$sSzsE20quotientAndRemainder10dividingByx0A0_x9remaindertx_tF":
             self = .integerQuotientAndRemainder
+        case "$ss17FixedWidthIntegerPsE9bigEndianxvg":
+            self = .integerUnary(.bigEndian)
+        case "$ss17FixedWidthIntegerPsE12littleEndianxvg":
+            self = .integerUnary(.littleEndian)
+        case "$ss17FixedWidthIntegerPsE8clampingxqd___tcSzRd__lufC":
+            self = .integerClampingConversion
         default:
             guard Self.hasConcreteIntegerReceiver(mangledName) else { return nil }
-            if mangledName.contains("8bitWidth") {
+            if mangledName.contains("19multipliedFullWidth") {
+                self = .integerFullWidthMultiply
+            } else if mangledName.contains("17dividingFullWidth") {
+                self = .integerFullWidthDivide
+            } else if mangledName.contains("8bitWidth") {
                 self = .staticValue(.bitWidth)
             } else if mangledName.contains("9magnitude") {
                 self = .integerUnary(.magnitude)

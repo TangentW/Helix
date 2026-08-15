@@ -193,6 +193,12 @@ public enum FloatBinaryOperation: String, Codable, Hashable, Sendable {
     case subtract
     case multiply
     case divide
+    case remainder
+    case truncatingRemainder
+    case minimum
+    case maximum
+    case minimumMagnitude
+    case maximumMagnitude
 }
 
 public enum FloatUnaryOperation: String, Codable, Hashable, Sendable {
@@ -220,6 +226,23 @@ public enum FloatPredicateOperation: String, Codable, Hashable, Sendable {
     case isSubnormal
     case isZero
     case isSignMinus
+    case isCanonical
+}
+
+public enum FloatBinaryPredicateOperation: String, Codable, Hashable, Sendable {
+    case isTotallyOrderedBelowOrEqual
+}
+
+public enum FloatTernaryOperation: String, Codable, Hashable, Sendable {
+    /// Computes `multiplicand * multiplier + addend` with one rounding step.
+    case fusedMultiplyAdd
+}
+
+public enum FloatIntegerPropertyOperation: String, Codable, Hashable, Sendable {
+    case exponent
+    case exponentBitPattern
+    case significandBitPattern
+    case significandWidth
 }
 
 public enum IntegerUnaryOperation: String, Codable, Hashable, Sendable {
@@ -228,6 +251,8 @@ public enum IntegerUnaryOperation: String, Codable, Hashable, Sendable {
     case leadingZeroBitCount
     case trailingZeroBitCount
     case byteSwapped
+    case bigEndian
+    case littleEndian
     case signum
 }
 
@@ -236,6 +261,7 @@ public enum IntegerConversionOperation: String, Codable, Hashable, Sendable {
     case signExtend
     case zeroExtend
     case reinterpret
+    case clamp
 }
 
 public enum FloatingConversionOperation: String, Codable, Hashable, Sendable {
@@ -465,10 +491,41 @@ public enum Instruction: Codable, Hashable, Sendable {
         operation: Bytecode.FloatPredicateOperation,
         operand: Bytecode.Register
     )
+    case floatingBinaryPredicate(
+        result: Bytecode.Register,
+        operation: Bytecode.FloatBinaryPredicateOperation,
+        lhs: Bytecode.Register,
+        rhs: Bytecode.Register
+    )
+    case floatingTernary(
+        result: Bytecode.Register,
+        operation: Bytecode.FloatTernaryOperation,
+        multiplicand: Bytecode.Register,
+        multiplier: Bytecode.Register,
+        addend: Bytecode.Register
+    )
+    case floatingIntegerProperty(
+        result: Bytecode.Register,
+        operation: Bytecode.FloatIntegerPropertyOperation,
+        operand: Bytecode.Register
+    )
     case integerUnary(
         result: Bytecode.Register,
         operation: Bytecode.IntegerUnaryOperation,
         operand: Bytecode.Register
+    )
+    case integerFullWidthMultiply(
+        high: Bytecode.Register,
+        low: Bytecode.Register,
+        lhs: Bytecode.Register,
+        rhs: Bytecode.Register
+    )
+    case integerFullWidthDivide(
+        quotient: Bytecode.Register,
+        remainder: Bytecode.Register,
+        dividendHigh: Bytecode.Register,
+        dividendLow: Bytecode.Register,
+        divisor: Bytecode.Register
     )
     case scalarBitCast(
         result: Bytecode.Register,
@@ -754,6 +811,9 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .floatingBinary(result, _, _, _),
              let .floatingUnary(result, _, _),
              let .floatingPredicate(result, _, _),
+             let .floatingBinaryPredicate(result, _, _, _),
+             let .floatingTernary(result, _, _, _, _),
+             let .floatingIntegerProperty(result, _, _),
              let .integerUnary(result, _, _),
              let .scalarBitCast(result, _),
              let .integerConvert(result, _, _),
@@ -796,6 +856,10 @@ public enum Instruction: Codable, Hashable, Sendable {
             results
         case let .checkedBinary(result, overflow, _, _, _):
             [result, overflow]
+        case let .integerFullWidthMultiply(high, low, _, _):
+            [high, low]
+        case let .integerFullWidthDivide(quotient, remainder, _, _, _):
+            [quotient, remainder]
         case let .arrayPopLast(elementResult, arrayResult, _):
             [elementResult, arrayResult]
         case let .dictionaryRemove(valueResult, dictionaryResult, _, _):
@@ -885,13 +949,23 @@ public enum Instruction: Codable, Hashable, Sendable {
             [address, source]
         case let .checkedBinary(_, _, _, lhs, rhs),
              let .floatingBinary(_, _, lhs, rhs),
+             let .floatingBinaryPredicate(_, _, lhs, rhs),
              let .booleanBinary(_, _, lhs, rhs),
              let .compare(_, _, lhs, rhs):
             [lhs, rhs]
+        case let .floatingTernary(_, _, multiplicand, multiplier, addend):
+            [multiplicand, multiplier, addend]
+        case let .integerFullWidthMultiply(_, _, lhs, rhs):
+            [lhs, rhs]
+        case let .integerFullWidthDivide(
+            _, _, dividendHigh, dividendLow, divisor
+        ):
+            [dividendHigh, dividendLow, divisor]
         case let .select(_, condition, trueValue, falseValue):
             [condition, trueValue, falseValue]
         case let .floatingUnary(_, _, operand),
              let .floatingPredicate(_, _, operand),
+             let .floatingIntegerProperty(_, _, operand),
              let .integerUnary(_, _, operand),
              let .scalarBitCast(_, operand),
              let .integerConvert(_, _, operand),

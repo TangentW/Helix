@@ -2745,6 +2745,180 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Representation-level numeric instructions enforce exact shapes")
+    func rejectsMalformedRepresentationNumericInstructions() throws {
+        let badFloatProperty = try makeFixture { function in
+            function.registerTypes.append(contentsOf: [
+                .float(bitWidth: 32),
+                .integer(bitWidth: 32, signed: true),
+            ])
+            function.blocks[0].instructions = [
+                .constantFloat(result: .init(rawValue: 1), bitPattern: 0),
+                .floatingIntegerProperty(
+                    result: .init(rawValue: 2),
+                    operation: .significandBitPattern,
+                    operand: .init(rawValue: 1)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "floating integer property has an operation-specific result type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(badFloatProperty.module),
+                shell: badFloatProperty.shell,
+                policy: badFloatProperty.policy
+            )
+        }
+
+        let badTernary = try makeFixture { function in
+            function.registerTypes.append(contentsOf: [
+                .float(bitWidth: 32),
+                .float(bitWidth: 64),
+                .float(bitWidth: 32),
+                .float(bitWidth: 32),
+            ])
+            function.blocks[0].instructions = [
+                .constantFloat(result: .init(rawValue: 1), bitPattern: 0),
+                .constantFloat(result: .init(rawValue: 2), bitPattern: 0),
+                .constantFloat(result: .init(rawValue: 3), bitPattern: 0),
+                .floatingTernary(
+                    result: .init(rawValue: 4),
+                    operation: .fusedMultiplyAdd,
+                    multiplicand: .init(rawValue: 1),
+                    multiplier: .init(rawValue: 2),
+                    addend: .init(rawValue: 3)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 3,
+                reason: "floating ternary operands and result must use one float type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(badTernary.module),
+                shell: badTernary.shell,
+                policy: badTernary.policy
+            )
+        }
+
+        let badBinaryPredicate = try makeFixture { function in
+            function.registerTypes.append(contentsOf: [
+                .float(bitWidth: 32),
+                .float(bitWidth: 64),
+                .bool,
+            ])
+            function.blocks[0].instructions = [
+                .constantFloat(result: .init(rawValue: 1), bitPattern: 0),
+                .constantFloat(result: .init(rawValue: 2), bitPattern: 0),
+                .floatingBinaryPredicate(
+                    result: .init(rawValue: 3),
+                    operation: .isTotallyOrderedBelowOrEqual,
+                    lhs: .init(rawValue: 1),
+                    rhs: .init(rawValue: 2)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "floating binary predicate requires one float type and Bool result"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(badBinaryPredicate.module),
+                shell: badBinaryPredicate.shell,
+                policy: badBinaryPredicate.policy
+            )
+        }
+
+        let badFullWidthMultiply = try makeFixture { function in
+            let signed32 = Bytecode.ValueType.integer(
+                bitWidth: 32,
+                signed: true
+            )
+            function.registerTypes.append(contentsOf: [
+                signed32, signed32, signed32, signed32,
+            ])
+            function.blocks[0].instructions = [
+                .constantInteger(result: .init(rawValue: 1), bitPattern: 1),
+                .constantInteger(result: .init(rawValue: 2), bitPattern: 2),
+                .integerFullWidthMultiply(
+                    high: .init(rawValue: 3),
+                    low: .init(rawValue: 4),
+                    lhs: .init(rawValue: 1),
+                    rhs: .init(rawValue: 2)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "full-width multiply requires matching operands, high result, and unsigned low result"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(badFullWidthMultiply.module),
+                shell: badFullWidthMultiply.shell,
+                policy: badFullWidthMultiply.policy
+            )
+        }
+
+        let badFullWidthDivide = try makeFixture { function in
+            let signed32 = Bytecode.ValueType.integer(
+                bitWidth: 32,
+                signed: true
+            )
+            function.registerTypes.append(contentsOf: [
+                signed32, signed32, signed32, signed32, signed32,
+            ])
+            function.blocks[0].instructions = [
+                .constantInteger(result: .init(rawValue: 1), bitPattern: 0),
+                .constantInteger(result: .init(rawValue: 2), bitPattern: 1),
+                .constantInteger(result: .init(rawValue: 3), bitPattern: 1),
+                .integerFullWidthDivide(
+                    quotient: .init(rawValue: 4),
+                    remainder: .init(rawValue: 5),
+                    dividendHigh: .init(rawValue: 1),
+                    dividendLow: .init(rawValue: 2),
+                    divisor: .init(rawValue: 3)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 3,
+                reason: "full-width divide requires a same-type high/divisor/result and unsigned low word"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(badFullWidthDivide.module),
+                shell: badFullWidthDivide.shell,
+                policy: badFullWidthDivide.policy
+            )
+        }
+    }
+
     private struct Fixture {
         var module: Bytecode.Module
         var shell: Verification.ShellInterface

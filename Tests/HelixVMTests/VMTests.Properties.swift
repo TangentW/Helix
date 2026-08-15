@@ -54,6 +54,12 @@ struct Properties {
             .subtract,
             .multiply,
             .divide,
+            .remainder,
+            .truncatingRemainder,
+            .minimum,
+            .maximum,
+            .minimumMagnitude,
+            .maximumMagnitude,
         ] {
             let function = Bytecode.Function(
                 id: .init(rawValue: 0),
@@ -98,13 +104,23 @@ struct Properties {
                 let lhs = Float(bitPattern: UInt32(truncatingIfNeeded: generator.next()))
                 let rhs = Float(bitPattern: UInt32(truncatingIfNeeded: generator.next()))
                 guard lhs.isFinite, rhs.isFinite,
-                      operation != .divide || rhs != 0
+                      ![.divide, .remainder, .truncatingRemainder]
+                        .contains(operation) || rhs != 0
                 else { continue }
                 let expected: Float = switch operation {
                 case .add: lhs + rhs
                 case .subtract: lhs - rhs
                 case .multiply: lhs * rhs
                 case .divide: lhs / rhs
+                case .remainder: lhs.remainder(dividingBy: rhs)
+                case .truncatingRemainder:
+                    lhs.truncatingRemainder(dividingBy: rhs)
+                case .minimum: Float.minimum(lhs, rhs)
+                case .maximum: Float.maximum(lhs, rhs)
+                case .minimumMagnitude:
+                    Float.minimumMagnitude(lhs, rhs)
+                case .maximumMagnitude:
+                    Float.maximumMagnitude(lhs, rhs)
                 }
                 let result = VM.Interpreter().invoke(
                     entry: .init(rawValue: 0),
@@ -370,7 +386,7 @@ struct Properties {
 
         let predicates: [Bytecode.FloatPredicateOperation] = [
             .isFinite, .isInfinite, .isNaN, .isSignalingNaN,
-            .isNormal, .isSubnormal, .isZero, .isSignMinus,
+            .isNormal, .isSubnormal, .isZero, .isSignMinus, .isCanonical,
         ]
         let predicateValues: [VM.FloatingValue] = [
             .init(-0.0 as Float),
@@ -400,6 +416,7 @@ struct Properties {
                     case .isSubnormal: scalar.isSubnormal
                     case .isZero: scalar.isZero
                     case .isSignMinus: scalar.bitPattern >> 31 == 1
+                    case .isCanonical: scalar.isCanonical
                     }
                 } else {
                     let scalar = value.doubleValue
@@ -412,6 +429,7 @@ struct Properties {
                     case .isSubnormal: scalar.isSubnormal
                     case .isZero: scalar.isZero
                     case .isSignMinus: scalar.bitPattern >> 63 == 1
+                    case .isCanonical: scalar.isCanonical
                     }
                 }
                 #expect(
@@ -422,6 +440,200 @@ struct Properties {
                     ) == .returned(.bool(expected))
                 )
             }
+        }
+    }
+
+    @Test("Floating decomposition, FMA, and total order agree with Swift")
+    func advancedFloatingOperationsMatchSwift() throws {
+        func image(width: UInt16) throws -> Verification.Image {
+            let float = Bytecode.ValueType.float(bitWidth: width)
+            let uint64 = Bytecode.ValueType.integer(
+                bitWidth: 64,
+                signed: false
+            )
+            let significandBits = Bytecode.ValueType.integer(
+                bitWidth: width,
+                signed: false
+            )
+            let result = Bytecode.ValueType.tuple([
+                float, .bool, .int64, uint64, significandBits, .int64,
+            ])
+            return try makeVerified(
+                function: .init(
+                    id: .init(rawValue: 0),
+                    name: "advancedFloat\(width)",
+                    parameterRegisters: [
+                        .init(rawValue: 0),
+                        .init(rawValue: 1),
+                        .init(rawValue: 2),
+                    ],
+                    resultType: result,
+                    registerTypes: [
+                        float, float, float, float, .bool, .int64, uint64,
+                        significandBits, .int64, result,
+                    ],
+                    entryBlock: .init(rawValue: 0),
+                    blocks: [
+                        .init(
+                            id: .init(rawValue: 0),
+                            parameters: [
+                                .init(rawValue: 0),
+                                .init(rawValue: 1),
+                                .init(rawValue: 2),
+                            ],
+                            instructions: [
+                                .floatingTernary(
+                                    result: .init(rawValue: 3),
+                                    operation: .fusedMultiplyAdd,
+                                    multiplicand: .init(rawValue: 0),
+                                    multiplier: .init(rawValue: 1),
+                                    addend: .init(rawValue: 2)
+                                ),
+                                .floatingBinaryPredicate(
+                                    result: .init(rawValue: 4),
+                                    operation: .isTotallyOrderedBelowOrEqual,
+                                    lhs: .init(rawValue: 0),
+                                    rhs: .init(rawValue: 1)
+                                ),
+                                .floatingIntegerProperty(
+                                    result: .init(rawValue: 5),
+                                    operation: .exponent,
+                                    operand: .init(rawValue: 0)
+                                ),
+                                .floatingIntegerProperty(
+                                    result: .init(rawValue: 6),
+                                    operation: .exponentBitPattern,
+                                    operand: .init(rawValue: 0)
+                                ),
+                                .floatingIntegerProperty(
+                                    result: .init(rawValue: 7),
+                                    operation: .significandBitPattern,
+                                    operand: .init(rawValue: 0)
+                                ),
+                                .floatingIntegerProperty(
+                                    result: .init(rawValue: 8),
+                                    operation: .significandWidth,
+                                    operand: .init(rawValue: 0)
+                                ),
+                                .makeTuple(
+                                    result: .init(rawValue: 9),
+                                    elements: [
+                                        .init(rawValue: 3),
+                                        .init(rawValue: 4),
+                                        .init(rawValue: 5),
+                                        .init(rawValue: 6),
+                                        .init(rawValue: 7),
+                                        .init(rawValue: 8),
+                                    ]
+                                ),
+                                .returnValue(.init(rawValue: 9)),
+                            ]
+                        ),
+                    ]
+                ),
+                signature: .init(
+                    parameters: [float.description, float.description, float.description],
+                    result: result.description
+                ),
+                parameterTypes: [float, float, float],
+                resultType: result,
+                capabilities: [.baselineV1]
+            )
+        }
+
+        let floatImage = try image(width: 32)
+        let floatCases: [(Float, Float, Float)] = [
+            (1.25, 2.5, -3),
+            (-0.0, 0.0, 1),
+            (Float(bitPattern: 0x7FA1_2345), 1, 0),
+        ]
+        for (lhs, rhs, addend) in floatCases {
+            let result = VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: floatImage,
+                arguments: [.float32(lhs), .float32(rhs), .float32(addend)]
+            )
+            guard case let .returned(.some(.tuple(values))) = result,
+                  values.count == 6,
+                  case let .float(fma) = values[0]
+            else {
+                Issue.record("unexpected advanced Float32 result: \(result)")
+                continue
+            }
+            #expect(
+                fma.bitPattern
+                    == UInt64(addend.addingProduct(lhs, rhs).bitPattern)
+            )
+            #expect(
+                values[1]
+                    == .bool(lhs.isTotallyOrdered(belowOrEqualTo: rhs))
+            )
+            #expect(values[2] == .integer(try .init(
+                signed: Int64(lhs.exponent),
+                bitWidth: 64,
+                isSigned: true
+            )))
+            #expect(values[3] == .integer(try .init(
+                rawBits: UInt64(lhs.exponentBitPattern),
+                bitWidth: 64,
+                isSigned: false
+            )))
+            #expect(values[4] == .integer(try .init(
+                rawBits: UInt64(lhs.significandBitPattern),
+                bitWidth: 32,
+                isSigned: false
+            )))
+            #expect(values[5] == .integer(try .init(
+                signed: Int64(lhs.significandWidth),
+                bitWidth: 64,
+                isSigned: true
+            )))
+        }
+
+        let doubleImage = try image(width: 64)
+        let doubleCases: [(Double, Double, Double)] = [
+            (1.25, 2.5, -3),
+            (-0.0, 0.0, 1),
+            (Double(bitPattern: 0xFFF0_0000_0000_1234), 1, 0),
+        ]
+        for (lhs, rhs, addend) in doubleCases {
+            let result = VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: doubleImage,
+                arguments: [.float64(lhs), .float64(rhs), .float64(addend)]
+            )
+            guard case let .returned(.some(.tuple(values))) = result,
+                  values.count == 6,
+                  case let .float(fma) = values[0]
+            else {
+                Issue.record("unexpected advanced Float64 result: \(result)")
+                continue
+            }
+            #expect(fma.bitPattern == addend.addingProduct(lhs, rhs).bitPattern)
+            #expect(
+                values[1]
+                    == .bool(lhs.isTotallyOrdered(belowOrEqualTo: rhs))
+            )
+            #expect(values[2] == .integer(try .init(
+                signed: Int64(lhs.exponent),
+                bitWidth: 64,
+                isSigned: true
+            )))
+            #expect(values[3] == .integer(try .init(
+                rawBits: UInt64(lhs.exponentBitPattern),
+                bitWidth: 64,
+                isSigned: false
+            )))
+            #expect(values[4] == .integer(try .init(
+                rawBits: lhs.significandBitPattern,
+                bitWidth: 64,
+                isSigned: false
+            )))
+            #expect(values[5] == .integer(try .init(
+                signed: Int64(lhs.significandWidth),
+                bitWidth: 64,
+                isSigned: true
+            )))
         }
     }
 

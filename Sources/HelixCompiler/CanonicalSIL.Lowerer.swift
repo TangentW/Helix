@@ -497,6 +497,7 @@ public struct Lowerer: Sendable {
         var initializingRuntimeAccesses = Set<String>()
         var inoutParameterAddressBases = Set<String>()
         var passthroughRuntimeAccesses = Set<String>()
+        var deferredAccessMetadataCleanup = Set<String>()
         var borrowedAddressValues: [String: Bytecode.Register] = [:]
         var borrowedValueTokens = Set<String>()
         var borrowedLoadTokens = Set<String>()
@@ -739,6 +740,17 @@ public struct Lowerer: Sendable {
                 else { return false }
                 return lineContainsSILValue(token, line: instruction)
             }
+        }
+
+        func removeAccessMetadata(_ token: String) {
+            passthroughRuntimeAccesses.remove(token)
+            initializingRuntimeAccesses.remove(token)
+            scopedRuntimeAddresses.remove(token)
+            runtimeAddressValues.removeValue(forKey: token)
+            runtimeAddressPointees.removeValue(forKey: token)
+            mutableCaptureState.addresses.removeValue(forKey: token)
+            values.removeValue(forKey: token)
+            addressAliases.removeValue(forKey: token)
         }
 
         func prepareNativeReferenceConversion(
@@ -4184,6 +4196,82 @@ public struct Lowerer: Sendable {
             return result
         }
 
+        func emitFloatingBinary(
+            _ operation: Bytecode.FloatBinaryOperation,
+            lhs: Bytecode.Register,
+            rhs: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            let type = registerTypes[Int(lhs.rawValue)]
+            guard case .float = type,
+                  registerTypes[Int(rhs.rawValue)] == type
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "floating binary operation does not use one float type"
+                )
+            }
+            let result = try allocate(type: type)
+            appendInstruction(
+                .floatingBinary(
+                    result: result,
+                    operation: operation,
+                    lhs: lhs,
+                    rhs: rhs
+                )
+            )
+            return result
+        }
+
+        func emitFloatingIntegerProperty(
+            _ operation: Bytecode.FloatIntegerPropertyOperation,
+            operand: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            guard case let .float(width)
+                = registerTypes[Int(operand.rawValue)]
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "floating integer property has a non-floating operand"
+                )
+            }
+            let type: Bytecode.ValueType = switch operation {
+            case .exponent, .significandWidth: .int64
+            case .exponentBitPattern:
+                .integer(bitWidth: 64, signed: false)
+            case .significandBitPattern:
+                .integer(bitWidth: width, signed: false)
+            }
+            let result = try allocate(type: type)
+            appendInstruction(
+                .floatingIntegerProperty(
+                    result: result,
+                    operation: operation,
+                    operand: operand
+                )
+            )
+            return result
+        }
+
+        func emitScalarBitCast(
+            _ operand: Bytecode.Register,
+            to type: Bytecode.ValueType
+        ) throws -> Bytecode.Register {
+            let source = registerTypes[Int(operand.rawValue)]
+            switch (source, type) {
+            case let (.integer(sourceWidth, _), .float(targetWidth))
+            where sourceWidth == targetWidth:
+                break
+            case let (.float(sourceWidth), .integer(targetWidth, _))
+            where sourceWidth == targetWidth:
+                break
+            default:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "scalar bit-pattern conversion does not preserve width"
+                )
+            }
+            let result = try allocate(type: type)
+            appendInstruction(.scalarBitCast(result: result, operand: operand))
+            return result
+        }
+
         func emitIntegerUnary(
             _ operation: Bytecode.IntegerUnaryOperation,
             operand: Bytecode.Register
@@ -4318,6 +4406,95 @@ public struct Lowerer: Sendable {
                     values[resultToken] = result
                 }
 
+            case let .floatingBinary(operation, form):
+                switch form {
+                case .instance:
+                    guard arguments.count == 3,
+                          !genericArguments.isEmpty
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "FloatingPoint binary operation has unsupported arguments"
+                        )
+                    }
+                    let type = try parseStoredType(genericArguments)
+                    guard case .float = type,
+                          compilerAddressType(arguments[0]) == type,
+                          stackType(at: arguments[1]) == type,
+                          stackType(at: arguments[2]) == type,
+                          let rhs = try copyStoredValue(
+                              at: arguments[1],
+                              line: line
+                          ),
+                          let lhs = try copyStoredValue(
+                              at: arguments[2],
+                              line: line
+                          )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "FloatingPoint binary specialization does not match its storage"
+                        )
+                    }
+                    try storeConstructedValue(
+                        try emitFloatingBinary(operation, lhs: lhs, rhs: rhs),
+                        at: arguments[0],
+                        mode: .initialize
+                    )
+                    voidValues.insert(resultToken)
+
+                case .mutating:
+                    guard genericArguments.isEmpty,
+                          arguments.count == 2,
+                          let lhs = try copyStoredValue(
+                              at: arguments[1],
+                              line: line
+                          )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "mutating floating binary operation has unsupported arguments"
+                        )
+                    }
+                    let rhs = try resolve(arguments[0], line: line)
+                    try storeConstructedValue(
+                        try emitFloatingBinary(operation, lhs: lhs, rhs: rhs),
+                        at: arguments[1]
+                    )
+                    voidValues.insert(resultToken)
+
+                case .staticMember:
+                    guard arguments.count == 4,
+                          !genericArguments.isEmpty
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "static FloatingPoint binary operation has unsupported arguments"
+                        )
+                    }
+                    let type = try parseStoredType(genericArguments)
+                    guard case .float = type,
+                          compilerAddressType(arguments[0]) == type,
+                          stackType(at: arguments[1]) == type,
+                          stackType(at: arguments[2]) == type,
+                          scalarMetatypeValues[arguments[3]] == type,
+                          let lhs = try copyStoredValue(
+                              at: arguments[1],
+                              line: line
+                          ),
+                          let rhs = try copyStoredValue(
+                              at: arguments[2],
+                              line: line
+                          )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "static FloatingPoint specialization does not match its storage"
+                        )
+                    }
+                    try storeConstructedValue(
+                        try emitFloatingBinary(operation, lhs: lhs, rhs: rhs),
+                        at: arguments[0],
+                        mode: .initialize
+                    )
+                    voidValues.insert(resultToken)
+                }
+
             case let .floatingPredicate(operation):
                 guard genericArguments.isEmpty, arguments.count == 1 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -4339,6 +4516,103 @@ public struct Lowerer: Sendable {
                         operand: operand
                     )
                 )
+
+            case let .floatingBinaryPredicate(operation):
+                guard arguments.count == 2,
+                      !genericArguments.isEmpty
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating binary predicate has unsupported arguments"
+                    )
+                }
+                let type = try parseStoredType(genericArguments)
+                guard case .float = type,
+                      stackType(at: arguments[0]) == type,
+                      stackType(at: arguments[1]) == type,
+                      let rhs = try copyStoredValue(
+                          at: arguments[0],
+                          line: line
+                      ),
+                      let lhs = try copyStoredValue(
+                          at: arguments[1],
+                          line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating binary predicate specialization does not match its storage"
+                    )
+                }
+                let result = try allocate(type: .bool)
+                values[resultToken] = result
+                appendInstruction(
+                    .floatingBinaryPredicate(
+                        result: result,
+                        operation: operation,
+                        lhs: lhs,
+                        rhs: rhs
+                    )
+                )
+
+            case let .floatingIntegerProperty(operation):
+                guard genericArguments.isEmpty,
+                      arguments.count == 1
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating integer property has unsupported arguments"
+                    )
+                }
+                values[resultToken] = try emitFloatingIntegerProperty(
+                    operation,
+                    operand: resolve(arguments[0], line: line)
+                )
+
+            case let .floatingBitPattern(direction):
+                guard genericArguments.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating bit-pattern operation cannot be generic"
+                    )
+                }
+                switch direction {
+                case .extract:
+                    guard arguments.count == 1 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "floating bit-pattern getter has unsupported arguments"
+                        )
+                    }
+                    let operand = try resolve(arguments[0], line: line)
+                    guard case let .float(width)
+                        = registerTypes[Int(operand.rawValue)]
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "floating bit-pattern getter has a non-floating receiver"
+                        )
+                    }
+                    values[resultToken] = try emitScalarBitCast(
+                        operand,
+                        to: .integer(bitWidth: width, signed: false)
+                    )
+                case .initialize:
+                    guard arguments.count == 2,
+                          let type = scalarMetatypeValues[arguments[1]],
+                          case let .float(width) = type
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "floating bit-pattern initializer has unsupported arguments"
+                        )
+                    }
+                    let operand = try resolve(arguments[0], line: line)
+                    guard registerTypes[Int(operand.rawValue)]
+                            == .integer(bitWidth: width, signed: false)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "floating bit-pattern initializer has a mismatched integer"
+                        )
+                    }
+                    values[resultToken] = try emitScalarBitCast(
+                        operand,
+                        to: type
+                    )
+                }
 
             case .floatingSign:
                 guard genericArguments.isEmpty, arguments.count == 1 else {
@@ -4449,16 +4723,38 @@ public struct Lowerer: Sendable {
                 voidValues.insert(resultToken)
 
             case let .integerUnary(operation):
-                guard genericArguments.isEmpty, arguments.count == 1 else {
+                if genericArguments.isEmpty, arguments.count == 1 {
+                    let operand = try resolve(arguments[0], line: line)
+                    values[resultToken] = try emitIntegerUnary(
+                        operation,
+                        operand: operand
+                    )
+                } else if !genericArguments.isEmpty,
+                          arguments.count == 2 {
+                    let type = try parseStoredType(genericArguments)
+                    guard case .integer = type,
+                          compilerAddressType(arguments[0]) == type,
+                          stackType(at: arguments[1]) == type,
+                          let operand = try copyStoredValue(
+                              at: arguments[1],
+                              line: line
+                          )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "generic integer unary specialization does not match its storage"
+                        )
+                    }
+                    try storeConstructedValue(
+                        try emitIntegerUnary(operation, operand: operand),
+                        at: arguments[0],
+                        mode: .initialize
+                    )
+                    voidValues.insert(resultToken)
+                } else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "integer unary operation has unsupported arguments"
                     )
                 }
-                let operand = try resolve(arguments[0], line: line)
-                values[resultToken] = try emitIntegerUnary(
-                    operation,
-                    operand: operand
-                )
 
             case .integerIsMultiple:
                 guard arguments.count == 2, !genericArguments.isEmpty else {
@@ -4626,6 +4922,122 @@ public struct Lowerer: Sendable {
                     .makeTuple(
                         result: result,
                         elements: [partial, overflow]
+                    )
+                )
+
+            case .integerClampingConversion:
+                let specializations = try splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                    .map(parseStoredType)
+                guard specializations.count == 2,
+                      arguments.count == 3,
+                      case .integer = specializations[0],
+                      case .integer = specializations[1],
+                      compilerAddressType(arguments[0])
+                        == specializations[0],
+                      stackType(at: arguments[1]) == specializations[1],
+                      scalarMetatypeValues[arguments[2]]
+                        == specializations[0],
+                      let source = try copyStoredValue(
+                          at: arguments[1],
+                          line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "clamping integer conversion does not match its specialization"
+                    )
+                }
+                let result = try allocate(type: specializations[0])
+                appendInstruction(
+                    .integerConvert(
+                        result: result,
+                        operation: .clamp,
+                        value: source
+                    )
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case .integerFullWidthMultiply:
+                guard genericArguments.isEmpty,
+                      arguments.count == 2
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "full-width integer multiply has unsupported arguments"
+                    )
+                }
+                let rhs = try resolve(arguments[0], line: line)
+                let lhs = try resolve(arguments[1], line: line)
+                let type = registerTypes[Int(lhs.rawValue)]
+                guard case let .integer(width, _) = type,
+                      registerTypes[Int(rhs.rawValue)] == type
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "full-width integer multiply operands do not match"
+                    )
+                }
+                let lowType = Bytecode.ValueType.integer(
+                    bitWidth: width,
+                    signed: false
+                )
+                let high = try allocate(type: type)
+                let low = try allocate(type: lowType)
+                appendInstruction(
+                    .integerFullWidthMultiply(
+                        high: high,
+                        low: low,
+                        lhs: lhs,
+                        rhs: rhs
+                    )
+                )
+                let result = try allocate(type: .tuple([type, lowType]))
+                values[resultToken] = result
+                appendInstruction(
+                    .makeTuple(result: result, elements: [high, low])
+                )
+
+            case .integerFullWidthDivide:
+                guard genericArguments.isEmpty,
+                      arguments.count == 3
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "full-width integer divide has unsupported arguments"
+                    )
+                }
+                let dividendHigh = try resolve(arguments[0], line: line)
+                let dividendLow = try resolve(arguments[1], line: line)
+                let divisor = try resolve(arguments[2], line: line)
+                let type = registerTypes[Int(divisor.rawValue)]
+                guard case let .integer(width, _) = type,
+                      registerTypes[Int(dividendHigh.rawValue)] == type,
+                      registerTypes[Int(dividendLow.rawValue)]
+                        == .integer(bitWidth: width, signed: false)
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "full-width integer divide operands do not match"
+                    )
+                }
+                let quotient = try allocate(type: type)
+                let remainder = try allocate(type: type)
+                appendInstruction(
+                    .integerFullWidthDivide(
+                        quotient: quotient,
+                        remainder: remainder,
+                        dividendHigh: dividendHigh,
+                        dividendLow: dividendLow,
+                        divisor: divisor
+                    )
+                )
+                let result = try allocate(type: .tuple([type, type]))
+                values[resultToken] = result
+                appendInstruction(
+                    .makeTuple(
+                        result: result,
+                        elements: [quotient, remainder]
                     )
                 )
             }
@@ -7463,31 +7875,43 @@ public struct Lowerer: Sendable {
             }
 
             if let access = match(line, pattern: #"^end_access (%[0-9]+)$"#) {
-                if passthroughRuntimeAccesses.remove(access[0]) != nil {
-                    initializingRuntimeAccesses.remove(access[0])
-                    scopedRuntimeAddresses.remove(access[0])
-                    runtimeAddressValues.removeValue(forKey: access[0])
-                    runtimeAddressPointees.removeValue(forKey: access[0])
-                    values.removeValue(forKey: access[0])
-                    addressAliases.removeValue(forKey: access[0])
+                let token = access[0]
+                // SIL block layout is not execution order: a merge block may
+                // print its end_access before late textual predecessor blocks.
+                // Emit the dynamic close here but retain compile-time address
+                // metadata until every printed predecessor has been lowered.
+                let hasLaterTextualUse = hasFutureSemanticUse(
+                    of: token,
+                    after: currentSILLineIndex
+                )
+                if passthroughRuntimeAccesses.contains(token) {
+                    if hasLaterTextualUse {
+                        deferredAccessMetadataCleanup.insert(token)
+                    } else {
+                        removeAccessMetadata(token)
+                    }
                     continue
                 }
-                if scopedRuntimeAddresses.remove(access[0]) != nil,
-                   let register = runtimeAddressValues.removeValue(forKey: access[0]) {
-                    initializingRuntimeAccesses.remove(access[0])
+                if scopedRuntimeAddresses.contains(token),
+                   let register = runtimeAddressValues[token] {
                     appendInstruction(.endAccess(register))
-                    runtimeAddressPointees.removeValue(forKey: access[0])
-                    values.removeValue(forKey: access[0])
-                    addressAliases.removeValue(forKey: access[0])
+                    if hasLaterTextualUse {
+                        deferredAccessMetadataCleanup.insert(token)
+                    } else {
+                        removeAccessMetadata(token)
+                    }
                     continue
                 }
-                guard addressAliases.removeValue(forKey: access[0]) != nil else {
+                guard addressAliases[token] != nil else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "end_access references an unsupported access"
                     )
                 }
-                mutableCaptureState.addresses.removeValue(forKey: access[0])
-                values.removeValue(forKey: access[0])
+                if hasLaterTextualUse {
+                    deferredAccessMetadataCleanup.insert(token)
+                } else {
+                    removeAccessMetadata(token)
+                }
                 continue
             }
 
@@ -7819,6 +8243,41 @@ public struct Lowerer: Sendable {
                         operation: binary.operation,
                         lhs: lhs,
                         rhs: rhs
+                    )
+                )
+                continue
+            }
+
+            if let ternary = parseFloatingTernary(line) {
+                let multiplicand = try resolve(
+                    ternary.multiplicand,
+                    line: sourceLine
+                )
+                let multiplier = try resolve(
+                    ternary.multiplier,
+                    line: sourceLine
+                )
+                let addend = try resolve(ternary.addend, line: sourceLine)
+                let expected = Bytecode.ValueType.float(
+                    bitWidth: ternary.bitWidth
+                )
+                guard registerTypes[Int(multiplicand.rawValue)] == expected,
+                      registerTypes[Int(multiplier.rawValue)] == expected,
+                      registerTypes[Int(addend.rawValue)] == expected
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating ternary operands do not match its builtin"
+                    )
+                }
+                let result = try allocate(type: expected)
+                values[ternary.result] = result
+                appendInstruction(
+                    .floatingTernary(
+                        result: result,
+                        operation: ternary.operation,
+                        multiplicand: multiplicand,
+                        multiplier: multiplier,
+                        addend: addend
                     )
                 )
                 continue
@@ -12413,6 +12872,9 @@ public struct Lowerer: Sendable {
 
             throw CanonicalSIL.LoweringError.unsupportedInstruction(line: sourceLine, text: line)
         }
+        for token in deferredAccessMetadataCleanup {
+            removeAccessMetadata(token)
+        }
         finishCurrent()
         guard let entryBlock else { throw CanonicalSIL.LoweringError.malformedSIL("function contains no entry block") }
         guard pendingArrayLiterals.isEmpty else {
@@ -13570,6 +14032,30 @@ public struct Lowerer: Sendable {
         var operand: String
         var operation: Bytecode.FloatUnaryOperation
         var bitWidth: UInt16
+    }
+
+    private struct FloatingTernary {
+        var result: String
+        var multiplicand: String
+        var multiplier: String
+        var addend: String
+        var operation: Bytecode.FloatTernaryOperation
+        var bitWidth: UInt16
+    }
+
+    private func parseFloatingTernary(_ line: String) -> FloatingTernary? {
+        guard let parts = match(
+            line,
+            pattern: #"^(%[0-9]+) = builtin "int_fma_FPIEEE(32|64)"\((%[0-9]+), (%[0-9]+), (%[0-9]+)\).*$"#
+        ), let bitWidth = UInt16(parts[1]) else { return nil }
+        return FloatingTernary(
+            result: parts[0],
+            multiplicand: parts[2],
+            multiplier: parts[3],
+            addend: parts[4],
+            operation: .fusedMultiplyAdd,
+            bitWidth: bitWidth
+        )
     }
 
     private func parseFloatingUnary(_ line: String) -> FloatingUnary? {

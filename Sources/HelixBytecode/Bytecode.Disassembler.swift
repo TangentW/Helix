@@ -188,8 +188,22 @@ public enum Disassembler {
             "\(result) = float_\(operation.rawValue) \(operand)"
         case let .floatingPredicate(result, operation, operand):
             "\(result) = float_\(operation.rawValue) \(operand)"
+        case let .floatingBinaryPredicate(result, operation, lhs, rhs):
+            "\(result) = float_\(operation.rawValue) \(lhs), \(rhs)"
+        case let .floatingTernary(
+            result, operation, multiplicand, multiplier, addend
+        ):
+            "\(result) = float_\(operation.rawValue) \(multiplicand), \(multiplier), \(addend)"
+        case let .floatingIntegerProperty(result, operation, operand):
+            "\(result) = float_\(operation.rawValue) \(operand)"
         case let .integerUnary(result, operation, operand):
             "\(result) = integer_\(operation.rawValue) \(operand)"
+        case let .integerFullWidthMultiply(high, low, lhs, rhs):
+            "\(high), \(low) = integer_full_width_multiply \(lhs), \(rhs)"
+        case let .integerFullWidthDivide(
+            quotient, remainder, dividendHigh, dividendLow, divisor
+        ):
+            "\(quotient), \(remainder) = integer_full_width_divide \(dividendHigh), \(dividendLow), \(divisor)"
         case let .scalarBitCast(result, operand):
             "\(result) = scalar_bitcast \(operand)"
         case let .integerConvert(result, operation, value):

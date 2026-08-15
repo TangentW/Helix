@@ -1967,6 +1967,40 @@ public struct Engine: Verification.ImageVerifying {
             guard type(result) == .bool, case .float = type(operand) else {
                 throw fail("floating predicate requires a float operand and Bool result")
             }
+        case let .floatingBinaryPredicate(result, _, lhs, rhs):
+            guard type(result) == .bool,
+                  type(lhs) == type(rhs),
+                  case .float = type(lhs)
+            else {
+                throw fail(
+                    "floating binary predicate requires one float type and Bool result"
+                )
+            }
+        case let .floatingTernary(
+            result, _, multiplicand, multiplier, addend
+        ):
+            guard type(result) == type(multiplicand),
+                  type(multiplicand) == type(multiplier),
+                  type(multiplier) == type(addend),
+                  case .float = type(result)
+            else {
+                throw fail("floating ternary operands and result must use one float type")
+            }
+        case let .floatingIntegerProperty(result, operation, operand):
+            guard case let .float(width) = type(operand) else {
+                throw fail("floating integer property requires a float operand")
+            }
+            let expected: Bytecode.ValueType = switch operation {
+            case .exponent, .significandWidth: .int64
+            case .exponentBitPattern: .integer(bitWidth: 64, signed: false)
+            case .significandBitPattern:
+                .integer(bitWidth: width, signed: false)
+            }
+            guard type(result) == expected else {
+                throw fail(
+                    "floating integer property has an operation-specific result type"
+                )
+            }
         case let .integerUnary(result, operation, operand):
             guard case let .integer(width, signed) = type(operand) else {
                 throw fail("integer unary operation requires an integer operand")
@@ -1977,7 +2011,8 @@ public struct Engine: Verification.ImageVerifying {
                     throw fail("integer magnitude must produce the same-width unsigned type")
                 }
             case .nonzeroBitCount, .leadingZeroBitCount,
-                 .trailingZeroBitCount, .byteSwapped:
+                 .trailingZeroBitCount, .byteSwapped, .bigEndian,
+                 .littleEndian:
                 guard type(result) == type(operand) else {
                     throw fail("integer bit operation must preserve its operand type")
                 }
@@ -1985,6 +2020,30 @@ public struct Engine: Verification.ImageVerifying {
                 guard signed, type(result) == type(operand) else {
                     throw fail("integer signum requires one signed integer type")
                 }
+            }
+        case let .integerFullWidthMultiply(high, low, lhs, rhs):
+            guard case let .integer(width, _) = type(lhs),
+                  type(rhs) == type(lhs),
+                  type(high) == type(lhs),
+                  type(low) == .integer(bitWidth: width, signed: false)
+            else {
+                throw fail(
+                    "full-width multiply requires matching operands, high result, and unsigned low result"
+                )
+            }
+        case let .integerFullWidthDivide(
+            quotient, remainder, dividendHigh, dividendLow, divisor
+        ):
+            guard case let .integer(width, _) = type(divisor),
+                  type(dividendHigh) == type(divisor),
+                  type(dividendLow)
+                    == .integer(bitWidth: width, signed: false),
+                  type(quotient) == type(divisor),
+                  type(remainder) == type(divisor)
+            else {
+                throw fail(
+                    "full-width divide requires a same-type high/divisor/result and unsigned low word"
+                )
             }
         case let .scalarBitCast(result, operand):
             switch (type(operand), type(result)) {
@@ -2019,6 +2078,8 @@ public struct Engine: Verification.ImageVerifying {
                 guard targetWidth == sourceWidth else {
                     throw fail("integer reinterpretation must preserve bit width")
                 }
+            case .clamp:
+                break
             }
         case let .floatingConvert(result, operation, value):
             guard case let .float(targetWidth) = type(result) else {
@@ -3346,7 +3407,10 @@ public struct Engine: Verification.ImageVerifying {
                     live.removeAll()
                 case .constantInteger, .constantBool, .constantFloat, .checkedBinary,
                      .floatingBinary, .floatingUnary, .floatingPredicate,
-                     .integerUnary, .scalarBitCast, .integerConvert,
+                     .floatingBinaryPredicate, .floatingTernary,
+                     .floatingIntegerProperty, .integerUnary,
+                     .integerFullWidthMultiply, .integerFullWidthDivide,
+                     .scalarBitCast, .integerConvert,
                      .floatingConvert,
                      .booleanBinary, .stringConcat, .stringCount, .stringIsEmpty,
                      .stringPredicate, .stringTransform, .stringify,

@@ -39,14 +39,19 @@ does not by itself certify a physical device or distribution channel.
   standard-library APIs use operation- and value-type-driven lowering across
   the whole supported family rather than SDK-type shims. Fixed-width integers
   include `min`/`max`, `bitWidth`, `isSigned`, `magnitude`, population and zero
-  bit counts, `byteSwapped`, `signum()`, `isMultiple(of:)`,
-  `quotientAndRemainder(dividingBy:)`, and the five reporting-overflow
-  operations. `Float` and `Double` include their common constants,
+  bit counts, `byteSwapped`, `bigEndian`/`littleEndian`, `signum()`, clamping
+  and truncating conversions, `isMultiple(of:)`,
+  `quotientAndRemainder(dividingBy:)`, full-width multiply/divide, and the five
+  reporting-overflow operations. `Float` and `Double` include their common
+  constants, bit-pattern round trips, exponent/significand decomposition,
   classification predicates, `magnitude`, `squareRoot()`, `ulp`, `nextUp`,
-  `binade`, `significand`, `sign`, and every `rounded` rule. Division by zero,
-  signed minimum divided by minus one, signed zero, subnormal values, and
-  signaling NaNs retain Swift behavior; undefined zero-count builtin forms are
-  rejected rather than guessed.
+  `binade`, `significand`, `sign`, every rounding rule, IEEE and truncating
+  remainders, fused `addingProduct`/`addProduct`, total ordering, and the four
+  NaN- and signed-zero-aware min/max operations. Their ordinary mutating forms
+  lower to the same typed operations. Division by zero, an unrepresentable
+  full-width quotient, signed minimum divided by minus one, signed zero,
+  subnormal values, and signaling NaNs retain Swift behavior; undefined
+  zero-count builtin forms are rejected rather than guessed.
 - `String` literals, concatenation, interpolation for supported scalar values,
   Unicode `uppercased`/`lowercased` transforms, count/empty checks, comparisons,
   and common prefix/suffix/contains predicates. Variable-size transforms reserve
