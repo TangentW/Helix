@@ -170,9 +170,10 @@ includes common integer and floating-point operations and conversions,
 one-grapheme Character literals for the bounded String predicate path,
 tuple/Optional including address projection, Array boundary/mutation and
 Dictionary removal value semantics, common fully concrete Array-backed
-`map`/`filter`/`compactMap`/`reduce`/predicate operations, `Optional.map`,
-concrete `Result.map` for patch-local value payloads, VM-owned `Any`, and
-common dynamic casts,
+`map`/`filter`/`compactMap`/`reduce`/predicate operations,
+`Optional.map`/`flatMap`, concrete `Result` payload transforms and
+`Result.get()` for patch-local value payloads, VM-owned `Any`, and common
+dynamic casts,
 half-open `Range<Int>` loops, structured
 control flow, newly introduced non-exported ordinary/private helpers, computed
 accessors, file- or module-scope patch-local struct/enum, pure HLVM classes, and

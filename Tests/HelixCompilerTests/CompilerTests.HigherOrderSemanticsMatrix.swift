@@ -1279,6 +1279,22 @@ struct HigherOrderSemanticsMatrix {
             value.map { $0 }
         }
 
+        public func optionalFlatMappedObject(_ value: NSObject?) -> NSObject? {
+            value.flatMap { $0 }
+        }
+
+        enum LinearTransformFailure: Error { case rejected }
+
+        public func optionalThrowingFlatMappedObject(
+            _ value: NSObject?,
+            _ shouldThrow: Bool
+        ) throws -> NSObject? {
+            try value.flatMap { object in
+                if shouldThrow { throw LinearTransformFailure.rejected }
+                return object
+            }
+        }
+
         """
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-linear-higher-order-\(UUID().uuidString)",
@@ -1324,6 +1340,8 @@ struct HigherOrderSemanticsMatrix {
             "mappedObjects", "filteredObjects", "compactedObjects",
             "reducedObject", "firstObject", "containsObject",
             "visitsObjects", "optionalMappedObject",
+            "optionalFlatMappedObject",
+            "optionalThrowingFlatMappedObject",
         ]
 
         for (index, name) in names.enumerated() {

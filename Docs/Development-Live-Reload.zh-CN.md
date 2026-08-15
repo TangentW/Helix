@@ -140,7 +140,7 @@ struct ProfileScreen: View {
 
 ## 支持哪些修改
 
-默认工作流面向 Dev Shell 中已经存在、且字节码后端支持的声明 body。原 Swift access control 会保留，但源码可见并不自动创造 VM capability；每个原生操作还必须通过 eligible Entry 或精确 NativeImport 解析。受支持的局部 closure 与已经索引的同 image helper 可以使用同步 `@escaping` 参数、内部 closure 返回、嵌套 closure 捕获和同步 throwing 路径。标量、集合、Tuple 与补丁内 struct 的可变捕获（包括 Swift escape box）统一使用 VM-managed cell；常见完全具体且底层为 Array 的高阶操作使用经过验证的 closure CFG 与线性 builder。跨分支局部初始化使用字段敏感的“确定/可能初始化”状态，因此支持条件覆盖与清理，但所有字段确定初始化前仍会拒绝读取。closure 仍不能跨 Shell/Native 边界，也不能活过当前固定的 VM invocation。
+默认工作流面向 Dev Shell 中已经存在、且字节码后端支持的声明 body。原 Swift access control 会保留，但源码可见并不自动创造 VM capability；每个原生操作还必须通过 eligible Entry 或精确 NativeImport 解析。受支持的局部 closure 与已经索引的同 image helper 可以使用同步 `@escaping` 参数、内部 closure 返回、嵌套 closure 捕获和同步 throwing 路径。标量、集合、Tuple 与补丁内 struct 的可变捕获（包括 Swift escape box）统一使用 VM-managed cell；常见完全具体且底层为 Array 的高阶操作使用经过验证的 closure CFG 与线性 builder，受支持的 Optional/Result payload 变换则统一使用选定 case 计划。跨分支局部初始化使用字段敏感的“确定/可能初始化”状态，因此支持条件覆盖与清理，但所有字段确定初始化前仍会拒绝读取。closure 仍不能跨 Shell/Native 边界，也不能活过当前固定的 VM invocation。
 
 当前生成器会收集现有受监视源码文件中新增、且能从变化 root 或 hosted callback 到达的普通函数、class private 实例方法、计算 accessor 及其不导出的 patch-local 类型。补丁内非递归 struct/enum 可以随本次保存新增在文件/module scope，并可包含受支持的 stored field、实例/静态计算 accessor 与 mutating helper；pure `final class` 支持引用 identity、stored field、private/普通 method 和 computed accessor。它们不能跨 Shell Entry、NativeImport、generation 或原生存储边界；唯一例外是 hosted class 经 Verifier 证明后投影成冻结 superclass。函数内部 nominal 在当前 textual SIL 合同中没有稳定声明 identity，因此会用精确类型名拒绝；把它移到文件/module scope 即可。
 

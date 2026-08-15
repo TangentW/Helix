@@ -66,7 +66,7 @@ enum SubstitutedFunctionType {
                 )
             }
 
-            guard let archetypes = splitTopLevel(
+            guard let archetypes = archetypeParameters(
                 String(result[result.index(after: genericOpen)..<genericClose])
             ), let substitutions = splitTopLevel(
                 String(result[result.index(after: substitutionOpen)..<trimmedEnd])
@@ -103,6 +103,61 @@ enum SubstitutedFunctionType {
             result = String(prefix) + body + String(suffix)
         }
         return result
+    }
+
+    /// SIL generic signatures append requirements after a top-level `where`
+    /// inside the archetype list. Requirements constrain the declarations but
+    /// do not add substitutions, so retain only the declared archetype prefix.
+    private static func archetypeParameters(_ raw: String) -> [String]? {
+        var parenthesisDepth = 0
+        var angleDepth = 0
+        var bracketDepth = 0
+        var whereStart: String.Index?
+        var index = raw.startIndex
+        while index < raw.endIndex {
+            if parenthesisDepth == 0,
+               angleDepth == 0,
+               bracketDepth == 0,
+               raw[index...].hasPrefix(" where ") {
+                whereStart = index
+                break
+            }
+            switch raw[index] {
+            case "(": parenthesisDepth += 1
+            case ")": parenthesisDepth -= 1
+            case "<": angleDepth += 1
+            case ">":
+                let previous = index > raw.startIndex
+                    ? raw[raw.index(before: index)]
+                    : nil
+                if previous != "-" { angleDepth -= 1 }
+            case "[": bracketDepth += 1
+            case "]": bracketDepth -= 1
+            default: break
+            }
+            guard parenthesisDepth >= 0,
+                  angleDepth >= 0,
+                  bracketDepth >= 0
+            else { return nil }
+            index = raw.index(after: index)
+        }
+        let declarationText: String
+        if let whereStart {
+            let requirementStart = raw.index(
+                whereStart,
+                offsetBy: " where ".count
+            )
+            let requirementText = raw[requirementStart...]
+                .trimmingCharacters(in: .whitespaces)
+            guard let requirements = splitTopLevel(requirementText),
+                  !requirements.isEmpty,
+                  requirements.allSatisfy({ !$0.isEmpty })
+            else { return nil }
+            declarationText = String(raw[..<whereStart])
+        } else {
+            declarationText = raw
+        }
+        return splitTopLevel(declarationText)
     }
 
     private static func topLevelSubstitutionMarker(

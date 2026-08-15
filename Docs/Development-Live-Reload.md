@@ -339,8 +339,9 @@ parameters, internal closure returns, nested closure captures, and synchronous
 throwing paths. Mutable captures use the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
 boxes; common fully concrete Array-backed higher-order operations use verified
-closure CFGs and a linear builder. Multi-branch local initialization uses
-field-sensitive definite/possible state, so conditional replacement and
+closure CFGs and a linear builder, while supported Optional and Result payload
+transforms use the same selected-case plan. Multi-branch local initialization
+uses field-sensitive definite/possible state, so conditional replacement and
 cleanup are supported while reads remain fail-closed until every field is
 definitely initialized. The closure still cannot cross the
 Shell/Native boundary or survive the current pinned VM invocation.

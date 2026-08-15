@@ -24,6 +24,24 @@ struct SubstitutedFunctionTypes {
         #expect(!signature.effects.mayThrow)
     }
 
+    @Test("Concrete constrained substitutions discard requirements, not parameters")
+    func resolvesConstrainedSubstitution() throws {
+        let signature = try CanonicalSIL.Lowerer().parseFunctionType(
+            "$@convention(thin) @substituted "
+                + "<τ_0_0, τ_0_1, τ_0_2 where τ_0_2 : Error> "
+                + "(@in_guaranteed τ_0_0) -> @out Result<τ_0_1, τ_0_2> "
+                + "for <Int, String, Never>"
+        )
+
+        #expect(signature.parameters == [.int64])
+        #expect(
+            signature.result == .local(
+                .init(rawValue: "Swift.Result<String, Never>")
+            )
+        )
+        #expect(signature.hasIndirectResult)
+    }
+
     @Test("Nested substituted closure parameters retain their throwing contract")
     func resolvesNestedClosureSubstitution() throws {
         let signature = try CanonicalSIL.Lowerer().parseFunctionType(
@@ -60,6 +78,12 @@ struct SubstitutedFunctionTypes {
             _ = try CanonicalSIL.Lowerer().parseFunctionType(
                 "$@convention(thin) @substituted <τ_0_0> "
                     + "(τ_0_0) -> τ_0_0 for <(Int, String>"
+            )
+        }
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer().parseFunctionType(
+                "$@convention(thin) @substituted <τ_0_0 where > "
+                    + "(τ_0_0) -> τ_0_0 for <Int>"
             )
         }
     }

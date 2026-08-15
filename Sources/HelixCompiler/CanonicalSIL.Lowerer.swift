@@ -196,6 +196,14 @@ public struct Lowerer: Sendable {
         var callResultType: Bytecode.ValueType
     }
 
+    private enum AlgebraicTransformInvocation {
+        case direct(resultToken: String)
+        case branching(
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID
+        )
+    }
+
     private struct PreparedDirectCallArguments {
         var arguments: [Bytecode.Register]
         var accesses: [Bytecode.Register]
@@ -2370,10 +2378,6 @@ public struct Lowerer: Sendable {
             case .reduce, .forEach, .firstWhere, .containsWhere,
                  .allSatisfy:
                 usesArrayBuilder = false
-            case .optionalMap, .resultMap:
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "non-Array operation entered Array higher-order lowering"
-                )
             }
             let builder: Bytecode.Register?
             if usesArrayBuilder {
@@ -2765,10 +2769,6 @@ public struct Lowerer: Sendable {
                     id: continued,
                     instructions: [.branch(target: loop, arguments: [])]
                 )
-            case .optionalMap, .resultMap:
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "non-Array operation entered Array higher-order lowering"
-                )
             }
 
             let emptyInstructions: [IntermediateRepresentation.Instruction]
@@ -2823,10 +2823,6 @@ public struct Lowerer: Sendable {
                 ] + sourceCleanup + [
                     .branch(target: normalTarget, arguments: [result]),
                 ]
-            case .optionalMap, .resultMap:
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "non-Array operation entered Array higher-order lowering"
-                )
             }
             appendSyntheticBlock(id: empty, instructions: emptyInstructions)
 
@@ -2853,98 +2849,561 @@ public struct Lowerer: Sendable {
             )
         }
 
-        func lowerOptionalMapTryApply(
+        func resultContainer(
+            success: String,
+            failure: String
+        ) throws -> CanonicalSIL.AlgebraicTransform.Container {
+            let type = try parseType("Result<\(success), \(failure)>")
+            guard case let .local(key) = type else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "concrete Result container"
+                )
+            }
+            return .enumeration(key: key)
+        }
+
+        func isSupportedErrorType(
+            _ type: Bytecode.ValueType,
+            spelling: String
+        ) throws -> Bool {
+            switch ValueRepresentation.storable(type) {
+            case .never, .error:
+                return true
+            case .string:
+                let normalized = spelling
+                    .replacingOccurrences(of: "Swift.", with: "")
+                    .filter { !$0.isWhitespace }
+                return normalized == "Error" || normalized == "anyError"
+            case let .local(key):
+                return try typeEnvironment.definition(for: key)
+                    .conformsToError
+            default:
+                return false
+            }
+        }
+
+        func algebraicEnumerationCase(
+            named name: String,
+            payloadType: Bytecode.ValueType,
+            in container: CanonicalSIL.AlgebraicTransform.Container
+        ) throws -> CanonicalSIL.AlgebraicTransform.Case {
+            guard case let .enumeration(key) = container else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "algebraic enum case requires an enum container"
+                )
+            }
+            let index = try typeEnvironment.enumCaseIndex(
+                type: key,
+                name: name
+            )
+            guard let exact = UInt32(exactly: index) else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "algebraic enum case index exceeds UInt32"
+                )
+            }
+            return .init(
+                tag: .enumeration(exact),
+                payloadType: payloadType
+            )
+        }
+
+        func parseAlgebraicTransformPlan(
+            _ intrinsic: CanonicalSIL.AlgebraicIntrinsic,
             genericArguments: String,
             argumentText: String,
-            normalTarget: Bytecode.BlockID,
-            errorTarget: Bytecode.BlockID,
             line: Int
-        ) throws {
-            let genericTypes = try splitTopLevel(genericArguments)
+        ) throws -> CanonicalSIL.AlgebraicTransform.Plan {
+            let genericSpellings = splitTopLevel(genericArguments)
                 .filter { !$0.isEmpty }
-                .map(parseType)
             let arguments = try parseApplyValueTokens(
                 argumentText,
                 line: line
             )
-            guard genericTypes.count == 3, arguments.count == 4 else {
+
+            switch intrinsic {
+            case let .optional(transformation):
+                guard genericSpellings.count == 3,
+                      arguments.count == 4
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional transform has an unsupported specialization"
+                    )
+                }
+                let genericTypes = try genericSpellings.map(parseType)
+                guard try isSupportedErrorType(
+                    genericTypes[1],
+                    spelling: genericSpellings[1]
+                ) else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Optional transform Error \(genericTypes[1])"
+                    )
+                }
+                let inputPayload = ValueRepresentation.storable(
+                    genericTypes[0]
+                )
+                let outputPayload = ValueRepresentation.storable(
+                    genericTypes[2]
+                )
+                let input = CanonicalSIL.AlgebraicTransform.Container
+                    .optional(wrapped: inputPayload)
+                let output = CanonicalSIL.AlgebraicTransform.Container
+                    .optional(wrapped: outputPayload)
+                let inputSome = CanonicalSIL.AlgebraicTransform.Case(
+                    tag: .optionalSome,
+                    payloadType: inputPayload
+                )
+                let outputSome = CanonicalSIL.AlgebraicTransform.Case(
+                    tag: .optionalSome,
+                    payloadType: outputPayload
+                )
+                let none = CanonicalSIL.AlgebraicTransform.Case(
+                    tag: .optionalNone,
+                    payloadType: nil
+                )
+                let closureOutput: CanonicalSIL.AlgebraicTransform
+                    .ClosureOutput = switch transformation {
+                case .map:
+                    .payload(
+                        logicalType: genericTypes[2],
+                        storedType: outputPayload,
+                        outputCase: outputSome
+                    )
+                case .flatMap:
+                    .container(output.type)
+                }
+                return .init(
+                    sourceToken: arguments[3],
+                    closureToken: arguments[2],
+                    resultDestination: arguments[0],
+                    errorDestination: arguments[1],
+                    errorType: genericTypes[1],
+                    input: input,
+                    output: output,
+                    transformedInputCase: inputSome,
+                    passthroughInputCase: none,
+                    passthroughOutputCase: none,
+                    closureOutput: closureOutput
+                )
+
+            case let .result(selectedCase, transformation):
+                guard genericSpellings.count == 3,
+                      arguments.count == 3
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Result transform has an unsupported specialization"
+                    )
+                }
+                let genericTypes = try genericSpellings.map(parseType)
+                let outputFailureIsSupported: Bool
+                if selectedCase == .success {
+                    outputFailureIsSupported = true
+                } else {
+                    outputFailureIsSupported = try isSupportedErrorType(
+                        genericTypes[2],
+                        spelling: genericSpellings[2]
+                    )
+                }
+                guard try isSupportedErrorType(
+                    genericTypes[1],
+                    spelling: genericSpellings[1]
+                ),
+                      outputFailureIsSupported
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Result transform Failure specialization"
+                    )
+                }
+                let success = ValueRepresentation.storable(genericTypes[0])
+                let failure = ValueRepresentation.storable(genericTypes[1])
+                let transformedOutput = ValueRepresentation.storable(
+                    genericTypes[2]
+                )
+                let input = try resultContainer(
+                    success: genericSpellings[0],
+                    failure: genericSpellings[1]
+                )
+                let output: CanonicalSIL.AlgebraicTransform.Container
+                let transformedInputPayload: Bytecode.ValueType
+                let passthroughPayload: Bytecode.ValueType
+                let outputSuccess: Bytecode.ValueType
+                let outputFailure: Bytecode.ValueType
+                switch selectedCase {
+                case .success:
+                    output = try resultContainer(
+                        success: genericSpellings[2],
+                        failure: genericSpellings[1]
+                    )
+                    transformedInputPayload = success
+                    passthroughPayload = failure
+                    outputSuccess = transformedOutput
+                    outputFailure = failure
+                case .failure:
+                    output = try resultContainer(
+                        success: genericSpellings[0],
+                        failure: genericSpellings[2]
+                    )
+                    transformedInputPayload = failure
+                    passthroughPayload = success
+                    outputSuccess = success
+                    outputFailure = transformedOutput
+                }
+                let transformedInputCase = try algebraicEnumerationCase(
+                    named: selectedCase.rawValue,
+                    payloadType: transformedInputPayload,
+                    in: input
+                )
+                let passthroughInputCase = try algebraicEnumerationCase(
+                    named: selectedCase.opposite.rawValue,
+                    payloadType: passthroughPayload,
+                    in: input
+                )
+                let transformedOutputCase = try algebraicEnumerationCase(
+                    named: selectedCase.rawValue,
+                    payloadType: selectedCase == .success
+                        ? outputSuccess : outputFailure,
+                    in: output
+                )
+                let passthroughOutputCase = try algebraicEnumerationCase(
+                    named: selectedCase.opposite.rawValue,
+                    payloadType: passthroughPayload,
+                    in: output
+                )
+                let closureOutput: CanonicalSIL.AlgebraicTransform
+                    .ClosureOutput = switch transformation {
+                case .map:
+                    .payload(
+                        logicalType: genericTypes[2],
+                        storedType: transformedOutput,
+                        outputCase: transformedOutputCase
+                    )
+                case .flatMap:
+                    .container(output.type)
+                }
+                return .init(
+                    sourceToken: arguments[2],
+                    closureToken: arguments[1],
+                    resultDestination: arguments[0],
+                    errorDestination: nil,
+                    errorType: nil,
+                    input: input,
+                    output: output,
+                    transformedInputCase: transformedInputCase,
+                    passthroughInputCase: passthroughInputCase,
+                    passthroughOutputCase: passthroughOutputCase,
+                    closureOutput: closureOutput
+                )
+
+            case .resultGet:
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "Optional.map has an unsupported specialization"
+                    "Result.get entered closure-transform planning"
                 )
             }
-            let wrappedType = ValueRepresentation.storable(genericTypes[0])
-            let errorType = genericTypes[1]
-            let closureResultType = genericTypes[2]
-            let mappedType = ValueRepresentation.storable(closureResultType)
-            let resultType = Bytecode.ValueType.optional(mappedType)
-            let resultDestination = arguments[0]
-            let errorDestination = arguments[1]
-            let closure = try resolve(arguments[2], line: line)
+        }
+
+        func appendAlgebraicSwitch(
+            source: Bytecode.Register,
+            container: CanonicalSIL.AlgebraicTransform.Container,
+            transformedCase: CanonicalSIL.AlgebraicTransform.Case,
+            transformedTarget: Bytecode.BlockID,
+            passthroughCase: CanonicalSIL.AlgebraicTransform.Case,
+            passthroughTarget: Bytecode.BlockID
+        ) throws {
+            switch container {
+            case .optional:
+                let someTarget: Bytecode.BlockID
+                let noneTarget: Bytecode.BlockID
+                switch (transformedCase.tag, passthroughCase.tag) {
+                case (.optionalSome, .optionalNone):
+                    someTarget = transformedTarget
+                    noneTarget = passthroughTarget
+                case (.optionalNone, .optionalSome):
+                    someTarget = passthroughTarget
+                    noneTarget = transformedTarget
+                default:
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional transform must cover .some and .none exactly once"
+                    )
+                }
+                appendInstruction(
+                    .switchOptional(
+                        optional: source,
+                        someTarget: someTarget,
+                        noneTarget: noneTarget
+                    )
+                )
+
+            case .enumeration:
+                guard case let .enumeration(transformedIndex) =
+                        transformedCase.tag,
+                      case let .enumeration(passthroughIndex) =
+                        passthroughCase.tag,
+                      transformedIndex != passthroughIndex
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "enum transform must cover two distinct cases"
+                    )
+                }
+                appendInstruction(
+                    .switchEnum(
+                        enumeration: source,
+                        cases: [
+                            .init(
+                                caseIndex: transformedIndex,
+                                target: transformedTarget
+                            ),
+                            .init(
+                                caseIndex: passthroughIndex,
+                                target: passthroughTarget
+                            ),
+                        ],
+                        defaultTarget: nil
+                    )
+                )
+            }
+        }
+
+        func algebraicCaseIsValid(
+            _ shape: CanonicalSIL.AlgebraicTransform.Case,
+            in container: CanonicalSIL.AlgebraicTransform.Container
+        ) throws -> Bool {
+            switch (container, shape.tag) {
+            case let (.optional(wrapped), .optionalSome):
+                return shape.payloadType == wrapped
+            case (.optional, .optionalNone):
+                return shape.payloadType == nil
+            case let (.enumeration(key), .enumeration(rawIndex)):
+                guard case let .enumeration(cases) = try typeEnvironment
+                        .definition(for: key).kind,
+                      let index = Int(exactly: rawIndex),
+                      cases.indices.contains(index)
+                else { return false }
+                return cases[index].payloadType == shape.payloadType
+            default:
+                return false
+            }
+        }
+
+        func makeAlgebraicCase(
+            _ shape: CanonicalSIL.AlgebraicTransform.Case,
+            in container: CanonicalSIL.AlgebraicTransform.Container,
+            payload: Bytecode.Register?
+        ) throws -> (
+            value: Bytecode.Register,
+            instructions: [IntermediateRepresentation.Instruction]
+        ) {
+            let payloadType = payload.map {
+                registerTypes[Int($0.rawValue)]
+            }
+            guard payloadType == shape.payloadType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "algebraic case payload does not match its plan"
+                )
+            }
+            let value = try allocate(type: container.type)
+            switch (container, shape.tag) {
+            case let (.optional(wrapped), .optionalSome):
+                guard shape.payloadType == wrapped, let payload else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional.some transform has an invalid payload"
+                    )
+                }
+                return (
+                    value,
+                    [.makeOptionalSome(result: value, value: payload)]
+                )
+            case (.optional, .optionalNone):
+                guard payload == nil, shape.payloadType == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional.none transform unexpectedly has a payload"
+                    )
+                }
+                return (value, [.makeOptionalNone(result: value)])
+            case let (.enumeration, .enumeration(index)):
+                return (
+                    value,
+                    [
+                        .makeEnum(
+                            result: value,
+                            caseIndex: index,
+                            payload: payload
+                        ),
+                    ]
+                )
+            default:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "algebraic case does not belong to its output container"
+                )
+            }
+        }
+
+        func lowerAlgebraicTransform(
+            _ plan: CanonicalSIL.AlgebraicTransform.Plan,
+            invocation: AlgebraicTransformInvocation,
+            line: Int
+        ) throws {
+            let errorABIIsValid: Bool = switch (
+                plan.errorDestination,
+                plan.errorType
+            ) {
+            case (nil, nil):
+                true
+            case let (.some(destination), .some(type)):
+                compilerAddressType(destination) == type
+            default:
+                false
+            }
+            let outputCaseIsValid: Bool
+            switch plan.closureOutput {
+            case let .payload(_, _, outputCase):
+                outputCaseIsValid = try algebraicCaseIsValid(
+                    outputCase,
+                    in: plan.output
+                )
+            case .container:
+                outputCaseIsValid = true
+            }
+            guard let closureParameterType =
+                    plan.transformedInputCase.payloadType,
+                  try algebraicCaseIsValid(
+                    plan.transformedInputCase,
+                    in: plan.input
+                  ),
+                  try algebraicCaseIsValid(
+                    plan.passthroughInputCase,
+                    in: plan.input
+                  ),
+                  try algebraicCaseIsValid(
+                    plan.passthroughOutputCase,
+                    in: plan.output
+                  ),
+                  outputCaseIsValid,
+                  plan.passthroughInputCase.payloadType
+                    == plan.passthroughOutputCase.payloadType,
+                  compilerAddressType(plan.resultDestination)
+                    == plan.output.type,
+                  errorABIIsValid
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "algebraic transform plan does not match its physical ABI"
+                )
+            }
+            switch plan.closureOutput {
+            case let .payload(logicalType, storedType, outputCase):
+                guard outputCase.payloadType == storedType,
+                      logicalType == .void
+                        || ValueRepresentation.storable(logicalType)
+                            == storedType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "algebraic map result does not match its output case"
+                    )
+                }
+            case let .container(type):
+                guard type == plan.output.type else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "algebraic flatMap result is not its output container"
+                    )
+                }
+            }
+
             let source = try materializeOwnedValue(
-                at: arguments[3],
+                at: plan.sourceToken,
                 line: line
             )
-            guard compilerAddressType(resultDestination) == resultType,
-                  compilerAddressType(errorDestination) == errorType,
-                  registerTypes[Int(source.rawValue)] == .optional(wrappedType),
+            let closure = try resolve(plan.closureToken, line: line)
+            guard registerTypes[Int(source.rawValue)] == plan.input.type,
                   case let .closure(signature) = registerTypes[
                     Int(closure.rawValue)
                   ],
-                  signature.parameters == [wrappedType],
+                  signature.parameters == [closureParameterType],
                   signature.parameterConventions.count == 1,
                   signature.parameterConventions[0] != .inout,
-                  signature.result == closureResultType,
-                  !signature.effects.isAsync,
-                  signature.effects.mayThrow == (errorType != .never),
-                  implicitStackValues[normalTarget] == nil,
-                  indirectTryNormalBlocks.insert(normalTarget).inserted
+                  signature.result == plan.closureOutput.logicalType,
+                  !signature.effects.isAsync
             else {
                 throw CanonicalSIL.LoweringError.callSignatureMismatch(
                     line: line,
-                    mangledName: "Optional.map"
+                    mangledName: "algebraic transform"
                 )
             }
 
-            let dispatchSource = source
-            let payloadNeedsCleanup = wrappedType.requiresLinearOwnership
-                && signature.parameterConventions[0] == .borrowed
-
-            let propagatedResult = try allocate(type: resultType)
-            implicitStackValues[normalTarget] = [
-                (resultDestination, propagatedResult),
-            ]
-
-            let isThrowing = signature.effects.mayThrow
-            let errorCleanup = try allocateSyntheticBlockID()
-            let errorParameter: Bytecode.Register?
-            if isThrowing {
-                let expectedErrorType: Bytecode.ValueType = typeEnvironment
-                    .preservesTypedErrors ? .error : .string
-                guard errorType == expectedErrorType,
-                      implicitStackValues[errorTarget] == nil
+            let completionTarget: Bytecode.BlockID
+            let directResultToken: String?
+            let errorTarget: Bytecode.BlockID?
+            switch invocation {
+            case let .direct(resultToken):
+                guard !signature.effects.mayThrow,
+                      plan.errorDestination == nil,
+                      plan.errorType == nil
                 else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Optional.map Error specialization does not match its image"
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: line,
+                        mangledName: "nonthrowing algebraic transform"
                     )
                 }
-                errorParameter = try allocate(type: errorType)
-                let propagatedError = try allocate(type: errorType)
-                implicitStackValues[errorTarget] = [
-                    (errorDestination, propagatedError),
+                completionTarget = try allocateSyntheticBlockID()
+                directResultToken = resultToken
+                errorTarget = nil
+
+            case let .branching(normalTarget, branchErrorTarget):
+                guard let errorType = plan.errorType,
+                      plan.errorDestination != nil,
+                      signature.effects.mayThrow == (errorType != .never),
+                      implicitStackValues[normalTarget] == nil,
+                      indirectTryNormalBlocks.insert(normalTarget).inserted
+                else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: line,
+                        mangledName: "rethrowing algebraic transform"
+                    )
+                }
+                let propagatedResult = try allocate(type: plan.output.type)
+                implicitStackValues[normalTarget] = [
+                    (plan.resultDestination, propagatedResult),
                 ]
+                completionTarget = normalTarget
+                directResultToken = nil
+                errorTarget = branchErrorTarget
+            }
+
+            let isThrowing = signature.effects.mayThrow
+            let errorCleanup: Bytecode.BlockID?
+            let errorParameter: Bytecode.Register?
+            if let errorTarget {
+                let cleanup = try allocateSyntheticBlockID()
+                errorCleanup = cleanup
+                if isThrowing {
+                    let expectedErrorType: Bytecode.ValueType = typeEnvironment
+                        .preservesTypedErrors ? .error : .string
+                    guard plan.errorType == expectedErrorType,
+                          let errorDestination = plan.errorDestination,
+                          implicitStackValues[errorTarget] == nil
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "algebraic rethrows Error does not match its image"
+                        )
+                    }
+                    let parameter = try allocate(type: expectedErrorType)
+                    let propagated = try allocate(type: expectedErrorType)
+                    implicitStackValues[errorTarget] = [
+                        (errorDestination, propagated),
+                    ]
+                    errorParameter = parameter
+                } else {
+                    errorParameter = nil
+                }
             } else {
+                errorCleanup = nil
                 errorParameter = nil
             }
 
             let dispatch = try allocateSyntheticBlockID()
-            let some = try allocateSyntheticBlockID()
-            let none = try allocateSyntheticBlockID()
+            let transformed = try allocateSyntheticBlockID()
+            let passthrough = try allocateSyntheticBlockID()
             let closureContinuation = try allocateSyntheticBlockID()
-            if isThrowing {
-                appendInstruction(.branch(target: dispatch, arguments: []))
-            } else {
-                // The frontend still emits a Never error continuation. Keep it
-                // in the verified CFG with an explicitly impossible edge.
+            if let errorCleanup, !isThrowing {
+                // A Never-specialized `try_apply` still has an error edge in
+                // SIL. Preserve it as verified but statically impossible CFG.
                 let mustSucceed = try allocate(type: .bool)
                 appendInstruction(.constantBool(result: mustSucceed, value: true))
                 appendInstruction(
@@ -2956,26 +3415,38 @@ public struct Lowerer: Sendable {
                         falseArguments: []
                     )
                 )
+            } else {
+                appendInstruction(.branch(target: dispatch, arguments: []))
             }
             finishCurrent()
 
-            appendSyntheticBlock(
-                id: dispatch,
-                instructions: [
-                    .switchOptional(
-                        optional: dispatchSource,
-                        someTarget: some,
-                        noneTarget: none
-                    ),
-                ]
+            current = .init(id: dispatch, parameters: [], instructions: [])
+            try appendAlgebraicSwitch(
+                source: source,
+                container: plan.input,
+                transformedCase: plan.transformedInputCase,
+                transformedTarget: transformed,
+                passthroughCase: plan.passthroughInputCase,
+                passthroughTarget: passthrough
             )
-            let payload = try allocate(type: wrappedType)
-            let closureResult = try closureResultType == .void
-                ? nil
-                : allocate(type: closureResultType)
-            let closureInstructions: [IntermediateRepresentation.Instruction]
+            finishCurrent()
+
+            let payload = try allocate(type: closureParameterType)
+            let closureResultType: Bytecode.ValueType? = switch plan.closureOutput {
+            case let .payload(logicalType, storedType, _):
+                logicalType == .void ? nil : storedType
+            case let .container(type):
+                type
+            }
+            let closureResult = try closureResultType.map(allocate)
+            let transformedInstructions: [IntermediateRepresentation.Instruction]
             if isThrowing {
-                closureInstructions = [
+                guard let errorCleanup else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "throwing algebraic transform has no error cleanup"
+                    )
+                }
+                transformedInstructions = [
                     .closureTryApply(
                         closure: closure,
                         arguments: [payload],
@@ -2984,7 +3455,7 @@ public struct Lowerer: Sendable {
                     ),
                 ]
             } else {
-                closureInstructions = [
+                transformedInstructions = [
                     .closureApply(
                         result: closureResult,
                         closure: closure,
@@ -2997,264 +3468,251 @@ public struct Lowerer: Sendable {
                 ]
             }
             appendSyntheticBlock(
-                id: some,
+                id: transformed,
                 parameters: [payload],
-                instructions: closureInstructions
+                instructions: transformedInstructions
             )
 
-            let mapped = try closureResultType == .void
-                ? nil
-                : allocate(type: mappedType)
-            let materializedMapped: Bytecode.Register
-            let resultMaterialization: [IntermediateRepresentation.Instruction]
-            if let mapped {
-                materializedMapped = mapped
-                resultMaterialization = []
-            } else {
-                materializedMapped = try allocate(type: ValueRepresentation.unit)
-                resultMaterialization = [
-                    .makeTuple(result: materializedMapped, elements: []),
-                ]
+            let continuationResult = try closureResultType.map(allocate)
+            let transformedValue: Bytecode.Register
+            var continuationInstructions: [IntermediateRepresentation.Instruction]
+            switch plan.closureOutput {
+            case let .payload(_, _, outputCase):
+                let storedPayload: Bytecode.Register
+                let payloadMaterialization: [IntermediateRepresentation.Instruction]
+                if let continuationResult {
+                    storedPayload = continuationResult
+                    payloadMaterialization = []
+                } else {
+                    storedPayload = try allocate(type: ValueRepresentation.unit)
+                    payloadMaterialization = [
+                        .makeTuple(result: storedPayload, elements: []),
+                    ]
+                }
+                let constructed = try makeAlgebraicCase(
+                    outputCase,
+                    in: plan.output,
+                    payload: storedPayload
+                )
+                transformedValue = constructed.value
+                continuationInstructions = payloadMaterialization
+                    + constructed.instructions
+            case .container:
+                guard let continuationResult else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "flatMap closure did not produce its container"
+                    )
+                }
+                transformedValue = continuationResult
+                continuationInstructions = []
             }
-            let someResult = try allocate(type: resultType)
+            let payloadNeedsCleanup = closureParameterType
+                .requiresLinearOwnership
+                && signature.parameterConventions[0] == .borrowed
+            if payloadNeedsCleanup {
+                continuationInstructions.append(.destroyValue(payload))
+            }
+            continuationInstructions.append(
+                .branch(
+                    target: completionTarget,
+                    arguments: [transformedValue]
+                )
+            )
             appendSyntheticBlock(
                 id: closureContinuation,
-                parameters: mapped.map { [$0] } ?? [],
-                instructions: resultMaterialization + [
-                    .makeOptionalSome(
-                        result: someResult,
-                        value: materializedMapped
-                    ),
-                ] + (payloadNeedsCleanup
-                    ? [.destroyValue(payload)] : [])
-                    + [
+                parameters: continuationResult.map { [$0] } ?? [],
+                instructions: continuationInstructions
+            )
+
+            let passthroughPayload = try plan.passthroughInputCase
+                .payloadType.map(allocate)
+            let forwarded = try makeAlgebraicCase(
+                plan.passthroughOutputCase,
+                in: plan.output,
+                payload: passthroughPayload
+            )
+            appendSyntheticBlock(
+                id: passthrough,
+                parameters: passthroughPayload.map { [$0] } ?? [],
+                instructions: forwarded.instructions + [
                     .branch(
-                        target: normalTarget,
-                        arguments: [someResult]
+                        target: completionTarget,
+                        arguments: [forwarded.value]
                     ),
                 ]
             )
-            let noneResult = try allocate(type: resultType)
-            appendSyntheticBlock(
-                id: none,
-                instructions: [
-                    .makeOptionalNone(result: noneResult),
-                    .branch(
-                        target: normalTarget,
-                        arguments: [noneResult]
-                    ),
-                ]
-            )
-            appendSyntheticBlock(
-                id: errorCleanup,
-                parameters: errorParameter.map { [$0] } ?? [],
-                instructions: (!isThrowing
-                    && registerTypes[Int(dispatchSource.rawValue)]
-                        .requiresLinearOwnership
-                    ? [.destroyValue(dispatchSource)] : [])
-                    + (isThrowing && payloadNeedsCleanup
-                        ? [.destroyValue(payload)] : [])
-                    + [
+
+            if let errorCleanup, let errorTarget {
+                var instructions: [IntermediateRepresentation.Instruction] = []
+                if isThrowing && payloadNeedsCleanup {
+                    instructions.append(.destroyValue(payload))
+                } else if !isThrowing,
+                          plan.input.type.requiresLinearOwnership {
+                    // The impossible edge precedes the consuming Optional
+                    // switch, so it still owns the materialized source.
+                    instructions.append(.destroyValue(source))
+                }
+                instructions.append(
                     .branch(
                         target: errorTarget,
                         arguments: errorParameter.map { [$0] } ?? []
-                    ),
-                ]
-            )
+                    )
+                )
+                appendSyntheticBlock(
+                    id: errorCleanup,
+                    parameters: errorParameter.map { [$0] } ?? [],
+                    instructions: instructions
+                )
+            }
+
+            if let directResultToken {
+                let mergedResult = try allocate(type: plan.output.type)
+                current = .init(
+                    id: completionTarget,
+                    parameters: [mergedResult],
+                    instructions: []
+                )
+                try storeConstructedValue(
+                    mergedResult,
+                    at: plan.resultDestination,
+                    mode: .initialize
+                )
+                voidValues.insert(directResultToken)
+            }
         }
 
-        func lowerResultMapApply(
-            resultToken: String,
+        func parseResultProjectionPlan(
             genericArguments: String,
             argumentText: String,
             line: Int
-        ) throws {
+        ) throws -> CanonicalSIL.AlgebraicTransform.ProjectionPlan {
             let genericSpellings = splitTopLevel(genericArguments)
                 .filter { !$0.isEmpty }
-            guard genericSpellings.count == 3 else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "Result.map has an unsupported specialization"
-                )
-            }
-            let genericTypes = try genericSpellings.map(parseType)
-            let inputPayloadType = ValueRepresentation.storable(
-                genericTypes[0]
-            )
-            let closureResultType = genericTypes[2]
-            let outputPayloadType = ValueRepresentation.storable(
-                closureResultType
-            )
-            let inputType = try parseType(
-                "Result<\(genericSpellings[0]), \(genericSpellings[1])>"
-            )
-            let outputType = try parseType(
-                "Result<\(genericSpellings[2]), \(genericSpellings[1])>"
-            )
-            guard case let .local(inputKey) = inputType,
-                  case let .local(outputKey) = outputType
-            else {
-                throw CanonicalSIL.LoweringError.unsupportedType(
-                    "Result.map concrete container"
-                )
-            }
             let arguments = try parseApplyValueTokens(
                 argumentText,
                 line: line
             )
-            guard arguments.count == 3,
-                  !resultToken.isEmpty,
-                  compilerAddressType(arguments[0]) == outputType
-            else {
+            guard genericSpellings.count == 2, arguments.count == 3 else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "Result.map arguments do not match its specialization"
+                    "Result.get has an unsupported specialization"
                 )
             }
-            let source = try materializeOwnedValue(
-                at: arguments[2],
-                line: line
+            let genericTypes = try genericSpellings.map(parseType)
+            guard try isSupportedErrorType(
+                genericTypes[1],
+                spelling: genericSpellings[1]
+            ) else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "Result.get Failure \(genericTypes[1])"
+                )
+            }
+            let success = ValueRepresentation.storable(genericTypes[0])
+            let failure = ValueRepresentation.storable(genericTypes[1])
+            let input = try resultContainer(
+                success: genericSpellings[0],
+                failure: genericSpellings[1]
             )
-            guard registerTypes[Int(source.rawValue)] == inputType else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "Result.map source does not match its specialization"
+            return .init(
+                sourceToken: arguments[2],
+                resultDestination: arguments[0],
+                errorDestination: arguments[1],
+                input: input,
+                successCase: try algebraicEnumerationCase(
+                    named: CanonicalSIL.AlgebraicIntrinsic.ResultCase
+                        .success.rawValue,
+                    payloadType: success,
+                    in: input
+                ),
+                failureCase: try algebraicEnumerationCase(
+                    named: CanonicalSIL.AlgebraicIntrinsic.ResultCase
+                        .failure.rawValue,
+                    payloadType: failure,
+                    in: input
                 )
-            }
-            let closure = try resolve(arguments[1], line: line)
-            guard case let .closure(signature) = registerTypes[
-                Int(closure.rawValue)
-            ], signature.parameters == [inputPayloadType],
-               signature.parameterConventions.count == 1,
-               signature.parameterConventions[0] != .inout,
-               signature.result == closureResultType,
-               !signature.effects.mayThrow,
-               !signature.effects.isAsync
+            )
+        }
+
+        func lowerResultProjection(
+            _ plan: CanonicalSIL.AlgebraicTransform.ProjectionPlan,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            guard let successType = plan.successCase.payloadType,
+                  let failureType = plan.failureCase.payloadType,
+                  try algebraicCaseIsValid(
+                    plan.successCase,
+                    in: plan.input
+                  ),
+                  try algebraicCaseIsValid(
+                    plan.failureCase,
+                    in: plan.input
+                  ),
+                  compilerAddressType(plan.resultDestination) == successType,
+                  compilerAddressType(plan.errorDestination) == failureType,
+                  implicitStackValues[normalTarget] == nil,
+                  implicitStackValues[errorTarget] == nil,
+                  indirectTryNormalBlocks.insert(normalTarget).inserted
             else {
                 throw CanonicalSIL.LoweringError.callSignatureMismatch(
                     line: line,
-                    mangledName: "Result.map"
+                    mangledName: "Result.get"
+                )
+            }
+            let source = try materializeOwnedValue(
+                at: plan.sourceToken,
+                line: line
+            )
+            guard registerTypes[Int(source.rawValue)] == plan.input.type else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "Result.get"
                 )
             }
 
-            func caseIndex(
-                _ name: String,
-                in key: Bytecode.LocalTypeKey
-            ) throws -> UInt32 {
-                let index = try typeEnvironment.enumCaseIndex(
-                    type: key,
-                    name: name
-                )
-                guard let exact = UInt32(exactly: index) else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Result.\(name) case index exceeds UInt32"
-                    )
-                }
-                return exact
-            }
+            let propagatedSuccess = try allocate(type: successType)
+            let propagatedFailure = try allocate(type: failureType)
+            implicitStackValues[normalTarget] = [
+                (plan.resultDestination, propagatedSuccess),
+            ]
+            implicitStackValues[errorTarget] = [
+                (plan.errorDestination, propagatedFailure),
+            ]
 
-            let inputSuccess = try caseIndex("success", in: inputKey)
-            let inputFailure = try caseIndex("failure", in: inputKey)
-            let outputSuccess = try caseIndex("success", in: outputKey)
-            let outputFailure = try caseIndex("failure", in: outputKey)
             let success = try allocateSyntheticBlockID()
             let failure = try allocateSyntheticBlockID()
-            let closureContinuation = try allocateSyntheticBlockID()
-            let continuation = try allocateSyntheticBlockID()
-            appendInstruction(
-                .switchEnum(
-                    enumeration: source,
-                    cases: [
-                        .init(caseIndex: inputSuccess, target: success),
-                        .init(caseIndex: inputFailure, target: failure),
-                    ],
-                    defaultTarget: nil
-                )
+            try appendAlgebraicSwitch(
+                source: source,
+                container: plan.input,
+                transformedCase: plan.successCase,
+                transformedTarget: success,
+                passthroughCase: plan.failureCase,
+                passthroughTarget: failure
             )
             finishCurrent()
 
-            let successPayload = try allocate(type: inputPayloadType)
-            let mappedValue = try closureResultType == .void
-                ? nil
-                : allocate(type: outputPayloadType)
-            let successPayloadNeedsCleanup = inputPayloadType
-                .requiresLinearOwnership
-                && signature.parameterConventions[0] == .borrowed
+            let successPayload = try allocate(type: successType)
             appendSyntheticBlock(
                 id: success,
                 parameters: [successPayload],
                 instructions: [
-                    .closureApply(
-                        result: mappedValue,
-                        closure: closure,
+                    .branch(
+                        target: normalTarget,
                         arguments: [successPayload]
                     ),
-                ] + (successPayloadNeedsCleanup
-                    ? [.destroyValue(successPayload)] : []) + [
-                    .branch(
-                        target: closureContinuation,
-                        arguments: mappedValue.map { [$0] } ?? []
-                    ),
                 ]
             )
-            let mappedPayload = try closureResultType == .void
-                ? nil
-                : allocate(type: outputPayloadType)
-            let materializedPayload: Bytecode.Register
-            let resultMaterialization: [IntermediateRepresentation.Instruction]
-            if let mappedPayload {
-                materializedPayload = mappedPayload
-                resultMaterialization = []
-            } else {
-                materializedPayload = try allocate(type: ValueRepresentation.unit)
-                resultMaterialization = [
-                    .makeTuple(result: materializedPayload, elements: []),
-                ]
-            }
-            let successResult = try allocate(type: outputType)
-            appendSyntheticBlock(
-                id: closureContinuation,
-                parameters: mappedPayload.map { [$0] } ?? [],
-                instructions: resultMaterialization + [
-                    .makeEnum(
-                        result: successResult,
-                        caseIndex: outputSuccess,
-                        payload: materializedPayload
-                    ),
-                    .branch(
-                        target: continuation,
-                        arguments: [successResult]
-                    ),
-                ]
-            )
-            let failurePayload = try allocate(type: genericTypes[1])
-            let failureResult = try allocate(type: outputType)
+            let failurePayload = try allocate(type: failureType)
             appendSyntheticBlock(
                 id: failure,
                 parameters: [failurePayload],
                 instructions: [
-                    .makeEnum(
-                        result: failureResult,
-                        caseIndex: outputFailure,
-                        payload: failurePayload
-                    ),
                     .branch(
-                        target: continuation,
-                        arguments: [failureResult]
+                        target: errorTarget,
+                        arguments: [failurePayload]
                     ),
                 ]
             )
-            let mergedResult = try allocate(type: outputType)
-            current = .init(
-                id: continuation,
-                parameters: [mergedResult],
-                instructions: []
-            )
-            // Result.map's first physical argument is an `@out` destination;
-            // the synthesized merge initializes it exactly once.
-            try storeConstructedValue(
-                mergedResult,
-                at: arguments[0],
-                mode: .initialize
-            )
-            voidValues.insert(resultToken)
         }
 
         func lowerSwiftCoreIntrinsic(
@@ -3272,10 +3730,10 @@ public struct Lowerer: Sendable {
             }
 
             switch intrinsic {
-            case .higherOrder:
+            case .higherOrder, .algebraic:
                 throw CanonicalSIL.LoweringError.unsupportedInstruction(
                     line: line,
-                    text: "higher-order Swift intrinsic requires control-flow lowering"
+                    text: "Swift intrinsic requires control-flow lowering"
                 )
             case .minimum, .maximum:
                 guard arguments.count == 3, !genericArguments.isEmpty else {
@@ -7028,25 +7486,45 @@ public struct Lowerer: Sendable {
                 ] {
                     let normalTarget = try parseBlockID(call[4])
                     let errorTarget = try parseBlockID(call[5])
-                    switch operation {
-                    case .optionalMap:
-                        try lowerOptionalMapTryApply(
+                    try lowerArrayHigherOrderTryApply(
+                        operation: operation,
+                        genericArguments: call[1],
+                        argumentText: call[2],
+                        normalTarget: normalTarget,
+                        errorTarget: errorTarget,
+                        line: sourceLine
+                    )
+                    continue
+                }
+                if case let .algebraic(intrinsic)? = swiftCoreReferences[
+                    call[0]
+                ] {
+                    let normalTarget = try parseBlockID(call[4])
+                    let errorTarget = try parseBlockID(call[5])
+                    switch intrinsic {
+                    case .optional, .result:
+                        let plan = try parseAlgebraicTransformPlan(
+                            intrinsic,
                             genericArguments: call[1],
                             argumentText: call[2],
-                            normalTarget: normalTarget,
-                            errorTarget: errorTarget,
                             line: sourceLine
                         )
-                    case .resultMap:
-                        throw CanonicalSIL.LoweringError.unsupportedInstruction(
-                            line: sourceLine,
-                            text: "throwing Result.map ABI"
+                        try lowerAlgebraicTransform(
+                            plan,
+                            invocation: .branching(
+                                normalTarget: normalTarget,
+                                errorTarget: errorTarget
+                            ),
+                            line: sourceLine
                         )
-                    default:
-                        try lowerArrayHigherOrderTryApply(
-                            operation: operation,
+                    case .resultGet:
+                        let plan = try parseResultProjectionPlan(
                             genericArguments: call[1],
                             argumentText: call[2],
+                            line: sourceLine
+                        )
+                        try lowerResultProjection(
+                            plan,
                             normalTarget: normalTarget,
                             errorTarget: errorTarget,
                             line: sourceLine
@@ -7476,13 +7954,28 @@ public struct Lowerer: Sendable {
                     }
                     continue
                 }
-                if swiftCoreReferences[call[1]] == .higherOrder(.resultMap) {
-                    try lowerResultMapApply(
-                        resultToken: call[0],
-                        genericArguments: call[2],
-                        argumentText: call[3],
-                        line: sourceLine
-                    )
+                if case let .algebraic(intrinsic)? = swiftCoreReferences[
+                    call[1]
+                ] {
+                    switch intrinsic {
+                    case .optional, .result:
+                        let plan = try parseAlgebraicTransformPlan(
+                            intrinsic,
+                            genericArguments: call[2],
+                            argumentText: call[3],
+                            line: sourceLine
+                        )
+                        try lowerAlgebraicTransform(
+                            plan,
+                            invocation: .direct(resultToken: call[0]),
+                            line: sourceLine
+                        )
+                    case .resultGet:
+                        throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                            line: sourceLine,
+                            text: "Result.get requires try_apply"
+                        )
+                    }
                     continue
                 }
                 if let intrinsic = swiftCoreReferences[call[1]] {
@@ -10897,8 +11390,7 @@ public struct Lowerer: Sendable {
             case .forEach: .void
             case .firstWhere: .optional(input)
             case .containsWhere, .allSatisfy: .bool
-            case .map, .filter, .compactMap, .reduce, .optionalMap,
-                 .resultMap:
+            case .map, .filter, .compactMap, .reduce:
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "predicate operation dispatch is inconsistent"
                 )
@@ -10913,11 +11405,6 @@ public struct Lowerer: Sendable {
                 inputType: input,
                 closureResultType: closureResult,
                 callResultType: callResult
-            )
-        case .optionalMap, .resultMap:
-            throw CanonicalSIL.LoweringError.unsupportedInstruction(
-                line: line,
-                text: "non-Array higher-order intrinsic"
             )
         }
     }

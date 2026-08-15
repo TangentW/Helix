@@ -1095,8 +1095,10 @@ enum StorageInitialization {
               )
         else { return nil }
 
-        let rawResult = String(text[arrow.upperBound...])
-            .trimmingCharacters(in: .whitespaces)
+        let rawResult = strippingLeadingLifetimeAttributes(
+            String(text[arrow.upperBound...])
+                .trimmingCharacters(in: .whitespaces)
+        )
         let resultComponents: [String]
         if rawResult.first == "(", rawResult.last == ")",
            let close = matchingClose(
@@ -1116,17 +1118,72 @@ enum StorageInitialization {
             resultComponents = [rawResult]
         }
         var indirectResultEdges: [IndirectResultEdge] = []
-        if resultComponents.first?.trimmingCharacters(in: .whitespaces)
-            .hasPrefix("@out ") == true {
+        if resultComponents.first.map({
+            containsTopLevelToken("@out", in: $0)
+        }) == true {
             indirectResultEdges.append(.normal)
         }
         if resultComponents.contains(where: {
-            $0.trimmingCharacters(in: .whitespaces)
-                .hasPrefix("@error_indirect ")
+            containsTopLevelToken("@error_indirect", in: $0)
         }) {
             indirectResultEdges.append(.error)
         }
         return (parameters, indirectResultEdges)
+    }
+
+    private static func strippingLeadingLifetimeAttributes(
+        _ text: String
+    ) -> String {
+        var result = text
+        while result.hasPrefix("@lifetime("),
+              let open = result.firstIndex(of: "("),
+              let close = matchingClose(in: result, after: open) {
+            result = String(result[result.index(after: close)...])
+                .trimmingCharacters(in: .whitespaces)
+        }
+        return result
+    }
+
+    /// Result lifetime attributes can precede `@out` in current SIL. Find the
+    /// physical convention only at top level so nested closure result markers
+    /// cannot be mistaken for the application's own indirect result.
+    private static func containsTopLevelToken(
+        _ token: String,
+        in text: String
+    ) -> Bool {
+        var depths = (parenthesis: 0, angle: 0, square: 0)
+        var index = text.startIndex
+        while index < text.endIndex {
+            if depths == (0, 0, 0), text[index...].hasPrefix(token) {
+                let end = text.index(index, offsetBy: token.count)
+                let startsAtBoundary = index == text.startIndex
+                    || text[text.index(before: index)].isWhitespace
+                    || text[text.index(before: index)] == ","
+                let endsAtBoundary = end == text.endIndex
+                    || text[end].isWhitespace
+                    || text[end] == "("
+                if startsAtBoundary && endsAtBoundary { return true }
+            }
+            switch text[index] {
+            case "(": depths.parenthesis += 1
+            case ")": depths.parenthesis -= 1
+            case "<": depths.angle += 1
+            case ">":
+                let previous = index > text.startIndex
+                    ? text[text.index(before: index)]
+                    : nil
+                if previous != "-" { depths.angle -= 1 }
+            case "[": depths.square += 1
+            case "]": depths.square -= 1
+            default: break
+            }
+            guard depths.parenthesis >= 0,
+                  depths.angle >= 0,
+                  depths.square >= 0
+            else { return false }
+            index = text.index(after: index)
+        }
+        return false
     }
 
     private static func outerFunctionArrow(

@@ -8,7 +8,5 @@ enum HigherOrderIntrinsic: Equatable {
     case firstWhere
     case containsWhere
     case allSatisfy
-    case optionalMap
-    case resultMap
 }
 }

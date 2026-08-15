@@ -3,6 +3,7 @@ import HelixBytecode
 extension CanonicalSIL {
 enum SwiftCoreIntrinsic: Equatable {
     case higherOrder(CanonicalSIL.HigherOrderIntrinsic)
+    case algebraic(CanonicalSIL.AlgebraicIntrinsic)
     case minimum
     case maximum
     case absoluteValue
@@ -63,9 +64,27 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sSTsE10allSatisfyyS2b7ElementQzKXEKF":
             self = .higherOrder(.allSatisfy)
         case "$sSq3mapyqd_0_Sgqd_0_xqd__YKXEqd__YKs5ErrorRd__Ri_d_0_r0_lF":
-            self = .higherOrder(.optionalMap)
+            self = .algebraic(.optional(.map))
+        case "$sSq7flatMapyqd_0_SgABxqd__YKXEqd__YKs5ErrorRd__Ri_d_0_r0_lF":
+            self = .algebraic(.optional(.flatMap))
         case "$ss6ResultO3mapyAByqd__q_Gqd__xXERi_d__lF":
-            self = .higherOrder(.resultMap)
+            self = .algebraic(
+                .result(case: .success, transformation: .map)
+            )
+        case "$ss6ResultOsRi_zRi0_zrlE8mapErroryAByxqd__Gqd__q_XEs0C0Rd__lF":
+            self = .algebraic(
+                .result(case: .failure, transformation: .map)
+            )
+        case "$ss6ResultO7flatMapyAByqd__q_GADxXERi_d__lF":
+            self = .algebraic(
+                .result(case: .success, transformation: .flatMap)
+            )
+        case "$ss6ResultOsRi_zrlE12flatMapErroryAByxqd__GADq_XEs0D0Rd__lF":
+            self = .algebraic(
+                .result(case: .failure, transformation: .flatMap)
+            )
+        case "$ss6ResultOsRi_zRi0_zrlE3getxyq_YKF":
+            self = .algebraic(.resultGet)
         case "$ss3minyxx_xtSLRzlF": self = .minimum
         case "$ss3maxyxx_xtSLRzlF": self = .maximum
         case "$ss3absyxxSLRzs13SignedNumericRzlF": self = .absoluteValue

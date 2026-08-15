@@ -47,9 +47,12 @@ does not by itself certify a physical device or distribution channel.
   value types. Fully concrete Array-backed `map`, `filter`, `compactMap`,
   `reduce`, `forEach`, `first(where:)`, `contains(where:)`, and `allSatisfy`
   use verified closure control flow and a linear, invocation-local Array
-  builder instead of repeated copy-on-write append. `Optional.map` and
-  concrete `Result.map` whose payloads are valid patch-local values use the
-  same closure path; a local `Result` cannot currently embed a native handle.
+  builder instead of repeated copy-on-write append. `Optional.map`/`flatMap`
+  and concrete `Result.map`/`mapError`/`flatMap`/`flatMapError` whose payloads
+  are valid patch-local values use one selected-case transform with explicit
+  payload ownership; `Result.get()` projects success and failure onto verified
+  normal and error edges. A local `Result` cannot currently embed a native
+  handle.
 - Structured branches, loops, switches, calls, recursion, checked business
   error edges, and local payload-carrying Error values. Real-frontend coverage
   includes ternary expressions, `repeat-while`, labeled `break`/`continue`,
