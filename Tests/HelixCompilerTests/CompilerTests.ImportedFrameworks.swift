@@ -62,6 +62,104 @@ struct ImportedFrameworks {
         })
     }
 
+    @Test("Same-type reference casts support Objective-C superclass lookup")
+    func lowersSameTypeReceiverCast() throws {
+        let controllerType = Core.TypeID(rawValue: .sha256("Fixture.Controller"))
+        let viewControllerType = Core.TypeID(rawValue: .sha256("UIKit.UIViewController"))
+        let upcastRequirement = importRequirement(id: 5)
+        let superRequirement = importRequirement(id: 6)
+        let loweredSuperType = "@convention(objc_method) (UIViewController) -> ()"
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: CanonicalSIL.NativeBridgeSymbols.upcast(
+                    from: controllerType,
+                    to: viewControllerType
+                ),
+                parameterTypes: [.native(controllerType)],
+                resultType: .native(viewControllerType),
+                target: .nativeImport(upcastRequirement)
+            ),
+            .init(
+                mangledName: CanonicalSIL.NativeBridgeSymbols.foreignCall(
+                    reference: "#UIViewController.viewDidLayoutSubviews!foreign",
+                    loweredType: loweredSuperType
+                ),
+                parameterTypes: [.native(viewControllerType)],
+                resultType: .void,
+                target: .nativeImport(superRequirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            [
+                "Fixture.Controller": controllerType,
+                "UIViewController": viewControllerType,
+            ],
+            kinds: [
+                controllerType: .reference,
+                viewControllerType: .reference,
+            ]
+        )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture10ControlleryyF",
+            loweredType: "@convention(thin) (@guaranteed Fixture.Controller) -> ()",
+            body: """
+            bb0(%0 : @guaranteed $Fixture.Controller):
+              %1 = upcast %0 to $UIViewController
+              %2 = unchecked_ref_cast %0 to $Fixture.Controller
+              %3 = objc_super_method %2, #UIViewController.viewDidLayoutSubviews!foreign : (UIViewController) -> () -> (), $\(loweredSuperType)
+              %4 = apply %3(%1) : $\(loweredSuperType)
+              %5 = tuple ()
+              return %5
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+            function,
+            displayName: "Fixture.Controller.layout",
+            directCalls: calls
+        )
+        let imports = lowered.blocks.flatMap(\.instructions).compactMap {
+            instruction -> Core.NativeImportID? in
+            guard case let .nativeApply(_, id, _) = instruction else { return nil }
+            return id
+        }
+        #expect(imports == [upcastRequirement.id, superRequirement.id])
+    }
+
+    @Test("Reference casts between distinct frozen types remain rejected")
+    func rejectsDifferentTypeReceiverCast() throws {
+        let controllerType = Core.TypeID(rawValue: .sha256("Fixture.Controller"))
+        let viewControllerType = Core.TypeID(rawValue: .sha256("UIKit.UIViewController"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            [
+                "Fixture.Controller": controllerType,
+                "UIViewController": viewControllerType,
+            ],
+            kinds: [
+                controllerType: .reference,
+                viewControllerType: .reference,
+            ]
+        )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture10ControlleryyF",
+            loweredType: "@convention(thin) (@guaranteed Fixture.Controller) -> ()",
+            body: """
+            bb0(%0 : @guaranteed $Fixture.Controller):
+              %1 = unchecked_ref_cast %0 to $UIViewController
+              %2 = tuple ()
+              return %2
+            """
+        )
+
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+                function,
+                displayName: "Fixture.Controller.invalidCast",
+                directCalls: .empty
+            )
+        }
+    }
+
     @Test("Borrowed native upcasts release their temporary after the final use")
     func balancesBorrowedNativeUpcast() throws {
         let labelType = Core.TypeID(rawValue: .sha256("UIKit.UILabel"))
@@ -571,21 +669,109 @@ struct ImportedFrameworks {
             displayName: "Fixture.consume"
         )
         #expect(Set(lowered.blocks.map(\.id.rawValue)).isSuperset(of: [0, 1, 2, 3]))
+        let someInstructions = try #require(
+            lowered.blocks.first { $0.id.rawValue == 1 }?.instructions
+        )
         let noneInstructions = try #require(
             lowered.blocks.first { $0.id.rawValue == 3 }?.instructions
         )
-        let reconstruction = try #require(noneInstructions.first { instruction in
-            guard case .makeOptionalNone = instruction else { return false }
+        #expect(someInstructions.contains { instruction in
+            guard case .unwrapOptional = instruction else { return false }
             return true
         })
-        guard case let .makeOptionalNone(reconstructed) = reconstruction else {
-            Issue.record("expected Optional.none reconstruction")
-            return
-        }
         #expect(noneInstructions.contains { instruction in
-            guard case let .copyValue(_, source) = instruction else { return false }
-            return source == reconstructed
+            guard case .copyValue = instruction else { return false }
+            return true
         })
+        #expect(!lowered.blocks.flatMap(\.instructions).contains { instruction in
+            guard case .switchOptional = instruction else { return false }
+            return true
+        })
+    }
+
+    @Test("Optional address copies preserve some-case dominance and ownership")
+    func lowersTakenOptionalAddressCopyWithinSomeCase() throws {
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7consume_ys6StringVSgF",
+            loweredType: "@convention(thin) (@owned Optional<String>) -> ()",
+            body: """
+            bb0(%0 : @owned $Optional<String>):
+              %1 = alloc_stack $Optional<String>
+              store %0 to %1
+              switch_enum_addr %1, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
+            bb1:
+              %2 = alloc_stack $Optional<String>
+              copy_addr %1 to [init] %2
+              %3 = unchecked_take_enum_data_addr %2, #Optional.some!enumelt
+              %4 = load [take] %3
+              destroy_value %4
+              dealloc_stack %2
+              destroy_addr %1
+              dealloc_stack %1
+              br bb3
+            bb2:
+              destroy_addr %1
+              dealloc_stack %1
+              br bb3
+            bb3:
+              %5 = tuple ()
+              return %5
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer().lower(
+            function,
+            displayName: "Fixture.consume"
+        )
+        let entry = try #require(
+            lowered.blocks.first { $0.id.rawValue == 0 }?.instructions
+        )
+        let some = try #require(
+            lowered.blocks.first { $0.id.rawValue == 1 }?.instructions
+        )
+        #expect(entry.contains { instruction in
+            guard case .optionalIsSome = instruction else { return false }
+            return true
+        })
+        let copiedOptional = try #require(some.compactMap {
+            instruction -> Bytecode.Register? in
+            guard case let .copyValue(result, _) = instruction else { return nil }
+            return result
+        }.first)
+        #expect(some.contains { instruction in
+            guard case let .unwrapOptional(_, optional) = instruction else { return false }
+            return optional == copiedOptional
+        })
+        #expect(!some.contains { instruction in
+            guard case let .destroyValue(value) = instruction else { return false }
+            return value == copiedOptional
+        })
+    }
+
+    @Test("Optional address payload takes require a proven some edge")
+    func rejectsUnprovenOptionalAddressTake() throws {
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7consume_ys6StringVSgF",
+            loweredType: "@convention(thin) (@owned Optional<String>) -> ()",
+            body: """
+            bb0(%0 : @owned $Optional<String>):
+              %1 = alloc_stack $Optional<String>
+              store %0 to %1
+              %2 = unchecked_take_enum_data_addr %1, #Optional.some!enumelt
+              %3 = load [take] %2
+              destroy_value %3
+              dealloc_stack %1
+              %4 = tuple ()
+              return %4
+            """
+        )
+
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer().lower(
+                function,
+                displayName: "Fixture.consume"
+            )
+        }
     }
 
     @Test("Frozen bridge pseudo-symbols include the exact physical ABI")

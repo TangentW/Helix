@@ -494,17 +494,30 @@ extension FrontendReceipt.Adapter {
                   expression["type"],
                   demangled: demangled
               ),
-              let base = expression["base"] as? [String: Any],
-              let receiverType = importedSwiftType(
-                  base["type"],
-                  demangled: demangled
-              )
+              let base = expression["base"] as? [String: Any]
         else { return }
+
+        let staticOwner = importedMetatypeInstanceType(
+            base["type"],
+            demangled: demangled
+        )
+        let instanceOwner = importedSwiftType(
+            base["type"],
+            demangled: demangled
+        )
+        guard let receiverType = staticOwner ?? instanceOwner else { return }
+        let isStatic = staticOwner != nil
+        // The generated bridge currently models class-property reads but not
+        // class-property mutation. Keep writes fail-closed until that physical
+        // metatype ABI has an explicit NativeImport dispatch.
+        guard !isStatic || accessor == .instanceGetter else { return }
 
         let marker = accessor == .instanceSetter ? "setter" : "getter"
         let references: [String]
-        if usr.hasPrefix("c:"), usr.contains("(py)") {
-            references = foreignMemberReferences(
+        let isObjectiveCProperty = usr.hasPrefix("c:")
+            && (usr.contains("(py)") || usr.contains("(cpy)"))
+        if isObjectiveCProperty {
+            references = Self.foreignMemberReferences(
                 in: function.body,
                 ownerType: receiverType,
                 baseName: baseName,
@@ -521,7 +534,7 @@ extension FrontendReceipt.Adapter {
         }
         guard !references.isEmpty else { return }
 
-        let receiverRepresentation = recordImportedNominalType(
+        let receiverRepresentation = isStatic ? nil : recordImportedNominalType(
             rawMangledType: base["type"],
             spelling: receiverType,
             source: source,
@@ -537,13 +550,18 @@ extension FrontendReceipt.Adapter {
             requiresMainActor: requiresMainActor,
             types: &types
         )
-        guard receiverRepresentation != nil else { return }
+        guard isStatic || receiverRepresentation != nil else { return }
 
         let dispatch: NativeImportDiscovery.Dispatch
         let parameterTypes: [String]
         let labels: [String]
         let resultType: String
-        if accessor == .instanceSetter {
+        if isStatic {
+            dispatch = .staticGetter
+            parameterTypes = []
+            labels = []
+            resultType = propertyType
+        } else if accessor == .instanceSetter {
             dispatch = receiverRepresentation == .opaqueValue
                 ? .instanceValueSetter : .instanceSetter
             parameterTypes = [propertyType, receiverType]
@@ -1776,7 +1794,7 @@ extension FrontendReceipt.Adapter {
         return owner.isEmpty ? nil : owner
     }
 
-    private func foreignMemberReferences(
+    static func foreignMemberReferences(
         in body: String,
         ownerType: String,
         baseName: String,
@@ -1808,7 +1826,7 @@ extension FrontendReceipt.Adapter {
         try mergeImportedNativeTypes(references: [], operationTypes: values)
     }
 
-    private func mergeImportedOperations(
+    func mergeImportedOperations(
         _ values: [ImportedOperation]
     ) throws -> [ImportedOperation] {
         var byIdentity: [String: ImportedOperation] = [:]

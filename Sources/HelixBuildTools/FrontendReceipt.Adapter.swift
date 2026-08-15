@@ -63,7 +63,7 @@ public struct Adapter: Sendable {
             moduleName: moduleName,
             demangled: demangled
         )
-        let importedOperationSurface = try discoverImportedOperationSurface(
+        var importedOperationSurface = try discoverImportedOperationSurface(
             documents: documents,
             sourcesByPhysicalPath: sourceByPhysicalPath,
             moduleName: moduleName,
@@ -74,6 +74,17 @@ public struct Adapter: Sendable {
             references: importedReferences,
             operationTypes: importedOperationSurface.types
         )
+        if request.callingSurfacePolicy == .managedDebugModule {
+            let managedOperations = try FrontendReceipt.ManagedDebugSurface
+                .importedOperations(
+                    for: importedTypes,
+                    frontend: frontend,
+                    invocation: request.metadata.frontendInvocation
+                )
+            importedOperationSurface.operations = try mergeImportedOperations(
+                importedOperationSurface.operations + managedOperations
+            )
+        }
         let provisionalNativeTypes = try makeNativeTypes(
             request.nativeImportCatalog,
             sourceNominals: sourceNominals,

@@ -87,6 +87,15 @@ does not by itself certify a physical device or distribution channel.
   new Shell. It supports common Bridge-compatible `Any` values,
   separator/terminator semantics, and a 64 KiB output bound without App catalog
   configuration.
+- Managed Debug measurement of Objective-C class-property getters. If `UIColor`
+  is already an imported native type, the standard iOS 15 color palette is
+  emitted as separate exact NativeImports, so a Live Reload body may first use
+  `.black`, `.systemMint`, and the other measured colors without a rebuild.
+  Production Shells do not receive this convenience surface.
+- Objective-C superclass dispatch and address-form Optional control flow when
+  their exact native operations are frozen. Same-type receiver casts are
+  accepted only as aliases of one reference `TypeID`, and Optional payload takes
+  require a dominating `.some` edge even after an exact address copy.
 - Calls to same-image helpers, eligible Shell entries, and exact allowlisted
   NativeImports already emitted in the target Shell. Baseline-used imported
   APIs can be frozen automatically when Typed AST semantics and canonical SIL
@@ -120,10 +129,12 @@ does not by itself certify a physical device or distribution channel.
   consuming ABI, typed-throws roots, `rethrows`, and general unwind cleanup.
 - Unrestricted pointers, `unsafeBitCast`, arbitrary Objective-C selector/IMP,
   `dlopen`/`dlsym`, Mirror-driven field mutation, and unknown builtins.
-- A native call that does not have an exact `NativeImportID` in the released
-  Shell, even if a similarly named Swift function exists. A patch also cannot
-  add a framework or use an SDK operation for the first time after that Shell
-  was released.
+- A native call that does not have an exact `NativeImportID` in the target
+  Shell, even if a similarly named Swift function exists. A production patch
+  also cannot add a framework or use an SDK operation for the first time after
+  that Shell was released. The measured managed-Debug color palette above works
+  precisely because those individual IDs are frozen during the normal Debug
+  build.
 
 ## Development Live Reload boundary
 
@@ -138,6 +149,7 @@ machine code.
 | Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM |
 | Change an existing Shell struct/enum/actor instance root or existing native static/class method | Rejected until Shell value writeback, executor, and native metatype ABI are implemented; this does not restrict image-local value-type accessors/helpers |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
+| First use a standard `UIColor` static property in a managed Debug body | Supported when `UIColor` belongs to the Shell's imported type surface; the captured frontend measures and prefreezes each iOS 15 palette getter as an exact NativeImport |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |

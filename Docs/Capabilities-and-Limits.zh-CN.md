@@ -36,6 +36,8 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - VM-owned `Any`、`is`、`as?`、`as!`，以及受支持 Optional/Array/Dictionary 的递归动态转换；Swift existential metadata、native object 和线性生命周期不会进入下载字节码。
 - 完全具体的默认参数 generator。生产与开发编译器会把可达 `fA...` thunk 一起链接并纳入传递实现指纹；当前只承诺一个完整 module source set 内的 eligible 调用点。跨 module 的 public/package 默认值、非 eligible 调用点或仍需泛型 metadata 时要求完整构建。
 - 普通 `Swift.print`，由所有新 Shell 自动冻结的同步 NativeImport 承载。支持常见 Bridge-compatible `Any` 值、separator/terminator 和 64 KiB 输出上限，不要求 App 手工配置 Catalog。
+- Objective-C class-property getter 的受管 Debug 实测能力。当 `UIColor` 已是 imported native type 时，iOS 15 标准调色板会逐项生成独立、精确的 NativeImport，因此 Live Reload body 可以首次使用 `.black`、`.systemMint` 等已测量颜色而无需重建；生产 Shell 不会得到这组便利能力。
+- 精确原生操作已冻结时的 Objective-C superclass dispatch 与 address-form Optional 控制流。同类型 receiver cast 只有在两端是同一 reference `TypeID` 时才作为 alias；Optional payload take 即使经过精确地址复制，也必须受 `.some` edge 支配。
 - 调用同 image helper、eligible Shell entry 与目标 Shell 已经生成的精确 allowlisted NativeImport。发布基线已经使用、且 Typed AST 语义与 canonical SIL 物理 ABI 能够对齐的外部 API 可以自动冻结；当前覆盖 reference、raw enum、OptionSet、opaque copyable value、accessor、method、全局值/函数、简单 imported C value、Selector、upcast，以及已验证的 String/Array Objective-C bridge。
 
 ### 拒绝或有意未完成
@@ -48,7 +50,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - 任意新 Swift metadata、原生侧可识别的补丁具体 class、retroactive conformance，以及修改 Shell 已有类型的 layout、superclass 或 enum case。上面的 hosted Objective-C subclass 是冻结 superclass projection，不是动态生成任意 Swift metadata。
 - Generic 或 `inout` Shell entry、noncopyable root、任意 borrowing/consuming ABI、typed-throws root、`rethrows` 与通用 unwind cleanup。
 - 不受限 pointer、`unsafeBitCast`、任意 Objective-C selector/IMP、`dlopen`/`dlsym`、Mirror 字段修改与未知 builtin。
-- 已发布 Shell 中没有精确 `NativeImportID` 的原生调用，即使 App 中存在名字相似的 Swift 函数。补丁也不能给旧 Shell 新增 framework，或首次使用发布时未冻结的 SDK 操作。
+- 目标 Shell 中没有精确 `NativeImportID` 的原生调用，即使 App 中存在名字相似的 Swift 函数。生产补丁也不能给旧 Shell 新增 framework，或首次使用发布时未冻结的 SDK 操作。上面的受管 Debug 调色板之所以可用，正是因为正常 Debug Build 已经逐项冻结了这些 ID。
 
 ## 开发期 Live Reload 边界
 
@@ -60,6 +62,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | 修改已索引的源码 class 实例方法体 | 支持；生成 TypeOps 会把精确 `self` 引用传入 HLVM |
 | 修改 Shell 已有 struct/enum/actor 实例 root 或已有原生 static/class 方法 | 在 Shell value writeback、executor 与 native metatype ABI 实现前拒绝；这不限制 image-local 值类型的 accessor/helper |
 | 从函数体调用已有 private/internal/public 声明 | 仅在解析为同 image 函数、eligible Shell Entry 或实际生成的精确 NativeImport 时支持 |
+| 在受管 Debug body 中首次使用标准 `UIColor` static property | `UIColor` 已属于 Shell imported type surface 时支持；捕获的 frontend 会测量并把 iOS 15 调色板 getter 逐项冻结为精确 NativeImport |
 | 在现有源码文件新增普通顶层 helper、class private 实例方法或计算 accessor | 能从变化 root 到达、且具体签名与函数体落在 HLBC 子集内时支持；声明仅属于该 image |
 | 普通直接递归 | 解析到同一不可变 HLBC image 内的函数 |
 | 从源码有意调用上一代 | HLBC 不支持；应保存/激活一个恢复 generation |

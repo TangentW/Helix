@@ -773,6 +773,154 @@ struct NativeImportDiscoveryTests {
         )
     }
 
+    @Test("Managed Debug prefreezes measured UIColor class properties")
+    func prefreezesManagedUIColorProperties() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-managed-uicolor-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let sourceDirectory = directory.appendingPathComponent("Sources", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: sourceDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = sourceDirectory.appendingPathComponent("Color.swift")
+        let baseline = """
+        import UIKit
+
+        @MainActor
+        public func selectedColor(_ preferred: Bool) -> UIColor {
+            if preferred { return .systemBlue }
+            return UIColor(red: 0.2, green: 0.4, blue: 0.8, alpha: 1)
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let moduleName = "ManagedUIColorFixture"
+        let target = "arm64-apple-ios15.0-simulator"
+        let configuration = try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          \(moduleName):
+            include:
+              - Sources/**
+            entrypoints: all
+            nativeImports:
+              candidateIndex: source-and-catalog
+              emit: scoped
+              sourceScope:
+                include:
+                  - Sources/**
+                declarations:
+                  - \(moduleName).*
+                visibility: all
+                profile: bounded-read-write
+                maximumDurationMicroseconds: 2000
+                allowsMainThread: true
+        """)
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: moduleName,
+            targetTriple: target,
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library"]
+        )
+        let metadata = InterfaceArchive.ReleaseMetadata(
+            bundleID: "dev.helix.managed-uicolor",
+            buildNumber: "1",
+            shellNamespaceID: .derive(
+                bundleID: "dev.helix.managed-uicolor",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            machOUUIDs: [],
+            targetTriple: target,
+            minimumOS: .init(15),
+            xcodeBuild: "integration-test",
+            sdkBuild: sdk.buildVersion,
+            frontendInvocation: invocation,
+            transformPipelineHash: ShellBuild.transformPipelineHash,
+            sourceBaselineHash: .sha256("computed by indexer")
+        )
+        let request = FrontendReceipt.Request(
+            metadata: metadata,
+            configuration: configuration,
+            sources: [.init(logicalPath: "Sources/Color.swift", url: sourceURL)],
+            compilerURL: compilerURL
+        )
+
+        let configured = try FrontendReceipt.Adapter().generate(request)
+        let configuredNames = Set(
+            configured.receipt.nativeImportCandidates.map(\.canonicalCallee)
+        )
+        #expect(configuredNames.contains(
+            "\(moduleName).HelixExternal.UIColor.systemBlue.get"
+        ))
+        #expect(!configuredNames.contains(
+            "\(moduleName).HelixExternal.UIColor.black.get"
+        ))
+
+        var managedRequest = request
+        managedRequest.callingSurfacePolicy = .managedDebugModule
+        let managed = try FrontendReceipt.Adapter().generate(managedRequest)
+        let managedNames = Set(
+            managed.receipt.nativeImportCandidates.map(\.canonicalCallee)
+        )
+        let blackName = "\(moduleName).HelixExternal.UIColor.black.get"
+        #expect(managedNames.contains(blackName))
+        #expect(managedNames.contains(
+            "\(moduleName).HelixExternal.UIColor.systemMint.get"
+        ))
+        #expect(managedNames.contains(
+            "\(moduleName).HelixExternal.UIColor.tintColor.get"
+        ))
+        let black = try #require(managed.receipt.nativeImportCandidates.first {
+            $0.canonicalCallee == blackName
+        })
+        let blackID = try #require(black.id)
+        #expect(black.contract.kind == .staticGetter)
+        #expect(black.effects.requiresMainActor)
+
+        let shell = try ShellBuild.Materializer().materialize(
+            receipt: managed.receipt,
+            sourceRoot: directory
+        )
+        let generated = shell.bridge.sourceFiles.values.joined(separator: "\n")
+        #expect(generated.contains("UIColor.black"))
+        #expect(generated.contains("UIColor.systemMint"))
+        #expect(generated.contains("UIColor.tintColor"))
+
+        let changed = baseline.replacingOccurrences(
+            of: ".systemBlue",
+            with: ".black"
+        )
+        try Data(changed.utf8).write(to: sourceURL)
+        let patch = try ReleaseCompiler.Driver().build(
+            .init(
+                archive: shell.archive,
+                sourceFiles: [sourceURL],
+                compilerURL: compilerURL
+            )
+        )
+        #expect(patch.module.imports.contains { $0.id == blackID })
+        #expect(patch.disassembly.contains("native_apply #\(blackID.rawValue)"))
+        _ = try Verification.Engine().verify(
+            bytes: patch.bytecode,
+            shell: Verification.ShellInterface(archive: shell.archive),
+            policy: .init(
+                acceptedCapabilities: Set(shell.archive.capabilities),
+                allowedNativeImports: Set(shell.archive.nativeImports.compactMap(\.id)),
+                allowMainActorSynchronousEntries: true
+            )
+        )
+    }
+
     private func swiftPMModulesDirectory() throws -> URL {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

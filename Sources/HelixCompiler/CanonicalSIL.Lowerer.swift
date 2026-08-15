@@ -386,9 +386,7 @@ public struct Lowerer: Sendable {
         var compilerOptionalVoidValues = Set<String>()
         var optionalSourceBySomeBlock: [Bytecode.BlockID: String] = [:]
         var optionalSourceByNoneBlock: [Bytecode.BlockID: String] = [:]
-        var optionalAddressPayloadByBlock: [
-            Bytecode.BlockID: (address: String, payload: Bytecode.Register)
-        ] = [:]
+        var knownSomeOptionalAddresses: [Bytecode.BlockID: Set<String>] = [:]
         var optionalAddressSelectionConditions: [
             String: (address: String, someWhenTrue: Bool)
         ] = [:]
@@ -590,6 +588,27 @@ public struct Lowerer: Sendable {
                 current = next
             }
             return current
+        }
+
+        func isKnownSomeOptionalAddress(
+            _ token: String,
+            in blockID: Bytecode.BlockID?
+        ) -> Bool {
+            guard let blockID else { return false }
+            return knownSomeOptionalAddresses[blockID]?.contains(addressBase(token)) == true
+        }
+
+        func setKnownSomeOptionalAddress(
+            _ token: String,
+            in blockID: Bytecode.BlockID,
+            isKnownSome: Bool
+        ) {
+            let root = addressBase(token)
+            if isKnownSome {
+                knownSomeOptionalAddresses[blockID, default: []].insert(root)
+            } else {
+                knownSomeOptionalAddresses[blockID]?.remove(root)
+            }
         }
 
         func stackType(at token: String) -> Bytecode.ValueType? {
@@ -2698,6 +2717,11 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^copy_addr(?: \[(take)\])? (%[0-9]+) to (?:\[(init|assign)\] )?(%[0-9]+)$"#
             ) {
+                let blockID = current?.id
+                let sourceIsKnownSome = isKnownSomeOptionalAddress(
+                    copy[1],
+                    in: blockID
+                )
                 let sourceType = stackType(at: copy[1])
                 let destinationType = compilerAddressType(copy[3])
                 guard let source = try resolvedStackValue(
@@ -2724,6 +2748,20 @@ public struct Lowerer: Sendable {
                     try storeExistential(value, at: copy[3])
                 } else {
                     try storeConstructedValue(value, at: copy[3])
+                }
+                if let blockID, case .optional = type {
+                    setKnownSomeOptionalAddress(
+                        copy[3],
+                        in: blockID,
+                        isKnownSome: sourceIsKnownSome
+                    )
+                    if copy[0] == "take" {
+                        setKnownSomeOptionalAddress(
+                            copy[1],
+                            in: blockID,
+                            isKnownSome: false
+                        )
+                    }
                 }
                 if copy[0] == "take" {
                     stackAddressValues.removeValue(forKey: addressBase(copy[1]))
@@ -5038,6 +5076,22 @@ public struct Lowerer: Sendable {
 
             if let cast = match(
                 line,
+                pattern: #"^(%[0-9]+) = unchecked_ref_cast (%[0-9]+) to \$(.+)$"#
+            ), let targetType = try? parseType(cast[2]) {
+                let source = try resolve(cast[1], line: sourceLine)
+                let sourceType = registerTypes[Int(source.rawValue)]
+                // Swift may spell an Objective-C superclass lookup with a
+                // same-type cast of the concrete receiver. This is an alias,
+                // not authority to reinterpret one frozen reference as another.
+                if sourceType == targetType,
+                   typeEnvironment.containsReferenceNativeValue(sourceType) {
+                    values[cast[0]] = source
+                    continue
+                }
+            }
+
+            if let cast = match(
+                line,
                 pattern: #"^(%[0-9]+) = unchecked_ref_cast (%[0-9]+) to \$Optional<(.+)>$"#
             ) {
                 let source = try resolve(cast[1], line: sourceLine)
@@ -5210,17 +5264,32 @@ public struct Lowerer: Sendable {
                 pattern: #"^(%[0-9]+) = unchecked_take_enum_data_addr (%[0-9]+), #Optional\.some!enumelt$"#
             ) {
                 guard let blockID = current?.id,
-                      let projection = optionalAddressPayloadByBlock[blockID],
-                      projection.address == extraction[1]
+                      isKnownSomeOptionalAddress(extraction[1], in: blockID),
+                      let optional = stackValue(at: extraction[1]),
+                      case let .optional(wrapped) = registerTypes[Int(optional.rawValue)],
+                      compilerAddressType(extraction[1]) == .optional(wrapped)
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "unchecked Optional address payload is not dominated by its some edge"
                     )
                 }
-                let wrapped = registerTypes[Int(projection.payload.rawValue)]
+                let payload = try allocate(type: wrapped)
+                appendInstruction(
+                    .unwrapOptional(result: payload, optional: optional)
+                )
+                let root = addressBase(extraction[1])
+                stackAddressValues.removeValue(forKey: root)
+                for token in [root, extraction[1]] where values[token] == optional {
+                    values.removeValue(forKey: token)
+                }
+                setKnownSomeOptionalAddress(
+                    extraction[1],
+                    in: blockID,
+                    isKnownSome: false
+                )
                 stackAddressTypes[extraction[0]] = wrapped
-                stackAddressValues[extraction[0]] = projection.payload
-                takenOptionalPayloadRoots[extraction[0]] = projection.address
+                stackAddressValues[extraction[0]] = payload
+                takenOptionalPayloadRoots[extraction[0]] = root
                 continue
             }
 
@@ -6461,7 +6530,7 @@ public struct Lowerer: Sendable {
             ) {
                 guard branch[1] != branch[3],
                       let optional = stackValue(at: branch[0]),
-                      case let .optional(wrapped) = registerTypes[Int(optional.rawValue)]
+                      case .optional = registerTypes[Int(optional.rawValue)]
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "switch_enum_addr requires initialized Optional storage and distinct cases"
@@ -6471,53 +6540,36 @@ public struct Lowerer: Sendable {
                 let secondTarget = try parseBlockID(branch[4])
                 let someTarget = branch[1] == "some" ? firstTarget : secondTarget
                 let noneTarget = branch[1] == "none" ? firstTarget : secondTarget
-                guard optionalSourceBySomeBlock[someTarget] == nil,
-                      optionalSourceByNoneBlock[noneTarget] == nil,
-                      optionalAddressPayloadByBlock[someTarget] == nil
-                else {
+                guard knownSomeOptionalAddresses[someTarget] == nil else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "multiple Optional address switches share a case block"
                     )
                 }
-                optionalSourceBySomeBlock[someTarget] = branch[0]
-                optionalSourceByNoneBlock[noneTarget] = branch[0]
-                let payload = try allocate(type: wrapped)
-                let payloadTarget = try allocateSyntheticBlockID()
-                optionalAddressPayloadByBlock[someTarget] = (
-                    address: branch[0],
-                    payload: payload
+                // An enum-address branch only inspects storage. Ownership moves
+                // when a proven `.some` address is explicitly taken below.
+                setKnownSomeOptionalAddress(
+                    branch[0],
+                    in: someTarget,
+                    isKnownSome: true
                 )
                 try inheritCompilerAddressValue(
                     optional,
                     at: branch[0],
                     into: [someTarget, noneTarget]
                 )
+                let isSome = try allocate(type: .bool)
                 appendInstruction(
-                    .switchOptional(
-                        optional: optional,
-                        someTarget: payloadTarget,
-                        noneTarget: noneTarget
+                    .optionalIsSome(result: isSome, optional: optional)
+                )
+                appendInstruction(
+                    .conditionalBranch(
+                        condition: isSome,
+                        trueTarget: someTarget,
+                        trueArguments: [],
+                        falseTarget: noneTarget,
+                        falseArguments: []
                     )
                 )
-                finishCurrent()
-                blocks.append(
-                    .init(
-                        id: payloadTarget,
-                        parameters: [payload],
-                        instructions: [
-                            .branch(target: someTarget, arguments: []),
-                        ]
-                    )
-                )
-                if let currentSourceLocation {
-                    sourceMap.append(
-                        .init(
-                            blockID: payloadTarget,
-                            instructionOffset: 0,
-                            location: currentSourceLocation
-                        )
-                    )
-                }
                 continue
             }
 
@@ -6743,22 +6795,17 @@ public struct Lowerer: Sendable {
                 let someTarget = selection.someWhenTrue ? trueTarget : falseTarget
                 let noneTarget = selection.someWhenTrue ? falseTarget : trueTarget
                 guard let optional = stackValue(at: selection.address),
-                      case let .optional(wrapped) = registerTypes[Int(optional.rawValue)],
-                      optionalSourceBySomeBlock[someTarget] == nil,
-                      optionalSourceByNoneBlock[noneTarget] == nil,
-                      optionalAddressPayloadByBlock[someTarget] == nil
+                      case .optional = registerTypes[Int(optional.rawValue)],
+                      knownSomeOptionalAddresses[someTarget] == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Optional address condition does not dominate distinct case blocks"
                     )
                 }
-                optionalSourceBySomeBlock[someTarget] = selection.address
-                optionalSourceByNoneBlock[noneTarget] = selection.address
-                let payload = try allocate(type: wrapped)
-                let payloadTarget = try allocateSyntheticBlockID()
-                optionalAddressPayloadByBlock[someTarget] = (
-                    address: selection.address,
-                    payload: payload
+                setKnownSomeOptionalAddress(
+                    selection.address,
+                    in: someTarget,
+                    isKnownSome: true
                 )
                 try inheritCompilerAddressValue(
                     optional,
@@ -6766,31 +6813,14 @@ public struct Lowerer: Sendable {
                     into: [someTarget, noneTarget]
                 )
                 appendInstruction(
-                    .switchOptional(
-                        optional: optional,
-                        someTarget: payloadTarget,
-                        noneTarget: noneTarget
+                    .conditionalBranch(
+                        condition: try resolve(branch[0], line: sourceLine),
+                        trueTarget: trueTarget,
+                        trueArguments: [],
+                        falseTarget: falseTarget,
+                        falseArguments: []
                     )
                 )
-                finishCurrent()
-                blocks.append(
-                    .init(
-                        id: payloadTarget,
-                        parameters: [payload],
-                        instructions: [
-                            .branch(target: someTarget, arguments: []),
-                        ]
-                    )
-                )
-                if let currentSourceLocation {
-                    sourceMap.append(
-                        .init(
-                            blockID: payloadTarget,
-                            instructionOffset: 0,
-                            location: currentSourceLocation
-                        )
-                    )
-                }
                 continue
             }
 

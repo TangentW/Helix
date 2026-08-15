@@ -78,9 +78,15 @@ iOS 进程不会接收或执行 Swift 编译器、linker、JIT、dylib 或源文
 
 新 Dev Shell 会自动包含 `Swift.print(_:separator:terminator:)` 的精确 NativeImport，因此在受支持 body 中新增 `print("value: \(value)", value)` 不需要开发者配置 Catalog。编译器会把 variadic 参数降成 VM-owned `Array<Any>`，并把省略的 separator/terminator 作为通用默认参数 generator 链入同一 image。其他函数的完全具体默认参数使用同一机制；非 eligible 调用点、泛型 metadata 或跨 module public/package 默认值无法证明完整覆盖时，保存事务会明确失败并要求正常构建。
 
-对于受支持的源码 `class` 实例方法，隐藏 Bridge 会把 `self` 作为冻结的引用 `TypeID` 传入。生成的 `NativeTypeOperations` 负责 retain、identity 与类型验证，不把进程指针写进 HLBC。这条路径解决了 class method receiver；具体属性或方法操作仍必须拥有受支持的 Shell Entry 或精确 NativeImport。struct/enum writeback、actor executor 与 static/class metatype ABI 不会被猜测模拟，当前需要正常构建。
+受管 Debug Shell 还会用捕获的同一 Xcode frontend 测量 UIKit 的 Objective-C class-property getter。当 `UIColor` 已属于该 module 的 imported type surface 时，Helix 会把 iOS 15 标准调色板逐项冻结为独立、精确的 NativeImport。因此把 `.systemBlue` 改成 `.black`，或首次使用该调色板中的另一种颜色，都不需要重建。这只是有界的 Live Reload 便利能力：生产 Shell 不会自动扩张，任意 UIKit 成员不会因此获权，设备端也不会按字符串查 selector 或 symbol。
+
+对于受支持的源码 `class` 实例方法，隐藏 Bridge 会把 `self` 作为冻结的引用 `TypeID` 传入。生成的 `NativeTypeOperations` 负责 retain、identity 与类型验证，不把进程指针写进 HLBC。这条路径解决了 class method receiver；具体属性或方法操作仍必须拥有受支持的 Shell Entry 或精确 NativeImport。Objective-C class-property 读取可以走上面的实测 static-getter 路径；struct/enum writeback、actor executor、class-property 写入与任意 static/class method ABI 不会被猜测模拟，当前需要正常构建。
 
 Swift SIL 通常把 class receiver 写成 `@guaranteed self`，而 Entry/NativeImport Bridge 会拥有每一个跨设备边界的值。Helix 用物理 SIL convention 验证调用，再只对 borrowed→owned 的边界插入强类型 VM copy；同 image 的局部调用仍要求 ownership ABI 完全一致。这样既不会因无害的 borrow spelling 错误拒绝 private 实例 helper，也没有放宽类型、effect、address 或 capability 检查。
+
+frontend 可能同时用一次 upcast 表达 Objective-C `super` 调用的物理 ABI，再用同类型 `unchecked_ref_cast` 作为方法查找 token。Helix 只在两端确实是同一个冻结 reference `TypeID` 时把后者视为 alias；不同冻结类型之间的 cast 仍然拒绝。
+
+Imported Optional property 在比较或复制时还会产生 address-form SIL。Helix 会先以不消费 storage 的方式判断分支，在 `.some` case 内把证明沿精确 `copy_addr` 传递，再只 unwrap 已证明的地址；兄弟控制流的状态彼此独立，没有受 `.some` edge 支配的 payload take 会 fail closed。
 
 直接递归会解析到同一个不可变 HLBC image 内的函数，因此普通递归 Swift 语义保持不变。一次调用链会固定一个 Runtime generation，并发保存不会让它在中途混用两代实现。`LiveReload.previous` 只属于显式 Native Dynamic Replacement 实验，默认 HLBC 路径不接受它；恢复旧行为应通过再次保存或显式 generation rollback/tombstone 完成，而不是依赖隐藏的源码调用约定。
 

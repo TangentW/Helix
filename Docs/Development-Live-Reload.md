@@ -161,13 +161,24 @@ the save transaction with a full-build diagnostic. Cross-module public/package
 default changes also require a normal build because one module receipt cannot
 prove that every precompiled caller was replaced.
 
+A managed Debug Shell also measures UIKit Objective-C class-property getters
+with the captured Xcode frontend. When `UIColor` is already part of the module's
+imported type surface, Helix prefreezes the standard iOS 15 color palette as
+separate exact NativeImports. An edit such as `.systemBlue` to `.black`, or the
+first use of another color in that palette, therefore needs no rebuild. This is
+a bounded Live Reload convenience surface: it is not added to production
+Shells, does not authorize arbitrary UIKit members, and never performs runtime
+selector or symbol lookup.
+
 For a supported source `class` instance method, the hidden Bridge carries
 `self` as a frozen reference `TypeID`. Generated `NativeTypeOperations` retain,
 identify, and validate the object without exposing a process pointer in HLBC.
 This establishes the receiver path for class methods; individual property and
 method operations still need a supported Shell entry or exact NativeImport.
-Struct/enum writeback, actor executors, and static/class metatype ABI are not
-silently approximated and currently require a normal build.
+Objective-C class-property reads can use the measured static-getter path above,
+while struct/enum writeback, actor executors, class-property mutation, and
+arbitrary static/class method ABI are not silently approximated and currently
+require a normal build.
 
 Swift commonly spells a class receiver as `@guaranteed self` in SIL, while an
 Entry/NativeImport Bridge owns each value that crosses the device boundary.
@@ -176,6 +187,17 @@ typed VM copy only for that borrowed-to-owned boundary. Local same-image calls
 still require an exact ownership ABI. This prevents a harmless borrow
 convention from rejecting private instance helpers without weakening type,
 effect, address, or capability checks.
+
+The frontend may encode an Objective-C `super` dispatch with both an upcast for
+the call ABI and a same-type `unchecked_ref_cast` as its lookup token. Helix
+treats that second spelling as an alias only when both sides are the same frozen
+reference `TypeID`; a cast between different frozen types remains rejected.
+
+Imported Optional properties also produce address-form SIL when source code
+compares or copies them. Helix tests such storage without consuming it, carries
+the `.some` proof through an exact `copy_addr` in that case block, and unwraps
+only the proven address. Sibling control-flow state stays independent, and an
+unchecked payload take without a dominating `.some` edge fails closed.
 
 Direct recursion resolves to the function in the same immutable HLBC image, so
 an ordinary recursive Swift body remains ordinary recursion. A call chain pins
