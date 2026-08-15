@@ -21,10 +21,10 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 
 ### 已实现
 
-- `Bool`、有/无符号定宽整数、`Float` 与 `Double`，包括已声明的算术、位运算、比较、移位和数值转换规则。
-- `String` 字面量、拼接、支持标量的插值、count/empty、比较以及常见 prefix/suffix/contains 判断。常见的 `String.contains(Character)` 可以使用单 grapheme 的 `Character` 字面量，而不暴露 Swift 私有 Character 布局。
+- `Bool`、有/无符号定宽整数、`Float` 与 `Double`，包括已声明的算术、位运算、比较、移位和数值转换规则。完全具体化的标量 `min`/`max` 与有符号数值 `abs` 会保留 Swift 的操作数顺序、溢出、正负零和 NaN 语义。
+- `String` 字面量、拼接、支持标量的插值、Unicode `uppercased`/`lowercased`、count/empty、比较以及常见 prefix/suffix/contains 判断。可变大小转换会在分配前预留已经证明的输出上界，最终只按实际 UTF-8 结果计费。常见的 `String.contains(Character)` 可以使用单 grapheme 的 `Character` 字面量，而不暴露 Swift 私有 Character 布局。
 - Tuple、`Void` 与 `Optional`，包括 `if let`、`guard let`、`??` 和 `try?` 产生的普通控制流，也包括 Dictionary semantic SIL 产生的地址型 Optional projection。
-- Array 值语义、append、迭代、安全下标和返回新值的更新；支持键值类型下的 Dictionary 构建、查找、更新与迭代。
+- Array 值语义、append、`first`/`last`、`popLast`、迭代、安全下标和返回新值的更新；支持键值类型下的 Dictionary 构建、查找、更新、`removeValue(forKey:)` 与迭代。
 - 结构化分支、循环、switch、调用、递归、显式业务错误边和带 payload 的局部 Error 值。真实 frontend 语料已覆盖三元表达式、`repeat-while`、带标签的 `break`/`continue`、Tuple 与 Optional 模式匹配、`for case`、`while let`、`fallthrough`、提前返回，以及循环与返回清理路径上的 `defer`。
 - `Range<Int>` 半开区间 `for` 循环；Lowerer 会把它变成 HLBC 的强类型 cursor 控制流，不依赖 Swift 标准库 Range/Iterator ABI 对象。
 - 可在现有受监视文件中新加、且不导出到原生 ABI 的文件或 module scope 补丁内非递归 stored struct/enum；支持具体 `Result`、字段读取、enum switch、实例/静态计算 getter/setter 与受支持的 mutating helper。嵌套声明保留完整 namespace identity。它们是仅属于当前 generation 的 VM 值，不是新加载的 Swift metadata。
@@ -105,7 +105,7 @@ Canonical Swift debug metadata 会降低成经过 Verifier 检查的 HLBC source
 
 ## 安全与资源边界
 
-生产与开发路径都会对未知版本、capability、目标、身份、重复记录、畸形容器和资源超限 fail closed。生产字节码具有 fuel、deadline、stack、register、调用深度、值形状、NativeImport 和内存计量；下载与 live transfer 会在分配和执行前进行有界检查。
+生产与开发路径都会对未知版本、capability、目标、身份、重复记录、畸形容器和资源超限 fail closed。生产字节码具有 fuel、deadline、stack、register、调用深度、值形状、NativeImport 和内存计量。可变大小 VM 操作会原子预留已验证的最坏分配上界、退回未使用部分并保留实际计费；下载与 live transfer 会在分配和执行前进行有界检查。
 
 开发期 Live Reload 会限制 artifact 字节与保留 generation。同步 Swift NativeImport 无法被硬抢占；只有具备 deadline 与 checkpoint 的 bounded/cooperative import 才适合进入生产 Catalog。真实设备尾延迟和内存压力仍是 Gate。
 

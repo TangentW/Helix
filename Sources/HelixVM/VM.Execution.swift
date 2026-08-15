@@ -397,6 +397,27 @@ public final class InvocationBudget: @unchecked Sendable {
         }
     }
 
+    /// Reserves a proven upper bound before an operation allocates variable-size
+    /// VM storage, then retains only the measured allocation. This keeps dynamic
+    /// output fail-closed without permanently charging a conservative bound.
+    func withReservedVMHeap<Result>(
+        maximumBytes: UInt64,
+        _ allocate: () throws -> (value: Result, actualBytes: UInt64)
+    ) throws -> Result {
+        try consumeVMHeap(bytes: maximumBytes)
+        do {
+            let allocation = try allocate()
+            guard allocation.actualBytes <= maximumBytes else {
+                throw VM.RuntimeTrap.vmHeapLimitExceeded
+            }
+            refundVMHeap(bytes: maximumBytes - allocation.actualBytes)
+            return allocation.value
+        } catch {
+            refundVMHeap(bytes: maximumBytes)
+            throw error
+        }
+    }
+
     func consumeAggregateStorage(elementCount: Int) throws {
         guard elementCount >= 0 else { throw VM.RuntimeTrap.vmHeapLimitExceeded }
         let count = UInt64(elementCount).addingReportingOverflow(1)
@@ -482,6 +503,14 @@ public final class InvocationBudget: @unchecked Sendable {
                 throw VM.RuntimeTrap.nativeOwnedMemoryLimitExceeded
             }
             remainingNativeOwnedBytes -= bytes
+        }
+    }
+
+    private func refundVMHeap(bytes: UInt64) {
+        lock.withLock {
+            let restored = remainingVMHeapBytes.addingReportingOverflow(bytes)
+            precondition(!restored.overflow, "unbalanced HLVM heap reservation")
+            remainingVMHeapBytes = restored.partialValue
         }
     }
 

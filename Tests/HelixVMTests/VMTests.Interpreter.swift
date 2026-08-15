@@ -1715,6 +1715,175 @@ struct Interpreter {
         )
     }
 
+    @Test("Variable-size VM allocations reserve an upper bound and charge actual bytes")
+    func variableSizeAllocationReservationIsFailClosed() throws {
+        let budget = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: 10,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        let value = try budget.withReservedVMHeap(maximumBytes: 8) {
+            (value: 42, actualBytes: 3)
+        }
+        #expect(value == 42)
+        try budget.consumeVMHeap(bytes: 7)
+        #expect(throws: VM.RuntimeTrap.vmHeapLimitExceeded) {
+            try budget.consumeVMHeap(bytes: 1)
+        }
+
+        let rejected = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: 10,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        #expect(throws: VM.RuntimeTrap.vmHeapLimitExceeded) {
+            try rejected.withReservedVMHeap(maximumBytes: 8) {
+                (value: 42, actualBytes: 9)
+            }
+        }
+        try rejected.consumeVMHeap(bytes: 10)
+    }
+
+    @Test("String case mapping proves its output bound before allocating")
+    func stringCaseMappingReservesHeapBeforeAllocation() throws {
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "uppercase",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .string,
+            registerTypes: [.string, .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .stringTransform(
+                            result: .init(rawValue: 1),
+                            operation: .uppercase,
+                            string: .init(rawValue: 0)
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let input = "ß"
+        let inputBytes = UInt64(input.utf8.count)
+        let frameBytes = UInt64(2 * MemoryLayout<VM.Value?>.stride)
+        let outputBound = try VM.StringAllocation
+            .maximumCaseMappingUTF8ByteCount(for: input)
+        let exactBudget = frameBytes + inputBytes + outputBound
+
+        func image(maximumHeapBytes: UInt64) throws -> Verification.Image {
+            try makeVerified(
+                function: function,
+                limits: .init(
+                    maxVMHeapBytes: maximumHeapBytes,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                capabilities: [.baselineV1, .stringsV1],
+                signature: .init(parameters: ["Swift.String"], result: "Swift.String"),
+                parameterTypes: [.string],
+                resultType: .string
+            )
+        }
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: exactBudget - 1),
+                arguments: [.string(input)]
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: exactBudget),
+                arguments: [.string(input)]
+            ) == .returned(.string("SS"))
+        )
+    }
+
+    @Test("Scalar stringification proves its output bound before allocating")
+    func scalarStringificationReservesHeapBeforeAllocation() throws {
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "stringify",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .string,
+            registerTypes: [.int64, .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .stringify(
+                            result: .init(rawValue: 1),
+                            value: .init(rawValue: 0)
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let input = VM.Value.integer(
+            try VM.Integer(signed: 42, bitWidth: 64, isSigned: true)
+        )
+        let outputBound = try VM.StringAllocation
+            .maximumStringificationUTF8ByteCount(for: input)
+        let frameBytes = UInt64(2 * MemoryLayout<VM.Value?>.stride)
+        let exactBudget = frameBytes + outputBound
+
+        func image(maximumHeapBytes: UInt64) throws -> Verification.Image {
+            try makeVerified(
+                function: function,
+                limits: .init(
+                    maxVMHeapBytes: maximumHeapBytes,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                capabilities: [.baselineV1, .stringsV1],
+                signature: .init(parameters: ["Swift.Int"], result: "Swift.String"),
+                parameterTypes: [.int64],
+                resultType: .string
+            )
+        }
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: exactBudget - 1),
+                arguments: [input]
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: exactBudget),
+                arguments: [input]
+            ) == .returned(.string("42"))
+        )
+
+        let boundedScalars: [VM.Value] = [
+            .bool(false),
+            .integer(try VM.Integer(signed: .min, bitWidth: 64, isSigned: true)),
+            .integer(try VM.Integer(rawBits: .max, bitWidth: 64, isSigned: false)),
+            .float(-Double.greatestFiniteMagnitude, bitWidth: 64),
+            .float(-Double(Float.greatestFiniteMagnitude), bitWidth: 32),
+            .float(.nan, bitWidth: 64),
+            .float(-.infinity, bitWidth: 64),
+        ]
+        for scalar in boundedScalars {
+            let text = try VM.StringAllocation.stringify(scalar)
+            let maximum = try VM.StringAllocation
+                .maximumStringificationUTF8ByteCount(for: scalar)
+            #expect(UInt64(text.utf8.count) <= maximum)
+        }
+    }
+
     @Test("Array boundary storage is typed and charged before execution")
     func arrayBoundaryConsumesHeapBudget() throws {
         let arrayType = Bytecode.ValueType.array(.int64)

@@ -29,18 +29,22 @@ does not by itself certify a physical device or distribution channel.
 
 - `Bool`, signed and unsigned fixed-width integers, `Float`, and `Double`, with
   the documented arithmetic, bitwise, comparison, shift, and supported numeric
-  conversion rules.
+  conversion rules. Fully concrete scalar `min`/`max` and signed numeric `abs`
+  preserve Swift's operand-order, overflow, signed-zero, and NaN behavior.
 - `String` literals, concatenation, interpolation for supported scalar values,
-  count/empty checks, comparisons, and common prefix/suffix/contains predicates.
-  A one-grapheme `Character` literal is supported for the common
+  Unicode `uppercased`/`lowercased` transforms, count/empty checks, comparisons,
+  and common prefix/suffix/contains predicates. Variable-size transforms reserve
+  a proven output bound before allocation and charge only their measured UTF-8
+  result. A one-grapheme `Character` literal is supported for the common
   `String.contains(Character)` form without exposing Swift's private Character
   layout.
 - Tuple, `Void`, and `Optional`, including the ordinary control flow produced by
   `if let`, `guard let`, `??`, and `try?`, including address-based Optional
   projection emitted by semantic Dictionary lookup SIL.
-- Array value semantics, append, iteration, checked subscript access, and
-  value-returning updates; Dictionary construction, lookup, update, and
-  iteration for supported key and value types.
+- Array value semantics, append, `first`/`last`, `popLast`, iteration, checked
+  subscript access, and value-returning updates; Dictionary construction,
+  lookup, update, `removeValue(forKey:)`, and iteration for supported key and
+  value types.
 - Structured branches, loops, switches, calls, recursion, checked business
   error edges, and local payload-carrying Error values. Real-frontend coverage
   includes ternary expressions, `repeat-while`, labeled `break`/`continue`,
@@ -240,8 +244,10 @@ the Mac with the original logical source diagnostic.
 Production and development fail closed on unknown versions, capabilities,
 targets, identities, duplicate records, malformed containers, and resource
 limits. Production bytecode has fuel, deadline, stack, register, call-depth,
-value-shape, native import, and memory accounting. Downloads and live transfers
-are bounded before allocation or execution.
+value-shape, native import, and memory accounting. Variable-size VM operations
+atomically reserve a verified worst-case allocation, refund the unused portion,
+and retain the measured charge. Downloads and live transfers are bounded before
+allocation or execution.
 
 Development Live Reload bounds artifact bytes and retained generations. A
 synchronous Swift NativeImport cannot be forcibly preempted;

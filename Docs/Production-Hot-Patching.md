@@ -165,10 +165,11 @@ device performance qualification.
 ## Current language boundary
 
 The current wire versions are HLBC 1.0 and HLXI 1.0. The implemented subset
-includes common integer and floating-point operations and conversions, Bool,
-String operations and interpolation, one-grapheme Character literals for the
-bounded String predicate path, tuple/Optional including address projection,
-Array and Dictionary value semantics, VM-owned `Any` and common dynamic casts,
+includes common integer and floating-point operations and conversions,
+`min`/`max`/`abs`, Bool, Unicode String transforms and interpolation,
+one-grapheme Character literals for the bounded String predicate path,
+tuple/Optional including address projection, Array boundary/mutation and
+Dictionary removal value semantics, VM-owned `Any` and common dynamic casts,
 half-open `Range<Int>` loops, structured
 control flow, newly introduced non-exported ordinary/private helpers, computed
 accessors, file- or module-scope patch-local struct/enum, pure HLVM classes, and

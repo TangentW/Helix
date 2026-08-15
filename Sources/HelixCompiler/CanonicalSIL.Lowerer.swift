@@ -6,94 +6,6 @@ extension CanonicalSIL {
 public struct Lowerer: Sendable {
     private let typeEnvironment: CanonicalSIL.TypeEnvironment
 
-    private enum SwiftCoreIntrinsic: Equatable {
-        case stringLiteral
-        case characterLiteral
-        case stringEqual
-        case stringLess
-        case stringConcat
-        case stringCount
-        case stringIsEmpty
-        case stringHasPrefix
-        case stringHasSuffix
-        case stringContains
-        case stringInterpolationInit
-        case stringInterpolationAppendLiteral
-        case stringInterpolationAppendValue
-        case stringFromInterpolation
-        case arrayCount
-        case collectionIsEmpty
-        case arraySubscript
-        case arraySubscriptModify
-        case collectionFirst
-        case sequenceContains
-        case arrayAppend
-        case collectionMakeIterator
-        case indexingIteratorNext
-        case dictionaryCount
-        case dictionaryIsEmpty
-        case dictionarySubscriptGet
-        case dictionarySubscriptSet
-        case dictionaryLiteral
-        case dictionaryMakeIterator
-        case dictionaryIteratorNext
-        case allocateUninitializedArray
-        case finalizeUninitializedArray
-        case assertionFailure
-
-        init?(mangledName: String) {
-            switch mangledName {
-            case "$sSS21_builtinStringLiteral17utf8CodeUnitCount7isASCIISSBp_BwBi1_tcfC":
-                self = .stringLiteral
-            case "$sSJ38_builtinExtendedGraphemeClusterLiteral17utf8CodeUnitCount7isASCIISJBp_BwBi1_tcfC":
-                self = .characterLiteral
-            case "$sSS2eeoiySbSS_SStFZ": self = .stringEqual
-            case "$sSS1loiySbSS_SStFZ": self = .stringLess
-            case "$sSS1poiyS2S_SStFZ": self = .stringConcat
-            case "$sSS5countSivg": self = .stringCount
-            case "$sSS7isEmptySbvg": self = .stringIsEmpty
-            case "$sSS9hasPrefixySbSSF": self = .stringHasPrefix
-            case "$sSS9hasSuffixySbSSF": self = .stringHasSuffix
-            case "$sSy17_StringProcessingE8containsySbSSF": self = .stringContains
-            case "$ss26DefaultStringInterpolationV15literalCapacity18interpolationCountABSi_SitcfC":
-                self = .stringInterpolationInit
-            case "$ss26DefaultStringInterpolationV13appendLiteralyySSF":
-                self = .stringInterpolationAppendLiteral
-            case "$ss26DefaultStringInterpolationV06appendC0yyxs06CustomB11ConvertibleRzlF":
-                self = .stringInterpolationAppendValue
-            case "$ss26DefaultStringInterpolationV06appendC0yyxs06CustomB11ConvertibleRzs20TextOutputStreamableRzlF":
-                self = .stringInterpolationAppendValue
-            case "$sSS19stringInterpolationSSs013DefaultStringB0V_tcfC":
-                self = .stringFromInterpolation
-            case "$sSa5countSivg": self = .arrayCount
-            case "$sSlsE7isEmptySbvg": self = .collectionIsEmpty
-            case "$sSayxSicig": self = .arraySubscript
-            case "$sSayxSiciM": self = .arraySubscriptModify
-            case "$sSlsE5first7ElementQzSgvg": self = .collectionFirst
-            case "$sSTsSQ7ElementRpzrlE8containsySbABF": self = .sequenceContains
-            case "$sSa6appendyyxnF": self = .arrayAppend
-            case "$sSlss16IndexingIteratorVyxG0B0RtzrlE04makeB0ACyF":
-                self = .collectionMakeIterator
-            case "$ss16IndexingIteratorV4next7ElementQzSgyF":
-                self = .indexingIteratorNext
-            case "$sSD5countSivg": self = .dictionaryCount
-            case "$sSD7isEmptySbvg": self = .dictionaryIsEmpty
-            case "$sSDyq_Sgxcig": self = .dictionarySubscriptGet
-            case "$sSDyq_Sgxcis": self = .dictionarySubscriptSet
-            case "$sSD17dictionaryLiteralSDyxq_Gx_q_td_tcfC": self = .dictionaryLiteral
-            case "$sSD12makeIteratorSD0B0Vyxq__GyF": self = .dictionaryMakeIterator
-            case "$sSD8IteratorV4nextx3key_q_5valuetSgyF": self = .dictionaryIteratorNext
-            case "$ss27_allocateUninitializedArrayySayxG_BptBwlF":
-                self = .allocateUninitializedArray
-            case "$ss27_finalizeUninitializedArrayySayxGABnlF":
-                self = .finalizeUninitializedArray
-            case "$ss17_assertionFailure__4file4line5flagss5NeverOs12StaticStringV_A2HSus6UInt32VtF":
-                self = .assertionFailure
-            default: return nil
-            }
-        }
-    }
-
     /// Swift emits these Foundation bridges around imported Objective-C APIs.
     /// HLBC calls a generated, Swift-typed NativeImport instead, so lowering
     /// preserves the Swift value while validating the exact compiler bridge.
@@ -1123,6 +1035,50 @@ public struct Lowerer: Sendable {
             current = nil
         }
 
+        func appendConditionalTrap(
+            condition: Bytecode.Register,
+            reason: Bytecode.TrapReason
+        ) throws {
+            guard registerTypes[Int(condition.rawValue)] == .bool else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "conditional trap requires a Bool condition"
+                )
+            }
+            let trapID = try allocateSyntheticBlockID()
+            let continuationID = try allocateSyntheticBlockID()
+            appendInstruction(
+                .conditionalBranch(
+                    condition: condition,
+                    trueTarget: trapID,
+                    trueArguments: [],
+                    falseTarget: continuationID,
+                    falseArguments: []
+                )
+            )
+            finishCurrent()
+            blocks.append(
+                IntermediateRepresentation.Block(
+                    id: trapID,
+                    parameters: [],
+                    instructions: [.trap(reason)]
+                )
+            )
+            if let currentSourceLocation {
+                sourceMap.append(
+                    .init(
+                        blockID: trapID,
+                        instructionOffset: 0,
+                        location: currentSourceLocation
+                    )
+                )
+            }
+            current = IntermediateRepresentation.Block(
+                id: continuationID,
+                parameters: [],
+                instructions: []
+            )
+        }
+
         func materializeArrayLiteralElements(
             _ pending: PendingArrayLiteral
         ) throws -> [Bytecode.Register] {
@@ -1469,6 +1425,139 @@ public struct Lowerer: Sendable {
             }
 
             switch intrinsic {
+            case .minimum, .maximum:
+                guard arguments.count == 3, !genericArguments.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift min/max has unsupported arguments"
+                    )
+                }
+                let type = try parseType(genericArguments)
+                switch type {
+                case .integer, .float, .string:
+                    break
+                default:
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "min/max operand \(type)"
+                    )
+                }
+                guard compilerAddressType(arguments[0]) == type,
+                      stackType(at: arguments[1]) == type,
+                      stackType(at: arguments[2]) == type,
+                      let lhs = try resolvedStackValue(at: arguments[1], line: line),
+                      let rhs = try resolvedStackValue(at: arguments[2], line: line),
+                      registerTypes[Int(lhs.rawValue)] == type,
+                      registerTypes[Int(rhs.rawValue)] == type
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift min/max operands do not match their specialization"
+                    )
+                }
+                let condition = try allocate(type: .bool)
+                let predicate: Bytecode.ComparisonPredicate = intrinsic == .minimum
+                    ? .lessThan
+                    : .lessThanOrEqual
+                appendInstruction(
+                    .compare(
+                        result: condition,
+                        predicate: predicate,
+                        lhs: intrinsic == .minimum ? rhs : lhs,
+                        rhs: intrinsic == .minimum ? lhs : rhs
+                    )
+                )
+                let result = try allocate(type: type)
+                appendInstruction(
+                    .select(
+                        result: result,
+                        condition: condition,
+                        trueValue: rhs,
+                        falseValue: lhs
+                    )
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case .absoluteValue:
+                guard arguments.count == 2, !genericArguments.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift abs has unsupported arguments"
+                    )
+                }
+                let type = try parseType(genericArguments)
+                guard compilerAddressType(arguments[0]) == type,
+                      stackType(at: arguments[1]) == type,
+                      let operand = try resolvedStackValue(
+                        at: arguments[1],
+                        line: line
+                      ),
+                      registerTypes[Int(operand.rawValue)] == type
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift abs operand does not match its specialization"
+                    )
+                }
+                let result: Bytecode.Register
+                switch type {
+                case .integer(_, signed: true):
+                    let zero = try allocate(type: type)
+                    appendInstruction(.constantInteger(result: zero, value: 0))
+                    let isNegative = try allocate(type: .bool)
+                    appendInstruction(
+                        .compare(
+                            result: isNegative,
+                            predicate: .lessThan,
+                            lhs: operand,
+                            rhs: zero
+                        )
+                    )
+                    let negated = try allocate(type: type)
+                    let overflow = try allocate(type: .bool)
+                    appendInstruction(
+                        .checkedBinary(
+                            result: negated,
+                            overflow: overflow,
+                            operation: .subtract,
+                            lhs: zero,
+                            rhs: operand
+                        )
+                    )
+                    try appendConditionalTrap(
+                        condition: overflow,
+                        reason: .integerOverflow
+                    )
+                    result = try allocate(type: type)
+                    appendInstruction(
+                        .select(
+                            result: result,
+                            condition: isNegative,
+                            trueValue: negated,
+                            falseValue: operand
+                        )
+                    )
+                case .float:
+                    result = try allocate(type: type)
+                    appendInstruction(
+                        .floatingUnary(
+                            result: result,
+                            operation: .absolute,
+                            operand: operand
+                        )
+                    )
+                default:
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "abs operand \(type)"
+                    )
+                }
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
             case .assertionFailure:
                 guard genericArguments.isEmpty,
                       arguments.count == 5,
@@ -1600,6 +1689,28 @@ public struct Lowerer: Sendable {
                     intrinsic == .stringCount
                         ? .stringCount(result: result, string: operand)
                         : .stringIsEmpty(result: result, string: operand)
+                )
+
+            case let .stringTransform(operation):
+                guard genericArguments.isEmpty, arguments.count == 1 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String transform has unsupported arguments"
+                    )
+                }
+                let operand = try resolve(arguments[0], line: line)
+                guard registerTypes[Int(operand.rawValue)] == .string else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String transform operand must be String"
+                    )
+                }
+                let result = try allocate(type: .string)
+                values[resultToken] = result
+                appendInstruction(
+                    .stringTransform(
+                        result: result,
+                        operation: operation,
+                        string: operand
+                    )
                 )
 
             case .stringHasPrefix, .stringHasSuffix:
@@ -1823,12 +1934,12 @@ public struct Lowerer: Sendable {
                     "Array.subscript.modify must be consumed by begin_apply"
                 )
 
-            case .collectionFirst:
+            case let .collectionBoundary(operation):
                 guard arguments.count == 2, !genericArguments.isEmpty,
                       let outputType = stackType(at: arguments[0])
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Collection.first has unsupported arguments"
+                        "Collection boundary getter has unsupported arguments"
                     )
                 }
                 let array = try resolve(arguments[1], line: line)
@@ -1838,11 +1949,17 @@ public struct Lowerer: Sendable {
                       outputType == .optional(element)
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Collection.first types do not match Array.Element"
+                        "Collection boundary types do not match Array.Element"
                     )
                 }
                 let result = try allocate(type: .optional(element))
-                appendInstruction(.arrayFirst(result: result, array: array))
+                appendInstruction(
+                    .arrayBoundary(
+                        result: result,
+                        operation: operation,
+                        array: array
+                    )
+                )
                 try storeConstructedValue(result, at: arguments[0], mode: .initialize)
                 voidValues.insert(resultToken)
 
@@ -1912,6 +2029,48 @@ public struct Lowerer: Sendable {
                     .arrayAppend(result: result, array: array, value: value)
                 )
                 try storeConstructedValue(result, at: arguments[1], mode: .assign)
+                voidValues.insert(resultToken)
+
+            case .arrayPopLast:
+                guard arguments.count == 2,
+                      !genericArguments.isEmpty,
+                      let outputType = compilerAddressType(arguments[0]),
+                      let arrayType = compilerAddressType(arguments[1]),
+                      let array = stackValue(at: arguments[1])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array.popLast has unsupported inout arguments"
+                    )
+                }
+                let collectionType = try parseType(genericArguments)
+                guard case let .array(element) = collectionType,
+                      arrayType == collectionType,
+                      outputType == .optional(element),
+                      registerTypes[Int(array.rawValue)] == collectionType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array.popLast types do not match Array.Element"
+                    )
+                }
+                let removed = try allocate(type: outputType)
+                let updated = try allocate(type: collectionType)
+                appendInstruction(
+                    .arrayPopLast(
+                        elementResult: removed,
+                        arrayResult: updated,
+                        array: array
+                    )
+                )
+                try storeConstructedValue(
+                    removed,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                try storeConstructedValue(
+                    updated,
+                    at: arguments[1],
+                    mode: .assign
+                )
                 voidValues.insert(resultToken)
 
             case .collectionMakeIterator:
@@ -2107,6 +2266,55 @@ public struct Lowerer: Sendable {
                     )
                 )
                 try storeConstructedValue(result, at: arguments[2], mode: .assign)
+                voidValues.insert(resultToken)
+
+            case .dictionaryRemoveValue:
+                guard arguments.count == 3,
+                      let outputType = compilerAddressType(arguments[0]),
+                      let keyType = compilerAddressType(arguments[1]),
+                      let key = stackValue(at: arguments[1]),
+                      let dictionaryType = compilerAddressType(arguments[2]),
+                      let dictionary = stackValue(at: arguments[2])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary.removeValue has unsupported arguments"
+                    )
+                }
+                let types = try parseDictionaryGenericArguments(genericArguments)
+                let expectedDictionary = Bytecode.ValueType.dictionary(
+                    key: types.key,
+                    value: types.value
+                )
+                guard outputType == .optional(types.value),
+                      keyType == types.key,
+                      registerTypes[Int(key.rawValue)] == keyType,
+                      dictionaryType == expectedDictionary,
+                      registerTypes[Int(dictionary.rawValue)] == dictionaryType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary.removeValue types do not match Dictionary"
+                    )
+                }
+                let removed = try allocate(type: outputType)
+                let updated = try allocate(type: dictionaryType)
+                appendInstruction(
+                    .dictionaryRemove(
+                        valueResult: removed,
+                        dictionaryResult: updated,
+                        dictionary: dictionary,
+                        key: key
+                    )
+                )
+                try storeConstructedValue(
+                    removed,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                try storeConstructedValue(
+                    updated,
+                    at: arguments[2],
+                    mode: .assign
+                )
                 voidValues.insert(resultToken)
 
             case .dictionaryLiteral:
@@ -6399,35 +6607,10 @@ public struct Lowerer: Sendable {
 
             if let failure = match(line, pattern: #"^cond_fail (%[0-9]+), \"([^\"]*)\"$"#) {
                 let condition = try resolve(failure[0], line: sourceLine)
-                let trapID = try allocateSyntheticBlockID()
-                let continuationID = try allocateSyntheticBlockID()
-                appendInstruction(
-                    .conditionalBranch(
-                        condition: condition,
-                        trueTarget: trapID,
-                        trueArguments: [],
-                        falseTarget: continuationID,
-                        falseArguments: []
-                    )
+                try appendConditionalTrap(
+                    condition: condition,
+                    reason: trapReason(for: failure[1])
                 )
-                finishCurrent()
-                blocks.append(
-                    IntermediateRepresentation.Block(
-                        id: trapID,
-                        parameters: [],
-                        instructions: [.trap(trapReason(for: failure[1]))]
-                    )
-                )
-                if let currentSourceLocation {
-                    sourceMap.append(
-                        .init(
-                            blockID: trapID,
-                            instructionOffset: 0,
-                            location: currentSourceLocation
-                        )
-                    )
-                }
-                current = IntermediateRepresentation.Block(id: continuationID, parameters: [], instructions: [])
                 continue
             }
 

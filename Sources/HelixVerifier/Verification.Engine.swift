@@ -1808,6 +1808,16 @@ public struct Engine: Verification.ImageVerifying {
             guard type(result) == .bool, type(lhs) == .bool, type(rhs) == .bool else {
                 throw fail("boolean binary operands and result must be Bool")
             }
+        case let .select(result, condition, trueValue, falseValue):
+            guard type(condition) == .bool,
+                  type(result) == type(trueValue),
+                  type(trueValue) == type(falseValue)
+            else {
+                throw fail("select requires a Bool condition and matching value types")
+            }
+            guard isCopyable(type(result), shell: shell) else {
+                throw fail("select requires a copyable value type")
+            }
         case let .stringConcat(result, lhs, rhs):
             guard capabilities.contains(.stringsV1) else {
                 throw fail("String concatenation requires \(Core.Capability.stringsV1)")
@@ -1838,6 +1848,13 @@ public struct Engine: Verification.ImageVerifying {
                   type(pattern) == .string
             else {
                 throw fail("String predicates need two String operands and a Bool result")
+            }
+        case let .stringTransform(result, _, string):
+            guard capabilities.contains(.stringsV1) else {
+                throw fail("String transforms require \(Core.Capability.stringsV1)")
+            }
+            guard type(result) == .string, type(string) == .string else {
+                throw fail("string transform operand and result must both be String")
             }
         case let .stringify(result, value):
             guard capabilities.contains(.stringsV1) else {
@@ -1888,17 +1905,17 @@ public struct Engine: Verification.ImageVerifying {
             guard isCopyable(element, shell: shell) else {
                 throw fail("array_get requires a copyable element type")
             }
-        case let .arrayFirst(result, array):
+        case let .arrayBoundary(result, _, array):
             guard capabilities.contains(.collectionsV1) else {
-                throw fail("Array.first requires \(Core.Capability.collectionsV1)")
+                throw fail("Array boundary lookup requires \(Core.Capability.collectionsV1)")
             }
             guard case let .array(element) = type(array),
                   type(result) == .optional(element)
             else {
-                throw fail("array_first result must be Optional<Array.Element>")
+                throw fail("array boundary result must be Optional<Array.Element>")
             }
             guard isCopyable(element, shell: shell) else {
-                throw fail("array_first requires a copyable element type")
+                throw fail("array boundary lookup requires a copyable element type")
             }
         case let .arrayContains(result, array, value):
             guard capabilities.contains(.collectionsV1) else {
@@ -1942,6 +1959,19 @@ public struct Engine: Verification.ImageVerifying {
             }
             guard isCopyable(element, shell: shell) else {
                 throw fail("array_update requires a copyable element type")
+            }
+        case let .arrayPopLast(elementResult, arrayResult, array):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array.popLast requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(arrayResult) == type(array),
+                  type(elementResult) == .optional(element)
+            else {
+                throw fail("array_pop_last results must match Array.Element")
+            }
+            guard isCopyable(element, shell: shell) else {
+                throw fail("array_pop_last requires a copyable element type")
             }
         case let .arrayNext(result, array, indexSlot):
             guard capabilities.contains(.collectionsV1) else {
@@ -2009,6 +2039,20 @@ public struct Engine: Verification.ImageVerifying {
             }
             guard isCopyable(keyType, shell: shell), isCopyable(valueType, shell: shell) else {
                 throw fail("dictionary_update requires copyable key and value types")
+            }
+        case let .dictionaryRemove(valueResult, dictionaryResult, dictionary, key):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Dictionary.removeValue requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .dictionary(keyType, valueType) = type(dictionary),
+                  type(dictionaryResult) == type(dictionary),
+                  type(key) == keyType,
+                  type(valueResult) == .optional(valueType)
+            else {
+                throw fail("dictionary_remove results must match Dictionary key and value types")
+            }
+            guard isCopyable(keyType, shell: shell), isCopyable(valueType, shell: shell) else {
+                throw fail("dictionary_remove requires copyable key and value types")
             }
         case let .dictionaryNext(result, dictionary, indexSlot):
             guard capabilities.contains(.collectionsV1) else {
@@ -2623,13 +2667,25 @@ public struct Engine: Verification.ImageVerifying {
                         }
                     }
                     if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
-                case let .arrayGet(result, _, _), let .arrayFirst(result, _),
+                case let .select(result, _, _, _),
+                     let .arrayGet(result, _, _),
+                     let .arrayBoundary(result, _, _),
                      let .arrayAppend(result, _, _), let .arrayUpdate(result, _, _, _),
                      let .arrayNext(result, _, _),
                      let .makeDictionary(result, _), let .dictionaryGet(result, _, _),
                      let .dictionaryUpdate(result, _, _, _),
                      let .dictionaryNext(result, _, _):
                     if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+                case let .arrayPopLast(elementResult, arrayResult, _):
+                    for result in [elementResult, arrayResult]
+                    where function.type(of: result)?.requiresLinearOwnership == true {
+                        live.insert(result)
+                    }
+                case let .dictionaryRemove(valueResult, dictionaryResult, _, _):
+                    for result in [valueResult, dictionaryResult]
+                    where function.type(of: result)?.requiresLinearOwnership == true {
+                        live.insert(result)
+                    }
                 case .constantString:
                     break
                 case let .apply(result, callee, arguments):
@@ -2762,7 +2818,8 @@ public struct Engine: Verification.ImageVerifying {
                 case .constantInteger, .constantBool, .constantFloat, .checkedBinary,
                      .floatingBinary, .floatingUnary, .integerConvert, .floatingConvert,
                      .booleanBinary, .stringConcat, .stringCount, .stringIsEmpty,
-                     .stringPredicate, .stringify, .arrayCount, .arrayIsEmpty, .arrayContains,
+                     .stringPredicate, .stringTransform, .stringify,
+                     .arrayCount, .arrayIsEmpty, .arrayContains,
                      .dictionaryCount, .dictionaryIsEmpty, .compare:
                     break
                 }

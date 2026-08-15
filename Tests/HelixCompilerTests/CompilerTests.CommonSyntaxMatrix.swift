@@ -1,10 +1,6 @@
-import Foundation
 import HelixBytecode
-import HelixCore
-import HelixVerifier
 import HelixVM
 import Testing
-@testable import HelixCompiler
 
 extension CompilerTests {
 @Suite("Common Swift syntax matrix")
@@ -219,7 +215,10 @@ struct CommonSyntaxMatrix {
         var failures: [String] = []
         for probe in probes {
             do {
-                let fixture = try compileAndVerify(probe)
+                let fixture = try FrontendExecutionHarness.compile(
+                    source: probe.source,
+                    functionName: probe.name
+                )
                 let result = VM.Interpreter().invoke(
                     entry: fixture.entry,
                     image: fixture.image,
@@ -238,91 +237,6 @@ struct CommonSyntaxMatrix {
         if !failures.isEmpty {
             Issue.record("common syntax gaps:\n\(failures.joined(separator: "\n"))")
         }
-    }
-
-    private func compileAndVerify(
-        _ probe: Probe
-    ) throws -> (image: Verification.Image, entry: Core.EntryIndex) {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "helix-common-syntax-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: false
-        )
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let sourceURL = directory.appendingPathComponent("Patch.swift")
-        try Data((probe.source + "\n").utf8).write(to: sourceURL)
-        let sil = try SwiftFrontend.Driver().emitCanonicalSIL(
-            sourceFiles: [sourceURL],
-            moduleName: "HelixCommonSyntaxFixture",
-            optimization: "-Onone",
-            additionalArguments: ["-Xfrontend", "-disable-sil-perf-optzns"],
-            purpose: .semanticLowering
-        )
-        let file = try CanonicalSIL.File(text: sil)
-        let functions = file.functions.filter {
-            $0.mangledName.contains(probe.name)
-        }.sorted {
-            ($0.mangledName.utf8.count, $0.mangledName)
-                < ($1.mangledName.utf8.count, $1.mangledName)
-        }
-        let function = try #require(functions.first)
-        let lowerer = CanonicalSIL.Lowerer(typeEnvironment: file.typeEnvironment)
-        let signature = try lowerer.parseFunctionType(function.loweredType)
-        let namespace = Core.ShellNamespaceID.derive(
-            bundleID: "dev.helix.common-syntax",
-            buildNumber: "1",
-            seed: "fixture"
-        )
-        let key = try Core.FunctionKey.derive(
-            namespace: namespace,
-            module: "HelixCommonSyntaxFixture",
-            sourceFileLogicalID: "Patch.swift",
-            canonicalDeclaration: "func \(probe.name)",
-            loweredSignature: .init(parameters: [], result: "Swift.Void"),
-            role: .function
-        )
-        let shellHash = Core.Digest.sha256("helix-common-syntax-\(probe.name)")
-        let compatibility = Core.Compatibility(
-            runtime: Core.Versions.runtime,
-            bytecode: Core.Versions.bytecode,
-            interfaceArchive: Core.Versions.interfaceArchive,
-            compilerFingerprint: "common-syntax-fixture"
-        )
-        let entry = Core.EntryIndex(rawValue: 0)
-        let compiled = try PatchCompiler.Driver().compile(
-            .init(
-                canonicalSIL: sil,
-                mangledName: function.mangledName,
-                displayName: probe.name,
-                functionKey: key,
-                entryIndex: entry,
-                shellInterfaceHash: shellHash,
-                compatibility: compatibility
-            )
-        )
-        let shell = try Verification.ShellInterface(
-            interfaceHash: shellHash,
-            compatibility: compatibility,
-            capabilities: compiled.module.capabilities,
-            entries: [
-                .init(
-                    index: entry,
-                    key: key,
-                    parameterTypes: signature.parameters,
-                    resultType: signature.result,
-                    effects: signature.effects
-                ),
-            ]
-        )
-        let image = try Verification.Engine().verify(
-            bytes: compiled.bytecode,
-            shell: shell,
-            policy: .init(acceptedCapabilities: compiled.module.capabilities)
-        )
-        return (image, entry)
     }
 
     private func integer(_ value: Int64) throws -> VM.Value {

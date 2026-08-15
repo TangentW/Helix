@@ -2358,13 +2358,19 @@ struct Pipeline {
         }
     }
 
-    @Test("Unsupported String APIs remain a stable compile-time rejection")
-    func rejectsUnsupportedStringAPI() throws {
-        let source = "@inline(never) public func upper(_ value: String) -> String { value.uppercased() }"
+    @Test("Locale-dependent String transforms remain a stable compile-time rejection")
+    func rejectsLocaleDependentStringTransform() throws {
+        let source = """
+        import Foundation
+        @inline(never)
+        public func localeUpper(_ value: String) -> String {
+            value.uppercased(with: Locale(identifier: "tr_TR"))
+        }
+        """
         #expect(throws: CanonicalSIL.LoweringError.self) {
             _ = try compileFixture(
                 source: source,
-                functionName: "upper",
+                functionName: "localeUpper",
                 signature: .init(parameters: ["Swift.String"], result: "Swift.String"),
                 parameterTypes: [.string],
                 resultType: .string,

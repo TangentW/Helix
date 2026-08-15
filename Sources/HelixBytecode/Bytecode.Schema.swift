@@ -168,6 +168,7 @@ public enum FloatBinaryOperation: String, Codable, Hashable, Sendable {
 
 public enum FloatUnaryOperation: String, Codable, Hashable, Sendable {
     case negate
+    case absolute
 }
 
 public enum IntegerConversionOperation: String, Codable, Hashable, Sendable {
@@ -188,6 +189,16 @@ public enum StringPredicateOperation: String, Codable, Hashable, Sendable {
     case hasPrefix
     case hasSuffix
     case contains
+}
+
+public enum StringTransformOperation: String, Codable, Hashable, Sendable {
+    case uppercase
+    case lowercase
+}
+
+public enum ArrayBoundaryOperation: String, Codable, Hashable, Sendable {
+    case first
+    case last
 }
 
 public enum BooleanBinaryOperation: String, Codable, Hashable, Sendable {
@@ -362,6 +373,12 @@ public enum Instruction: Codable, Hashable, Sendable {
         lhs: Bytecode.Register,
         rhs: Bytecode.Register
     )
+    case select(
+        result: Bytecode.Register,
+        condition: Bytecode.Register,
+        trueValue: Bytecode.Register,
+        falseValue: Bytecode.Register
+    )
     case stringConcat(
         result: Bytecode.Register,
         lhs: Bytecode.Register,
@@ -375,6 +392,11 @@ public enum Instruction: Codable, Hashable, Sendable {
         string: Bytecode.Register,
         pattern: Bytecode.Register
     )
+    case stringTransform(
+        result: Bytecode.Register,
+        operation: Bytecode.StringTransformOperation,
+        string: Bytecode.Register
+    )
     case stringify(result: Bytecode.Register, value: Bytecode.Register)
     case makeArray(result: Bytecode.Register, elements: [Bytecode.Register])
     case arrayCount(result: Bytecode.Register, array: Bytecode.Register)
@@ -384,7 +406,11 @@ public enum Instruction: Codable, Hashable, Sendable {
         array: Bytecode.Register,
         index: Bytecode.Register
     )
-    case arrayFirst(result: Bytecode.Register, array: Bytecode.Register)
+    case arrayBoundary(
+        result: Bytecode.Register,
+        operation: Bytecode.ArrayBoundaryOperation,
+        array: Bytecode.Register
+    )
     case arrayContains(
         result: Bytecode.Register,
         array: Bytecode.Register,
@@ -400,6 +426,11 @@ public enum Instruction: Codable, Hashable, Sendable {
         array: Bytecode.Register,
         index: Bytecode.Register,
         value: Bytecode.Register
+    )
+    case arrayPopLast(
+        elementResult: Bytecode.Register,
+        arrayResult: Bytecode.Register,
+        array: Bytecode.Register
     )
     case arrayNext(
         result: Bytecode.Register,
@@ -419,6 +450,12 @@ public enum Instruction: Codable, Hashable, Sendable {
         dictionary: Bytecode.Register,
         key: Bytecode.Register,
         value: Bytecode.Register
+    )
+    case dictionaryRemove(
+        valueResult: Bytecode.Register,
+        dictionaryResult: Bytecode.Register,
+        dictionary: Bytecode.Register,
+        key: Bytecode.Register
     )
     case dictionaryNext(
         result: Bytecode.Register,
@@ -520,16 +557,18 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .integerConvert(result, _, _),
              let .floatingConvert(result, _, _),
              let .booleanBinary(result, _, _, _),
+             let .select(result, _, _, _),
              let .stringConcat(result, _, _),
              let .stringCount(result, _),
              let .stringIsEmpty(result, _),
              let .stringPredicate(result, _, _, _),
+             let .stringTransform(result, _, _),
              let .stringify(result, _),
              let .makeArray(result, _),
              let .arrayCount(result, _),
              let .arrayIsEmpty(result, _),
              let .arrayGet(result, _, _),
-             let .arrayFirst(result, _),
+             let .arrayBoundary(result, _, _),
              let .arrayContains(result, _, _),
              let .arrayAppend(result, _, _),
              let .arrayUpdate(result, _, _, _),
@@ -547,6 +586,10 @@ public enum Instruction: Codable, Hashable, Sendable {
             results
         case let .checkedBinary(result, overflow, _, _, _):
             [result, overflow]
+        case let .arrayPopLast(elementResult, arrayResult, _):
+            [elementResult, arrayResult]
+        case let .dictionaryRemove(valueResult, dictionaryResult, _, _):
+            [valueResult, dictionaryResult]
         case let .apply(result, _, _),
              let .entryApply(result, _, _),
              let .nativeApply(result, _, _),
@@ -616,6 +659,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .booleanBinary(_, _, lhs, rhs),
              let .compare(_, _, lhs, rhs):
             [lhs, rhs]
+        case let .select(_, condition, trueValue, falseValue):
+            [condition, trueValue, falseValue]
         case let .floatingUnary(_, _, operand),
              let .integerConvert(_, _, operand),
              let .floatingConvert(_, _, operand):
@@ -626,12 +671,14 @@ public enum Instruction: Codable, Hashable, Sendable {
             [string]
         case let .stringPredicate(_, _, string, pattern):
             [string, pattern]
+        case let .stringTransform(_, _, string):
+            [string]
         case let .stringify(_, value):
             [value]
         case let .makeArray(_, elements):
             elements
         case let .arrayCount(_, array), let .arrayIsEmpty(_, array),
-             let .arrayFirst(_, array):
+             let .arrayBoundary(_, _, array):
             [array]
         case let .arrayGet(_, array, index):
             [array, index]
@@ -641,6 +688,8 @@ public enum Instruction: Codable, Hashable, Sendable {
             [array, value]
         case let .arrayUpdate(_, array, index, value):
             [array, index, value]
+        case let .arrayPopLast(_, _, array):
+            [array]
         case let .arrayNext(_, array, _):
             [array]
         case let .makeDictionary(_, pairs):
@@ -653,6 +702,8 @@ public enum Instruction: Codable, Hashable, Sendable {
             [dictionary, key]
         case let .dictionaryUpdate(_, dictionary, key, value):
             [dictionary, key, value]
+        case let .dictionaryRemove(_, _, dictionary, key):
+            [dictionary, key]
         case let .branch(_, arguments):
             arguments
         case let .conditionalBranch(condition, _, trueArguments, _, falseArguments):

@@ -179,6 +179,8 @@ public enum Disassembler {
             "\(result) = floating_convert.\(operation.rawValue) \(value)"
         case let .booleanBinary(result, operation, lhs, rhs):
             "\(result) = bool_\(operation.rawValue) \(lhs), \(rhs)"
+        case let .select(result, condition, trueValue, falseValue):
+            "\(result) = select \(condition), \(trueValue), \(falseValue)"
         case let .stringConcat(result, lhs, rhs):
             "\(result) = string_concat \(lhs), \(rhs)"
         case let .stringCount(result, string):
@@ -187,6 +189,8 @@ public enum Disassembler {
             "\(result) = string_is_empty \(string)"
         case let .stringPredicate(result, operation, string, pattern):
             "\(result) = string_\(operation.rawValue) \(string), \(pattern)"
+        case let .stringTransform(result, operation, string):
+            "\(result) = string_\(operation.rawValue) \(string)"
         case let .stringify(result, value):
             "\(result) = stringify \(value)"
         case let .makeArray(result, elements):
@@ -197,14 +201,16 @@ public enum Disassembler {
             "\(result) = array_is_empty \(array)"
         case let .arrayGet(result, array, index):
             "\(result) = array_get \(array)[\(index)]"
-        case let .arrayFirst(result, array):
-            "\(result) = array_first \(array)"
+        case let .arrayBoundary(result, operation, array):
+            "\(result) = array_\(operation.rawValue) \(array)"
         case let .arrayContains(result, array, value):
             "\(result) = array_contains \(array), \(value)"
         case let .arrayAppend(result, array, value):
             "\(result) = array_append \(array), \(value)"
         case let .arrayUpdate(result, array, index, value):
             "\(result) = array_update \(array)[\(index)] = \(value)"
+        case let .arrayPopLast(elementResult, arrayResult, array):
+            "(\(elementResult), \(arrayResult)) = array_pop_last \(array)"
         case let .arrayNext(result, array, indexSlot):
             "\(result) = array_next \(array), \(indexSlot)"
         case let .makeDictionary(result, pairs):
@@ -217,6 +223,8 @@ public enum Disassembler {
             "\(result) = dictionary_get \(dictionary)[\(key)]"
         case let .dictionaryUpdate(result, dictionary, key, value):
             "\(result) = dictionary_update \(dictionary)[\(key)] = \(value)"
+        case let .dictionaryRemove(valueResult, dictionaryResult, dictionary, key):
+            "(\(valueResult), \(dictionaryResult)) = dictionary_remove \(dictionary)[\(key)]"
         case let .dictionaryNext(result, dictionary, indexSlot):
             "\(result) = dictionary_next \(dictionary), \(indexSlot)"
         case let .compare(result, predicate, lhs, rhs):

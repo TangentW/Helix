@@ -995,11 +995,13 @@ public struct Interpreter: Sendable {
                     if operandValue.bitWidth == 32 {
                         let result: Float = switch operation {
                         case .negate: -Float(operandValue.value)
+                        case .absolute: abs(Float(operandValue.value))
                         }
                         value = .float(Double(result), bitWidth: 32)
                     } else {
                         let result: Double = switch operation {
                         case .negate: -operandValue.value
+                        case .absolute: abs(operandValue.value)
                         }
                         value = .float(result, bitWidth: 64)
                     }
@@ -1090,6 +1092,25 @@ public struct Interpreter: Sendable {
                     case .xor: left != right
                     }
                     try initialize(.bool(value), register: result, registers: &registers)
+                case let .select(result, condition, trueValue, falseValue):
+                    guard case let .bool(selectTrue) = try read(
+                        condition,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .bool,
+                            actual: try read(condition, registers: registers).type
+                        )
+                    }
+                    let selected = try read(
+                        selectTrue ? trueValue : falseValue,
+                        registers: registers
+                    )
+                    try initialize(
+                        try copyCharging(selected, budget: budget),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .stringConcat(result, lhs, rhs):
                     let left = try string(lhs, registers: registers)
                     let right = try string(rhs, registers: registers)
@@ -1136,24 +1157,37 @@ public struct Interpreter: Sendable {
                         matched = value.contains(candidate)
                     }
                     try initialize(.bool(matched), register: result, registers: &registers)
+                case let .stringTransform(result, operation, string):
+                    let source = try self.string(string, registers: registers)
+                    try budget.consumeUTF8Work(byteCount: source.utf8.count)
+                    let maximumBytes = try VM.StringAllocation
+                        .maximumCaseMappingUTF8ByteCount(for: source)
+                    let transformed = try budget.withReservedVMHeap(
+                        maximumBytes: maximumBytes
+                    ) {
+                        let value = switch operation {
+                        case .uppercase: source.uppercased()
+                        case .lowercase: source.lowercased()
+                        }
+                        return (value, UInt64(value.utf8.count))
+                    }
+                    try budget.consumeUTF8Work(byteCount: transformed.utf8.count)
+                    try budget.checkDeadline()
+                    try initialize(
+                        .string(transformed),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .stringify(result, operand):
                     let source = try read(operand, registers: registers)
-                    let value: String
-                    switch source {
-                    case let .bool(boolean):
-                        value = String(boolean)
-                    case let .integer(integer):
-                        value = integer.description
-                    case let .float(number, bitWidth):
-                        value = bitWidth == 32
-                            ? String(Float(number))
-                            : String(number)
-                    default:
-                        throw VM.RuntimeTrap.nativeFailure(
-                            "stringify is unsupported for \(source.type)"
-                        )
+                    let maximumBytes = try VM.StringAllocation
+                        .maximumStringificationUTF8ByteCount(for: source)
+                    let value = try budget.withReservedVMHeap(
+                        maximumBytes: maximumBytes
+                    ) {
+                        let string = try VM.StringAllocation.stringify(source)
+                        return (string, UInt64(string.utf8.count))
                     }
-                    try budget.consumeVMHeap(bytes: UInt64(value.utf8.count))
                     try initialize(.string(value), register: result, registers: &registers)
                 case let .makeArray(result, elements):
                     guard case let .array(elementType) = function.type(of: result)! else {
@@ -1204,12 +1238,16 @@ public struct Interpreter: Sendable {
                     }
                     let value = try copyCharging(values[exact], budget: budget)
                     try initialize(value, register: result, registers: &registers)
-                case let .arrayFirst(result, operand):
+                case let .arrayBoundary(result, operation, operand):
                     let (values, _) = try array(operand, registers: registers)
                     let value: VM.Value?
-                    if let first = values.first {
+                    let boundary = switch operation {
+                    case .first: values.first
+                    case .last: values.last
+                    }
+                    if let boundary {
                         try chargeAggregate(elementCount: 1, budget: budget)
-                        value = try copyCharging(first, budget: budget)
+                        value = try copyCharging(boundary, budget: budget)
                     } else {
                         try chargeAggregate(elementCount: 0, budget: budget)
                         value = nil
@@ -1298,6 +1336,37 @@ public struct Interpreter: Sendable {
                     try initialize(
                         .array(updated, elementType: elementType),
                         register: result,
+                        registers: &registers
+                    )
+                case let .arrayPopLast(elementResult, arrayResult, array):
+                    let (elements, elementType) = try self.array(
+                        array,
+                        registers: registers
+                    )
+                    let remainingCount = max(elements.count - 1, 0)
+                    try budget.consumeLinearWork(elementCount: elements.count)
+                    try chargeAggregate(elementCount: remainingCount, budget: budget)
+                    try chargeAggregate(
+                        elementCount: elements.isEmpty ? 0 : 1,
+                        budget: budget
+                    )
+                    for element in elements.dropLast() {
+                        try prepareCopy(element, budget: budget)
+                    }
+                    if let last = elements.last {
+                        try prepareCopy(last, budget: budget)
+                    }
+                    let remaining = try elements.dropLast().map(copy)
+                    let removed = try elements.last.map(copy)
+                    try budget.checkDeadline()
+                    try initialize(
+                        .optional(removed),
+                        register: elementResult,
+                        registers: &registers
+                    )
+                    try initialize(
+                        .array(remaining, elementType: elementType),
+                        register: arrayResult,
                         registers: &registers
                     )
                 case let .arrayNext(result, array, indexSlot):
@@ -1524,6 +1593,59 @@ public struct Interpreter: Sendable {
                     try initialize(
                         .dictionary(entries, keyType: keyType, valueType: valueType),
                         register: result,
+                        registers: &registers
+                    )
+                case let .dictionaryRemove(
+                    valueResult,
+                    dictionaryResult,
+                    operand,
+                    key
+                ):
+                    let (source, keyType, valueType) = try dictionary(
+                        operand,
+                        registers: registers
+                    )
+                    let needle = try read(key, registers: registers)
+                    let matchingIndex = try dictionaryIndex(
+                        of: needle,
+                        in: source,
+                        budget: budget
+                    )
+                    let finalCount = source.count - (matchingIndex == nil ? 0 : 1)
+                    try budget.consumeLinearWork(elementCount: source.count)
+                    try chargeDictionaryStorage(entryCount: finalCount, budget: budget)
+                    try chargeAggregate(
+                        elementCount: matchingIndex == nil ? 0 : 1,
+                        budget: budget
+                    )
+                    for (index, entry) in source.enumerated() {
+                        if index == matchingIndex {
+                            try prepareCopy(entry.value, budget: budget)
+                        } else {
+                            try prepareCopy(entry.key, budget: budget)
+                            try prepareCopy(entry.value, budget: budget)
+                        }
+                    }
+                    let removed = try matchingIndex.map { try copy(source[$0].value) }
+                    var entries: [VM.DictionaryEntry] = []
+                    entries.reserveCapacity(finalCount)
+                    for (index, entry) in source.enumerated() where index != matchingIndex {
+                        entries.append(
+                            .init(
+                                key: try copy(entry.key),
+                                value: try copy(entry.value)
+                            )
+                        )
+                    }
+                    try budget.checkDeadline()
+                    try initialize(
+                        .optional(removed),
+                        register: valueResult,
+                        registers: &registers
+                    )
+                    try initialize(
+                        .dictionary(entries, keyType: keyType, valueType: valueType),
+                        register: dictionaryResult,
                         registers: &registers
                     )
                 case let .dictionaryNext(result, operand, indexSlot):
