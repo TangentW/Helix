@@ -601,7 +601,15 @@ public struct Archive: Codable, Hashable, Sendable {
         let mainActorTypeIDs = Set(
             nativeTypes.filter { $0.isEmittedToDevice && $0.requiresMainActor }.map(\.id)
         )
-        func validateDeviceType(_ type: Bytecode.ValueType) throws {
+        func validateDeviceType(
+            _ type: Bytecode.ValueType,
+            depth: Int = 0
+        ) throws {
+            guard depth <= 32 else {
+                throw InterfaceArchive.Error.invalidArchive(
+                    "device signature type nesting exceeds 32 levels"
+                )
+            }
             switch type {
             case .string:
                 guard capabilities.contains(.stringsV1) else {
@@ -619,25 +627,31 @@ public struct Archive: Codable, Hashable, Sendable {
                 guard capabilities.contains(.collectionsV1) else {
                     throw InterfaceArchive.Error.invalidArchive("Array capability is absent")
                 }
-                try validateDeviceType(element)
+                try validateDeviceType(element, depth: depth + 1)
             case let .dictionary(key, value):
                 guard capabilities.contains(.collectionsV1) else {
                     throw InterfaceArchive.Error.invalidArchive("Dictionary capability is absent")
                 }
-                switch key {
-                case .bool, .integer, .string:
-                    break
-                default:
+                guard key.isVMHashable else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "Dictionary key must be Bool, integer, or String"
+                        "Dictionary key lacks VM-defined Hashable semantics"
                     )
                 }
-                try validateDeviceType(key)
-                try validateDeviceType(value)
+                try validateDeviceType(key, depth: depth + 1)
+                try validateDeviceType(value, depth: depth + 1)
+            case let .set(element):
+                guard capabilities.contains(.collectionsV1), element.isVMHashable else {
+                    throw InterfaceArchive.Error.invalidArchive(
+                        "Set requires collection capability and a VM-defined Hashable element"
+                    )
+                }
+                try validateDeviceType(element, depth: depth + 1)
             case let .tuple(elements):
-                for element in elements { try validateDeviceType(element) }
+                for element in elements {
+                    try validateDeviceType(element, depth: depth + 1)
+                }
             case let .optional(wrapped):
-                try validateDeviceType(wrapped)
+                try validateDeviceType(wrapped, depth: depth + 1)
             case .float:
                 break
             case .local, .error, .address, .mutableCell, .arrayBuilder,
@@ -665,7 +679,7 @@ public struct Archive: Codable, Hashable, Sendable {
         func usesMainActorType(_ type: Bytecode.ValueType) -> Bool {
             switch type {
             case let .native(id): mainActorTypeIDs.contains(id)
-            case let .array(element), let .optional(element):
+            case let .array(element), let .optional(element), let .set(element):
                 usesMainActorType(element)
             case let .dictionary(key, value):
                 usesMainActorType(key) || usesMainActorType(value)

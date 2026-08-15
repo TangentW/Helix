@@ -99,6 +99,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
     case any
     case array(Bytecode.ValueType)
     case dictionary(key: Bytecode.ValueType, value: Bytecode.ValueType)
+    case set(Bytecode.ValueType)
     case native(Core.TypeID)
     case local(Bytecode.LocalTypeKey)
     case error
@@ -119,7 +120,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
             elements.allSatisfy(\.isTrivial)
         case let .optional(wrapped):
             wrapped.isTrivial
-        case .string, .any, .array, .dictionary, .native, .local, .error,
+        case .string, .any, .array, .dictionary, .set, .native, .local, .error,
              .address, .mutableCell, .arrayBuilder, .closure:
             false
         }
@@ -139,6 +140,8 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
             element.requiresLinearOwnership
         case let .dictionary(key, value):
             key.requiresLinearOwnership || value.requiresLinearOwnership
+        case let .set(element):
+            element.requiresLinearOwnership
         case .arrayBuilder:
             true
         case .void, .never, .bool, .integer, .float, .string, .any, .local,
@@ -158,6 +161,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case .any: "Any"
         case let .array(element): "Array<\(element)>"
         case let .dictionary(key, value): "Dictionary<\(key), \(value)>"
+        case let .set(element): "Set<\(element)>"
         case let .native(type): "Native<\(type)>"
         case let .local(key): key.description
         case .error: "any Error"
@@ -224,6 +228,22 @@ public enum StringTransformOperation: String, Codable, Hashable, Sendable {
 public enum ArrayBoundaryOperation: String, Codable, Hashable, Sendable {
     case first
     case last
+}
+
+public enum SetAlgebraOperation: String, Codable, Hashable, Sendable {
+    case union
+    case intersection
+    case subtracting
+    case symmetricDifference
+}
+
+public enum SetRelationOperation: String, Codable, Hashable, Sendable {
+    case equal
+    case subset
+    case strictSubset
+    case superset
+    case strictSuperset
+    case disjoint
 }
 
 public enum BooleanBinaryOperation: String, Codable, Hashable, Sendable {
@@ -529,6 +549,58 @@ public enum Instruction: Codable, Hashable, Sendable {
         dictionary: Bytecode.Register,
         indexSlot: Bytecode.StackSlot
     )
+    /// Builds a Set from an Array or Set with the same element type. The VM
+    /// removes duplicate Array elements while preserving a deterministic
+    /// iteration order; that order is not part of Set equality.
+    case makeSet(result: Bytecode.Register, source: Bytecode.Register)
+    case setCount(result: Bytecode.Register, set: Bytecode.Register)
+    case setIsEmpty(result: Bytecode.Register, set: Bytecode.Register)
+    case setContains(
+        result: Bytecode.Register,
+        set: Bytecode.Register,
+        element: Bytecode.Register
+    )
+    case setInsert(
+        insertedResult: Bytecode.Register,
+        memberResult: Bytecode.Register,
+        setResult: Bytecode.Register,
+        set: Bytecode.Register,
+        element: Bytecode.Register
+    )
+    case setUpdate(
+        oldMemberResult: Bytecode.Register,
+        setResult: Bytecode.Register,
+        set: Bytecode.Register,
+        element: Bytecode.Register
+    )
+    case setRemove(
+        removedResult: Bytecode.Register,
+        setResult: Bytecode.Register,
+        set: Bytecode.Register,
+        element: Bytecode.Register
+    )
+    case setPopFirst(
+        elementResult: Bytecode.Register,
+        setResult: Bytecode.Register,
+        set: Bytecode.Register
+    )
+    case setNext(
+        result: Bytecode.Register,
+        set: Bytecode.Register,
+        indexSlot: Bytecode.StackSlot
+    )
+    case setAlgebra(
+        result: Bytecode.Register,
+        operation: Bytecode.SetAlgebraOperation,
+        lhs: Bytecode.Register,
+        rhs: Bytecode.Register
+    )
+    case setRelation(
+        result: Bytecode.Register,
+        operation: Bytecode.SetRelationOperation,
+        lhs: Bytecode.Register,
+        rhs: Bytecode.Register
+    )
     case compare(
         result: Bytecode.Register,
         predicate: Bytecode.ComparisonPredicate,
@@ -658,6 +730,13 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .dictionaryGet(result, _, _),
              let .dictionaryUpdate(result, _, _, _),
              let .dictionaryNext(result, _, _),
+             let .makeSet(result, _),
+             let .setCount(result, _),
+             let .setIsEmpty(result, _),
+             let .setContains(result, _, _),
+             let .setNext(result, _, _),
+             let .setAlgebra(result, _, _, _),
+             let .setRelation(result, _, _, _),
              let .compare(result, _, _, _),
              let .makeClosure(result, _, _):
             [result]
@@ -669,6 +748,14 @@ public enum Instruction: Codable, Hashable, Sendable {
             [elementResult, arrayResult]
         case let .dictionaryRemove(valueResult, dictionaryResult, _, _):
             [valueResult, dictionaryResult]
+        case let .setInsert(insertedResult, memberResult, setResult, _, _):
+            [insertedResult, memberResult, setResult]
+        case let .setUpdate(oldMemberResult, setResult, _, _):
+            [oldMemberResult, setResult]
+        case let .setRemove(removedResult, setResult, _, _):
+            [removedResult, setResult]
+        case let .setPopFirst(elementResult, setResult, _):
+            [elementResult, setResult]
         case let .apply(result, _, _),
              let .entryApply(result, _, _),
              let .nativeApply(result, _, _),
@@ -802,6 +889,22 @@ public enum Instruction: Codable, Hashable, Sendable {
             [dictionary, key, value]
         case let .dictionaryRemove(_, _, dictionary, key):
             [dictionary, key]
+        case let .makeSet(_, source):
+            [source]
+        case let .setCount(_, set),
+             let .setIsEmpty(_, set),
+             let .setNext(_, set, _):
+            [set]
+        case let .setContains(_, set, element),
+             let .setInsert(_, _, _, set, element),
+             let .setUpdate(_, _, set, element),
+             let .setRemove(_, _, set, element):
+            [set, element]
+        case let .setPopFirst(_, _, set):
+            [set]
+        case let .setAlgebra(_, _, lhs, rhs),
+             let .setRelation(_, _, lhs, rhs):
+            [lhs, rhs]
         case let .branch(_, arguments):
             arguments
         case let .conditionalBranch(condition, _, trueArguments, _, falseArguments):

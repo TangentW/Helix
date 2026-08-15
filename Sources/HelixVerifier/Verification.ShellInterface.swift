@@ -146,8 +146,14 @@ public struct ShellInterface: Sendable {
     private static func validateBoundaryType(
         _ type: Bytecode.ValueType,
         owner: String,
-        capabilities: Set<Core.Capability>
+        capabilities: Set<Core.Capability>,
+        depth: Int = 0
     ) throws {
+        guard depth <= 32 else {
+            throw Verification.Error.invalidShellInterface(
+                "type nesting in \(owner) exceeds 32 levels"
+            )
+        }
         switch type {
         case .any:
             guard capabilities.contains(.anyValuesV1) else {
@@ -161,21 +167,62 @@ public struct ShellInterface: Sendable {
             throw Verification.Error.invalidShellInterface(
                 "patch-local nominal, Error, internal storage, and closure values cannot appear in \(owner) signature"
             )
-        case let .array(element), let .optional(element):
+        case let .optional(element):
             try validateBoundaryType(
                 element,
                 owner: owner,
-                capabilities: capabilities
+                capabilities: capabilities,
+                depth: depth + 1
             )
+        case let .array(element):
+            try validateBoundaryType(
+                element,
+                owner: owner,
+                capabilities: capabilities,
+                depth: depth + 1
+            )
+            guard capabilities.contains(.collectionsV1) else {
+                throw Verification.Error.invalidShellInterface(
+                    "Array in \(owner) signature requires \(Core.Capability.collectionsV1)"
+                )
+            }
         case let .dictionary(key, value):
-            try validateBoundaryType(key, owner: owner, capabilities: capabilities)
-            try validateBoundaryType(value, owner: owner, capabilities: capabilities)
+            try validateBoundaryType(
+                key,
+                owner: owner,
+                capabilities: capabilities,
+                depth: depth + 1
+            )
+            try validateBoundaryType(
+                value,
+                owner: owner,
+                capabilities: capabilities,
+                depth: depth + 1
+            )
+            guard capabilities.contains(.collectionsV1), key.isVMHashable else {
+                throw Verification.Error.invalidShellInterface(
+                    "Dictionary in \(owner) signature requires collection capability and a VM-defined Hashable key"
+                )
+            }
+        case let .set(element):
+            try validateBoundaryType(
+                element,
+                owner: owner,
+                capabilities: capabilities,
+                depth: depth + 1
+            )
+            guard capabilities.contains(.collectionsV1), element.isVMHashable else {
+                throw Verification.Error.invalidShellInterface(
+                    "Set in \(owner) signature requires collection capability and a VM-defined Hashable element"
+                )
+            }
         case let .tuple(elements):
             for element in elements {
                 try validateBoundaryType(
                     element,
                     owner: owner,
-                    capabilities: capabilities
+                    capabilities: capabilities,
+                    depth: depth + 1
                 )
             }
         case .void, .never, .bool, .integer, .float, .string, .native:

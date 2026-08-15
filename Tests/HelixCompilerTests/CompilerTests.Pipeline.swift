@@ -3931,41 +3931,22 @@ struct Pipeline {
         )
     }
 
-    @Test("Unsupported collection surfaces remain stable compile-time rejections")
+    @Test("User-defined Hashable semantics remain a stable compile-time rejection")
     func rejectsUnsupportedCollectionSurfaces() throws {
-        let floatKeySource = """
-        @inline(never)
-        public func dictionaryCount(_ values: [Double: Int]) -> Int { values.count }
-        """
-        #expect(throws: CanonicalSIL.LoweringError.self) {
-            _ = try compileFixture(
-                source: floatKeySource,
-                functionName: "dictionaryCount",
-                signature: .init(
-                    parameters: ["Swift.Dictionary<Swift.Double, Swift.Int>"],
-                    result: "Swift.Int"
-                ),
-                parameterTypes: [
-                    .dictionary(key: .float(bitWidth: 64), value: .int64),
-                ],
-                resultType: .int64,
-                additionalFrontendArguments: ["-Xfrontend", "-disable-sil-perf-optzns"]
-            )
-        }
-
         let setSource = """
+        public struct Key: Hashable { public var raw: Int }
         @inline(never)
-        public func setCount(_ values: Set<Int>) -> Int { values.count }
+        public func setCount(_ raw: Int) -> Int { Set([Key(raw: raw)]).count }
         """
         #expect(throws: CanonicalSIL.LoweringError.self) {
             _ = try compileFixture(
                 source: setSource,
                 functionName: "setCount",
                 signature: .init(
-                    parameters: ["Swift.Set<Swift.Int>"],
+                    parameters: ["Swift.Int"],
                     result: "Swift.Int"
                 ),
-                parameterTypes: [.array(.int64)],
+                parameterTypes: [.int64],
                 resultType: .int64,
                 additionalFrontendArguments: ["-Xfrontend", "-disable-sil-perf-optzns"]
             )

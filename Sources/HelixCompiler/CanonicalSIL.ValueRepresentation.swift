@@ -17,6 +17,8 @@ enum ValueRepresentation {
             .array(storable(element))
         case let .dictionary(key, value):
             .dictionary(key: storable(key), value: storable(value))
+        case let .set(element):
+            .set(storable(element))
         case let .optional(wrapped):
             .optional(storable(wrapped))
         case let .tuple(elements):

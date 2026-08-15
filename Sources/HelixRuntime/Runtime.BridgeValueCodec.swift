@@ -135,6 +135,67 @@ public enum BridgeValueCodec {
         return try elements.map(decodeElement)
     }
 
+    /// Encodes a Set with a compiler-supplied element codec and VM element type.
+    public static func encodeSet<Element: Hashable>(
+        _ value: Set<Element>,
+        elementType: Bytecode.ValueType,
+        encodeElement: (Element) throws -> VM.Value
+    ) throws -> VM.Value {
+        guard elementType.isVMHashable else {
+            throw Runtime.BridgeInputError.encodedTypeMismatch(
+                expected: "a VM-defined Hashable Set element",
+                actual: elementType.description
+            )
+        }
+        var elements: [VM.Value] = []
+        elements.reserveCapacity(value.count)
+        for element in value {
+            let encoded = try encodeElement(element)
+            guard encoded.matches(elementType) else {
+                throw Runtime.BridgeInputError.encodedTypeMismatch(
+                    expected: elementType.description,
+                    actual: encoded.type.description
+                )
+            }
+            elements.append(encoded)
+        }
+        let set = VM.SetValue(elements: elements, elementType: elementType)
+        guard set.elements.count == elements.count else {
+            throw Runtime.BridgeInputError.duplicateEncodedSetElement
+        }
+        return .set(set)
+    }
+
+    /// Decodes a Set after verifying its declared VM element type.
+    public static func decodeSet<Element: Hashable>(
+        _ value: VM.Value,
+        elementType: Bytecode.ValueType,
+        decodeElement: (VM.Value) throws -> Element
+    ) throws -> Set<Element> {
+        guard case let .set(set) = value, set.elementType == elementType else {
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: .set(elementType),
+                actual: value.type
+            )
+        }
+        var result: Set<Element> = []
+        result.reserveCapacity(set.elements.count)
+        for element in set.elements {
+            guard element.matches(elementType) else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: elementType,
+                    actual: element.type
+                )
+            }
+            guard result.insert(try decodeElement(element)).inserted else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "VM Set contains duplicate Swift-equivalent elements"
+                )
+            }
+        }
+        return result
+    }
+
     /// Encodes dictionary entries with compiler-supplied key and value codecs.
     public static func encodeDictionary<Key: Hashable, Value>(
         _ value: [Key: Value],
@@ -142,12 +203,38 @@ public enum BridgeValueCodec {
         valueType: Bytecode.ValueType,
         encodeKey: (Key) throws -> VM.Value,
         encodeValue: (Value) throws -> VM.Value
-    ) rethrows -> VM.Value {
-        let entries = try value.map { key, value in
-            VM.DictionaryEntry(
-                key: try encodeKey(key),
-                value: try encodeValue(value)
+    ) throws -> VM.Value {
+        guard keyType.isVMHashable else {
+            throw Runtime.BridgeInputError.encodedTypeMismatch(
+                expected: "a VM-defined Hashable Dictionary key",
+                actual: keyType.description
             )
+        }
+        var entries: [VM.DictionaryEntry] = []
+        entries.reserveCapacity(value.count)
+        for (key, value) in value {
+            let encodedKey = try encodeKey(key)
+            let encodedValue = try encodeValue(value)
+            guard encodedKey.matches(keyType) else {
+                throw Runtime.BridgeInputError.encodedTypeMismatch(
+                    expected: keyType.description,
+                    actual: encodedKey.type.description
+                )
+            }
+            guard encodedValue.matches(valueType) else {
+                throw Runtime.BridgeInputError.encodedTypeMismatch(
+                    expected: valueType.description,
+                    actual: encodedValue.type.description
+                )
+            }
+            entries.append(.init(key: encodedKey, value: encodedValue))
+        }
+        let uniqueKeys = VM.SetValue(
+            elements: entries.map(\.key),
+            elementType: keyType
+        )
+        guard uniqueKeys.elements.count == entries.count else {
+            throw Runtime.BridgeInputError.duplicateEncodedDictionaryKey
         }
         return .dictionary(entries, keyType: keyType, valueType: valueType)
     }
@@ -172,6 +259,18 @@ public enum BridgeValueCodec {
         var result: [Key: Value] = [:]
         result.reserveCapacity(entries.count)
         for entry in entries {
+            guard entry.key.matches(keyType) else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: keyType,
+                    actual: entry.key.type
+                )
+            }
+            guard entry.value.matches(valueType) else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: valueType,
+                    actual: entry.value.type
+                )
+            }
             let key = try decodeKey(entry.key)
             let decodedValue = try decodeValue(entry.value)
             guard result.updateValue(decodedValue, forKey: key) == nil else {

@@ -718,20 +718,17 @@ extension FrontendReceipt.ManagedDebugSurface {
             true
         case let .array(element), let .optional(element):
             isAutomaticallyBridgeable(element)
+        case let .set(element):
+            element.isVMHashable && isAutomaticallyBridgeable(element)
         case let .dictionary(key, value):
-            isDictionaryKey(key) && isAutomaticallyBridgeable(value)
+            key.isVMHashable
+                && isAutomaticallyBridgeable(key)
+                && isAutomaticallyBridgeable(value)
         case let .tuple(elements):
             !elements.isEmpty && elements.allSatisfy(isAutomaticallyBridgeable)
         case .void, .never, .local, .error, .address, .mutableCell,
              .arrayBuilder, .closure:
             false
-        }
-    }
-
-    private static func isDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .bool, .integer, .string: true
-        default: false
         }
     }
 
@@ -778,7 +775,8 @@ extension FrontendReceipt.ManagedDebugSurface {
         switch type {
         case let .native(typeID):
             typeIDs.contains(typeID)
-        case let .array(element), let .optional(element), let .address(element),
+        case let .array(element), let .optional(element), let .set(element),
+             let .address(element),
              let .mutableCell(element), let .arrayBuilder(element):
             containsNativeType(element, in: typeIDs)
         case let .dictionary(key, value):

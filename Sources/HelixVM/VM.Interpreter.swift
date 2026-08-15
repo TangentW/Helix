@@ -244,7 +244,7 @@ public struct Interpreter: Sendable {
             case let .optional(wrapped), let .address(wrapped),
                  let .mutableCell(wrapped), let .arrayBuilder(wrapped):
                 visit(wrapped)
-            case let .array(element):
+            case let .array(element), let .set(element):
                 visit(element)
             case let .dictionary(key, value):
                 visit(key)
@@ -1649,7 +1649,7 @@ public struct Interpreter: Sendable {
                         elementCount: pairValues.count,
                         budget: budget
                     )
-                    var uniqueKeys = Set<VM.Value>()
+                    var uniqueKeys: [VM.Value] = []
                     uniqueKeys.reserveCapacity(pairValues.count)
                     for pair in pairValues {
                         guard case let .tuple(elements) = pair, elements.count == 2 else {
@@ -1658,12 +1658,16 @@ public struct Interpreter: Sendable {
                                 actual: pair.type
                             )
                         }
-                        try chargeValueTraversal(elements[0], budget: budget)
-                        guard uniqueKeys.insert(elements[0]).inserted else {
+                        guard try collectionIndex(
+                            of: elements[0],
+                            in: uniqueKeys,
+                            budget: budget
+                        ) == nil else {
                             throw VM.RuntimeTrap.explicit(
                                 "Dictionary literal contains duplicate keys"
                             )
                         }
+                        uniqueKeys.append(elements[0])
                     }
                     try chargeDictionaryStorage(entryCount: pairValues.count, budget: budget)
                     for pair in pairValues {
@@ -1903,6 +1907,348 @@ public struct Interpreter: Sendable {
                         next = nil
                     }
                     try initialize(.optional(next), register: result, registers: &registers)
+                case let .makeSet(result, source):
+                    guard case let .set(elementType) = function.type(of: result) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .set(.never),
+                            actual: function.type(of: result) ?? .never
+                        )
+                    }
+                    let sourceValue = try read(source, registers: registers)
+                    let set: VM.SetValue
+                    switch sourceValue {
+                    case let .array(elements, actualType) where actualType == elementType:
+                        set = try normalizedSetValue(
+                            elements,
+                            elementType: elementType,
+                            budget: budget
+                        )
+                    case let .set(value) where value.elementType == elementType:
+                        set = try copySetValue(value, budget: budget)
+                    default:
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .array(elementType),
+                            actual: sourceValue.type
+                        )
+                    }
+                    try initialize(.set(set), register: result, registers: &registers)
+                case let .setCount(result, operand):
+                    let value = try set(operand, registers: registers)
+                    guard let count = Int64(exactly: value.elements.count) else {
+                        throw VM.RuntimeTrap.integerOverflow
+                    }
+                    try initialize(
+                        .integer(VM.Integer(signed: count, bitWidth: 64, isSigned: true)),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .setIsEmpty(result, operand):
+                    let value = try set(operand, registers: registers)
+                    try initialize(
+                        .bool(value.elements.isEmpty),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .setContains(result, operand, element):
+                    let value = try set(operand, registers: registers)
+                    let needle = try read(element, registers: registers)
+                    try budget.consumeLinearWork(elementCount: value.elements.count)
+                    let contains = try collectionIndex(
+                        of: needle,
+                        in: value.elements,
+                        budget: budget
+                    ) != nil
+                    try initialize(.bool(contains), register: result, registers: &registers)
+                case let .setInsert(
+                    insertedResult,
+                    memberResult,
+                    setResult,
+                    operand,
+                    element
+                ):
+                    let source = try set(operand, registers: registers)
+                    let needle = try read(element, registers: registers)
+                    try budget.consumeLinearWork(elementCount: source.elements.count)
+                    let matchingIndex = try collectionIndex(
+                        of: needle,
+                        in: source.elements,
+                        budget: budget
+                    )
+                    let updatedCount = source.elements.count.addingReportingOverflow(
+                        matchingIndex == nil ? 1 : 0
+                    )
+                    guard !updatedCount.overflow else {
+                        throw VM.RuntimeTrap.vmHeapLimitExceeded
+                    }
+                    try chargeAggregate(
+                        elementCount: updatedCount.partialValue,
+                        budget: budget
+                    )
+                    var updatedElements = source.elements
+                    if matchingIndex == nil { updatedElements.append(needle) }
+                    let updated = try copySetElements(
+                        updatedElements,
+                        elementType: source.elementType,
+                        budget: budget
+                    )
+                    let member = try copyCharging(
+                        matchingIndex.map { source.elements[$0] } ?? needle,
+                        budget: budget
+                    )
+                    try initialize(
+                        .bool(matchingIndex == nil),
+                        register: insertedResult,
+                        registers: &registers
+                    )
+                    try initialize(member, register: memberResult, registers: &registers)
+                    try initialize(.set(updated), register: setResult, registers: &registers)
+                case let .setUpdate(
+                    oldMemberResult,
+                    setResult,
+                    operand,
+                    element
+                ):
+                    let source = try set(operand, registers: registers)
+                    let needle = try read(element, registers: registers)
+                    try budget.consumeLinearWork(elementCount: source.elements.count)
+                    let matchingIndex = try collectionIndex(
+                        of: needle,
+                        in: source.elements,
+                        budget: budget
+                    )
+                    let updatedCount = source.elements.count.addingReportingOverflow(
+                        matchingIndex == nil ? 1 : 0
+                    )
+                    guard !updatedCount.overflow else {
+                        throw VM.RuntimeTrap.vmHeapLimitExceeded
+                    }
+                    try chargeAggregate(
+                        elementCount: updatedCount.partialValue,
+                        budget: budget
+                    )
+                    var updatedElements = source.elements
+                    if let matchingIndex {
+                        updatedElements[matchingIndex] = needle
+                    } else {
+                        updatedElements.append(needle)
+                    }
+                    let updated = try copySetElements(
+                        updatedElements,
+                        elementType: source.elementType,
+                        budget: budget
+                    )
+                    let oldMember = try matchingIndex.map {
+                        try copyCharging(source.elements[$0], budget: budget)
+                    }
+                    try chargeAggregate(
+                        elementCount: oldMember == nil ? 0 : 1,
+                        budget: budget
+                    )
+                    try initialize(
+                        .optional(oldMember),
+                        register: oldMemberResult,
+                        registers: &registers
+                    )
+                    try initialize(.set(updated), register: setResult, registers: &registers)
+                case let .setRemove(
+                    removedResult,
+                    setResult,
+                    operand,
+                    element
+                ):
+                    let source = try set(operand, registers: registers)
+                    let needle = try read(element, registers: registers)
+                    try budget.consumeLinearWork(elementCount: source.elements.count)
+                    let matchingIndex = try collectionIndex(
+                        of: needle,
+                        in: source.elements,
+                        budget: budget
+                    )
+                    let updated = try copySetElements(
+                        source.elements,
+                        excluding: matchingIndex,
+                        elementType: source.elementType,
+                        budget: budget
+                    )
+                    let removed = try matchingIndex.map {
+                        try copyCharging(source.elements[$0], budget: budget)
+                    }
+                    try chargeAggregate(
+                        elementCount: removed == nil ? 0 : 1,
+                        budget: budget
+                    )
+                    try initialize(
+                        .optional(removed),
+                        register: removedResult,
+                        registers: &registers
+                    )
+                    try initialize(.set(updated), register: setResult, registers: &registers)
+                case let .setPopFirst(elementResult, setResult, operand):
+                    let source = try set(operand, registers: registers)
+                    try budget.consumeLinearWork(elementCount: source.elements.count)
+                    let removed = try source.elements.first.map {
+                        try copyCharging($0, budget: budget)
+                    }
+                    try chargeAggregate(
+                        elementCount: removed == nil ? 0 : 1,
+                        budget: budget
+                    )
+                    let updated = try copySetElements(
+                        source.elements.dropFirst(),
+                        elementType: source.elementType,
+                        budget: budget
+                    )
+                    try initialize(
+                        .optional(removed),
+                        register: elementResult,
+                        registers: &registers
+                    )
+                    try initialize(
+                        .set(updated),
+                        register: setResult,
+                        registers: &registers
+                    )
+                case let .setNext(result, operand, indexSlot):
+                    let value = try set(operand, registers: registers)
+                    let indexValue = try read(indexSlot, stackSlots: stackSlots)
+                    guard case let .integer(integer) = indexValue,
+                          integer.bitWidth == 64,
+                          integer.isSigned,
+                          integer.signedValue >= 0,
+                          let index = Int(exactly: integer.signedValue)
+                    else {
+                        throw VM.RuntimeTrap.invalidProgramCounter
+                    }
+                    let next: VM.Value?
+                    if value.elements.indices.contains(index) {
+                        try chargeAggregate(elementCount: 1, budget: budget)
+                        next = try copyCharging(value.elements[index], budget: budget)
+                        let advanced = integer.signedValue.addingReportingOverflow(1)
+                        guard !advanced.overflow else {
+                            throw VM.RuntimeTrap.integerOverflow
+                        }
+                        try store(
+                            .integer(
+                                VM.Integer(
+                                    signed: advanced.partialValue,
+                                    bitWidth: 64,
+                                    isSigned: true
+                                )
+                            ),
+                            in: indexSlot,
+                            mode: .assign,
+                            stackSlots: &stackSlots
+                        )
+                    } else {
+                        try chargeAggregate(elementCount: 0, budget: budget)
+                        next = nil
+                    }
+                    try initialize(.optional(next), register: result, registers: &registers)
+                case let .setAlgebra(result, operation, lhs, rhs):
+                    let left = try set(lhs, registers: registers)
+                    let right = try set(rhs, registers: registers)
+                    try budget.consumeLinearWork(elementCount: left.elements.count)
+                    try budget.consumeLinearWork(elementCount: right.elements.count)
+                    let temporaryLimit: Int
+                    switch operation {
+                    case .intersection, .subtracting:
+                        temporaryLimit = left.elements.count
+                    case .union, .symmetricDifference:
+                        let count = left.elements.count.addingReportingOverflow(
+                            right.elements.count
+                        )
+                        guard !count.overflow else {
+                            throw VM.RuntimeTrap.vmHeapLimitExceeded
+                        }
+                        temporaryLimit = count.partialValue
+                    }
+                    try chargeAggregate(
+                        elementCount: temporaryLimit,
+                        budget: budget
+                    )
+                    var selected: [VM.Value] = []
+                    selected.reserveCapacity(temporaryLimit)
+                    switch operation {
+                    case .union:
+                        selected = left.elements
+                        for element in right.elements where try collectionIndex(
+                            of: element,
+                            in: selected,
+                            budget: budget
+                        ) == nil {
+                            selected.append(element)
+                        }
+                    case .intersection:
+                        for element in left.elements where try collectionIndex(
+                            of: element,
+                            in: right.elements,
+                            budget: budget
+                        ) != nil {
+                            selected.append(element)
+                        }
+                    case .subtracting:
+                        for element in left.elements where try collectionIndex(
+                            of: element,
+                            in: right.elements,
+                            budget: budget
+                        ) == nil {
+                            selected.append(element)
+                        }
+                    case .symmetricDifference:
+                        for element in left.elements where try collectionIndex(
+                            of: element,
+                            in: right.elements,
+                            budget: budget
+                        ) == nil {
+                            selected.append(element)
+                        }
+                        for element in right.elements where try collectionIndex(
+                            of: element,
+                            in: left.elements,
+                            budget: budget
+                        ) == nil {
+                            selected.append(element)
+                        }
+                    }
+                    let value = try copySetElements(
+                        selected,
+                        elementType: left.elementType,
+                        budget: budget
+                    )
+                    try initialize(.set(value), register: result, registers: &registers)
+                case let .setRelation(result, operation, lhs, rhs):
+                    let left = try set(lhs, registers: registers)
+                    let right = try set(rhs, registers: registers)
+                    let relation: Bool
+                    switch operation {
+                    case .equal:
+                        relation = if left.sharesStorage(with: right) {
+                            true
+                        } else if left.elements.count == right.elements.count {
+                            try setIsSubset(left, of: right, budget: budget)
+                        } else {
+                            false
+                        }
+                    case .subset:
+                        relation = try setIsSubset(left, of: right, budget: budget)
+                    case .strictSubset:
+                        relation = if left.elements.count < right.elements.count {
+                            try setIsSubset(left, of: right, budget: budget)
+                        } else {
+                            false
+                        }
+                    case .superset:
+                        relation = try setIsSubset(right, of: left, budget: budget)
+                    case .strictSuperset:
+                        relation = if left.elements.count > right.elements.count {
+                            try setIsSubset(right, of: left, budget: budget)
+                        } else {
+                            false
+                        }
+                    case .disjoint:
+                        relation = try setsAreDisjoint(left, right, budget: budget)
+                    }
+                    try initialize(.bool(relation), register: result, registers: &registers)
                 case let .compare(result, predicate, lhs, rhs):
                     let comparison = try compare(
                         predicate,
@@ -2543,11 +2889,11 @@ public struct Interpreter: Sendable {
                 throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
             }
             if let budget {
-                // Duplicate detection uses a transient hash set. Charge it even
+                // Duplicate detection uses a transient key index. Charge it even
                 // though it is released after boundary validation.
                 try budget.consumeAggregateStorage(elementCount: entries.count)
             }
-            var keys = Set<VM.Value>()
+            var keys: [VM.Value] = []
             keys.reserveCapacity(entries.count)
             for entry in entries {
                 try validateRuntimeValue(
@@ -2564,11 +2910,62 @@ public struct Interpreter: Sendable {
                     budget: budget,
                     depth: depth + 1
                 )
-                guard keys.insert(entry.key).inserted else {
+                var isDuplicate = false
+                for key in keys {
+                    if try hashableValuesEqual(
+                        key,
+                        entry.key,
+                        budget: budget
+                    ) {
+                        isDuplicate = true
+                        break
+                    }
+                }
+                guard !isDuplicate else {
                     throw VM.RuntimeTrap.nativeFailure(
                         "Dictionary boundary value contains a duplicate key"
                     )
                 }
+                keys.append(entry.key)
+            }
+        case let (.set(set), .set(expectedElement)):
+            guard expectedElement.isVMHashable,
+                  set.elementType == expectedElement
+            else {
+                throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
+            }
+            if let budget {
+                try budget.consumeAggregateStorage(
+                    elementCount: set.elements.count
+                )
+            }
+            var unique: [VM.Value] = []
+            unique.reserveCapacity(set.elements.count)
+            for element in set.elements {
+                try validateRuntimeValue(
+                    element,
+                    expected: expectedElement,
+                    localTypes: localTypes,
+                    budget: budget,
+                    depth: depth + 1
+                )
+                var isDuplicate = false
+                for existing in unique {
+                    if try hashableValuesEqual(
+                        existing,
+                        element,
+                        budget: budget
+                    ) {
+                        isDuplicate = true
+                        break
+                    }
+                }
+                guard !isDuplicate else {
+                    throw VM.RuntimeTrap.nativeFailure(
+                        "Set boundary value contains a duplicate element"
+                    )
+                }
+                unique.append(element)
             }
         case let (.optional(.some(wrapped)), .optional(type)):
             try validateRuntimeValue(
@@ -2668,7 +3065,13 @@ public struct Interpreter: Sendable {
     }
 
     private func copy(_ value: VM.Value) throws -> VM.Value {
-        switch value {
+        if value.type.isVMHashable {
+            // This closed family contains no native handles or mutable cells.
+            // Sharing its immutable COW storage is both safe and required for
+            // Swift's reflexive collection equality when payloads contain NaN.
+            return value
+        }
+        return switch value {
         case let .native(native):
             .native(try nativeTypeCatalog.copy(native))
         case let .any(erased):
@@ -2690,6 +3093,10 @@ public struct Interpreter: Sendable {
                 keyType: keyType,
                 valueType: valueType
             )
+        case let .set(set):
+            // Malformed non-VM-hashable Set types are rejected by verification;
+            // keep this total for diagnostics and direct unit fixtures.
+            .set(set)
         case let .optional(.some(wrapped)):
             .optional(try copy(wrapped))
         case .optional(nil):
@@ -2861,6 +3268,11 @@ public struct Interpreter: Sendable {
                 try chargeCopiedValue(entry.key, budget: budget, depth: depth + 1)
                 try chargeCopiedValue(entry.value, budget: budget, depth: depth + 1)
             }
+        case let .set(set):
+            try budget.consumeAggregateStorage(elementCount: set.elements.count)
+            for element in set.elements {
+                try chargeCopiedValue(element, budget: budget, depth: depth + 1)
+            }
         case let .optional(.some(wrapped)):
             try budget.consumeAggregateStorage(elementCount: 1)
             try chargeCopiedValue(wrapped, budget: budget, depth: depth + 1)
@@ -2922,6 +3334,10 @@ public struct Interpreter: Sendable {
             for entry in entries {
                 try chargeValueTraversal(entry.key, budget: budget, depth: depth + 1)
                 try chargeValueTraversal(entry.value, budget: budget, depth: depth + 1)
+            }
+        case let .set(set):
+            for element in set.elements {
+                try chargeValueTraversal(element, budget: budget, depth: depth + 1)
             }
         case let .optional(.some(wrapped)):
             try chargeValueTraversal(wrapped, budget: budget, depth: depth + 1)
@@ -2989,6 +3405,10 @@ public struct Interpreter: Sendable {
                 try chargeShapeValidation(entry.key, budget: budget, depth: depth + 1)
                 try chargeShapeValidation(entry.value, budget: budget, depth: depth + 1)
             }
+        case let .set(set):
+            for element in set.elements {
+                try chargeShapeValidation(element, budget: budget, depth: depth + 1)
+            }
         case let .optional(.some(wrapped)):
             try chargeShapeValidation(wrapped, budget: budget, depth: depth + 1)
         case let .structure(_, fields):
@@ -3022,6 +3442,22 @@ public struct Interpreter: Sendable {
     ) throws {
         try chargeValueTraversal(lhs, budget: budget)
         try chargeValueTraversal(rhs, budget: budget)
+    }
+
+    private func hashableValuesEqual(
+        _ lhs: VM.Value,
+        _ rhs: VM.Value,
+        budget: VM.InvocationBudget?
+    ) throws -> Bool {
+        guard let budget else { return VM.HashableValue.equal(lhs, rhs) }
+        try chargeComparisonWork(lhs: lhs, rhs: rhs, budget: budget)
+        let scratchBytes = try VM.HashableValue.equalityScratchBytes(for: rhs)
+        guard scratchBytes > 0 else {
+            return VM.HashableValue.equal(lhs, rhs)
+        }
+        return try budget.withReservedVMHeap(maximumBytes: scratchBytes) {
+            (value: VM.HashableValue.equal(lhs, rhs), actualBytes: 0)
+        }
     }
 
     private func transfer(
@@ -3211,18 +3647,147 @@ public struct Interpreter: Sendable {
         return (entries, keyType, valueType)
     }
 
+    private func set(
+        _ register: Bytecode.Register,
+        registers: [VM.Value?]
+    ) throws -> VM.SetValue {
+        let value = try read(register, registers: registers)
+        guard case let .set(set) = value else {
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: .set(.never),
+                actual: value.type
+            )
+        }
+        return set
+    }
+
+    private func normalizedSetValue(
+        _ elements: [VM.Value],
+        elementType: Bytecode.ValueType,
+        budget: VM.InvocationBudget
+    ) throws -> VM.SetValue {
+        try budget.consumeLinearWork(elementCount: elements.count)
+        try chargeAggregate(elementCount: elements.count, budget: budget)
+        var unique: [VM.Value] = []
+        unique.reserveCapacity(elements.count)
+        for element in elements where try collectionIndex(
+            of: element,
+            in: unique,
+            budget: budget
+        ) == nil {
+            unique.append(element)
+        }
+        return try copySetElements(
+            unique,
+            elementType: elementType,
+            budget: budget
+        )
+    }
+
+    private func copySetValue(
+        _ set: VM.SetValue,
+        budget: VM.InvocationBudget
+    ) throws -> VM.SetValue {
+        try chargeAggregate(elementCount: set.elements.count, budget: budget)
+        for element in set.elements {
+            try prepareCopy(element, budget: budget)
+        }
+        try budget.checkDeadline()
+        return set
+    }
+
+    private func copySetElements<Elements: Collection>(
+        _ elements: Elements,
+        elementType: Bytecode.ValueType,
+        budget: VM.InvocationBudget
+    ) throws -> VM.SetValue where Elements.Element == VM.Value {
+        try chargeAggregate(elementCount: elements.count, budget: budget)
+        for element in elements {
+            try prepareCopy(element, budget: budget)
+        }
+        let copied = try elements.map(copy)
+        try budget.checkDeadline()
+        return .init(uncheckedElements: copied, elementType: elementType)
+    }
+
+    private func copySetElements(
+        _ elements: [VM.Value],
+        excluding excludedIndex: Int?,
+        elementType: Bytecode.ValueType,
+        budget: VM.InvocationBudget
+    ) throws -> VM.SetValue {
+        let count = elements.count - (excludedIndex == nil ? 0 : 1)
+        try chargeAggregate(elementCount: count, budget: budget)
+        for (index, element) in elements.enumerated()
+        where index != excludedIndex {
+            try prepareCopy(element, budget: budget)
+        }
+        var copied: [VM.Value] = []
+        copied.reserveCapacity(count)
+        for (index, element) in elements.enumerated()
+        where index != excludedIndex {
+            copied.append(try copy(element))
+        }
+        try budget.checkDeadline()
+        return .init(uncheckedElements: copied, elementType: elementType)
+    }
+
+    private func setIsSubset(
+        _ subset: VM.SetValue,
+        of superset: VM.SetValue,
+        budget: VM.InvocationBudget
+    ) throws -> Bool {
+        try budget.consumeLinearWork(elementCount: subset.elements.count)
+        for element in subset.elements where try collectionIndex(
+            of: element,
+            in: superset.elements,
+            budget: budget
+        ) == nil {
+            return false
+        }
+        return true
+    }
+
+    private func setsAreDisjoint(
+        _ lhs: VM.SetValue,
+        _ rhs: VM.SetValue,
+        budget: VM.InvocationBudget
+    ) throws -> Bool {
+        let smaller = lhs.elements.count <= rhs.elements.count ? lhs : rhs
+        let larger = lhs.elements.count <= rhs.elements.count ? rhs : lhs
+        try budget.consumeLinearWork(elementCount: smaller.elements.count)
+        for element in smaller.elements where try collectionIndex(
+            of: element,
+            in: larger.elements,
+            budget: budget
+        ) != nil {
+            return false
+        }
+        return true
+    }
+
     private func dictionaryIndex(
         of needle: VM.Value,
         in entries: [VM.DictionaryEntry],
         budget: VM.InvocationBudget
     ) throws -> Int? {
         for (index, entry) in entries.enumerated() {
-            try chargeComparisonWork(
-                lhs: entry.key,
-                rhs: needle,
-                budget: budget
-            )
-            if entry.key == needle { return index }
+            if try hashableValuesEqual(entry.key, needle, budget: budget) {
+                return index
+            }
+        }
+        return nil
+    }
+
+    private func collectionIndex(
+        of needle: VM.Value,
+        in values: [VM.Value],
+        budget: VM.InvocationBudget
+    ) throws -> Int? {
+        for (index, value) in values.enumerated() {
+            if try hashableValuesEqual(value, needle, budget: budget) {
+                return index
+            }
         }
         return nil
     }

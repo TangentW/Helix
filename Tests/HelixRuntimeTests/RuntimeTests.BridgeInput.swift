@@ -167,6 +167,42 @@ struct BridgeInput {
             }
         }
 
+        let collidingSet = makeEncoder()
+        #expect(throws: Runtime.BridgeInputError.duplicateEncodedSetElement) {
+            _ = try collidingSet.encodeSet(
+                Set([1, 2]),
+                elementType: .int64
+            ) { _ in
+                try collidingSet.encode(Int64(0))
+            }
+        }
+
+        let unsupportedSet = makeEncoder()
+        #expect(
+            throws: Runtime.BridgeInputError.encodedTypeMismatch(
+                expected: "a VM-defined Hashable Set element",
+                actual: Bytecode.ValueType.tuple([.int64]).description
+            )
+        ) {
+            _ = try unsupportedSet.encodeSet(
+                Set([1]),
+                elementType: .tuple([.int64])
+            ) { value in
+                try unsupportedSet.encode(Int64(value))
+            }
+        }
+
+        let collidingDictionary = makeEncoder()
+        #expect(throws: Runtime.BridgeInputError.duplicateEncodedDictionaryKey) {
+            _ = try collidingDictionary.encodeDictionary(
+                [1: "one", 2: "two"],
+                keyType: .int64,
+                valueType: .string,
+                encodeKey: { _ in try collidingDictionary.encode(Int64(0)) },
+                encodeValue: { try collidingDictionary.encode($0) }
+            )
+        }
+
         let untracked = makeEncoder()
         #expect(throws: Runtime.BridgeInputError.untrackedEncodedValue) {
             try untracked.finalize(arguments: [.string("not encoded")])

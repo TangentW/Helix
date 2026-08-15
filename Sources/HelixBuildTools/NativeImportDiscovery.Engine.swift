@@ -323,8 +323,12 @@ extension NativeImportDiscovery {
                 true
             case let .array(element), let .optional(element):
                 isAutomaticallyBridgeable(element)
+            case let .set(element):
+                element.isVMHashable && isAutomaticallyBridgeable(element)
             case let .dictionary(key, value):
-                isDictionaryKey(key) && isAutomaticallyBridgeable(value)
+                key.isVMHashable
+                    && isAutomaticallyBridgeable(key)
+                    && isAutomaticallyBridgeable(value)
             case let .tuple(elements):
                 !elements.isEmpty && elements.allSatisfy(isAutomaticallyBridgeable)
             case .void, .never, .local, .error, .address, .mutableCell,
@@ -337,12 +341,6 @@ extension NativeImportDiscovery {
             type == .void || isAutomaticallyBridgeable(type)
         }
 
-        private func isDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
-            switch type {
-            case .bool, .integer, .string: true
-            default: false
-            }
-        }
 
         private func isSwiftIdentifier(_ value: String) -> Bool {
             guard let first = value.first, first == "_" || first.isLetter else {

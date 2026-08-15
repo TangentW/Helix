@@ -73,6 +73,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         keyType: Bytecode.ValueType,
         valueType: Bytecode.ValueType
     )
+    case set(VM.SetValue)
     case native(VM.NativeValue)
     case tuple([VM.Value])
     case optional(VM.Value?)
@@ -99,6 +100,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .array(_, elementType): .array(elementType)
         case let .dictionary(_, keyType, valueType):
             .dictionary(key: keyType, value: valueType)
+        case let .set(value): .set(value.elementType)
         case let .native(value): .native(value.typeID)
         case let .tuple(elements): .tuple(elements.map(\.type))
         case let .optional(value): .optional(value?.type ?? .never)
@@ -122,6 +124,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .array(values, _): "[\(values.map(\.description).joined(separator: ", "))]"
         case let .dictionary(entries, _, _):
             "[\(entries.map { "\($0.key.description): \($0.value.description)" }.joined(separator: ", "))]"
+        case let .set(value): value.description
         case let .native(value): value.description
         case let .tuple(values): "(\(values.map(\.description).joined(separator: ", ")))"
         case let .optional(value): value.map { "Optional(\($0))" } ?? "nil"
@@ -232,6 +235,12 @@ extension VM.Value {
                 && entries.allSatisfy {
                     $0.key.matches(expectedKey, depth: depth + 1)
                         && $0.value.matches(expectedValue, depth: depth + 1)
+                }
+        case let (.set(value), .set(expectedElement)):
+            expectedElement.isVMHashable
+                && value.elementType == expectedElement
+                && value.elements.allSatisfy {
+                    $0.matches(expectedElement, depth: depth + 1)
                 }
         case let (.native(value), .native(typeID)):
             value.typeID == typeID

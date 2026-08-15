@@ -454,6 +454,7 @@ public struct Generator: Sendable {
         case named(String)
         case array(SwiftTypeShape)
         case dictionary(key: SwiftTypeShape, value: SwiftTypeShape)
+        case set(SwiftTypeShape)
         case optional(SwiftTypeShape)
         case tuple([SwiftTypeShape])
 
@@ -463,6 +464,7 @@ public struct Generator: Sendable {
             case let .array(element): "Swift.Array<\(element.rendered)>"
             case let .dictionary(key, value):
                 "Swift.Dictionary<\(key.rendered), \(value.rendered)>"
+            case let .set(element): "Swift.Set<\(element.rendered)>"
             case let .optional(wrapped): "Swift.Optional<\(wrapped.rendered)>"
             case let .tuple(elements): "(\(elements.map(\.rendered).joined(separator: ", ")))"
             }
@@ -577,6 +579,15 @@ public struct Generator: Sendable {
             return .dictionary(
                 key: try parseSwiftType(components[0]),
                 value: try parseSwiftType(components[1])
+            )
+        }
+        for prefix in ["Swift.Set<", "Set<"] where value.hasPrefix(prefix) {
+            guard value.hasSuffix(">") else {
+                throw BridgeGeneration.Error.invalidSwiftType(raw)
+            }
+            let start = value.index(value.startIndex, offsetBy: prefix.count)
+            return .set(
+                try parseSwiftType(String(value[start..<value.index(before: value.endIndex)]))
             )
         }
         for prefix in ["Swift.Optional<", "Optional<"] where value.hasPrefix(prefix) {
@@ -726,6 +737,8 @@ public struct Generator: Sendable {
         case let (.dictionary(keyShape, valueShape), .dictionary(keyType, valueType)):
             return swiftTypeMatches(keyShape, type: keyType, archive: archive)
                 && swiftTypeMatches(valueShape, type: valueType, archive: archive)
+        case let (.set(shape), .set(type)):
+            return swiftTypeMatches(shape, type: type, archive: archive)
         case let (.tuple(shapes), .tuple(types)):
             return shapes.count == types.count && zip(shapes, types).allSatisfy {
                 swiftTypeMatches($0.0, type: $0.1, archive: archive)
@@ -1310,6 +1323,20 @@ public struct Generator: Sendable {
                 + "\(render(keyType)), valueType: \(render(valueType)), "
                 + "encodeKey: { key in \(encodedKey) }, "
                 + "encodeValue: { value in \(encodedValue) })"
+        case let (.set(elementShape), .set(elementType)):
+            let encoded = renderEncode(
+                expression: "element",
+                shape: elementShape,
+                type: elementType,
+                nativeCatalog: nativeCatalog,
+                inputEncoder: inputEncoder
+            )
+            if let inputEncoder {
+                return "try \(inputEncoder).encodeSet(\(expression), elementType: "
+                    + "\(render(elementType))) { element in \(encoded) }"
+            }
+            return "try Runtime.BridgeValueCodec.encodeSet(\(expression), elementType: "
+                + "\(render(elementType))) { element in \(encoded) }"
         case let (.tuple(shapes), .tuple(types)):
             let values = zip(shapes, types).enumerated().map { offset, pair in
                 renderEncode(
@@ -1372,6 +1399,14 @@ public struct Generator: Sendable {
                 + "\(render(keyType)), valueType: \(render(valueType)), "
                 + "decodeKey: { key in \(decodedKey) }, "
                 + "decodeValue: { value in \(decodedValue) })"
+        case let (.set(elementShape), .set(elementType)):
+            let decoded = renderDecode(
+                expression: "element",
+                shape: elementShape,
+                type: elementType
+            )
+            return "try Runtime.BridgeValueCodec.decodeSet(\(expression), elementType: "
+                + "\(render(elementType))) { element in \(decoded) }"
         case let (.tuple(shapes), .tuple(types)):
             let temporary = "tuple_\(Core.Digest.sha256(expression).hex.prefix(8))"
             let values = zip(shapes, types).enumerated().map { offset, pair in
@@ -1685,6 +1720,8 @@ public struct Generator: Sendable {
             true
         case let .array(element), let .optional(element):
             isGeneratedValueType(element)
+        case let .set(element):
+            element.isVMHashable && isGeneratedValueType(element)
         case let .dictionary(key, value):
             isGeneratedDictionaryKey(key) && isGeneratedValueType(value)
         case let .tuple(elements):
@@ -1705,10 +1742,7 @@ public struct Generator: Sendable {
     }
 
     private func isGeneratedDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .bool, .integer, .string: true
-        default: false
-        }
+        type.isVMHashable && isGeneratedValueType(type)
     }
 
     private func isValidGeneratedSwiftTypeSpelling(_ raw: String) -> Bool {
@@ -1963,6 +1997,7 @@ public struct Generator: Sendable {
         case let .array(element): ".array(\(render(element)))"
         case let .dictionary(key, value):
             ".dictionary(key: \(render(key)), value: \(render(value)))"
+        case let .set(element): ".set(\(render(element)))"
         case let .native(id): ".native(Core.TypeID(rawValue: \(render(id.rawValue))))"
         case let .local(key):
             ".local(Bytecode.LocalTypeKey(rawValue: \(quoted(key.rawValue))))"

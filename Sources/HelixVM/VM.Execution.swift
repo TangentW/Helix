@@ -465,6 +465,11 @@ public final class InvocationBudget: @unchecked Sendable {
                 try consumeBoundaryValue(entry.key, depth: depth + 1)
                 try consumeBoundaryValue(entry.value, depth: depth + 1)
             }
+        case let .set(set):
+            try consumeAggregateStorage(elementCount: set.elements.count)
+            for element in set.elements {
+                try consumeBoundaryValue(element, depth: depth + 1)
+            }
         case let .native(native):
             try consumeNativeOwned(bytes: native.estimatedByteCount)
         case let .tuple(elements):

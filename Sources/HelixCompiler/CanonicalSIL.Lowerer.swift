@@ -94,6 +94,12 @@ public struct Lowerer: Sendable {
         var indexSlot: Bytecode.StackSlot
     }
 
+    private struct SetIteratorState {
+        var elementType: Bytecode.ValueType
+        var set: Bytecode.Register
+        var indexSlot: Bytecode.StackSlot
+    }
+
     private struct ArrayLiteralComponentAddress {
         var allocation: String
         var index: Int
@@ -464,6 +470,7 @@ public struct Lowerer: Sendable {
         var characterMetatypeValues = Set<String>()
         var localMetatypeValues: [String: Bytecode.LocalTypeKey] = [:]
         var dictionaryMetatypeValues: [String: (Bytecode.ValueType, Bytecode.ValueType)] = [:]
+        var setMetatypeValues: [String: Bytecode.ValueType] = [:]
         var stackAddressTypes: [String: Bytecode.ValueType] = [:]
         var stackAddressValues: [String: Bytecode.Register] = [:]
         var stackSlotTypes: [Bytecode.ValueType] = []
@@ -506,6 +513,10 @@ public struct Lowerer: Sendable {
         var pendingDictionaryIteratorValues: [String: DictionaryIteratorState] = [:]
         var dictionaryIteratorStates: [String: DictionaryIteratorState] = [:]
         var destroyedDictionaryIterators: [String: Set<Bytecode.BlockID>] = [:]
+        var pendingSetIteratorTypes: [String: Bytecode.ValueType] = [:]
+        var pendingSetIteratorValues: [String: SetIteratorState] = [:]
+        var setIteratorStates: [String: SetIteratorState] = [:]
+        var destroyedSetIterators: [String: Set<Bytecode.BlockID>] = [:]
         var pendingStringInterpolationAddresses = Set<String>()
         var stringInterpolationAddressValues: [String: Bytecode.Register] = [:]
         var stringInterpolationValues: [String: Bytecode.Register] = [:]
@@ -978,6 +989,18 @@ public struct Lowerer: Sendable {
             line: Int
         ) throws -> Bytecode.Register? {
             guard let type = stackType(at: token) else { return nil }
+            if storageInitializationPlan.consumesApplicationArgument(
+                token,
+                at: currentSILLineIndex
+            ) {
+                guard let taken = try takeStoredValue(at: token, line: line) else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: line,
+                        text: "consuming @in argument cannot transfer its storage"
+                    )
+                }
+                return taken
+            }
             if let cell = mutableCell(at: token) {
                 let result = try allocate(type: type)
                 appendInstruction(
@@ -4035,6 +4058,32 @@ public struct Lowerer: Sendable {
                 )
             }
 
+            func materializeSetOperand(
+                _ token: String,
+                element expectedElement: Bytecode.ValueType,
+                expectedSequence: Bytecode.ValueType? = nil
+            ) throws -> Bytecode.Register {
+                let source = try materializeOwnedValue(at: token, line: line)
+                let sourceType = registerTypes[Int(source.rawValue)]
+                if let expectedSequence, sourceType != expectedSequence {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set Sequence specialization does not match its operand"
+                    )
+                }
+                switch sourceType {
+                case .set(let element) where element == expectedElement:
+                    return source
+                case .array(let element) where element == expectedElement:
+                    let result = try allocate(type: .set(expectedElement))
+                    appendInstruction(.makeSet(result: result, source: source))
+                    return result
+                default:
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Set operations support Array<Element> and Set<Element> sequences"
+                    )
+                }
+            }
+
             switch intrinsic {
             case .higherOrder, .algebraic:
                 throw CanonicalSIL.LoweringError.unsupportedInstruction(
@@ -4772,24 +4821,52 @@ public struct Lowerer: Sendable {
                         "Collection boundary getter has unsupported arguments"
                     )
                 }
-                let array = try resolve(arguments[1], line: line)
                 let collectionType = try parseType(genericArguments)
-                guard case let .array(element) = collectionType,
-                      registerTypes[Int(array.rawValue)] == collectionType,
-                      outputType == .optional(element)
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Collection boundary types do not match Array.Element"
+                let result: Bytecode.Register
+                switch collectionType {
+                case let .array(element):
+                    let array = try resolve(arguments[1], line: line)
+                    guard registerTypes[Int(array.rawValue)] == collectionType,
+                          outputType == .optional(element)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Collection boundary types do not match Array.Element"
+                        )
+                    }
+                    result = try allocate(type: outputType)
+                    appendInstruction(
+                        .arrayBoundary(
+                            result: result,
+                            operation: operation,
+                            array: array
+                        )
+                    )
+                case let .set(element) where operation == .first:
+                    let set = try materializeSetOperand(
+                        arguments[1],
+                        element: element
+                    )
+                    guard outputType == .optional(element) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Collection.first types do not match Set.Element"
+                        )
+                    }
+                    let zero = try allocate(type: .int64)
+                    appendInstruction(.constantInteger(result: zero, value: 0))
+                    let slot = try allocateStackSlot(type: .int64)
+                    appendInstruction(
+                        .storeStack(slot: slot, source: zero, mode: .initialize)
+                    )
+                    result = try allocate(type: outputType)
+                    appendInstruction(
+                        .setNext(result: result, set: set, indexSlot: slot)
+                    )
+                    appendInstruction(.destroyStack(slot))
+                default:
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Collection boundary operation for \(collectionType)"
                     )
                 }
-                let result = try allocate(type: .optional(element))
-                appendInstruction(
-                    .arrayBoundary(
-                        result: result,
-                        operation: operation,
-                        array: array
-                    )
-                )
                 try storeConstructedValue(result, at: arguments[0], mode: .initialize)
                 voidValues.insert(resultToken)
 
@@ -5260,6 +5337,490 @@ public struct Lowerer: Sendable {
                     )
                 )
                 try storeConstructedValue(result, at: arguments[0], mode: .initialize)
+                voidValues.insert(resultToken)
+
+            case .setEmpty:
+                guard arguments.count == 1 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set.init() has unsupported arguments"
+                    )
+                }
+                let types = try parseSetGenericArguments(genericArguments)
+                guard setMetatypeValues[arguments[0]] == types.element else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set.init() metatype does not match Element"
+                    )
+                }
+                let emptyArray = try allocate(type: .array(types.element))
+                appendInstruction(.makeArray(result: emptyArray, elements: []))
+                let result = try allocate(type: .set(types.element))
+                appendInstruction(.makeSet(result: result, source: emptyArray))
+                values[resultToken] = result
+
+            case .setCount, .setIsEmpty:
+                guard arguments.count == 1 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set property getter has unsupported arguments"
+                    )
+                }
+                let types = try parseSetGenericArguments(genericArguments)
+                let set = try materializeSetOperand(
+                    arguments[0],
+                    element: types.element
+                )
+                let resultType: Bytecode.ValueType = intrinsic == .setCount
+                    ? .int64
+                    : .bool
+                let result = try allocate(type: resultType)
+                values[resultToken] = result
+                appendInstruction(
+                    intrinsic == .setCount
+                        ? .setCount(result: result, set: set)
+                        : .setIsEmpty(result: result, set: set)
+                )
+
+            case .setContains:
+                guard arguments.count == 2,
+                      let element = try copyStoredValue(
+                        at: arguments[0],
+                        line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set.contains has unsupported arguments"
+                    )
+                }
+                let types = try parseSetGenericArguments(genericArguments)
+                let set = try materializeSetOperand(
+                    arguments[1],
+                    element: types.element
+                )
+                guard registerTypes[Int(element.rawValue)] == types.element else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set.contains element type does not match"
+                    )
+                }
+                let result = try allocate(type: .bool)
+                values[resultToken] = result
+                appendInstruction(
+                    .setContains(result: result, set: set, element: element)
+                )
+
+            case .setInsert:
+                guard arguments.count == 3,
+                      let memberType = compilerAddressType(arguments[0]),
+                      let elementType = compilerAddressType(arguments[1]),
+                      let setType = compilerAddressType(arguments[2]),
+                      let element = try copyStoredValue(
+                        at: arguments[1],
+                        line: line
+                      ),
+                      let set = try copyStoredValue(
+                        at: arguments[2],
+                        line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set.insert has unsupported or uninitialized arguments"
+                    )
+                }
+                let types = try parseSetGenericArguments(genericArguments)
+                let expectedSet = Bytecode.ValueType.set(types.element)
+                guard memberType == types.element,
+                      elementType == types.element,
+                      setType == expectedSet,
+                      registerTypes[Int(element.rawValue)] == types.element,
+                      registerTypes[Int(set.rawValue)] == expectedSet
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set.insert types do not match Set.Element"
+                    )
+                }
+                let inserted = try allocate(type: .bool)
+                let member = try allocate(type: types.element)
+                let updated = try allocate(type: expectedSet)
+                appendInstruction(
+                    .setInsert(
+                        insertedResult: inserted,
+                        memberResult: member,
+                        setResult: updated,
+                        set: set,
+                        element: element
+                    )
+                )
+                values[resultToken] = inserted
+                try storeConstructedValue(
+                    member,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                try storeConstructedValue(
+                    updated,
+                    at: arguments[2],
+                    mode: .assign
+                )
+
+            case .setUpdate, .setRemove:
+                guard arguments.count == 3,
+                      let outputType = compilerAddressType(arguments[0]),
+                      let elementType = compilerAddressType(arguments[1]),
+                      let setType = compilerAddressType(arguments[2]),
+                      let element = try copyStoredValue(
+                        at: arguments[1],
+                        line: line
+                      ),
+                      let set = try copyStoredValue(
+                        at: arguments[2],
+                        line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set mutation has unsupported or uninitialized arguments"
+                    )
+                }
+                let types = try parseSetGenericArguments(genericArguments)
+                let expectedSet = Bytecode.ValueType.set(types.element)
+                guard outputType == .optional(types.element),
+                      elementType == types.element,
+                      setType == expectedSet,
+                      registerTypes[Int(element.rawValue)] == types.element,
+                      registerTypes[Int(set.rawValue)] == expectedSet
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set mutation types do not match Set.Element"
+                    )
+                }
+                let oldMember = try allocate(type: outputType)
+                let updated = try allocate(type: expectedSet)
+                if intrinsic == .setUpdate {
+                    appendInstruction(
+                        .setUpdate(
+                            oldMemberResult: oldMember,
+                            setResult: updated,
+                            set: set,
+                            element: element
+                        )
+                    )
+                } else {
+                    appendInstruction(
+                        .setRemove(
+                            removedResult: oldMember,
+                            setResult: updated,
+                            set: set,
+                            element: element
+                        )
+                    )
+                }
+                try storeConstructedValue(
+                    oldMember,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                try storeConstructedValue(
+                    updated,
+                    at: arguments[2],
+                    mode: .assign
+                )
+                voidValues.insert(resultToken)
+
+            case .setPopFirst, .setRemoveFirst:
+                let types = try parseSetGenericArguments(genericArguments)
+                let expectedOutput: Bytecode.ValueType = intrinsic == .setPopFirst
+                    ? .optional(types.element)
+                    : types.element
+                let expectedSet = Bytecode.ValueType.set(types.element)
+                guard arguments.count == 2,
+                      compilerAddressType(arguments[0]) == expectedOutput,
+                      compilerAddressType(arguments[1]) == expectedSet,
+                      let source = try copyStoredValue(
+                        at: arguments[1],
+                        line: line
+                      ),
+                      registerTypes[Int(source.rawValue)] == expectedSet
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set first-element removal types do not match Set.Element"
+                    )
+                }
+                let optional = try allocate(type: .optional(types.element))
+                let updated = try allocate(type: expectedSet)
+                appendInstruction(
+                    .setPopFirst(
+                        elementResult: optional,
+                        setResult: updated,
+                        set: source
+                    )
+                )
+                let output: Bytecode.Register
+                if intrinsic == .setPopFirst {
+                    output = optional
+                } else {
+                    output = try allocate(type: types.element)
+                    appendInstruction(
+                        .unwrapOptional(result: output, optional: optional)
+                    )
+                }
+                try storeConstructedValue(
+                    output,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                try storeConstructedValue(
+                    updated,
+                    at: arguments[1],
+                    mode: .assign
+                )
+                voidValues.insert(resultToken)
+
+            case .setReserveCapacity:
+                let types = try parseSetGenericArguments(genericArguments)
+                guard arguments.count == 2,
+                      compilerAddressType(arguments[1]) == .set(types.element),
+                      let capacity = try? resolve(arguments[0], line: line),
+                      registerTypes[Int(capacity.rawValue)] == .int64,
+                      let source = try copyStoredValue(
+                        at: arguments[1],
+                        line: line
+                      ),
+                      registerTypes[Int(source.rawValue)] == .set(types.element)
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set.reserveCapacity has unsupported arguments"
+                    )
+                }
+                let zero = try allocate(type: .int64)
+                appendInstruction(.constantInteger(result: zero, value: 0))
+                let isNegative = try allocate(type: .bool)
+                appendInstruction(
+                    .compare(
+                        result: isNegative,
+                        predicate: .lessThan,
+                        lhs: capacity,
+                        rhs: zero
+                    )
+                )
+                try appendConditionalTrap(
+                    condition: isNegative,
+                    reason: .explicit("Set capacity must not be negative")
+                )
+                // Capacity is an implementation detail unless queried; the VM
+                // keeps immutable value storage and therefore needs no mutation.
+                voidValues.insert(resultToken)
+
+            case .setLiteral, .setSequenceInit:
+                guard arguments.count == 2 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set initializer has unsupported arguments"
+                    )
+                }
+                let types = try parseSetGenericArguments(genericArguments)
+                guard setMetatypeValues[arguments[1]] == types.element else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set initializer metatype does not match Element"
+                    )
+                }
+                let expectedSequence = intrinsic == .setSequenceInit
+                    ? types.sequence
+                    : nil
+                let result = try materializeSetOperand(
+                    arguments[0],
+                    element: types.element,
+                    expectedSequence: expectedSequence
+                )
+                values[resultToken] = result
+
+            case .setMakeIterator:
+                guard arguments.count == 1 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set.makeIterator has unsupported arguments"
+                    )
+                }
+                let types = try parseSetGenericArguments(genericArguments)
+                let set = try materializeSetOperand(
+                    arguments[0],
+                    element: types.element
+                )
+                guard pendingSetIteratorValues[resultToken] == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set iterator value is initialized more than once"
+                    )
+                }
+                let zero = try allocate(type: .int64)
+                appendInstruction(.constantInteger(result: zero, value: 0))
+                let slot = try allocateStackSlot(type: .int64)
+                appendInstruction(
+                    .storeStack(slot: slot, source: zero, mode: .initialize)
+                )
+                pendingSetIteratorValues[resultToken] = .init(
+                    elementType: types.element,
+                    set: set,
+                    indexSlot: slot
+                )
+
+            case .setIteratorNext:
+                guard arguments.count == 2 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set.Iterator.next has unsupported arguments"
+                    )
+                }
+                let types = try parseSetGenericArguments(genericArguments)
+                let resultType = Bytecode.ValueType.optional(types.element)
+                guard compilerAddressType(arguments[0]) == resultType,
+                      let state = setIteratorStates[addressBase(arguments[1])],
+                      state.elementType == types.element
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set.Iterator.next types do not match"
+                    )
+                }
+                let result = try allocate(type: resultType)
+                appendInstruction(
+                    .setNext(
+                        result: result,
+                        set: state.set,
+                        indexSlot: state.indexSlot
+                    )
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case let .setAlgebra(operation):
+                guard arguments.count == 2 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set algebra has unsupported arguments"
+                    )
+                }
+                let types = try parseSetGenericArguments(genericArguments)
+                let rhs = try materializeSetOperand(
+                    arguments[0],
+                    element: types.element,
+                    expectedSequence: types.sequence
+                )
+                let lhs = try materializeSetOperand(
+                    arguments[1],
+                    element: types.element
+                )
+                let result = try allocate(type: .set(types.element))
+                values[resultToken] = result
+                appendInstruction(
+                    .setAlgebra(
+                        result: result,
+                        operation: operation,
+                        lhs: lhs,
+                        rhs: rhs
+                    )
+                )
+
+            case let .setFormAlgebra(operation):
+                let types = try parseSetGenericArguments(genericArguments)
+                guard arguments.count == 2,
+                      compilerAddressType(arguments[1]) == .set(types.element)
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "mutating Set algebra has unsupported arguments"
+                    )
+                }
+                let rhs = try materializeSetOperand(
+                    arguments[0],
+                    element: types.element,
+                    expectedSequence: types.sequence
+                )
+                guard let lhs = try copyStoredValue(
+                    at: arguments[1],
+                    line: line
+                ) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "mutating Set algebra references uninitialized storage"
+                    )
+                }
+                let result = try allocate(type: .set(types.element))
+                appendInstruction(
+                    .setAlgebra(
+                        result: result,
+                        operation: operation,
+                        lhs: lhs,
+                        rhs: rhs
+                    )
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[1],
+                    mode: .assign
+                )
+                voidValues.insert(resultToken)
+
+            case let .setRelation(operation):
+                let types = try parseSetGenericArguments(genericArguments)
+                let lhs: Bytecode.Register
+                let rhs: Bytecode.Register
+                if operation == .equal {
+                    guard arguments.count == 3,
+                          setMetatypeValues[arguments[2]] == types.element
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Set equality has unsupported arguments"
+                        )
+                    }
+                    lhs = try materializeSetOperand(
+                        arguments[0],
+                        element: types.element
+                    )
+                    rhs = try materializeSetOperand(
+                        arguments[1],
+                        element: types.element
+                    )
+                } else {
+                    guard arguments.count == 2 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Set relation has unsupported arguments"
+                        )
+                    }
+                    rhs = try materializeSetOperand(
+                        arguments[0],
+                        element: types.element
+                    )
+                    lhs = try materializeSetOperand(
+                        arguments[1],
+                        element: types.element
+                    )
+                }
+                let result = try allocate(type: .bool)
+                values[resultToken] = result
+                appendInstruction(
+                    .setRelation(
+                        result: result,
+                        operation: operation,
+                        lhs: lhs,
+                        rhs: rhs
+                    )
+                )
+
+            case .setRemoveAll:
+                let types = try parseSetGenericArguments(genericArguments)
+                guard arguments.count == 2,
+                      let element = compilerAddressType(arguments[1]),
+                      case let .set(elementType) = element,
+                      elementType == types.element,
+                      let keepCapacity = try? resolve(arguments[0], line: line),
+                      registerTypes[Int(keepCapacity.rawValue)] == .bool
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set.removeAll has unsupported arguments"
+                    )
+                }
+                let emptyArray = try allocate(type: .array(elementType))
+                appendInstruction(.makeArray(result: emptyArray, elements: []))
+                let emptySet = try allocate(type: .set(elementType))
+                appendInstruction(.makeSet(result: emptySet, source: emptyArray))
+                try storeConstructedValue(
+                    emptySet,
+                    at: arguments[1],
+                    mode: .assign
+                )
                 voidValues.insert(resultToken)
 
             case .allocateUninitializedArray:
@@ -5814,6 +6375,20 @@ public struct Lowerer: Sendable {
 
             if let metatype = match(
                 line,
+                pattern: #"^(%[0-9]+) = metatype \$@thin (?:Swift\.)?Set<(.+)>\.Type$"#
+            ) {
+                let element = try parseStoredType(metatype[1])
+                guard element.isVMHashable else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Set element \(element) lacks VM-defined Hashable semantics"
+                    )
+                }
+                setMetatypeValues[metatype[0]] = element
+                continue
+            }
+
+            if let metatype = match(
+                line,
                 pattern: #"^(%[0-9]+) = metatype \$@(?:thin|thick|objc_metatype) (.+)\.Type$"#
             ), let key = typeEnvironment.localKey(for: metatype[1]) {
                 localMetatypeValues[metatype[0]] = key
@@ -5933,6 +6508,10 @@ public struct Lowerer: Sendable {
                 }
                 if let types = try dictionaryIteratorTypes(stack[1]) {
                     pendingDictionaryIteratorTypes[stack[0]] = (types.key, types.value)
+                    continue
+                }
+                if let element = try setIteratorElementType(stack[1]) {
+                    pendingSetIteratorTypes[stack[0]] = element
                     continue
                 }
                 let type = try parseStoredType(stack[1])
@@ -6229,6 +6808,7 @@ public struct Lowerer: Sendable {
                         || progressionAddresses[base] != nil
                         || progressionIteratorAddresses[base] != nil
                         || pendingDictionaryIteratorTypes[base] != nil
+                        || pendingSetIteratorTypes[base] != nil
                         || pendingStringInterpolationAddresses.contains(base)
                         || nativePropertyAddresses[base] != nil
                 else {
@@ -6361,6 +6941,22 @@ public struct Lowerer: Sendable {
                         pendingDictionaryIteratorTypes.removeValue(forKey: address)
                         dictionaryIteratorStates.removeValue(forKey: address)
                         destroyedDictionaryIterators.removeValue(forKey: address)
+                    }
+                    continue
+                }
+                if pendingSetIteratorTypes[address] != nil {
+                    guard let block = current?.id,
+                          setIteratorStates[address] != nil,
+                          destroyedSetIterators[address]?.contains(block) == true
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Set iterator is deallocated before destroy_addr"
+                        )
+                    }
+                    if isFinalLexicalUse {
+                        pendingSetIteratorTypes.removeValue(forKey: address)
+                        setIteratorStates.removeValue(forKey: address)
+                        destroyedSetIterators.removeValue(forKey: address)
                     }
                     continue
                 }
@@ -9595,6 +10191,22 @@ public struct Lowerer: Sendable {
             if let store = match(
                 line,
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
+            ), let state = pendingSetIteratorValues.removeValue(forKey: store[0]) {
+                let address = addressBase(store[1])
+                guard pendingSetIteratorTypes[address] == state.elementType,
+                      setIteratorStates[address] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set iterator store does not match its stack address"
+                    )
+                }
+                setIteratorStates[address] = state
+                continue
+            }
+
+            if let store = match(
+                line,
+                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
             ), let box = projectedBoxByAddress[store[1]],
                let key = typedErrorBoxTypes[box] {
                 let payload = try resolve(store[0], line: sourceLine)
@@ -9973,6 +10585,18 @@ public struct Lowerer: Sendable {
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Dictionary iterator is destroyed twice in one block"
+                        )
+                    }
+                    appendInstruction(.destroyStack(iterator.indexSlot))
+                    continue
+                }
+                if let iterator = setIteratorStates[address] {
+                    guard let block = current?.id,
+                          destroyedSetIterators[address, default: []]
+                            .insert(block).inserted
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Set iterator is destroyed twice in one block"
                         )
                     }
                     appendInstruction(.destroyStack(iterator.indexSlot))
@@ -10939,6 +11563,13 @@ public struct Lowerer: Sendable {
                 + destroyedDictionaryIterators.count
         )
         recordIncompleteLifetime(
+            "set-iterator",
+            count: pendingSetIteratorTypes.count
+                + pendingSetIteratorValues.count
+                + setIteratorStates.count
+                + destroyedSetIterators.count
+        )
+        recordIncompleteLifetime(
             "string-interpolation",
             count: pendingStringInterpolationAddresses.count
                 + stringInterpolationAddressValues.count
@@ -11225,7 +11856,7 @@ public struct Lowerer: Sendable {
         switch type {
         case .void, .never, .address, .mutableCell, .arrayBuilder:
             false
-        case .bool, .integer, .float, .string, .any, .array, .dictionary,
+        case .bool, .integer, .float, .string, .any, .array, .dictionary, .set,
              .tuple, .native, .local, .error, .closure, .optional:
             true
         }
@@ -11476,12 +12107,55 @@ public struct Lowerer: Sendable {
         let start = type.index(type.startIndex, offsetBy: prefix.count)
         let end = type.index(type.endIndex, offsetBy: -">.Iterator".count)
         let types = try parseDictionaryGenericArguments(String(type[start..<end]))
-        guard isSupportedDictionaryKey(types.key) else {
+        guard types.key.isVMHashable else {
             throw CanonicalSIL.LoweringError.unsupportedType(
                 "Dictionary iterator key \(types.key)"
             )
         }
         return types
+    }
+
+    private func setIteratorElementType(
+        _ raw: String
+    ) throws -> Bytecode.ValueType? {
+        let type = raw.trimmingCharacters(in: .whitespaces)
+        let prefixes = ["Set<", "Swift.Set<"]
+        guard let prefix = prefixes.first(where: { type.hasPrefix($0) }),
+              type.hasSuffix(">.Iterator")
+        else { return nil }
+        let start = type.index(type.startIndex, offsetBy: prefix.count)
+        let end = type.index(type.endIndex, offsetBy: -">.Iterator".count)
+        let element = try parseStoredType(String(type[start..<end]))
+        guard element.isVMHashable else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "Set iterator element \(element) lacks VM-defined Hashable semantics"
+            )
+        }
+        return element
+    }
+
+    private func parseSetGenericArguments(
+        _ raw: String
+    ) throws -> (element: Bytecode.ValueType, sequence: Bytecode.ValueType?) {
+        let components = splitTopLevel(raw)
+        guard (1...2).contains(components.count) else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "Set generic arguments must contain Element and an optional Sequence"
+            )
+        }
+        let element = try parseStoredType(components[0])
+        guard element.isVMHashable else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "Set element \(element) lacks VM-defined Hashable semantics"
+            )
+        }
+        let sequence: Bytecode.ValueType?
+        if components.count == 2 {
+            sequence = try parseStoredType(components[1])
+        } else {
+            sequence = nil
+        }
+        return (element, sequence)
     }
 
     private func parseDictionaryGenericArguments(
@@ -11497,15 +12171,6 @@ public struct Lowerer: Sendable {
             try parseStoredType(components[0]),
             try parseStoredType(components[1])
         )
-    }
-
-    private func isSupportedDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .bool, .integer, .string:
-            true
-        default:
-            false
-        }
     }
 
     private func removeTupleLabel(_ raw: String) -> String {

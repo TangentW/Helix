@@ -116,6 +116,12 @@ struct FrontendReceiptPipeline {
                 allowVoid: false
             ) == nil
         )
+        #expect(
+            FrontendReceipt.ValueTypeParser.parse(
+                "Swift.Set<Swift.Optional<Swift.Int>>",
+                allowVoid: false
+            ) == .set(.optional(.int64))
+        )
     }
 
     @Test("Typed AST and SIL derive both HLBC and Native roots without text discovery")

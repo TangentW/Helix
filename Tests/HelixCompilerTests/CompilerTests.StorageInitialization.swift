@@ -369,6 +369,25 @@ struct StorageInitialization {
         #expect(plan.conditionalDestroyLines.isEmpty)
     }
 
+    @Test("Indirect results are discovered in every physical tuple position")
+    func tracksNonleadingIndirectApplicationResults() throws {
+        let plan = try CanonicalSIL.StorageInitialization.analyze(
+            body: """
+            bb0:
+              %0 = alloc_stack $Int
+              %1 = apply %2(%0) : $@convention(thin) () -> (Bool, @out Int)
+              destroy_addr %0
+              dealloc_stack %0
+              return %3
+            """,
+            directCalls: .empty,
+            typeEnvironment: .empty
+        )
+
+        #expect(plan.runtimeStorageRoots.isEmpty)
+        #expect(plan.conditionalDestroyLines.isEmpty)
+    }
+
     @Test("Indirect call results bridge both continuations into value storage")
     func lowersIndirectCallDestinations() throws {
         let symbol = "$s7Fixture7forwardyypypKF"
@@ -526,6 +545,41 @@ struct StorageInitialization {
                 typeEnvironment: .empty
             )
         }
+    }
+
+    @Test("A runtime-backed @in argument transfers with take semantics")
+    func lowersRuntimeApplicationArgumentTake() throws {
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7captureSbyShySiGzF",
+            loweredType: "@convention(thin) (@inout_aliasable Set<Int>) -> Bool",
+            body: """
+            bb0(%0 : @closureCapture $*Set<Int>):
+              %1 = alloc_stack $Int
+              %2 = integer_literal $Builtin.Int64, 3
+              %3 = struct $Int (%2)
+              %4 = alloc_stack $Int
+              store %3 to %4
+              %5 = begin_access [modify] [static] %0
+              %6 = function_ref @$sSh6insertySb8inserted_x17memberAfterInserttxnF : $@convention(method) <τ_0_0 where τ_0_0 : Hashable> (@in τ_0_0, @inout Set<τ_0_0>) -> (Bool, @out τ_0_0)
+              %7 = apply %6<Int>(%1, %4, %5) : $@convention(method) <τ_0_0 where τ_0_0 : Hashable> (@in τ_0_0, @inout Set<τ_0_0>) -> (Bool, @out τ_0_0)
+              end_access %5
+              dealloc_stack %4
+              dealloc_stack %1
+              return %7
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer().lower(
+            function,
+            displayName: "capture",
+            kind: .concreteSpecialization
+        )
+        #expect(lowered.blocks.flatMap(\.instructions).contains { instruction in
+            guard case let .loadStack(_, slot, mode) = instruction else {
+                return false
+            }
+            return slot.rawValue == 1 && mode == .take
+        })
     }
 
     @Test("A checked cast initializes its destination only on success")

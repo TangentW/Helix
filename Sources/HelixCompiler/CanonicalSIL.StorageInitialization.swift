@@ -1118,15 +1118,12 @@ enum StorageInitialization {
             resultComponents = [rawResult]
         }
         var indirectResultEdges: [IndirectResultEdge] = []
-        if resultComponents.first.map({
-            containsTopLevelToken("@out", in: $0)
-        }) == true {
-            indirectResultEdges.append(.normal)
-        }
-        if resultComponents.contains(where: {
-            containsTopLevelToken("@error_indirect", in: $0)
-        }) {
-            indirectResultEdges.append(.error)
+        for component in resultComponents {
+            if containsTopLevelToken("@out", in: component) {
+                indirectResultEdges.append(.normal)
+            } else if containsTopLevelToken("@error_indirect", in: component) {
+                indirectResultEdges.append(.error)
+            }
         }
         return (parameters, indirectResultEdges)
     }

@@ -379,6 +379,50 @@ struct Routing {
             } == [3, 5]
         )
 
+        let set = try Runtime.BridgeValueCodec.encodeSet(
+            Set([Int32(3), Int32(5)]),
+            elementType: .integer(bitWidth: 32, signed: true)
+        ) {
+            try Runtime.BridgeValueCodec.encode($0)
+        }
+        #expect(
+            try Runtime.BridgeValueCodec.decodeSet(
+                set,
+                elementType: .integer(bitWidth: 32, signed: true)
+            ) {
+                try Runtime.BridgeValueCodec.decode($0, as: Int32.self)
+            } == Set([3, 5])
+        )
+        #expect(throws: VM.RuntimeTrap.self) {
+            _ = try Runtime.BridgeValueCodec.decodeSet(
+                set,
+                elementType: .int64
+            ) {
+                try Runtime.BridgeValueCodec.decode($0, as: Int.self)
+            }
+        }
+        #expect(throws: Runtime.BridgeInputError.duplicateEncodedSetElement) {
+            _ = try Runtime.BridgeValueCodec.encodeSet(
+                Set([1, 2]),
+                elementType: .int64
+            ) { _ in
+                try Runtime.BridgeValueCodec.encode(Int64(0))
+            }
+        }
+        #expect(
+            throws: Runtime.BridgeInputError.encodedTypeMismatch(
+                expected: Bytecode.ValueType.int64.description,
+                actual: Bytecode.ValueType.string.description
+            )
+        ) {
+            _ = try Runtime.BridgeValueCodec.encodeSet(
+                Set([1]),
+                elementType: .int64
+            ) { _ in
+                .string("wrong")
+            }
+        }
+
         let dictionary = try Runtime.BridgeValueCodec.encodeDictionary(
             ["alpha": Int32(3), "beta": Int32(5)],
             keyType: .string,
@@ -395,6 +439,15 @@ struct Routing {
                 decodeValue: { try Runtime.BridgeValueCodec.decode($0, as: Int32.self) }
             ) == ["alpha": 3, "beta": 5]
         )
+        #expect(throws: Runtime.BridgeInputError.duplicateEncodedDictionaryKey) {
+            _ = try Runtime.BridgeValueCodec.encodeDictionary(
+                [1: "one", 2: "two"],
+                keyType: .int64,
+                valueType: .string,
+                encodeKey: { _ in try Runtime.BridgeValueCodec.encode(Int64(0)) },
+                encodeValue: { try Runtime.BridgeValueCodec.encode($0) }
+            )
+        }
     }
 
     @Test("Bridge input limits fall back only when the frozen entry allows it")

@@ -558,6 +558,8 @@ struct ReleasePipeline {
 
         public func remap(_ values: [String: Int]) -> [String: Int] { values }
 
+        public func unique(_ values: Set<Int>) -> Set<Int> { values }
+
         public func echo(_ value: Any) -> Any { value }
         """
         try Data(source.utf8).write(to: sourceURL, options: .atomic)
@@ -612,6 +614,10 @@ struct ReleasePipeline {
         dictionaryInterface.baseName = "remap"
         dictionaryInterface.canonicalFormalType = "(Swift.Dictionary<Swift.String, Swift.Int>) -> Swift.Dictionary<Swift.String, Swift.Int>"
         dictionaryInterface.loweredSILType = "@convention(thin) (@guaranteed Dictionary<String, Int>) -> @owned Dictionary<String, Int>"
+        var setInterface = commonInterface
+        setInterface.baseName = "unique"
+        setInterface.canonicalFormalType = "(Swift.Set<Swift.Int>) -> Swift.Set<Swift.Int>"
+        setInterface.loweredSILType = "@convention(thin) (@guaranteed Set<Int>) -> @owned Set<Int>"
         var anyInterface = commonInterface
         anyInterface.baseName = "echo"
         anyInterface.canonicalFormalType = "(Swift.Any) -> Swift.Any"
@@ -682,6 +688,21 @@ struct ReleasePipeline {
                     .init(
                         moduleName: "Fixture",
                         sourceFileLogicalID: "Sources/BridgeFeatures.swift",
+                        canonicalDeclaration: "func unique(_: Set<Int>) -> Set<Int>",
+                        mangledName: "$s7Fixture6uniqueyShySiGACF",
+                        role: .function,
+                        loweredSignature: .init(
+                            parameters: ["Swift.Set<Swift.Int>"],
+                            result: "Swift.Set<Swift.Int>"
+                        ),
+                        parameterTypes: [.set(.int64)],
+                        resultType: .set(.int64),
+                        interface: setInterface,
+                        canonicalSILBody: "return %0"
+                    ),
+                    .init(
+                        moduleName: "Fixture",
+                        sourceFileLogicalID: "Sources/BridgeFeatures.swift",
                         canonicalDeclaration: "func remap(_: [String: Int]) -> [String: Int]",
                         mangledName: "$s7Fixture5remapySDySSSiGACF",
                         role: .function,
@@ -712,7 +733,7 @@ struct ReleasePipeline {
                 ]
             )
         )
-        #expect(report.eligibleCount == 5)
+        #expect(report.eligibleCount == 6)
         #expect(report.archive.capabilities.contains(.untypedThrowsV1))
         #expect(report.archive.capabilities.contains(.mainActorSyncV1))
         #expect(report.archive.capabilities.contains(.collectionsV1))
@@ -750,6 +771,21 @@ struct ReleasePipeline {
                     resultSwiftType: "Swift.Dictionary<Swift.String, Swift.Int>",
                     originalInvocation: "remap(values)",
                     bridgeInvocation: "helixBridge_remap(argument0)"
+                )
+            }
+            if record.canonicalDeclaration.contains("unique") {
+                return .init(
+                    functionKey: record.key,
+                    entryIndex: entry,
+                    sourceFileLogicalID: record.sourceFileLogicalID,
+                    privateImportSourceFile: "BridgeFeatures.swift",
+                    originalReference: "unique(_:)",
+                    replacementDeclaration: "public func helixBridge_unique(_ values: Set<Int>) -> Set<Int>",
+                    parameterExpressions: ["values"],
+                    parameterSwiftTypes: ["Swift.Set<Swift.Int>"],
+                    resultSwiftType: "Swift.Set<Swift.Int>",
+                    originalInvocation: "unique(values)",
+                    bridgeInvocation: "helixBridge_unique(argument0)"
                 )
             }
             if record.canonicalDeclaration.contains("select") {
@@ -807,6 +843,7 @@ struct ReleasePipeline {
         #expect(entrySource.contains("encoder.encodeArguments(count:"))
         #expect(entrySource.contains("encoder.encodeArray"))
         #expect(entrySource.contains("encoder.encodeDictionary"))
+        #expect(entrySource.contains("encoder.encodeSet"))
         #expect(entrySource.contains("return try risky(x)"))
         #expect(entrySource.contains("MainActor.assumeIsolated"))
         #expect(entrySource.contains("return .businessError"))
@@ -814,6 +851,8 @@ struct ReleasePipeline {
         #expect(entrySource.contains("BridgeValueCodec.decodeArray"))
         #expect(entrySource.contains("BridgeValueCodec.encodeDictionary"))
         #expect(entrySource.contains("BridgeValueCodec.decodeDictionary"))
+        #expect(entrySource.contains("BridgeValueCodec.encodeSet"))
+        #expect(entrySource.contains("BridgeValueCodec.decodeSet"))
         #expect(entrySource.contains("encoder.encodeAny"))
         #expect(entrySource.contains("BridgeValueCodec.encodeAny"))
         #expect(entrySource.contains("BridgeValueCodec.decodeAny"))

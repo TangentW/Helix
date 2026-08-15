@@ -524,11 +524,11 @@ struct SemanticVerifier {
         }
     }
 
-    @Test("Dictionary keys are restricted to frozen scalar Hashable types")
+    @Test("Dictionary keys require VM-defined Hashable semantics")
     func rejectsUnsupportedDictionaryKey() throws {
         var fixture = try makeFixture { function in
             function.registerTypes.append(
-                .dictionary(key: .float(bitWidth: 64), value: .int64)
+                .dictionary(key: .tuple([.int64]), value: .int64)
             )
         }
         fixture.module.capabilities.insert(.collectionsV1)

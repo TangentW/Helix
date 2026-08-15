@@ -158,6 +158,15 @@ enum ValueTypeParser {
                 nativeTypes: nativeTypes
             ).map(Bytecode.ValueType.array)
         }
+        for prefix in ["Set<", "Swift.Set<"]
+        where value.hasPrefix(prefix) && value.hasSuffix(">") {
+            let wrapped = String(value.dropFirst(prefix.count).dropLast())
+            return parse(
+                wrapped,
+                allowVoid: false,
+                nativeTypes: nativeTypes
+            ).map(Bytecode.ValueType.set)
+        }
         for prefix in ["Dictionary<", "Swift.Dictionary<"]
         where value.hasPrefix(prefix) && value.hasSuffix(">") {
             let body = String(value.dropFirst(prefix.count).dropLast())

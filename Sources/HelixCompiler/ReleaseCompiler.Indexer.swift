@@ -405,7 +405,8 @@ public struct Indexer: Sendable {
     ) -> Bool {
         switch type {
         case let .native(id): ids.contains(id)
-        case let .array(element), let .optional(element), let .address(element),
+        case let .array(element), let .optional(element), let .set(element),
+             let .address(element),
              let .mutableCell(element), let .arrayBuilder(element):
             containsNativeType(element, ids: ids)
         case let .dictionary(key, value):
@@ -436,17 +437,10 @@ public struct Indexer: Sendable {
         case let .array(element):
             isSupportedType(element, allowVoid: false)
         case let .dictionary(key, value):
-            isSupportedDictionaryKey(key)
+            key.isVMHashable
                 && isSupportedType(value, allowVoid: false)
-        }
-    }
-
-    private func isSupportedDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .bool, .integer, .string:
-            true
-        default:
-            false
+        case let .set(element):
+            element.isVMHashable && isSupportedType(element, allowVoid: false)
         }
     }
 
@@ -456,6 +450,7 @@ public struct Indexer: Sendable {
         case let .tuple(elements): elements.contains(where: containsString)
         case let .optional(wrapped): containsString(wrapped)
         case let .array(element): containsString(element)
+        case let .set(element): containsString(element)
         case let .dictionary(key, value): containsString(key) || containsString(value)
         case let .closure(signature):
             (signature.parameters + [signature.result]).contains(where: containsString)
@@ -467,7 +462,8 @@ public struct Indexer: Sendable {
         switch type {
         case .closure:
             true
-        case let .array(element), let .optional(element), let .address(element):
+        case let .array(element), let .optional(element), let .set(element),
+             let .address(element):
             containsClosure(element)
         case let .dictionary(key, value):
             containsClosure(key) || containsClosure(value)
@@ -480,7 +476,7 @@ public struct Indexer: Sendable {
 
     private func containsCollection(_ type: Bytecode.ValueType) -> Bool {
         switch type {
-        case .array, .dictionary: true
+        case .array, .dictionary, .set: true
         case let .tuple(elements): elements.contains(where: containsCollection)
         case let .optional(wrapped): containsCollection(wrapped)
         default: false

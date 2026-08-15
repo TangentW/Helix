@@ -247,6 +247,28 @@ public enum Disassembler {
             "(\(valueResult), \(dictionaryResult)) = dictionary_remove \(dictionary)[\(key)]"
         case let .dictionaryNext(result, dictionary, indexSlot):
             "\(result) = dictionary_next \(dictionary), \(indexSlot)"
+        case let .makeSet(result, source):
+            "\(result) = make_set \(source)"
+        case let .setCount(result, set):
+            "\(result) = set_count \(set)"
+        case let .setIsEmpty(result, set):
+            "\(result) = set_is_empty \(set)"
+        case let .setContains(result, set, element):
+            "\(result) = set_contains \(set), \(element)"
+        case let .setInsert(inserted, member, updated, set, element):
+            "(\(inserted), \(member), \(updated)) = set_insert \(element) into \(set)"
+        case let .setUpdate(oldMember, updated, set, element):
+            "(\(oldMember), \(updated)) = set_update \(element) in \(set)"
+        case let .setRemove(removed, updated, set, element):
+            "(\(removed), \(updated)) = set_remove \(element) from \(set)"
+        case let .setPopFirst(element, updated, set):
+            "(\(element), \(updated)) = set_pop_first \(set)"
+        case let .setNext(result, set, indexSlot):
+            "\(result) = set_next \(set), \(indexSlot)"
+        case let .setAlgebra(result, operation, lhs, rhs):
+            "\(result) = set_\(operation.rawValue) \(lhs), \(rhs)"
+        case let .setRelation(result, operation, lhs, rhs):
+            "\(result) = set_\(operation.rawValue) \(lhs), \(rhs)"
         case let .compare(result, predicate, lhs, rhs):
             "\(result) = compare \(predicate.rawValue) \(lhs), \(rhs)"
         case let .branch(target, arguments):

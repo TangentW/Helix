@@ -374,7 +374,7 @@ public struct TypeEnvironment: Sendable {
             containsReferenceNativeValue(element)
         case let .tuple(elements):
             elements.contains(where: containsReferenceNativeValue)
-        case .array, .dictionary:
+        case .array, .dictionary, .set:
             // Objective-C collection parameters are reference bridges. This
             // matters only when their element graph contains native handles.
             true
@@ -527,6 +527,21 @@ public struct TypeEnvironment: Sendable {
                 )
             )
         }
+        for setPrefix in ["Set<", "Swift.Set<"]
+        where type.hasPrefix(setPrefix) && type.hasSuffix(">") {
+            let element = ValueRepresentation.storable(
+                try resolve(
+                    genericBody(type, prefix: setPrefix),
+                    relativeTo: parentScope
+                )
+            )
+            guard element.isVMHashable else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "Set element \(element) does not have VM-defined Hashable semantics"
+                )
+            }
+            return .set(element)
+        }
         for dictionaryPrefix in ["Dictionary<", "Swift.Dictionary<"]
         where type.hasPrefix(dictionaryPrefix) && type.hasSuffix(">") {
             let components = splitTopLevel(genericBody(type, prefix: dictionaryPrefix))
@@ -538,9 +553,9 @@ public struct TypeEnvironment: Sendable {
             let key = ValueRepresentation.storable(
                 try resolve(components[0], relativeTo: parentScope)
             )
-            guard Self.isSupportedDictionaryKey(key) else {
+            guard key.isVMHashable else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
-                    "Dictionary key \(key)"
+                    "Dictionary key \(key) does not have VM-defined Hashable semantics"
                 )
             }
             return .dictionary(
@@ -991,7 +1006,7 @@ public struct TypeEnvironment: Sendable {
             switch type {
             case let .local(key):
                 if seen.insert(key).inserted { pending.append(key) }
-            case let .array(element), let .optional(element),
+            case let .array(element), let .optional(element), let .set(element),
                  let .address(element), let .mutableCell(element),
                  let .arrayBuilder(element):
                 collect(element)
@@ -1087,7 +1102,7 @@ public struct TypeEnvironment: Sendable {
                         depths: &depths
                     )
                 }
-            case let .array(element), let .optional(element),
+            case let .array(element), let .optional(element), let .set(element),
                  let .address(element), let .mutableCell(element),
                  let .arrayBuilder(element):
                 try typeDepth(element) + 1
@@ -1827,17 +1842,6 @@ public struct TypeEnvironment: Sendable {
         }
         result.append(String(raw[start...]).trimmingCharacters(in: .whitespaces))
         return result
-    }
-
-    private static func isSupportedDictionaryKey(
-        _ type: Bytecode.ValueType
-    ) -> Bool {
-        switch type {
-        case .bool, .integer, .string:
-            true
-        default:
-            false
-        }
     }
 
     private func captures(_ value: String, pattern: String) -> [String]? {

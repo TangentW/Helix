@@ -229,17 +229,14 @@ public struct Document: Codable, Hashable, Sendable {
         case .local, .error: false
         case let .array(element): isSupported(element, allowVoid: false)
         case let .dictionary(key, value):
-            isSupportedDictionaryKey(key) && isSupported(value, allowVoid: false)
+            key.isVMHashable
+                && isSupported(key, allowVoid: false)
+                && isSupported(value, allowVoid: false)
+        case let .set(element):
+            element.isVMHashable && isSupported(element, allowVoid: false)
         case let .optional(wrapped): isSupported(wrapped, allowVoid: false)
         case let .tuple(elements):
             !elements.isEmpty && elements.allSatisfy { isSupported($0, allowVoid: false) }
-        }
-    }
-
-    private static func isSupportedDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .bool, .integer, .string: true
-        default: false
         }
     }
 
@@ -249,7 +246,8 @@ public struct Document: Codable, Hashable, Sendable {
     ) -> Bool {
         switch type {
         case let .native(id): ids.contains(id)
-        case let .array(element), let .optional(element), let .address(element),
+        case let .array(element), let .optional(element), let .set(element),
+             let .address(element),
              let .mutableCell(element), let .arrayBuilder(element):
             containsNativeType(element, ids: ids)
         case let .dictionary(key, value):

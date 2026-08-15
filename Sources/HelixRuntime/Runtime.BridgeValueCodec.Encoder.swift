@@ -176,6 +176,35 @@ public final class Encoder {
         }
     }
 
+    /// Reserves the complete Set shape before encoding and type-checking elements.
+    public func encodeSet<Element: Hashable>(
+        _ value: Set<Element>,
+        elementType: Bytecode.ValueType,
+        encodeElement: (Element) throws -> VM.Value
+    ) throws -> VM.Value {
+        guard elementType.isVMHashable else {
+            throw Runtime.BridgeInputError.encodedTypeMismatch(
+                expected: "a VM-defined Hashable Set element",
+                actual: elementType.description
+            )
+        }
+        return try withContainer(childValueCount: value.count) {
+            var elements: [VM.Value] = []
+            elements.reserveCapacity(value.count)
+            for element in value {
+                let encoded = try encodeElement(element)
+                try require(encoded, matches: elementType)
+                elements.append(encoded)
+            }
+            let set = VM.SetValue(elements: elements, elementType: elementType)
+            guard set.elements.count == elements.count else {
+                throw Runtime.BridgeInputError.duplicateEncodedSetElement
+            }
+            try pollDeadline(force: true)
+            return .set(set)
+        }
+    }
+
     /// Reserves key/value nodes before encoding and type-checking dictionary entries.
     public func encodeDictionary<Key: Hashable, Value>(
         _ value: [Key: Value],
@@ -184,6 +213,12 @@ public final class Encoder {
         encodeKey: (Key) throws -> VM.Value,
         encodeValue: (Value) throws -> VM.Value
     ) throws -> VM.Value {
+        guard keyType.isVMHashable else {
+            throw Runtime.BridgeInputError.encodedTypeMismatch(
+                expected: "a VM-defined Hashable Dictionary key",
+                actual: keyType.description
+            )
+        }
         let childCount = value.count.multipliedReportingOverflow(by: 2)
         guard !childCount.overflow else {
             throw Runtime.BridgeInputError.invalidContainerCount
@@ -198,6 +233,14 @@ public final class Encoder {
                 try require(encodedValue, matches: valueType)
                 entries.append(.init(key: encodedKey, value: encodedValue))
             }
+            let uniqueKeys = VM.SetValue(
+                elements: entries.map(\.key),
+                elementType: keyType
+            )
+            guard uniqueKeys.elements.count == entries.count else {
+                throw Runtime.BridgeInputError.duplicateEncodedDictionaryKey
+            }
+            try pollDeadline(force: true)
             return .dictionary(entries, keyType: keyType, valueType: valueType)
         }
     }
@@ -415,6 +458,10 @@ public final class Encoder {
                     pending.append((entry.value, childDepth))
                     pending.append((entry.key, childDepth))
                 }
+            case let .set(set):
+                try validate(set.elements.count, limits: limits)
+                try addAggregate(set.elements.count, to: &result, limits: limits)
+                try append(set.elements, below: depth, to: &pending, limits: limits)
             case let .tuple(elements):
                 try validate(elements.count, limits: limits)
                 try addAggregate(elements.count, to: &result, limits: limits)

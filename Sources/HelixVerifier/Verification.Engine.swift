@@ -388,10 +388,21 @@ public struct Engine: Verification.ImageVerifying {
                     depth: depth + 1,
                     permitsNative: permitsNative
                 )
-            case let .dictionary(key, value):
-                guard isSupportedDictionaryKey(key) else {
+            case let .set(element):
+                guard element.isVMHashable else {
                     throw Verification.Error.invalidModule(
-                        "local type Dictionary key must be Bool, integer, or String"
+                        "local type Set element lacks VM-defined Hashable semantics"
+                    )
+                }
+                try verifyMemberType(
+                    element,
+                    depth: depth + 1,
+                    permitsNative: permitsNative
+                )
+            case let .dictionary(key, value):
+                guard key.isVMHashable else {
+                    throw Verification.Error.invalidModule(
+                        "local type Dictionary key lacks VM-defined Hashable semantics"
                     )
                 }
                 try verifyMemberType(key, depth: depth + 1, permitsNative: permitsNative)
@@ -483,7 +494,7 @@ public struct Engine: Verification.ImageVerifying {
                         depths: &depths
                     )
                 }
-            case let .array(element), let .optional(element),
+            case let .array(element), let .optional(element), let .set(element),
                  let .mutableCell(element), let .arrayBuilder(element):
                 try typeDepth(element) + 1
             case let .dictionary(key, value):
@@ -524,7 +535,7 @@ public struct Engine: Verification.ImageVerifying {
                         "function type references unknown local type \(key)"
                     )
                 }
-            case let .array(element), let .optional(element):
+            case let .array(element), let .optional(element), let .set(element):
                 try visit(element)
             case let .address(pointee), let .mutableCell(pointee),
                  let .arrayBuilder(pointee):
@@ -838,7 +849,8 @@ public struct Engine: Verification.ImageVerifying {
     ) -> Bool {
         switch type {
         case let .native(id): shell.types[id]?.requiresMainActor == true
-        case let .array(element), let .optional(element), let .address(element),
+        case let .array(element), let .optional(element), let .set(element),
+             let .address(element),
              let .mutableCell(element), let .arrayBuilder(element):
             usesMainActorNativeType(element, shell: shell)
         case let .dictionary(key, value):
@@ -866,6 +878,8 @@ public struct Engine: Verification.ImageVerifying {
              let .mutableCell(wrapped), let .arrayBuilder(wrapped):
             try verifyNativeTypes(wrapped, shell: shell)
         case let .array(element):
+            try verifyNativeTypes(element, shell: shell)
+        case let .set(element):
             try verifyNativeTypes(element, shell: shell)
         case let .dictionary(key, value):
             try verifyNativeTypes(key, shell: shell)
@@ -940,6 +954,11 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 try visit(key)
                 try visit(value)
+            case let .set(element):
+                guard capabilities.contains(.collectionsV1) else {
+                    throw Verification.Error.capabilityDenied(.collectionsV1)
+                }
+                try visit(element)
             case let .tuple(elements):
                 for element in elements { try visit(element) }
             case let .optional(wrapped):
@@ -1251,11 +1270,19 @@ public struct Engine: Verification.ImageVerifying {
                 try verify(wrapped, depth: depth + 1, isRegister: false)
             case let .array(element):
                 try verify(element, depth: depth + 1, isRegister: false)
-            case let .dictionary(key, value):
-                guard isSupportedDictionaryKey(key) else {
+            case let .set(element):
+                guard element.isVMHashable else {
                     throw Verification.Error.invalidFunction(
                         function: function.id,
-                        reason: "Dictionary key must be Bool, integer, or String"
+                        reason: "Set element lacks VM-defined Hashable semantics"
+                    )
+                }
+                try verify(element, depth: depth + 1, isRegister: false)
+            case let .dictionary(key, value):
+                guard key.isVMHashable else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "Dictionary key lacks VM-defined Hashable semantics"
                     )
                 }
                 try verify(key, depth: depth + 1, isRegister: false)
@@ -2240,7 +2267,7 @@ public struct Engine: Verification.ImageVerifying {
             }
             guard case let .dictionary(key, value) = type(result),
                   type(pairs) == .array(.tuple([key, value])),
-                  isSupportedDictionaryKey(key)
+                  key.isVMHashable
             else {
                 throw fail("make_dictionary needs Array<(Key, Value)> and Dictionary<Key, Value>")
             }
@@ -2314,6 +2341,117 @@ public struct Engine: Verification.ImageVerifying {
             }
             guard isCopyable(key, shell: shell), isCopyable(value, shell: shell) else {
                 throw fail("dictionary_next requires copyable key and value types")
+            }
+        case let .makeSet(result, source):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("make_set requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .set(element) = type(result),
+                  element.isVMHashable,
+                  type(source) == .array(element) || type(source) == .set(element)
+            else {
+                throw fail("make_set needs Array<T> or Set<T> and a matching Set<T> result")
+            }
+            guard isCopyable(element, shell: shell) else {
+                throw fail("make_set requires a copyable element type")
+            }
+        case let .setCount(result, set):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Set.count requires \(Core.Capability.collectionsV1)")
+            }
+            guard type(result) == .int64, case .set = type(set) else {
+                throw fail("set_count needs a Set operand and Int64 result")
+            }
+        case let .setIsEmpty(result, set):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Set.isEmpty requires \(Core.Capability.collectionsV1)")
+            }
+            guard type(result) == .bool, case .set = type(set) else {
+                throw fail("set_is_empty needs a Set operand and Bool result")
+            }
+        case let .setContains(result, set, element):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Set.contains requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .set(elementType) = type(set),
+                  type(element) == elementType,
+                  type(result) == .bool
+            else {
+                throw fail("set_contains operands must match Set.Element and return Bool")
+            }
+        case let .setInsert(inserted, member, updated, set, element):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Set.insert requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .set(elementType) = type(set),
+                  type(element) == elementType,
+                  type(inserted) == .bool,
+                  type(member) == elementType,
+                  type(updated) == type(set)
+            else {
+                throw fail("set_insert results and operands must match Set.Element")
+            }
+        case let .setUpdate(oldMember, updated, set, element):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Set.update requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .set(elementType) = type(set),
+                  type(element) == elementType,
+                  type(oldMember) == .optional(elementType),
+                  type(updated) == type(set)
+            else {
+                throw fail("set_update results and operands must match Set.Element")
+            }
+        case let .setRemove(removed, updated, set, element):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Set.remove requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .set(elementType) = type(set),
+                  type(element) == elementType,
+                  type(removed) == .optional(elementType),
+                  type(updated) == type(set)
+            else {
+                throw fail("set_remove results and operands must match Set.Element")
+            }
+        case let .setPopFirst(element, updated, set):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Set.popFirst requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .set(elementType) = type(set),
+                  type(element) == .optional(elementType),
+                  type(updated) == type(set)
+            else {
+                throw fail("set_pop_first results must match Set.Element")
+            }
+        case let .setNext(result, set, indexSlot):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Set iteration requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .set(element) = type(set),
+                  type(result) == .optional(element),
+                  function.type(of: indexSlot) == .int64
+            else {
+                throw fail("set_next needs Set<T>, Optional<T>, and an Int64 index slot")
+            }
+        case let .setAlgebra(result, _, lhs, rhs):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Set algebra requires \(Core.Capability.collectionsV1)")
+            }
+            guard case .set = type(lhs),
+                  type(rhs) == type(lhs),
+                  type(result) == type(lhs)
+            else {
+                throw fail("set algebra needs three matching Set operands/results")
+            }
+        case let .setRelation(result, _, lhs, rhs):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Set relation requires \(Core.Capability.collectionsV1)")
+            }
+            guard case .set = type(lhs),
+                  type(rhs) == type(lhs),
+                  type(result) == .bool
+            else {
+                throw fail("set relation needs matching Set operands and Bool result")
             }
         case let .compare(result, _, lhs, rhs):
             guard type(result) == .bool, type(lhs) == type(rhs) else {
@@ -2636,6 +2774,8 @@ public struct Engine: Verification.ImageVerifying {
             isCopyable(element, shell: shell)
         case let .dictionary(key, value):
             isCopyable(key, shell: shell) && isCopyable(value, shell: shell)
+        case let .set(element):
+            isCopyable(element, shell: shell)
         case .void, .never, .address:
             false
         case .bool, .integer, .float, .string, .any, .local, .error:
@@ -2661,15 +2801,6 @@ public struct Engine: Verification.ImageVerifying {
             return fields[index].type
         default:
             return nil
-        }
-    }
-
-    private func isSupportedDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .bool, .integer, .string:
-            true
-        default:
-            false
         }
     }
 
@@ -3013,7 +3144,9 @@ public struct Engine: Verification.ImageVerifying {
                      let .progressionNext(result, _, _, _, _),
                      let .makeDictionary(result, _), let .dictionaryGet(result, _, _),
                      let .dictionaryUpdate(result, _, _, _),
-                     let .dictionaryNext(result, _, _):
+                     let .dictionaryNext(result, _, _),
+                     let .makeSet(result, _), let .setNext(result, _, _),
+                     let .setAlgebra(result, _, _, _):
                     if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
                 case let .arrayPopLast(elementResult, arrayResult, _):
                     for result in [elementResult, arrayResult]
@@ -3022,6 +3155,18 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 case let .dictionaryRemove(valueResult, dictionaryResult, _, _):
                     for result in [valueResult, dictionaryResult]
+                    where function.type(of: result)?.requiresLinearOwnership == true {
+                        live.insert(result)
+                    }
+                case let .setInsert(inserted, member, updated, _, _):
+                    for result in [inserted, member, updated]
+                    where function.type(of: result)?.requiresLinearOwnership == true {
+                        live.insert(result)
+                    }
+                case let .setUpdate(oldMember, updated, _, _),
+                     let .setRemove(oldMember, updated, _, _),
+                     let .setPopFirst(oldMember, updated, _):
+                    for result in [oldMember, updated]
                     where function.type(of: result)?.requiresLinearOwnership == true {
                         live.insert(result)
                     }
@@ -3178,7 +3323,9 @@ public struct Engine: Verification.ImageVerifying {
                      .booleanBinary, .stringConcat, .stringCount, .stringIsEmpty,
                      .stringPredicate, .stringTransform, .stringify,
                      .arrayCount, .arrayIsEmpty, .arrayContains,
-                     .dictionaryCount, .dictionaryIsEmpty, .compare:
+                     .dictionaryCount, .dictionaryIsEmpty,
+                     .setCount, .setIsEmpty, .setContains, .setRelation,
+                     .compare:
                     break
                 }
             }
@@ -4133,6 +4280,8 @@ public struct Engine: Verification.ImageVerifying {
                 case let .progressionNext(_, slot, _, _, _):
                     try requireInitialized(slot: slot)
                 case let .dictionaryNext(_, _, slot):
+                    try requireInitialized(slot: slot)
+                case let .setNext(_, _, slot):
                     try requireInitialized(slot: slot)
                 case .returnValue, .throwError:
                     guard initialized.values.allSatisfy({

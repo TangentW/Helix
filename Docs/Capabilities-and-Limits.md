@@ -45,7 +45,18 @@ does not by itself certify a physical device or distribution channel.
 - Array value semantics, append, `first`/`last`, `popLast`, iteration, checked
   subscript access, and value-returning updates; Dictionary construction,
   lookup, update, `removeValue(forKey:)`, and iteration for supported key and
-  value types. Fully concrete Array-backed `map`, `filter`, `compactMap`,
+  value types. Set supports empty, literal, Array, and Set construction;
+  `count`, `isEmpty`, `first`, `contains`, `insert`, `update`, `remove`,
+  `popFirst`, `removeFirst`, `removeAll`, the capacity hint, iteration, the
+  union/intersection/subtraction/symmetric-difference families, and the common
+  equality/subset/superset/disjoint relations. Set order is deliberately not
+  observable through equality; HLVM keeps deterministic iteration within one
+  value only so execution and diagnostics remain reproducible. Dictionary keys
+  and Set elements use one VM-defined Hashable family: Bool, fixed-width
+  integers, floating-point values, String, and recursively supported Optional,
+  Array, Dictionary, and Set values. User-defined `Hashable` witnesses remain
+  fail-closed because downloaded code cannot invoke arbitrary hashing or
+  equality. Fully concrete Array-backed `map`, `filter`, `compactMap`,
   `reduce`, `forEach`, `first(where:)`, `contains(where:)`, and `allSatisfy`
   use verified closure control flow and a linear, invocation-local Array
   builder instead of repeated copy-on-write append. `Optional.map`/`flatMap`
@@ -92,7 +103,7 @@ does not by itself certify a physical device or distribution channel.
 - Synchronous patch-local closure values with copyable VM-managed captures,
   including nonthrowing and throwing invocation paths. Mutable local values
   are promoted through one type-independent VM cell model, covering scalar,
-  String, Optional, Array, Dictionary, tuple, and patch-local struct storage,
+  String, Optional, Array, Dictionary, Set, tuple, and patch-local struct storage,
   projected fields, nested captures, and the `{ var T }` boxes emitted for
   escaping Swift closures. Field-sensitive definite/possible initialization
   also covers branch initialization, conditional replacement, and cleanup
@@ -169,6 +180,9 @@ does not by itself certify a physical device or distribution channel.
   non-exported patch-local struct or enum to file/module scope in an existing
   watched source file; no Shell rebuild is needed when the resulting
   declaration remains private to the HLBC image.
+- User-defined `Hashable` semantics for Dictionary keys or Set elements, and
+  dynamic Set payloads inside VM-owned `Any`. Typed Set Shell bridges are
+  supported, but the bounded dynamic-Any codec does not guess an element type.
 - Arbitrary new Swift metadata, a patch concrete class identity visible to
   native code, retroactive conformances, or changes to a Shell type's layout,
   superclass, or enum cases. The hosted Objective-C subclass above is a frozen

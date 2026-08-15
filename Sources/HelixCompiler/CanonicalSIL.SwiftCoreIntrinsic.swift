@@ -45,6 +45,24 @@ enum SwiftCoreIntrinsic: Equatable {
     case dictionaryLiteral
     case dictionaryMakeIterator
     case dictionaryIteratorNext
+    case setCount
+    case setIsEmpty
+    case setEmpty
+    case setContains
+    case setInsert
+    case setUpdate
+    case setRemove
+    case setPopFirst
+    case setRemoveFirst
+    case setReserveCapacity
+    case setLiteral
+    case setSequenceInit
+    case setMakeIterator
+    case setIteratorNext
+    case setAlgebra(Bytecode.SetAlgebraOperation)
+    case setFormAlgebra(Bytecode.SetAlgebraOperation)
+    case setRelation(Bytecode.SetRelationOperation)
+    case setRemoveAll
     case allocateUninitializedArray
     case finalizeUninitializedArray
     case assertionFailure
@@ -152,6 +170,44 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sSD17dictionaryLiteralSDyxq_Gx_q_td_tcfC": self = .dictionaryLiteral
         case "$sSD12makeIteratorSD0B0Vyxq__GyF": self = .dictionaryMakeIterator
         case "$sSD8IteratorV4nextx3key_q_5valuetSgyF": self = .dictionaryIteratorNext
+        case "$sSh5countSivg": self = .setCount
+        case "$sSh7isEmptySbvg": self = .setIsEmpty
+        case "$sS2hyxGycfC": self = .setEmpty
+        case "$sSh8containsySbxF": self = .setContains
+        case "$sSh6insertySb8inserted_x17memberAfterInserttxnF": self = .setInsert
+        case "$sSh6update4withxSgxn_tF": self = .setUpdate
+        case "$sSh6removeyxSgxF": self = .setRemove
+        case "$sSh8popFirstxSgyF": self = .setPopFirst
+        case "$sSh11removeFirstxyF": self = .setRemoveFirst
+        case "$sSh15reserveCapacityyySiF": self = .setReserveCapacity
+        case "$sSh12arrayLiteralShyxGxd_tcfC": self = .setLiteral
+        case "$sShyShyxGqd__nc7ElementQyd__RszSTRd__lufC": self = .setSequenceInit
+        case "$sSh12makeIteratorSh0B0Vyx_GyF": self = .setMakeIterator
+        case "$sSh8IteratorV4nextxSgyF": self = .setIteratorNext
+        case "$sSh5unionyShyxGqd__n7ElementQyd__RszSTRd__lF":
+            self = .setAlgebra(.union)
+        case "$sSh12intersectionyShyxGABF": self = .setAlgebra(.intersection)
+        case "$sSh11subtractingyShyxGABF": self = .setAlgebra(.subtracting)
+        case "$sSh19symmetricDifferenceyShyxGqd__n7ElementQyd__RszSTRd__lF":
+            self = .setAlgebra(.symmetricDifference)
+        case "$sSh9formUnionyyqd__n7ElementQyd__RszSTRd__lF":
+            self = .setFormAlgebra(.union)
+        case "$sSh16formIntersectionyyqd__7ElementQyd__RszSTRd__lF":
+            self = .setFormAlgebra(.intersection)
+        case "$sSh8subtractyyShyxGF": self = .setFormAlgebra(.subtracting)
+        case "$sSh8subtractyyqd__7ElementQyd__RszSTRd__lF":
+            self = .setFormAlgebra(.subtracting)
+        case "$sSh23formSymmetricDifferenceyyShyxGnF":
+            self = .setFormAlgebra(.symmetricDifference)
+        case "$sSh23formSymmetricDifferenceyyqd__n7ElementQyd__RszSTRd__lF":
+            self = .setFormAlgebra(.symmetricDifference)
+        case "$sSh2eeoiySbShyxG_ABtFZ": self = .setRelation(.equal)
+        case "$sSh8isSubset2ofSbShyxG_tF": self = .setRelation(.subset)
+        case "$sSh14isStrictSubset2ofSbShyxG_tF": self = .setRelation(.strictSubset)
+        case "$sSh10isSuperset2ofSbShyxG_tF": self = .setRelation(.superset)
+        case "$sSh16isStrictSuperset2ofSbShyxG_tF": self = .setRelation(.strictSuperset)
+        case "$sSh10isDisjoint4withSbShyxG_tF": self = .setRelation(.disjoint)
+        case "$sSh9removeAll15keepingCapacityySb_tF": self = .setRemoveAll
         case "$ss27_allocateUninitializedArrayySayxG_BptBwlF":
             self = .allocateUninitializedArray
         case "$ss27_finalizeUninitializedArrayySayxGABnlF":

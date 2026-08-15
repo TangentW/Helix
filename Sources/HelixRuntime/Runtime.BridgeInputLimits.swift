@@ -14,7 +14,7 @@ public struct BridgeInputLimits: Hashable, Sendable {
     public var maximumEstimatedNativeBytes: UInt64
     /// Maximum scalar and container nodes in one encoded argument graph.
     public var maximumValueNodes: UInt64
-    /// Maximum nesting depth of tuples, optionals, arrays, and dictionaries.
+    /// Maximum nesting depth of tuples, optionals, arrays, sets, and dictionaries.
     public var maximumNestingDepth: UInt32
     /// Maximum child count reserved by any one container.
     public var maximumContainerElements: UInt64
@@ -81,6 +81,10 @@ public enum BridgeInputError: Error, Equatable, Sendable, CustomStringConvertibl
     case estimatedNativeByteLimitExceeded(maximum: UInt64)
     /// Generated code encoded an element with the wrong VM value type.
     case encodedTypeMismatch(expected: String, actual: String)
+    /// Distinct Swift Set elements collapsed to one VM-defined Hashable value.
+    case duplicateEncodedSetElement
+    /// Distinct Swift Dictionary keys collapsed to one VM-defined Hashable value.
+    case duplicateEncodedDictionaryKey
     /// A dynamic Swift value cannot be represented by the bounded Any bridge.
     case unsupportedAnyType(String)
     /// Final arguments contain a value not created by the scoped encoder.
@@ -105,6 +109,10 @@ public enum BridgeInputError: Error, Equatable, Sendable, CustomStringConvertibl
             "Bridge input exceeds the \(maximum)-byte native-value limit"
         case let .encodedTypeMismatch(expected, actual):
             "Bridge input encoder expected \(expected), got \(actual)"
+        case .duplicateEncodedSetElement:
+            "Distinct Swift Set elements encode as the same VM Set element"
+        case .duplicateEncodedDictionaryKey:
+            "Distinct Swift Dictionary keys encode as the same VM key"
         case let .unsupportedAnyType(type):
             "Swift Any boundary does not support \(type)"
         case .untrackedEncodedValue:
