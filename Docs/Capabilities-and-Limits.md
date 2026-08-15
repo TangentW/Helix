@@ -35,7 +35,18 @@ does not by itself certify a physical device or distribution channel.
   HLBC constants and HLVM values retain destination-width raw bits: the entire
   `UInt64` domain is representable, and binary32 never passes through binary64
   storage, so infinities, signed zero, NaN payloads, and signaling state survive
-  canonical encoding and typed Bridge round trips.
+  canonical encoding and typed Bridge round trips. Common concrete scalar
+  standard-library APIs use operation- and value-type-driven lowering across
+  the whole supported family rather than SDK-type shims. Fixed-width integers
+  include `min`/`max`, `bitWidth`, `isSigned`, `magnitude`, population and zero
+  bit counts, `byteSwapped`, `signum()`, `isMultiple(of:)`,
+  `quotientAndRemainder(dividingBy:)`, and the five reporting-overflow
+  operations. `Float` and `Double` include their common constants,
+  classification predicates, `magnitude`, `squareRoot()`, `ulp`, `nextUp`,
+  `binade`, `significand`, `sign`, and every `rounded` rule. Division by zero,
+  signed minimum divided by minus one, signed zero, subnormal values, and
+  signaling NaNs retain Swift behavior; undefined zero-count builtin forms are
+  rejected rather than guessed.
 - `String` literals, concatenation, interpolation for supported scalar values,
   Unicode `uppercased`/`lowercased` transforms, count/empty checks, comparisons,
   and common prefix/suffix/contains predicates. Variable-size transforms reserve

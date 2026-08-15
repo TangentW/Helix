@@ -1142,16 +1142,155 @@ public struct Interpreter: Sendable {
                         let result: Float = switch operation {
                         case .negate: -operandValue.floatValue
                         case .absolute: abs(operandValue.floatValue)
+                        case .squareRoot: operandValue.floatValue.squareRoot()
+                        case .ulp: operandValue.floatValue.ulp
+                        case .nextUp: operandValue.floatValue.nextUp
+                        case .binade: operandValue.floatValue.binade
+                        case .significand: operandValue.floatValue.significand
+                        case .roundDown: operandValue.floatValue.rounded(.down)
+                        case .roundUp: operandValue.floatValue.rounded(.up)
+                        case .roundTowardZero: operandValue.floatValue.rounded(.towardZero)
+                        case .roundAwayFromZero: operandValue.floatValue.rounded(.awayFromZero)
+                        case .roundToNearestOrAwayFromZero:
+                            operandValue.floatValue.rounded(.toNearestOrAwayFromZero)
+                        case .roundToNearestOrEven:
+                            operandValue.floatValue.rounded(.toNearestOrEven)
                         }
                         value = .init(result)
                     } else {
                         let result: Double = switch operation {
                         case .negate: -operandValue.doubleValue
                         case .absolute: abs(operandValue.doubleValue)
+                        case .squareRoot: operandValue.doubleValue.squareRoot()
+                        case .ulp: operandValue.doubleValue.ulp
+                        case .nextUp: operandValue.doubleValue.nextUp
+                        case .binade: operandValue.doubleValue.binade
+                        case .significand: operandValue.doubleValue.significand
+                        case .roundDown: operandValue.doubleValue.rounded(.down)
+                        case .roundUp: operandValue.doubleValue.rounded(.up)
+                        case .roundTowardZero: operandValue.doubleValue.rounded(.towardZero)
+                        case .roundAwayFromZero: operandValue.doubleValue.rounded(.awayFromZero)
+                        case .roundToNearestOrAwayFromZero:
+                            operandValue.doubleValue.rounded(.toNearestOrAwayFromZero)
+                        case .roundToNearestOrEven:
+                            operandValue.doubleValue.rounded(.toNearestOrEven)
                         }
                         value = .init(result)
                     }
                     try initialize(.float(value), register: result, registers: &registers)
+                case let .floatingPredicate(result, operation, operand):
+                    let value = try floating(operand, registers: registers)
+                    let predicate: Bool
+                    if value.bitWidth == 32 {
+                        let scalar = value.floatValue
+                        predicate = switch operation {
+                        case .isFinite: scalar.isFinite
+                        case .isInfinite: scalar.isInfinite
+                        case .isNaN: scalar.isNaN
+                        case .isSignalingNaN: scalar.isSignalingNaN
+                        case .isNormal: scalar.isNormal
+                        case .isSubnormal: scalar.isSubnormal
+                        case .isZero: scalar.isZero
+                        case .isSignMinus: scalar.bitPattern >> 31 == 1
+                        }
+                    } else {
+                        let scalar = value.doubleValue
+                        predicate = switch operation {
+                        case .isFinite: scalar.isFinite
+                        case .isInfinite: scalar.isInfinite
+                        case .isNaN: scalar.isNaN
+                        case .isSignalingNaN: scalar.isSignalingNaN
+                        case .isNormal: scalar.isNormal
+                        case .isSubnormal: scalar.isSubnormal
+                        case .isZero: scalar.isZero
+                        case .isSignMinus: scalar.bitPattern >> 63 == 1
+                        }
+                    }
+                    try initialize(.bool(predicate), register: result, registers: &registers)
+                case let .integerUnary(result, operation, operand):
+                    let source = try integer(operand, registers: registers)
+                    guard case let .integer(resultWidth, resultSigned) = function.type(of: result)!
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .integer(
+                                bitWidth: source.bitWidth,
+                                signed: source.isSigned
+                            ),
+                            actual: function.type(of: result)
+                        )
+                    }
+                    let rawBits: UInt64
+                    switch operation {
+                    case .magnitude:
+                        rawBits = source.isSigned && source.signedValue < 0
+                            ? (0 &- source.rawBits) & VM.Integer.mask(for: source.bitWidth)
+                            : source.rawBits
+                    case .nonzeroBitCount:
+                        rawBits = UInt64(source.rawBits.nonzeroBitCount)
+                    case .leadingZeroBitCount:
+                        rawBits = UInt64(
+                            source.rawBits.leadingZeroBitCount
+                                - (64 - Int(source.bitWidth))
+                        )
+                    case .trailingZeroBitCount:
+                        rawBits = UInt64(
+                            min(source.rawBits.trailingZeroBitCount, Int(source.bitWidth))
+                        )
+                    case .byteSwapped:
+                        rawBits = switch source.bitWidth {
+                        case 8: source.rawBits
+                        case 16: UInt64(UInt16(truncatingIfNeeded: source.rawBits).byteSwapped)
+                        case 32: UInt64(UInt32(truncatingIfNeeded: source.rawBits).byteSwapped)
+                        default: source.rawBits.byteSwapped
+                        }
+                    case .signum:
+                        rawBits = UInt64(bitPattern: source.signedValue == 0
+                            ? 0
+                            : source.signedValue < 0 ? -1 : 1)
+                    }
+                    try initialize(
+                        .integer(
+                            try VM.Integer(
+                                rawBits: rawBits,
+                                bitWidth: resultWidth,
+                                isSigned: resultSigned
+                            )
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .scalarBitCast(result, operand):
+                    let resultType = function.type(of: result)!
+                    let value: VM.Value
+                    switch (try read(operand, registers: registers), resultType) {
+                    case let (.integer(source), .float(width))
+                    where source.bitWidth == width:
+                        value = .float(
+                            try VM.FloatingValue(
+                                bitPattern: source.rawBits,
+                                bitWidth: width
+                            )
+                        )
+                    case let (.float(source), .integer(width, signed))
+                    where source.bitWidth == width:
+                        value = .integer(
+                            try VM.Integer(
+                                rawBits: source.bitPattern,
+                                bitWidth: width,
+                                isSigned: signed
+                            )
+                        )
+                    default:
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: resultType,
+                            actual: try read(operand, registers: registers).type
+                        )
+                    }
+                    try initialize(
+                        value,
+                        register: result,
+                        registers: &registers
+                    )
                 case let .integerConvert(result, operation, operand):
                     let source = try integer(operand, registers: registers)
                     guard case let .integer(targetWidth, targetSigned) = function.type(of: result)!
@@ -3835,7 +3974,7 @@ public struct Interpreter: Sendable {
         case .subtract: (raw, machineOverflow) = left.subtractingReportingOverflow(right)
         case .multiply: (raw, machineOverflow) = left.multipliedReportingOverflow(by: right)
         case .divide:
-            guard right != 0 else { throw VM.RuntimeTrap.divisionByZero }
+            guard right != 0 else { return (lhs, true) }
             if left == VM.Integer.signedBounds(bitWidth: lhs.bitWidth).min, right == -1 {
                 return (
                     try VM.Integer(
@@ -3849,7 +3988,7 @@ public struct Interpreter: Sendable {
             raw = left / right
             machineOverflow = false
         case .remainder:
-            guard right != 0 else { throw VM.RuntimeTrap.divisionByZero }
+            guard right != 0 else { return (lhs, true) }
             if left == VM.Integer.signedBounds(bitWidth: lhs.bitWidth).min, right == -1 {
                 return (
                     try VM.Integer(rawBits: 0, bitWidth: lhs.bitWidth, isSigned: true),
@@ -3888,10 +4027,10 @@ public struct Interpreter: Sendable {
         case .subtract: (raw, machineOverflow) = left.subtractingReportingOverflow(right)
         case .multiply: (raw, machineOverflow) = left.multipliedReportingOverflow(by: right)
         case .divide:
-            guard right != 0 else { throw VM.RuntimeTrap.divisionByZero }
+            guard right != 0 else { return (lhs, true) }
             raw = left / right; machineOverflow = false
         case .remainder:
-            guard right != 0 else { throw VM.RuntimeTrap.divisionByZero }
+            guard right != 0 else { return (lhs, true) }
             raw = left % right; machineOverflow = false
         case .bitAnd: raw = left & right; machineOverflow = false
         case .bitOr: raw = left | right; machineOverflow = false

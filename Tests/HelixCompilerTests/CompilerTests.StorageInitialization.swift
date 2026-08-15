@@ -224,6 +224,54 @@ struct StorageInitialization {
         #expect(plan.conditionalDestroyLines.isEmpty)
     }
 
+    @Test("One apply can initialize multiple independent out addresses")
+    func classifiesMultipleIndirectResultsPerCall() throws {
+        let plan = try CanonicalSIL.StorageInitialization.analyze(
+            body: """
+            bb0(%0 : $*Int, %1 : $*Int):
+              %2 = alloc_stack $Int
+              %3 = alloc_stack $Int
+              %4 = function_ref @$sSzsE20quotientAndRemainder10dividingByx0A0_x9remaindertx_tF : $@convention(method) <τ_0_0 where τ_0_0 : BinaryInteger> (@in_guaranteed τ_0_0, @in_guaranteed τ_0_0) -> (@out τ_0_0, @out τ_0_0)
+              %5 = apply %4<Int>(%2, %3, %0, %1) : $@convention(method) <τ_0_0 where τ_0_0 : BinaryInteger> (@in_guaranteed τ_0_0, @in_guaranteed τ_0_0) -> (@out τ_0_0, @out τ_0_0)
+              dealloc_stack %3
+              dealloc_stack %2
+              return %5
+            """,
+            directCalls: .empty,
+            typeEnvironment: .empty
+        )
+
+        let call = try #require(
+            plan.storeModes.first { $0.value.count == 2 }
+        )
+        #expect(call.value.values.allSatisfy { $0 == .initialize })
+        #expect(plan.storeMode(at: call.key, address: "%2") == .initialize)
+        #expect(plan.storeMode(at: call.key, address: "%3") == .initialize)
+    }
+
+    @Test("Store modes resolve through equivalent projected addresses")
+    func resolvesProjectedStoreAliases() throws {
+        let plan = try CanonicalSIL.StorageInitialization.analyze(
+            body: """
+            bb0(%0 : $Int):
+              %1 = alloc_stack $Any
+              %2 = init_existential_addr %1, $Int
+              store %0 to %2
+              destroy_addr %1
+              dealloc_stack %1
+              return %0
+            """,
+            directCalls: .empty,
+            typeEnvironment: .empty
+        )
+
+        let storeLine = try #require(
+            plan.storeModes.first { !$0.value.isEmpty }?.key
+        )
+        #expect(plan.storeMode(at: storeLine, address: "%1") == .initialize)
+        #expect(plan.storeMode(at: storeLine, address: "%2") == .initialize)
+    }
+
     @Test("Deep control-flow cycles are analyzed without recursive stack growth")
     func analyzesDeepCyclesIteratively() throws {
         let finalBlock = 4_096

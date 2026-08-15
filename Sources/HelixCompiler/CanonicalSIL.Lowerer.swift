@@ -173,6 +173,13 @@ public struct Lowerer: Sendable {
         var payload: Bytecode.Register?
     }
 
+    /// A standard-library enum that remains compiler-only while its semantic
+    /// payload is lowered to typed HLBC operations.
+    private struct CompilerEnumCase: Equatable {
+        var typeName: String
+        var caseName: String
+    }
+
     /// Lowering represents a destructive enum-payload projection as a value
     /// take followed by writeback. The first reconstructed enum must therefore
     /// initialize the VM storage even when the original SIL expresses an
@@ -456,6 +463,12 @@ public struct Lowerer: Sendable {
         var retypedIntegerOperands: [String: [Bytecode.ValueType: Bytecode.Register]] = [:]
         var boolLiterals: [String: Bool] = [:]
         var metatypeValues = Set<String>()
+        var scalarMetatypeValues: [String: Bytecode.ValueType] = [:]
+        var compilerEnumMetatypeValues = Set<String>()
+        var compilerEnumValues: [String: CompilerEnumCase] = [:]
+        var compilerEnumAddressTypes: [String: String] = [:]
+        var compilerEnumAddressCases: [String: CompilerEnumCase] = [:]
+        var floatingSignValues: [String: Bytecode.Register] = [:]
         var arrayMetatypeValues: [String: Bytecode.ValueType] = [:]
         var nativeMetatypeValues: [String: Core.TypeID] = [:]
         var hostedMetatypeValues: [String: (
@@ -1128,7 +1141,8 @@ public struct Lowerer: Sendable {
             if let addressRegister = runtimeAddress(at: token) {
                 let root = addressBase(token)
                 let inferredMode = storageInitializationPlan.storeMode(
-                    at: currentSILLineIndex
+                    at: currentSILLineIndex,
+                    address: token
                 )
                 if isScopedRuntimeAddress(token) {
                     appendInstruction(
@@ -1854,6 +1868,66 @@ public struct Lowerer: Sendable {
             )
         }
 
+        /// A compiler-only enum case is statically known, but canonical SIL
+        /// still contains every switch successor. Preserve those CFG edges so
+        /// verifier reachability and phi validation continue to describe the
+        /// complete source function while execution takes only the selected
+        /// case.
+        func appendStaticBranch(
+            selected: Bytecode.BlockID,
+            preserving targets: [Bytecode.BlockID]
+        ) throws {
+            var seen = Set<Bytecode.BlockID>()
+            let alternatives = targets.filter {
+                $0 != selected && seen.insert($0).inserted
+            }
+            guard !alternatives.isEmpty else {
+                appendInstruction(.branch(target: selected, arguments: []))
+                return
+            }
+
+            let syntheticBlocks = try alternatives.map { _ in
+                try allocateSyntheticBlockID()
+            }
+            let selectKnownCase = try allocate(type: .bool)
+            appendInstruction(
+                .constantBool(result: selectKnownCase, value: true)
+            )
+            appendInstruction(
+                .conditionalBranch(
+                    condition: selectKnownCase,
+                    trueTarget: selected,
+                    trueArguments: [],
+                    falseTarget: syntheticBlocks[0],
+                    falseArguments: []
+                )
+            )
+            finishCurrent()
+
+            for index in alternatives.indices {
+                let exposeAlternative = try allocate(type: .bool)
+                let next = syntheticBlocks.indices.contains(index + 1)
+                    ? syntheticBlocks[index + 1]
+                    : selected
+                appendSyntheticBlock(
+                    id: syntheticBlocks[index],
+                    instructions: [
+                        .constantBool(
+                            result: exposeAlternative,
+                            value: false
+                        ),
+                        .conditionalBranch(
+                            condition: exposeAlternative,
+                            trueTarget: alternatives[index],
+                            trueArguments: [],
+                            falseTarget: next,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+            }
+        }
+
         func materializeArrayLiteralElements(
             _ pending: PendingArrayLiteral
         ) throws -> [Bytecode.Register] {
@@ -2154,7 +2228,8 @@ public struct Lowerer: Sendable {
             if let cell = mutableCell(at: token) {
                 let storeMode = mode
                     ?? storageInitializationPlan.storeMode(
-                        at: currentSILLineIndex
+                        at: currentSILLineIndex,
+                        address: token
                     )
                 appendInstruction(
                     .storeMutableCell(
@@ -4043,6 +4118,519 @@ public struct Lowerer: Sendable {
             voidValues.insert(resultToken)
         }
 
+        func roundingOperation(
+            for rule: CompilerEnumCase
+        ) throws -> Bytecode.FloatUnaryOperation {
+            guard rule.typeName == "FloatingPointRoundingRule" else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "rounding operation references an unrelated compiler enum"
+                )
+            }
+            return switch rule.caseName {
+            case "down": .roundDown
+            case "up": .roundUp
+            case "towardZero": .roundTowardZero
+            case "awayFromZero": .roundAwayFromZero
+            case "toNearestOrAwayFromZero": .roundToNearestOrAwayFromZero
+            case "toNearestOrEven": .roundToNearestOrEven
+            default:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "unknown FloatingPointRoundingRule case \(rule.caseName)"
+                )
+            }
+        }
+
+        func emitScalarLiteral(
+            _ literal: CanonicalSIL.ScalarIntrinsic.StaticValue.Literal
+        ) throws -> Bytecode.Register {
+            switch literal {
+            case let .integer(type, bitPattern):
+                let result = try allocate(type: type)
+                appendInstruction(
+                    .constantInteger(result: result, bitPattern: bitPattern)
+                )
+                return result
+            case let .floating(type, bitPattern):
+                let result = try allocate(type: type)
+                appendInstruction(
+                    .constantFloat(result: result, bitPattern: bitPattern)
+                )
+                return result
+            case let .boolean(value):
+                let result = try allocate(type: .bool)
+                appendInstruction(.constantBool(result: result, value: value))
+                return result
+            }
+        }
+
+        func emitFloatingUnary(
+            _ operation: Bytecode.FloatUnaryOperation,
+            operand: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            let type = registerTypes[Int(operand.rawValue)]
+            guard case .float = type else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "floating scalar operation has a non-floating operand"
+                )
+            }
+            let result = try allocate(type: type)
+            appendInstruction(
+                .floatingUnary(
+                    result: result,
+                    operation: operation,
+                    operand: operand
+                )
+            )
+            return result
+        }
+
+        func emitIntegerUnary(
+            _ operation: Bytecode.IntegerUnaryOperation,
+            operand: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            let type = registerTypes[Int(operand.rawValue)]
+            guard case let .integer(width, signed) = type else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "integer scalar operation has a non-integer operand"
+                )
+            }
+            let primitiveType: Bytecode.ValueType = operation == .magnitude
+                ? .integer(bitWidth: width, signed: false)
+                : type
+            if operation == .signum, !signed {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "unsigned integer signum"
+                )
+            }
+            let primitive = try allocate(type: primitiveType)
+            appendInstruction(
+                .integerUnary(
+                    result: primitive,
+                    operation: operation,
+                    operand: operand
+                )
+            )
+            guard operation == .nonzeroBitCount
+                    || operation == .leadingZeroBitCount
+                    || operation == .trailingZeroBitCount
+            else { return primitive }
+            if primitiveType == .int64 { return primitive }
+            let result = try allocate(type: .int64)
+            let conversion: Bytecode.IntegerConversionOperation
+            if width == 64 {
+                conversion = .reinterpret
+            } else {
+                conversion = signed ? .signExtend : .zeroExtend
+            }
+            appendInstruction(
+                .integerConvert(
+                    result: result,
+                    operation: conversion,
+                    value: primitive
+                )
+            )
+            return result
+        }
+
+        func lowerScalarIntrinsic(
+            _ intrinsic: CanonicalSIL.ScalarIntrinsic,
+            resultToken: String,
+            genericArguments: String,
+            arguments: [String],
+            line: Int
+        ) throws {
+            switch intrinsic {
+            case let .staticValue(property):
+                guard let metatype = arguments.last,
+                      let receiver = scalarMetatypeValues[metatype],
+                      arguments.count == 1 || arguments.count == 2
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "scalar static property has unsupported arguments"
+                    )
+                }
+                if !genericArguments.isEmpty,
+                   try parseStoredType(genericArguments) != receiver {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "scalar static property specialization disagrees with its metatype"
+                    )
+                }
+                guard let literal = property.literal(for: receiver) else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "scalar static property \(property) on \(receiver)"
+                    )
+                }
+                let value = try emitScalarLiteral(literal)
+                if arguments.count == 2 {
+                    guard compilerAddressType(arguments[0])
+                            == registerTypes[Int(value.rawValue)]
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect scalar static result has the wrong storage type"
+                        )
+                    }
+                    try storeConstructedValue(
+                        value,
+                        at: arguments[0],
+                        mode: .initialize
+                    )
+                    voidValues.insert(resultToken)
+                } else {
+                    values[resultToken] = value
+                }
+
+            case let .floatingUnary(operation):
+                let operand: Bytecode.Register
+                let destination: String?
+                if arguments.count == 1, genericArguments.isEmpty {
+                    operand = try resolve(arguments[0], line: line)
+                    destination = nil
+                } else if arguments.count == 2, !genericArguments.isEmpty {
+                    let type = try parseStoredType(genericArguments)
+                    guard compilerAddressType(arguments[0]) == type,
+                          stackType(at: arguments[1]) == type,
+                          let stored = try copyStoredValue(
+                              at: arguments[1],
+                              line: line
+                          ),
+                          registerTypes[Int(stored.rawValue)] == type
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect floating operation does not match its specialization"
+                        )
+                    }
+                    operand = stored
+                    destination = arguments[0]
+                } else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating scalar operation has unsupported arguments"
+                    )
+                }
+                let result = try emitFloatingUnary(operation, operand: operand)
+                if let destination {
+                    try storeConstructedValue(
+                        result,
+                        at: destination,
+                        mode: .initialize
+                    )
+                    voidValues.insert(resultToken)
+                } else {
+                    values[resultToken] = result
+                }
+
+            case let .floatingPredicate(operation):
+                guard genericArguments.isEmpty, arguments.count == 1 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating predicate has unsupported arguments"
+                    )
+                }
+                let operand = try resolve(arguments[0], line: line)
+                guard case .float = registerTypes[Int(operand.rawValue)] else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating predicate has a non-floating operand"
+                    )
+                }
+                let result = try allocate(type: .bool)
+                values[resultToken] = result
+                appendInstruction(
+                    .floatingPredicate(
+                        result: result,
+                        operation: operation,
+                        operand: operand
+                    )
+                )
+
+            case .floatingSign:
+                guard genericArguments.isEmpty, arguments.count == 1 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating sign getter has unsupported arguments"
+                    )
+                }
+                let operand = try resolve(arguments[0], line: line)
+                guard case .float = registerTypes[Int(operand.rawValue)] else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating sign getter has a non-floating operand"
+                    )
+                }
+                let isMinus = try allocate(type: .bool)
+                appendInstruction(
+                    .floatingPredicate(
+                        result: isMinus,
+                        operation: .isSignMinus,
+                        operand: operand
+                    )
+                )
+                floatingSignValues[resultToken] = isMinus
+
+            case .floatingRoundDefault:
+                guard arguments.count == 2, !genericArguments.isEmpty,
+                      let operand = try copyStoredValue(
+                          at: arguments[1],
+                          line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "FloatingPoint.rounded() has unsupported arguments"
+                    )
+                }
+                let type = try parseStoredType(genericArguments)
+                guard compilerAddressType(arguments[0]) == type,
+                      stackType(at: arguments[1]) == type,
+                      registerTypes[Int(operand.rawValue)] == type
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "FloatingPoint.rounded() specialization does not match its storage"
+                    )
+                }
+                let result = try emitFloatingUnary(
+                    .roundToNearestOrAwayFromZero,
+                    operand: operand
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case .floatingRoundRule:
+                guard arguments.count == 3, !genericArguments.isEmpty,
+                      let rule = compilerEnumAddressCases[
+                          addressBase(arguments[1])
+                      ],
+                      let operand = try copyStoredValue(
+                          at: arguments[2],
+                          line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "FloatingPoint.rounded(_:) has unsupported arguments"
+                    )
+                }
+                let type = try parseStoredType(genericArguments)
+                guard compilerAddressType(arguments[0]) == type,
+                      stackType(at: arguments[2]) == type,
+                      registerTypes[Int(operand.rawValue)] == type
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "FloatingPoint.rounded(_:) specialization does not match its storage"
+                    )
+                }
+                let result = try emitFloatingUnary(
+                    try roundingOperation(for: rule),
+                    operand: operand
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case .floatingRoundSlowPath:
+                guard genericArguments.isEmpty, arguments.count == 2,
+                      let rule = compilerEnumAddressCases[
+                          addressBase(arguments[0])
+                      ],
+                      let operand = try copyStoredValue(
+                          at: arguments[1],
+                          line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating round slow path has unsupported arguments"
+                    )
+                }
+                let result = try emitFloatingUnary(
+                    try roundingOperation(for: rule),
+                    operand: operand
+                )
+                try storeConstructedValue(result, at: arguments[1])
+                voidValues.insert(resultToken)
+
+            case let .integerUnary(operation):
+                guard genericArguments.isEmpty, arguments.count == 1 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "integer unary operation has unsupported arguments"
+                    )
+                }
+                let operand = try resolve(arguments[0], line: line)
+                values[resultToken] = try emitIntegerUnary(
+                    operation,
+                    operand: operand
+                )
+
+            case .integerIsMultiple:
+                guard arguments.count == 2, !genericArguments.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "BinaryInteger.isMultiple(of:) has unsupported arguments"
+                    )
+                }
+                let type = try parseStoredType(genericArguments)
+                guard case .integer = type,
+                      stackType(at: arguments[0]) == type,
+                      stackType(at: arguments[1]) == type,
+                      let divisor = try copyStoredValue(
+                          at: arguments[0],
+                          line: line
+                      ),
+                      let value = try copyStoredValue(
+                          at: arguments[1],
+                          line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "BinaryInteger.isMultiple(of:) specialization does not match its storage"
+                    )
+                }
+                let remainder = try allocate(type: type)
+                let overflow = try allocate(type: .bool)
+                appendInstruction(
+                    .checkedBinary(
+                        result: remainder,
+                        overflow: overflow,
+                        operation: .remainder,
+                        lhs: value,
+                        rhs: divisor
+                    )
+                )
+                let zero = try allocate(type: type)
+                appendInstruction(
+                    .constantInteger(result: zero, bitPattern: 0)
+                )
+                let result = try allocate(type: .bool)
+                values[resultToken] = result
+                appendInstruction(
+                    .compare(
+                        result: result,
+                        predicate: .equal,
+                        lhs: remainder,
+                        rhs: zero
+                    )
+                )
+
+            case .integerQuotientAndRemainder:
+                guard arguments.count == 4, !genericArguments.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "BinaryInteger.quotientAndRemainder(dividingBy:) has unsupported arguments"
+                    )
+                }
+                let type = try parseStoredType(genericArguments)
+                guard case .integer = type,
+                      compilerAddressType(arguments[0]) == type,
+                      compilerAddressType(arguments[1]) == type,
+                      stackType(at: arguments[2]) == type,
+                      stackType(at: arguments[3]) == type,
+                      let divisor = try copyStoredValue(
+                          at: arguments[2],
+                          line: line
+                      ),
+                      let value = try copyStoredValue(
+                          at: arguments[3],
+                          line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "BinaryInteger quotient/remainder specialization does not match its storage"
+                    )
+                }
+                let zero = try allocate(type: type)
+                appendInstruction(
+                    .constantInteger(result: zero, bitPattern: 0)
+                )
+                let dividesByZero = try allocate(type: .bool)
+                appendInstruction(
+                    .compare(
+                        result: dividesByZero,
+                        predicate: .equal,
+                        lhs: divisor,
+                        rhs: zero
+                    )
+                )
+                try appendConditionalTrap(
+                    condition: dividesByZero,
+                    reason: .divisionByZero
+                )
+                let quotient = try allocate(type: type)
+                let quotientOverflow = try allocate(type: .bool)
+                appendInstruction(
+                    .checkedBinary(
+                        result: quotient,
+                        overflow: quotientOverflow,
+                        operation: .divide,
+                        lhs: value,
+                        rhs: divisor
+                    )
+                )
+                try appendConditionalTrap(
+                    condition: quotientOverflow,
+                    reason: .integerOverflow
+                )
+                let remainder = try allocate(type: type)
+                let remainderOverflow = try allocate(type: .bool)
+                appendInstruction(
+                    .checkedBinary(
+                        result: remainder,
+                        overflow: remainderOverflow,
+                        operation: .remainder,
+                        lhs: value,
+                        rhs: divisor
+                    )
+                )
+                try appendConditionalTrap(
+                    condition: remainderOverflow,
+                    reason: .integerOverflow
+                )
+                try storeConstructedValue(
+                    quotient,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                try storeConstructedValue(
+                    remainder,
+                    at: arguments[1],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case let .integerReportingOverflow(operation):
+                guard genericArguments.isEmpty, arguments.count == 2 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "integer reporting-overflow operation has unsupported arguments"
+                    )
+                }
+                let rhs = try resolve(arguments[0], line: line)
+                let lhs = try resolve(arguments[1], line: line)
+                let type = registerTypes[Int(lhs.rawValue)]
+                guard case .integer = type,
+                      registerTypes[Int(rhs.rawValue)] == type
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "integer reporting-overflow operands do not match"
+                    )
+                }
+                let partial = try allocate(type: type)
+                let overflow = try allocate(type: .bool)
+                appendInstruction(
+                    .checkedBinary(
+                        result: partial,
+                        overflow: overflow,
+                        operation: operation,
+                        lhs: lhs,
+                        rhs: rhs
+                    )
+                )
+                let result = try allocate(type: .tuple([type, .bool]))
+                values[resultToken] = result
+                appendInstruction(
+                    .makeTuple(
+                        result: result,
+                        elements: [partial, overflow]
+                    )
+                )
+            }
+        }
+
         func lowerSwiftCoreIntrinsic(
             _ intrinsic: SwiftCoreIntrinsic,
             resultToken: String,
@@ -4084,6 +4672,14 @@ public struct Lowerer: Sendable {
             }
 
             switch intrinsic {
+            case let .scalar(scalar):
+                try lowerScalarIntrinsic(
+                    scalar,
+                    resultToken: resultToken,
+                    genericArguments: genericArguments,
+                    arguments: arguments,
+                    line: line
+                )
             case .higherOrder, .algebraic:
                 throw CanonicalSIL.LoweringError.unsupportedInstruction(
                     line: line,
@@ -6341,6 +6937,27 @@ public struct Lowerer: Sendable {
 
             if let metatype = match(
                 line,
+                pattern: #"^(%[0-9]+) = metatype \$@(thin|thick) (.+)\.Type$"#
+            ) {
+                let normalized = metatype[2]
+                    .replacingOccurrences(of: "Swift.", with: "")
+                if normalized == "FloatingPointRoundingRule" {
+                    compilerEnumMetatypeValues.insert(metatype[0])
+                    continue
+                }
+                if let type = try? parseStoredType(metatype[2]) {
+                    switch type {
+                    case .integer, .float:
+                        scalarMetatypeValues[metatype[0]] = type
+                        continue
+                    default:
+                        break
+                    }
+                }
+            }
+
+            if let metatype = match(
+                line,
                 pattern: #"^(%[0-9]+) = metatype \$@thin (?:Swift\.)?Array<(.+)>\.Type$"#
             ) {
                 arrayMetatypeValues[metatype[0]] = try parseType(metatype[1])
@@ -6482,6 +7099,12 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = alloc_stack(?: \[[^\]]+\])* \$(.+?)(?:, (?:var|let),.*)?$"#
             ) {
+                let compilerEnumType = stack[1]
+                    .replacingOccurrences(of: "Swift.", with: "")
+                if compilerEnumType == "FloatingPointRoundingRule" {
+                    compilerEnumAddressTypes[stack[0]] = compilerEnumType
+                    continue
+                }
                 if stack[1] == "DefaultStringInterpolation"
                     || stack[1] == "Swift.DefaultStringInterpolation" {
                     pendingStringInterpolationAddresses.insert(stack[0])
@@ -6611,6 +7234,26 @@ public struct Lowerer: Sendable {
             ) {
                 let source = addressBase(copy[1])
                 let destination = addressBase(copy[3])
+                if let sourceType = compilerEnumAddressTypes[source] {
+                    guard compilerEnumAddressTypes[destination] == sourceType,
+                          let value = compilerEnumAddressCases[source]
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "compiler enum copy_addr requires initialized matching storage"
+                        )
+                    }
+                    if copy[2] != "init",
+                       compilerEnumAddressCases[destination] == nil {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "compiler enum assignment requires initialized destination storage"
+                        )
+                    }
+                    compilerEnumAddressCases[destination] = value
+                    if copy[0] == "take" {
+                        compilerEnumAddressCases.removeValue(forKey: source)
+                    }
+                    continue
+                }
                 if let progression = progressionAddressValues[source] {
                     guard progressionAddresses[source] == progression.type,
                           progressionAddresses[destination] == progression.type
@@ -6863,6 +7506,13 @@ public struct Lowerer: Sendable {
                     remainingDeallocStackUses.removeValue(forKey: token)
                 } else {
                     remainingDeallocStackUses[token] = remainingUses - 1
+                }
+                if compilerEnumAddressTypes[address] != nil {
+                    if isFinalLexicalUse {
+                        compilerEnumAddressTypes.removeValue(forKey: address)
+                        compilerEnumAddressCases.removeValue(forKey: address)
+                    }
+                    continue
                 }
                 if onStackClosureValues.contains(address) {
                     // SIL models an on-stack partial_apply as storage. The VM owns the
@@ -7174,26 +7824,93 @@ public struct Lowerer: Sendable {
                 continue
             }
 
-            if let unary = match(
-                line,
-                pattern: #"^(%[0-9]+) = builtin "fneg_FPIEEE(32|64)"\((%[0-9]+)\).*$"#
-            ) {
-                let operand = try resolve(unary[2], line: sourceLine)
-                guard let bitWidth = UInt16(unary[1]) else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "floating unary builtin has an invalid bit width"
-                    )
-                }
-                let type = Bytecode.ValueType.float(bitWidth: bitWidth)
+            if let unary = parseFloatingUnary(line) {
+                let operand = try resolve(unary.operand, line: sourceLine)
+                let type = Bytecode.ValueType.float(bitWidth: unary.bitWidth)
                 guard registerTypes[Int(operand.rawValue)] == type else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "floating unary operand does not match its builtin"
                     )
                 }
                 let result = try allocate(type: type)
-                values[unary[0]] = result
+                values[unary.result] = result
                 appendInstruction(
-                    .floatingUnary(result: result, operation: .negate, operand: operand)
+                    .floatingUnary(
+                        result: result,
+                        operation: unary.operation,
+                        operand: operand
+                    )
+                )
+                continue
+            }
+
+            if let unary = parseIntegerUnary(line) {
+                let operand = try resolve(unary.operand, line: sourceLine)
+                guard case let .integer(width, _) = registerTypes[
+                    Int(operand.rawValue)
+                ], width == unary.bitWidth else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "integer unary operand does not match its builtin"
+                    )
+                }
+                if let flag = unary.zeroIsUndefinedFlag,
+                   boolLiterals[flag] != false {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: "integer count builtin with undefined zero semantics"
+                    )
+                }
+                let type = registerTypes[Int(operand.rawValue)]
+                let result = try allocate(type: type)
+                values[unary.result] = result
+                appendInstruction(
+                    .integerUnary(
+                        result: result,
+                        operation: unary.operation,
+                        operand: operand
+                    )
+                )
+                continue
+            }
+
+            if let bitcast = match(
+                line,
+                pattern: #"^(%[0-9]+) = builtin "bitcast_(FPIEEE|Int)(32|64)_(FPIEEE|Int)(32|64)"\((%[0-9]+)\).*$"#
+            ) {
+                guard bitcast[1] != bitcast[3],
+                      bitcast[2] == bitcast[4],
+                      let width = UInt16(bitcast[2])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "scalar bitcast must preserve width across integer and float"
+                    )
+                }
+                let operand = try resolve(bitcast[5], line: sourceLine)
+                let operandType = registerTypes[Int(operand.rawValue)]
+                let resultType: Bytecode.ValueType
+                if bitcast[1] == "FPIEEE" {
+                    guard operandType == .float(bitWidth: width) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "floating scalar bitcast operand has the wrong width"
+                        )
+                    }
+                    // Builtin.IntN has no signedness. Begin with its raw-bit
+                    // interpretation and retype it at the first signed use.
+                    resultType = .integer(bitWidth: width, signed: false)
+                } else {
+                    guard case let .integer(actualWidth, _) = operandType,
+                          actualWidth == width
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "integer scalar bitcast operand has the wrong width"
+                        )
+                    }
+                    resultType = .float(bitWidth: width)
+                }
+                let result = try allocate(type: resultType)
+                values[bitcast[0]] = result
+                appendInstruction(
+                    .scalarBitCast(result: result, operand: operand)
                 )
                 continue
             }
@@ -9765,6 +10482,32 @@ public struct Lowerer: Sendable {
 
             if let enumeration = match(
                 line,
+                pattern: #"^(%[0-9]+) = enum \$(?:Swift\.)?(FloatingPointSign|FloatingPointRoundingRule), #(?:Swift\.)?[^.]+\.([^!]+)!enumelt$"#
+            ) {
+                let value = CompilerEnumCase(
+                    typeName: enumeration[1],
+                    caseName: enumeration[2]
+                )
+                switch value.typeName {
+                case "FloatingPointSign":
+                    guard value.caseName == "plus" || value.caseName == "minus" else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "unknown FloatingPointSign case \(value.caseName)"
+                        )
+                    }
+                case "FloatingPointRoundingRule":
+                    _ = try roundingOperation(for: value)
+                default:
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "unknown compiler-only enum \(value.typeName)"
+                    )
+                }
+                compilerEnumValues[enumeration[0]] = value
+                continue
+            }
+
+            if let enumeration = match(
+                line,
                 pattern: #"^(%[0-9]+) = enum \$(.+), #([^!]+)!enumelt$"#
             ), case let .native(typeID) = try parseType(enumeration[1]) {
                 let reference = "#\(enumeration[2])!enumelt"
@@ -9887,6 +10630,28 @@ public struct Lowerer: Sendable {
                     wrappedType: wrapped
                 )
                 optionalPayloadAddressRoots[initialization[0]] = initialization[1]
+                continue
+            }
+
+            if let injection = match(
+                line,
+                pattern: #"^inject_enum_addr (%[0-9]+), #(?:Swift\.)?FloatingPointRoundingRule\.([^!]+)!enumelt$"#
+            ) {
+                let address = addressBase(injection[0])
+                guard compilerEnumAddressTypes[address]
+                        == "FloatingPointRoundingRule",
+                      compilerEnumAddressCases[address] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "compiler enum injection has invalid or initialized storage"
+                    )
+                }
+                let enumeration = CompilerEnumCase(
+                    typeName: "FloatingPointRoundingRule",
+                    caseName: injection[1]
+                )
+                _ = try roundingOperation(for: enumeration)
+                compilerEnumAddressCases[address] = enumeration
                 continue
             }
 
@@ -10554,6 +11319,14 @@ public struct Lowerer: Sendable {
 
             if let destroy = match(line, pattern: #"^destroy_addr (%[0-9]+)$"#) {
                 let address = addressBase(destroy[0])
+                if compilerEnumAddressTypes[address] != nil {
+                    guard compilerEnumAddressCases.removeValue(forKey: address) != nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "destroy_addr references uninitialized compiler enum storage"
+                        )
+                    }
+                    continue
+                }
                 if mutableCell(at: destroy[0]) != nil {
                     // The cell owns its payload until every closure/context
                     // reference is released; SIL's stack destroy must not
@@ -11089,6 +11862,102 @@ public struct Lowerer: Sendable {
 
             if let selection = match(
                 line,
+                pattern: #"^(%[0-9]+) = select_enum (%[0-9]+), case #(?:Swift\.)?FloatingPointSign\.(plus|minus)!enumelt: (%[0-9]+), case #(?:Swift\.)?FloatingPointSign\.(plus|minus)!enumelt: (%[0-9]+) : \$Builtin\.Int(8|16|32|64)$"#
+            ) {
+                guard selection[2] != selection[4],
+                      let first = values[selection[3]],
+                      let second = values[selection[5]],
+                      registerTypes[Int(first.rawValue)]
+                        == registerTypes[Int(second.rawValue)],
+                      case let .integer(width, _) = registerTypes[Int(first.rawValue)],
+                      String(width) == selection[6]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "FloatingPointSign selection has invalid cases or values"
+                    )
+                }
+                if let isMinus = floatingSignValues[selection[1]] {
+                    let minus = selection[2] == "minus" ? first : second
+                    let plus = selection[2] == "plus" ? first : second
+                    let result = try allocate(
+                        type: registerTypes[Int(first.rawValue)]
+                    )
+                    values[selection[0]] = result
+                    appendInstruction(
+                        .select(
+                            result: result,
+                            condition: isMinus,
+                            trueValue: minus,
+                            falseValue: plus
+                        )
+                    )
+                    continue
+                }
+                if let concrete = compilerEnumValues[selection[1]],
+                   concrete.typeName == "FloatingPointSign" {
+                    values[selection[0]] = concrete.caseName == selection[2]
+                        ? first
+                        : second
+                    continue
+                }
+            }
+
+            if line.hasPrefix("switch_enum_addr "),
+               let separator = line.firstIndex(of: ",") {
+                let operand = String(
+                    line[line.index(line.startIndex, offsetBy: "switch_enum_addr ".count)..<separator]
+                ).trimmingCharacters(in: .whitespaces)
+                let address = addressBase(operand)
+                if let selected = compilerEnumAddressCases[address] {
+                    let clauses = splitTopLevel(
+                        String(line[line.index(after: separator)...])
+                    )
+                    var targets: [String: Bytecode.BlockID] = [:]
+                    var defaultTarget: Bytecode.BlockID?
+                    var allTargets: [Bytecode.BlockID] = []
+                    for clause in clauses {
+                        if let item = match(
+                            clause,
+                            pattern: #"^case #(?:Swift\.)?FloatingPointRoundingRule\.([^!]+)!enumelt: bb([0-9]+)$"#
+                        ) {
+                            guard targets[item[0]] == nil else {
+                                throw CanonicalSIL.LoweringError.malformedSIL(
+                                    "compiler enum switch repeats a case"
+                                )
+                            }
+                            let target = try parseBlockID(item[1])
+                            targets[item[0]] = target
+                            allTargets.append(target)
+                        } else if let item = match(
+                            clause,
+                            pattern: #"^default bb([0-9]+)$"#
+                        ), defaultTarget == nil {
+                            let target = try parseBlockID(item[0])
+                            defaultTarget = target
+                            allTargets.append(target)
+                        } else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "compiler enum switch contains an unsupported clause"
+                            )
+                        }
+                    }
+                    guard selected.typeName == compilerEnumAddressTypes[address],
+                          let target = targets[selected.caseName] ?? defaultTarget
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "compiler enum switch does not cover its stored case"
+                        )
+                    }
+                    try appendStaticBranch(
+                        selected: target,
+                        preserving: allTargets
+                    )
+                    continue
+                }
+            }
+
+            if let selection = match(
+                line,
                 pattern: #"^(%[0-9]+) = select_enum_addr (%[0-9]+), case #Optional\.(some|none)!enumelt: (%[0-9]+), default (%[0-9]+) : \$Builtin\.Int1$"#
             ) {
                 guard let borrowed = try borrowStoredValue(
@@ -11240,6 +12109,47 @@ public struct Lowerer: Sendable {
                     )
                 )
                 continue
+            }
+
+            if let branch = match(
+                line,
+                pattern: #"^switch_enum (%[0-9]+), case #(?:Swift\.)?FloatingPointSign\.(plus|minus)!enumelt: bb([0-9]+), case #(?:Swift\.)?FloatingPointSign\.(plus|minus)!enumelt: bb([0-9]+)$"#
+            ) {
+                guard branch[1] != branch[3] else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "FloatingPointSign switch must cover plus and minus"
+                    )
+                }
+                let firstTarget = try parseBlockID(branch[2])
+                let secondTarget = try parseBlockID(branch[4])
+                let plusTarget = branch[1] == "plus"
+                    ? firstTarget
+                    : secondTarget
+                let minusTarget = branch[1] == "minus"
+                    ? firstTarget
+                    : secondTarget
+                if let isMinus = floatingSignValues[branch[0]] {
+                    appendInstruction(
+                        .conditionalBranch(
+                            condition: isMinus,
+                            trueTarget: minusTarget,
+                            trueArguments: [],
+                            falseTarget: plusTarget,
+                            falseArguments: []
+                        )
+                    )
+                    continue
+                }
+                if let concrete = compilerEnumValues[branch[0]],
+                   concrete.typeName == "FloatingPointSign" {
+                    try appendStaticBranch(
+                        selected: concrete.caseName == "minus"
+                            ? minusTarget
+                            : plusTarget,
+                        preserving: [plusTarget, minusTarget]
+                    )
+                    continue
+                }
             }
 
             if line.hasPrefix("switch_enum ") {
@@ -11588,6 +12498,11 @@ public struct Lowerer: Sendable {
         recordIncompleteLifetime(
             "lexical-dealloc",
             count: remainingDeallocStackUses.values.reduce(0, +)
+        )
+        recordIncompleteLifetime(
+            "compiler-enum",
+            count: compilerEnumAddressTypes.count
+                + compilerEnumAddressCases.count
         )
         recordIncompleteLifetime(
             "borrowed-call-cleanup",
@@ -12648,6 +13563,73 @@ public struct Lowerer: Sendable {
         var rhs: String
         var operation: Bytecode.FloatBinaryOperation
         var bitWidth: UInt16
+    }
+
+    private struct FloatingUnary {
+        var result: String
+        var operand: String
+        var operation: Bytecode.FloatUnaryOperation
+        var bitWidth: UInt16
+    }
+
+    private func parseFloatingUnary(_ line: String) -> FloatingUnary? {
+        guard let parts = match(
+            line,
+            pattern: #"^(%[0-9]+) = builtin "(fneg|int_fabs|int_round|int_rint|int_trunc|int_ceil|int_floor)_FPIEEE(32|64)"\((%[0-9]+)\).*$"#
+        ), let bitWidth = UInt16(parts[2]) else { return nil }
+        let operation: Bytecode.FloatUnaryOperation = switch parts[1] {
+        case "fneg": .negate
+        case "int_fabs": .absolute
+        case "int_round": .roundToNearestOrAwayFromZero
+        case "int_rint": .roundToNearestOrEven
+        case "int_trunc": .roundTowardZero
+        case "int_ceil": .roundUp
+        default: .roundDown
+        }
+        return FloatingUnary(
+            result: parts[0],
+            operand: parts[3],
+            operation: operation,
+            bitWidth: bitWidth
+        )
+    }
+
+    private struct IntegerUnary {
+        var result: String
+        var operand: String
+        var zeroIsUndefinedFlag: String?
+        var operation: Bytecode.IntegerUnaryOperation
+        var bitWidth: UInt16
+    }
+
+    private func parseIntegerUnary(_ line: String) -> IntegerUnary? {
+        if let parts = match(
+            line,
+            pattern: #"^(%[0-9]+) = builtin "int_(ctpop|bswap)_Int(8|16|32|64)"\((%[0-9]+)\).*$"#
+        ), let bitWidth = UInt16(parts[2]) {
+            return IntegerUnary(
+                result: parts[0],
+                operand: parts[3],
+                zeroIsUndefinedFlag: nil,
+                operation: parts[1] == "ctpop"
+                    ? .nonzeroBitCount
+                    : .byteSwapped,
+                bitWidth: bitWidth
+            )
+        }
+        guard let parts = match(
+            line,
+            pattern: #"^(%[0-9]+) = builtin "int_(ctlz|cttz)_Int(8|16|32|64)"\((%[0-9]+), (%[0-9]+)\).*$"#
+        ), let bitWidth = UInt16(parts[2]) else { return nil }
+        return IntegerUnary(
+            result: parts[0],
+            operand: parts[3],
+            zeroIsUndefinedFlag: parts[4],
+            operation: parts[1] == "ctlz"
+                ? .leadingZeroBitCount
+                : .trailingZeroBitCount,
+            bitWidth: bitWidth
+        )
     }
 
     private func parseFloatingBinary(_ line: String) -> FloatingBinary? {

@@ -13,14 +13,16 @@ enum StorageInitialization {
     }
 
     struct Plan: Equatable, Sendable {
+        var addressTargets: [String: AddressTarget]
         var mutableCapturePointees: [String: Bytecode.ValueType]
-        var storeModes: [Int: Bytecode.StackStoreMode]
+        var storeModes: [Int: [AddressTarget: Bytecode.StackStoreMode]]
         var conditionalDestroyLines: Set<Int>
         var runtimeStorageRoots: Set<String>
         var consumingApplicationArguments: [Int: Set<String>]
         var deallocationModes: [Int: DeallocationMode]
 
         static let empty = Self(
+            addressTargets: [:],
             mutableCapturePointees: [:],
             storeModes: [:],
             conditionalDestroyLines: [],
@@ -30,9 +32,11 @@ enum StorageInitialization {
         )
 
         func storeMode(
-            at line: Int
+            at line: Int,
+            address: String
         ) -> Bytecode.StackStoreMode {
-            storeModes[line] ?? .assign
+            guard let target = addressTargets[address] else { return .assign }
+            return storeModes[line]?[target] ?? .assign
         }
 
         func consumesApplicationArgument(
@@ -47,7 +51,7 @@ enum StorageInitialization {
         }
     }
 
-    private struct AddressTarget: Equatable, Sendable {
+    struct AddressTarget: Hashable, Sendable {
         var root: String
         var path: [UInt32]
     }
@@ -225,6 +229,7 @@ enum StorageInitialization {
             typeEnvironment: typeEnvironment
         )
         return .init(
+            addressTargets: targets,
             mutableCapturePointees: pointees,
             storeModes: classification.storeModes,
             conditionalDestroyLines: classification.conditionalDestroyLines,
@@ -599,7 +604,7 @@ enum StorageInitialization {
         pointees: [String: Bytecode.ValueType],
         typeEnvironment: CanonicalSIL.TypeEnvironment
     ) throws -> (
-        storeModes: [Int: Bytecode.StackStoreMode],
+        storeModes: [Int: [AddressTarget: Bytecode.StackStoreMode]],
         conditionalDestroyLines: Set<Int>,
         deallocationModes: [Int: DeallocationMode]
     ) {
@@ -735,7 +740,7 @@ enum StorageInitialization {
             }
         }
 
-        var storeModes: [Int: Bytecode.StackStoreMode] = [:]
+        var storeModes: [Int: [AddressTarget: Bytecode.StackStoreMode]] = [:]
         var conditionalDestroyLines = Set<Int>()
         var deallocationModes: [Int: DeallocationMode] = [:]
 
@@ -774,9 +779,12 @@ enum StorageInitialization {
                     mode = .replace
                 }
                 if recordsStoreMode {
-                    guard storeModes.updateValue(mode, forKey: line) == nil else {
+                    guard storeModes[line, default: [:]].updateValue(
+                        mode,
+                        forKey: target
+                    ) == nil else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "one SIL line writes multiple analyzed storage roots"
+                            "one SIL storage target is written twice on the same line"
                         )
                     }
                 }

@@ -186,6 +186,12 @@ public enum Disassembler {
             "\(result) = float_\(operation.rawValue) \(lhs), \(rhs)"
         case let .floatingUnary(result, operation, operand):
             "\(result) = float_\(operation.rawValue) \(operand)"
+        case let .floatingPredicate(result, operation, operand):
+            "\(result) = float_\(operation.rawValue) \(operand)"
+        case let .integerUnary(result, operation, operand):
+            "\(result) = integer_\(operation.rawValue) \(operand)"
+        case let .scalarBitCast(result, operand):
+            "\(result) = scalar_bitcast \(operand)"
         case let .integerConvert(result, operation, value):
             "\(result) = integer_convert.\(operation.rawValue) \(value)"
         case let .floatingConvert(result, operation, value):

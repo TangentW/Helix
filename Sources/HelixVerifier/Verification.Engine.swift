@@ -1963,6 +1963,39 @@ public struct Engine: Verification.ImageVerifying {
             guard type(result) == type(operand), case .float = type(operand) else {
                 throw fail("floating unary operand and result must use one float type")
             }
+        case let .floatingPredicate(result, _, operand):
+            guard type(result) == .bool, case .float = type(operand) else {
+                throw fail("floating predicate requires a float operand and Bool result")
+            }
+        case let .integerUnary(result, operation, operand):
+            guard case let .integer(width, signed) = type(operand) else {
+                throw fail("integer unary operation requires an integer operand")
+            }
+            switch operation {
+            case .magnitude:
+                guard type(result) == .integer(bitWidth: width, signed: false) else {
+                    throw fail("integer magnitude must produce the same-width unsigned type")
+                }
+            case .nonzeroBitCount, .leadingZeroBitCount,
+                 .trailingZeroBitCount, .byteSwapped:
+                guard type(result) == type(operand) else {
+                    throw fail("integer bit operation must preserve its operand type")
+                }
+            case .signum:
+                guard signed, type(result) == type(operand) else {
+                    throw fail("integer signum requires one signed integer type")
+                }
+            }
+        case let .scalarBitCast(result, operand):
+            switch (type(operand), type(result)) {
+            case let (.integer(sourceWidth, _), .float(targetWidth)),
+                 let (.float(sourceWidth), .integer(targetWidth, _)):
+                guard sourceWidth == targetWidth else {
+                    throw fail("scalar bitcast must preserve its storage width")
+                }
+            default:
+                throw fail("scalar bitcast requires one integer and one float")
+            }
         case let .integerConvert(result, operation, value):
             guard case let .integer(sourceWidth, sourceSigned) = type(value),
                   case let .integer(targetWidth, _) = type(result)
@@ -3312,7 +3345,9 @@ public struct Engine: Verification.ImageVerifying {
                 case .trap:
                     live.removeAll()
                 case .constantInteger, .constantBool, .constantFloat, .checkedBinary,
-                     .floatingBinary, .floatingUnary, .integerConvert, .floatingConvert,
+                     .floatingBinary, .floatingUnary, .floatingPredicate,
+                     .integerUnary, .scalarBitCast, .integerConvert,
+                     .floatingConvert,
                      .booleanBinary, .stringConcat, .stringCount, .stringIsEmpty,
                      .stringPredicate, .stringTransform, .stringify,
                      .arrayCount, .arrayIsEmpty, .arrayContains,

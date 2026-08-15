@@ -403,6 +403,166 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Scalar unary operations enforce operation-specific result types")
+    func rejectsMalformedScalarUnaryOperations() throws {
+        let badPredicate = try makeFixture { function in
+            function.registerTypes.append(contentsOf: [.float(bitWidth: 64), .int64])
+            function.blocks[0].instructions = [
+                .constantFloat(result: .init(rawValue: 1), bitPattern: 0),
+                .floatingPredicate(
+                    result: .init(rawValue: 2),
+                    operation: .isFinite,
+                    operand: .init(rawValue: 1)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "floating predicate requires a float operand and Bool result"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(badPredicate.module),
+                shell: badPredicate.shell,
+                policy: badPredicate.policy
+            )
+        }
+
+        let signedMagnitude = try makeFixture { function in
+            function.registerTypes.append(.int64)
+            function.blocks[0].instructions = [
+                .integerUnary(
+                    result: .init(rawValue: 1),
+                    operation: .magnitude,
+                    operand: .init(rawValue: 0)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "integer magnitude must produce the same-width unsigned type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(signedMagnitude.module),
+                shell: signedMagnitude.shell,
+                policy: signedMagnitude.policy
+            )
+        }
+
+        let mismatchedBitOperation = try makeFixture { function in
+            function.registerTypes.append(.integer(bitWidth: 64, signed: false))
+            function.blocks[0].instructions = [
+                .integerUnary(
+                    result: .init(rawValue: 1),
+                    operation: .nonzeroBitCount,
+                    operand: .init(rawValue: 0)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "integer bit operation must preserve its operand type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(mismatchedBitOperation.module),
+                shell: mismatchedBitOperation.shell,
+                policy: mismatchedBitOperation.policy
+            )
+        }
+
+        let unsignedSignum = try makeFixture { function in
+            let unsigned = Bytecode.ValueType.integer(bitWidth: 64, signed: false)
+            function.registerTypes.append(contentsOf: [unsigned, unsigned])
+            function.blocks[0].instructions = [
+                .constantInteger(result: .init(rawValue: 1), bitPattern: 1),
+                .integerUnary(
+                    result: .init(rawValue: 2),
+                    operation: .signum,
+                    operand: .init(rawValue: 1)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "integer signum requires one signed integer type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(unsignedSignum.module),
+                shell: unsignedSignum.shell,
+                policy: unsignedSignum.policy
+            )
+        }
+
+        let mismatchedBitcast = try makeFixture { function in
+            function.registerTypes.append(.float(bitWidth: 32))
+            function.blocks[0].instructions = [
+                .scalarBitCast(
+                    result: .init(rawValue: 1),
+                    operand: .init(rawValue: 0)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "scalar bitcast must preserve its storage width"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(mismatchedBitcast.module),
+                shell: mismatchedBitcast.shell,
+                policy: mismatchedBitcast.policy
+            )
+        }
+
+        let sameKindBitcast = try makeFixture { function in
+            function.registerTypes.append(.int64)
+            function.blocks[0].instructions = [
+                .scalarBitCast(
+                    result: .init(rawValue: 1),
+                    operand: .init(rawValue: 0)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "scalar bitcast requires one integer and one float"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(sameKindBitcast.module),
+                shell: sameKindBitcast.shell,
+                policy: sameKindBitcast.policy
+            )
+        }
+    }
+
     @Test("Select cannot merge values of different verified types")
     func rejectsMismatchedSelectTypes() throws {
         let fixture = try makeFixture { function in

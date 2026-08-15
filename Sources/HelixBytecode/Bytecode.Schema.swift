@@ -198,6 +198,37 @@ public enum FloatBinaryOperation: String, Codable, Hashable, Sendable {
 public enum FloatUnaryOperation: String, Codable, Hashable, Sendable {
     case negate
     case absolute
+    case squareRoot
+    case ulp
+    case nextUp
+    case binade
+    case significand
+    case roundDown
+    case roundUp
+    case roundTowardZero
+    case roundAwayFromZero
+    case roundToNearestOrAwayFromZero
+    case roundToNearestOrEven
+}
+
+public enum FloatPredicateOperation: String, Codable, Hashable, Sendable {
+    case isFinite
+    case isInfinite
+    case isNaN
+    case isSignalingNaN
+    case isNormal
+    case isSubnormal
+    case isZero
+    case isSignMinus
+}
+
+public enum IntegerUnaryOperation: String, Codable, Hashable, Sendable {
+    case magnitude
+    case nonzeroBitCount
+    case leadingZeroBitCount
+    case trailingZeroBitCount
+    case byteSwapped
+    case signum
 }
 
 public enum IntegerConversionOperation: String, Codable, Hashable, Sendable {
@@ -427,6 +458,20 @@ public enum Instruction: Codable, Hashable, Sendable {
     case floatingUnary(
         result: Bytecode.Register,
         operation: Bytecode.FloatUnaryOperation,
+        operand: Bytecode.Register
+    )
+    case floatingPredicate(
+        result: Bytecode.Register,
+        operation: Bytecode.FloatPredicateOperation,
+        operand: Bytecode.Register
+    )
+    case integerUnary(
+        result: Bytecode.Register,
+        operation: Bytecode.IntegerUnaryOperation,
+        operand: Bytecode.Register
+    )
+    case scalarBitCast(
+        result: Bytecode.Register,
         operand: Bytecode.Register
     )
     case integerConvert(
@@ -708,6 +753,9 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .loadAddress(result, _, _),
              let .floatingBinary(result, _, _, _),
              let .floatingUnary(result, _, _),
+             let .floatingPredicate(result, _, _),
+             let .integerUnary(result, _, _),
+             let .scalarBitCast(result, _),
              let .integerConvert(result, _, _),
              let .floatingConvert(result, _, _),
              let .booleanBinary(result, _, _, _),
@@ -843,6 +891,9 @@ public enum Instruction: Codable, Hashable, Sendable {
         case let .select(_, condition, trueValue, falseValue):
             [condition, trueValue, falseValue]
         case let .floatingUnary(_, _, operand),
+             let .floatingPredicate(_, _, operand),
+             let .integerUnary(_, _, operand),
+             let .scalarBitCast(_, operand),
              let .integerConvert(_, _, operand),
              let .floatingConvert(_, _, operand):
             [operand]

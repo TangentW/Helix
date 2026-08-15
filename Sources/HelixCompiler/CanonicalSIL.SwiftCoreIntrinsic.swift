@@ -2,6 +2,7 @@ import HelixBytecode
 
 extension CanonicalSIL {
 enum SwiftCoreIntrinsic: Equatable {
+    case scalar(CanonicalSIL.ScalarIntrinsic)
     case higherOrder(CanonicalSIL.HigherOrderIntrinsic)
     case algebraic(CanonicalSIL.AlgebraicIntrinsic)
     case minimum
@@ -68,6 +69,10 @@ enum SwiftCoreIntrinsic: Equatable {
     case assertionFailure
 
     init?(mangledName: String) {
+        if let scalar = CanonicalSIL.ScalarIntrinsic(mangledName: mangledName) {
+            self = .scalar(scalar)
+            return
+        }
         switch mangledName {
         case "$sSlsE3mapySayqd__Gqd__7ElementQzqd_0_YKXEqd_0_YKs5ErrorRd_0_r0_lF":
             self = .higherOrder(.map)

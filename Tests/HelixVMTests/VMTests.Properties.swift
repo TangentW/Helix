@@ -215,6 +215,527 @@ struct Properties {
         }
     }
 
+    @Test("Floating scalar transforms and predicates agree with Swift")
+    func floatingScalarOperationsMatchSwift() throws {
+        func transformImage(
+            width: UInt16,
+            operation: Bytecode.FloatUnaryOperation
+        ) throws -> Verification.Image {
+            let type = Bytecode.ValueType.float(bitWidth: width)
+            return try makeVerified(
+                function: .init(
+                    id: .init(rawValue: 0),
+                    name: "float_\(width)_\(operation.rawValue)",
+                    parameterRegisters: [.init(rawValue: 0)],
+                    resultType: type,
+                    registerTypes: [type, type],
+                    entryBlock: .init(rawValue: 0),
+                    blocks: [
+                        .init(
+                            id: .init(rawValue: 0),
+                            parameters: [.init(rawValue: 0)],
+                            instructions: [
+                                .floatingUnary(
+                                    result: .init(rawValue: 1),
+                                    operation: operation,
+                                    operand: .init(rawValue: 0)
+                                ),
+                                .returnValue(.init(rawValue: 1)),
+                            ]
+                        ),
+                    ]
+                ),
+                signature: .init(
+                    parameters: [type.description],
+                    result: type.description
+                ),
+                parameterTypes: [type],
+                resultType: type,
+                capabilities: [.baselineV1]
+            )
+        }
+
+        func predicateImage(
+            width: UInt16,
+            operation: Bytecode.FloatPredicateOperation
+        ) throws -> Verification.Image {
+            let type = Bytecode.ValueType.float(bitWidth: width)
+            return try makeVerified(
+                function: .init(
+                    id: .init(rawValue: 0),
+                    name: "float_\(width)_\(operation.rawValue)",
+                    parameterRegisters: [.init(rawValue: 0)],
+                    resultType: .bool,
+                    registerTypes: [type, .bool],
+                    entryBlock: .init(rawValue: 0),
+                    blocks: [
+                        .init(
+                            id: .init(rawValue: 0),
+                            parameters: [.init(rawValue: 0)],
+                            instructions: [
+                                .floatingPredicate(
+                                    result: .init(rawValue: 1),
+                                    operation: operation,
+                                    operand: .init(rawValue: 0)
+                                ),
+                                .returnValue(.init(rawValue: 1)),
+                            ]
+                        ),
+                    ]
+                ),
+                signature: .init(
+                    parameters: [type.description],
+                    result: "Swift.Bool"
+                ),
+                parameterTypes: [type],
+                resultType: .bool,
+                capabilities: [.baselineV1]
+            )
+        }
+
+        let transforms: [Bytecode.FloatUnaryOperation] = [
+            .negate, .absolute, .squareRoot, .ulp, .nextUp, .binade, .significand,
+            .roundDown, .roundUp, .roundTowardZero, .roundAwayFromZero,
+            .roundToNearestOrAwayFromZero, .roundToNearestOrEven,
+        ]
+        let floatInputs: [Float] = [
+            -2.5, -0.3, -0.0, 0, 2.5, .infinity,
+            Float(bitPattern: 0xFFA1_2345),
+        ]
+        for operation in transforms {
+            let image = try transformImage(width: 32, operation: operation)
+            for input in floatInputs {
+                let expected: Float = switch operation {
+                case .negate: -input
+                case .absolute: abs(input)
+                case .squareRoot: input.squareRoot()
+                case .ulp: input.ulp
+                case .nextUp: input.nextUp
+                case .binade: input.binade
+                case .significand: input.significand
+                case .roundDown: input.rounded(.down)
+                case .roundUp: input.rounded(.up)
+                case .roundTowardZero: input.rounded(.towardZero)
+                case .roundAwayFromZero: input.rounded(.awayFromZero)
+                case .roundToNearestOrAwayFromZero:
+                    input.rounded(.toNearestOrAwayFromZero)
+                case .roundToNearestOrEven: input.rounded(.toNearestOrEven)
+                }
+                guard case let .returned(.some(.float(actual))) = VM.Interpreter().invoke(
+                    entry: .init(rawValue: 0),
+                    image: image,
+                    arguments: [.float32(input)]
+                ) else {
+                    Issue.record("Float32 \(operation) did not return a scalar")
+                    continue
+                }
+                #expect(actual.floatValue.bitPattern == expected.bitPattern)
+            }
+        }
+
+        let doubleInputs: [Double] = [
+            -2.5, -0.3, -0.0, 0, 2.5, .infinity,
+            Double(bitPattern: 0xFFF0_0000_0000_1234),
+        ]
+        for operation in transforms {
+            let image = try transformImage(width: 64, operation: operation)
+            for input in doubleInputs {
+                let expected: Double = switch operation {
+                case .negate: -input
+                case .absolute: abs(input)
+                case .squareRoot: input.squareRoot()
+                case .ulp: input.ulp
+                case .nextUp: input.nextUp
+                case .binade: input.binade
+                case .significand: input.significand
+                case .roundDown: input.rounded(.down)
+                case .roundUp: input.rounded(.up)
+                case .roundTowardZero: input.rounded(.towardZero)
+                case .roundAwayFromZero: input.rounded(.awayFromZero)
+                case .roundToNearestOrAwayFromZero:
+                    input.rounded(.toNearestOrAwayFromZero)
+                case .roundToNearestOrEven: input.rounded(.toNearestOrEven)
+                }
+                guard case let .returned(.some(.float(actual))) = VM.Interpreter().invoke(
+                    entry: .init(rawValue: 0),
+                    image: image,
+                    arguments: [.float64(input)]
+                ) else {
+                    Issue.record("Float64 \(operation) did not return a scalar")
+                    continue
+                }
+                #expect(actual.doubleValue.bitPattern == expected.bitPattern)
+            }
+        }
+
+        let predicates: [Bytecode.FloatPredicateOperation] = [
+            .isFinite, .isInfinite, .isNaN, .isSignalingNaN,
+            .isNormal, .isSubnormal, .isZero, .isSignMinus,
+        ]
+        let predicateValues: [VM.FloatingValue] = [
+            .init(-0.0 as Float),
+            .init(Float.leastNonzeroMagnitude),
+            .init(Float.infinity),
+            try .init(bitPattern: 0x7FA1_2345, bitWidth: 32),
+            .init(-0.0 as Double),
+            .init(Double.leastNonzeroMagnitude),
+            .init(Double.infinity),
+            try .init(bitPattern: 0xFFF0_0000_0000_1234, bitWidth: 64),
+        ]
+        for operation in predicates {
+            for value in predicateValues {
+                let image = try predicateImage(
+                    width: value.bitWidth,
+                    operation: operation
+                )
+                let expected: Bool
+                if value.bitWidth == 32 {
+                    let scalar = value.floatValue
+                    expected = switch operation {
+                    case .isFinite: scalar.isFinite
+                    case .isInfinite: scalar.isInfinite
+                    case .isNaN: scalar.isNaN
+                    case .isSignalingNaN: scalar.isSignalingNaN
+                    case .isNormal: scalar.isNormal
+                    case .isSubnormal: scalar.isSubnormal
+                    case .isZero: scalar.isZero
+                    case .isSignMinus: scalar.bitPattern >> 31 == 1
+                    }
+                } else {
+                    let scalar = value.doubleValue
+                    expected = switch operation {
+                    case .isFinite: scalar.isFinite
+                    case .isInfinite: scalar.isInfinite
+                    case .isNaN: scalar.isNaN
+                    case .isSignalingNaN: scalar.isSignalingNaN
+                    case .isNormal: scalar.isNormal
+                    case .isSubnormal: scalar.isSubnormal
+                    case .isZero: scalar.isZero
+                    case .isSignMinus: scalar.bitPattern >> 63 == 1
+                    }
+                }
+                #expect(
+                    VM.Interpreter().invoke(
+                        entry: .init(rawValue: 0),
+                        image: image,
+                        arguments: [.float(value)]
+                    ) == .returned(.bool(expected))
+                )
+            }
+        }
+    }
+
+    @Test("Scalar bitcasts preserve every IEEE payload bit")
+    func scalarBitcastsPreservePayloads() throws {
+        func image(width: UInt16) throws -> Verification.Image {
+            let floating = Bytecode.ValueType.float(bitWidth: width)
+            let integer = Bytecode.ValueType.integer(
+                bitWidth: width,
+                signed: false
+            )
+            return try makeVerified(
+                function: .init(
+                    id: .init(rawValue: 0),
+                    name: "bitcast_\(width)",
+                    parameterRegisters: [.init(rawValue: 0)],
+                    resultType: floating,
+                    registerTypes: [floating, integer, floating],
+                    entryBlock: .init(rawValue: 0),
+                    blocks: [
+                        .init(
+                            id: .init(rawValue: 0),
+                            parameters: [.init(rawValue: 0)],
+                            instructions: [
+                                .scalarBitCast(
+                                    result: .init(rawValue: 1),
+                                    operand: .init(rawValue: 0)
+                                ),
+                                .scalarBitCast(
+                                    result: .init(rawValue: 2),
+                                    operand: .init(rawValue: 1)
+                                ),
+                                .returnValue(.init(rawValue: 2)),
+                            ]
+                        ),
+                    ]
+                ),
+                signature: .init(
+                    parameters: [floating.description],
+                    result: floating.description
+                ),
+                parameterTypes: [floating],
+                resultType: floating,
+                capabilities: [.baselineV1]
+            )
+        }
+
+        let values: [VM.FloatingValue] = [
+            try .init(bitPattern: 0x8000_0000, bitWidth: 32),
+            try .init(bitPattern: 0x7FA1_2345, bitWidth: 32),
+            try .init(bitPattern: 0x8000_0000_0000_0000, bitWidth: 64),
+            try .init(bitPattern: 0xFFF0_0000_0000_1234, bitWidth: 64),
+        ]
+        for value in values {
+            let result = VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(width: value.bitWidth),
+                arguments: [.float(value)]
+            )
+            guard case let .returned(.some(.float(actual))) = result else {
+                Issue.record("scalar bitcast did not return a float: \(result)")
+                continue
+            }
+            #expect(actual.bitWidth == value.bitWidth)
+            #expect(actual.bitPattern == value.bitPattern)
+        }
+    }
+
+    @Test("Integer unary operations preserve width and signedness contracts")
+    func integerUnaryOperationsMatchSwift() throws {
+        func image(
+            sourceType: Bytecode.ValueType,
+            includeSignum: Bool
+        ) throws -> Verification.Image {
+            guard case let .integer(width, _) = sourceType else {
+                throw VM.RuntimeTrap.invalidIntegerWidth(0)
+            }
+            let magnitudeType = Bytecode.ValueType.integer(
+                bitWidth: width,
+                signed: false
+            )
+            let operations: [Bytecode.IntegerUnaryOperation] = [
+                .magnitude, .nonzeroBitCount, .leadingZeroBitCount,
+                .trailingZeroBitCount, .byteSwapped,
+            ] + (includeSignum ? [.signum] : [])
+            let resultTypes = [magnitudeType]
+                + Array(repeating: sourceType, count: operations.count - 1)
+            let tupleType = Bytecode.ValueType.tuple(resultTypes)
+            let tuple = Bytecode.Register(rawValue: UInt32(operations.count + 1))
+            var instructions = operations.enumerated().map { index, operation in
+                Bytecode.Instruction.integerUnary(
+                    result: .init(rawValue: UInt32(index + 1)),
+                    operation: operation,
+                    operand: .init(rawValue: 0)
+                )
+            }
+            instructions.append(
+                .makeTuple(
+                    result: tuple,
+                    elements: operations.indices.map {
+                        .init(rawValue: UInt32($0 + 1))
+                    }
+                )
+            )
+            instructions.append(.returnValue(tuple))
+            return try makeVerified(
+                function: .init(
+                    id: .init(rawValue: 0),
+                    name: "integer_unary_\(sourceType)",
+                    parameterRegisters: [.init(rawValue: 0)],
+                    resultType: tupleType,
+                    registerTypes: [sourceType] + resultTypes + [tupleType],
+                    entryBlock: .init(rawValue: 0),
+                    blocks: [
+                        .init(
+                            id: .init(rawValue: 0),
+                            parameters: [.init(rawValue: 0)],
+                            instructions: instructions
+                        ),
+                    ]
+                ),
+                signature: .init(
+                    parameters: [sourceType.description],
+                    result: tupleType.description
+                ),
+                parameterTypes: [sourceType],
+                resultType: tupleType,
+                capabilities: [.baselineV1]
+            )
+        }
+
+        let cases: [(type: Bytecode.ValueType, raw: UInt64)] = [
+            (.integer(bitWidth: 8, signed: true), 0x81),
+            (.integer(bitWidth: 16, signed: true), 0x8001),
+            (.integer(bitWidth: 32, signed: false), 0x0100_0010),
+            (.integer(bitWidth: 64, signed: false), 0x8000_0000_0000_0001),
+        ]
+        for item in cases {
+            guard case let .integer(width, signed) = item.type else { continue }
+            let source = try VM.Integer(
+                rawBits: item.raw,
+                bitWidth: width,
+                isSigned: signed
+            )
+            let fixture = try image(sourceType: item.type, includeSignum: signed)
+
+            func integer(raw: UInt64, signed resultSigned: Bool) throws -> VM.Value {
+                .integer(
+                    try .init(
+                        rawBits: raw,
+                        bitWidth: width,
+                        isSigned: resultSigned
+                    )
+                )
+            }
+
+            let magnitude = signed && source.signedValue < 0
+                ? (0 &- source.rawBits) & VM.Integer.mask(for: width)
+                : source.rawBits
+            let byteSwapped: UInt64 = switch width {
+            case 8: source.rawBits
+            case 16: UInt64(UInt16(truncatingIfNeeded: source.rawBits).byteSwapped)
+            case 32: UInt64(UInt32(truncatingIfNeeded: source.rawBits).byteSwapped)
+            default: source.rawBits.byteSwapped
+            }
+            var expected: [VM.Value] = [
+                try integer(raw: magnitude, signed: false),
+                try integer(raw: UInt64(source.rawBits.nonzeroBitCount), signed: signed),
+                try integer(
+                    raw: UInt64(source.rawBits.leadingZeroBitCount - (64 - Int(width))),
+                    signed: signed
+                ),
+                try integer(
+                    raw: UInt64(min(source.rawBits.trailingZeroBitCount, Int(width))),
+                    signed: signed
+                ),
+                try integer(raw: byteSwapped, signed: signed),
+            ]
+            if signed {
+                expected.append(
+                    try integer(
+                        raw: UInt64(bitPattern: source.signedValue < 0 ? -1 : 1),
+                        signed: true
+                    )
+                )
+            }
+            #expect(
+                VM.Interpreter().invoke(
+                    entry: .init(rawValue: 0),
+                    image: fixture,
+                    arguments: [.integer(source)]
+                ) == .returned(.tuple(expected))
+            )
+
+            let zero = try VM.Integer(rawBits: 0, bitWidth: width, isSigned: signed)
+            guard case let .returned(.some(.tuple(zeroValues))) = VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: fixture,
+                arguments: [.integer(zero)]
+            ) else {
+                Issue.record("integer unary zero case did not return a tuple")
+                continue
+            }
+            #expect(zeroValues[2] == (try integer(raw: UInt64(width), signed: signed)))
+            #expect(zeroValues[3] == (try integer(raw: UInt64(width), signed: signed)))
+        }
+    }
+
+    @Test("Checked division reports exceptional arithmetic without trapping")
+    func checkedDivisionReportsExceptionalArithmetic() throws {
+        func image(
+            type: Bytecode.ValueType,
+            operation: Bytecode.BinaryOperation
+        ) throws -> Verification.Image {
+            let tuple = Bytecode.ValueType.tuple([type, .bool])
+            return try makeVerified(
+                function: .init(
+                    id: .init(rawValue: 0),
+                    name: "reporting_\(operation.rawValue)",
+                    parameterRegisters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                    ],
+                    resultType: tuple,
+                    registerTypes: [type, type, type, .bool, tuple],
+                    entryBlock: .init(rawValue: 0),
+                    blocks: [
+                        .init(
+                            id: .init(rawValue: 0),
+                            parameters: [
+                                .init(rawValue: 0), .init(rawValue: 1),
+                            ],
+                            instructions: [
+                                .checkedBinary(
+                                    result: .init(rawValue: 2),
+                                    overflow: .init(rawValue: 3),
+                                    operation: operation,
+                                    lhs: .init(rawValue: 0),
+                                    rhs: .init(rawValue: 1)
+                                ),
+                                .makeTuple(
+                                    result: .init(rawValue: 4),
+                                    elements: [
+                                        .init(rawValue: 2),
+                                        .init(rawValue: 3),
+                                    ]
+                                ),
+                                .returnValue(.init(rawValue: 4)),
+                            ]
+                        ),
+                    ]
+                ),
+                signature: .init(
+                    parameters: [type.description, type.description],
+                    result: tuple.description
+                ),
+                parameterTypes: [type, type],
+                resultType: tuple,
+                capabilities: [.baselineV1]
+            )
+        }
+
+        let signed = Bytecode.ValueType.integer(bitWidth: 8, signed: true)
+        let signedCases: [(
+            Bytecode.BinaryOperation,
+            Int64,
+            Int64,
+            Int64,
+            Bool
+        )] = [
+            (.divide, 7, 0, 7, true),
+            (.remainder, 7, 0, 7, true),
+            (.divide, -128, -1, -128, true),
+            (.remainder, -128, -1, 0, true),
+            (.divide, 7, 3, 2, false),
+            (.remainder, 7, 3, 1, false),
+        ]
+        for (operation, lhs, rhs, partial, overflow) in signedCases {
+            let result = VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(type: signed, operation: operation),
+                arguments: [
+                    .integer(
+                        try .init(
+                            signed: lhs,
+                            bitWidth: 8,
+                            isSigned: true
+                        )
+                    ),
+                    .integer(
+                        try .init(
+                            signed: rhs,
+                            bitWidth: 8,
+                            isSigned: true
+                        )
+                    ),
+                ]
+            )
+            #expect(
+                result == .returned(
+                    .tuple([
+                        .integer(
+                            try .init(
+                                signed: partial,
+                                bitWidth: 8,
+                                isSigned: true
+                            )
+                        ),
+                        .bool(overflow),
+                    ])
+                )
+            )
+        }
+    }
+
     @Test("Seeded HLBC 1.0 conversions agree with Swift bit patterns")
     func conversionsMatchSwiftBitPatterns() throws {
         let int8 = Bytecode.ValueType.integer(bitWidth: 8, signed: true)
