@@ -3083,10 +3083,17 @@ public struct Lowerer: Sendable {
                     mangledName: "<higher-order closure>"
                 )
             }
-            let expectedClosureParameters: [Bytecode.ValueType] = plan.operation
-                == .reduce
-                ? [plan.callResultType, plan.inputType]
-                : [plan.inputType]
+            let expectedClosureParameters: [Bytecode.ValueType] = switch plan.operation {
+            case .reduce:
+                [plan.callResultType, plan.inputType]
+            case .minimumBy, .maximumBy:
+                [plan.inputType, plan.inputType]
+            case .map, .flatMap, .filter, .compactMap, .prefixWhile,
+                 .dropWhile, .forEach, .firstWhere, .lastWhere,
+                 .firstIndexWhere, .lastIndexWhere, .containsWhere,
+                 .allSatisfy:
+                [plan.inputType]
+            }
             guard closureSignature.parameters == expectedClosureParameters,
                   closureSignature.parameterConventions.count
                     == expectedClosureParameters.count,
@@ -3095,6 +3102,14 @@ public struct Lowerer: Sendable {
                 throw CanonicalSIL.LoweringError.callSignatureMismatch(
                     line: line,
                     mangledName: "<higher-order closure>"
+                )
+            }
+            if plan.operation.isComparatorSelection,
+               plan.inputType.requiresLinearOwnership,
+               closureSignature.parameterConventions != [.borrowed, .borrowed] {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<comparison closure>"
                 )
             }
 
@@ -3196,8 +3211,13 @@ public struct Lowerer: Sendable {
             } else {
                 builder = nil
             }
-            let accumulatorType: Bytecode.ValueType? = plan.operation == .reduce
-                ? plan.callResultType : nil
+            let accumulatorType: Bytecode.ValueType? = if plan.operation == .reduce {
+                plan.callResultType
+            } else if plan.operation.isComparatorSelection {
+                plan.inputType
+            } else {
+                nil
+            }
             let initialAccumulator: Bytecode.Register?
             if plan.operation == .reduce {
                 guard let initialToken = plan.initialToken
@@ -3226,9 +3246,19 @@ public struct Lowerer: Sendable {
             let some = try allocateSyntheticBlockID()
             let empty = try allocateSyntheticBlockID()
             let closureContinuation = try allocateSyntheticBlockID()
+            let seed = try plan.operation.isComparatorSelection
+                ? allocateSyntheticBlockID() : nil
+            let seedSome = try plan.operation.isComparatorSelection
+                ? allocateSyntheticBlockID() : nil
+            let seedEmpty = try plan.operation.isComparatorSelection
+                ? allocateSyntheticBlockID() : nil
             let loopAccumulator = try accumulatorType.map(allocate)
             let next = try allocate(type: .optional(plan.inputType))
             let element = try allocate(type: plan.inputType)
+            let seedNext = try plan.operation.isComparatorSelection
+                ? allocate(type: .optional(plan.inputType)) : nil
+            let seedElement = try plan.operation.isComparatorSelection
+                ? allocate(type: plan.inputType) : nil
             let directClosureResult = try isThrowing
                 || plan.closureResultType == .void
                 ? nil
@@ -3255,24 +3285,28 @@ public struct Lowerer: Sendable {
             let inputNeedsCleanup = plan.inputType.requiresLinearOwnership
                 && (inputConvention == .borrowed
                     || plan.operation.retainsInputAfterCall)
-            let accumulatorNeedsCleanup = plan.operation == .reduce
-                && plan.callResultType.requiresLinearOwnership
-                && closureSignature.parameterConventions[0] == .borrowed
+            let accumulatorNeedsCleanup = accumulatorType?
+                .requiresLinearOwnership == true
+                && (plan.operation.isComparatorSelection
+                    || closureSignature.parameterConventions[0] == .borrowed)
             let sourceCleanup: [IntermediateRepresentation.Instruction] =
                 borrowedSource?.temporaryOwner.map {
                     [.destroyValue($0)]
                 } ?? []
 
             let loopArguments = initialAccumulator.map { [$0] } ?? []
+            let initialTarget = seed ?? loop
             if isThrowing {
-                appendInstruction(.branch(target: loop, arguments: loopArguments))
+                appendInstruction(
+                    .branch(target: initialTarget, arguments: loopArguments)
+                )
             } else {
                 let mustSucceed = try allocate(type: .bool)
                 appendInstruction(.constantBool(result: mustSucceed, value: true))
                 appendInstruction(
                     .conditionalBranch(
                         condition: mustSucceed,
-                        trueTarget: loop,
+                        trueTarget: initialTarget,
                         trueArguments: loopArguments,
                         falseTarget: errorCleanup,
                         falseArguments: []
@@ -3280,6 +3314,43 @@ public struct Lowerer: Sendable {
                 )
             }
             finishCurrent()
+
+            if let seed, let seedSome, let seedEmpty,
+               let seedNext, let seedElement {
+                appendSyntheticBlock(
+                    id: seed,
+                    instructions: [
+                        .arrayNext(
+                            result: seedNext,
+                            array: source,
+                            indexSlot: indexSlot,
+                            direction: .forward
+                        ),
+                        .switchOptional(
+                            optional: seedNext,
+                            someTarget: seedSome,
+                            noneTarget: seedEmpty
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: seedSome,
+                    parameters: [seedElement],
+                    instructions: [
+                        .branch(target: loop, arguments: [seedElement]),
+                    ]
+                )
+                let result = try allocate(type: plan.callResultType)
+                appendSyntheticBlock(
+                    id: seedEmpty,
+                    instructions: [
+                        .makeOptionalNone(result: result),
+                        .destroyStack(indexSlot),
+                    ] + sourceCleanup + [
+                        .branch(target: normalTarget, arguments: [result]),
+                    ]
+                )
+            }
 
             appendSyntheticBlock(
                 id: loop,
@@ -3303,6 +3374,16 @@ public struct Lowerer: Sendable {
             if plan.operation == .reduce {
                 closureArguments = [
                     try requiredRegister(loopAccumulator, "loop accumulator"),
+                    closureInput,
+                ]
+            } else if plan.operation == .minimumBy {
+                closureArguments = [
+                    closureInput,
+                    try requiredRegister(loopAccumulator, "minimum candidate"),
+                ]
+            } else if plan.operation == .maximumBy {
+                closureArguments = [
+                    try requiredRegister(loopAccumulator, "maximum candidate"),
                     closureInput,
                 ]
             } else {
@@ -3789,6 +3870,44 @@ public struct Lowerer: Sendable {
                     id: continued,
                     instructions: [.branch(target: loop, arguments: [])]
                 )
+            case .minimumBy, .maximumBy:
+                let predicate = try requiredRegister(
+                    continuationResult,
+                    "comparison result"
+                )
+                let challengerWins = try allocateSyntheticBlockID()
+                let candidateWins = try allocateSyntheticBlockID()
+                let candidate = try requiredRegister(
+                    loopAccumulator,
+                    "comparison candidate"
+                )
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: [
+                        .conditionalBranch(
+                            condition: predicate,
+                            trueTarget: challengerWins,
+                            trueArguments: [],
+                            falseTarget: candidateWins,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: challengerWins,
+                    instructions: (plan.inputType.requiresLinearOwnership
+                        ? [.destroyValue(candidate)] : []) + [
+                        .branch(target: loop, arguments: [element]),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: candidateWins,
+                    instructions: (plan.inputType.requiresLinearOwnership
+                        ? [.destroyValue(element)] : []) + [
+                        .branch(target: loop, arguments: [candidate]),
+                    ]
+                )
             }
 
             let emptyInstructions: [IntermediateRepresentation.Instruction]
@@ -3840,6 +3959,20 @@ public struct Lowerer: Sendable {
                     .constantBool(
                         result: result,
                         value: plan.operation == .allSatisfy
+                    ),
+                    .destroyStack(indexSlot),
+                ] + sourceCleanup + [
+                    .branch(target: normalTarget, arguments: [result]),
+                ]
+            case .minimumBy, .maximumBy:
+                let result = try allocate(type: plan.callResultType)
+                emptyInstructions = [
+                    .makeOptionalSome(
+                        result: result,
+                        value: try requiredRegister(
+                            loopAccumulator,
+                            "final comparison candidate"
+                        )
                     ),
                     .destroyStack(indexSlot),
                 ] + sourceCleanup + [
@@ -15695,11 +15828,13 @@ public struct Lowerer: Sendable {
                 callResultType: accumulator
             )
         case .forEach, .firstWhere, .lastWhere, .firstIndexWhere,
-             .lastIndexWhere, .containsWhere, .allSatisfy:
+             .lastIndexWhere, .containsWhere, .allSatisfy,
+             .minimumBy, .maximumBy:
             let hasIndirectResult = operation == .firstWhere
                 || operation == .lastWhere
                 || operation == .firstIndexWhere
                 || operation == .lastIndexWhere
+                || operation.isComparatorSelection
             let expectedArgumentCount = hasIndirectResult ? 3 : 2
             guard genericTypes.count == 1,
                   arguments.count == expectedArgumentCount
@@ -15735,6 +15870,7 @@ public struct Lowerer: Sendable {
             case .firstWhere, .lastWhere: .optional(input)
             case .firstIndexWhere, .lastIndexWhere: .optional(.int64)
             case .containsWhere, .allSatisfy: .bool
+            case .minimumBy, .maximumBy: .optional(input)
             case .map, .flatMap, .filter, .compactMap, .prefixWhile,
                  .dropWhile, .reduce:
                 throw CanonicalSIL.LoweringError.malformedSIL(

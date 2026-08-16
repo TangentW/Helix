@@ -340,7 +340,8 @@ throwing paths. Mutable captures use the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
 boxes; common fully concrete Array-backed higher-order operations—including
 `flatMap`, short-circuiting prefix/drop predicates, and direction-preserving
-first/last searches—use verified closure CFGs and a linear builder, while
+first/last searches, including comparator-driven `min(by:)`/`max(by:)`—use
+verified closure CFGs; Array-producing variants use a linear builder, while
 supported Optional and Result payload transforms use the same selected-case
 plan. Multi-branch local initialization
 uses field-sensitive definite/possible state, so conditional replacement and

@@ -110,6 +110,10 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .higherOrder(.containsWhere)
         case "$sSTsE10allSatisfyyS2b7ElementQzKXEKF":
             self = .higherOrder(.allSatisfy)
+        case "$sSTsE3min2by7ElementQzSgSbAD_ADtKXE_tKF":
+            self = .higherOrder(.minimumBy)
+        case "$sSTsE3max2by7ElementQzSgSbAD_ADtKXE_tKF":
+            self = .higherOrder(.maximumBy)
         case "$sSq3mapyqd_0_Sgqd_0_xqd__YKXEqd__YKs5ErrorRd__Ri_d_0_r0_lF":
             self = .algebraic(.optional(.map))
         case "$sSq7flatMapyqd_0_SgABxqd__YKXEqd__YKs5ErrorRd__Ri_d_0_r0_lF":

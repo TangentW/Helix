@@ -89,6 +89,10 @@ Both workflows depend on stable, build-specific identities:
   upper bound, so both directions preserve Swift's predicate order without
   importing a collection iterator ABI. The VM rejects cursors outside the
   closed `0...count` boundary instead of treating corrupt state as exhaustion.
+  Comparator-driven `min(by:)`/`max(by:)` reuse the same traversal but carry
+  one owned candidate through the CFG. Their two borrowed inputs are ordered
+  exactly as Swift specifies, ties retain the earliest element, and both the
+  candidate and challenger are closed on a throwing edge.
 - A closure signature carries an ownership convention for every invocation
   parameter. The compiler preserves concrete Swift `@in_guaranteed` inputs as
   borrowed VM values, materializes copies only at owned boundaries, and the

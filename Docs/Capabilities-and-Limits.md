@@ -103,9 +103,11 @@ does not by itself certify a physical device or distribution channel.
   `compactMap`, `prefix(while:)`, Collection `drop(while:)`, `reduce`,
   `forEach`, `first(where:)`, `last(where:)`, zero-based Array-backed
   `firstIndex(where:)`/`lastIndex(where:)`, `contains(where:)`, and
-  `allSatisfy` use verified closure control flow and a linear, invocation-local
-  Array builder instead of repeated copy-on-write append. The `last` searches
-  invoke their predicates from the end, matching Swift's observable order.
+  `allSatisfy`, plus comparator-driven `min(by:)`/`max(by:)`, use verified
+  closure control flow; Array-producing variants use a linear,
+  invocation-local builder instead of repeated copy-on-write append. The
+  `last` searches invoke their predicates from the end; comparator selection
+  preserves Swift's argument order and first-element tie behavior.
   Sequence `prefix(while:)` is also supported when its concrete source has an
   Array-backed normalization. The lazy Sequence `drop(while:)` overload remains
   rejected: eagerly materializing it would change predicate side-effect timing.

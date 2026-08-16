@@ -16,6 +16,8 @@ enum HigherOrderIntrinsic: Equatable {
     case lastIndexWhere
     case containsWhere
     case allSatisfy
+    case minimumBy
+    case maximumBy
 
     var usesArrayBuilder: Bool {
         switch self {
@@ -23,7 +25,7 @@ enum HigherOrderIntrinsic: Equatable {
             true
         case .reduce, .forEach, .firstWhere, .lastWhere,
              .firstIndexWhere, .lastIndexWhere, .containsWhere,
-             .allSatisfy:
+             .allSatisfy, .minimumBy, .maximumBy:
             false
         }
     }
@@ -32,7 +34,8 @@ enum HigherOrderIntrinsic: Equatable {
     /// operation uses it again after the closure returns.
     var retainsInputAfterCall: Bool {
         switch self {
-        case .filter, .firstWhere, .lastWhere, .prefixWhile, .dropWhile:
+        case .filter, .firstWhere, .lastWhere, .prefixWhile, .dropWhile,
+             .minimumBy, .maximumBy:
             true
         case .map, .flatMap, .compactMap, .reduce, .forEach,
              .firstIndexWhere, .lastIndexWhere, .containsWhere,
@@ -47,9 +50,14 @@ enum HigherOrderIntrinsic: Equatable {
             .reverse
         case .map, .flatMap, .filter, .compactMap, .prefixWhile,
              .dropWhile, .reduce, .forEach, .firstWhere,
-             .firstIndexWhere, .containsWhere, .allSatisfy:
+             .firstIndexWhere, .containsWhere, .allSatisfy,
+             .minimumBy, .maximumBy:
             .forward
         }
+    }
+
+    var isComparatorSelection: Bool {
+        self == .minimumBy || self == .maximumBy
     }
 }
 }
