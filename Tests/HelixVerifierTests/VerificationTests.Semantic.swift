@@ -2246,6 +2246,56 @@ struct SemanticVerifier {
             policy: fixture.policy
         )
 
+        var batched = fixture.module
+        batched.functions[0].registerTypes.append(.array(.int64))
+        batched.functions[0].blocks[0].instructions.insert(
+            .makeArray(
+                result: .init(rawValue: 3),
+                elements: [.init(rawValue: 0)]
+            ),
+            at: 0
+        )
+        batched.functions[0].blocks[0].instructions.insert(
+            .arrayBuilderAppendContents(
+                builder: .init(rawValue: 1),
+                array: .init(rawValue: 3)
+            ),
+            at: 3
+        )
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(batched),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var mismatchedBatch = fixture.module
+        mismatchedBatch.functions[0].registerTypes.append(.array(.bool))
+        mismatchedBatch.functions[0].blocks[0].instructions.insert(
+            .makeArray(result: .init(rawValue: 3), elements: []),
+            at: 0
+        )
+        mismatchedBatch.functions[0].blocks[0].instructions.insert(
+            .arrayBuilderAppendContents(
+                builder: .init(rawValue: 1),
+                array: .init(rawValue: 3)
+            ),
+            at: 2
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "array_builder_append_contents requires a matching copyable Array"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(mismatchedBatch),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
         var copied = fixture.module
         copied.functions[0].registerTypes.append(builderType)
         copied.functions[0].blocks[0].instructions.insert(

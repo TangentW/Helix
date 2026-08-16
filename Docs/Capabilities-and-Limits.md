@@ -87,10 +87,15 @@ does not by itself certify a physical device or distribution channel.
   and Set elements use the same recursively VM-defined value family as their
   Hashable domain. User-defined `Hashable` or equality witnesses remain
   fail-closed because downloaded code cannot invoke arbitrary hashing or
-  equality. Fully concrete Array-backed `map`, `filter`, `compactMap`,
-  `reduce`, `forEach`, `first(where:)`, `contains(where:)`, and `allSatisfy`
-  use verified closure control flow and a linear, invocation-local Array
-  builder instead of repeated copy-on-write append. Common Array-backed
+  equality. Fully concrete Array-backed `map`, `flatMap`, `filter`,
+  `compactMap`, `prefix(while:)`, Collection `drop(while:)`, `reduce`,
+  `forEach`, `first(where:)`, zero-based Array-backed `firstIndex(where:)`,
+  `contains(where:)`, and `allSatisfy` use verified closure control flow and a linear,
+  invocation-local Array builder instead of repeated copy-on-write append.
+  Sequence `prefix(while:)` is also supported when its concrete source has an
+  Array-backed normalization. The lazy Sequence `drop(while:)` overload remains
+  rejected: eagerly materializing it would change predicate side-effect timing.
+  Common Array-backed
   adapter paths also support `enumerated()`, `reversed()`, `repeatElement`,
   `Array(repeating:count:)`, count-based `dropFirst`/`dropLast`/`prefix`/
   `suffix`, concrete Array index prefixes/suffixes, `Range<Int>` slicing,

@@ -80,6 +80,10 @@ Both workflows depend on stable, build-specific identities:
   pre-allocation accounting. Only element-sequence semantics are normalized;
   an ArraySlice's non-zero-based index identity is not erased into an Array
   index, so unsupported slice-index APIs still fail closed.
+- Array-producing closure traversals use one invocation-local linear builder.
+  Scalar appends and bounded whole-Array appends share the same verifier-owned
+  element type and precharge copied storage before allocation; this supports
+  Sequence-returning `flatMap` without an intermediate nested Array.
 - A closure signature carries an ownership convention for every invocation
   parameter. The compiler preserves concrete Swift `@in_guaranteed` inputs as
   borrowed VM values, materializes copies only at owned boundaries, and the

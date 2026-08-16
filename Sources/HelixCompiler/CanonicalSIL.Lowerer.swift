@@ -2666,16 +2666,8 @@ public struct Lowerer: Sendable {
                 .storeStack(slot: indexSlot, source: zero, mode: .initialize)
             )
 
-            let usesArrayBuilder: Bool
-            switch plan.operation {
-            case .map, .filter, .compactMap:
-                usesArrayBuilder = true
-            case .reduce, .forEach, .firstWhere, .containsWhere,
-                 .allSatisfy:
-                usesArrayBuilder = false
-            }
             let builder: Bytecode.Register?
-            if usesArrayBuilder {
+            if plan.operation.usesArrayBuilder {
                 guard case let .array(element) = plan.callResultType else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "higher-order Array builder has a non-Array result"
@@ -2728,15 +2720,13 @@ public struct Lowerer: Sendable {
             let inputConvention = closureSignature.parameterConventions[
                 plan.operation == .reduce ? 1 : 0
             ]
-            let retainsInputAfterCall = plan.operation == .filter
-                || plan.operation == .firstWhere
             let closureInput: Bytecode.Register
             var closureArgumentPreparation: [
                 IntermediateRepresentation.Instruction
             ] = []
             if plan.inputType.requiresLinearOwnership,
                inputConvention == .owned,
-               retainsInputAfterCall {
+               plan.operation.retainsInputAfterCall {
                 let copy = try allocate(type: plan.inputType)
                 closureArgumentPreparation.append(
                     .copyValue(result: copy, source: element)
@@ -2746,7 +2736,8 @@ public struct Lowerer: Sendable {
                 closureInput = element
             }
             let inputNeedsCleanup = plan.inputType.requiresLinearOwnership
-                && (inputConvention == .borrowed || retainsInputAfterCall)
+                && (inputConvention == .borrowed
+                    || plan.operation.retainsInputAfterCall)
             let accumulatorNeedsCleanup = plan.operation == .reduce
                 && plan.callResultType.requiresLinearOwnership
                 && closureSignature.parameterConventions[0] == .borrowed
@@ -2882,6 +2873,30 @@ public struct Lowerer: Sendable {
                     parameters: continuationParameters,
                     instructions: instructions
                 )
+            case .flatMap:
+                let result = try requiredRegister(
+                    continuationResult,
+                    "flatMap sequence result"
+                )
+                var instructions: [IntermediateRepresentation.Instruction] = [
+                    .arrayBuilderAppendContents(
+                        builder: try requiredRegister(
+                            builder,
+                            "Array builder"
+                        ),
+                        array: result
+                    ),
+                ]
+                if plan.closureResultType.requiresLinearOwnership {
+                    instructions.append(.destroyValue(result))
+                }
+                instructions.append(contentsOf: closureArgumentCleanup)
+                instructions.append(.branch(target: loop, arguments: []))
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: instructions
+                )
             case .filter:
                 let predicate = try requiredRegister(
                     continuationResult,
@@ -2968,6 +2983,114 @@ public struct Lowerer: Sendable {
                         .branch(target: loop, arguments: []),
                     ]
                 )
+            case .prefixWhile:
+                let predicate = try requiredRegister(
+                    continuationResult,
+                    "prefix(while:) predicate"
+                )
+                let builder = try requiredRegister(builder, "Array builder")
+                let append = try allocateSyntheticBlockID()
+                let finish = try allocateSyntheticBlockID()
+                let result = try allocate(type: plan.callResultType)
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: [
+                        .conditionalBranch(
+                            condition: predicate,
+                            trueTarget: append,
+                            trueArguments: [],
+                            falseTarget: finish,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: append,
+                    instructions: [
+                        .arrayBuilderAppend(builder: builder, value: element),
+                    ] + closureArgumentCleanup + [
+                        .branch(target: loop, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: finish,
+                    instructions: closureArgumentCleanup + [
+                        .finishArrayBuilder(result: result, builder: builder),
+                        .destroyStack(indexSlot),
+                    ] + sourceCleanup + [
+                        .branch(target: normalTarget, arguments: [result]),
+                    ]
+                )
+            case .dropWhile:
+                let predicate = try requiredRegister(
+                    continuationResult,
+                    "drop(while:) predicate"
+                )
+                let builder = try requiredRegister(builder, "Array builder")
+                let keepDropping = try allocateSyntheticBlockID()
+                let appendRemainder = try allocateSyntheticBlockID()
+                let remainderLoop = try allocateSyntheticBlockID()
+                let remainderSome = try allocateSyntheticBlockID()
+                let remainderNext = try allocate(
+                    type: .optional(plan.inputType)
+                )
+                let remainderElement = try allocate(type: plan.inputType)
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: [
+                        .conditionalBranch(
+                            condition: predicate,
+                            trueTarget: keepDropping,
+                            trueArguments: [],
+                            falseTarget: appendRemainder,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: keepDropping,
+                    instructions: closureArgumentCleanup + [
+                        .branch(target: loop, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: appendRemainder,
+                    instructions: [
+                        .arrayBuilderAppend(builder: builder, value: element),
+                    ] + closureArgumentCleanup + [
+                        .branch(target: remainderLoop, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: remainderLoop,
+                    instructions: [
+                        .arrayNext(
+                            result: remainderNext,
+                            array: source,
+                            indexSlot: indexSlot
+                        ),
+                        .switchOptional(
+                            optional: remainderNext,
+                            someTarget: remainderSome,
+                            noneTarget: empty
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: remainderSome,
+                    parameters: [remainderElement],
+                    instructions: [
+                        .arrayBuilderAppend(
+                            builder: builder,
+                            value: remainderElement
+                        ),
+                    ] + (plan.inputType.requiresLinearOwnership
+                        ? [.destroyValue(remainderElement)] : []) + [
+                        .branch(target: remainderLoop, arguments: []),
+                    ]
+                )
             case .reduce:
                 let result = try requiredRegister(
                     materializedContinuationResult,
@@ -3026,6 +3149,80 @@ public struct Lowerer: Sendable {
                         ? [.destroyValue(element)] : [])
                         + [.branch(target: loop, arguments: [])]
                 )
+            case .firstIndexWhere:
+                let predicate = try requiredRegister(
+                    continuationResult,
+                    "firstIndex(where:) predicate"
+                )
+                let matched = try allocateSyntheticBlockID()
+                let wrap = try allocateSyntheticBlockID()
+                let overflowTrap = try allocateSyntheticBlockID()
+                let skipped = try allocateSyntheticBlockID()
+                let advancedIndex = try allocate(type: .int64)
+                let one = try allocate(type: .int64)
+                let matchedIndex = try allocate(type: .int64)
+                let overflow = try allocate(type: .bool)
+                let result = try allocate(type: plan.callResultType)
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: [
+                        .conditionalBranch(
+                            condition: predicate,
+                            trueTarget: matched,
+                            trueArguments: [],
+                            falseTarget: skipped,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: matched,
+                    instructions: closureArgumentCleanup + [
+                        .loadStack(
+                            result: advancedIndex,
+                            slot: indexSlot,
+                            mode: .copy
+                        ),
+                        .constantInteger(result: one, bitPattern: 1),
+                        .checkedBinary(
+                            result: matchedIndex,
+                            overflow: overflow,
+                            operation: .subtract,
+                            lhs: advancedIndex,
+                            rhs: one
+                        ),
+                        .conditionalBranch(
+                            condition: overflow,
+                            trueTarget: overflowTrap,
+                            trueArguments: [],
+                            falseTarget: wrap,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: wrap,
+                    instructions: [
+                        .makeOptionalSome(
+                            result: result,
+                            value: matchedIndex
+                        ),
+                        .destroyStack(indexSlot),
+                    ] + sourceCleanup + [
+                        .branch(target: normalTarget, arguments: [result]),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: overflowTrap,
+                    instructions: [.trap(.integerOverflow)]
+                )
+                appendSyntheticBlock(
+                    id: skipped,
+                    instructions: closureArgumentCleanup + [
+                        .branch(target: loop, arguments: []),
+                    ]
+                )
             case .containsWhere, .allSatisfy:
                 let predicate = try requiredRegister(
                     continuationResult,
@@ -3068,7 +3265,8 @@ public struct Lowerer: Sendable {
 
             let emptyInstructions: [IntermediateRepresentation.Instruction]
             switch plan.operation {
-            case .map, .filter, .compactMap:
+            case .map, .flatMap, .filter, .compactMap, .prefixWhile,
+                 .dropWhile:
                 let result = try allocate(type: plan.callResultType)
                 emptyInstructions = [
                     .finishArrayBuilder(
@@ -3099,7 +3297,7 @@ public struct Lowerer: Sendable {
                 ] + sourceCleanup + [
                     .branch(target: normalTarget, arguments: []),
                 ]
-            case .firstWhere:
+            case .firstWhere, .firstIndexWhere:
                 let result = try allocate(type: plan.callResultType)
                 emptyInstructions = [
                     .makeOptionalNone(result: result),
@@ -14659,9 +14857,9 @@ public struct Lowerer: Sendable {
         argumentText: String,
         line: Int
     ) throws -> ArrayHigherOrderPlan {
-        let genericTypes = try splitTopLevel(genericArguments)
+        let genericSpellings = splitTopLevel(genericArguments)
             .filter { !$0.isEmpty }
-            .map(parseType)
+        let genericTypes = try genericSpellings.map(parseType)
         let arguments = try parseApplyValueTokens(argumentText, line: line)
 
         func arrayElement(
@@ -14691,6 +14889,25 @@ public struct Lowerer: Sendable {
                 initialToken: nil,
                 resultDestination: nil,
                 errorDestination: arguments[0],
+                inputType: input,
+                closureResultType: genericTypes[1],
+                callResultType: .array(mapped)
+            )
+        case .flatMap:
+            guard genericTypes.count == 2, arguments.count == 2 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Sequence.flatMap has an unsupported specialization"
+                )
+            }
+            let input = try arrayElement(genericTypes[0])
+            let mapped = try arrayElement(genericTypes[1])
+            return .init(
+                operation: operation,
+                sourceToken: arguments[1],
+                closureToken: arguments[0],
+                initialToken: nil,
+                resultDestination: nil,
+                errorDestination: nil,
                 inputType: input,
                 closureResultType: genericTypes[1],
                 callResultType: .array(mapped)
@@ -14732,6 +14949,29 @@ public struct Lowerer: Sendable {
                 closureResultType: .optional(mapped),
                 callResultType: .array(mapped)
             )
+        case .prefixWhile, .dropWhile:
+            let supportsDirectResult = operation == .prefixWhile
+            guard genericTypes.count == 1,
+                  arguments.count == 3
+                    || supportsDirectResult && arguments.count == 2
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "prefix/drop(while:) has an unsupported specialization"
+                )
+            }
+            let input = try arrayElement(genericTypes[0])
+            let hasIndirectResult = arguments.count == 3
+            return .init(
+                operation: operation,
+                sourceToken: arguments[arguments.count - 1],
+                closureToken: arguments[arguments.count - 2],
+                initialToken: nil,
+                resultDestination: hasIndirectResult ? arguments[0] : nil,
+                errorDestination: nil,
+                inputType: input,
+                closureResultType: .bool,
+                callResultType: .array(input)
+            )
         case .reduce:
             guard genericTypes.count == 2, arguments.count == 4 else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
@@ -14751,8 +14991,10 @@ public struct Lowerer: Sendable {
                 closureResultType: genericTypes[1],
                 callResultType: accumulator
             )
-        case .forEach, .firstWhere, .containsWhere, .allSatisfy:
+        case .forEach, .firstWhere, .firstIndexWhere, .containsWhere,
+             .allSatisfy:
             let hasIndirectResult = operation == .firstWhere
+                || operation == .firstIndexWhere
             let expectedArgumentCount = hasIndirectResult ? 3 : 2
             guard genericTypes.count == 1,
                   arguments.count == expectedArgumentCount
@@ -14762,13 +15004,31 @@ public struct Lowerer: Sendable {
                 )
             }
             let input = try arrayElement(genericTypes[0])
+            if operation == .firstIndexWhere {
+                switch typeEnvironment.collectionIndexModel(
+                    for: genericSpellings[0]
+                ) {
+                case .zeroBasedInteger:
+                    break
+                case .preservedBaseInteger:
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "firstIndex(where:) requires preserved slice indices"
+                    )
+                case .opaque:
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "firstIndex(where:) requires a represented collection index"
+                    )
+                }
+            }
             let closureResult: Bytecode.ValueType = operation == .forEach
                 ? .void : .bool
             let callResult: Bytecode.ValueType = switch operation {
             case .forEach: .void
             case .firstWhere: .optional(input)
+            case .firstIndexWhere: .optional(.int64)
             case .containsWhere, .allSatisfy: .bool
-            case .map, .filter, .compactMap, .reduce:
+            case .map, .flatMap, .filter, .compactMap, .prefixWhile,
+                 .dropWhile, .reduce:
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "predicate operation dispatch is inconsistent"
                 )

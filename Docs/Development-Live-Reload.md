@@ -338,7 +338,8 @@ closures and already indexed same-image helpers may use synchronous `@escaping`
 parameters, internal closure returns, nested closure captures, and synchronous
 throwing paths. Mutable captures use the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
-boxes; common fully concrete Array-backed higher-order operations use verified
+boxes; common fully concrete Array-backed higher-order operations—including
+`flatMap` and short-circuiting prefix/drop/search predicates—use verified
 closure CFGs and a linear builder, while supported Optional and Result payload
 transforms use the same selected-case plan. Multi-branch local initialization
 uses field-sensitive definite/possible state, so conditional replacement and

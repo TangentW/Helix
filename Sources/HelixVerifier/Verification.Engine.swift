@@ -2395,6 +2395,16 @@ public struct Engine: Verification.ImageVerifying {
                     "array_builder_append requires a matching copyable element"
                 )
             }
+        case let .arrayBuilderAppendContents(builder, array):
+            guard capabilities.contains(.collectionsV1),
+                  case let .arrayBuilder(element) = type(builder),
+                  type(array) == .array(element),
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_builder_append_contents requires a matching copyable Array"
+                )
+            }
         case let .finishArrayBuilder(result, builder):
             guard capabilities.contains(.collectionsV1),
                   case let .arrayBuilder(element) = type(builder),
@@ -3302,7 +3312,7 @@ public struct Engine: Verification.ImageVerifying {
                     break
                 case let .makeArrayBuilder(result):
                     live.insert(result)
-                case .arrayBuilderAppend:
+                case .arrayBuilderAppend, .arrayBuilderAppendContents:
                     break
                 case let .finishArrayBuilder(result, builder):
                     guard live.remove(builder) != nil else {

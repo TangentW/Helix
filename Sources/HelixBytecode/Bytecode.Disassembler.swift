@@ -263,6 +263,8 @@ public enum Disassembler {
             "\(result) = make_array_builder"
         case let .arrayBuilderAppend(builder, value):
             "array_builder_append \(value) to \(builder)"
+        case let .arrayBuilderAppendContents(builder, array):
+            "array_builder_append_contents \(array) to \(builder)"
         case let .finishArrayBuilder(result, builder):
             "\(result) = finish_array_builder \(builder)"
         case let .arrayUpdate(result, array, index, value):

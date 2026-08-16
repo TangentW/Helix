@@ -83,16 +83,25 @@ enum SwiftCoreIntrinsic: Equatable {
         switch mangledName {
         case "$sSlsE3mapySayqd__Gqd__7ElementQzqd_0_YKXEqd_0_YKs5ErrorRd_0_r0_lF":
             self = .higherOrder(.map)
+        case "$sSTsE7flatMapySay7ElementQyd__Gqd__ABQzKXEKSTRd__lF":
+            self = .higherOrder(.flatMap)
         case "$ss14_ArrayProtocolPsE6filterySay7ElementQzGSbAEKXEKF":
             self = .higherOrder(.filter)
         case "$sSTsE10compactMapySayqd__Gqd__Sg7ElementQzKXEKlF":
             self = .higherOrder(.compactMap)
+        case "$sSlsE6prefix5while11SubSequenceQzSb7ElementQzKXE_tKF",
+             "$sSTsE6prefix5whileSay7ElementQzGSbADKXE_tKF":
+            self = .higherOrder(.prefixWhile)
+        case "$sSlsE4drop5while11SubSequenceQzSb7ElementQzKXE_tKF":
+            self = .higherOrder(.dropWhile)
         case "$sSTsE6reduceyqd__qd___qd__qd___7ElementQztKXEtKlF":
             self = .higherOrder(.reduce)
         case "$sSTsE7forEachyyy7ElementQzKXEKF":
             self = .higherOrder(.forEach)
         case "$sSTsE5first5where7ElementQzSgSbADKXE_tKF":
             self = .higherOrder(.firstWhere)
+        case "$sSlsE10firstIndex5where0B0QzSgSb7ElementQzKXE_tKF":
+            self = .higherOrder(.firstIndexWhere)
         case "$sSTsE8contains5whereS2b7ElementQzKXE_tKF":
             self = .higherOrder(.containsWhere)
         case "$sSTsE10allSatisfyyS2b7ElementQzKXEKF":

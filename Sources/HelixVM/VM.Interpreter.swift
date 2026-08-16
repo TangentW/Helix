@@ -2093,6 +2093,38 @@ public struct Interpreter: Sendable {
                     try prepareCopy(sourceElement, budget: budget)
                     try builder.append(copy(sourceElement))
                     try budget.checkDeadline()
+                case let .arrayBuilderAppendContents(builderRegister, array):
+                    let builderValue = try read(
+                        builderRegister,
+                        registers: registers
+                    )
+                    guard case let .arrayBuilder(builder) = builderValue else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: builderRegister)
+                                ?? .never,
+                            actual: builderValue.type
+                        )
+                    }
+                    let (elements, elementType) = try self.array(
+                        array,
+                        registers: registers
+                    )
+                    guard builder.elementType == elementType else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: builder.elementType,
+                            actual: elementType
+                        )
+                    }
+                    try budget.consumeLinearWork(elementCount: elements.count)
+                    try budget.consumeAggregateElementStorage(
+                        elementCount: elements.count
+                    )
+                    for element in elements {
+                        try prepareCopy(element, budget: budget)
+                    }
+                    let copied = try elements.map(copy)
+                    try builder.append(contentsOf: copied)
+                    try budget.checkDeadline()
                 case let .finishArrayBuilder(result, builderRegister):
                     guard case let .arrayBuilder(element) = function.type(
                         of: builderRegister

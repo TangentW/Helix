@@ -32,6 +32,21 @@ public final class ArrayBuilder: @unchecked Sendable, Hashable,
         }
     }
 
+    func append(contentsOf values: [VM.Value]) throws {
+        try lock.withLock {
+            guard !isFinished else {
+                throw VM.RuntimeTrap.explicit("Array builder is already finished")
+            }
+            if let mismatched = values.first(where: { $0.type != elementType }) {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: elementType,
+                    actual: mismatched.type
+                )
+            }
+            elements.append(contentsOf: values)
+        }
+    }
+
     func finish() throws -> [VM.Value] {
         try lock.withLock {
             guard !isFinished else {

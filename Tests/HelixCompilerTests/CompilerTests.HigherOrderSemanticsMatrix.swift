@@ -1248,12 +1248,24 @@ struct HigherOrderSemanticsMatrix {
             values.map { $0 }
         }
 
+        public func flatMappedObjects(_ values: [NSObject]) -> [NSObject] {
+            values.flatMap { [$0] }
+        }
+
         public func filteredObjects(_ values: [NSObject]) -> [NSObject] {
             values.filter { _ in true }
         }
 
         public func compactedObjects(_ values: [NSObject?]) -> [NSObject] {
             values.compactMap { $0 }
+        }
+
+        public func prefixedObjects(_ values: [NSObject]) -> [NSObject] {
+            Array(values.prefix { _ in true })
+        }
+
+        public func droppedObjects(_ values: [NSObject]) -> [NSObject] {
+            Array(values.drop { _ in false })
         }
 
         public func reducedObject(
@@ -1265,6 +1277,10 @@ struct HigherOrderSemanticsMatrix {
 
         public func firstObject(_ values: [NSObject]) -> NSObject? {
             values.first { _ in true }
+        }
+
+        public func firstObjectIndex(_ values: [NSObject]) -> Int? {
+            values.firstIndex { _ in true }
         }
 
         public func containsObject(_ values: [NSObject]) -> Bool {
@@ -1337,8 +1353,10 @@ struct HigherOrderSemanticsMatrix {
             seed: "fixture"
         )
         let names = [
-            "mappedObjects", "filteredObjects", "compactedObjects",
-            "reducedObject", "firstObject", "containsObject",
+            "mappedObjects", "flatMappedObjects", "filteredObjects",
+            "compactedObjects", "prefixedObjects", "droppedObjects",
+            "reducedObject", "firstObject", "firstObjectIndex",
+            "containsObject",
             "visitsObjects", "optionalMappedObject",
             "optionalFlatMappedObject",
             "optionalThrowingFlatMappedObject",

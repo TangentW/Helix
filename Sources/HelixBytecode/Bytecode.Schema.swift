@@ -681,6 +681,10 @@ public enum Instruction: Codable, Hashable, Sendable {
         builder: Bytecode.Register,
         value: Bytecode.Register
     )
+    case arrayBuilderAppendContents(
+        builder: Bytecode.Register,
+        array: Bytecode.Register
+    )
     case finishArrayBuilder(
         result: Bytecode.Register,
         builder: Bytecode.Register
@@ -970,6 +974,7 @@ public enum Instruction: Codable, Hashable, Sendable {
         case .destroyValue, .switchEnum, .storeStack, .destroyStack,
              .destroyStackIfInitialized,
              .storeMutableCell, .arrayBuilderAppend,
+             .arrayBuilderAppendContents,
              .hostedSuperApply, .endAccess,
              .storeAddress, .switchOptional, .branch,
              .conditionalBranch, .closureTryApply, .tryApply,
@@ -1104,6 +1109,8 @@ public enum Instruction: Codable, Hashable, Sendable {
             []
         case let .arrayBuilderAppend(builder, value):
             [builder, value]
+        case let .arrayBuilderAppendContents(builder, array):
+            [builder, array]
         case let .finishArrayBuilder(_, builder):
             [builder]
         case let .arrayUpdate(_, array, index, value):

@@ -2912,6 +2912,126 @@ struct Interpreter {
         #expect(throws: VM.RuntimeTrap.self) {
             _ = try directBuilder.finish()
         }
+
+        let batchedBuilder = VM.ArrayBuilder(elementType: .int64)
+        try batchedBuilder.append(contentsOf: [value, value])
+        #expect(try batchedBuilder.finish() == [value, value])
+        #expect(throws: VM.RuntimeTrap.self) {
+            try batchedBuilder.append(contentsOf: [value])
+        }
+
+        let atomicBuilder = VM.ArrayBuilder(elementType: .int64)
+        #expect(
+            throws: VM.RuntimeTrap.typeMismatch(
+                expected: .int64,
+                actual: .bool
+            )
+        ) {
+            try atomicBuilder.append(contentsOf: [value, .bool(true)])
+        }
+        try atomicBuilder.append(contentsOf: [value])
+        #expect(try atomicBuilder.finish() == [value])
+    }
+
+    @Test("Array builders append Array contents with bounded copied storage")
+    func executesArrayBuilderBatchAppend() throws {
+        let sourceType = Bytecode.ValueType.array(.int64)
+        let builderType = Bytecode.ValueType.arrayBuilder(.int64)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "batchArrayBuilder",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: sourceType,
+            registerTypes: [sourceType, builderType, sourceType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeArrayBuilder(result: .init(rawValue: 1)),
+                        .arrayBuilderAppendContents(
+                            builder: .init(rawValue: 1),
+                            array: .init(rawValue: 0)
+                        ),
+                        .finishArrayBuilder(
+                            result: .init(rawValue: 2),
+                            builder: .init(rawValue: 1)
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .collectionsV1],
+            signature: .init(
+                parameters: ["Swift.Array<Swift.Int>"],
+                result: "Swift.Array<Swift.Int>"
+            ),
+            parameterTypes: [sourceType],
+            resultType: sourceType
+        )
+        let first = VM.Value.integer(
+            try .init(signed: 3, bitWidth: 64, isSigned: true)
+        )
+        let second = VM.Value.integer(
+            try .init(signed: 5, bitWidth: 64, isSigned: true)
+        )
+        let source = VM.Value.array([first, second], elementType: .int64)
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [source]
+            ) == .returned(source)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.array([], elementType: .int64)]
+            ) == .returned(.array([], elementType: .int64))
+        )
+
+        let boundaryBytes = UInt64(3 * 16)
+        let frameBytes = UInt64(
+            function.registerTypes.count * MemoryLayout<VM.Value?>.stride
+        )
+        let builderHeaderBytes: UInt64 = 16
+        let copiedElementBytes = UInt64(2 * 16)
+        let exactHeapBytes = boundaryBytes + frameBytes + builderHeaderBytes
+            + copiedElementBytes
+        let exactBudget = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: exactHeapBytes,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [source],
+                budget: exactBudget
+            ) == .returned(source)
+        )
+        let insufficientBudget = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: exactHeapBytes - 1,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [source],
+                budget: insufficientBudget
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
     }
 
     @Test("Mutable capture projections update their enclosing local value")

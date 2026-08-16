@@ -5,6 +5,12 @@ import HelixInterface
 
 extension CanonicalSIL {
 public struct TypeEnvironment: Sendable {
+    enum CollectionIndexModel: Sendable {
+        case zeroBasedInteger
+        case preservedBaseInteger
+        case opaque
+    }
+
     indirect enum StructFieldPlan: Sendable {
         case parameter(index: Int, type: Bytecode.ValueType)
         case tuple(
@@ -434,6 +440,34 @@ public struct TypeEnvironment: Sendable {
 
     func resolve(_ raw: String) throws -> Bytecode.ValueType {
         try resolve(raw, relativeTo: nil)
+    }
+
+    /// Array-backed normalization can preserve element order without always
+    /// preserving a Collection's public index identity.
+    func collectionIndexModel(for raw: String) -> CollectionIndexModel {
+        var type = raw.trimmingCharacters(in: .whitespaces)
+        var removedPrefix = true
+        while removedPrefix {
+            removedPrefix = false
+            for prefix in [
+                "$", "@owned ", "@guaranteed ", "@unowned ",
+                "@autoreleased ", "@in ", "@in_guaranteed ",
+            ] where type.hasPrefix(prefix) {
+                type.removeFirst(prefix.count)
+                type = type.trimmingCharacters(in: .whitespaces)
+                removedPrefix = true
+                break
+            }
+        }
+        if ["Array<", "Swift.Array<", "Repeated<", "Swift.Repeated<"]
+            .contains(where: type.hasPrefix) {
+            return .zeroBasedInteger
+        }
+        if ["ArraySlice<", "Swift.ArraySlice<"]
+            .contains(where: type.hasPrefix) {
+            return .preservedBaseInteger
+        }
+        return .opaque
     }
 
     private func resolve(
