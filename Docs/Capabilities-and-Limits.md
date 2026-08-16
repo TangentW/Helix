@@ -62,19 +62,30 @@ does not by itself certify a physical device or distribution channel.
 - Tuple, `Void`, and `Optional`, including the ordinary control flow produced by
   `if let`, `guard let`, `??`, and `try?`, including address-based Optional
   projection emitted by semantic Dictionary lookup SIL.
-- Array value semantics, append, `first`/`last`, `popLast`, iteration, checked
-  subscript access, and value-returning updates; Dictionary construction,
-  lookup, update, `removeValue(forKey:)`, and iteration for supported key and
-  value types. Set supports empty, literal, Array, and Set construction;
+- Array value semantics and equality, append, `first`/`last`,
+  `firstIndex(of:)`/`lastIndex(of:)`, `min`/`max`, `elementsEqual`,
+  `starts(with:)`, `lexicographicallyPrecedes`, `startIndex`/`endIndex`,
+  `distance(from:to:)`, index movement and limited offsets, `indices`,
+  `popLast`, iteration, checked subscript access, and value-returning updates.
+  Dictionary construction, equality, lookup, update, `removeValue(forKey:)`,
+  and iteration are supported for
+  eligible key and value types. Equality is defined recursively for Bool,
+  fixed-width integers, floating-point values, String, and supported Optional,
+  Array, Dictionary, and Set values. Dictionary and Set comparison is
+  order-independent, collection equality preserves Swift's shared-storage fast
+  path, and Float/Double preserve Swift NaN and signed-zero behavior.
+  Collection ordering operations remain
+  limited to the scalar integer, floating-point, and String types that the VM
+  can compare without executing a user witness. Set supports empty, literal,
+  Array, and Set construction;
   `count`, `isEmpty`, `first`, `contains`, `insert`, `update`, `remove`,
   `popFirst`, `removeFirst`, `removeAll`, the capacity hint, iteration, the
   union/intersection/subtraction/symmetric-difference families, and the common
   equality/subset/superset/disjoint relations. Set order is deliberately not
   observable through equality; HLVM keeps deterministic iteration within one
   value only so execution and diagnostics remain reproducible. Dictionary keys
-  and Set elements use one VM-defined Hashable family: Bool, fixed-width
-  integers, floating-point values, String, and recursively supported Optional,
-  Array, Dictionary, and Set values. User-defined `Hashable` witnesses remain
+  and Set elements use the same recursively VM-defined value family as their
+  Hashable domain. User-defined `Hashable` or equality witnesses remain
   fail-closed because downloaded code cannot invoke arbitrary hashing or
   equality. Fully concrete Array-backed `map`, `filter`, `compactMap`,
   `reduce`, `forEach`, `first(where:)`, `contains(where:)`, and `allSatisfy`

@@ -3,10 +3,10 @@ import HelixBytecode
 #endif
 
 extension VM {
-/// Reproduces the value equality and hashing of the closed family accepted by
-/// `Bytecode.ValueType.isVMHashable`. Collection cases deliberately do not use
-/// `VM.Value`'s synthesized equality because Dictionary and Set order is not
-/// part of Swift equality.
+/// Reproduces equality and hashing for the closed family accepted by
+/// `Bytecode.ValueType.isVMEquatable` and `isVMHashable`. Collection cases
+/// deliberately do not use `VM.Value`'s synthesized equality because
+/// Dictionary and Set order is not part of Swift equality.
 struct HashableValue: Hashable, Sendable {
     let value: VM.Value
 

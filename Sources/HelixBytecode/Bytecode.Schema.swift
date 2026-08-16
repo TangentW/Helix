@@ -287,6 +287,23 @@ public enum ArrayBoundaryOperation: String, Codable, Hashable, Sendable {
     case last
 }
 
+public enum ArraySearchOperation: String, Codable, Hashable, Sendable {
+    case firstIndex
+    case lastIndex
+}
+
+public enum ArrayExtremumOperation: String, Codable, Hashable, Sendable {
+    case minimum
+    case maximum
+}
+
+public enum ArrayRelationOperation: String, Codable, Hashable, Sendable {
+    /// Element-by-element equality without Array's shared-storage fast path.
+    case elementsEqual
+    case startsWith
+    case lexicographicallyPrecedes
+}
+
 public enum SetAlgebraOperation: String, Codable, Hashable, Sendable {
     case union
     case intersection
@@ -590,6 +607,23 @@ public enum Instruction: Codable, Hashable, Sendable {
         array: Bytecode.Register,
         value: Bytecode.Register
     )
+    case arraySearch(
+        result: Bytecode.Register,
+        operation: Bytecode.ArraySearchOperation,
+        array: Bytecode.Register,
+        value: Bytecode.Register
+    )
+    case arrayExtremum(
+        result: Bytecode.Register,
+        operation: Bytecode.ArrayExtremumOperation,
+        array: Bytecode.Register
+    )
+    case arrayRelation(
+        result: Bytecode.Register,
+        operation: Bytecode.ArrayRelationOperation,
+        lhs: Bytecode.Register,
+        rhs: Bytecode.Register
+    )
     case arrayAppend(
         result: Bytecode.Register,
         array: Bytecode.Register,
@@ -832,6 +866,9 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .arrayGet(result, _, _),
              let .arrayBoundary(result, _, _),
              let .arrayContains(result, _, _),
+             let .arraySearch(result, _, _, _),
+             let .arrayExtremum(result, _, _),
+             let .arrayRelation(result, _, _, _),
              let .arrayAppend(result, _, _),
              let .arrayUpdate(result, _, _, _),
              let .arrayNext(result, _, _),
@@ -990,6 +1027,12 @@ public enum Instruction: Codable, Hashable, Sendable {
             [array, index]
         case let .arrayContains(_, array, value):
             [array, value]
+        case let .arraySearch(_, _, array, value):
+            [array, value]
+        case let .arrayExtremum(_, _, array):
+            [array]
+        case let .arrayRelation(_, _, lhs, rhs):
+            [lhs, rhs]
         case let .arrayAppend(_, array, value):
             [array, value]
         case .makeArrayBuilder:

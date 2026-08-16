@@ -1725,18 +1725,126 @@ public struct Interpreter: Sendable {
                     let needle = try read(value, registers: registers)
                     var contains = false
                     for element in values {
-                        try chargeComparisonWork(
-                            lhs: element,
-                            rhs: needle,
+                        if try vmValuesEqual(
+                            element,
+                            needle,
                             budget: budget
-                        )
-                        if element == needle {
+                        ) {
                             contains = true
                             break
                         }
                     }
                     try initialize(
                         .bool(contains),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arraySearch(result, operation, array, value):
+                    let (values, _) = try self.array(
+                        array,
+                        registers: registers
+                    )
+                    let needle = try read(value, registers: registers)
+                    let index = try VM.CollectionSemantics.searchIndex(
+                        in: values,
+                        matching: needle,
+                        operation: operation
+                    ) { left, right in
+                        try vmValuesEqual(
+                            left,
+                            right,
+                            budget: budget
+                        )
+                    }
+                    let wrapped: VM.Value?
+                    if let index {
+                        guard let exact = Int64(exactly: index) else {
+                            throw VM.RuntimeTrap.integerOverflow
+                        }
+                        wrapped = .integer(
+                            try VM.Integer(
+                                signed: exact,
+                                bitWidth: 64,
+                                isSigned: true
+                            )
+                        )
+                    } else {
+                        wrapped = nil
+                    }
+                    try chargeAggregate(
+                        elementCount: wrapped == nil ? 0 : 1,
+                        budget: budget
+                    )
+                    try initialize(
+                        .optional(wrapped),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arrayExtremum(result, operation, array):
+                    let (values, _) = try self.array(
+                        array,
+                        registers: registers
+                    )
+                    let selected = try VM.CollectionSemantics.extremum(
+                        in: values,
+                        operation: operation
+                    ) { left, right in
+                        try compare(
+                            .lessThan,
+                            lhs: left,
+                            rhs: right,
+                            budget: budget
+                        )
+                    }
+                    try chargeAggregate(
+                        elementCount: selected == nil ? 0 : 1,
+                        budget: budget
+                    )
+                    let wrapped = try selected.map {
+                        try copyCharging($0, budget: budget)
+                    }
+                    try initialize(
+                        .optional(wrapped),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arrayRelation(result, operation, lhs, rhs):
+                    let (left, leftElement) = try self.array(
+                        lhs,
+                        registers: registers
+                    )
+                    let (right, rightElement) = try self.array(
+                        rhs,
+                        registers: registers
+                    )
+                    guard leftElement == rightElement else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .array(leftElement),
+                            actual: .array(rightElement)
+                        )
+                    }
+                    let relation = try VM.CollectionSemantics.relation(
+                        operation,
+                        lhs: left,
+                        rhs: right,
+                        areEqual: { left, right in
+                            try vmValuesEqual(
+                                left,
+                                right,
+                                budget: budget
+                            )
+                        },
+                        isOrderedBefore: { left, right in
+                            try compare(
+                                .lessThan,
+                                lhs: left,
+                                rhs: right,
+                                budget: budget
+                            )
+                        }
+                    )
+                    try initialize(
+                        .bool(relation),
                         register: result,
                         registers: &registers
                     )
@@ -3251,7 +3359,7 @@ public struct Interpreter: Sendable {
                 )
                 var isDuplicate = false
                 for key in keys {
-                    if try hashableValuesEqual(
+                    if try vmValuesEqual(
                         key,
                         entry.key,
                         budget: budget
@@ -3290,7 +3398,7 @@ public struct Interpreter: Sendable {
                 )
                 var isDuplicate = false
                 for existing in unique {
-                    if try hashableValuesEqual(
+                    if try vmValuesEqual(
                         existing,
                         element,
                         budget: budget
@@ -3783,7 +3891,7 @@ public struct Interpreter: Sendable {
         try chargeValueTraversal(rhs, budget: budget)
     }
 
-    private func hashableValuesEqual(
+    private func vmValuesEqual(
         _ lhs: VM.Value,
         _ rhs: VM.Value,
         budget: VM.InvocationBudget?
@@ -4111,7 +4219,7 @@ public struct Interpreter: Sendable {
         budget: VM.InvocationBudget
     ) throws -> Int? {
         for (index, entry) in entries.enumerated() {
-            if try hashableValuesEqual(entry.key, needle, budget: budget) {
+            if try vmValuesEqual(entry.key, needle, budget: budget) {
                 return index
             }
         }
@@ -4124,7 +4232,7 @@ public struct Interpreter: Sendable {
         budget: VM.InvocationBudget
     ) throws -> Int? {
         for (index, value) in values.enumerated() {
-            if try hashableValuesEqual(value, needle, budget: budget) {
+            if try vmValuesEqual(value, needle, budget: budget) {
                 return index
             }
         }
@@ -4283,6 +4391,28 @@ public struct Interpreter: Sendable {
         budget: VM.InvocationBudget
     ) throws -> Bool {
         guard lhs.type == rhs.type else { throw VM.RuntimeTrap.typeMismatch(expected: lhs.type, actual: rhs.type) }
+        switch predicate {
+        case .equal, .notEqual:
+            guard lhs.type.isVMEquatable else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "equality is unsupported for \(lhs.type)"
+                )
+            }
+            let equal = try vmValuesEqual(
+                lhs,
+                rhs,
+                budget: budget
+            )
+            return predicate == .equal ? equal : !equal
+        case .lessThan, .lessThanOrEqual,
+             .greaterThan, .greaterThanOrEqual:
+            guard lhs.type.isVMComparable else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "ordering is unsupported for \(lhs.type)"
+                )
+            }
+        }
+        try chargeComparisonWork(lhs: lhs, rhs: rhs, budget: budget)
         if case let (.float(rawLeft), .float(rawRight)) = (lhs, rhs) {
             // Preserve Swift/IEEE-754 unordered semantics. Mapping NaN to a total
             // ComparisonResult would incorrectly make it greater than every value.
@@ -4300,12 +4430,13 @@ public struct Interpreter: Sendable {
             )
         }
         if case let (.string(left), .string(right)) = (lhs, rhs) {
-            try chargeComparisonWork(lhs: lhs, rhs: rhs, budget: budget)
             // Swift String ordering is lexicographical over extended grapheme
             // clusters. Foundation's locale-sensitive compare is not equivalent.
             return switch predicate {
-            case .equal: left == right
-            case .notEqual: left != right
+            case .equal, .notEqual:
+                throw VM.RuntimeTrap.nativeFailure(
+                    "equality reached the ordered comparison path"
+                )
             case .lessThan: left < right
             case .lessThanOrEqual: left <= right
             case .greaterThan: left > right
@@ -4320,14 +4451,14 @@ public struct Interpreter: Sendable {
             } else {
                 ordering = left.unsignedValue == right.unsignedValue ? .orderedSame : (left.unsignedValue < right.unsignedValue ? .orderedAscending : .orderedDescending)
             }
-        case let (.bool(left), .bool(right)):
-            ordering = left == right ? .orderedSame : (!left && right ? .orderedAscending : .orderedDescending)
         default:
             throw VM.RuntimeTrap.nativeFailure("comparison is unsupported for \(lhs.type)")
         }
         return switch predicate {
-        case .equal: ordering == .orderedSame
-        case .notEqual: ordering != .orderedSame
+        case .equal, .notEqual:
+            throw VM.RuntimeTrap.nativeFailure(
+                "equality reached the ordered comparison path"
+            )
         case .lessThan: ordering == .orderedAscending
         case .lessThanOrEqual: ordering != .orderedDescending
         case .greaterThan: ordering == .orderedDescending

@@ -66,11 +66,13 @@ Both workflows depend on stable, build-specific identities:
   finished or destroyed on every control-flow path. Neither form can enter a
   Shell/Native boundary, local value layout, stack slot, or function result.
 - Array, Dictionary, and Set are typed VM values rather than projections of
-  private Swift runtime layouts. Set uses immutable COW storage with stable
-  in-value iteration, while equality and hashing are order-independent and
-  restricted to the recursively VM-defined Hashable family. Verification,
-  boundary validation, and pre-allocation resource charging enforce that same
-  model end to end.
+  private Swift runtime layouts. One bounded recursive value-semantics model
+  supplies VM-defined Equatable and Hashable behavior for supported scalars and
+  containers; strict ordering is a separate scalar-only capability. Set uses
+  immutable COW storage with stable in-value iteration, while Dictionary/Set
+  equality and hashing are order-independent. Verification, boundary
+  validation, comparison-work charging, and pre-allocation resource charging
+  enforce the same model end to end.
 - A closure signature carries an ownership convention for every invocation
   parameter. The compiler preserves concrete Swift `@in_guaranteed` inputs as
   borrowed VM values, materializes copies only at owned boundaries, and the

@@ -168,9 +168,10 @@ The current wire versions are HLBC 1.0 and HLXI 1.0. The implemented subset
 includes common integer and floating-point operations and conversions,
 `min`/`max`/`abs`, Bool, Unicode String transforms and interpolation,
 one-grapheme Character literals for the bounded String predicate path,
-tuple/Optional including address projection, Array boundary/mutation,
-Dictionary removal, and typed Set construction/query/mutation/iteration/algebra
-with recursively VM-defined Hashable semantics, common fully concrete Array-backed
+tuple/Optional including address projection, recursive Array/Dictionary equality,
+common Array index/search/extremum/sequence relations and mutation, Dictionary
+removal, and typed Set construction/query/mutation/iteration/algebra with
+recursively VM-defined Equatable/Hashable semantics, common fully concrete Array-backed
 `map`/`filter`/`compactMap`/`reduce`/predicate operations,
 `Optional.map`/`flatMap`, concrete `Result` payload transforms and
 `Result.get()` for patch-local value payloads, VM-owned `Any`, and common

@@ -2222,15 +2222,57 @@ public struct Engine: Verification.ImageVerifying {
             }
             guard case let .array(element) = type(array),
                   type(value) == element,
+                  type(result) == .bool,
+                  element.isVMEquatable
+            else {
+                throw fail(
+                    "array_contains requires VM-defined Equatable element semantics"
+                )
+            }
+        case let .arraySearch(result, _, array, value):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array index search requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(value) == element,
+                  type(result) == .optional(.int64),
+                  element.isVMEquatable
+            else {
+                throw fail(
+                    "array_search requires a matching VM-Equatable element and Optional<Int> result"
+                )
+            }
+        case let .arrayExtremum(result, _, array):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array extremum requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  element.isVMComparable,
+                  type(result) == .optional(element),
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_extremum requires a VM-Comparable Array and Optional<Element> result"
+                )
+            }
+        case let .arrayRelation(result, operation, lhs, rhs):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array relation requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(lhs),
+                  type(rhs) == type(lhs),
                   type(result) == .bool
             else {
-                throw fail("array_contains value must match Array.Element and return Bool")
+                throw fail("array_relation requires matching Arrays and Bool result")
             }
-            switch element {
-            case .bool, .integer, .float, .string:
-                break
-            default:
-                throw fail("array_contains supports only scalar Equatable elements")
+            let supportsElementOperation = switch operation {
+            case .elementsEqual, .startsWith: element.isVMEquatable
+            case .lexicographicallyPrecedes: element.isVMComparable
+            }
+            guard supportsElementOperation else {
+                throw fail(
+                    "array_relation element lacks the required VM value semantics"
+                )
             }
         case let .arrayAppend(result, array, value):
             guard capabilities.contains(.collectionsV1) else {
@@ -2540,19 +2582,21 @@ public struct Engine: Verification.ImageVerifying {
             else {
                 throw fail("set relation needs matching Set operands and Bool result")
             }
-        case let .compare(result, _, lhs, rhs):
+        case let .compare(result, predicate, lhs, rhs):
             guard type(result) == .bool, type(lhs) == type(rhs) else {
                 throw fail("comparison needs matching operands and Bool result")
             }
-            switch type(lhs) {
-            case .bool, .integer, .float:
-                break
-            case .string:
-                guard capabilities.contains(.stringsV1) else {
-                    throw fail("String comparison requires \(Core.Capability.stringsV1)")
-                }
-            default:
-                throw fail("comparison is unavailable for \(type(lhs))")
+            let supported = switch predicate {
+            case .equal, .notEqual:
+                type(lhs).isVMEquatable
+            case .lessThan, .lessThanOrEqual,
+                 .greaterThan, .greaterThanOrEqual:
+                type(lhs).isVMComparable
+            }
+            guard supported else {
+                throw fail(
+                    "comparison predicate is unavailable for \(type(lhs))"
+                )
             }
         case let .branch(target, arguments):
             try verifyBranchArguments(arguments, target: target, function: function, block: block, offset: offset, blocks: blocks)
@@ -3415,6 +3459,7 @@ public struct Engine: Verification.ImageVerifying {
                      .booleanBinary, .stringConcat, .stringCount, .stringIsEmpty,
                      .stringPredicate, .stringTransform, .stringify,
                      .arrayCount, .arrayIsEmpty, .arrayContains,
+                     .arraySearch, .arrayExtremum, .arrayRelation,
                      .dictionaryCount, .dictionaryIsEmpty,
                      .setCount, .setIsEmpty, .setContains, .setRelation,
                      .compare:

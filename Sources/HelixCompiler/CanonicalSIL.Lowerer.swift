@@ -5043,6 +5043,521 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func lowerCollectionIntrinsic(
+            _ intrinsic: CanonicalSIL.CollectionIntrinsic,
+            resultToken: String,
+            genericArguments: String,
+            arguments: [String],
+            line: Int
+        ) throws {
+            func materialize(
+                _ token: String,
+                as expected: Bytecode.ValueType
+            ) throws -> Bytecode.Register {
+                let value = if let stored = try copyStoredValue(
+                    at: token,
+                    line: line
+                ) {
+                    stored
+                } else {
+                    try resolve(token, line: line)
+                }
+                guard registerTypes[Int(value.rawValue)] == expected else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "collection operand does not match its specialization"
+                    )
+                }
+                return value
+            }
+
+            func emitArrayCount(
+                _ array: Bytecode.Register
+            ) throws -> Bytecode.Register {
+                guard case .array = registerTypes[Int(array.rawValue)] else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array index operation has a non-Array operand"
+                    )
+                }
+                let count = try allocate(type: .int64)
+                appendInstruction(.arrayCount(result: count, array: array))
+                return count
+            }
+
+            func emitCheckedIndexArithmetic(
+                _ operation: Bytecode.BinaryOperation,
+                _ lhs: Bytecode.Register,
+                _ rhs: Bytecode.Register
+            ) throws -> Bytecode.Register {
+                let result = try allocate(type: .int64)
+                let overflow = try allocate(type: .bool)
+                appendInstruction(
+                    .checkedBinary(
+                        result: result,
+                        overflow: overflow,
+                        operation: operation,
+                        lhs: lhs,
+                        rhs: rhs
+                    )
+                )
+                try appendConditionalTrap(
+                    condition: overflow,
+                    reason: .integerOverflow
+                )
+                return result
+            }
+
+            switch intrinsic {
+            case let .equality(container):
+                guard arguments.count == 3 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "collection equality has unsupported arguments"
+                    )
+                }
+                let type: Bytecode.ValueType
+                switch container {
+                case .array:
+                    let element = try parseStoredType(genericArguments)
+                    guard element.isVMEquatable,
+                          arrayMetatypeValues[arguments[2]] == element
+                    else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "Array equality element \(element)"
+                        )
+                    }
+                    type = .array(element)
+                case .dictionary:
+                    let types = try parseDictionaryGenericArguments(
+                        genericArguments
+                    )
+                    guard types.key.isVMHashable,
+                          types.value.isVMEquatable,
+                          dictionaryMetatypeValues[arguments[2]]?.0
+                            == types.key,
+                          dictionaryMetatypeValues[arguments[2]]?.1
+                            == types.value
+                    else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "Dictionary equality specialization"
+                        )
+                    }
+                    type = .dictionary(
+                        key: types.key,
+                        value: types.value
+                    )
+                }
+                let lhs = try materialize(arguments[0], as: type)
+                let rhs = try materialize(arguments[1], as: type)
+                let result = try allocate(type: .bool)
+                values[resultToken] = result
+                appendInstruction(
+                    .compare(
+                        result: result,
+                        predicate: .equal,
+                        lhs: lhs,
+                        rhs: rhs
+                    )
+                )
+
+            case let .search(operation):
+                guard arguments.count == 3 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Collection index search has unsupported arguments"
+                    )
+                }
+                let collection = try parseType(genericArguments)
+                guard case let .array(element) = collection,
+                      element.isVMEquatable,
+                      compilerAddressType(arguments[0]) == .optional(.int64),
+                      stackType(at: arguments[1]) == element,
+                      stackType(at: arguments[2]) == collection
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Collection index search specialization \(collection)"
+                    )
+                }
+                let needle = try materialize(arguments[1], as: element)
+                let array = try materialize(arguments[2], as: collection)
+                let result = try allocate(type: .optional(.int64))
+                appendInstruction(
+                    .arraySearch(
+                        result: result,
+                        operation: operation,
+                        array: array,
+                        value: needle
+                    )
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case let .extremum(operation):
+                guard arguments.count == 2 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Sequence extremum has unsupported arguments"
+                    )
+                }
+                let sequence = try parseType(genericArguments)
+                guard case let .array(element) = sequence,
+                      element.isVMComparable,
+                      compilerAddressType(arguments[0]) == .optional(element),
+                      stackType(at: arguments[1]) == sequence
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Sequence extremum specialization \(sequence)"
+                    )
+                }
+                let array = try materialize(arguments[1], as: sequence)
+                let result = try allocate(type: .optional(element))
+                appendInstruction(
+                    .arrayExtremum(
+                        result: result,
+                        operation: operation,
+                        array: array
+                    )
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case let .relation(operation):
+                let specializations = try splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                    .map(parseType)
+                guard specializations.count == 2,
+                      arguments.count == 2,
+                      specializations[0] == specializations[1],
+                      case let .array(element) = specializations[0]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Sequence relation has unsupported specializations"
+                    )
+                }
+                let supportsElementOperation = switch operation {
+                case .elementsEqual, .startsWith: element.isVMEquatable
+                case .lexicographicallyPrecedes: element.isVMComparable
+                }
+                guard supportsElementOperation,
+                      stackType(at: arguments[0]) == specializations[0],
+                      stackType(at: arguments[1]) == specializations[0]
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Sequence relation element \(element)"
+                    )
+                }
+                let rhs = try materialize(
+                    arguments[0],
+                    as: specializations[0]
+                )
+                let lhs = try materialize(
+                    arguments[1],
+                    as: specializations[0]
+                )
+                let result = try allocate(type: .bool)
+                values[resultToken] = result
+                appendInstruction(
+                    .arrayRelation(
+                        result: result,
+                        operation: operation,
+                        lhs: lhs,
+                        rhs: rhs
+                    )
+                )
+
+            case let .arrayIndex(operation):
+                switch operation {
+                case .start, .end:
+                    guard arguments.count == 1 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array boundary index has unsupported arguments"
+                        )
+                    }
+                    let element = try parseStoredType(genericArguments)
+                    let array = try materialize(
+                        arguments[0],
+                        as: .array(element)
+                    )
+                    let result: Bytecode.Register
+                    switch operation {
+                    case .start:
+                        result = try allocate(type: .int64)
+                        appendInstruction(
+                            .constantInteger(result: result, bitPattern: 0)
+                        )
+                    case .end:
+                        result = try emitArrayCount(array)
+                    case .distance, .indices, .after, .before, .offsetBy,
+                         .offsetByLimited:
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array index dispatch is inconsistent"
+                        )
+                    }
+                    values[resultToken] = result
+
+                case .distance:
+                    guard arguments.count == 3 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array distance has unsupported arguments"
+                        )
+                    }
+                    let element = try parseStoredType(genericArguments)
+                    let from = try materialize(arguments[0], as: .int64)
+                    let to = try materialize(arguments[1], as: .int64)
+                    _ = try materialize(
+                        arguments[2],
+                        as: .array(element)
+                    )
+                    let result = try emitCheckedIndexArithmetic(
+                        .subtract,
+                        to,
+                        from
+                    )
+                    values[resultToken] = result
+
+                case .indices:
+                    guard arguments.count == 2 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array.indices has unsupported arguments"
+                        )
+                    }
+                    let collection = try parseType(genericArguments)
+                    guard case .array = collection else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "Array.indices specialization \(collection)"
+                        )
+                    }
+                    let output = addressBase(arguments[0])
+                    let range = CanonicalSIL.Progression.SequenceType(
+                        family: .range,
+                        element: .int64
+                    )
+                    guard progressionAddresses[output] == range,
+                          stackType(at: arguments[1]) == collection
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array.indices storage does not match Range<Int>"
+                        )
+                    }
+                    let array = try materialize(arguments[1], as: collection)
+                    let start = try allocate(type: .int64)
+                    appendInstruction(
+                        .constantInteger(result: start, bitPattern: 0)
+                    )
+                    progressionAddressValues[output] = .init(
+                        type: range,
+                        start: start,
+                        end: try emitArrayCount(array),
+                        stride: nil
+                    )
+                    voidValues.insert(resultToken)
+
+                case .after, .before:
+                    guard arguments.count == 2 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array index movement has unsupported arguments"
+                        )
+                    }
+                    let element = try parseStoredType(genericArguments)
+                    let index = try materialize(arguments[0], as: .int64)
+                    _ = try materialize(
+                        arguments[1],
+                        as: .array(element)
+                    )
+                    let one = try allocate(type: .int64)
+                    appendInstruction(
+                        .constantInteger(result: one, bitPattern: 1)
+                    )
+                    let arithmetic: Bytecode.BinaryOperation = operation == .after
+                        ? .add
+                        : .subtract
+                    values[resultToken] = try emitCheckedIndexArithmetic(
+                        arithmetic,
+                        index,
+                        one
+                    )
+
+                case .offsetBy, .offsetByLimited:
+                    let expectedCount = operation == .offsetBy ? 3 : 4
+                    guard arguments.count == expectedCount else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array offset index has unsupported arguments"
+                        )
+                    }
+                    let element = try parseStoredType(genericArguments)
+                    let index = try materialize(arguments[0], as: .int64)
+                    let distance = try materialize(arguments[1], as: .int64)
+                    let arrayArgument = operation == .offsetBy ? 2 : 3
+                    _ = try materialize(
+                        arguments[arrayArgument],
+                        as: .array(element)
+                    )
+                    guard operation == .offsetByLimited else {
+                        values[resultToken] = try emitCheckedIndexArithmetic(
+                            .add,
+                            index,
+                            distance
+                        )
+                        break
+                    }
+
+                    let limit = try materialize(arguments[2], as: .int64)
+                    let destination = try allocate(type: .int64)
+                    let overflow = try allocate(type: .bool)
+                    appendInstruction(
+                        .checkedBinary(
+                            result: destination,
+                            overflow: overflow,
+                            operation: .add,
+                            lhs: index,
+                            rhs: distance
+                        )
+                    )
+                    let zero = try allocate(type: .int64)
+                    appendInstruction(
+                        .constantInteger(result: zero, bitPattern: 0)
+                    )
+
+                    func predicate(
+                        _ comparison: Bytecode.ComparisonPredicate,
+                        _ lhs: Bytecode.Register,
+                        _ rhs: Bytecode.Register
+                    ) throws -> Bytecode.Register {
+                        let result = try allocate(type: .bool)
+                        appendInstruction(
+                            .compare(
+                                result: result,
+                                predicate: comparison,
+                                lhs: lhs,
+                                rhs: rhs
+                            )
+                        )
+                        return result
+                    }
+
+                    func conjunction(
+                        _ lhs: Bytecode.Register,
+                        _ rhs: Bytecode.Register
+                    ) throws -> Bytecode.Register {
+                        let result = try allocate(type: .bool)
+                        appendInstruction(
+                            .booleanBinary(
+                                result: result,
+                                operation: .and,
+                                lhs: lhs,
+                                rhs: rhs
+                            )
+                        )
+                        return result
+                    }
+
+                    func disjunction(
+                        _ lhs: Bytecode.Register,
+                        _ rhs: Bytecode.Register
+                    ) throws -> Bytecode.Register {
+                        let result = try allocate(type: .bool)
+                        appendInstruction(
+                            .booleanBinary(
+                                result: result,
+                                operation: .or,
+                                lhs: lhs,
+                                rhs: rhs
+                            )
+                        )
+                        return result
+                    }
+
+                    // A limit constrains movement only when it lies in the
+                    // requested direction from the starting index.
+                    let movingForward = try predicate(
+                        .greaterThan,
+                        distance,
+                        zero
+                    )
+                    let forwardLimitApplies = try conjunction(
+                        movingForward,
+                        predicate(.greaterThanOrEqual, limit, index)
+                    )
+                    let pastForwardLimit = try predicate(
+                        .greaterThan,
+                        destination,
+                        limit
+                    )
+                    let positiveExceeded = try conjunction(
+                        forwardLimitApplies,
+                        disjunction(overflow, pastForwardLimit)
+                    )
+                    let movingBackward = try predicate(
+                        .lessThan,
+                        distance,
+                        zero
+                    )
+                    let backwardLimitApplies = try conjunction(
+                        movingBackward,
+                        predicate(.lessThanOrEqual, limit, index)
+                    )
+                    let pastBackwardLimit = try predicate(
+                        .lessThan,
+                        destination,
+                        limit
+                    )
+                    let negativeExceeded = try conjunction(
+                        backwardLimitApplies,
+                        disjunction(overflow, pastBackwardLimit)
+                    )
+                    let limitApplies = try disjunction(
+                        forwardLimitApplies,
+                        backwardLimitApplies
+                    )
+                    let trueValue = try allocate(type: .bool)
+                    appendInstruction(
+                        .constantBool(result: trueValue, value: true)
+                    )
+                    let limitDoesNotApply = try allocate(type: .bool)
+                    appendInstruction(
+                        .booleanBinary(
+                            result: limitDoesNotApply,
+                            operation: .xor,
+                            lhs: limitApplies,
+                            rhs: trueValue
+                        )
+                    )
+                    let unboundedOverflow = try conjunction(
+                        overflow,
+                        limitDoesNotApply
+                    )
+                    try appendConditionalTrap(
+                        condition: unboundedOverflow,
+                        reason: .integerOverflow
+                    )
+                    let exceeded = try disjunction(
+                        positiveExceeded,
+                        negativeExceeded
+                    )
+                    let some = try allocate(type: .optional(.int64))
+                    appendInstruction(
+                        .makeOptionalSome(result: some, value: destination)
+                    )
+                    let none = try allocate(type: .optional(.int64))
+                    appendInstruction(.makeOptionalNone(result: none))
+                    let result = try allocate(type: .optional(.int64))
+                    appendInstruction(
+                        .select(
+                            result: result,
+                            condition: exceeded,
+                            trueValue: none,
+                            falseValue: some
+                        )
+                    )
+                    values[resultToken] = result
+                }
+            }
+        }
+
         func lowerSwiftCoreIntrinsic(
             _ intrinsic: SwiftCoreIntrinsic,
             resultToken: String,
@@ -5087,6 +5602,14 @@ public struct Lowerer: Sendable {
             case let .scalar(scalar):
                 try lowerScalarIntrinsic(
                     scalar,
+                    resultToken: resultToken,
+                    genericArguments: genericArguments,
+                    arguments: arguments,
+                    line: line
+                )
+            case let .collection(collection):
+                try lowerCollectionIntrinsic(
+                    collection,
                     resultToken: resultToken,
                     genericArguments: genericArguments,
                     arguments: arguments,
