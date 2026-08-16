@@ -304,6 +304,21 @@ public enum ArrayRelationOperation: String, Codable, Hashable, Sendable {
     case lexicographicallyPrecedes
 }
 
+public enum ArrayAdapterOperation: String, Codable, Hashable, Sendable {
+    case reversed
+    case enumerated
+}
+
+public enum ArraySubsequenceOperation: String, Codable, Hashable, Sendable {
+    case dropFirst
+    case dropLast
+    case prefix
+    case suffix
+    case prefixUpTo
+    case prefixThrough
+    case suffixFrom
+}
+
 public enum SetAlgebraOperation: String, Codable, Hashable, Sendable {
     case union
     case intersection
@@ -624,6 +639,38 @@ public enum Instruction: Codable, Hashable, Sendable {
         lhs: Bytecode.Register,
         rhs: Bytecode.Register
     )
+    case arrayAdapter(
+        result: Bytecode.Register,
+        operation: Bytecode.ArrayAdapterOperation,
+        array: Bytecode.Register
+    )
+    case arrayRepeat(
+        result: Bytecode.Register,
+        value: Bytecode.Register,
+        count: Bytecode.Register
+    )
+    case arraySubsequence(
+        result: Bytecode.Register,
+        operation: Bytecode.ArraySubsequenceOperation,
+        array: Bytecode.Register,
+        bound: Bytecode.Register
+    )
+    case arrayRangeSlice(
+        result: Bytecode.Register,
+        array: Bytecode.Register,
+        lowerBound: Bytecode.Register,
+        upperBound: Bytecode.Register
+    )
+    case arrayZip(
+        result: Bytecode.Register,
+        lhs: Bytecode.Register,
+        rhs: Bytecode.Register
+    )
+    case arrayJoined(
+        result: Bytecode.Register,
+        arrays: Bytecode.Register,
+        separator: Bytecode.Register?
+    )
     case arrayAppend(
         result: Bytecode.Register,
         array: Bytecode.Register,
@@ -869,6 +916,12 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .arraySearch(result, _, _, _),
              let .arrayExtremum(result, _, _),
              let .arrayRelation(result, _, _, _),
+             let .arrayAdapter(result, _, _),
+             let .arrayRepeat(result, _, _),
+             let .arraySubsequence(result, _, _, _),
+             let .arrayRangeSlice(result, _, _, _),
+             let .arrayZip(result, _, _),
+             let .arrayJoined(result, _, _),
              let .arrayAppend(result, _, _),
              let .arrayUpdate(result, _, _, _),
              let .arrayNext(result, _, _),
@@ -1033,6 +1086,18 @@ public enum Instruction: Codable, Hashable, Sendable {
             [array]
         case let .arrayRelation(_, _, lhs, rhs):
             [lhs, rhs]
+        case let .arrayAdapter(_, _, array):
+            [array]
+        case let .arrayRepeat(_, value, count):
+            [value, count]
+        case let .arraySubsequence(_, _, array, bound):
+            [array, bound]
+        case let .arrayRangeSlice(_, array, lowerBound, upperBound):
+            [array, lowerBound, upperBound]
+        case let .arrayZip(_, lhs, rhs):
+            [lhs, rhs]
+        case let .arrayJoined(_, arrays, separator):
+            [arrays] + (separator.map { [$0] } ?? [])
         case let .arrayAppend(_, array, value):
             [array, value]
         case .makeArrayBuilder:

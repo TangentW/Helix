@@ -244,6 +244,19 @@ public enum Disassembler {
             "\(result) = array_\(operation.rawValue) \(array)"
         case let .arrayRelation(result, operation, lhs, rhs):
             "\(result) = array_\(operation.rawValue) \(lhs), \(rhs)"
+        case let .arrayAdapter(result, operation, array):
+            "\(result) = array_\(operation.rawValue) \(array)"
+        case let .arrayRepeat(result, value, count):
+            "\(result) = array_repeat \(value), count: \(count)"
+        case let .arraySubsequence(result, operation, array, bound):
+            "\(result) = array_\(operation.rawValue) \(array), \(bound)"
+        case let .arrayRangeSlice(result, array, lowerBound, upperBound):
+            "\(result) = array_slice \(array)[\(lowerBound)..<\(upperBound)]"
+        case let .arrayZip(result, lhs, rhs):
+            "\(result) = array_zip \(lhs), \(rhs)"
+        case let .arrayJoined(result, arrays, separator):
+            "\(result) = array_joined \(arrays)"
+                + (separator.map { ", separator: \($0)" } ?? "")
         case let .arrayAppend(result, array, value):
             "\(result) = array_append \(array), \(value)"
         case let .makeArrayBuilder(result):

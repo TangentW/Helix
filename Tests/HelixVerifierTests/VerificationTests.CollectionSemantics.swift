@@ -124,6 +124,147 @@ struct CollectionSemantics {
         )
     }
 
+    @Test("Array adapters verify operation-specific generic result shapes")
+    func acceptsGenericArrayAdapters() throws {
+        let strings = Bytecode.ValueType.array(.string)
+        let enumerated = Bytecode.ValueType.array(
+            .tuple([.int64, .string])
+        )
+        _ = try verify(
+            fixture(
+                parameterTypes: [strings],
+                resultType: enumerated,
+                registerTypes: [strings, enumerated],
+                instruction: .arrayAdapter(
+                    result: register(1),
+                    operation: .enumerated,
+                    array: register(0)
+                )
+            )
+        )
+
+        let integers = Bytecode.ValueType.array(.int64)
+        let zipped = Bytecode.ValueType.array(
+            .tuple([.string, .int64])
+        )
+        _ = try verify(
+            fixture(
+                parameterTypes: [strings, integers],
+                resultType: zipped,
+                registerTypes: [strings, integers, zipped],
+                instruction: .arrayZip(
+                    result: register(2),
+                    lhs: register(0),
+                    rhs: register(1)
+                )
+            )
+        )
+
+        let nested = Bytecode.ValueType.array(integers)
+        _ = try verify(
+            fixture(
+                parameterTypes: [nested, integers],
+                resultType: integers,
+                registerTypes: [nested, integers, integers],
+                instruction: .arrayJoined(
+                    result: register(2),
+                    arrays: register(0),
+                    separator: register(1)
+                )
+            )
+        )
+    }
+
+    @Test("Array adapters reject forged bounds and element shapes")
+    func rejectsInvalidArrayAdapters() throws {
+        let integers = Bytecode.ValueType.array(.int64)
+        try expectInvalid(
+            fixture(
+                parameterTypes: [integers],
+                resultType: integers,
+                registerTypes: [integers, integers],
+                instruction: .arrayAdapter(
+                    result: register(1),
+                    operation: .enumerated,
+                    array: register(0)
+                )
+            ),
+            reason: "array_adapter result does not match its operation"
+        )
+
+        try expectInvalid(
+            fixture(
+                parameterTypes: [integers, .bool],
+                resultType: integers,
+                registerTypes: [integers, .bool, integers],
+                instruction: .arraySubsequence(
+                    result: register(2),
+                    operation: .prefix,
+                    array: register(0),
+                    bound: register(1)
+                )
+            ),
+            reason: "array_subsequence requires matching Arrays and an Int bound"
+        )
+
+        let strings = Bytecode.ValueType.array(.string)
+        let wrongZip = Bytecode.ValueType.array(
+            .tuple([.int64, .int64])
+        )
+        try expectInvalid(
+            fixture(
+                parameterTypes: [integers, strings],
+                resultType: wrongZip,
+                registerTypes: [integers, strings, wrongZip],
+                instruction: .arrayZip(
+                    result: register(2),
+                    lhs: register(0),
+                    rhs: register(1)
+                )
+            ),
+            reason: "array_zip result must contain both Array elements"
+        )
+    }
+
+    @Test("Array adapters track recursively owned native results")
+    func tracksNativeAdapterResults() throws {
+        let namespace = Core.ShellNamespaceID.derive(
+            bundleID: "dev.helix.verifier.collection",
+            buildNumber: "1",
+            seed: "adapter-native"
+        )
+        let typeID = Core.TypeID.derive(
+            namespace: namespace,
+            canonicalType: "Fixture.Reference"
+        )
+        let native = Bytecode.ValueType.native(typeID)
+        let array = Bytecode.ValueType.array(native)
+        var fixture = try fixture(
+            parameterTypes: [array],
+            resultType: array,
+            registerTypes: [array, array],
+            instruction: .arrayAdapter(
+                result: register(1),
+                operation: .reversed,
+                array: register(0)
+            ),
+            cleanup: [.destroyValue(register(0))]
+        )
+        fixture.module.capabilities.insert(.nativeTypesV1)
+        fixture.shell.capabilities.insert(.nativeTypesV1)
+        fixture.policy.acceptedCapabilities.insert(.nativeTypesV1)
+        fixture.shell.types[typeID] = .init(
+            id: typeID,
+            canonicalName: "Fixture.Reference",
+            kind: .reference,
+            layoutFingerprint: .sha256("Fixture.Reference.layout.v1"),
+            isCopyable: true,
+            estimatedSize: 8
+        )
+
+        _ = try verify(fixture)
+    }
+
     private struct Fixture {
         var module: Bytecode.Module
         var shell: Verification.ShellInterface
@@ -134,7 +275,8 @@ struct CollectionSemantics {
         parameterTypes: [Bytecode.ValueType],
         resultType: Bytecode.ValueType,
         registerTypes: [Bytecode.ValueType],
-        instruction: Bytecode.Instruction
+        instruction: Bytecode.Instruction,
+        cleanup: [Bytecode.Instruction] = []
     ) throws -> Fixture {
         let result = register(registerTypes.count - 1)
         let parameters = parameterTypes.indices.map(register)
@@ -149,7 +291,9 @@ struct CollectionSemantics {
                 .init(
                     id: .init(rawValue: 0),
                     parameters: parameters,
-                    instructions: [instruction, .returnValue(result)]
+                    instructions: [instruction] + cleanup + [
+                        .returnValue(result),
+                    ]
                 ),
             ]
         )

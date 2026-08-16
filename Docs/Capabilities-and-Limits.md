@@ -90,7 +90,15 @@ does not by itself certify a physical device or distribution channel.
   equality. Fully concrete Array-backed `map`, `filter`, `compactMap`,
   `reduce`, `forEach`, `first(where:)`, `contains(where:)`, and `allSatisfy`
   use verified closure control flow and a linear, invocation-local Array
-  builder instead of repeated copy-on-write append. `Optional.map`/`flatMap`
+  builder instead of repeated copy-on-write append. Common Array-backed
+  adapter paths also support `enumerated()`, `reversed()`, `repeatElement`,
+  `Array(repeating:count:)`, count-based `dropFirst`/`dropLast`/`prefix`/
+  `suffix`, concrete Array index prefixes/suffixes, `Range<Int>` slicing,
+  `zip`, `joined()`, `joined(separator:)`, iteration, and Array
+  materialization. These views are normalized by element sequence; index-based
+  operations on a derived ArraySlice remain rejected until its preserved base
+  index is modeled, rather than being treated incorrectly as zero-based.
+  `Optional.map`/`flatMap`
   and concrete `Result.map`/`mapError`/`flatMap`/`flatMapError` whose payloads
   are valid patch-local values use one selected-case transform with explicit
   payload ownership; `Result.get()` projects success and failure onto verified

@@ -2274,6 +2274,91 @@ public struct Engine: Verification.ImageVerifying {
                     "array_relation element lacks the required VM value semantics"
                 )
             }
+        case let .arrayAdapter(result, operation, array):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array adapters require \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail("array_adapter requires a copyable Array element")
+            }
+            let expected: Bytecode.ValueType = switch operation {
+            case .reversed:
+                .array(element)
+            case .enumerated:
+                .array(.tuple([.int64, element]))
+            }
+            guard type(result) == expected else {
+                throw fail("array_adapter result does not match its operation")
+            }
+        case let .arrayRepeat(result, value, count):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array repetition requires \(Core.Capability.collectionsV1)")
+            }
+            guard type(count) == .int64,
+                  type(result) == .array(type(value)),
+                  isCopyable(type(value), shell: shell)
+            else {
+                throw fail("array_repeat requires a copyable value and Int count")
+            }
+        case let .arraySubsequence(result, _, array, bound):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array subsequences require \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(result) == type(array),
+                  type(bound) == .int64,
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_subsequence requires matching Arrays and an Int bound"
+                )
+            }
+        case let .arrayRangeSlice(
+            result,
+            array,
+            lowerBound,
+            upperBound
+        ):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array slices require \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(result) == type(array),
+                  type(lowerBound) == .int64,
+                  type(upperBound) == .int64,
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_slice requires matching Arrays and Int bounds"
+                )
+            }
+        case let .arrayZip(result, lhs, rhs):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("zip requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(lhsElement) = type(lhs),
+                  case let .array(rhsElement) = type(rhs),
+                  type(result) == .array(.tuple([lhsElement, rhsElement])),
+                  isCopyable(lhsElement, shell: shell),
+                  isCopyable(rhsElement, shell: shell)
+            else {
+                throw fail("array_zip result must contain both Array elements")
+            }
+        case let .arrayJoined(result, arrays, separator):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("joined requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(.array(element)) = type(arrays),
+                  type(result) == .array(element),
+                  separator.map({ type($0) == .array(element) }) ?? true,
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_joined requires nested Arrays and a matching separator"
+                )
+            }
         case let .arrayAppend(result, array, value):
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("Array.append requires \(Core.Capability.collectionsV1)")
@@ -3270,6 +3355,12 @@ public struct Engine: Verification.ImageVerifying {
                 case let .select(result, _, _, _),
                      let .arrayGet(result, _, _),
                      let .arrayBoundary(result, _, _),
+                     let .arrayAdapter(result, _, _),
+                     let .arrayRepeat(result, _, _),
+                     let .arraySubsequence(result, _, _, _),
+                     let .arrayRangeSlice(result, _, _, _),
+                     let .arrayZip(result, _, _),
+                     let .arrayJoined(result, _, _),
                      let .arrayAppend(result, _, _), let .arrayUpdate(result, _, _, _),
                      let .arrayNext(result, _, _),
                      let .progressionNext(result, _, _, _, _),

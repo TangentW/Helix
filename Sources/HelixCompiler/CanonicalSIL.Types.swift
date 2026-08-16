@@ -527,6 +527,98 @@ public struct TypeEnvironment: Sendable {
                 )
             )
         }
+
+        // These standard-library adapters are compiler-only views in HLBC.
+        // Their supported APIs observe sequence elements, not private storage
+        // or index wrappers, so lowering normalizes them to the VM's typed
+        // Array representation and keeps unsupported index APIs fail-closed.
+        for slicePrefix in ["ArraySlice<", "Swift.ArraySlice<"]
+        where type.hasPrefix(slicePrefix) && type.hasSuffix(">") {
+            return .array(
+                ValueRepresentation.storable(
+                    try resolve(
+                        genericBody(type, prefix: slicePrefix),
+                        relativeTo: parentScope
+                    )
+                )
+            )
+        }
+        for repeatedPrefix in ["Repeated<", "Swift.Repeated<"]
+        where type.hasPrefix(repeatedPrefix) && type.hasSuffix(">") {
+            return .array(
+                ValueRepresentation.storable(
+                    try resolve(
+                        genericBody(type, prefix: repeatedPrefix),
+                        relativeTo: parentScope
+                    )
+                )
+            )
+        }
+        for reversedPrefix in [
+            "ReversedCollection<", "Swift.ReversedCollection<",
+        ] where type.hasPrefix(reversedPrefix) && type.hasSuffix(">") {
+            let base = ValueRepresentation.storable(
+                try resolve(
+                    genericBody(type, prefix: reversedPrefix),
+                    relativeTo: parentScope
+                )
+            )
+            guard case .array = base else {
+                throw CanonicalSIL.LoweringError.unsupportedType(type)
+            }
+            return base
+        }
+        for enumeratedPrefix in [
+            "EnumeratedSequence<", "Swift.EnumeratedSequence<",
+        ] where type.hasPrefix(enumeratedPrefix) && type.hasSuffix(">") {
+            let base = ValueRepresentation.storable(
+                try resolve(
+                    genericBody(type, prefix: enumeratedPrefix),
+                    relativeTo: parentScope
+                )
+            )
+            guard case let .array(element) = base else {
+                throw CanonicalSIL.LoweringError.unsupportedType(type)
+            }
+            return .array(.tuple([.int64, element]))
+        }
+        for zipPrefix in ["Zip2Sequence<", "Swift.Zip2Sequence<"]
+        where type.hasPrefix(zipPrefix) && type.hasSuffix(">") {
+            let components = splitTopLevel(
+                genericBody(type, prefix: zipPrefix)
+            )
+            guard components.count == 2 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Zip2Sequence requires two sequence arguments"
+                )
+            }
+            let sequences = try components.map {
+                ValueRepresentation.storable(
+                    try resolve($0, relativeTo: parentScope)
+                )
+            }
+            guard case let .array(lhs) = sequences[0],
+                  case let .array(rhs) = sequences[1]
+            else {
+                throw CanonicalSIL.LoweringError.unsupportedType(type)
+            }
+            return .array(.tuple([lhs, rhs]))
+        }
+        for joinedPrefix in [
+            "FlattenSequence<", "Swift.FlattenSequence<",
+            "JoinedSequence<", "Swift.JoinedSequence<",
+        ] where type.hasPrefix(joinedPrefix) && type.hasSuffix(">") {
+            let outer = ValueRepresentation.storable(
+                try resolve(
+                    genericBody(type, prefix: joinedPrefix),
+                    relativeTo: parentScope
+                )
+            )
+            guard case let .array(.array(element)) = outer else {
+                throw CanonicalSIL.LoweringError.unsupportedType(type)
+            }
+            return .array(element)
+        }
         for setPrefix in ["Set<", "Swift.Set<"]
         where type.hasPrefix(setPrefix) && type.hasSuffix(">") {
             let element = ValueRepresentation.storable(

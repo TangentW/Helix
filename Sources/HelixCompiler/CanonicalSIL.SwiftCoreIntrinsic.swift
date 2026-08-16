@@ -33,8 +33,8 @@ enum SwiftCoreIntrinsic: Equatable {
     case sequenceContains
     case arrayAppend
     case arrayPopLast
-    case collectionMakeIterator
-    case indexingIteratorNext
+    case collectionMakeIterator(CanonicalSIL.CollectionIntrinsic.IteratorShape)
+    case indexingIteratorNext(CanonicalSIL.CollectionIntrinsic.IteratorShape)
     case progressionConstructor(CanonicalSIL.Progression.Family)
     case progressionMakeIterator(CanonicalSIL.Progression.Family)
     case progressionIteratorNext(CanonicalSIL.Progression.Family)
@@ -157,9 +157,29 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sSa6appendyyxnF": self = .arrayAppend
         case "$sSmsSKRzrlE7popLast7ElementSTQzSgyF": self = .arrayPopLast
         case "$sSlss16IndexingIteratorVyxG0B0RtzrlE04makeB0ACyF":
-            self = .collectionMakeIterator
+            self = .collectionMakeIterator(.collection)
+        case "$ss18ReversedCollectionV12makeIteratorAB0D0Vyx_GyF":
+            self = .collectionMakeIterator(.reversed)
+        case "$ss18EnumeratedSequenceV12makeIteratorAB0D0Vyx_GyF":
+            self = .collectionMakeIterator(.enumerated)
+        case "$ss12Zip2SequenceV12makeIteratorAB0D0Vyxq__GyF":
+            self = .collectionMakeIterator(.zipped)
+        case "$ss15FlattenSequenceV12makeIteratorAB0D0Vyx_GyF":
+            self = .collectionMakeIterator(.flattened)
+        case "$ss14JoinedSequenceV12makeIteratorAB0D0Vyx_GyF":
+            self = .collectionMakeIterator(.joined)
         case "$ss16IndexingIteratorV4next7ElementQzSgyF":
-            self = .indexingIteratorNext
+            self = .indexingIteratorNext(.collection)
+        case "$ss18ReversedCollectionV8IteratorV4next7ElementQzSgyF":
+            self = .indexingIteratorNext(.reversed)
+        case "$ss18EnumeratedSequenceV8IteratorV4nextSi6offset_7ElementQz7elementtSgyF":
+            self = .indexingIteratorNext(.enumerated)
+        case "$ss12Zip2SequenceV8IteratorV4next7ElementQz_AFQy_tSgyF":
+            self = .indexingIteratorNext(.zipped)
+        case "$ss15FlattenSequenceV8IteratorV4next7Element_AFQZSgyF":
+            self = .indexingIteratorNext(.flattened)
+        case "$ss14JoinedSequenceV8IteratorV4next7Element_AFQZSgyF":
+            self = .indexingIteratorNext(.joined)
         case "$ss6stride4from2to2bys8StrideToVyxGx_x0E0QztSxRzlF":
             self = .progressionConstructor(.strideTo)
         case "$ss6stride4from7through2bys13StrideThroughVyxGx_x0E0QztSxRzlF":

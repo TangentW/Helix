@@ -21,11 +21,31 @@ enum CollectionIntrinsic: Equatable {
         case offsetByLimited
     }
 
+    enum IteratorShape: Equatable {
+        case collection
+        case reversed
+        case enumerated
+        case zipped
+        case flattened
+        case joined
+    }
+
+    enum Adapter: Equatable {
+        case transform(Bytecode.ArrayAdapterOperation)
+        case arrayFromSequence
+        case arrayRepeat(hasMetatype: Bool)
+        case subsequence(Bytecode.ArraySubsequenceOperation)
+        case rangeSlice
+        case zip
+        case joined(hasSeparator: Bool)
+    }
+
     case equality(EqualityContainer)
     case search(Bytecode.ArraySearchOperation)
     case extremum(Bytecode.ArrayExtremumOperation)
     case relation(Bytecode.ArrayRelationOperation)
     case arrayIndex(ArrayIndexOperation)
+    case adapter(Adapter)
 
     init?(mangledName: String) {
         switch mangledName {
@@ -63,6 +83,38 @@ enum CollectionIntrinsic: Equatable {
             self = .arrayIndex(.offsetBy)
         case "$sSa5index_8offsetBy07limitedC0SiSgSi_S2itF":
             self = .arrayIndex(.offsetByLimited)
+        case "$sSTsE10enumerateds18EnumeratedSequenceVyxGyF":
+            self = .adapter(.transform(.enumerated))
+        case "$sSKsE8reverseds18ReversedCollectionVyxGyF":
+            self = .adapter(.transform(.reversed))
+        case "$sSaySayxGqd__c7ElementQyd__RszSTRd__lufC":
+            self = .adapter(.arrayFromSequence)
+        case "$sSa9repeating5countSayxGx_SitcfC":
+            self = .adapter(.arrayRepeat(hasMetatype: true))
+        case "$ss13repeatElement_5counts8RepeatedVyxGx_SitlF":
+            self = .adapter(.arrayRepeat(hasMetatype: false))
+        case "$sSlsE9dropFirsty11SubSequenceQzSiF":
+            self = .adapter(.subsequence(.dropFirst))
+        case "$sSKsE8dropLasty11SubSequenceQzSiF":
+            self = .adapter(.subsequence(.dropLast))
+        case "$sSlsE6prefixy11SubSequenceQzSiF":
+            self = .adapter(.subsequence(.prefix))
+        case "$sSKsE6suffixy11SubSequenceQzSiF":
+            self = .adapter(.subsequence(.suffix))
+        case "$sSlsE6prefix4upTo11SubSequenceQz5IndexQz_tF":
+            self = .adapter(.subsequence(.prefixUpTo))
+        case "$sSlsE6prefix7through11SubSequenceQz5IndexQz_tF":
+            self = .adapter(.subsequence(.prefixThrough))
+        case "$sSlsE6suffix4from11SubSequenceQz5IndexQz_tF":
+            self = .adapter(.subsequence(.suffixFrom))
+        case "$sSays10ArraySliceVyxGSnySiGcig":
+            self = .adapter(.rangeSlice)
+        case "$ss3zipys12Zip2SequenceVyxq_Gx_q_tSTRzSTR_r0_lF":
+            self = .adapter(.zip)
+        case "$sSTsST7ElementRpzrlE6joineds15FlattenSequenceVyxGyF":
+            self = .adapter(.joined(hasSeparator: false))
+        case "$sSTsST7ElementRpzrlE6joined9separators14JoinedSequenceVyxGqd___tSTRd__AA_AAQZAARtd__lF":
+            self = .adapter(.joined(hasSeparator: true))
         default:
             return nil
         }

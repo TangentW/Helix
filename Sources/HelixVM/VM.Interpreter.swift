@@ -1848,6 +1848,188 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
+                case let .arrayAdapter(result, operation, array):
+                    let (elements, elementType) = try self.array(
+                        array,
+                        registers: registers
+                    )
+                    let adapted = try adaptArray(
+                        elements,
+                        elementType: elementType,
+                        operation: operation,
+                        budget: budget
+                    )
+                    guard let resultType = function.type(of: result),
+                          adapted.type == resultType
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: adapted.type
+                        )
+                    }
+                    try initialize(
+                        adapted,
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arrayRepeat(result, value, count):
+                    let element = try read(value, registers: registers)
+                    let count = try integer(count, registers: registers)
+                    guard case let .array(elementType) = function.type(
+                        of: result
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .array(.never),
+                            actual: function.type(of: result)
+                        )
+                    }
+                    let repeated = try repeatedArray(
+                        element,
+                        elementType: elementType,
+                        count: count.signedValue,
+                        budget: budget
+                    )
+                    try initialize(
+                        repeated,
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arraySubsequence(
+                    result,
+                    operation,
+                    array,
+                    bound
+                ):
+                    let (elements, elementType) = try self.array(
+                        array,
+                        registers: registers
+                    )
+                    let bound = try integer(bound, registers: registers)
+                    let bounds = try VM.ArrayAdapters.subsequenceBounds(
+                        count: elements.count,
+                        bound: bound.signedValue,
+                        operation: operation
+                    )
+                    let sliced = try copiedArray(
+                        elements,
+                        elementType: elementType,
+                        bounds: bounds,
+                        budget: budget
+                    )
+                    try initialize(
+                        sliced,
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arrayRangeSlice(
+                    result,
+                    array,
+                    lowerBound,
+                    upperBound
+                ):
+                    let (elements, elementType) = try self.array(
+                        array,
+                        registers: registers
+                    )
+                    let lower = try integer(
+                        lowerBound,
+                        registers: registers
+                    )
+                    let upper = try integer(
+                        upperBound,
+                        registers: registers
+                    )
+                    let bounds = try VM.ArrayAdapters.rangeBounds(
+                        count: elements.count,
+                        lowerBound: lower.signedValue,
+                        upperBound: upper.signedValue
+                    )
+                    let sliced = try copiedArray(
+                        elements,
+                        elementType: elementType,
+                        bounds: bounds,
+                        budget: budget
+                    )
+                    try initialize(
+                        sliced,
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arrayZip(result, lhs, rhs):
+                    let (left, leftElement) = try self.array(
+                        lhs,
+                        registers: registers
+                    )
+                    let (right, rightElement) = try self.array(
+                        rhs,
+                        registers: registers
+                    )
+                    let zipped = try zippedArray(
+                        left,
+                        leftElement: leftElement,
+                        right,
+                        rightElement: rightElement,
+                        budget: budget
+                    )
+                    guard let resultType = function.type(of: result),
+                          zipped.type == resultType
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: zipped.type
+                        )
+                    }
+                    try initialize(
+                        zipped,
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arrayJoined(result, arrays, separator):
+                    let (nested, nestedType) = try self.array(
+                        arrays,
+                        registers: registers
+                    )
+                    guard case let .array(elementType) = nestedType else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .array(.never),
+                            actual: nestedType
+                        )
+                    }
+                    let separatorValues: [VM.Value]?
+                    if let separator {
+                        let (values, actualType) = try self.array(
+                            separator,
+                            registers: registers
+                        )
+                        guard actualType == elementType else {
+                            throw VM.RuntimeTrap.typeMismatch(
+                                expected: elementType,
+                                actual: actualType
+                            )
+                        }
+                        separatorValues = values
+                    } else {
+                        separatorValues = nil
+                    }
+                    let joined = try joinedArray(
+                        nested,
+                        elementType: elementType,
+                        separator: separatorValues,
+                        budget: budget
+                    )
+                    guard let resultType = function.type(of: result),
+                          joined.type == resultType
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: joined.type
+                        )
+                    }
+                    try initialize(
+                        joined,
+                        register: result,
+                        registers: &registers
+                    )
                 case let .arrayAppend(result, array, value):
                     let (elements, elementType) = try self.array(
                         array,
@@ -4237,6 +4419,227 @@ public struct Interpreter: Sendable {
             }
         }
         return nil
+    }
+
+    private func adaptArray(
+        _ elements: [VM.Value],
+        elementType: Bytecode.ValueType,
+        operation: Bytecode.ArrayAdapterOperation,
+        budget: VM.InvocationBudget
+    ) throws -> VM.Value {
+        try budget.consumeLinearWork(elementCount: elements.count)
+        switch operation {
+        case .reversed:
+            try chargeAggregate(elementCount: elements.count, budget: budget)
+            for element in elements {
+                try prepareCopy(element, budget: budget)
+            }
+            let reversed = try elements.reversed().map(copy)
+            try budget.checkDeadline()
+            return .array(reversed, elementType: elementType)
+
+        case .enumerated:
+            let aggregateCount = elements.count.multipliedReportingOverflow(
+                by: 3
+            )
+            guard !aggregateCount.overflow else {
+                throw VM.RuntimeTrap.vmHeapLimitExceeded
+            }
+            try chargeAggregate(
+                elementCount: aggregateCount.partialValue,
+                budget: budget
+            )
+            for element in elements {
+                try prepareCopy(element, budget: budget)
+            }
+            var result: [VM.Value] = []
+            result.reserveCapacity(elements.count)
+            for (offset, element) in elements.enumerated() {
+                guard let exact = Int64(exactly: offset) else {
+                    throw VM.RuntimeTrap.integerOverflow
+                }
+                result.append(
+                    .tuple([
+                        .integer(
+                            try VM.Integer(
+                                signed: exact,
+                                bitWidth: 64,
+                                isSigned: true
+                            )
+                        ),
+                        try copy(element),
+                    ])
+                )
+            }
+            try budget.checkDeadline()
+            return .array(
+                result,
+                elementType: .tuple([.int64, elementType])
+            )
+        }
+    }
+
+    private func repeatedArray(
+        _ element: VM.Value,
+        elementType: Bytecode.ValueType,
+        count: Int64,
+        budget: VM.InvocationBudget
+    ) throws -> VM.Value {
+        guard count >= 0 else {
+            throw VM.RuntimeTrap.explicit(
+                "Array repeat count must not be negative"
+            )
+        }
+        guard let count = Int(exactly: count) else {
+            throw VM.RuntimeTrap.vmHeapLimitExceeded
+        }
+        try budget.consumeLinearWork(elementCount: count)
+        try chargeAggregate(elementCount: count, budget: budget)
+        for _ in 0..<count {
+            try prepareCopy(element, budget: budget)
+        }
+        var result: [VM.Value] = []
+        result.reserveCapacity(count)
+        for _ in 0..<count {
+            result.append(try copy(element))
+        }
+        try budget.checkDeadline()
+        return .array(result, elementType: elementType)
+    }
+
+    private func copiedArray(
+        _ elements: [VM.Value],
+        elementType: Bytecode.ValueType,
+        bounds: Range<Int>,
+        budget: VM.InvocationBudget
+    ) throws -> VM.Value {
+        guard bounds.lowerBound >= 0,
+              bounds.upperBound <= elements.count
+        else {
+            throw VM.RuntimeTrap.invalidProgramCounter
+        }
+        if bounds.lowerBound == 0, bounds.upperBound == elements.count {
+            return try copyCharging(
+                .array(elements, elementType: elementType),
+                budget: budget
+            )
+        }
+        try budget.consumeLinearWork(elementCount: bounds.count)
+        try chargeAggregate(elementCount: bounds.count, budget: budget)
+        for element in elements[bounds] {
+            try prepareCopy(element, budget: budget)
+        }
+        let result = try elements[bounds].map(copy)
+        try budget.checkDeadline()
+        return .array(result, elementType: elementType)
+    }
+
+    private func zippedArray(
+        _ lhs: [VM.Value],
+        leftElement: Bytecode.ValueType,
+        _ rhs: [VM.Value],
+        rightElement: Bytecode.ValueType,
+        budget: VM.InvocationBudget
+    ) throws -> VM.Value {
+        let count = min(lhs.count, rhs.count)
+        let aggregateCount = count.multipliedReportingOverflow(by: 3)
+        guard !aggregateCount.overflow else {
+            throw VM.RuntimeTrap.vmHeapLimitExceeded
+        }
+        try budget.consumeLinearWork(elementCount: count)
+        try chargeAggregate(
+            elementCount: aggregateCount.partialValue,
+            budget: budget
+        )
+        for index in 0..<count {
+            try prepareCopy(lhs[index], budget: budget)
+            try prepareCopy(rhs[index], budget: budget)
+        }
+        var result: [VM.Value] = []
+        result.reserveCapacity(count)
+        for index in 0..<count {
+            result.append(
+                .tuple([
+                    try copy(lhs[index]),
+                    try copy(rhs[index]),
+                ])
+            )
+        }
+        try budget.checkDeadline()
+        return .array(
+            result,
+            elementType: .tuple([leftElement, rightElement])
+        )
+    }
+
+    private func joinedArray(
+        _ nested: [VM.Value],
+        elementType: Bytecode.ValueType,
+        separator: [VM.Value]?,
+        budget: VM.InvocationBudget
+    ) throws -> VM.Value {
+        try budget.consumeLinearWork(elementCount: nested.count)
+        var resultCount = 0
+        for value in nested {
+            guard case let .array(elements, actualType) = value,
+                  actualType == elementType
+            else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: .array(elementType),
+                    actual: value.type
+                )
+            }
+            let sum = resultCount.addingReportingOverflow(elements.count)
+            guard !sum.overflow else {
+                throw VM.RuntimeTrap.vmHeapLimitExceeded
+            }
+            resultCount = sum.partialValue
+        }
+        if let separator, nested.count > 1 {
+            let separatorCount = separator.count.multipliedReportingOverflow(
+                by: nested.count - 1
+            )
+            let total = resultCount.addingReportingOverflow(
+                separatorCount.partialValue
+            )
+            guard !separatorCount.overflow, !total.overflow else {
+                throw VM.RuntimeTrap.vmHeapLimitExceeded
+            }
+            resultCount = total.partialValue
+        }
+        try budget.consumeLinearWork(elementCount: resultCount)
+        try chargeAggregate(elementCount: resultCount, budget: budget)
+        for (index, value) in nested.enumerated() {
+            if index > 0, let separator {
+                for element in separator {
+                    try prepareCopy(element, budget: budget)
+                }
+            }
+            guard case let .array(elements, _) = value else {
+                throw VM.RuntimeTrap.invalidProgramCounter
+            }
+            for element in elements {
+                try prepareCopy(element, budget: budget)
+            }
+        }
+
+        var result: [VM.Value] = []
+        result.reserveCapacity(resultCount)
+        for (index, value) in nested.enumerated() {
+            if index > 0, let separator {
+                for element in separator {
+                    result.append(try copy(element))
+                }
+            }
+            guard case let .array(elements, _) = value else {
+                throw VM.RuntimeTrap.invalidProgramCounter
+            }
+            for element in elements {
+                result.append(try copy(element))
+            }
+        }
+        try budget.checkDeadline()
+        return .array(result, elementType: elementType)
     }
 
     private func chargeDictionaryStorage(

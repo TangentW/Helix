@@ -367,6 +367,7 @@ public struct Lowerer: Sendable {
             omittingEmptySubsequences: false
         ).map(String.init)
         var remainingDeallocStackUses: [String: Int] = [:]
+        var explicitlyDestroyedAddresses = Set<String>()
         for (index, rawLine) in rawLines.enumerated()
         where !nsErrorBridges.skippedLines.contains(index) {
             let instruction = CanonicalSIL.DebugMetadata.strippingMetadata(
@@ -377,6 +378,12 @@ public struct Lowerer: Sendable {
                 pattern: #"^dealloc_stack (%[0-9]+)$"#
             ) {
                 remainingDeallocStackUses[deallocation[0], default: 0] += 1
+            }
+            if let destruction = match(
+                instruction,
+                pattern: #"^destroy_addr (%[0-9]+)$"#
+            ) {
+                explicitlyDestroyedAddresses.insert(destruction[0])
             }
         }
         // Reject a forbidden existential payload before incidental SIL such
@@ -4019,6 +4026,33 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func normalizedIteratorCollectionType(
+            _ shape: CanonicalSIL.CollectionIntrinsic.IteratorShape,
+            genericArguments: String
+        ) throws -> Bytecode.ValueType {
+            let spelling: String = switch shape {
+            case .collection:
+                genericArguments
+            case .reversed:
+                "ReversedCollection<\(genericArguments)>"
+            case .enumerated:
+                "EnumeratedSequence<\(genericArguments)>"
+            case .zipped:
+                "Zip2Sequence<\(genericArguments)>"
+            case .flattened:
+                "FlattenSequence<\(genericArguments)>"
+            case .joined:
+                "JoinedSequence<\(genericArguments)>"
+            }
+            let type = try parseType(spelling)
+            guard case .array = type else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "collection iterator \(spelling)"
+                )
+            }
+            return type
+        }
+
         func progressionValue(
             at address: String,
             line: Int
@@ -5268,6 +5302,277 @@ public struct Lowerer: Sendable {
                         rhs: rhs
                     )
                 )
+
+            case let .adapter(.transform(operation)):
+                guard arguments.count == 2 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "collection adapter has unsupported arguments"
+                    )
+                }
+                let sourceType = try parseType(genericArguments)
+                guard case let .array(element) = sourceType else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "collection adapter source \(sourceType)"
+                    )
+                }
+                let resultType: Bytecode.ValueType = switch operation {
+                case .reversed:
+                    sourceType
+                case .enumerated:
+                    .array(.tuple([.int64, element]))
+                }
+                guard compilerAddressType(arguments[0]) == resultType,
+                      stackType(at: arguments[1]) == sourceType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "collection adapter storage does not match its specialization"
+                    )
+                }
+                let source = try materialize(arguments[1], as: sourceType)
+                let result = try allocate(type: resultType)
+                appendInstruction(
+                    .arrayAdapter(
+                        result: result,
+                        operation: operation,
+                        array: source
+                    )
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case .adapter(.arrayFromSequence):
+                let specializations = try splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                    .map(parseType)
+                guard specializations.count == 2,
+                      arguments.count == 2,
+                      case let .array(sourceElement) = specializations[1],
+                      ValueRepresentation.storable(specializations[0])
+                        == sourceElement,
+                      arrayMetatypeValues[arguments[1]] == sourceElement,
+                      stackType(at: arguments[0]) == specializations[1]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array sequence initializer specialization does not match"
+                    )
+                }
+                values[resultToken] = try materialize(
+                    arguments[0],
+                    as: specializations[1]
+                )
+
+            case let .adapter(.arrayRepeat(hasMetatype)):
+                guard arguments.count == 3 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "repeated collection has unsupported arguments"
+                    )
+                }
+                let element = try parseStoredType(genericArguments)
+                let valueIndex = hasMetatype ? 0 : 1
+                let countIndex = hasMetatype ? 1 : 2
+                if hasMetatype,
+                   arrayMetatypeValues[arguments[2]] != element {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array(repeating:) metatype does not match Element"
+                    )
+                }
+                let value = try materialize(arguments[valueIndex], as: element)
+                let count = try materialize(arguments[countIndex], as: .int64)
+                let result = try allocate(type: .array(element))
+                appendInstruction(
+                    .arrayRepeat(result: result, value: value, count: count)
+                )
+                if hasMetatype {
+                    values[resultToken] = result
+                } else {
+                    guard compilerAddressType(arguments[0]) == .array(element)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "repeatElement output does not match Element"
+                        )
+                    }
+                    try storeConstructedValue(
+                        result,
+                        at: arguments[0],
+                        mode: .initialize
+                    )
+                    voidValues.insert(resultToken)
+                }
+
+            case let .adapter(.subsequence(operation)):
+                guard arguments.count == 3 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "collection subsequence has unsupported arguments"
+                    )
+                }
+                let collection = try parseType(genericArguments)
+                let normalizedSpelling = genericArguments
+                    .trimmingCharacters(in: .whitespaces)
+                    .trimmingPrefix("$")
+                let isConcreteArray = ["Array<", "Swift.Array<"]
+                    .contains(where: normalizedSpelling.hasPrefix)
+                let usesConcreteIndex = switch operation {
+                case .prefixUpTo, .prefixThrough, .suffixFrom: true
+                case .dropFirst, .dropLast, .prefix, .suffix: false
+                }
+                guard case .array = collection,
+                      !usesConcreteIndex || isConcreteArray,
+                      compilerAddressType(arguments[0]) == collection,
+                      stackType(at: arguments[2]) == collection
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "collection subsequence specialization \(genericArguments)"
+                    )
+                }
+                let bound = try materialize(arguments[1], as: .int64)
+                let source = try materialize(arguments[2], as: collection)
+                let result = try allocate(type: collection)
+                appendInstruction(
+                    .arraySubsequence(
+                        result: result,
+                        operation: operation,
+                        array: source,
+                        bound: bound
+                    )
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case .adapter(.rangeSlice):
+                guard arguments.count == 2 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array range subscript has unsupported arguments"
+                    )
+                }
+                let element = try parseStoredType(genericArguments)
+                guard let range = progressionValues[arguments[0]],
+                      range.type == .init(family: .range, element: .int64),
+                      range.stride == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array range subscript requires Range<Int>"
+                    )
+                }
+                let source = try materialize(
+                    arguments[1],
+                    as: .array(element)
+                )
+                let result = try allocate(type: .array(element))
+                appendInstruction(
+                    .arrayRangeSlice(
+                        result: result,
+                        array: source,
+                        lowerBound: range.start,
+                        upperBound: range.end
+                    )
+                )
+                if !hasFutureSemanticUse(
+                    of: arguments[0],
+                    after: currentSILLineIndex
+                ) {
+                    progressionValues.removeValue(forKey: arguments[0])
+                }
+                values[resultToken] = result
+
+            case .adapter(.zip):
+                let sequences = try splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                    .map(parseType)
+                guard sequences.count == 2,
+                      arguments.count == 3,
+                      case let .array(lhsElement) = sequences[0],
+                      case let .array(rhsElement) = sequences[1]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "zip requires two supported sequence specializations"
+                    )
+                }
+                let resultType: Bytecode.ValueType = .array(
+                    .tuple([lhsElement, rhsElement])
+                )
+                guard compilerAddressType(arguments[0]) == resultType,
+                      stackType(at: arguments[1]) == sequences[0],
+                      stackType(at: arguments[2]) == sequences[1]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "zip storage does not match its sequence elements"
+                    )
+                }
+                let lhs = try materialize(arguments[1], as: sequences[0])
+                let rhs = try materialize(arguments[2], as: sequences[1])
+                let result = try allocate(type: resultType)
+                appendInstruction(
+                    .arrayZip(result: result, lhs: lhs, rhs: rhs)
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case let .adapter(.joined(hasSeparator)):
+                let sequences = try splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                    .map(parseType)
+                let expectedSpecializations = hasSeparator ? 2 : 1
+                let expectedArguments = hasSeparator ? 3 : 2
+                guard sequences.count == expectedSpecializations,
+                      arguments.count == expectedArguments,
+                      case let .array(.array(element)) = sequences[0]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "joined requires an Array-backed nested sequence"
+                    )
+                }
+                let resultType: Bytecode.ValueType = .array(element)
+                let sourceIndex = hasSeparator ? 2 : 1
+                guard compilerAddressType(arguments[0]) == resultType,
+                      stackType(at: arguments[sourceIndex]) == sequences[0]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "joined storage does not match its nested sequence"
+                    )
+                }
+                let separator: Bytecode.Register?
+                if hasSeparator {
+                    guard sequences[1] == resultType,
+                          stackType(at: arguments[1]) == resultType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "joined separator does not match nested Element"
+                        )
+                    }
+                    separator = try materialize(arguments[1], as: resultType)
+                } else {
+                    separator = nil
+                }
+                let source = try materialize(
+                    arguments[sourceIndex],
+                    as: sequences[0]
+                )
+                let result = try allocate(type: resultType)
+                appendInstruction(
+                    .arrayJoined(
+                        result: result,
+                        arrays: source,
+                        separator: separator
+                    )
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
 
             case let .arrayIndex(operation):
                 switch operation {
@@ -6526,8 +6831,9 @@ public struct Lowerer: Sendable {
                 )
                 voidValues.insert(resultToken)
 
-            case .collectionMakeIterator:
-                if let type = try progressionSequenceType(genericArguments) {
+            case let .collectionMakeIterator(shape):
+                if shape == .collection,
+                   let type = try progressionSequenceType(genericArguments) {
                     guard arguments.count == 2 else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Range.makeIterator has unsupported arguments"
@@ -6544,7 +6850,10 @@ public struct Lowerer: Sendable {
                 }
                 guard arguments.count == 2,
                       !genericArguments.isEmpty,
-                      let collectionType = try? parseType(genericArguments),
+                      let collectionType = try? normalizedIteratorCollectionType(
+                          shape,
+                          genericArguments: genericArguments
+                      ),
                       case let .array(element) = collectionType,
                       pendingArrayIteratorTypes[addressBase(arguments[0])] == element,
                       stackType(at: arguments[1]) == collectionType,
@@ -6578,8 +6887,9 @@ public struct Lowerer: Sendable {
                 )
                 voidValues.insert(resultToken)
 
-            case .indexingIteratorNext:
-                if let type = try progressionSequenceType(genericArguments) {
+            case let .indexingIteratorNext(shape):
+                if shape == .collection,
+                   let type = try progressionSequenceType(genericArguments) {
                     guard arguments.count == 2 else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Range iterator next has unsupported arguments"
@@ -6596,7 +6906,10 @@ public struct Lowerer: Sendable {
                 }
                 guard arguments.count == 2,
                       !genericArguments.isEmpty,
-                      let collectionType = try? parseType(genericArguments),
+                      let collectionType = try? normalizedIteratorCollectionType(
+                          shape,
+                          genericArguments: genericArguments
+                      ),
                       case let .array(element) = collectionType,
                       stackType(at: arguments[0]) == .optional(element),
                       let state = arrayIteratorStates[addressBase(arguments[1])],
@@ -8510,12 +8823,31 @@ public struct Lowerer: Sendable {
                 }
                 if pendingArrayIteratorTypes[address] != nil {
                     guard let block = current?.id,
-                          arrayIteratorStates[address] != nil,
-                          destroyedArrayIterators[address]?.contains(block) == true
+                          let iterator = arrayIteratorStates[address]
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Array iterator is deallocated before destroy_addr"
+                            "Array iterator is deallocated before initialization"
                         )
+                    }
+                    let hasExplicitDestroy = explicitlyDestroyedAddresses
+                        .contains(token)
+                    if hasExplicitDestroy {
+                        guard destroyedArrayIterators[address]?
+                            .contains(block) == true
+                        else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "Array iterator is deallocated before destroy_addr"
+                            )
+                        }
+                    } else {
+                        guard destroyedArrayIterators[address, default: []]
+                            .insert(block).inserted
+                        else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "trivial Array iterator is deallocated twice"
+                            )
+                        }
+                        appendInstruction(.destroyStack(iterator.indexSlot))
                     }
                     if isFinalLexicalUse {
                         pendingArrayIteratorTypes.removeValue(forKey: address)
@@ -13985,17 +14317,32 @@ public struct Lowerer: Sendable {
     ) throws -> Bytecode.ValueType? {
         let type = raw.trimmingCharacters(in: .whitespaces)
         let prefixes = ["IndexingIterator<", "Swift.IndexingIterator<"]
-        guard let prefix = prefixes.first(where: { type.hasPrefix($0) }) else {
+        let collection: Bytecode.ValueType
+        if let prefix = prefixes.first(where: { type.hasPrefix($0) }) {
+            guard type.hasSuffix(">") else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "IndexingIterator type is missing its closing angle bracket"
+                )
+            }
+            let start = type.index(type.startIndex, offsetBy: prefix.count)
+            let end = type.index(before: type.endIndex)
+            collection = try parseType(String(type[start..<end]))
+        } else if type.hasSuffix(".Iterator") {
+            let base = String(type.dropLast(".Iterator".count))
+            let adapterPrefixes = [
+                "ReversedCollection<", "Swift.ReversedCollection<",
+                "EnumeratedSequence<", "Swift.EnumeratedSequence<",
+                "Zip2Sequence<", "Swift.Zip2Sequence<",
+                "FlattenSequence<", "Swift.FlattenSequence<",
+                "JoinedSequence<", "Swift.JoinedSequence<",
+            ]
+            guard adapterPrefixes.contains(where: base.hasPrefix) else {
+                return nil
+            }
+            collection = try parseType(base)
+        } else {
             return nil
         }
-        guard type.hasSuffix(">") else {
-            throw CanonicalSIL.LoweringError.malformedSIL(
-                "IndexingIterator type is missing its closing angle bracket"
-            )
-        }
-        let start = type.index(type.startIndex, offsetBy: prefix.count)
-        let end = type.index(before: type.endIndex)
-        let collection = try parseType(String(type[start..<end]))
         guard case let .array(element) = collection else {
             throw CanonicalSIL.LoweringError.unsupportedType(type)
         }

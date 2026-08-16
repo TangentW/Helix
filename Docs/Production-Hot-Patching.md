@@ -172,7 +172,8 @@ tuple/Optional including address projection, recursive Array/Dictionary equality
 common Array index/search/extremum/sequence relations and mutation, Dictionary
 removal, and typed Set construction/query/mutation/iteration/algebra with
 recursively VM-defined Equatable/Hashable semantics, common fully concrete Array-backed
-`map`/`filter`/`compactMap`/`reduce`/predicate operations,
+`map`/`filter`/`compactMap`/`reduce`/predicate operations, plus typed
+enumerated/reversed/repeated/sliced/zipped/joined Array-backed adapters,
 `Optional.map`/`flatMap`, concrete `Result` payload transforms and
 `Result.get()` for patch-local value payloads, VM-owned `Any`, and common
 dynamic casts, fixed-width integer `Range`/`ClosedRange` iteration,
