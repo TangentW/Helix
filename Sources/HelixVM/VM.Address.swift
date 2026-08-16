@@ -60,7 +60,7 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
     }
 
     func directDestroyIfInitialized() throws {
-        try lock.withLock {
+        let retained = try lock.withLock {
             guard accesses.isEmpty
                     || (accesses.count == 1
                         && accesses.values.first?.kind == .modify
@@ -68,9 +68,12 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
             else {
                 throw VM.RuntimeTrap.exclusivityViolation
             }
+            let retained = (storage, partialStorage)
             storage = nil
             partialStorage.removeAll(keepingCapacity: true)
+            return retained
         }
+        withExtendedLifetime(retained) {}
     }
 
     func unscopedRead(path: [UInt32]) throws -> VM.Value {
@@ -121,6 +124,55 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
             _ = try activeAccess(token: token, path: path, requiresModify: false)
             return try storedValue(at: path)
         }
+    }
+
+    func take(path: [UInt32], token: UUID) throws -> VM.Value {
+        try lock.withLock {
+            _ = try activeAccess(token: token, path: path, requiresModify: true)
+            let value = try storedValue(at: path)
+            try removeStoredValue(at: path)
+            return value
+        }
+    }
+
+    /// Returns a deterministic upper bound for projected aggregate
+    /// decomposition. The interpreter charges it before mutation so an
+    /// exhausted budget cannot leave storage partially changed.
+    func projectedRemovalWork(path: [UInt32], token: UUID) throws -> Int {
+        try lock.withLock {
+            _ = try activeAccess(token: token, path: path, requiresModify: true)
+            guard !path.isEmpty else { return 0 }
+            guard let storageShape else {
+                throw VM.RuntimeTrap.invalidAddressProjection
+            }
+            _ = try Self.storageShape(at: path[...], in: storageShape)
+            guard let nodeCount = storageShape.nodeCount else {
+                throw VM.RuntimeTrap.vmHeapLimitExceeded
+            }
+            return nodeCount
+        }
+    }
+
+    func destroy(
+        path: [UInt32],
+        token: UUID,
+        ifInitialized: Bool
+    ) throws {
+        let retained = try lock.withLock {
+            _ = try activeAccess(token: token, path: path, requiresModify: true)
+            if !ifInitialized {
+                _ = try storedValue(at: path)
+            }
+            // Keep removed native owners alive until after the cell lock is
+            // released; an arbitrary host object's deinit must not reenter a
+            // locked storage cell.
+            let retained = (storage, partialStorage)
+            // Conditional aggregate cleanup removes every initialized leaf in
+            // the projection while preserving independently owned siblings.
+            try removeStoredValue(at: path)
+            return retained
+        }
+        withExtendedLifetime(retained) {}
     }
 
     func store(
@@ -268,6 +320,104 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
             storage = completed
             partialStorage.removeAll(keepingCapacity: false)
         }
+    }
+
+    /// Called only while `lock` is held. A projected take decomposes the
+    /// nearest initialized aggregate into independently owned sibling fields.
+    private func removeStoredValue(at path: [UInt32]) throws {
+        if path.isEmpty {
+            storage = nil
+            partialStorage.removeAll(keepingCapacity: true)
+            return
+        }
+        guard let storageShape else {
+            throw VM.RuntimeTrap.invalidAddressProjection
+        }
+        _ = try Self.storageShape(at: path[...], in: storageShape)
+        if let storage {
+            let fragments = try Self.fragments(
+                of: storage,
+                shape: storageShape,
+                at: [],
+                removing: path
+            )
+            self.storage = nil
+            partialStorage = fragments
+            return
+        }
+        if let ancestor = Self.closestStoredAncestor(
+            of: path,
+            values: partialStorage
+        ), let value = partialStorage[ancestor] {
+            let shape = try Self.storageShape(
+                at: ancestor[...],
+                in: storageShape
+            )
+            let fragments = try Self.fragments(
+                of: value,
+                shape: shape,
+                at: ancestor,
+                removing: path
+            )
+            for fragmentPath in fragments.keys where fragmentPath != ancestor {
+                guard partialStorage[fragmentPath] == nil else {
+                    throw VM.RuntimeTrap.addressAlreadyInitialized
+                }
+            }
+            partialStorage.removeValue(forKey: ancestor)
+            for (fragmentPath, fragment) in fragments {
+                partialStorage[fragmentPath] = fragment
+            }
+            return
+        }
+        partialStorage = partialStorage.filter {
+            !Self.contains(path, $0.key)
+        }
+    }
+
+    private static func fragments(
+        of value: VM.Value,
+        shape: VM.StorageShape,
+        at path: [UInt32],
+        removing removedPath: [UInt32]
+    ) throws -> [[UInt32]: VM.Value] {
+        if path == removedPath { return [:] }
+        guard contains(path, removedPath) else { return [path: value] }
+
+        let children: [VM.Value]
+        let childShapes: [VM.StorageShape]
+        switch (value, shape) {
+        case let (.tuple(values), .tuple(shapes))
+        where values.count == shapes.count:
+            children = values
+            childShapes = shapes
+        case let (.structure(valueKey, fields), .structure(shapeKey, shapes))
+        where valueKey == shapeKey && fields.count == shapes.count:
+            children = fields
+            childShapes = shapes
+        default:
+            throw VM.RuntimeTrap.invalidAddressProjection
+        }
+
+        var result: [[UInt32]: VM.Value] = [:]
+        for index in children.indices {
+            guard let field = UInt32(exactly: index) else {
+                throw VM.RuntimeTrap.invalidAddressProjection
+            }
+            let childPath = path + [field]
+            let childFragments = try fragments(
+                of: children[index],
+                shape: childShapes[index],
+                at: childPath,
+                removing: removedPath
+            )
+            for (fragmentPath, fragment) in childFragments {
+                guard result.updateValue(fragment, forKey: fragmentPath) == nil else {
+                    throw VM.RuntimeTrap.addressAlreadyInitialized
+                }
+            }
+        }
+        return result
     }
 
     private func activeAccess(
@@ -478,6 +628,25 @@ public struct Address: Hashable, @unchecked Sendable, CustomStringConvertible {
     func read() throws -> VM.Value {
         guard let token else { throw VM.RuntimeTrap.inactiveAddressAccess }
         return try cell.read(path: path, token: token)
+    }
+
+    func take() throws -> VM.Value {
+        guard let token else { throw VM.RuntimeTrap.inactiveAddressAccess }
+        return try cell.take(path: path, token: token)
+    }
+
+    func projectedRemovalWork() throws -> Int {
+        guard let token else { throw VM.RuntimeTrap.inactiveAddressAccess }
+        return try cell.projectedRemovalWork(path: path, token: token)
+    }
+
+    func destroy(ifInitialized: Bool) throws {
+        guard let token else { throw VM.RuntimeTrap.inactiveAddressAccess }
+        try cell.destroy(
+            path: path,
+            token: token,
+            ifInitialized: ifInitialized
+        )
     }
 
     func store(_ value: VM.Value, mode: Bytecode.StackStoreMode) throws {

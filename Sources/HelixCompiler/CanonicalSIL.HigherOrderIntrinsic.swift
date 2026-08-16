@@ -1,3 +1,5 @@
+import HelixBytecode
+
 extension CanonicalSIL {
 enum HigherOrderIntrinsic: Equatable {
     case map
@@ -9,7 +11,9 @@ enum HigherOrderIntrinsic: Equatable {
     case reduce
     case forEach
     case firstWhere
+    case lastWhere
     case firstIndexWhere
+    case lastIndexWhere
     case containsWhere
     case allSatisfy
 
@@ -17,8 +21,9 @@ enum HigherOrderIntrinsic: Equatable {
         switch self {
         case .map, .flatMap, .filter, .compactMap, .prefixWhile, .dropWhile:
             true
-        case .reduce, .forEach, .firstWhere, .firstIndexWhere,
-             .containsWhere, .allSatisfy:
+        case .reduce, .forEach, .firstWhere, .lastWhere,
+             .firstIndexWhere, .lastIndexWhere, .containsWhere,
+             .allSatisfy:
             false
         }
     }
@@ -27,11 +32,23 @@ enum HigherOrderIntrinsic: Equatable {
     /// operation uses it again after the closure returns.
     var retainsInputAfterCall: Bool {
         switch self {
-        case .filter, .firstWhere, .prefixWhile, .dropWhile:
+        case .filter, .firstWhere, .lastWhere, .prefixWhile, .dropWhile:
             true
         case .map, .flatMap, .compactMap, .reduce, .forEach,
-             .firstIndexWhere, .containsWhere, .allSatisfy:
+             .firstIndexWhere, .lastIndexWhere, .containsWhere,
+             .allSatisfy:
             false
+        }
+    }
+
+    var traversalDirection: Bytecode.ArrayTraversalDirection {
+        switch self {
+        case .lastWhere, .lastIndexWhere:
+            .reverse
+        case .map, .flatMap, .filter, .compactMap, .prefixWhile,
+             .dropWhile, .reduce, .forEach, .firstWhere,
+             .firstIndexWhere, .containsWhere, .allSatisfy:
+            .forward
         }
     }
 }

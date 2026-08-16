@@ -100,8 +100,12 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .higherOrder(.forEach)
         case "$sSTsE5first5where7ElementQzSgSbADKXE_tKF":
             self = .higherOrder(.firstWhere)
+        case "$sSKsE4last5where7ElementQzSgSbADKXE_tKF":
+            self = .higherOrder(.lastWhere)
         case "$sSlsE10firstIndex5where0B0QzSgSb7ElementQzKXE_tKF":
             self = .higherOrder(.firstIndexWhere)
+        case "$sSKsE9lastIndex5where0B0QzSgSb7ElementQzKXE_tKF":
+            self = .higherOrder(.lastIndexWhere)
         case "$sSTsE8contains5whereS2b7ElementQzKXE_tKF":
             self = .higherOrder(.containsWhere)
         case "$sSTsE10allSatisfyyS2b7ElementQzKXEKF":

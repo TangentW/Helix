@@ -1,5 +1,6 @@
 import HelixBytecode
 import HelixCore
+import HelixVM
 import Testing
 @testable import HelixCompiler
 
@@ -75,6 +76,55 @@ struct StorageInitialization {
         )
         #expect(lowered.blocks.flatMap(\.instructions).contains {
             if case .destroyStackIfInitialized = $0 { return true }
+            return false
+        })
+    }
+
+    @Test("A conditional projected lifetime lowers to address-local cleanup")
+    func lowersConditionalProjectedDestroy() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let body = """
+        bb0(%0 : @owned $NSObject, %1 : $Bool):
+          %2 = alloc_stack $(NSObject, Int)
+          %3 = tuple_element_addr %2, 0
+          cond_br %1, bb1, bb2
+        bb1:
+          store %0 to [init] %3
+          br bb3
+        bb2:
+          destroy_value %0
+          br bb3
+        bb3:
+          destroy_addr %3
+          dealloc_stack %2
+          %4 = tuple ()
+          return %4
+        """
+        let plan = try CanonicalSIL.StorageInitialization.analyze(
+            body: body,
+            directCalls: .empty,
+            typeEnvironment: environment
+        )
+        #expect(plan.runtimeStorageRoots == ["%2"])
+        #expect(plan.conditionalDestroyLines.count == 1)
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture27conditionalProjectedStorageyySo8NSObjectC_SbtF",
+                loweredType: "@convention(thin) (@owned NSObject, Bool) -> ()",
+                body: body
+            ),
+            displayName: "conditionalProjectedStorage"
+        )
+        #expect(lowered.blocks.flatMap(\.instructions).contains {
+            if case .destroyAddressIfInitialized = $0 { return true }
             return false
         })
     }
@@ -593,6 +643,337 @@ struct StorageInitialization {
                 typeEnvironment: .empty
             )
         }
+    }
+
+    @Test("An inout application preserves initialized local storage")
+    func tracksInitializedInoutApplicationArguments() throws {
+        let plan = try CanonicalSIL.StorageInitialization.analyze(
+            body: """
+            bb0(%0 : $Int):
+              %1 = alloc_stack $Int
+              store %0 to %1
+              %2 = function_ref @$s7Fixture6modifyyySizF : $@convention(thin) (@inout_aliasable Int) -> ()
+              %3 = apply %2(%1) : $@convention(thin) (@inout_aliasable Int) -> ()
+              %4 = load [take] %1
+              dealloc_stack %1
+              return %4
+            """,
+            directCalls: .empty,
+            typeEnvironment: .empty
+        )
+
+        #expect(plan.runtimeStorageRoots.isEmpty)
+    }
+
+    @Test("An inout application rejects uninitialized local storage")
+    func rejectsUninitializedInoutApplicationArguments() {
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.StorageInitialization.analyze(
+                body: """
+                bb0:
+                  %0 = alloc_stack $Int
+                  %1 = function_ref @$s7Fixture6modifyyySizF : $@convention(thin) (@inout Int) -> ()
+                  %2 = apply %1(%0) : $@convention(thin) (@inout Int) -> ()
+                  dealloc_stack %0
+                  %3 = tuple ()
+                  return %3
+                """,
+                directCalls: .empty,
+                typeEnvironment: .empty
+            )
+        }
+    }
+
+    @Test("Direct calls reject overlapping inout storage")
+    func rejectsOverlappingInoutApplicationArguments() throws {
+        let symbol = "$s7Fixture6mutateyySiz_SiztF"
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.address(.int64), .address(.int64)],
+                resultType: .void,
+                target: .function(.init(rawValue: 1))
+            ),
+        ])
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture3runyS2iF",
+            loweredType: "@convention(thin) (Int) -> Int",
+            body: """
+            bb0(%0 : $Int):
+              %1 = alloc_stack $Int
+              store %0 to %1
+              %2 = function_ref @\(symbol) : $@convention(thin) (@inout Int, @inout Int) -> ()
+              %3 = apply %2(%1, %1) : $@convention(thin) (@inout Int, @inout Int) -> ()
+              %4 = load [take] %1
+              dealloc_stack %1
+              return %4
+            """
+        )
+
+        do {
+            _ = try CanonicalSIL.Lowerer().lower(
+                function,
+                displayName: "Fixture.run",
+                directCalls: calls
+            )
+            Issue.record("overlapping inout arguments unexpectedly lowered")
+        } catch let error as CanonicalSIL.LoweringError {
+            #expect(error.description.contains("overlapping inout arguments"))
+        }
+    }
+
+    @Test("An inout mutation reconstructs a destructively projected enum")
+    func tracksInoutDetachedEnumPayloadWriteback() throws {
+        let plan = try CanonicalSIL.StorageInitialization.analyze(
+            body: """
+            bb0(%0 : @owned $Optional<Int>):
+              %1 = alloc_stack $Optional<Int>
+              store %0 to %1
+              %2 = unchecked_take_enum_data_addr %1, #Optional.some!enumelt
+              %3 = function_ref @$s7Fixture6modifyyySizF : $@convention(thin) (@inout Int) -> ()
+              %4 = apply %3(%2) : $@convention(thin) (@inout Int) -> ()
+              %5 = load [take] %1
+              dealloc_stack %1
+              return %5
+            """,
+            directCalls: .empty,
+            typeEnvironment: .empty
+        )
+
+        #expect(plan.detachedPayloadUses["%2"] == .modify)
+    }
+
+    @Test("Detached enum payload effects follow their physical consumers")
+    func classifiesDetachedEnumPayloadConsumers() throws {
+        let read = try CanonicalSIL.StorageInitialization.analyze(
+            body: """
+            bb0(%0 : @owned $Optional<Int>):
+              %1 = alloc_stack $Optional<Int>
+              store %0 to %1
+              %2 = unchecked_take_enum_data_addr %1, #Optional.some!enumelt
+              %3 = load [trivial] %2
+              %4 = load [take] %1
+              dealloc_stack %1
+              return %4
+            """,
+            directCalls: .empty,
+            typeEnvironment: .empty
+        )
+        let take = try CanonicalSIL.StorageInitialization.analyze(
+            body: """
+            bb0(%0 : @owned $Optional<Int>):
+              %1 = alloc_stack $Optional<Int>
+              store %0 to %1
+              %2 = unchecked_take_enum_data_addr %1, #Optional.some!enumelt
+              %3 = load [take] %2
+              dealloc_stack %1
+              return %3
+            """,
+            directCalls: .empty,
+            typeEnvironment: .empty
+        )
+
+        #expect(read.detachedPayloadUses["%2"] == .read)
+        #expect(take.detachedPayloadUses["%2"] == .take)
+    }
+
+    @Test("Detached payloads reject mixed take and modify lifetimes")
+    func rejectsMixedDetachedEnumPayloadConsumers() {
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.StorageInitialization.analyze(
+                body: """
+                bb0(%0 : @owned $Optional<Int>, %1 : $Int):
+                  %2 = alloc_stack $Optional<Int>
+                  store %0 to %2
+                  %3 = unchecked_take_enum_data_addr %2, #Optional.some!enumelt
+                  store %1 to %3
+                  %4 = load [take] %3
+                  dealloc_stack %2
+                  return %4
+                """,
+                directCalls: .empty,
+                typeEnvironment: .empty
+            )
+        }
+    }
+
+    @Test("Projected Optional writes rebuild nested patch-local aggregates")
+    func executesProjectedOptionalAggregateWriteback() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            struct Leaf {
+                var value: Int
+            }
+
+            struct Payload {
+                var value: Int
+                var leaf: Leaf
+            }
+
+            public func updateOptional(
+                _ seed: Int,
+                present: Bool
+            ) -> (Int?, Int?) {
+                var payload = present
+                    ? Payload(value: seed, leaf: Leaf(value: seed))
+                    : nil
+                payload?.value = 7
+                payload?.leaf.value = 8
+                return (payload?.value, payload?.leaf.value)
+            }
+            """,
+            functionName: "updateOptional",
+            moduleName: "HelixAggregateWriteback"
+        )
+        let seed = VM.Value.integer(
+            try .init(signed: 3, bitWidth: 64, isSigned: true)
+        )
+        let seven = VM.Value.integer(
+            try .init(signed: 7, bitWidth: 64, isSigned: true)
+        )
+        let eight = VM.Value.integer(
+            try .init(signed: 8, bitWidth: 64, isSigned: true)
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [seed, .bool(true)]
+            ) == .returned(
+                .tuple([.optional(seven), .optional(eight)])
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [seed, .bool(false)]
+            ) == .returned(
+                .tuple([.optional(nil), .optional(nil)])
+            )
+        )
+    }
+
+    @Test("Nested Optional fields support ordinary mutating helpers")
+    func executesProjectedOptionalMutatingHelpers() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            struct Counter {
+                var value: Int
+
+                mutating func add(_ delta: Int) {
+                    value += delta
+                }
+            }
+
+            struct Payload {
+                var first: Counter
+                var second: Counter
+            }
+
+            public func mutateOptional(
+                _ seed: Int,
+                present: Bool
+            ) -> (Int?, Int?) {
+                var payload = present
+                    ? Payload(
+                        first: Counter(value: seed),
+                        second: Counter(value: seed)
+                    )
+                    : nil
+                payload?.first.add(2)
+                payload?.second.add(3)
+                return (payload?.first.value, payload?.second.value)
+            }
+            """,
+            functionName: "mutateOptional",
+            moduleName: "HelixMutatingHelpers"
+        )
+        let seed = VM.Value.integer(
+            try .init(signed: 5, bitWidth: 64, isSigned: true)
+        )
+        let seven = VM.Value.integer(
+            try .init(signed: 7, bitWidth: 64, isSigned: true)
+        )
+        let eight = VM.Value.integer(
+            try .init(signed: 8, bitWidth: 64, isSigned: true)
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [seed, .bool(true)]
+            ) == .returned(
+                .tuple([.optional(seven), .optional(eight)])
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [seed, .bool(false)]
+            ) == .returned(
+                .tuple([.optional(nil), .optional(nil)])
+            )
+        )
+    }
+
+    @Test("Disjoint inout fields rebuild their ordinary aggregate")
+    func executesDisjointCompilerInoutWriteback() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            struct Counter {
+                var value: Int
+            }
+
+            struct Payload {
+                var first: Counter
+                var second: Counter
+            }
+
+            private func update(
+                _ first: inout Counter,
+                _ second: inout Counter
+            ) {
+                first.value += 2
+                second.value += 3
+            }
+
+            public func mutateFields(_ seed: Int) -> (Int, Int) {
+                var payload = Payload(
+                    first: Counter(value: seed),
+                    second: Counter(value: seed)
+                )
+                update(&payload.first, &payload.second)
+                let snapshot = payload
+                return (snapshot.first.value, snapshot.second.value)
+            }
+            """,
+            functionName: "mutateFields",
+            moduleName: "HelixDisjointInoutWriteback"
+        )
+        let seed = VM.Value.integer(
+            try .init(signed: 5, bitWidth: 64, isSigned: true)
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [seed]
+            ) == .returned(
+                .tuple([
+                    .integer(
+                        try .init(signed: 7, bitWidth: 64, isSigned: true)
+                    ),
+                    .integer(
+                        try .init(signed: 8, bitWidth: 64, isSigned: true)
+                    ),
+                ])
+            )
+        )
     }
 
     @Test("A runtime-backed @in argument transfers with take semantics")

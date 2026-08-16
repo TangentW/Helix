@@ -84,6 +84,11 @@ Both workflows depend on stable, build-specific identities:
   Scalar appends and bounded whole-Array appends share the same verifier-owned
   element type and precharge copied storage before allocation; this supports
   Sequence-returning `flatMap` without an intermediate nested Array.
+- Array-backed predicate traversal uses one direction-aware cursor operation.
+  Forward cursors hold the next index and reverse cursors hold an exclusive
+  upper bound, so both directions preserve Swift's predicate order without
+  importing a collection iterator ABI. The VM rejects cursors outside the
+  closed `0...count` boundary instead of treating corrupt state as exhaustion.
 - A closure signature carries an ownership convention for every invocation
   parameter. The compiler preserves concrete Swift `@in_guaranteed` inputs as
   borrowed VM values, materializes copies only at owned boundaries, and the
@@ -94,8 +99,29 @@ Both workflows depend on stable, build-specific identities:
   shape. The compiler promotes multi-block lifetimes, classifies
   initialize/assign/replace and conditional cleanup, and the Verifier computes
   definitely-versus-possibly initialized leaves at CFG joins. Reads remain
-  definite-only; runtime shape allocation and partial storage are charged to
-  the invocation budget.
+  definite-only. Optional case evidence uses the same root-plus-field-path
+  identity and remains block-local; writes, takes, and destruction invalidate
+  every overlapping fact. A frame-local projected take or destroy deinitializes
+  only its exact leaves and preserves sibling ownership, while caller-owned and
+  object storage are rejected without a writeback contract. Runtime shape
+  allocation and partial storage are charged to the invocation budget;
+  projected decomposition precharges its shape-bounded linear work before any
+  storage mutation.
+- Address effects at calls come from the specialized physical SIL function
+  type rather than an API allowlist: `@in` consumes initialized storage,
+  `@inout`/`@inout_aliasable` requires and preserves initialization, and
+  indirect results initialize only on their declared continuation. Likewise,
+  an `unchecked_take_enum_data_addr` projection is classified by its actual
+  consumers. Read-only loads retain the parent Optional, consuming uses take
+  it, and mutation rebuilds the changed tuple/local-struct spine before writing
+  the Optional back. A nonthrowing compiler-only `inout` argument is
+  materialized into verified temporary address storage and routed through that
+  same writeback path after the call; overlapping projections are rejected.
+  Compiler-proven static accesses to frame-local aggregates are narrowed to
+  their eventual operation or field projection, so disjoint sibling `inout`
+  arguments retain independent VM exclusivity scopes.
+  Mixed destructive and modifying lifetimes fail closed, as does a throwing
+  compiler-only `inout` call until writeback on both continuations is modeled.
 - Activation materializes inherited routes into a self-contained snapshot. The
   registry normally retains only the active snapshot and its direct rollback
   predecessor; older snapshots remain alive only while a lease pins them. A

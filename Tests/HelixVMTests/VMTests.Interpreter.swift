@@ -3034,6 +3034,148 @@ struct Interpreter {
         )
     }
 
+    @Test("Array cursors traverse both directions and reject corrupt bounds")
+    func executesDirectionalArrayTraversal() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let optionalType = Bytecode.ValueType.optional(.int64)
+
+        func function(
+            direction: Bytecode.ArrayTraversalDirection,
+            fixedCursor: Int64?
+        ) -> Bytecode.Function {
+            var instructions: [Bytecode.Instruction] = []
+            if let fixedCursor {
+                instructions.append(
+                    .constantInteger(
+                        result: .init(rawValue: 1),
+                        bitPattern: UInt64(bitPattern: fixedCursor)
+                    )
+                )
+            } else {
+                instructions.append(
+                    .arrayCount(
+                        result: .init(rawValue: 1),
+                        array: .init(rawValue: 0)
+                    )
+                )
+            }
+            instructions.append(contentsOf: [
+                .storeStack(
+                    slot: .init(rawValue: 0),
+                    source: .init(rawValue: 1),
+                    mode: .initialize
+                ),
+                .arrayNext(
+                    result: .init(rawValue: 2),
+                    array: .init(rawValue: 0),
+                    indexSlot: .init(rawValue: 0),
+                    direction: direction
+                ),
+                .destroyStack(.init(rawValue: 0)),
+                .returnValue(.init(rawValue: 2)),
+            ])
+            return .init(
+                id: .init(rawValue: 0),
+                name: "directionalArrayTraversal",
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: optionalType,
+                registerTypes: [arrayType, .int64, optionalType],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: instructions
+                    ),
+                ],
+                stackSlotTypes: [.int64]
+            )
+        }
+
+        func image(
+            direction: Bytecode.ArrayTraversalDirection,
+            fixedCursor: Int64?
+        ) throws -> Verification.Image {
+            try makeVerified(
+                function: function(
+                    direction: direction,
+                    fixedCursor: fixedCursor
+                ),
+                capabilities: [.baselineV1, .collectionsV1],
+                signature: .init(
+                    parameters: ["Swift.Array<Swift.Int>"],
+                    result: "Swift.Optional<Swift.Int>"
+                ),
+                parameterTypes: [arrayType],
+                resultType: optionalType
+            )
+        }
+
+        let first = VM.Value.integer(
+            try .init(signed: 3, bitWidth: 64, isSigned: true)
+        )
+        let last = VM.Value.integer(
+            try .init(signed: 5, bitWidth: 64, isSigned: true)
+        )
+        let values = VM.Value.array([first, last], elementType: .int64)
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(direction: .forward, fixedCursor: 0),
+                arguments: [values]
+            ) == .returned(.optional(first))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(direction: .reverse, fixedCursor: nil),
+                arguments: [values]
+            ) == .returned(.optional(last))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(direction: .reverse, fixedCursor: nil),
+                arguments: [.array([], elementType: .int64)]
+            ) == .returned(.optional(nil))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(direction: .forward, fixedCursor: 2),
+                arguments: [values]
+            ) == .returned(.optional(nil))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(direction: .reverse, fixedCursor: 0),
+                arguments: [values]
+            ) == .returned(.optional(nil))
+        )
+        for direction in [
+            Bytecode.ArrayTraversalDirection.forward, .reverse,
+        ] {
+            for invalidCursor: Int64 in [-1, 3] {
+                #expect(
+                    VM.Interpreter().invoke(
+                        entry: .init(rawValue: 0),
+                        image: try image(
+                            direction: direction,
+                            fixedCursor: invalidCursor
+                        ),
+                        arguments: [values]
+                    ) == .trapped(
+                        .arrayIndexOutOfBounds(
+                            index: invalidCursor,
+                            count: 2
+                        )
+                    )
+                )
+            }
+        }
+    }
+
     @Test("Mutable capture projections update their enclosing local value")
     func executesProjectedMutableCapture() throws {
         let key = Bytecode.LocalTypeKey(rawValue: "Fixture.Pair")

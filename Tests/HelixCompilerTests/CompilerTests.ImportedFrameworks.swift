@@ -975,6 +975,193 @@ struct ImportedFrameworks {
         }
     }
 
+    @Test("Optional case facts remain field-sensitive across tuple projections")
+    func rejectsSiblingOptionalCaseLeakage() throws {
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7consumeyySiSg_AEtF",
+            loweredType: "@convention(thin) (Optional<Int>, Optional<Int>) -> ()",
+            body: """
+            bb0(%0 : $Optional<Int>, %1 : $Optional<Int>):
+              %2 = alloc_stack $(Optional<Int>, Optional<Int>)
+              %3 = tuple_element_addr %2, 0
+              %4 = tuple_element_addr %2, 1
+              store %0 to %3
+              store %1 to %4
+              switch_enum_addr %3, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
+            bb1:
+              %5 = unchecked_take_enum_data_addr %4, #Optional.some!enumelt
+              %6 = load [take] %5
+              dealloc_stack %2
+              %7 = tuple ()
+              return %7
+            bb2:
+              destroy_addr %3
+              destroy_addr %4
+              dealloc_stack %2
+              %8 = tuple ()
+              return %8
+            """
+        )
+
+        do {
+            _ = try CanonicalSIL.Lowerer().lower(
+                function,
+                displayName: "Fixture.consume"
+            )
+            Issue.record("a sibling Optional inherited the wrong case fact")
+        } catch let error as CanonicalSIL.LoweringError {
+            #expect(error.description.contains("not dominated by its some edge"))
+        }
+    }
+
+    @Test("Aggregate writes invalidate projected Optional case evidence")
+    func rejectsStaleOptionalCaseAfterAggregateWrite() throws {
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7consumeyySiSg_AEtF",
+            loweredType: "@convention(thin) (Optional<Int>, Optional<Int>) -> ()",
+            body: """
+            bb0(%0 : $Optional<Int>, %1 : $Optional<Int>):
+              %2 = alloc_stack $(Optional<Int>, Optional<Int>)
+              %3 = tuple_element_addr %2, 0
+              %4 = tuple_element_addr %2, 1
+              store %0 to %3
+              store %1 to %4
+              switch_enum_addr %3, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
+            bb1:
+              %5 = enum $Optional<Int>, #Optional.none!enumelt
+              %6 = tuple (%5, %1)
+              store %6 to [assign] %2
+              %7 = unchecked_take_enum_data_addr %3, #Optional.some!enumelt
+              %8 = load [take] %7
+              dealloc_stack %2
+              %9 = tuple ()
+              return %9
+            bb2:
+              destroy_addr %3
+              destroy_addr %4
+              dealloc_stack %2
+              %10 = tuple ()
+              return %10
+            """
+        )
+
+        do {
+            _ = try CanonicalSIL.Lowerer().lower(
+                function,
+                displayName: "Fixture.consume"
+            )
+            Issue.record("an aggregate overwrite retained a stale case fact")
+        } catch let error as CanonicalSIL.LoweringError {
+            #expect(error.description.contains("not dominated by its some edge"))
+        }
+    }
+
+    @Test("Sibling writes preserve an independent Optional case proof")
+    func preservesOptionalCaseAcrossSiblingWrite() throws {
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7consumeyySiSg_AEtF",
+            loweredType: "@convention(thin) (Optional<Int>, Optional<Int>) -> ()",
+            body: """
+            bb0(%0 : $Optional<Int>, %1 : $Optional<Int>):
+              %2 = alloc_stack $(Optional<Int>, Optional<Int>)
+              %3 = tuple_element_addr %2, 0
+              %4 = tuple_element_addr %2, 1
+              store %0 to %3
+              store %1 to %4
+              switch_enum_addr %3, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
+            bb1:
+              store %1 to [assign] %4
+              %5 = unchecked_take_enum_data_addr %3, #Optional.some!enumelt
+              %6 = load [take] %5
+              destroy_value %6
+              destroy_addr %4
+              dealloc_stack %2
+              %7 = tuple ()
+              return %7
+            bb2:
+              destroy_addr %3
+              destroy_addr %4
+              dealloc_stack %2
+              %8 = tuple ()
+              return %8
+            """
+        )
+
+        _ = try CanonicalSIL.Lowerer().lower(
+            function,
+            displayName: "Fixture.consume"
+        )
+    }
+
+    @Test("Patch-local struct fields keep independent Optional case facts")
+    func isolatesOptionalCaseFactsAcrossLocalStructFields() throws {
+        let file = try CanonicalSIL.File(text: """
+        struct Pair {
+          @_hasStorage var first: Optional<Int>
+          @_hasStorage var second: Optional<Int>
+        }
+
+        sil @$s7Fixture3badyySiSg_AEtF : $@convention(thin) (Optional<Int>, Optional<Int>) -> () {
+        bb0(%0 : $Optional<Int>, %1 : $Optional<Int>):
+          %2 = alloc_stack $Pair
+          %3 = struct_element_addr %2, #Pair.first
+          %4 = struct_element_addr %2, #Pair.second
+          store %0 to %3
+          store %1 to %4
+          switch_enum_addr %3, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
+        bb1:
+          %5 = unchecked_take_enum_data_addr %4, #Optional.some!enumelt
+          %6 = load [take] %5
+          destroy_value %6
+          destroy_addr %3
+          dealloc_stack %2
+          %7 = tuple ()
+          return %7
+        bb2:
+          destroy_addr %3
+          destroy_addr %4
+          dealloc_stack %2
+          %8 = tuple ()
+          return %8
+        } // end sil function '$s7Fixture3badyySiSg_AEtF'
+
+        sil @$s7Fixture4goodyySiSg_AEtF : $@convention(thin) (Optional<Int>, Optional<Int>) -> () {
+        bb0(%0 : $Optional<Int>, %1 : $Optional<Int>):
+          %2 = alloc_stack $Pair
+          %3 = struct_element_addr %2, #Pair.first
+          %4 = struct_element_addr %2, #Pair.second
+          store %0 to %3
+          store %1 to %4
+          switch_enum_addr %3, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
+        bb1:
+          store %1 to [assign] %4
+          %5 = unchecked_take_enum_data_addr %3, #Optional.some!enumelt
+          %6 = load [take] %5
+          destroy_value %6
+          destroy_addr %4
+          dealloc_stack %2
+          %7 = tuple ()
+          return %7
+        bb2:
+          destroy_addr %3
+          destroy_addr %4
+          dealloc_stack %2
+          %8 = tuple ()
+          return %8
+        } // end sil function '$s7Fixture4goodyySiSg_AEtF'
+        """)
+        let bad = try file.uniqueFunction(mangledNameContaining: "3bad")
+        let good = try file.uniqueFunction(mangledNameContaining: "4good")
+        let lowerer = CanonicalSIL.Lowerer(
+            typeEnvironment: file.typeEnvironment
+        )
+
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try lowerer.lower(bad, displayName: "Fixture.bad")
+        }
+        _ = try lowerer.lower(good, displayName: "Fixture.good")
+    }
+
     @Test("Frozen bridge pseudo-symbols include the exact physical ABI")
     func derivesStableExactForeignSymbols() {
         let reference = "#UILabel.text!setter.foreign"

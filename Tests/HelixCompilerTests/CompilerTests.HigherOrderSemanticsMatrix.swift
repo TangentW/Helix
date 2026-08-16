@@ -1283,6 +1283,14 @@ struct HigherOrderSemanticsMatrix {
             values.firstIndex { _ in true }
         }
 
+        public func lastObject(_ values: [NSObject]) -> NSObject? {
+            values.last { _ in true }
+        }
+
+        public func lastObjectIndex(_ values: [NSObject]) -> Int? {
+            values.lastIndex { _ in true }
+        }
+
         public func containsObject(_ values: [NSObject]) -> Bool {
             values.contains { _ in true }
         }
@@ -1356,7 +1364,7 @@ struct HigherOrderSemanticsMatrix {
             "mappedObjects", "flatMappedObjects", "filteredObjects",
             "compactedObjects", "prefixedObjects", "droppedObjects",
             "reducedObject", "firstObject", "firstObjectIndex",
-            "containsObject",
+            "lastObject", "lastObjectIndex", "containsObject",
             "visitsObjects", "optionalMappedObject",
             "optionalFlatMappedObject",
             "optionalThrowingFlatMappedObject",

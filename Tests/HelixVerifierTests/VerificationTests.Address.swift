@@ -267,6 +267,274 @@ struct AddressSemantics {
         }
     }
 
+    @Test("Projected takes require local modify access and consume only one field")
+    func verifiesProjectedTake() throws {
+        let tuple = Bytecode.ValueType.tuple([.int64, .int64])
+
+        func projectedTake(
+            id: UInt32,
+            accessKind: Bytecode.AccessKind
+        ) -> Bytecode.Function {
+            .init(
+                id: .init(rawValue: id),
+                name: "projectedTake",
+                parameterRegisters: [],
+                resultType: .void,
+                registerTypes: [
+                    .int64, .int64, tuple, .address(tuple),
+                    .address(.int64), .address(.int64), .int64,
+                    .address(.int64), .address(.int64), .int64,
+                ],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        instructions: [
+                            .constantInteger(
+                                result: .init(rawValue: 0),
+                                bitPattern: 1
+                            ),
+                            .constantInteger(
+                                result: .init(rawValue: 1),
+                                bitPattern: 2
+                            ),
+                            .makeTuple(
+                                result: .init(rawValue: 2),
+                                elements: [
+                                    .init(rawValue: 0), .init(rawValue: 1),
+                                ]
+                            ),
+                            .storeStack(
+                                slot: .init(rawValue: 0),
+                                source: .init(rawValue: 2),
+                                mode: .initialize
+                            ),
+                            .stackAddress(
+                                result: .init(rawValue: 3),
+                                slot: .init(rawValue: 0)
+                            ),
+                            .projectAggregateAddress(
+                                result: .init(rawValue: 4),
+                                base: .init(rawValue: 3),
+                                fieldIndex: 0
+                            ),
+                            .beginAccess(
+                                result: .init(rawValue: 5),
+                                address: .init(rawValue: 4),
+                                kind: accessKind
+                            ),
+                            .loadAddress(
+                                result: .init(rawValue: 6),
+                                address: .init(rawValue: 5),
+                                mode: .take
+                            ),
+                            .endAccess(.init(rawValue: 5)),
+                            .projectAggregateAddress(
+                                result: .init(rawValue: 7),
+                                base: .init(rawValue: 3),
+                                fieldIndex: 1
+                            ),
+                            .beginAccess(
+                                result: .init(rawValue: 8),
+                                address: .init(rawValue: 7),
+                                kind: .modify
+                            ),
+                            .loadAddress(
+                                result: .init(rawValue: 9),
+                                address: .init(rawValue: 8),
+                                mode: .take
+                            ),
+                            .endAccess(.init(rawValue: 8)),
+                            .returnValue(nil),
+                        ]
+                    ),
+                ],
+                stackSlotTypes: [tuple]
+            )
+        }
+
+        _ = try verify(
+            additionalFunctions: [
+                projectedTake(id: 1, accessKind: .modify),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(
+                additionalFunctions: [
+                    projectedTake(id: 1, accessKind: .read),
+                ]
+            )
+        }
+
+        let callerOwnedTake = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "callerOwnedTake",
+            parameterRegisters: [.init(rawValue: 0)],
+            parameterConventions: [.inout],
+            resultType: .void,
+            registerTypes: [.address(.int64), .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .loadAddress(
+                            result: .init(rawValue: 1),
+                            address: .init(rawValue: 0),
+                            mode: .take
+                        ),
+                        .returnValue(nil),
+                    ]
+                ),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [callerOwnedTake])
+        }
+    }
+
+    @Test("Projected destroy requires local modify access and exact initialization")
+    func verifiesProjectedDestroy() throws {
+        let tuple = Bytecode.ValueType.tuple([.int64, .int64])
+
+        func projectedDestroy(
+            id: UInt32,
+            accessKind: Bytecode.AccessKind,
+            conditional: Bool
+        ) -> Bytecode.Function {
+            let destroy: Bytecode.Instruction = conditional
+                ? .destroyAddressIfInitialized(.init(rawValue: 4))
+                : .destroyAddress(.init(rawValue: 4))
+            return .init(
+                id: .init(rawValue: id),
+                name: "projectedDestroy",
+                parameterRegisters: [],
+                resultType: .void,
+                registerTypes: [
+                    .int64, .address(tuple), .address(.int64),
+                    .address(.int64), .address(.int64),
+                ],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        instructions: [
+                            .constantInteger(
+                                result: .init(rawValue: 0),
+                                bitPattern: 1
+                            ),
+                            .stackAddress(
+                                result: .init(rawValue: 1),
+                                slot: .init(rawValue: 0)
+                            ),
+                            .projectAggregateAddress(
+                                result: .init(rawValue: 2),
+                                base: .init(rawValue: 1),
+                                fieldIndex: 0
+                            ),
+                            .beginAccess(
+                                result: .init(rawValue: 3),
+                                address: .init(rawValue: 2),
+                                kind: .modify
+                            ),
+                            .storeAddress(
+                                address: .init(rawValue: 3),
+                                source: .init(rawValue: 0),
+                                mode: .initialize
+                            ),
+                            .endAccess(.init(rawValue: 3)),
+                            .beginAccess(
+                                result: .init(rawValue: 4),
+                                address: .init(rawValue: 2),
+                                kind: accessKind
+                            ),
+                            destroy,
+                            .endAccess(.init(rawValue: 4)),
+                            .returnValue(nil),
+                        ]
+                    ),
+                ],
+                stackSlotTypes: [tuple]
+            )
+        }
+
+        _ = try verify(
+            additionalFunctions: [
+                projectedDestroy(
+                    id: 1,
+                    accessKind: .modify,
+                    conditional: false
+                ),
+            ]
+        )
+        _ = try verify(
+            additionalFunctions: [
+                projectedDestroy(
+                    id: 1,
+                    accessKind: .modify,
+                    conditional: true
+                ),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(
+                additionalFunctions: [
+                    projectedDestroy(
+                        id: 1,
+                        accessKind: .read,
+                        conditional: true
+                    ),
+                ]
+            )
+        }
+
+        let callerOwned = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "callerOwnedDestroy",
+            parameterRegisters: [.init(rawValue: 0)],
+            parameterConventions: [.inout],
+            resultType: .void,
+            registerTypes: [.address(.int64)],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .destroyAddressIfInitialized(.init(rawValue: 0)),
+                        .returnValue(nil),
+                    ]
+                ),
+            ]
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [callerOwned])
+        }
+
+        let definitelyUninitialized = projectedDestroy(
+            id: 1,
+            accessKind: .modify,
+            conditional: false
+        )
+        var invalidBlocks = definitelyUninitialized.blocks
+        invalidBlocks[0].instructions.remove(at: 4)
+        let invalid = Bytecode.Function(
+            id: definitelyUninitialized.id,
+            name: definitelyUninitialized.name,
+            parameterRegisters: definitelyUninitialized.parameterRegisters,
+            parameterConventions: definitelyUninitialized.parameterConventions,
+            resultType: definitelyUninitialized.resultType,
+            registerTypes: definitelyUninitialized.registerTypes,
+            entryBlock: definitelyUninitialized.entryBlock,
+            blocks: invalidBlocks,
+            stackSlotTypes: definitelyUninitialized.stackSlotTypes
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(additionalFunctions: [invalid])
+        }
+    }
+
     @Test("An access scope may cross a checked branch and terminate on its trap edge")
     func acceptsAccessAcrossCheckedBranch() throws {
         let function = Bytecode.Function(

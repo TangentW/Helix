@@ -1074,15 +1074,28 @@ public struct Interpreter: Sendable {
                         )
                     }
                     try address.end()
-                case let .loadAddress(result, register, _):
+                case let .loadAddress(result, register, mode):
                     guard case let .address(address) = try read(register, registers: registers) else {
                         throw VM.RuntimeTrap.typeMismatch(
                             expected: function.type(of: register)!,
                             actual: try read(register, registers: registers).type
                         )
                     }
+                    let value: VM.Value
+                    switch mode {
+                    case .copy:
+                        value = try copyCharging(
+                            try address.read(),
+                            budget: budget
+                        )
+                    case .take:
+                        try budget.consumeLinearWork(
+                            elementCount: try address.projectedRemovalWork()
+                        )
+                        value = try address.take()
+                    }
                     try initialize(
-                        copyCharging(try address.read(), budget: budget),
+                        value,
                         register: result,
                         registers: &registers
                     )
@@ -1099,6 +1112,34 @@ public struct Interpreter: Sendable {
                         registers: &registers
                     )
                     try address.store(value, mode: mode)
+                case let .destroyAddress(register):
+                    guard case let .address(address) = try read(
+                        register,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: register)!,
+                            actual: try read(register, registers: registers).type
+                        )
+                    }
+                    try budget.consumeLinearWork(
+                        elementCount: try address.projectedRemovalWork()
+                    )
+                    try address.destroy(ifInitialized: false)
+                case let .destroyAddressIfInitialized(register):
+                    guard case let .address(address) = try read(
+                        register,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: register)!,
+                            actual: try read(register, registers: registers).type
+                        )
+                    }
+                    try budget.consumeLinearWork(
+                        elementCount: try address.projectedRemovalWork()
+                    )
+                    try address.destroy(ifInitialized: true)
                 case let .checkedBinary(result, overflow, operation, lhs, rhs):
                     let lhsValue = try integer(lhs, registers: registers)
                     let rhsValue = try integer(rhs, registers: registers)
@@ -2216,7 +2257,7 @@ public struct Interpreter: Sendable {
                         register: arrayResult,
                         registers: &registers
                     )
-                case let .arrayNext(result, array, indexSlot):
+                case let .arrayNext(result, array, indexSlot, direction):
                     let (elements, _) = try self.array(array, registers: registers)
                     let indexValue = try read(indexSlot, stackSlots: stackSlots)
                     guard case let .integer(integer) = indexValue,
@@ -2229,28 +2270,48 @@ public struct Interpreter: Sendable {
                         )
                     }
                     let index = integer.signedValue
-                    guard index >= 0, let exactIndex = Int(exactly: index) else {
+                    guard index >= 0,
+                          let exactIndex = Int(exactly: index),
+                          exactIndex <= elements.count
+                    else {
                         throw VM.RuntimeTrap.arrayIndexOutOfBounds(
                             index: index,
                             count: elements.count
                         )
                     }
-                    let next: VM.Value?
-                    if elements.indices.contains(exactIndex) {
-                        try chargeAggregate(elementCount: 1, budget: budget)
-                        let copied = try copyCharging(
-                            elements[exactIndex],
-                            budget: budget
-                        )
-                        next = copied
+                    let selectedIndex: Int?
+                    let advancedIndex: Int64?
+                    switch direction {
+                    case .forward where exactIndex < elements.count:
+                        selectedIndex = exactIndex
                         let advanced = index.addingReportingOverflow(1)
                         guard !advanced.overflow else {
                             throw VM.RuntimeTrap.integerOverflow
                         }
+                        advancedIndex = advanced.partialValue
+                    case .reverse where exactIndex > 0:
+                        selectedIndex = exactIndex - 1
+                        let advanced = index.subtractingReportingOverflow(1)
+                        guard !advanced.overflow else {
+                            throw VM.RuntimeTrap.integerOverflow
+                        }
+                        advancedIndex = advanced.partialValue
+                    case .forward, .reverse:
+                        selectedIndex = nil
+                        advancedIndex = nil
+                    }
+                    let next: VM.Value?
+                    if let selectedIndex, let advancedIndex {
+                        try chargeAggregate(elementCount: 1, budget: budget)
+                        let copied = try copyCharging(
+                            elements[selectedIndex],
+                            budget: budget
+                        )
+                        next = copied
                         try store(
                             .integer(
                                 VM.Integer(
-                                    signed: advanced.partialValue,
+                                    signed: advancedIndex,
                                     bitWidth: 64,
                                     isSigned: true
                                 )

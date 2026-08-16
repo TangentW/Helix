@@ -56,6 +56,228 @@ struct AddressExecution {
         }
     }
 
+    @Test("Projected takes preserve siblings and require modify access")
+    func executesProjectedTake() throws {
+        let first = VM.Value.integer(try int(1))
+        let second = VM.Value.integer(try int(2))
+        let replacement = VM.Value.integer(try int(3))
+        let cell = VM.MemoryCell(
+            .tuple([first, second]),
+            storageShape: .tuple([.leaf, .leaf])
+        )
+
+        let read = try cell.begin(path: [0], kind: .read)
+        #expect(throws: VM.RuntimeTrap.addressWriteRequiresModifyAccess) {
+            try cell.take(path: [0], token: read)
+        }
+        try cell.end(token: read)
+
+        let modify = try cell.begin(path: [0], kind: .modify)
+        #expect(
+            try cell.projectedRemovalWork(path: [0], token: modify) == 3
+        )
+        #expect(try cell.take(path: [0], token: modify) == first)
+        #expect(throws: VM.RuntimeTrap.uninitializedAddress) {
+            try cell.take(path: [0], token: modify)
+        }
+        try cell.end(token: modify)
+
+        #expect(try cell.unscopedRead(path: [1]) == second)
+        #expect(throws: VM.RuntimeTrap.uninitializedAddress) {
+            try cell.directRead()
+        }
+        try cell.unscopedStore(
+            replacement,
+            path: [0],
+            mode: .initialize
+        )
+        #expect(try cell.directRead() == .tuple([replacement, second]))
+    }
+
+    @Test("A failed projected take leaves storage unchanged")
+    func keepsProjectedTakeTransactional() throws {
+        let first = VM.Value.integer(try int(1))
+        let original = VM.Value.tuple([first])
+        let cell = VM.MemoryCell(
+            original,
+            storageShape: .tuple([.leaf, .leaf])
+        )
+        let modify = try cell.begin(path: [0], kind: .modify)
+
+        #expect(throws: VM.RuntimeTrap.invalidAddressProjection) {
+            try cell.take(path: [0], token: modify)
+        }
+        try cell.end(token: modify)
+        #expect(try cell.directRead() == original)
+    }
+
+    @Test("Projected destruction preserves siblings and partial initialization")
+    func executesProjectedDestroy() throws {
+        let first = VM.Value.integer(try int(1))
+        let second = VM.Value.integer(try int(2))
+        let cell = VM.MemoryCell(
+            storageShape: .tuple([
+                .tuple([.leaf, .leaf]),
+                .leaf,
+            ])
+        )
+        try cell.unscopedStore(first, path: [0, 0], mode: .initialize)
+        try cell.unscopedStore(second, path: [1], mode: .initialize)
+
+        let read = try cell.begin(path: [0], kind: .read)
+        #expect(throws: VM.RuntimeTrap.addressWriteRequiresModifyAccess) {
+            try cell.destroy(
+                path: [0],
+                token: read,
+                ifInitialized: true
+            )
+        }
+        try cell.end(token: read)
+
+        let modify = try cell.begin(path: [0], kind: .modify)
+        #expect(throws: VM.RuntimeTrap.uninitializedAddress) {
+            try cell.destroy(
+                path: [0],
+                token: modify,
+                ifInitialized: false
+            )
+        }
+        try cell.destroy(
+            path: [0],
+            token: modify,
+            ifInitialized: true
+        )
+        try cell.destroy(
+            path: [0],
+            token: modify,
+            ifInitialized: true
+        )
+        try cell.end(token: modify)
+
+        #expect(try cell.unscopedRead(path: [1]) == second)
+        #expect(throws: VM.RuntimeTrap.uninitializedAddress) {
+            try cell.unscopedRead(path: [0, 0])
+        }
+
+        let invalid = try cell.begin(path: [99], kind: .modify)
+        #expect(throws: VM.RuntimeTrap.invalidAddressProjection) {
+            try cell.destroy(
+                path: [99],
+                token: invalid,
+                ifInitialized: true
+            )
+        }
+        try cell.end(token: invalid)
+    }
+
+    @Test("Conditional projected destroy executes through verified bytecode")
+    func executesConditionalProjectedDestroyInstruction() throws {
+        let tuple = Bytecode.ValueType.tuple([.int64, .int64])
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "conditionalProjectedDestroy",
+            parameterRegisters: [],
+            resultType: .int64,
+            registerTypes: [
+                .int64, .address(tuple), .address(.int64),
+                .address(.int64), .address(.int64), .address(.int64),
+                .address(.int64), .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    instructions: [
+                        .constantInteger(
+                            result: .init(rawValue: 0),
+                            bitPattern: 2
+                        ),
+                        .stackAddress(
+                            result: .init(rawValue: 1),
+                            slot: .init(rawValue: 0)
+                        ),
+                        .projectAggregateAddress(
+                            result: .init(rawValue: 2),
+                            base: .init(rawValue: 1),
+                            fieldIndex: 1
+                        ),
+                        .beginAccess(
+                            result: .init(rawValue: 3),
+                            address: .init(rawValue: 2),
+                            kind: .modify
+                        ),
+                        .storeAddress(
+                            address: .init(rawValue: 3),
+                            source: .init(rawValue: 0),
+                            mode: .initialize
+                        ),
+                        .endAccess(.init(rawValue: 3)),
+                        .projectAggregateAddress(
+                            result: .init(rawValue: 4),
+                            base: .init(rawValue: 1),
+                            fieldIndex: 0
+                        ),
+                        .beginAccess(
+                            result: .init(rawValue: 5),
+                            address: .init(rawValue: 4),
+                            kind: .modify
+                        ),
+                        .destroyAddressIfInitialized(.init(rawValue: 5)),
+                        .endAccess(.init(rawValue: 5)),
+                        .beginAccess(
+                            result: .init(rawValue: 6),
+                            address: .init(rawValue: 2),
+                            kind: .modify
+                        ),
+                        .loadAddress(
+                            result: .init(rawValue: 7),
+                            address: .init(rawValue: 6),
+                            mode: .take
+                        ),
+                        .endAccess(.init(rawValue: 6)),
+                        .returnValue(.init(rawValue: 7)),
+                    ]
+                ),
+            ],
+            stackSlotTypes: [tuple]
+        )
+        let image = try verify(
+            root: function,
+            additionalFunctions: [],
+            capabilities: [.baselineV1, .addressValuesV1],
+            parameterTypes: [],
+            resultType: .int64
+        )
+
+        let interpreter = VM.Interpreter()
+        #expect(
+            interpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [],
+                budget: .init(
+                    limits: .init(
+                        instructionFuelPerEntry: 22,
+                        maxWallTimeMainThreadMilliseconds: 1_000
+                    )
+                )
+            ) == .trapped(.instructionFuelExhausted)
+        )
+        #expect(
+            interpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [],
+                budget: .init(
+                    limits: .init(
+                        instructionFuelPerEntry: 23,
+                        maxWallTimeMainThreadMilliseconds: 1_000
+                    )
+                )
+            ) == .returned(.integer(try int(2)))
+        )
+    }
+
     @Test("Conditional root destruction respects active access scope shape")
     func enforcesConditionalDestroyExclusivity() throws {
         let first = VM.Value.integer(try int(1))

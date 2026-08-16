@@ -500,6 +500,8 @@ public enum Instruction: Codable, Hashable, Sendable {
         source: Bytecode.Register,
         mode: Bytecode.StackStoreMode
     )
+    case destroyAddress(Bytecode.Register)
+    case destroyAddressIfInitialized(Bytecode.Register)
     case checkedBinary(
         result: Bytecode.Register,
         overflow: Bytecode.Register,
@@ -700,10 +702,14 @@ public enum Instruction: Codable, Hashable, Sendable {
         arrayResult: Bytecode.Register,
         array: Bytecode.Register
     )
+    /// Advances an Array cursor. A forward cursor is the next index and starts
+    /// at zero; a reverse cursor is an exclusive upper bound and starts at the
+    /// Array count. Both exhausted cursors remain at their boundary.
     case arrayNext(
         result: Bytecode.Register,
         array: Bytecode.Register,
-        indexSlot: Bytecode.StackSlot
+        indexSlot: Bytecode.StackSlot,
+        direction: Bytecode.ArrayTraversalDirection
     )
     /// Advances a compiler-lowered Range or Stride sequence. The cursor is an
     /// Optional<Element>: `nil` is the exhausted state, which also avoids a
@@ -928,7 +934,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .arrayJoined(result, _, _),
              let .arrayAppend(result, _, _),
              let .arrayUpdate(result, _, _, _),
-             let .arrayNext(result, _, _),
+             let .arrayNext(result, _, _, _),
              let .progressionNext(result, _, _, _, _),
              let .makeDictionary(result, _),
              let .dictionaryCount(result, _),
@@ -976,7 +982,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              .storeMutableCell, .arrayBuilderAppend,
              .arrayBuilderAppendContents,
              .hostedSuperApply, .endAccess,
-             .storeAddress, .switchOptional, .branch,
+             .storeAddress, .destroyAddress,
+             .destroyAddressIfInitialized, .switchOptional, .branch,
              .conditionalBranch, .closureTryApply, .tryApply,
              .entryTryApply, .nativeTryApply,
              .returnValue, .throwError, .trap:
@@ -1042,6 +1049,9 @@ public enum Instruction: Codable, Hashable, Sendable {
             [address]
         case let .storeAddress(address, source, _):
             [address, source]
+        case let .destroyAddress(address),
+             let .destroyAddressIfInitialized(address):
+            [address]
         case let .checkedBinary(_, _, _, lhs, rhs),
              let .floatingBinary(_, _, lhs, rhs),
              let .floatingBinaryPredicate(_, _, lhs, rhs),
@@ -1117,7 +1127,7 @@ public enum Instruction: Codable, Hashable, Sendable {
             [array, index, value]
         case let .arrayPopLast(_, _, array):
             [array]
-        case let .arrayNext(_, array, _):
+        case let .arrayNext(_, array, _, _):
             [array]
         case let .progressionNext(_, _, end, stride, _):
             [end, stride]

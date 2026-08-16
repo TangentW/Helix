@@ -6,6 +6,12 @@ extension CanonicalSIL {
 /// local storage independently of whether that storage remains frame-local or
 /// is heap-promoted into an escaping closure context.
 enum StorageInitialization {
+    enum DetachedPayloadUse: Equatable, Sendable {
+        case read
+        case take
+        case modify
+    }
+
     enum DeallocationMode: Equatable, Sendable {
         case none
         case destroy
@@ -20,6 +26,7 @@ enum StorageInitialization {
         var runtimeStorageRoots: Set<String>
         var consumingApplicationArguments: [Int: Set<String>]
         var deallocationModes: [Int: DeallocationMode]
+        var detachedPayloadUses: [String: DetachedPayloadUse]
 
         static let empty = Self(
             addressTargets: [:],
@@ -28,7 +35,8 @@ enum StorageInitialization {
             conditionalDestroyLines: [],
             runtimeStorageRoots: [],
             consumingApplicationArguments: [:],
-            deallocationModes: [:]
+            deallocationModes: [:],
+            detachedPayloadUses: [:]
         )
 
         func storeMode(
@@ -59,6 +67,7 @@ enum StorageInitialization {
     private enum InitializationAction: Equatable, Sendable {
         case allocate(root: String)
         case write(target: AddressTarget, line: Int)
+        case modify(target: AddressTarget, line: Int)
         case take(target: AddressTarget, line: Int)
         case destroy(target: AddressTarget, line: Int)
         case deallocate(target: AddressTarget, line: Int)
@@ -77,8 +86,18 @@ enum StorageInitialization {
     }
 
     private struct ApplicationStorageEffects: Sendable {
-        var takenArguments: [String]
+        var arguments: [Argument]
         var initializedResults: [EdgeResult]
+
+        struct Argument: Sendable {
+            enum Effect: Equatable, Sendable {
+                case take
+                case modify
+            }
+
+            var address: String
+            var effect: Effect
+        }
 
         struct EdgeResult: Sendable {
             var address: String
@@ -199,11 +218,18 @@ enum StorageInitialization {
             }
         }
         let consumingApplicationArguments = applicationEffects.mapValues {
-            Set($0.takenArguments)
+            Set($0.arguments.compactMap { argument in
+                argument.effect == .take ? argument.address : nil
+            })
         }.filter { !$0.value.isEmpty }
+        let detachedPayloads = try detachedEnumPayloadAnalysis(
+            lines: lines,
+            applicationEffects: applicationEffects
+        )
         guard !storagePointees.isEmpty else {
             var plan = Plan.empty
             plan.consumingApplicationArguments = consumingApplicationArguments
+            plan.detachedPayloadUses = detachedPayloads.uses
             return plan
         }
 
@@ -212,10 +238,16 @@ enum StorageInitialization {
             pointees: storagePointees,
             typeEnvironment: typeEnvironment
         )
+        let detachedPayloadWritebacks = detachedEnumPayloadWritebacks(
+            lines: lines,
+            targets: targets,
+            rootsByAddress: detachedPayloads.rootsByAddress
+        )
         let blocks = try initializationBlocks(
             lines: lines,
             pointees: storagePointees,
             targets: targets,
+            detachedPayloadWritebacks: detachedPayloadWritebacks,
             applicationEffects: applicationEffects
         )
         guard Set(blocks.map(\.id)).count == blocks.count else {
@@ -240,7 +272,8 @@ enum StorageInitialization {
                 deallocationModes: classification.deallocationModes
             ),
             consumingApplicationArguments: consumingApplicationArguments,
-            deallocationModes: classification.deallocationModes
+            deallocationModes: classification.deallocationModes,
+            detachedPayloadUses: detachedPayloads.uses
         )
     }
 
@@ -280,7 +313,8 @@ enum StorageInitialization {
                         conditionallyDeallocatedRoots.insert(value.root)
                     }
                     target = value
-                case let .write(value, _), let .take(value, _),
+                case let .write(value, _), let .modify(value, _),
+                     let .take(value, _),
                      let .destroy(value, _):
                     target = value
                 }
@@ -418,7 +452,6 @@ enum StorageInitialization {
                 " = init_existential_addr ",
                 " = init_enum_data_addr ",
                 " = unchecked_enum_data_addr ",
-                " = unchecked_take_enum_data_addr ",
                 " = open_existential_addr ",
             ] {
                 guard line.contains(marker),
@@ -488,6 +521,7 @@ enum StorageInitialization {
         lines: [String],
         pointees: [String: Bytecode.ValueType],
         targets: [String: AddressTarget],
+        detachedPayloadWritebacks: [String: AddressTarget],
         applicationEffects: [Int: ApplicationStorageEffects]
     ) throws -> [InitializationBlock] {
         var result: [InitializationBlock] = []
@@ -516,19 +550,24 @@ enum StorageInitialization {
                 current?.actions.append(.allocate(root: allocation))
             }
             if let source = takenAddress(in: line),
-               let target = targets[source] {
-                current?.actions.append(
-                    .take(target: target, line: lineIndex)
-                )
+               let target = targets[source]
+                    ?? detachedPayloadWritebacks[source] {
+                current?.actions.append(.take(target: target, line: lineIndex))
             }
-            if let destination = writtenAddress(in: line),
-               let target = targets[destination] {
-                current?.actions.append(
-                    .write(target: target, line: lineIndex)
-                )
+            if let destination = writtenAddress(in: line) {
+                if let target = targets[destination] {
+                    current?.actions.append(
+                        .write(target: target, line: lineIndex)
+                    )
+                } else if let target = detachedPayloadWritebacks[destination] {
+                    current?.actions.append(
+                        .modify(target: target, line: lineIndex)
+                    )
+                }
             }
             if let destination = destroyedAddress(in: line),
-               let target = targets[destination] {
+               let target = targets[destination]
+                    ?? detachedPayloadWritebacks[destination] {
                 current?.actions.append(
                     .destroy(target: target, line: lineIndex)
                 )
@@ -540,11 +579,30 @@ enum StorageInitialization {
                 )
             }
             if let effects = applicationEffects[lineIndex] {
-                for address in effects.takenArguments {
-                    guard let target = targets[address] else { continue }
-                    current?.actions.append(
-                        .take(target: target, line: lineIndex)
-                    )
+                for argument in effects.arguments {
+                    switch argument.effect {
+                    case .take:
+                        guard let target = targets[argument.address]
+                                ?? detachedPayloadWritebacks[argument.address]
+                        else {
+                            continue
+                        }
+                        current?.actions.append(
+                            .take(target: target, line: lineIndex)
+                        )
+                    case .modify:
+                        if let writeback = detachedPayloadWritebacks[
+                            argument.address
+                        ] {
+                            current?.actions.append(
+                                .modify(target: writeback, line: lineIndex)
+                            )
+                        } else if let target = targets[argument.address] {
+                            current?.actions.append(
+                                .modify(target: target, line: lineIndex)
+                            )
+                        }
+                    }
                 }
                 for initialized in effects.initializedResults {
                     guard let target = targets[initialized.address] else {
@@ -592,6 +650,113 @@ enum StorageInitialization {
         }
         finishCurrent()
         return result
+    }
+
+    private struct DetachedPayloadAnalysis: Sendable {
+        var rootsByAddress: [String: String]
+        var uses: [String: DetachedPayloadUse]
+    }
+
+    /// The projection instruction selects an address but its later physical
+    /// use determines the lifetime effect. A copy/trivial load is read-only,
+    /// `@in` or load-take consumes the enum, and a write or `@inout` mutation
+    /// preserves initialization through writeback.
+    private static func detachedEnumPayloadAnalysis(
+        lines: [String],
+        applicationEffects: [Int: ApplicationStorageEffects]
+    ) throws -> DetachedPayloadAnalysis {
+        var rootsByAddress: [String: String] = [:]
+        for line in lines {
+            if line.contains(" = unchecked_take_enum_data_addr "),
+               let payload = silResultValue(in: line) {
+                rootsByAddress[payload] = payload
+                continue
+            }
+            guard let destination = silResultValue(in: line) else { continue }
+            for marker in [
+                " = begin_access ",
+                " = begin_borrow ",
+                " = copy_value ",
+                " = move_value ",
+                " = mark_uninitialized ",
+                " = tuple_element_addr ",
+                " = struct_element_addr ",
+            ] {
+                guard line.contains(marker),
+                      let source = silValue(after: marker, in: line),
+                      let root = rootsByAddress[source]
+                else { continue }
+                rootsByAddress[destination] = root
+                break
+            }
+        }
+
+        var uses = Dictionary(
+            uniqueKeysWithValues: Set(rootsByAddress.values).map {
+                ($0, DetachedPayloadUse.read)
+            }
+        )
+        func record(
+            _ use: DetachedPayloadUse,
+            for address: String,
+            line: Int
+        ) throws {
+            guard let root = rootsByAddress[address] else { return }
+            let current = uses[root] ?? .read
+            guard current == .read || current == use else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "detached enum payload mixes take and modify effects "
+                        + "at SIL body line \(line + 1)"
+                )
+            }
+            uses[root] = use
+        }
+
+        for (lineIndex, line) in lines.enumerated() {
+            if let address = writtenAddress(in: line) {
+                try record(.modify, for: address, line: lineIndex)
+            }
+            if let address = takenAddress(in: line) {
+                try record(.take, for: address, line: lineIndex)
+            }
+            if let address = destroyedAddress(in: line) {
+                try record(.take, for: address, line: lineIndex)
+            }
+            for argument in applicationEffects[lineIndex]?.arguments ?? [] {
+                let use: DetachedPayloadUse = switch argument.effect {
+                case .take: .take
+                case .modify: .modify
+                }
+                try record(use, for: argument.address, line: lineIndex)
+            }
+        }
+        return .init(rootsByAddress: rootsByAddress, uses: uses)
+    }
+
+    /// Maps every represented descendant back to the containing enum storage.
+    /// This is a directional writeback relation, not a lifetime alias.
+    private static func detachedEnumPayloadWritebacks(
+        lines: [String],
+        targets: [String: AddressTarget],
+        rootsByAddress: [String: String]
+    ) -> [String: AddressTarget] {
+        var parentsByRoot: [String: AddressTarget] = [:]
+        for line in lines {
+            if line.contains(" = unchecked_take_enum_data_addr "),
+               let payload = silResultValue(in: line),
+               let source = silValue(
+                    after: " = unchecked_take_enum_data_addr ",
+                    in: line
+                  ),
+               let target = targets[source] {
+                parentsByRoot[payload] = target
+            }
+        }
+        return Dictionary(
+            uniqueKeysWithValues: rootsByAddress.compactMap { address, root in
+                parentsByRoot[root].map { (address, $0) }
+            }
+        )
     }
 
     private struct LeafState: Equatable, Sendable {
@@ -664,6 +829,8 @@ enum StorageInitialization {
                         definitelyInitialized: [],
                         possiblyInitialized: []
                     )].possiblyInitialized.formUnion(targetLeaves)
+                case .modify:
+                    break
                 case let .take(target, _), let .destroy(target, _):
                     let targetLeaves = leaves(for: target)
                     result[target.root]?.definitelyInitialized
@@ -796,7 +963,7 @@ enum StorageInitialization {
                     definitelyInitialized: [],
                     possiblyInitialized: []
                 )].possiblyInitialized.formUnion(targetLeaves)
-            case let .take(target, _):
+            case let .modify(target, line):
                 let targetLeaves = leaves(for: target)
                 guard !targetLeaves.isEmpty,
                       targetLeaves.isSubset(
@@ -804,7 +971,22 @@ enum StorageInitialization {
                       )
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "local storage is taken before initialization"
+                        "local storage \(target.root) at field path "
+                            + "\(target.path) is modified before initialization "
+                            + "at SIL body line \(line + 1)"
+                    )
+                }
+            case let .take(target, line):
+                let targetLeaves = leaves(for: target)
+                guard !targetLeaves.isEmpty,
+                      targetLeaves.isSubset(
+                        of: state[target.root]?.definitelyInitialized ?? []
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "local storage \(target.root) at field path "
+                            + "\(target.path) is taken before initialization "
+                            + "at SIL body line \(line + 1)"
                     )
                 }
                 state[target.root]?.definitelyInitialized
@@ -994,8 +1176,9 @@ enum StorageInitialization {
 
     /// Derives address lifetime effects from the physical SIL function type,
     /// rather than from a catalog of particular Swift APIs. `@in` arguments
-    /// are consumed on both return paths, while an `@out` result initializes
-    /// immediately for `apply` and only on the normal edge for `try_apply`.
+    /// are consumed, `@inout` arguments remain initialized after mutation,
+    /// and an `@out` result initializes immediately for `apply` and only on
+    /// the normal edge for `try_apply`.
     private static func applicationStorageEffects(
         in line: String
     ) throws -> ApplicationStorageEffects? {
@@ -1060,9 +1243,22 @@ enum StorageInitialization {
             shape.parameterSpellings,
             tokens.dropFirst(resultOffset)
         )
-        let taken = parameters.compactMap { spelling, token in
-            spelling.trimmingCharacters(in: .whitespaces)
-                .hasPrefix("@in ") ? token : nil
+        let arguments = parameters.compactMap { spelling, token in
+            let normalized = spelling.trimmingCharacters(in: .whitespaces)
+            if normalized.hasPrefix("@in ") {
+                return ApplicationStorageEffects.Argument(
+                    address: token,
+                    effect: .take
+                )
+            }
+            if normalized.hasPrefix("@inout ")
+                || normalized.hasPrefix("@inout_aliasable ") {
+                return ApplicationStorageEffects.Argument(
+                    address: token,
+                    effect: .modify
+                )
+            }
+            return nil
         }
         let initializedResults = zip(
             shape.indirectResultEdges,
@@ -1078,7 +1274,7 @@ enum StorageInitialization {
             )
         }
         return .init(
-            takenArguments: taken,
+            arguments: arguments,
             initializedResults: initializedResults
         )
     }

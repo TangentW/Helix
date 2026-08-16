@@ -180,6 +180,10 @@ public enum Disassembler {
             "\(result) = load_address.\(mode.rawValue) \(address)"
         case let .storeAddress(address, source, mode):
             "store_address.\(mode.rawValue) \(source), \(address)"
+        case let .destroyAddress(address):
+            "destroy_address \(address)"
+        case let .destroyAddressIfInitialized(address):
+            "destroy_address_if_initialized \(address)"
         case let .checkedBinary(result, overflow, operation, lhs, rhs):
             "(\(result), \(overflow)) = checked_\(operation.rawValue) \(lhs), \(rhs)"
         case let .floatingBinary(result, operation, lhs, rhs):
@@ -271,8 +275,8 @@ public enum Disassembler {
             "\(result) = array_update \(array)[\(index)] = \(value)"
         case let .arrayPopLast(elementResult, arrayResult, array):
             "(\(elementResult), \(arrayResult)) = array_pop_last \(array)"
-        case let .arrayNext(result, array, indexSlot):
-            "\(result) = array_next \(array), \(indexSlot)"
+        case let .arrayNext(result, array, indexSlot, direction):
+            "\(result) = array_next_\(direction.rawValue) \(array), \(indexSlot)"
         case let .progressionNext(result, cursorSlot, end, stride, boundary):
             "\(result) = progression_next.\(boundary.rawValue) "
                 + "\(cursorSlot), end: \(end), stride: \(stride)"

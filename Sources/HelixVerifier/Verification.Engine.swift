@@ -1932,8 +1932,8 @@ public struct Engine: Verification.ImageVerifying {
             else {
                 throw fail("load_address result must match its address pointee")
             }
-            guard mode == .copy, isCopyable(type(result), shell: shell) else {
-                throw fail("HLBC load_address requires copy mode and a copyable pointee")
+            guard mode != .copy || isCopyable(type(result), shell: shell) else {
+                throw fail("load_address.copy requires a copyable pointee")
             }
         case let .storeAddress(address, source, _):
             guard capabilities.contains(.addressValuesV1),
@@ -1944,6 +1944,13 @@ public struct Engine: Verification.ImageVerifying {
             }
             // All StackStoreMode cases are memory-safe after lifecycle
             // verification; replace is reserved for conditional initialization.
+        case let .destroyAddress(address),
+             let .destroyAddressIfInitialized(address):
+            guard capabilities.contains(.addressValuesV1),
+                  case .address = type(address)
+            else {
+                throw fail("destroy_address requires an address")
+            }
         case let .checkedBinary(result, overflow, operation, lhs, rhs):
             guard type(result) == type(lhs), type(lhs) == type(rhs), case .integer = type(lhs) else {
                 throw fail("checked binary operands and result must use one integer type")
@@ -2442,7 +2449,7 @@ public struct Engine: Verification.ImageVerifying {
             guard isCopyable(element, shell: shell) else {
                 throw fail("array_pop_last requires a copyable element type")
             }
-        case let .arrayNext(result, array, indexSlot):
+        case let .arrayNext(result, array, indexSlot, _):
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("Array iteration requires \(Core.Capability.collectionsV1)")
             }
@@ -3308,7 +3315,8 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 case let .loadStack(result, _, _):
                     if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
-                case .destroyStack, .destroyStackIfInitialized:
+                case .destroyStack, .destroyStackIfInitialized,
+                     .destroyAddress, .destroyAddressIfInitialized:
                     break
                 case let .makeArrayBuilder(result):
                     live.insert(result)
@@ -3372,7 +3380,7 @@ public struct Engine: Verification.ImageVerifying {
                      let .arrayZip(result, _, _),
                      let .arrayJoined(result, _, _),
                      let .arrayAppend(result, _, _), let .arrayUpdate(result, _, _, _),
-                     let .arrayNext(result, _, _),
+                     let .arrayNext(result, _, _, _),
                      let .progressionNext(result, _, _, _, _),
                      let .makeDictionary(result, _), let .dictionaryGet(result, _, _),
                      let .dictionaryUpdate(result, _, _, _),
@@ -3851,8 +3859,19 @@ public struct Engine: Verification.ImageVerifying {
                     else {
                         throw fail("end_access must close its matching begin_access result")
                     }
-                case let .loadAddress(_, address, _):
-                    _ = try requireScoped(address)
+                case let .loadAddress(_, address, mode):
+                    let source = try requireScoped(
+                        address,
+                        modify: mode == .take
+                    )
+                    if mode == .take,
+                       case .stack = source.root {
+                        break
+                    } else if mode == .take {
+                        throw fail(
+                            "load_address.take requires frame-owned stack storage"
+                        )
+                    }
                 case let .storeAddress(address, _, mode):
                     let destination = try requireScoped(address, modify: true)
                     if mode == .initialize {
@@ -3864,6 +3883,14 @@ public struct Engine: Verification.ImageVerifying {
                                 "initialize store cannot target caller-owned inout storage"
                             )
                         }
+                    }
+                case let .destroyAddress(address),
+                     let .destroyAddressIfInitialized(address):
+                    let destination = try requireScoped(address, modify: true)
+                    guard case .stack = destination.root else {
+                        throw fail(
+                            "destroy_address requires frame-owned stack storage"
+                        )
                     }
                 case let .projectAggregateAddress(_, base, _):
                     let baseProvenance = try checked(base)
@@ -4492,13 +4519,22 @@ public struct Engine: Verification.ImageVerifying {
                     initialized[slot, default: .empty].markUninitialized(
                         try targetLeaves(slot: slot)
                     )
-                case let .loadAddress(_, address, _):
+                case let .loadAddress(_, address, mode):
                     if let provenance = addresses[address],
                        case let .stack(slot) = provenance.root {
                         try requireInitialized(
                             slot: slot,
                             path: provenance.path
                         )
+                        if mode == .take {
+                            initialized[slot, default: .empty]
+                                .markUninitialized(
+                                    try targetLeaves(
+                                        slot: slot,
+                                        path: provenance.path
+                                    )
+                                )
+                        }
                     }
                 case let .storeAddress(address, _, mode):
                     if let provenance = addresses[address],
@@ -4513,7 +4549,35 @@ public struct Engine: Verification.ImageVerifying {
                             operation: "store_address"
                         )
                     }
-                case let .arrayNext(_, _, slot):
+                case let .destroyAddress(address):
+                    if let provenance = addresses[address],
+                       case let .stack(slot) = provenance.root {
+                        let target = try targetLeaves(
+                            slot: slot,
+                            path: provenance.path
+                        )
+                        guard target.isSubset(
+                            of: initialized[slot]?.definitelyInitialized ?? []
+                        ) else {
+                            throw fail(
+                                "destroy_address targets uninitialized stack storage"
+                            )
+                        }
+                        initialized[slot, default: .empty]
+                            .markUninitialized(target)
+                    }
+                case let .destroyAddressIfInitialized(address):
+                    if let provenance = addresses[address],
+                       case let .stack(slot) = provenance.root {
+                        initialized[slot, default: .empty]
+                            .markUninitialized(
+                                try targetLeaves(
+                                    slot: slot,
+                                    path: provenance.path
+                                )
+                            )
+                    }
+                case let .arrayNext(_, _, slot, _):
                     try requireInitialized(slot: slot)
                 case let .progressionNext(_, slot, _, _, _):
                     try requireInitialized(slot: slot)

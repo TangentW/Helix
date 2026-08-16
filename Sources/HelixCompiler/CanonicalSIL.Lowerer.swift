@@ -116,6 +116,18 @@ public struct Lowerer: Sendable {
         var path: [Int]
     }
 
+    /// Field identity is independent of how compiler-only aggregate values are
+    /// cached. Both tuples and patch-local structs use declaration-order paths.
+    private struct AggregateComponentAddress {
+        var base: String
+        var index: Int
+    }
+
+    private struct CompilerStorageIdentity: Hashable {
+        var root: String
+        var path: [Int]
+    }
+
     private struct NativePropertyAddress {
         var receiver: Bytecode.Register
         var valueType: Bytecode.ValueType
@@ -185,7 +197,7 @@ public struct Lowerer: Sendable {
     /// initialize the VM storage even when the original SIL expresses an
     /// in-place payload mutation.
     private struct TakenOptionalPayload {
-        var root: String
+        var address: String
         var requiresInitialization = true
     }
 
@@ -210,9 +222,19 @@ public struct Lowerer: Sendable {
     }
 
     private struct PreparedDirectCallArguments {
+        /// A nonthrowing call may temporarily materialize compiler-only value
+        /// storage as a VM address. The slot is taken exactly once after every
+        /// access closes, then routed through the ordinary aggregate writeback.
+        struct CompilerInoutWriteback {
+            var token: String
+            var slot: Bytecode.StackSlot
+            var pointee: Bytecode.ValueType
+        }
+
         var arguments: [Bytecode.Register]
         var accesses: [Bytecode.Register]
         var temporaryOwners: [Bytecode.Register]
+        var compilerInoutWritebacks: [CompilerInoutWriteback]
     }
 
     /// A compiler-only address can expose its SSA owner directly, while a VM
@@ -549,13 +571,23 @@ public struct Lowerer: Sendable {
         var arrayLiteralComponentAddresses: [String: ArrayLiteralComponentAddress] = [:]
         var tupleComponentAddresses: [String: TupleComponentAddress] = [:]
         var tupleComponentValues: [TupleComponentStorageKey: Bytecode.Register] = [:]
+        var aggregateComponentAddresses: [String: AggregateComponentAddress] = [:]
         var tupleValues: [String: (Bytecode.Register, Bytecode.Register)] = [:]
         var unpackedTuples: [String: [Bytecode.Register]] = [:]
         var onStackClosureValues = Set<String>()
         var voidValues = Set<String>()
         var optionalSourceBySomeBlock: [Bytecode.BlockID: String] = [:]
         var optionalSourceByNoneBlock: [Bytecode.BlockID: String] = [:]
-        var knownSomeOptionalAddresses: [Bytecode.BlockID: Set<String>] = [:]
+        // Root-only facts would let one Optional tuple field prove a sibling.
+        // SSA-to-storage provenance is block-local so textual block order
+        // cannot impersonate a CFG merge.
+        var knownSomeOptionalAddresses: [
+            Bytecode.BlockID: Set<CompilerStorageIdentity>
+        ] = [:]
+        var knownSomeOptionalValues: [Bytecode.BlockID: Set<String>] = [:]
+        var optionalValueSourcesByBlock: [
+            Bytecode.BlockID: [CompilerStorageIdentity: String]
+        ] = [:]
         var optionalAddressSelectionConditions: [
             String: (address: String, someWhenTrue: Bool)
         ] = [:]
@@ -852,7 +884,8 @@ public struct Lowerer: Sendable {
             in blockID: Bytecode.BlockID?
         ) -> Bool {
             guard let blockID else { return false }
-            return knownSomeOptionalAddresses[blockID]?.contains(addressBase(token)) == true
+            return knownSomeOptionalAddresses[blockID]?
+                .contains(compilerStorageIdentity(for: token)) == true
         }
 
         func setKnownSomeOptionalAddress(
@@ -860,11 +893,33 @@ public struct Lowerer: Sendable {
             in blockID: Bytecode.BlockID,
             isKnownSome: Bool
         ) {
-            let root = addressBase(token)
+            let key = compilerStorageIdentity(for: token)
             if isKnownSome {
-                knownSomeOptionalAddresses[blockID, default: []].insert(root)
+                knownSomeOptionalAddresses[blockID, default: []].insert(key)
             } else {
-                knownSomeOptionalAddresses[blockID]?.remove(root)
+                knownSomeOptionalAddresses[blockID]?.remove(key)
+            }
+        }
+
+        func isKnownSomeOptionalValue(
+            _ token: String,
+            in blockID: Bytecode.BlockID?
+        ) -> Bool {
+            knownOptionalSomePayloads[token] != nil
+                || blockID.map {
+                    knownSomeOptionalValues[$0]?.contains(token) == true
+                } == true
+        }
+
+        func setKnownSomeOptionalValue(
+            _ token: String,
+            in blockID: Bytecode.BlockID,
+            isKnownSome: Bool
+        ) {
+            if isKnownSome {
+                knownSomeOptionalValues[blockID, default: []].insert(token)
+            } else {
+                knownSomeOptionalValues[blockID]?.remove(token)
             }
         }
 
@@ -943,16 +998,108 @@ public struct Lowerer: Sendable {
         func tupleComponentStorageKey(
             for token: String
         ) -> TupleComponentStorageKey? {
-            var current = addressBase(token)
+            var current = token
             var reversedPath: [Int] = []
             var visited = Set<String>()
-            while let component = tupleComponentAddresses[current],
-                  visited.insert(current).inserted {
-                reversedPath.append(component.index)
-                current = addressBase(component.base)
+            while visited.insert(current).inserted {
+                if let component = tupleComponentAddresses[current] {
+                    reversedPath.append(component.index)
+                    current = component.base
+                    continue
+                }
+                let canonical = addressBase(current)
+                guard canonical != current else { break }
+                current = canonical
             }
             guard !reversedPath.isEmpty else { return nil }
-            return .init(root: current, path: Array(reversedPath.reversed()))
+            return .init(
+                root: addressBase(current),
+                path: Array(reversedPath.reversed())
+            )
+        }
+
+        func compilerStorageIdentity(
+            for token: String
+        ) -> CompilerStorageIdentity {
+            var current = token
+            var reversedPath: [Int] = []
+            var visited = Set<String>()
+            while visited.insert(current).inserted {
+                if let component = aggregateComponentAddresses[current] {
+                    reversedPath.append(component.index)
+                    current = component.base
+                    continue
+                }
+                let canonical = addressBase(current)
+                guard canonical != current else { break }
+                current = canonical
+            }
+            return .init(
+                root: addressBase(current),
+                path: Array(reversedPath.reversed())
+            )
+        }
+
+        func optionalValueSource(at token: String) -> String? {
+            guard let blockID = current?.id else { return nil }
+            return optionalValueSourcesByBlock[blockID]?[
+                compilerStorageIdentity(for: token)
+            ]
+        }
+
+        func recordOptionalValueSource(
+            _ source: String?,
+            at token: String
+        ) {
+            guard let blockID = current?.id else { return }
+            let key = compilerStorageIdentity(for: token)
+            if let source {
+                optionalValueSourcesByBlock[blockID, default: [:]][key] = source
+            } else {
+                optionalValueSourcesByBlock[blockID]?.removeValue(forKey: key)
+            }
+        }
+
+        func invalidateOptionalStorageFacts(at token: String) {
+            guard let blockID = current?.id else { return }
+            let changed = compilerStorageIdentity(for: token)
+            func overlaps(_ candidate: CompilerStorageIdentity) -> Bool {
+                guard candidate.root == changed.root else { return false }
+                return candidate.path.starts(with: changed.path)
+                    || changed.path.starts(with: candidate.path)
+            }
+            if let known = knownSomeOptionalAddresses[blockID] {
+                knownSomeOptionalAddresses[blockID] = Set(
+                    known.filter { !overlaps($0) }
+                )
+            }
+            if let sources = optionalValueSourcesByBlock[blockID] {
+                optionalValueSourcesByBlock[blockID] = sources.filter {
+                    !overlaps($0.key)
+                }
+            }
+        }
+
+        func inheritKnownOptionalValueCase(
+            from source: String,
+            to result: String
+        ) {
+            guard let blockID = current?.id,
+                  isKnownSomeOptionalValue(source, in: blockID)
+            else { return }
+            setKnownSomeOptionalValue(result, in: blockID, isKnownSome: true)
+        }
+
+        func recordOptionalLoadCase(
+            from address: String,
+            to result: String,
+            type: Bytecode.ValueType
+        ) {
+            guard case .optional = type,
+                  let blockID = current?.id,
+                  isKnownSomeOptionalAddress(address, in: blockID)
+            else { return }
+            setKnownSomeOptionalValue(result, in: blockID, isKnownSome: true)
         }
 
         @discardableResult
@@ -1116,22 +1263,46 @@ public struct Lowerer: Sendable {
                   mutableCell(at: token) == nil
             else { return nil }
             let root = addressBase(token)
-            if runtimeAddress(at: token) != nil {
-                guard let slot = runtimeStackSlots[root],
-                      runtimeAddressValues[token] == nil
-                        || runtimeAddressValues[token]
-                            == runtimeAddressValues[root]
-                else {
+            if let address = runtimeAddress(at: token) {
+                guard let slot = runtimeStackSlots[root] else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: line,
-                        text: "taking copy_addr through projected or caller-owned storage"
+                        text: "taking caller-owned address storage requires writeback"
                     )
                 }
                 let result = try allocate(type: type)
-                appendInstruction(
-                    .loadStack(result: result, slot: slot, mode: .take)
-                )
+                if token == root, !isScopedRuntimeAddress(token) {
+                    appendInstruction(
+                        .loadStack(result: result, slot: slot, mode: .take)
+                    )
+                } else if isScopedRuntimeAddress(token) {
+                    appendInstruction(
+                        .loadAddress(
+                            result: result,
+                            address: address,
+                            mode: .take
+                        )
+                    )
+                } else {
+                    let access = try allocate(type: .address(type))
+                    appendInstruction(
+                        .beginAccess(
+                            result: access,
+                            address: address,
+                            kind: .modify
+                        )
+                    )
+                    appendInstruction(
+                        .loadAddress(
+                            result: result,
+                            address: access,
+                            mode: .take
+                        )
+                    )
+                    appendInstruction(.endAccess(access))
+                }
                 stackAddressValues.removeValue(forKey: root)
+                invalidateOptionalStorageFacts(at: token)
                 return result
             }
             guard let stored = try resolvedStackValue(at: token, line: line),
@@ -1139,7 +1310,53 @@ public struct Lowerer: Sendable {
                     || !isBorrowedValue(token: token, register: stored)
             else { return nil }
             removeCompilerAddressValue(at: token)
+            invalidateOptionalStorageFacts(at: token)
             return stored
+        }
+
+        func destroyRuntimeStoredValue(
+            at token: String,
+            line: Int,
+            ifInitialized: Bool
+        ) throws -> Bool {
+            guard let type = stackType(at: token),
+                  mutableCell(at: token) == nil,
+                  let address = runtimeAddress(at: token)
+            else { return false }
+            let root = addressBase(token)
+            guard runtimeStackSlots[root] != nil else {
+                throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                    line: line,
+                    text: "destroying caller-owned or object address storage requires writeback"
+                )
+            }
+            let destroy: Bytecode.Instruction = if ifInitialized {
+                .destroyAddressIfInitialized(address)
+            } else {
+                .destroyAddress(address)
+            }
+            if isScopedRuntimeAddress(token) {
+                appendInstruction(destroy)
+            } else {
+                let access = try allocate(type: .address(type))
+                appendInstruction(
+                    .beginAccess(
+                        result: access,
+                        address: address,
+                        kind: .modify
+                    )
+                )
+                let scopedDestroy: Bytecode.Instruction = if ifInitialized {
+                    .destroyAddressIfInitialized(access)
+                } else {
+                    .destroyAddress(access)
+                }
+                appendInstruction(scopedDestroy)
+                appendInstruction(.endAccess(access))
+            }
+            removeCompilerAddressValue(at: token)
+            invalidateOptionalStorageFacts(at: token)
+            return true
         }
 
         // Materialized values must cross this single sink so compiler-only
@@ -1157,6 +1374,7 @@ public struct Lowerer: Sendable {
                     "store value does not match its stack address"
                 )
             }
+            invalidateOptionalStorageFacts(at: token)
             if let addressRegister = runtimeAddress(at: token) {
                 let root = addressBase(token)
                 let inferredMode = storageInitializationPlan.storeMode(
@@ -1337,9 +1555,30 @@ public struct Lowerer: Sendable {
                     "direct call physical and logical argument counts disagree"
                 )
             }
+            let inoutIdentities = zip(tokens, physicalConventions)
+                .compactMap { token, convention in
+                    convention == .inout
+                        ? compilerStorageIdentity(for: token) : nil
+                }
+            for index in inoutIdentities.indices {
+                for other in inoutIdentities.indices where other > index {
+                    let lhs = inoutIdentities[index]
+                    let rhs = inoutIdentities[other]
+                    guard lhs.root == rhs.root,
+                          lhs.path.starts(with: rhs.path)
+                            || rhs.path.starts(with: lhs.path)
+                    else { continue }
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "direct call contains overlapping inout arguments"
+                    )
+                }
+            }
             var arguments: [Bytecode.Register] = []
             var accesses: [Bytecode.Register] = []
             var temporaryOwners: [Bytecode.Register] = []
+            var compilerInoutWritebacks: [
+                PreparedDirectCallArguments.CompilerInoutWriteback
+            ] = []
             arguments.reserveCapacity(tokens.count)
             for ((token, convention), logicalType) in zip(
                 zip(tokens, physicalConventions),
@@ -1356,6 +1595,57 @@ public struct Lowerer: Sendable {
                     }
                     value = existing
                     arguments.append(value)
+                    continue
+                }
+                if convention == .inout,
+                   runtimeAddress(at: token) == nil,
+                   case let .address(pointee) = logicalType,
+                   stackType(at: token) == pointee {
+                    guard allowsSynthesizedAccess else {
+                        throw CanonicalSIL.LoweringError
+                            .unsupportedInstruction(
+                                line: line,
+                                text: "compiler-only inout access across try_apply"
+                            )
+                    }
+                    let preservesAggregate = takenOptionalPayloadProjection(
+                        at: token
+                    )?.path.isEmpty == false
+                    let initial = if preservesAggregate {
+                        try copyStoredValue(at: token, line: line)
+                    } else {
+                        try takeStoredValue(at: token, line: line)
+                    }
+                    guard let initial,
+                          registerTypes[Int(initial.rawValue)] == pointee
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "compiler-only inout argument is uninitialized"
+                        )
+                    }
+                    let slot = try allocateStackSlot(type: pointee)
+                    appendInstruction(
+                        .storeStack(
+                            slot: slot,
+                            source: initial,
+                            mode: .initialize
+                        )
+                    )
+                    let address = try allocate(type: .address(pointee))
+                    appendInstruction(.stackAddress(result: address, slot: slot))
+                    let access = try allocate(type: .address(pointee))
+                    appendInstruction(
+                        .beginAccess(
+                            result: access,
+                            address: address,
+                            kind: .modify
+                        )
+                    )
+                    arguments.append(access)
+                    accesses.append(access)
+                    compilerInoutWritebacks.append(
+                        .init(token: token, slot: slot, pointee: pointee)
+                    )
                     continue
                 }
                 if convention == .inout {
@@ -1423,7 +1713,8 @@ public struct Lowerer: Sendable {
             return .init(
                 arguments: arguments,
                 accesses: accesses,
-                temporaryOwners: temporaryOwners
+                temporaryOwners: temporaryOwners,
+                compilerInoutWritebacks: compilerInoutWritebacks
             )
         }
 
@@ -1435,10 +1726,34 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func finishPreparedAccessesAndWritebacks(
+            _ prepared: PreparedDirectCallArguments
+        ) throws {
+            for access in prepared.accesses.reversed() {
+                appendInstruction(.endAccess(access))
+            }
+            for writeback in prepared.compilerInoutWritebacks {
+                let value = try allocate(type: writeback.pointee)
+                appendInstruction(
+                    .loadStack(
+                        result: value,
+                        slot: writeback.slot,
+                        mode: .take
+                    )
+                )
+                try storeConstructedValue(value, at: writeback.token)
+            }
+        }
+
         func schedulePreparedOwnerCleanups(
             _ prepared: PreparedDirectCallArguments,
             in targets: [Bytecode.BlockID]
         ) throws {
+            guard prepared.compilerInoutWritebacks.isEmpty else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "compiler-only inout writeback cannot cross call continuations"
+                )
+            }
             for target in targets {
                 for owner in prepared.temporaryOwners {
                     guard !implicitOwnerCleanups[target, default: []]
@@ -2233,6 +2548,138 @@ public struct Lowerer: Sendable {
             return cell
         }
 
+        func takenOptionalPayloadProjection(
+            at token: String
+        ) -> (root: String, path: [Int], state: TakenOptionalPayload)? {
+            var current = token
+            var reversedPath: [Int] = []
+            var visited = Set<String>()
+            while visited.insert(current).inserted {
+                if let state = takenOptionalPayloads[current] {
+                    return (
+                        root: current,
+                        path: Array(reversedPath.reversed()),
+                        state: state
+                    )
+                }
+                if let component = aggregateComponentAddresses[current] {
+                    reversedPath.append(component.index)
+                    current = component.base
+                    continue
+                }
+                let canonical = addressBase(current)
+                guard canonical != current else { return nil }
+                current = canonical
+            }
+            return nil
+        }
+
+        /// Rebuilds only the aggregate spine containing a projected write.
+        /// Sibling values are carried forward in declaration order, so this
+        /// supports nested tuples and patch-local structs without a nominal- or
+        /// API-specific setter table.
+        func replacingAggregateProjection(
+            in currentValue: Bytecode.Register,
+            type: Bytecode.ValueType,
+            path: ArraySlice<Int>,
+            prefix: [Int] = [],
+            with replacement: Bytecode.Register,
+            updatedValues: inout [[Int]: Bytecode.Register]
+        ) throws -> Bytecode.Register {
+            guard registerTypes[Int(currentValue.rawValue)] == type else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "projected Optional writeback has a mismatched aggregate value"
+                )
+            }
+            guard let fieldIndex = path.first else {
+                guard registerTypes[Int(replacement.rawValue)] == type else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "projected Optional writeback has a mismatched replacement"
+                    )
+                }
+                if currentValue != replacement, type.requiresLinearOwnership {
+                    appendInstruction(.destroyValue(currentValue))
+                }
+                updatedValues[prefix] = replacement
+                return replacement
+            }
+
+            let childTypes: [Bytecode.ValueType]
+            let children: [Bytecode.Register]
+            let rebuild: ([Bytecode.Register]) throws -> Bytecode.Register
+            switch type {
+            case let .tuple(types):
+                guard types.indices.contains(fieldIndex) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "projected Optional tuple writeback is out of bounds"
+                    )
+                }
+                childTypes = types
+                children = try types.map { try allocate(type: $0) }
+                appendInstruction(
+                    .unpackTuple(results: children, tuple: currentValue)
+                )
+                rebuild = { fields in
+                    let result = try allocate(type: type)
+                    appendInstruction(
+                        .makeTuple(result: result, elements: fields)
+                    )
+                    return result
+                }
+            case let .local(key):
+                let fields = try typeEnvironment.structFields(for: key)
+                guard fields.indices.contains(fieldIndex) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "projected Optional struct writeback is out of bounds"
+                    )
+                }
+                childTypes = fields.map(\.type)
+                children = try fields.indices.map { index in
+                    guard let rawIndex = UInt32(exactly: index) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "projected Optional struct field exceeds UInt32"
+                        )
+                    }
+                    let child = try allocate(type: fields[index].type)
+                    appendInstruction(
+                        .structExtract(
+                            result: child,
+                            structure: currentValue,
+                            fieldIndex: rawIndex
+                        )
+                    )
+                    return child
+                }
+                rebuild = { fields in
+                    let result = try allocate(type: type)
+                    appendInstruction(
+                        .makeStruct(result: result, fields: fields)
+                    )
+                    return result
+                }
+            default:
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "projected Optional writeback requires a represented aggregate"
+                )
+            }
+
+            var rebuiltChildren = children
+            rebuiltChildren[fieldIndex] = try replacingAggregateProjection(
+                in: children[fieldIndex],
+                type: childTypes[fieldIndex],
+                path: path.dropFirst(),
+                prefix: prefix + [fieldIndex],
+                with: replacement,
+                updatedValues: &updatedValues
+            )
+            for index in rebuiltChildren.indices {
+                updatedValues[prefix + [index]] = rebuiltChildren[index]
+            }
+            let rebuilt = try rebuild(rebuiltChildren)
+            updatedValues[prefix] = rebuilt
+            return rebuilt
+        }
+
         func storeConstructedValue(
             _ value: Bytecode.Register,
             at token: String,
@@ -2270,27 +2717,75 @@ public struct Lowerer: Sendable {
                 )
                 return
             }
-            if var payload = takenOptionalPayloads[token] {
+            if var projection = takenOptionalPayloadProjection(at: token) {
                 guard case let .optional(wrapped) = compilerAddressType(
-                    payload.root
+                    projection.state.address
                 ),
-                      wrapped == type
+                      compilerAddressType(projection.root) == wrapped
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "taken Optional payload no longer matches its source storage"
                     )
                 }
-                recordCompilerAddressValue(value, at: token)
+                var updatedValues: [[Int]: Bytecode.Register] = [:]
+                let payload: Bytecode.Register
+                if projection.path.isEmpty {
+                    if let currentValue = stackValue(at: projection.root) {
+                        payload = try replacingAggregateProjection(
+                            in: currentValue,
+                            type: wrapped,
+                            path: projection.path[...],
+                            with: value,
+                            updatedValues: &updatedValues
+                        )
+                    } else {
+                        payload = value
+                        updatedValues[[]] = value
+                    }
+                } else {
+                    guard let currentValue = stackValue(at: projection.root) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "projected Optional writeback lost its payload value"
+                        )
+                    }
+                    payload = try replacingAggregateProjection(
+                        in: currentValue,
+                        type: wrapped,
+                        path: projection.path[...],
+                        with: value,
+                        updatedValues: &updatedValues
+                    )
+                }
+                recordCompilerAddressValue(payload, at: projection.root)
+                for candidate in aggregateComponentAddresses.keys {
+                    guard let candidateProjection = takenOptionalPayloadProjection(
+                        at: candidate
+                    ), candidateProjection.root == projection.root,
+                       let updated = updatedValues[candidateProjection.path]
+                    else { continue }
+                    if let key = tupleComponentStorageKey(for: candidate) {
+                        tupleComponentValues[key] = updated
+                    } else {
+                        stackAddressValues[addressBase(candidate)] = updated
+                    }
+                }
                 let optional = try allocate(type: .optional(wrapped))
-                appendInstruction(.makeOptionalSome(result: optional, value: value))
+                appendInstruction(.makeOptionalSome(result: optional, value: payload))
                 try storeVMValue(
                     optional,
-                    at: payload.root,
-                    requestedMode: payload.requiresInitialization
+                    at: projection.state.address,
+                    requestedMode: projection.state.requiresInitialization
                         ? .initialize : mode
                 )
-                payload.requiresInitialization = false
-                takenOptionalPayloads[token] = payload
+                if let blockID = current?.id {
+                    setKnownSomeOptionalAddress(
+                        projection.state.address,
+                        in: blockID,
+                        isKnownSome: true
+                    )
+                }
+                projection.state.requiresInitialization = false
+                takenOptionalPayloads[projection.root] = projection.state
                 return
             }
             if let root = optionalPayloadAddressRoots[token],
@@ -2371,8 +2866,13 @@ public struct Lowerer: Sendable {
                     : argument
             }
             let receiver: Bytecode.Register
+            let transfersCompilerStorage: Bool
+            let detachedProjection = takenOptionalPayloadProjection(
+                at: receiverToken
+            )
             if runtimeAddress(at: receiverToken) != nil
-                || mutableCell(at: receiverToken) != nil {
+                || mutableCell(at: receiverToken) != nil
+                || detachedProjection?.path.isEmpty == false {
                 guard let copied = try copyStoredValue(
                     at: receiverToken,
                     line: line
@@ -2382,11 +2882,13 @@ public struct Lowerer: Sendable {
                     )
                 }
                 receiver = copied
+                transfersCompilerStorage = false
             } else if let taken = try takeStoredValue(
                 at: receiverToken,
                 line: line
             ) {
                 receiver = taken
+                transfersCompilerStorage = true
             } else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "mutating value receiver references uninitialized storage"
@@ -2398,8 +2900,10 @@ public struct Lowerer: Sendable {
                 )
             }
             // The adapter consumes a value snapshot and returns its mutated
-            // replacement. Compiler-only storage transfers its owner; runtime
-            // storage keeps the old value until the replacement is assigned.
+            // replacement. A direct compiler-only value can transfer its
+            // owner. Runtime storage and a detached aggregate projection keep
+            // the enclosing value until the replacement is assigned or its
+            // aggregate spine is rebuilt.
             arguments.append(receiver)
             guard arguments.map({ registerTypes[Int($0.rawValue)] })
                     == binding.parameterTypes
@@ -2422,17 +2926,17 @@ public struct Lowerer: Sendable {
                 resolvedArguments: prepared.arguments,
                 conventions: valueConventions
             )
-            try transferOwnedCompilerAddressArguments(
-                tokens: [receiverToken],
-                resolvedArguments: [receiver],
-                conventions: [.owned],
-                forceOwnedTokens: [receiverToken]
-            )
+            if transfersCompilerStorage {
+                try transferOwnedCompilerAddressArguments(
+                    tokens: [receiverToken],
+                    resolvedArguments: [receiver],
+                    conventions: [.owned],
+                    forceOwnedTokens: [receiverToken]
+                )
+            }
             appendPreparedOwnerCleanups(prepared)
             try storeConstructedValue(mutated, at: receiverToken)
-            for access in prepared.accesses.reversed() {
-                appendInstruction(.endAccess(access))
-            }
+            try finishPreparedAccessesAndWritebacks(prepared)
             voidValues.insert(resultToken)
         }
 
@@ -2660,10 +3164,23 @@ public struct Lowerer: Sendable {
             }
 
             let indexSlot = try allocateStackSlot(type: .int64)
-            let zero = try allocate(type: .int64)
-            appendInstruction(.constantInteger(result: zero, bitPattern: 0))
+            let initialIndex = try allocate(type: .int64)
+            let traversalDirection = plan.operation.traversalDirection
+            if traversalDirection == .reverse {
+                appendInstruction(
+                    .arrayCount(result: initialIndex, array: source)
+                )
+            } else {
+                appendInstruction(
+                    .constantInteger(result: initialIndex, bitPattern: 0)
+                )
+            }
             appendInstruction(
-                .storeStack(slot: indexSlot, source: zero, mode: .initialize)
+                .storeStack(
+                    slot: indexSlot,
+                    source: initialIndex,
+                    mode: .initialize
+                )
             )
 
             let builder: Bytecode.Register?
@@ -2768,7 +3285,12 @@ public struct Lowerer: Sendable {
                 id: loop,
                 parameters: loopAccumulator.map { [$0] } ?? [],
                 instructions: [
-                    .arrayNext(result: next, array: source, indexSlot: indexSlot),
+                    .arrayNext(
+                        result: next,
+                        array: source,
+                        indexSlot: indexSlot,
+                        direction: traversalDirection
+                    ),
                     .switchOptional(
                         optional: next,
                         someTarget: some,
@@ -3069,7 +3591,8 @@ public struct Lowerer: Sendable {
                         .arrayNext(
                             result: remainderNext,
                             array: source,
-                            indexSlot: indexSlot
+                            indexSlot: indexSlot,
+                            direction: .forward
                         ),
                         .switchOptional(
                             optional: remainderNext,
@@ -3113,10 +3636,10 @@ public struct Lowerer: Sendable {
                     instructions: closureArgumentCleanup
                         + [.branch(target: loop, arguments: [])]
                 )
-            case .firstWhere:
+            case .firstWhere, .lastWhere:
                 let predicate = try requiredRegister(
                     continuationResult,
-                    "first(where:) predicate"
+                    "first/last(where:) predicate"
                 )
                 let matched = try allocateSyntheticBlockID()
                 let skipped = try allocateSyntheticBlockID()
@@ -3149,20 +3672,22 @@ public struct Lowerer: Sendable {
                         ? [.destroyValue(element)] : [])
                         + [.branch(target: loop, arguments: [])]
                 )
-            case .firstIndexWhere:
+            case .firstIndexWhere, .lastIndexWhere:
                 let predicate = try requiredRegister(
                     continuationResult,
-                    "firstIndex(where:) predicate"
+                    "first/lastIndex(where:) predicate"
                 )
                 let matched = try allocateSyntheticBlockID()
                 let wrap = try allocateSyntheticBlockID()
                 let overflowTrap = try allocateSyntheticBlockID()
                 let skipped = try allocateSyntheticBlockID()
                 let advancedIndex = try allocate(type: .int64)
-                let one = try allocate(type: .int64)
+                let cursorAdjustment = try allocate(type: .int64)
                 let matchedIndex = try allocate(type: .int64)
                 let overflow = try allocate(type: .bool)
                 let result = try allocate(type: plan.callResultType)
+                let cursorAdjustmentBitPattern: UInt64 =
+                    traversalDirection == .forward ? 1 : 0
                 appendSyntheticBlock(
                     id: closureContinuation,
                     parameters: continuationParameters,
@@ -3184,13 +3709,16 @@ public struct Lowerer: Sendable {
                             slot: indexSlot,
                             mode: .copy
                         ),
-                        .constantInteger(result: one, bitPattern: 1),
+                        .constantInteger(
+                            result: cursorAdjustment,
+                            bitPattern: cursorAdjustmentBitPattern
+                        ),
                         .checkedBinary(
                             result: matchedIndex,
                             overflow: overflow,
                             operation: .subtract,
                             lhs: advancedIndex,
-                            rhs: one
+                            rhs: cursorAdjustment
                         ),
                         .conditionalBranch(
                             condition: overflow,
@@ -3297,7 +3825,8 @@ public struct Lowerer: Sendable {
                 ] + sourceCleanup + [
                     .branch(target: normalTarget, arguments: []),
                 ]
-            case .firstWhere, .firstIndexWhere:
+            case .firstWhere, .lastWhere, .firstIndexWhere,
+                 .lastIndexWhere:
                 let result = try allocate(type: plan.callResultType)
                 emptyInstructions = [
                     .makeOptionalNone(result: result),
@@ -7123,7 +7652,8 @@ public struct Lowerer: Sendable {
                     .arrayNext(
                         result: result,
                         array: state.array,
-                        indexSlot: state.indexSlot
+                        indexSlot: state.indexSlot,
+                        direction: .forward
                     )
                 )
                 try storeConstructedValue(result, at: arguments[0], mode: .initialize)
@@ -8725,6 +9255,7 @@ public struct Lowerer: Sendable {
                     copy[1],
                     in: blockID
                 )
+                let sourceOptionalValue = optionalValueSource(at: copy[1])
                 let sourceType = stackType(at: copy[1])
                 let destinationType = compilerAddressType(copy[3])
                 guard let sourceType, sourceType == destinationType else {
@@ -8769,18 +9300,12 @@ public struct Lowerer: Sendable {
                     try storeConstructedValue(value, at: copy[3])
                 }
                 if let blockID, case .optional = type {
+                    recordOptionalValueSource(sourceOptionalValue, at: copy[3])
                     setKnownSomeOptionalAddress(
                         copy[3],
                         in: blockID,
                         isKnownSome: sourceIsKnownSome
                     )
-                    if copy[0] == "take" {
-                        setKnownSomeOptionalAddress(
-                            copy[1],
-                            in: blockID,
-                            isKnownSome: false
-                        )
-                    }
                 }
                 continue
             }
@@ -8848,9 +9373,9 @@ public struct Lowerer: Sendable {
 
             if let access = match(
                 line,
-                pattern: #"^(%[0-9]+) = begin_access \[(read|modify|init)\] \[(?:static|dynamic)\] (%[0-9]+)$"#
+                pattern: #"^(%[0-9]+) = begin_access \[(read|modify|init)\] \[(static|dynamic)\] (%[0-9]+)$"#
             ) {
-                let source = access[2]
+                let source = access[3]
                 let base = addressBase(source)
                 if let cell = mutableCell(at: source),
                    let pointee = mutableCellPointee(at: source) {
@@ -8864,6 +9389,23 @@ public struct Lowerer: Sendable {
                 }
                 if let sourceAddress = runtimeAddress(at: source),
                    let pointee = stackType(at: source) {
+                    if access[2] == "static",
+                       runtimeStackSlots[base] != nil {
+                        // Swift has already proven a static frame-local access.
+                        // Preserve its address provenance without opening a VM
+                        // scope at the aggregate root: the eventual projected
+                        // load, store, or inout call opens the narrowest scope.
+                        // This keeps sibling fields independently accessible.
+                        addressAliases[access[0]] = base
+                        runtimeAddressValues[access[0]] = sourceAddress
+                        runtimeAddressPointees[access[0]] = pointee
+                        passthroughRuntimeAccesses.insert(access[0])
+                        if access[1] == "init" {
+                            initializingRuntimeAccesses.insert(access[0])
+                        }
+                        values[access[0]] = sourceAddress
+                        continue
+                    }
                     if isScopedRuntimeAddress(source),
                        inoutParameterAddressBases.contains(base) {
                         // An inout parameter already carries its caller-owned access
@@ -9117,7 +9659,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 takenOptionalPayloads = takenOptionalPayloads.filter {
-                    addressBase($0.value.root) != address
+                    addressBase($0.value.address) != address
                 }
                 // Swift treats some imported C values as trivial even though
                 // HLBC represents them with an owned native box. Release any
@@ -9769,6 +10311,10 @@ public struct Lowerer: Sendable {
                         register: result,
                         pointee: pointee
                     )
+                    aggregateComponentAddresses[projection[0]] = .init(
+                        base: projection[1],
+                        index: index
+                    )
                     addressAliases[projection[0]] = addressBase(projection[1])
                     values[projection[0]] = result
                     continue
@@ -9815,6 +10361,10 @@ public struct Lowerer: Sendable {
                     )
                     stackAddressTypes[projection[0]] = fields[index].type
                     stackAddressValues[projection[0]] = result
+                    aggregateComponentAddresses[projection[0]] = .init(
+                        base: projection[1],
+                        index: index
+                    )
                     continue
                 }
                 guard let base = runtimeAddress(at: projection[1]),
@@ -9860,6 +10410,10 @@ public struct Lowerer: Sendable {
                 )
                 runtimeAddressValues[projection[0]] = result
                 runtimeAddressPointees[projection[0]] = pointee
+                aggregateComponentAddresses[projection[0]] = .init(
+                    base: projection[1],
+                    index: index
+                )
                 addressAliases[projection[0]] = addressBase(projection[1])
                 if isScopedRuntimeAddress(projection[1]) {
                     scopedRuntimeAddresses.insert(projection[0])
@@ -10657,6 +11211,10 @@ public struct Lowerer: Sendable {
                     if let payload = knownOptionalSomePayloads[borrowed[1]] {
                         knownOptionalSomePayloads[borrowed[0]] = payload
                     }
+                    inheritKnownOptionalValueCase(
+                        from: borrowed[1],
+                        to: borrowed[0]
+                    )
                 }
                 continue
             }
@@ -11197,9 +11755,7 @@ public struct Lowerer: Sendable {
                             )
                         }
                     }
-                    for access in prepared.accesses.reversed() {
-                        appendInstruction(.endAccess(access))
-                    }
+                    try finishPreparedAccessesAndWritebacks(prepared)
                     continue
                 }
                 if let factory = localFactoryReferences[call[1]] {
@@ -11556,9 +12112,7 @@ public struct Lowerer: Sendable {
                         )
                     }
                 }
-                for access in prepared.accesses.reversed() {
-                    appendInstruction(.endAccess(access))
-                }
+                try finishPreparedAccessesAndWritebacks(prepared)
                 releasePreservedNativeConversionsAfterLastUse(
                     zip(
                         argumentTokens,
@@ -11791,6 +12345,14 @@ public struct Lowerer: Sendable {
                     register: result,
                     pointee: pointee
                 )
+                tupleComponentAddresses[component[0]] = .init(
+                    base: component[1],
+                    index: index
+                )
+                aggregateComponentAddresses[component[0]] = .init(
+                    base: component[1],
+                    index: index
+                )
                 addressAliases[component[0]] = addressBase(component[1])
                 values[component[0]] = result
                 continue
@@ -11845,6 +12407,14 @@ public struct Lowerer: Sendable {
                 )
                 runtimeAddressValues[component[0]] = result
                 runtimeAddressPointees[component[0]] = pointee
+                tupleComponentAddresses[component[0]] = .init(
+                    base: component[1],
+                    index: index
+                )
+                aggregateComponentAddresses[component[0]] = .init(
+                    base: component[1],
+                    index: index
+                )
                 addressAliases[component[0]] = addressBase(component[1])
                 if isScopedRuntimeAddress(component[1]) {
                     scopedRuntimeAddresses.insert(component[0])
@@ -11860,6 +12430,10 @@ public struct Lowerer: Sendable {
                let index = Int(component[2]),
                types.indices.contains(index) {
                 tupleComponentAddresses[component[0]] = .init(
+                    base: component[1],
+                    index: index
+                )
+                aggregateComponentAddresses[component[0]] = .init(
                     base: component[1],
                     index: index
                 )
@@ -11895,37 +12469,72 @@ public struct Lowerer: Sendable {
                 pattern: #"^(%[0-9]+) = unchecked_take_enum_data_addr (%[0-9]+), #Optional\.some!enumelt$"#
             ) {
                 guard let blockID = current?.id,
-                      isKnownSomeOptionalAddress(extraction[1], in: blockID),
-                      case let .optional(wrapped) = compilerAddressType(
-                        extraction[1]
-                      ),
-                      let optional = try takeStoredValue(
+                      isKnownSomeOptionalAddress(extraction[1], in: blockID)
+                else {
+                    let block = current?.id.description ?? "<none>"
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "unchecked Optional address payload \(extraction[1]) in "
+                            + "\(block) is not dominated by its some edge"
+                    )
+                }
+                guard case let .optional(wrapped) = compilerAddressType(
+                    extraction[1]
+                ) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "unchecked Optional payload projection has a non-Optional address"
+                    )
+                }
+                let payloadUse = storageInitializationPlan.detachedPayloadUses[
+                    extraction[0]
+                ] ?? .read
+                let optional: Bytecode.Register?
+                switch payloadUse {
+                case .read:
+                    optional = try copyStoredValue(
                         at: extraction[1],
                         line: sourceLine
-                      ),
-                      registerTypes[Int(optional.rawValue)]
+                    )
+                case .take, .modify:
+                    optional = try takeStoredValue(
+                        at: extraction[1],
+                        line: sourceLine
+                    )
+                }
+                guard let optional else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "unchecked Optional payload projection references uninitialized storage"
+                    )
+                }
+                guard registerTypes[Int(optional.rawValue)]
                         == .optional(wrapped)
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "unchecked Optional address payload is not dominated by its some edge"
+                        "unchecked Optional payload projection has mismatched storage"
                     )
                 }
                 let payload = try allocate(type: wrapped)
                 appendInstruction(
                     .unwrapOptional(result: payload, optional: optional)
                 )
-                let root = addressBase(extraction[1])
-                for token in [root, extraction[1]] where values[token] == optional {
-                    values.removeValue(forKey: token)
+                if payloadUse != .read {
+                    let root = addressBase(extraction[1])
+                    for token in [root, extraction[1]]
+                    where values[token] == optional {
+                        values.removeValue(forKey: token)
+                    }
+                    setKnownSomeOptionalAddress(
+                        extraction[1],
+                        in: blockID,
+                        isKnownSome: false
+                    )
                 }
-                setKnownSomeOptionalAddress(
-                    extraction[1],
-                    in: blockID,
-                    isKnownSome: false
-                )
                 stackAddressTypes[extraction[0]] = wrapped
                 stackAddressValues[extraction[0]] = payload
-                takenOptionalPayloads[extraction[0]] = .init(root: root)
+                if payloadUse == .modify {
+                    takenOptionalPayloads[extraction[0]] = .init(
+                        address: extraction[1]
+                    )
+                }
                 continue
             }
 
@@ -12625,6 +13234,19 @@ public struct Lowerer: Sendable {
                     )
                 }
                 try storeConstructedValue(value, at: store[1])
+                if case .optional = addressType {
+                    recordOptionalValueSource(store[0], at: store[1])
+                    if let blockID = current?.id {
+                        setKnownSomeOptionalAddress(
+                            store[1],
+                            in: blockID,
+                            isKnownSome: isKnownSomeOptionalValue(
+                                store[0],
+                                in: blockID
+                            )
+                        )
+                    }
+                }
                 continue
             }
 
@@ -12743,18 +13365,41 @@ public struct Lowerer: Sendable {
                         .loadMutableCell(result: result, cell: cell)
                     )
                     values[load[0]] = result
+                    recordOptionalLoadCase(
+                        from: load[2],
+                        to: load[0],
+                        type: pointee
+                    )
                     continue
                 }
                 if let addressRegister = runtimeAddress(at: load[2]),
                    let addressType = stackType(at: load[2]) {
-                    let result = try allocate(type: addressType)
-                    if isScopedRuntimeAddress(load[2]) {
-                        guard mode != "take" else {
-                            throw CanonicalSIL.LoweringError.unsupportedInstruction(
-                                line: sourceLine,
-                                text: "taking load through inout address"
+                    if mode == "take" {
+                        let blockID = current?.id
+                        let wasKnownSome = isKnownSomeOptionalAddress(
+                            load[2],
+                            in: blockID
+                        )
+                        guard let result = try takeStoredValue(
+                            at: load[2],
+                            line: sourceLine
+                        ) else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "taking load references unavailable address storage"
                             )
                         }
+                        values[load[0]] = result
+                        if let blockID, wasKnownSome {
+                            setKnownSomeOptionalValue(
+                                load[0],
+                                in: blockID,
+                                isKnownSome: true
+                            )
+                        }
+                        continue
+                    }
+                    let result = try allocate(type: addressType)
+                    if isScopedRuntimeAddress(load[2]) {
                         appendInstruction(
                             .loadAddress(result: result, address: addressRegister, mode: .copy)
                         )
@@ -12765,12 +13410,6 @@ public struct Lowerer: Sendable {
                         )
                         if loadMode == .take { stackAddressValues.removeValue(forKey: address) }
                     } else {
-                        guard mode != "take" else {
-                            throw CanonicalSIL.LoweringError.unsupportedInstruction(
-                                line: sourceLine,
-                                text: "taking load through projected address"
-                            )
-                        }
                         let access = try allocate(type: .address(addressType))
                         appendInstruction(
                             .beginAccess(result: access, address: addressRegister, kind: .read)
@@ -12781,6 +13420,11 @@ public struct Lowerer: Sendable {
                         appendInstruction(.endAccess(access))
                     }
                     values[load[0]] = result
+                    recordOptionalLoadCase(
+                        from: load[2],
+                        to: load[0],
+                        type: addressType
+                    )
                     continue
                 }
                 guard let value = try resolvedStackValue(
@@ -12794,6 +13438,11 @@ public struct Lowerer: Sendable {
                         "load references an uninitialized stack address"
                     )
                 }
+                let blockID = current?.id
+                let wasKnownSome = isKnownSomeOptionalAddress(
+                    load[2],
+                    in: blockID
+                )
                 if mode == "take" {
                     guard !addressType.requiresLinearOwnership
                             || !isBorrowedValue(
@@ -12806,7 +13455,16 @@ public struct Lowerer: Sendable {
                         )
                     }
                     removeCompilerAddressValue(at: load[2])
+                    invalidateOptionalStorageFacts(at: load[2])
                     values[load[0]] = value
+                    if let blockID, wasKnownSome,
+                       case .optional = addressType {
+                        setKnownSomeOptionalValue(
+                            load[0],
+                            in: blockID,
+                            isKnownSome: true
+                        )
+                    }
                 } else if mode == "copy"
                             || (mode.isEmpty
                                 && !addressType.isTrivial
@@ -12826,11 +13484,19 @@ public struct Lowerer: Sendable {
                         borrowedLoadTokens.insert(load[0])
                     }
                 }
+                if mode != "take" {
+                    recordOptionalLoadCase(
+                        from: load[2],
+                        to: load[0],
+                        type: addressType
+                    )
+                }
                 continue
             }
 
             if let destroy = match(line, pattern: #"^destroy_addr (%[0-9]+)$"#) {
                 let address = addressBase(destroy[0])
+                invalidateOptionalStorageFacts(at: destroy[0])
                 if compilerEnumAddressTypes[address] != nil {
                     guard compilerEnumAddressCases.removeValue(forKey: address) != nil else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -12855,6 +13521,21 @@ public struct Lowerer: Sendable {
                 }
                 if catchScratchAddresses.contains(address),
                    runtimeStackSlots[address] == nil {
+                    continue
+                }
+                if runtimeAddress(at: destroy[0]) != nil,
+                   destroy[0] != address {
+                    guard try destroyRuntimeStoredValue(
+                        at: destroy[0],
+                        line: sourceLine,
+                        ifInitialized: storageInitializationPlan
+                            .conditionalDestroyLines
+                            .contains(currentSILLineIndex)
+                    ) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "projected address destroy references uninitialized storage"
+                        )
+                    }
                     continue
                 }
                 if let iterator = arrayIteratorStates[address] {
@@ -13180,6 +13861,10 @@ public struct Lowerer: Sendable {
                 if let payload = knownOptionalSomePayloads[copy[1]] {
                     knownOptionalSomePayloads[copy[0]] = payload
                 }
+                inheritKnownOptionalValueCase(
+                    from: copy[1],
+                    to: copy[0]
+                )
                 if let selection = optionalAddressSelectionConditions[copy[1]] {
                     optionalAddressSelectionConditions[copy[0]] = selection
                 }
@@ -13244,6 +13929,10 @@ public struct Lowerer: Sendable {
                 if let payload = knownOptionalSomePayloads.removeValue(forKey: move[1]) {
                     knownOptionalSomePayloads[move[0]] = payload
                 }
+                inheritKnownOptionalValueCase(
+                    from: move[1],
+                    to: move[0]
+                )
                 if let selection = optionalAddressSelectionConditions.removeValue(
                     forKey: move[1]
                 ) {
@@ -13558,6 +14247,13 @@ public struct Lowerer: Sendable {
                     in: someTarget,
                     isKnownSome: true
                 )
+                if let source = optionalValueSource(at: branch[0]) {
+                    setKnownSomeOptionalValue(
+                        source,
+                        in: someTarget,
+                        isKnownSome: true
+                    )
+                }
                 if runtimeAddress(at: branch[0]) == nil,
                    mutableCell(at: branch[0]) == nil {
                     try inheritCompilerAddressValue(
@@ -13768,6 +14464,13 @@ public struct Lowerer: Sendable {
                     in: someTarget,
                     isKnownSome: true
                 )
+                if let source = optionalValueSource(at: selection.address) {
+                    setKnownSomeOptionalValue(
+                        source,
+                        in: someTarget,
+                        isKnownSome: true
+                    )
+                }
                 if runtimeAddress(at: selection.address) == nil,
                    mutableCell(at: selection.address) == nil {
                     guard let optional = stackValue(at: selection.address) else {
@@ -14991,10 +15694,12 @@ public struct Lowerer: Sendable {
                 closureResultType: genericTypes[1],
                 callResultType: accumulator
             )
-        case .forEach, .firstWhere, .firstIndexWhere, .containsWhere,
-             .allSatisfy:
+        case .forEach, .firstWhere, .lastWhere, .firstIndexWhere,
+             .lastIndexWhere, .containsWhere, .allSatisfy:
             let hasIndirectResult = operation == .firstWhere
+                || operation == .lastWhere
                 || operation == .firstIndexWhere
+                || operation == .lastIndexWhere
             let expectedArgumentCount = hasIndirectResult ? 3 : 2
             guard genericTypes.count == 1,
                   arguments.count == expectedArgumentCount
@@ -15004,7 +15709,8 @@ public struct Lowerer: Sendable {
                 )
             }
             let input = try arrayElement(genericTypes[0])
-            if operation == .firstIndexWhere {
+            if operation == .firstIndexWhere
+                || operation == .lastIndexWhere {
                 switch typeEnvironment.collectionIndexModel(
                     for: genericSpellings[0]
                 ) {
@@ -15012,11 +15718,13 @@ public struct Lowerer: Sendable {
                     break
                 case .preservedBaseInteger:
                     throw CanonicalSIL.LoweringError.unsupportedType(
-                        "firstIndex(where:) requires preserved slice indices"
+                        "predicate index search requires preserved indices for "
+                            + genericSpellings[0]
                     )
                 case .opaque:
                     throw CanonicalSIL.LoweringError.unsupportedType(
-                        "firstIndex(where:) requires a represented collection index"
+                        "predicate index search requires a represented index for "
+                            + genericSpellings[0]
                     )
                 }
             }
@@ -15024,8 +15732,8 @@ public struct Lowerer: Sendable {
                 ? .void : .bool
             let callResult: Bytecode.ValueType = switch operation {
             case .forEach: .void
-            case .firstWhere: .optional(input)
-            case .firstIndexWhere: .optional(.int64)
+            case .firstWhere, .lastWhere: .optional(input)
+            case .firstIndexWhere, .lastIndexWhere: .optional(.int64)
             case .containsWhere, .allSatisfy: .bool
             case .map, .flatMap, .filter, .compactMap, .prefixWhile,
                  .dropWhile, .reduce:

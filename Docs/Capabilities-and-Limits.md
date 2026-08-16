@@ -61,7 +61,19 @@ does not by itself certify a physical device or distribution channel.
   layout.
 - Tuple, `Void`, and `Optional`, including the ordinary control flow produced by
   `if let`, `guard let`, `??`, and `try?`, including address-based Optional
-  projection emitted by semantic Dictionary lookup SIL.
+  projection emitted by semantic Dictionary lookup SIL. Optional case evidence
+  is field-sensitive through Tuple and patch-local struct projections: a proven
+  projected payload take consumes only that field, while sibling or
+  caller-owned storage cannot borrow its proof. Definite and conditional
+  projected cleanup preserve independently initialized sibling fields.
+  Detached Optional payload addresses are classified from their physical
+  consumers rather than their opcode spelling: read-only loads preserve the
+  parent, consuming loads and `@in` take it, and stores or `@inout` mutation
+  rebuild nested Tuple/local-struct fields before writeback. A destructive and
+  modifying lifetime on the same detached payload is rejected. Nonthrowing
+  compiler-only `inout` calls use verified temporary address storage and reject
+  overlapping projections; their throwing form remains unsupported because it
+  requires writeback on both continuations.
 - Array value semantics and equality, append, `first`/`last`,
   `firstIndex(of:)`/`lastIndex(of:)`, `min`/`max`, `elementsEqual`,
   `starts(with:)`, `lexicographicallyPrecedes`, `startIndex`/`endIndex`,
@@ -89,9 +101,11 @@ does not by itself certify a physical device or distribution channel.
   fail-closed because downloaded code cannot invoke arbitrary hashing or
   equality. Fully concrete Array-backed `map`, `flatMap`, `filter`,
   `compactMap`, `prefix(while:)`, Collection `drop(while:)`, `reduce`,
-  `forEach`, `first(where:)`, zero-based Array-backed `firstIndex(where:)`,
-  `contains(where:)`, and `allSatisfy` use verified closure control flow and a linear,
-  invocation-local Array builder instead of repeated copy-on-write append.
+  `forEach`, `first(where:)`, `last(where:)`, zero-based Array-backed
+  `firstIndex(where:)`/`lastIndex(where:)`, `contains(where:)`, and
+  `allSatisfy` use verified closure control flow and a linear, invocation-local
+  Array builder instead of repeated copy-on-write append. The `last` searches
+  invoke their predicates from the end, matching Swift's observable order.
   Sequence `prefix(while:)` is also supported when its concrete source has an
   Array-backed normalization. The lazy Sequence `drop(while:)` overload remains
   rejected: eagerly materializing it would change predicate side-effect timing.
