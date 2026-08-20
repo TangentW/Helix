@@ -3326,6 +3326,161 @@ struct Interpreter {
             ) == .trapped(.vmHeapLimitExceeded)
         )
 
+        let groupedDictionaryType = Bytecode.ValueType.dictionary(
+            key: .int64,
+            value: .array(.int64)
+        )
+        let groupedBuilderType = Bytecode.ValueType.dictionaryState(
+            key: .int64,
+            value: .array(.int64)
+        )
+        let groupedFunction = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "groupedDictionaryBuilder",
+            parameterRegisters: [
+                .init(rawValue: 0),
+                .init(rawValue: 1),
+                .init(rawValue: 2),
+            ],
+            resultType: groupedDictionaryType,
+            registerTypes: [
+                .int64, .int64, .int64,
+                groupedBuilderType, groupedDictionaryType,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0),
+                        .init(rawValue: 1),
+                        .init(rawValue: 2),
+                    ],
+                    instructions: [
+                        .makeDictionaryBuilder(
+                            result: .init(rawValue: 3),
+                            initialValue: nil
+                        ),
+                        .dictionaryBuilderAppendArrayElement(
+                            builder: .init(rawValue: 3),
+                            key: .init(rawValue: 0),
+                            element: .init(rawValue: 1)
+                        ),
+                        .dictionaryBuilderAppendArrayElement(
+                            builder: .init(rawValue: 3),
+                            key: .init(rawValue: 0),
+                            element: .init(rawValue: 2)
+                        ),
+                        .finishDictionaryBuilder(
+                            result: .init(rawValue: 4),
+                            builder: .init(rawValue: 3)
+                        ),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ]
+        )
+        let groupedImage = try makeVerified(
+            function: groupedFunction,
+            capabilities: [.baselineV1, .collectionsV1],
+            signature: .init(
+                parameters: ["Swift.Int", "Swift.Int", "Swift.Int"],
+                result: "Swift.Dictionary<Swift.Int, Swift.Array<Swift.Int>>"
+            ),
+            parameterTypes: [.int64, .int64, .int64],
+            resultType: groupedDictionaryType
+        )
+        let groupedExpected = VM.Value.dictionary(
+            [
+                .init(
+                    key: one,
+                    value: .array(
+                        [ten, twenty],
+                        elementType: .int64
+                    )
+                ),
+            ],
+            keyType: .int64,
+            valueType: .array(.int64)
+        )
+        let groupedFrameBytes = UInt64(
+            groupedFunction.registerTypes.count
+                * MemoryLayout<VM.Value?>.stride
+        )
+        let groupedExactHeapBytes = groupedFrameBytes
+            + 16 // Dictionary builder header.
+            + 32 // Key and Array-valued entry slots.
+            + 32 // Singleton Array header and first element.
+            + 16 // One additional grouped element.
+        let groupedExactBudget = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: groupedExactHeapBytes,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: groupedImage,
+                arguments: [one, ten, twenty],
+                budget: groupedExactBudget
+            ) == .returned(groupedExpected)
+        )
+        let groupedInsufficientBudget = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: groupedExactHeapBytes - 1,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: groupedImage,
+                arguments: [one, ten, twenty],
+                budget: groupedInsufficientBudget
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+
+        let groupedDirect = VM.DictionaryBuilder(
+            keyType: .int64,
+            valueType: .array(.int64)
+        )
+        #expect(
+            throws: VM.RuntimeTrap.typeMismatch(
+                expected: .int64,
+                actual: .bool
+            )
+        ) {
+            try groupedDirect.appendArrayElement(
+                key: one,
+                element: .bool(true),
+                matchingIndex: nil
+            )
+        }
+        #expect(throws: VM.RuntimeTrap.invalidProgramCounter) {
+            try groupedDirect.appendArrayElement(
+                key: one,
+                element: ten,
+                matchingIndex: 1
+            )
+        }
+        let scalarDirect = VM.DictionaryBuilder(
+            keyType: .int64,
+            valueType: .int64
+        )
+        #expect(
+            throws: VM.RuntimeTrap.typeMismatch(
+                expected: .array(.int64),
+                actual: .int64
+            )
+        ) {
+            try scalarDirect.appendArrayElement(
+                key: one,
+                element: ten,
+                matchingIndex: nil
+            )
+        }
+
         let direct = VM.DictionaryBuilder(
             keyType: .int64,
             valueType: .int64,

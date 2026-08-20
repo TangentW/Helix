@@ -289,6 +289,8 @@ public enum Disassembler {
             "\(result) = dictionary_builder_get \(builder), \(key)"
         case let .dictionaryBuilderSet(builder, key, value):
             "dictionary_builder_set \(builder), \(key), \(value)"
+        case let .dictionaryBuilderAppendArrayElement(builder, key, element):
+            "dictionary_builder_append_array_element \(builder), \(key), \(element)"
         case let .finishDictionaryBuilder(result, builder):
             "\(result) = finish_dictionary_builder \(builder)"
         case let .arraySorted(result, array):

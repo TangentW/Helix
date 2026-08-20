@@ -398,6 +398,8 @@ struct Container {
             .string,
             .optional(.int64),
             .dictionary(key: .string, value: .int64),
+            .dictionaryState(key: .string, value: .array(.int64)),
+            .dictionary(key: .string, value: .array(.int64)),
         ])
         module.functions[0].blocks[0].instructions.insert(contentsOf: [
             .makeDictionaryBuilder(
@@ -419,6 +421,19 @@ struct Container {
                 result: .init(rawValue: 8),
                 builder: .init(rawValue: 5)
             ),
+            .makeDictionaryBuilder(
+                result: .init(rawValue: 9),
+                initialValue: nil
+            ),
+            .dictionaryBuilderAppendArrayElement(
+                builder: .init(rawValue: 9),
+                key: .init(rawValue: 6),
+                element: .init(rawValue: 0)
+            ),
+            .finishDictionaryBuilder(
+                result: .init(rawValue: 10),
+                builder: .init(rawValue: 9)
+            ),
         ], at: 0)
 
         let bytes = try Bytecode.Encoder.encode(module)
@@ -431,6 +446,7 @@ struct Container {
         #expect(text.contains("make_dictionary_builder"))
         #expect(text.contains("dictionary_builder_get"))
         #expect(text.contains("dictionary_builder_set"))
+        #expect(text.contains("dictionary_builder_append_array_element"))
         #expect(text.contains("finish_dictionary_builder"))
     }
 

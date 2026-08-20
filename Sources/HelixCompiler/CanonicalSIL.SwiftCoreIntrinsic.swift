@@ -8,6 +8,9 @@ enum SwiftCoreIntrinsic: Equatable {
     case ordering(CanonicalSIL.OrderingIntrinsic)
     case split(CanonicalSIL.SplitIntrinsic)
     case algebraic(CanonicalSIL.AlgebraicIntrinsic)
+    case dictionaryAccumulation(
+        CanonicalSIL.DictionaryAccumulationIntrinsic
+    )
     case minimum
     case maximum
     case absoluteValue
@@ -89,6 +92,12 @@ enum SwiftCoreIntrinsic: Equatable {
             mangledName: mangledName
         ) {
             self = .collection(collection)
+            return
+        }
+        if let accumulation = CanonicalSIL.DictionaryAccumulationIntrinsic(
+            mangledName: mangledName
+        ) {
+            self = .dictionaryAccumulation(accumulation)
             return
         }
         switch mangledName {

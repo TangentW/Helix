@@ -261,6 +261,22 @@ public struct Lowerer: Sendable {
         var elementType: Bytecode.ValueType
     }
 
+    private struct DictionaryAccumulationPlan {
+        var intrinsic: CanonicalSIL.DictionaryAccumulationIntrinsic
+        var sourceToken: String
+        var sourceType: Bytecode.ValueType
+        var elementType: Bytecode.ValueType
+        var closureToken: String
+        var seedToken: String?
+        var metatypeToken: String?
+        var keyType: Bytecode.ValueType
+        var valueType: Bytecode.ValueType
+
+        var dictionaryType: Bytecode.ValueType {
+            .dictionary(key: keyType, value: valueType)
+        }
+    }
+
     private struct ImplicitStackValue {
         var address: String
         var register: Bytecode.Register
@@ -4244,6 +4260,387 @@ public struct Lowerer: Sendable {
                 instructions: borrowedElementCleanup + [
                     .destroyValue(state),
                     .branch(target: errorTarget, arguments: [error]),
+                ]
+            )
+        }
+
+        func lowerDictionaryAccumulationTryApply(
+            intrinsic: CanonicalSIL.DictionaryAccumulationIntrinsic,
+            genericArguments: String,
+            argumentText: String,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            let plan = try parseDictionaryAccumulationPlan(
+                intrinsic: intrinsic,
+                genericArguments: genericArguments,
+                argumentText: argumentText,
+                line: line
+            )
+            let source = try materializeOwnedValue(
+                at: plan.sourceToken,
+                line: line
+            )
+            guard registerTypes[Int(source.rawValue)] == plan.sourceType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Dictionary accumulation source does not match its specialization"
+                )
+            }
+
+            let closure = try resolve(plan.closureToken, line: line)
+            let expectedClosureParameters: [Bytecode.ValueType]
+            let expectedClosureResult: Bytecode.ValueType
+            switch plan.intrinsic.callback {
+            case .combineValues:
+                expectedClosureParameters = [plan.valueType, plan.valueType]
+                expectedClosureResult = plan.valueType
+            case .classifyElement:
+                expectedClosureParameters = [plan.elementType]
+                expectedClosureResult = plan.keyType
+            }
+            guard case let .closure(closureSignature) = registerTypes[
+                Int(closure.rawValue)
+            ], closureSignature.parameters == expectedClosureParameters,
+               closureSignature.parameterConventions.count
+                    == expectedClosureParameters.count,
+               !closureSignature.parameterConventions.contains(.inout),
+               closureSignature.result == expectedClosureResult,
+               closureSignature.effects.mayThrow,
+               !closureSignature.effects.isAsync
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<Dictionary accumulation closure>"
+                )
+            }
+            for (type, convention) in zip(
+                expectedClosureParameters,
+                closureSignature.parameterConventions
+            ) where type.requiresLinearOwnership
+                && convention != .borrowed {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<Dictionary accumulation borrowed input>"
+                )
+            }
+
+            let initialDictionary: Bytecode.Register?
+            let writesBackPartialResult: Bool
+            switch plan.intrinsic.seed {
+            case .empty:
+                guard let metatypeToken = plan.metatypeToken,
+                      let metatype = dictionaryMetatypeValues[metatypeToken],
+                      metatype.0 == plan.keyType,
+                      metatype.1 == plan.valueType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary accumulation metatype does not match its result"
+                    )
+                }
+                initialDictionary = nil
+                writesBackPartialResult = false
+
+            case .ownedDictionary:
+                guard let seedToken = plan.seedToken else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary accumulation omitted its owned seed"
+                    )
+                }
+                let seed = try materializeOwnedValue(
+                    at: seedToken,
+                    line: line
+                )
+                guard registerTypes[Int(seed.rawValue)]
+                        == plan.dictionaryType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary accumulation seed has the wrong type"
+                    )
+                }
+                initialDictionary = seed
+                writesBackPartialResult = false
+
+            case .inoutDictionary:
+                guard let seedToken = plan.seedToken,
+                      compilerAddressType(seedToken) == plan.dictionaryType,
+                      let seed = try takeStoredValue(
+                        at: seedToken,
+                        line: line
+                      ),
+                      registerTypes[Int(seed.rawValue)]
+                        == plan.dictionaryType,
+                      implicitStackValues[normalTarget] == nil,
+                      implicitStackValues[errorTarget] == nil,
+                      suppressedVoidTryNormalBlocks
+                        .insert(normalTarget).inserted
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary accumulation inout seed cannot be written back"
+                    )
+                }
+                let normalWriteback = try allocate(
+                    type: plan.dictionaryType
+                )
+                let errorWriteback = try allocate(
+                    type: plan.dictionaryType
+                )
+                implicitStackValues[normalTarget] = [
+                    .init(seedToken, normalWriteback, storeMode: .initialize),
+                ]
+                implicitStackValues[errorTarget] = [
+                    .init(seedToken, errorWriteback, storeMode: .initialize),
+                ]
+                initialDictionary = seed
+                writesBackPartialResult = true
+            }
+
+            let builder = try allocate(
+                type: .dictionaryState(
+                    key: plan.keyType,
+                    value: plan.valueType
+                )
+            )
+            appendInstruction(
+                .makeDictionaryBuilder(
+                    result: builder,
+                    initialValue: initialDictionary
+                )
+            )
+            if let initialDictionary,
+               plan.dictionaryType.requiresLinearOwnership {
+                appendInstruction(.destroyValue(initialDictionary))
+            }
+
+            let indexSlot = try allocateStackSlot(type: .int64)
+            let initialIndex = try allocate(type: .int64)
+            appendInstruction(
+                .constantInteger(result: initialIndex, bitPattern: 0)
+            )
+            appendInstruction(
+                .storeStack(
+                    slot: indexSlot,
+                    source: initialIndex,
+                    mode: .initialize
+                )
+            )
+
+            let errorType: Bytecode.ValueType = typeEnvironment
+                .preservesTypedErrors ? .error : .string
+            let error = try allocate(type: errorType)
+            let completedDictionary = try allocate(
+                type: plan.dictionaryType
+            )
+            let loop = try allocateSyntheticBlockID()
+            let some = try allocateSyntheticBlockID()
+            let complete = try allocateSyntheticBlockID()
+            let failed = try allocateSyntheticBlockID()
+            let next = try allocate(type: .optional(plan.elementType))
+            let element = try allocate(type: plan.elementType)
+            let sourceCleanup: [IntermediateRepresentation.Instruction] =
+                plan.sourceType.requiresLinearOwnership
+                    ? [.destroyValue(source)] : []
+
+            appendInstruction(.branch(target: loop, arguments: []))
+            finishCurrent()
+            appendSyntheticBlock(
+                id: loop,
+                instructions: [
+                    .collectionNext(
+                        result: next,
+                        collection: source,
+                        indexSlot: indexSlot,
+                        direction: .forward
+                    ),
+                    .switchOptional(
+                        optional: next,
+                        someTarget: some,
+                        noneTarget: complete
+                    ),
+                ]
+            )
+
+            switch plan.intrinsic.callback {
+            case .combineValues:
+                let key = try allocate(type: plan.keyType)
+                let incoming = try allocate(type: plan.valueType)
+                let existingOptional = try allocate(
+                    type: .optional(plan.valueType)
+                )
+                let existing = try allocate(type: plan.valueType)
+                let combined = try allocate(type: plan.valueType)
+                let duplicate = try allocateSyntheticBlockID()
+                let missing = try allocateSyntheticBlockID()
+                let combinedValue = try allocateSyntheticBlockID()
+                let keyCleanup: [IntermediateRepresentation.Instruction] =
+                    plan.keyType.requiresLinearOwnership
+                        ? [.destroyValue(key)] : []
+                let incomingCleanup: [IntermediateRepresentation.Instruction] =
+                    plan.valueType.requiresLinearOwnership
+                        ? [.destroyValue(incoming)] : []
+                let existingCleanup: [IntermediateRepresentation.Instruction] =
+                    plan.valueType.requiresLinearOwnership
+                        ? [.destroyValue(existing)] : []
+                let combinedCleanup: [IntermediateRepresentation.Instruction] =
+                    plan.valueType.requiresLinearOwnership
+                        ? [.destroyValue(combined)] : []
+
+                appendSyntheticBlock(
+                    id: some,
+                    parameters: [element],
+                    instructions: [
+                        .unpackTuple(
+                            results: [key, incoming],
+                            tuple: element
+                        ),
+                        .dictionaryBuilderGet(
+                            result: existingOptional,
+                            builder: builder,
+                            key: key
+                        ),
+                        .switchOptional(
+                            optional: existingOptional,
+                            someTarget: duplicate,
+                            noneTarget: missing
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: duplicate,
+                    parameters: [existing],
+                    instructions: [
+                        .closureTryApply(
+                            closure: closure,
+                            arguments: [existing, incoming],
+                            normalTarget: combinedValue,
+                            errorTarget: failed
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: missing,
+                    instructions: [
+                        .dictionaryBuilderSet(
+                            builder: builder,
+                            key: key,
+                            value: incoming
+                        ),
+                    ] + keyCleanup + incomingCleanup + [
+                        .branch(target: loop, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: combinedValue,
+                    parameters: [combined],
+                    instructions: [
+                        .dictionaryBuilderSet(
+                            builder: builder,
+                            key: key,
+                            value: combined
+                        ),
+                    ] + keyCleanup + incomingCleanup + existingCleanup
+                        + combinedCleanup + [
+                        .branch(target: loop, arguments: []),
+                    ]
+                )
+
+                var failureInstructions = keyCleanup + incomingCleanup
+                    + existingCleanup
+                if writesBackPartialResult {
+                    let partial = try allocate(type: plan.dictionaryType)
+                    failureInstructions.append(
+                        .finishDictionaryBuilder(
+                            result: partial,
+                            builder: builder
+                        )
+                    )
+                    failureInstructions.append(.destroyStack(indexSlot))
+                    failureInstructions.append(contentsOf: sourceCleanup)
+                    failureInstructions.append(
+                        .branch(
+                            target: errorTarget,
+                            arguments: [error, partial]
+                        )
+                    )
+                } else {
+                    failureInstructions.append(.destroyValue(builder))
+                    failureInstructions.append(.destroyStack(indexSlot))
+                    failureInstructions.append(contentsOf: sourceCleanup)
+                    failureInstructions.append(
+                        .branch(
+                            target: errorTarget,
+                            arguments: [error]
+                        )
+                    )
+                }
+                appendSyntheticBlock(
+                    id: failed,
+                    parameters: [error],
+                    instructions: failureInstructions
+                )
+
+            case .classifyElement:
+                let key = try allocate(type: plan.keyType)
+                let classified = try allocateSyntheticBlockID()
+                let elementCleanup: [IntermediateRepresentation.Instruction] =
+                    plan.elementType.requiresLinearOwnership
+                        ? [.destroyValue(element)] : []
+                let keyCleanup: [IntermediateRepresentation.Instruction] =
+                    plan.keyType.requiresLinearOwnership
+                        ? [.destroyValue(key)] : []
+                appendSyntheticBlock(
+                    id: some,
+                    parameters: [element],
+                    instructions: [
+                        .closureTryApply(
+                            closure: closure,
+                            arguments: [element],
+                            normalTarget: classified,
+                            errorTarget: failed
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: classified,
+                    parameters: [key],
+                    instructions: [
+                        .dictionaryBuilderAppendArrayElement(
+                            builder: builder,
+                            key: key,
+                            element: element
+                        ),
+                    ] + keyCleanup + elementCleanup + [
+                        .branch(target: loop, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: failed,
+                    parameters: [error],
+                    instructions: elementCleanup + [
+                        .destroyValue(builder),
+                        .destroyStack(indexSlot),
+                    ] + sourceCleanup + [
+                        .branch(
+                            target: errorTarget,
+                            arguments: [error]
+                        ),
+                    ]
+                )
+            }
+
+            appendSyntheticBlock(
+                id: complete,
+                instructions: [
+                    .finishDictionaryBuilder(
+                        result: completedDictionary,
+                        builder: builder
+                    ),
+                    .destroyStack(indexSlot),
+                ] + sourceCleanup + [
+                    .branch(
+                        target: normalTarget,
+                        arguments: [completedDictionary]
+                    ),
                 ]
             )
         }
@@ -9478,7 +9875,8 @@ public struct Lowerer: Sendable {
                     argumentText: argumentText,
                     line: line
                 )
-            case .higherOrder, .ordering, .split, .algebraic:
+            case .higherOrder, .ordering, .split, .algebraic,
+                 .dictionaryAccumulation:
                 throw CanonicalSIL.LoweringError.unsupportedInstruction(
                     line: line,
                     text: "Swift intrinsic requires control-flow lowering"
@@ -14634,6 +15032,20 @@ public struct Lowerer: Sendable {
                     )
                     continue
                 }
+                if case let .dictionaryAccumulation(intrinsic)? =
+                    swiftCoreReferences[call[0]] {
+                    let normalTarget = try parseBlockID(call[4])
+                    let errorTarget = try parseBlockID(call[5])
+                    try lowerDictionaryAccumulationTryApply(
+                        intrinsic: intrinsic,
+                        genericArguments: call[1],
+                        argumentText: call[2],
+                        normalTarget: normalTarget,
+                        errorTarget: errorTarget,
+                        line: sourceLine
+                    )
+                    continue
+                }
                 if case let .higherOrder(operation)? = swiftCoreReferences[
                     call[0]
                 ] {
@@ -19066,6 +19478,123 @@ public struct Lowerer: Sendable {
         }
     }
 
+    private func representedManagedCollectionElement(
+        of type: Bytecode.ValueType,
+        context: String
+    ) throws -> Bytecode.ValueType {
+        switch type {
+        case let .array(element), let .set(element):
+            return element
+        case let .dictionary(key, value):
+            return .tuple([key, value])
+        default:
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "\(context) requires a represented managed Collection, got \(type)"
+            )
+        }
+    }
+
+    private func parseDictionaryAccumulationPlan(
+        intrinsic: CanonicalSIL.DictionaryAccumulationIntrinsic,
+        genericArguments: String,
+        argumentText: String,
+        line: Int
+    ) throws -> DictionaryAccumulationPlan {
+        let genericTypes = try splitTopLevel(genericArguments)
+            .filter { !$0.isEmpty }
+            .map(parseStoredType)
+        let arguments = try parseApplyValueTokens(
+            argumentText,
+            line: line
+        )
+        guard arguments.count == 3 else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "Dictionary accumulation has unsupported arguments"
+            )
+        }
+
+        let keyType: Bytecode.ValueType
+        let valueType: Bytecode.ValueType
+        let sourceType: Bytecode.ValueType
+        let elementType: Bytecode.ValueType
+        switch intrinsic.source {
+        case .dictionaryPairs:
+            guard genericTypes.count == 2 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Dictionary-pair accumulation requires Key and Value"
+                )
+            }
+            keyType = genericTypes[0]
+            valueType = genericTypes[1]
+            sourceType = .dictionary(key: keyType, value: valueType)
+            elementType = .tuple([keyType, valueType])
+
+        case .sequencePairs:
+            guard genericTypes.count == 3 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "pair-sequence accumulation requires Key, Value, and Sequence"
+                )
+            }
+            keyType = genericTypes[0]
+            valueType = genericTypes[1]
+            elementType = .tuple([keyType, valueType])
+            sourceType = genericTypes[2]
+            guard try representedManagedCollectionElement(
+                of: sourceType,
+                context: "Dictionary accumulation"
+            ) == elementType
+            else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "Dictionary accumulation pair Sequence has the wrong Element"
+                )
+            }
+
+        case .sequenceElements:
+            guard genericTypes.count == 3,
+                  case let .array(groupedElement) = genericTypes[1],
+                  try representedManagedCollectionElement(
+                    of: genericTypes[2],
+                    context: "grouped Dictionary accumulation"
+                  ) == groupedElement
+            else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "grouped Dictionary accumulation Sequence has the wrong Element"
+                )
+            }
+            keyType = genericTypes[0]
+            valueType = genericTypes[1]
+            sourceType = genericTypes[2]
+            elementType = groupedElement
+        }
+        guard keyType.isVMHashable else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "Dictionary accumulation key \(keyType) lacks VM-defined Hashable semantics"
+            )
+        }
+        switch (intrinsic.source, intrinsic.callback) {
+        case (.dictionaryPairs, .combineValues),
+             (.sequencePairs, .combineValues),
+             (.sequenceElements, .classifyElement):
+            break
+        default:
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "Dictionary accumulation source and callback shapes disagree"
+            )
+        }
+
+        return .init(
+            intrinsic: intrinsic,
+            sourceToken: arguments[0],
+            sourceType: sourceType,
+            elementType: elementType,
+            closureToken: arguments[1],
+            seedToken: intrinsic.seed == .empty ? nil : arguments[2],
+            metatypeToken: intrinsic.seed == .empty ? arguments[2] : nil,
+            keyType: keyType,
+            valueType: valueType
+        )
+    }
+
     private func parseCollectionHigherOrderPlan(
         operation: CanonicalSIL.HigherOrderIntrinsic,
         genericArguments: String,
@@ -19076,21 +19605,6 @@ public struct Lowerer: Sendable {
             .filter { !$0.isEmpty }
         let genericTypes = try genericSpellings.map(parseType)
         let arguments = try parseApplyValueTokens(argumentText, line: line)
-
-        func managedCollectionElement(
-            _ type: Bytecode.ValueType
-        ) throws -> Bytecode.ValueType {
-            switch type {
-            case let .array(element), let .set(element):
-                return element
-            case let .dictionary(key, value):
-                return .tuple([key, value])
-            default:
-                throw CanonicalSIL.LoweringError.unsupportedType(
-                    "higher-order collection \(type)"
-                )
-            }
-        }
 
         func arrayElement(
             _ type: Bytecode.ValueType
@@ -19110,7 +19624,10 @@ public struct Lowerer: Sendable {
                     "Collection.map has an unsupported specialization"
                 )
             }
-            let input = try managedCollectionElement(genericTypes[0])
+            let input = try representedManagedCollectionElement(
+                of: genericTypes[0],
+                context: "higher-order operation"
+            )
             let mapped = ValueRepresentation.storable(genericTypes[1])
             return .init(
                 operation: operation,
@@ -19130,7 +19647,10 @@ public struct Lowerer: Sendable {
                     "Sequence.flatMap has an unsupported specialization"
                 )
             }
-            let input = try managedCollectionElement(genericTypes[0])
+            let input = try representedManagedCollectionElement(
+                of: genericTypes[0],
+                context: "higher-order operation"
+            )
             let mapped = try arrayElement(genericTypes[1])
             return .init(
                 operation: operation,
@@ -19212,7 +19732,10 @@ public struct Lowerer: Sendable {
                     "Sequence.compactMap has an unsupported specialization"
                 )
             }
-            let input = try managedCollectionElement(genericTypes[0])
+            let input = try representedManagedCollectionElement(
+                of: genericTypes[0],
+                context: "higher-order operation"
+            )
             let mapped = ValueRepresentation.storable(genericTypes[1])
             return .init(
                 operation: operation,
@@ -19279,7 +19802,10 @@ public struct Lowerer: Sendable {
                     "Sequence.reduce has an unsupported specialization"
                 )
             }
-            let input = try managedCollectionElement(genericTypes[0])
+            let input = try representedManagedCollectionElement(
+                of: genericTypes[0],
+                context: "higher-order operation"
+            )
             let accumulator = ValueRepresentation.storable(genericTypes[1])
             return .init(
                 operation: operation,
@@ -19299,7 +19825,10 @@ public struct Lowerer: Sendable {
                     "Sequence.reduce(into:_:) has an unsupported specialization"
                 )
             }
-            let input = try managedCollectionElement(genericTypes[0])
+            let input = try representedManagedCollectionElement(
+                of: genericTypes[0],
+                context: "higher-order operation"
+            )
             let accumulator = ValueRepresentation.storable(genericTypes[1])
             return .init(
                 operation: operation,
@@ -19329,7 +19858,10 @@ public struct Lowerer: Sendable {
                     "Sequence predicate operation has an unsupported specialization"
                 )
             }
-            let input = try managedCollectionElement(genericTypes[0])
+            let input = try representedManagedCollectionElement(
+                of: genericTypes[0],
+                context: "higher-order operation"
+            )
             if operation.traversalDirection == .reverse {
                 guard case .array = genericTypes[0] else {
                     throw CanonicalSIL.LoweringError.unsupportedType(

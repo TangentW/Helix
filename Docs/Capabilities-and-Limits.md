@@ -96,8 +96,17 @@ does not by itself certify a physical device or distribution channel.
   lazy `subscript(_:default:)` lookup and scoped mutation,
   `updateValue(_:forKey:)`, `removeValue(forKey:)`,
   `removeAll(keepingCapacity:)`, `keys`/`values` sequence materialization,
-  `init(uniqueKeysWithValues:)`, `reserveCapacity`, and iteration are supported
-  for eligible key and value types. Insertion, replacement, and removal share
+  `init(uniqueKeysWithValues:)`, `init(_:uniquingKeysWith:)`, both Dictionary-
+  and represented-Sequence forms of `merging`/`merge`,
+  `init(grouping:by:)`, `reserveCapacity`, and iteration are supported for
+  eligible key and value types. Grouping accepts represented managed
+  Array/Set/Dictionary sources and normalized Array-backed adapters. It uses a
+  fused Array-valued accumulator append rather than repeatedly copying a whole
+  bucket. Combining callbacks run only for duplicate keys; first-key identity,
+  insertion order, source traversal order, and `rethrows` behavior are
+  preserved. A throwing mutating `merge` retains successful prefix mutations,
+  while value-returning construction discards its partial result. Insertion,
+  replacement, and removal share
   one typed Optional-update primitive that returns both the previous value and
   the updated Dictionary; key/value views share one typed projection primitive.
   Those update and projection paths precharge work and output storage before
@@ -281,6 +290,9 @@ does not by itself certify a physical device or distribution channel.
 
 - Generic roots or any execution that still requires runtime generic metadata,
   witness tables, unresolved/generic reabstraction, or dynamic specialization.
+  This includes opaque custom `Sequence` implementations whose iteration has
+  not been normalized to a represented managed Collection; they are not
+  redirected to the Swift standard library through NativeImport.
 - True suspension: `await`, continuations, tasks, async callees, async closures,
   cancellation, and cross-suspension ownership or generation leases.
 - Actor-isolated instance roots, custom global actors, and arbitrary executor

@@ -2424,6 +2424,69 @@ public struct Interpreter: Sendable {
                         value: copiedValue,
                         matchingIndex: matchingIndex
                     )
+                case let .dictionaryBuilderAppendArrayElement(
+                    builderRegister,
+                    key,
+                    element
+                ):
+                    guard case let .dictionaryState(
+                        keyType,
+                        .array(elementType)
+                    ) = function.type(of: builderRegister),
+                          function.type(of: key) == keyType,
+                          function.type(of: element) == elementType,
+                          case let .dictionaryBuilder(builder) = try read(
+                            builderRegister,
+                            registers: registers
+                          )
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: builderRegister)
+                                ?? .never,
+                            actual: try read(
+                                builderRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    let sourceKey = try read(key, registers: registers)
+                    let sourceElement = try read(
+                        element,
+                        registers: registers
+                    )
+                    let matchingIndex = try builder.withEntries { entries in
+                        try dictionaryIndex(
+                            of: sourceKey,
+                            in: entries,
+                            budget: budget
+                        )
+                    }
+                    try budget.consumeLinearWork(elementCount: 1)
+                    if matchingIndex == nil {
+                        try budget.consumeAggregateElementStorage(
+                            elementCount: 2
+                        )
+                        try chargeAggregate(elementCount: 1, budget: budget)
+                        try prepareCopy(sourceKey, budget: budget)
+                    } else {
+                        try budget.consumeAggregateElementStorage(
+                            elementCount: 1
+                        )
+                    }
+                    try prepareCopy(sourceElement, budget: budget)
+                    let copiedKey: VM.Value
+                    if matchingIndex == nil {
+                        copiedKey = try copy(sourceKey)
+                    } else {
+                        copiedKey = sourceKey
+                    }
+                    let copiedElement = try copy(sourceElement)
+                    try budget.checkDeadline()
+                    try builder.appendArrayElement(
+                        key: copiedKey,
+                        element: copiedElement,
+                        matchingIndex: matchingIndex
+                    )
                 case let .finishDictionaryBuilder(result, builderRegister):
                     guard case let .dictionaryState(keyType, valueType) =
                             function.type(of: builderRegister),

@@ -2587,6 +2587,22 @@ public struct Engine: Verification.ImageVerifying {
                     "dictionary_builder_set requires matching copyable key/value types"
                 )
             }
+        case let .dictionaryBuilderAppendArrayElement(builder, key, element):
+            guard capabilities.contains(.collectionsV1),
+                  case let .dictionaryState(
+                    keyType,
+                    .array(elementType)
+                  ) = type(builder),
+                  type(key) == keyType,
+                  type(element) == elementType,
+                  keyType.isVMHashable,
+                  isCopyable(keyType, shell: shell),
+                  isCopyable(elementType, shell: shell)
+            else {
+                throw fail(
+                    "dictionary_builder_append_array_element requires matching copyable key/Array element types"
+                )
+            }
         case let .finishDictionaryBuilder(result, builder):
             guard capabilities.contains(.collectionsV1),
                   case let .dictionaryState(key, value) = type(builder),
@@ -3663,6 +3679,8 @@ public struct Engine: Verification.ImageVerifying {
                         live.insert(result)
                     }
                 case .dictionaryBuilderSet:
+                    break
+                case .dictionaryBuilderAppendArrayElement:
                     break
                 case let .finishDictionaryBuilder(result, builder):
                     guard live.remove(builder) != nil else {

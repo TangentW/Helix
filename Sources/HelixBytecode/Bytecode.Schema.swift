@@ -736,6 +736,13 @@ public enum Instruction: Codable, Hashable, Sendable {
         key: Bytecode.Register,
         value: Bytecode.Register
     )
+    /// Appends one element to an Array-valued entry, inserting a singleton
+    /// Array when the key is absent. This keeps grouped accumulation linear.
+    case dictionaryBuilderAppendArrayElement(
+        builder: Bytecode.Register,
+        key: Bytecode.Register,
+        element: Bytecode.Register
+    )
     case finishDictionaryBuilder(
         result: Bytecode.Register,
         builder: Bytecode.Register
@@ -1097,6 +1104,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              .storeMutableCell, .arrayBuilderAppend,
              .arrayBuilderAppendContents,
              .dictionaryBuilderSet,
+             .dictionaryBuilderAppendArrayElement,
              .arraySortAcceptComparison,
              .arraySplitAcceptElement,
              .hostedSuperApply, .endAccess,
@@ -1255,6 +1263,8 @@ public enum Instruction: Codable, Hashable, Sendable {
             [builder, key]
         case let .dictionaryBuilderSet(builder, key, value):
             [builder, key, value]
+        case let .dictionaryBuilderAppendArrayElement(builder, key, element):
+            [builder, key, element]
         case let .finishDictionaryBuilder(_, builder):
             [builder]
         case let .arraySorted(_, array),

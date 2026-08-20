@@ -2580,6 +2580,67 @@ struct SemanticVerifier {
             policy: fixture.policy
         )
 
+        let groupedDictionaryType = Bytecode.ValueType.dictionary(
+            key: .int64,
+            value: .array(.int64)
+        )
+        let groupedBuilderType = Bytecode.ValueType.dictionaryState(
+            key: .int64,
+            value: .array(.int64)
+        )
+        var grouped = try makeFixture { function in
+            function.resultType = groupedDictionaryType
+            function.registerTypes = [
+                .int64,
+                groupedBuilderType,
+                groupedDictionaryType,
+            ]
+            function.blocks[0].instructions = [
+                .makeDictionaryBuilder(
+                    result: .init(rawValue: 1),
+                    initialValue: nil
+                ),
+                .dictionaryBuilderAppendArrayElement(
+                    builder: .init(rawValue: 1),
+                    key: .init(rawValue: 0),
+                    element: .init(rawValue: 0)
+                ),
+                .finishDictionaryBuilder(
+                    result: .init(rawValue: 2),
+                    builder: .init(rawValue: 1)
+                ),
+                .returnValue(.init(rawValue: 2)),
+            ]
+        }
+        grouped.module.capabilities.insert(.collectionsV1)
+        grouped.shell.capabilities.insert(.collectionsV1)
+        grouped.policy.acceptedCapabilities.insert(.collectionsV1)
+        let groupedEntry = try #require(
+            grouped.shell.entries[.init(rawValue: 0)]
+        )
+        grouped.shell.entries[groupedEntry.index] = .init(
+            index: groupedEntry.index,
+            key: groupedEntry.key,
+            parameterTypes: groupedEntry.parameterTypes,
+            resultType: groupedDictionaryType,
+            effects: groupedEntry.effects
+        )
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(grouped.module),
+            shell: grouped.shell,
+            policy: grouped.policy
+        )
+
+        var invalidGrouped = grouped.module
+        invalidGrouped.functions[0].registerTypes[1] = builderType
+        #expect(throws: Verification.Error.self) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(invalidGrouped),
+                shell: grouped.shell,
+                policy: grouped.policy
+            )
+        }
+
         var copied = fixture.module
         copied.functions[0].registerTypes.append(builderType)
         copied.functions[0].blocks[0].instructions.insert(

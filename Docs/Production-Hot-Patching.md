@@ -174,7 +174,8 @@ Array-backed structural concatenation/insertion/replacement/removal/swap and
 capacity hints, Dictionary lookup/subscript mutation including lazy default
 lookup and scoped default-value writeback, `updateValue`,
 `removeValue`, `removeAll`, key/value projection, unique-key sequence
-construction and capacity hints, and typed Set
+construction, uniquing construction, Dictionary/represented-Sequence
+`merging`/`merge`, represented-Collection grouping, and capacity hints; typed Set
 construction/query/mutation/iteration/algebra with recursively VM-defined
 Equatable/Hashable semantics. Common fully concrete transforms, reductions,
 visits, predicate queries, and comparator selection share one closure traversal

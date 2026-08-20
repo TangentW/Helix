@@ -105,6 +105,12 @@ Both workflows depend on stable, build-specific identities:
   empty or from a copied Dictionary, supports typed lookup and replacement in
   ordinary verified control flow, preserves the first equivalent key and its
   insertion position, then moves its storage into one finished Dictionary.
+  Array-valued accumulation also has one fused typed append operation, so
+  grouping grows each bucket linearly without materializing and replacing an
+  immutable Array after every element. Merge, uniquing, and grouping callbacks
+  remain ordinary closure CFG edges: combining is lazy on duplicate keys,
+  errors destroy nonmutating partial results, and mutating `merge` writes back
+  the successfully accumulated prefix on its error continuation as Swift does.
   The Verifier proves VM-defined key hashing and copyable key/value types; the
   VM charges lookup work, copied values, and new entry storage before mutation.
   This lets compiler lowering share one bounded mechanism without repeatedly

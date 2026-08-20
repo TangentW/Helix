@@ -72,6 +72,72 @@ public final class DictionaryBuilder: @unchecked Sendable, Hashable,
         }
     }
 
+    func appendArrayElement(
+        key: VM.Value,
+        element: VM.Value,
+        matchingIndex: Int?
+    ) throws {
+        try withLock {
+            guard !isFinished else {
+                throw VM.RuntimeTrap.explicit(
+                    "Dictionary builder is already finished"
+                )
+            }
+            guard key.type == keyType else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: keyType,
+                    actual: key.type
+                )
+            }
+            guard case let .array(elementType) = valueType else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: .array(element.type),
+                    actual: valueType
+                )
+            }
+            guard element.type == elementType else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: elementType,
+                    actual: element.type
+                )
+            }
+            guard let matchingIndex else {
+                entries.append(
+                    .init(
+                        key: key,
+                        value: .array([element], elementType: elementType)
+                    )
+                )
+                return
+            }
+            guard entries.indices.contains(matchingIndex),
+                  entries[matchingIndex].value.type == valueType
+            else {
+                throw VM.RuntimeTrap.invalidProgramCounter
+            }
+
+            // Move the uniquely owned Array buffer out of the entry before
+            // appending. Keeping the old enum payload alive here would force
+            // Swift COW to copy the entire group on every element.
+            var owned = entries[matchingIndex].value
+            guard case .array(var elements, let actualType) = owned,
+                  actualType == elementType
+            else {
+                throw VM.RuntimeTrap.invalidProgramCounter
+            }
+            entries[matchingIndex].value = .array(
+                [],
+                elementType: elementType
+            )
+            owned = .array([], elementType: elementType)
+            elements.append(element)
+            entries[matchingIndex].value = .array(
+                elements,
+                elementType: elementType
+            )
+        }
+    }
+
     func finish() throws -> [VM.DictionaryEntry] {
         try withLock {
             guard !isFinished else {

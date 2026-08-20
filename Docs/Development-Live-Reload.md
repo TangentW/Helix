@@ -364,6 +364,11 @@ special-cased for a framework class. Dictionary default lookup invokes its
 autoclosure only for a missing key. Its scoped `_modify` and Array element
 `_modify` share frame-backed lending and write back on normal `end_apply` and
 throwing `abort_apply`, including nested collections and imported references.
+Dictionary merging, mutating merge, uniquing construction, and grouping share
+one typed linear accumulator and the ordinary closure CFG. These operations
+therefore preserve duplicate-only combining, traversal order, partial mutating
+writeback on error, and imported-reference ownership without a per-API opcode
+or a Swift-standard-library NativeImport.
 Natural `sorted()`/`sort()` is available
 for VM-comparable scalar elements. Mutating ordering commits only on its normal
 continuation, so a throwing callback leaves the original Array unchanged.
