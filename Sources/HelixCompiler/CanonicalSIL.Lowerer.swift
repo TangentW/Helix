@@ -245,9 +245,10 @@ public struct Lowerer: Sendable {
         case dictionaryKeyValue
     }
 
-    private struct ArrayOrderingPlan {
+    private struct CollectionOrderingPlan {
         var operation: CanonicalSIL.OrderingIntrinsic
         var sourceToken: String
+        var sourceType: Bytecode.ValueType
         var closureToken: String
         var elementType: Bytecode.ValueType
     }
@@ -443,7 +444,10 @@ public struct Lowerer: Sendable {
             .analyze(
                 body: normalizedBody,
                 directCalls: directCalls,
-                typeEnvironment: typeEnvironment
+                typeEnvironment: typeEnvironment,
+                indirectResultType: signature.hasIndirectResult
+                    ? signature.result : nil,
+                indirectErrorType: signature.indirectErrorType
             )
         let nsErrorBridges = try CanonicalSIL.NSErrorBridgePlan.analyze(
             body: normalizedBody,
@@ -2828,7 +2832,7 @@ public struct Lowerer: Sendable {
                 return signature.indirectErrorType
             }
             if let component = tupleComponentAddresses[token],
-               case let .tuple(types) = stackType(at: component.base),
+               case let .tuple(types) = compilerAddressType(component.base),
                types.indices.contains(component.index) {
                 return types[component.index]
             }
@@ -3476,7 +3480,33 @@ public struct Lowerer: Sendable {
             try storeExistential(erased, at: projection.destination)
         }
 
-        func lowerNaturalArrayOrdering(
+        func materializeManagedCollectionElements(
+            _ source: Bytecode.Register,
+            sourceType: Bytecode.ValueType,
+            context: String
+        ) throws -> (array: Bytecode.Register, cleanupOwner: Bytecode.Register?) {
+            guard registerTypes[Int(source.rawValue)] == sourceType,
+                  let element = sourceType.managedCollectionElement
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) source does not match a represented managed Collection"
+                )
+            }
+            let arrayType = Bytecode.ValueType.array(element)
+            if sourceType == arrayType {
+                return (source, nil)
+            }
+            let result = try allocate(type: arrayType)
+            appendInstruction(
+                .collectionMaterialize(result: result, collection: source)
+            )
+            return (
+                result,
+                arrayType.requiresLinearOwnership ? result : nil
+            )
+        }
+
+        func lowerNaturalCollectionOrdering(
             _ operation: CanonicalSIL.OrderingIntrinsic,
             resultToken: String,
             genericArguments: String,
@@ -3487,25 +3517,28 @@ public struct Lowerer: Sendable {
                   arguments.count == 1
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "natural Array ordering has unsupported arguments"
+                    "natural Collection ordering has unsupported arguments"
                 )
             }
             let genericSpellings = splitTopLevel(genericArguments)
                 .filter { !$0.isEmpty }
             let genericTypes = try genericSpellings.map(parseType)
             guard genericTypes.count == 1,
-                  case let .array(element) = genericTypes[0],
+                  let element = genericTypes[0].managedCollectionElement,
                   element.isVMComparable
             else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
-                    "natural ordering requires an Array with VM-defined Comparable semantics"
+                    "natural ordering requires a represented Collection with VM-defined Comparable semantics"
                 )
             }
+            let sourceType = genericTypes[0]
             let arrayType = Bytecode.ValueType.array(element)
             if operation.mutatesSource {
-                guard compilerAddressType(arguments[0]) == arrayType else {
+                guard sourceType == arrayType,
+                      compilerAddressType(arguments[0]) == arrayType
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "MutableCollection.sort() requires matching inout storage"
+                        "MutableCollection.sort() requires represented Array inout storage"
                     )
                 }
                 switch typeEnvironment.collectionIndexModel(
@@ -3526,13 +3559,23 @@ public struct Lowerer: Sendable {
             )
             let source = try borrowedSource?.register
                 ?? resolve(arguments[0], line: line)
-            guard registerTypes[Int(source.rawValue)] == arrayType else {
+            guard registerTypes[Int(source.rawValue)] == sourceType else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "natural ordering source does not match its specialization"
                 )
             }
+            let materialized = try materializeManagedCollectionElements(
+                source,
+                sourceType: sourceType,
+                context: "natural ordering"
+            )
             let result = try allocate(type: arrayType)
-            appendInstruction(.arraySorted(result: result, array: source))
+            appendInstruction(
+                .arraySorted(result: result, array: materialized.array)
+            )
+            if let cleanupOwner = materialized.cleanupOwner {
+                appendInstruction(.destroyValue(cleanupOwner))
+            }
             if let owner = borrowedSource?.temporaryOwner {
                 appendInstruction(.destroyValue(owner))
             }
@@ -3620,8 +3663,8 @@ public struct Lowerer: Sendable {
             values[resultToken] = result
         }
 
-        func resolveArrayOrderingClosure(
-            for plan: ArrayOrderingPlan,
+        func resolveCollectionOrderingClosure(
+            for plan: CollectionOrderingPlan,
             line: Int
         ) throws -> (Bytecode.Register, Bytecode.ClosureSignature) {
             let closure = try resolve(plan.closureToken, line: line)
@@ -3637,14 +3680,14 @@ public struct Lowerer: Sendable {
             else {
                 throw CanonicalSIL.LoweringError.callSignatureMismatch(
                     line: line,
-                    mangledName: "<Array ordering closure>"
+                    mangledName: "<Collection ordering closure>"
                 )
             }
             return (closure, signature)
         }
 
-        func prepareArrayOrderingContinuations(
-            plan: ArrayOrderingPlan,
+        func prepareCollectionOrderingContinuations(
+            plan: CollectionOrderingPlan,
             normalTarget: Bytecode.BlockID
         ) throws {
             switch plan.operation {
@@ -3652,7 +3695,8 @@ public struct Lowerer: Sendable {
                 break
             case .sortBy:
                 let arrayType = Bytecode.ValueType.array(plan.elementType)
-                guard compilerAddressType(plan.sourceToken) == arrayType,
+                guard plan.sourceType == arrayType,
+                      compilerAddressType(plan.sourceToken) == arrayType,
                       implicitStackValues[normalTarget] == nil,
                       suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
                 else {
@@ -3679,8 +3723,8 @@ public struct Lowerer: Sendable {
         /// the VM owns a bounded stable merge-sort state machine. This keeps
         /// captures, throwing callbacks, call depth, and linear values on the
         /// same paths as every other higher-order operation.
-        func lowerArrayComparatorSortTryApply(
-            plan: ArrayOrderingPlan,
+        func lowerCollectionComparatorSortTryApply(
+            plan: CollectionOrderingPlan,
             normalTarget: Bytecode.BlockID,
             errorTarget: Bytecode.BlockID,
             line: Int
@@ -3698,16 +3742,21 @@ public struct Lowerer: Sendable {
             )
             let source = try borrowedSource?.register
                 ?? resolve(plan.sourceToken, line: line)
-            guard registerTypes[Int(source.rawValue)] == arrayType else {
+            guard registerTypes[Int(source.rawValue)] == plan.sourceType else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "sort source does not match its Array specialization"
+                    "sort source does not match its Collection specialization"
                 )
             }
-            let (closure, closureSignature) = try resolveArrayOrderingClosure(
+            let materialized = try materializeManagedCollectionElements(
+                source,
+                sourceType: plan.sourceType,
+                context: "comparator ordering"
+            )
+            let (closure, closureSignature) = try resolveCollectionOrderingClosure(
                 for: plan,
                 line: line
             )
-            try prepareArrayOrderingContinuations(
+            try prepareCollectionOrderingContinuations(
                 plan: plan,
                 normalTarget: normalTarget
             )
@@ -3738,8 +3787,11 @@ public struct Lowerer: Sendable {
             let failed = try allocateSyntheticBlockID()
 
             appendInstruction(
-                .makeArraySortState(result: state, array: source)
+                .makeArraySortState(result: state, array: materialized.array)
             )
+            if let cleanupOwner = materialized.cleanupOwner {
+                appendInstruction(.destroyValue(cleanupOwner))
+            }
             if let owner = borrowedSource?.temporaryOwner {
                 appendInstruction(.destroyValue(owner))
             }
@@ -4593,7 +4645,7 @@ public struct Lowerer: Sendable {
             )
         }
 
-        func lowerArrayOrderingTryApply(
+        func lowerCollectionOrderingTryApply(
             operation: CanonicalSIL.OrderingIntrinsic,
             genericArguments: String,
             argumentText: String,
@@ -4601,7 +4653,7 @@ public struct Lowerer: Sendable {
             errorTarget: Bytecode.BlockID,
             line: Int
         ) throws {
-            let plan = try parseArrayOrderingPlan(
+            let plan = try parseCollectionOrderingPlan(
                 operation: operation,
                 genericArguments: genericArguments,
                 argumentText: argumentText,
@@ -4609,7 +4661,7 @@ public struct Lowerer: Sendable {
             )
             switch operation {
             case .sortedBy, .sortBy:
-                try lowerArrayComparatorSortTryApply(
+                try lowerCollectionComparatorSortTryApply(
                     plan: plan,
                     normalTarget: normalTarget,
                     errorTarget: errorTarget,
@@ -8800,10 +8852,15 @@ public struct Lowerer: Sendable {
             arguments: [String],
             line: Int
         ) throws {
-            func materialize(
+            func trivialOperand(
                 _ token: String,
                 as expected: Bytecode.ValueType
             ) throws -> Bytecode.Register {
+                guard expected.isTrivial else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "nontrivial collection operand requires an explicit borrow or ownership transfer"
+                    )
+                }
                 let value = if let stored = try copyStoredValue(
                     at: token,
                     line: line
@@ -8818,6 +8875,71 @@ public struct Lowerer: Sendable {
                     )
                 }
                 return value
+            }
+
+            func ownedOperand(
+                _ token: String,
+                as expected: Bytecode.ValueType,
+                context: String
+            ) throws -> Bytecode.Register {
+                let value = try materializeOwnedValue(at: token, line: line)
+                guard registerTypes[Int(value.rawValue)] == expected else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "\(context) operand does not match its specialization"
+                    )
+                }
+                return value
+            }
+
+            func borrowOperand(
+                _ token: String,
+                as expected: Bytecode.ValueType,
+                context: String
+            ) throws -> BorrowedStoredValue {
+                let borrowed = try borrowStoredValue(at: token, line: line)
+                    ?? .init(
+                        register: try resolve(token, line: line),
+                        temporaryOwner: nil
+                    )
+                guard registerTypes[Int(borrowed.register.rawValue)]
+                        == expected
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "\(context) operand does not match its specialization"
+                    )
+                }
+                return borrowed
+            }
+
+            func validateOperandType(
+                _ token: String,
+                as expected: Bytecode.ValueType,
+                context: String
+            ) throws {
+                if let stored = stackType(at: token) {
+                    guard stored == expected else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "\(context) operand does not match its specialization"
+                        )
+                    }
+                    return
+                }
+                let value = try resolve(token, line: line)
+                guard registerTypes[Int(value.rawValue)] == expected else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "\(context) operand does not match its specialization"
+                    )
+                }
+            }
+
+            func destroyBorrowedOwners(
+                _ operands: [BorrowedStoredValue]
+            ) {
+                var destroyed = Set<Bytecode.Register>()
+                for owner in operands.compactMap(\.temporaryOwner)
+                where destroyed.insert(owner).inserted {
+                    appendInstruction(.destroyValue(owner))
+                }
             }
 
             func emitArrayCount(
@@ -8895,18 +9017,27 @@ public struct Lowerer: Sendable {
                         value: types.value
                     )
                 }
-                let lhs = try materialize(arguments[0], as: type)
-                let rhs = try materialize(arguments[1], as: type)
+                let lhs = try borrowOperand(
+                    arguments[0],
+                    as: type,
+                    context: "collection equality"
+                )
+                let rhs = try borrowOperand(
+                    arguments[1],
+                    as: type,
+                    context: "collection equality"
+                )
                 let result = try allocate(type: .bool)
                 values[resultToken] = result
                 appendInstruction(
                     .compare(
                         result: result,
                         predicate: .equal,
-                        lhs: lhs,
-                        rhs: rhs
+                        lhs: lhs.register,
+                        rhs: rhs.register
                     )
                 )
+                destroyBorrowedOwners([lhs, rhs])
 
             case let .search(operation):
                 guard arguments.count == 3 else {
@@ -8925,17 +9056,26 @@ public struct Lowerer: Sendable {
                         "Collection index search specialization \(collection)"
                     )
                 }
-                let needle = try materialize(arguments[1], as: element)
-                let array = try materialize(arguments[2], as: collection)
+                let needle = try borrowOperand(
+                    arguments[1],
+                    as: element,
+                    context: "Collection index search"
+                )
+                let array = try borrowOperand(
+                    arguments[2],
+                    as: collection,
+                    context: "Collection index search"
+                )
                 let result = try allocate(type: .optional(.int64))
                 appendInstruction(
                     .arraySearch(
                         result: result,
                         operation: operation,
-                        array: array,
-                        value: needle
+                        array: array.register,
+                        value: needle.register
                     )
                 )
+                destroyBorrowedOwners([needle, array])
                 try storeConstructedValue(
                     result,
                     at: arguments[0],
@@ -8950,7 +9090,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let sequence = try parseType(genericArguments)
-                guard case let .array(element) = sequence,
+                guard let element = sequence.managedCollectionElement,
                       element.isVMComparable,
                       compilerAddressType(arguments[0]) == .optional(element),
                       stackType(at: arguments[1]) == sequence
@@ -8959,15 +9099,28 @@ public struct Lowerer: Sendable {
                         "Sequence extremum specialization \(sequence)"
                     )
                 }
-                let array = try materialize(arguments[1], as: sequence)
+                let source = try borrowOperand(
+                    arguments[1],
+                    as: sequence,
+                    context: "Sequence extremum"
+                )
+                let materialized = try materializeManagedCollectionElements(
+                    source.register,
+                    sourceType: sequence,
+                    context: "Sequence extremum"
+                )
                 let result = try allocate(type: .optional(element))
                 appendInstruction(
                     .arrayExtremum(
                         result: result,
                         operation: operation,
-                        array: array
+                        array: materialized.array
                     )
                 )
+                if let cleanupOwner = materialized.cleanupOwner {
+                    appendInstruction(.destroyValue(cleanupOwner))
+                }
+                destroyBorrowedOwners([source])
                 try storeConstructedValue(
                     result,
                     at: arguments[0],
@@ -8981,32 +9134,48 @@ public struct Lowerer: Sendable {
                     .map(parseType)
                 guard specializations.count == 2,
                       arguments.count == 2,
-                      specializations[0] == specializations[1],
-                      case let .array(element) = specializations[0]
+                      let lhsElement = specializations[0]
+                        .managedCollectionElement,
+                      let rhsElement = specializations[1]
+                        .managedCollectionElement,
+                      lhsElement == rhsElement
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Sequence relation has unsupported specializations"
                     )
                 }
+                let element = lhsElement
                 let supportsElementOperation = switch operation {
                 case .elementsEqual, .startsWith: element.isVMEquatable
                 case .lexicographicallyPrecedes: element.isVMComparable
                 }
                 guard supportsElementOperation,
-                      stackType(at: arguments[0]) == specializations[0],
+                      stackType(at: arguments[0]) == specializations[1],
                       stackType(at: arguments[1]) == specializations[0]
                 else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
                         "Sequence relation element \(element)"
                     )
                 }
-                let rhs = try materialize(
+                let rhsSource = try borrowOperand(
                     arguments[0],
-                    as: specializations[0]
+                    as: specializations[1],
+                    context: "Sequence relation"
                 )
-                let lhs = try materialize(
+                let lhsSource = try borrowOperand(
                     arguments[1],
-                    as: specializations[0]
+                    as: specializations[0],
+                    context: "Sequence relation"
+                )
+                let rhs = try materializeManagedCollectionElements(
+                    rhsSource.register,
+                    sourceType: specializations[1],
+                    context: "Sequence relation"
+                )
+                let lhs = try materializeManagedCollectionElements(
+                    lhsSource.register,
+                    sourceType: specializations[0],
+                    context: "Sequence relation"
                 )
                 let result = try allocate(type: .bool)
                 values[resultToken] = result
@@ -9014,10 +9183,15 @@ public struct Lowerer: Sendable {
                     .arrayRelation(
                         result: result,
                         operation: operation,
-                        lhs: lhs,
-                        rhs: rhs
+                        lhs: lhs.array,
+                        rhs: rhs.array
                     )
                 )
+                for cleanupOwner in [lhs.cleanupOwner, rhs.cleanupOwner]
+                    .compactMap({ $0 }) {
+                    appendInstruction(.destroyValue(cleanupOwner))
+                }
+                destroyBorrowedOwners([lhsSource, rhsSource])
 
             case let .adapter(.transform(operation)):
                 guard arguments.count == 2 else {
@@ -9026,16 +9200,22 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let sourceType = try parseType(genericArguments)
-                guard case let .array(element) = sourceType else {
+                guard let element = sourceType.managedCollectionElement else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
                         "collection adapter source \(sourceType)"
                     )
                 }
-                let resultType: Bytecode.ValueType = switch operation {
+                let resultType: Bytecode.ValueType
+                switch operation {
                 case .reversed:
-                    sourceType
+                    guard sourceType == .array(element) else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "reversed requires a represented bidirectional Collection"
+                        )
+                    }
+                    resultType = sourceType
                 case .enumerated:
-                    .array(.tuple([.int64, element]))
+                    resultType = .array(.tuple([.int64, element]))
                 }
                 guard compilerAddressType(arguments[0]) == resultType,
                       stackType(at: arguments[1]) == sourceType
@@ -9044,15 +9224,28 @@ public struct Lowerer: Sendable {
                         "collection adapter storage does not match its specialization"
                     )
                 }
-                let source = try materialize(arguments[1], as: sourceType)
+                let source = try borrowOperand(
+                    arguments[1],
+                    as: sourceType,
+                    context: "collection adapter"
+                )
+                let materialized = try materializeManagedCollectionElements(
+                    source.register,
+                    sourceType: sourceType,
+                    context: "collection adapter"
+                )
                 let result = try allocate(type: resultType)
                 appendInstruction(
                     .arrayAdapter(
                         result: result,
                         operation: operation,
-                        array: source
+                        array: materialized.array
                     )
                 )
+                if let cleanupOwner = materialized.cleanupOwner {
+                    appendInstruction(.destroyValue(cleanupOwner))
+                }
+                destroyBorrowedOwners([source])
                 try storeConstructedValue(
                     result,
                     at: arguments[0],
@@ -9064,11 +9257,14 @@ public struct Lowerer: Sendable {
                 let specializations = try splitTopLevel(genericArguments)
                     .filter { !$0.isEmpty }
                     .map(parseType)
+                let resultElement = specializations.first.map(
+                    ValueRepresentation.storable
+                )
                 guard specializations.count == 2,
                       arguments.count == 2,
-                      case let .array(sourceElement) = specializations[1],
-                      ValueRepresentation.storable(specializations[0])
-                        == sourceElement,
+                      let sourceElement = specializations[1]
+                        .managedCollectionElement,
+                      resultElement == sourceElement,
                       arrayMetatypeValues[arguments[1]] == sourceElement,
                       stackType(at: arguments[0]) == specializations[1]
                 else {
@@ -9076,10 +9272,23 @@ public struct Lowerer: Sendable {
                         "Array sequence initializer specialization does not match"
                     )
                 }
-                values[resultToken] = try materialize(
+                let source = try ownedOperand(
                     arguments[0],
-                    as: specializations[1]
+                    as: specializations[1],
+                    context: "Array sequence initializer"
                 )
+                let materialized = try materializeManagedCollectionElements(
+                    source,
+                    sourceType: specializations[1],
+                    context: "Array sequence initializer"
+                )
+                if materialized.array != source,
+                   specializations[1].requiresLinearOwnership {
+                    appendInstruction(.destroyValue(source))
+                }
+                // The source owner transfers directly for Array input; for
+                // Set or Dictionary, the materialized owner becomes the result.
+                values[resultToken] = materialized.array
 
             case let .adapter(.arrayRepeat(hasMetatype)):
                 guard arguments.count == 3 else {
@@ -9096,12 +9305,24 @@ public struct Lowerer: Sendable {
                         "Array(repeating:) metatype does not match Element"
                     )
                 }
-                let value = try materialize(arguments[valueIndex], as: element)
-                let count = try materialize(arguments[countIndex], as: .int64)
+                let value = try borrowOperand(
+                    arguments[valueIndex],
+                    as: element,
+                    context: "repeated collection"
+                )
+                let count = try trivialOperand(
+                    arguments[countIndex],
+                    as: .int64
+                )
                 let result = try allocate(type: .array(element))
                 appendInstruction(
-                    .arrayRepeat(result: result, value: value, count: count)
+                    .arrayRepeat(
+                        result: result,
+                        value: value.register,
+                        count: count
+                    )
                 )
+                destroyBorrowedOwners([value])
                 if hasMetatype {
                     values[resultToken] = result
                 } else {
@@ -9144,17 +9365,22 @@ public struct Lowerer: Sendable {
                         "collection subsequence specialization \(genericArguments)"
                     )
                 }
-                let bound = try materialize(arguments[1], as: .int64)
-                let source = try materialize(arguments[2], as: collection)
+                let bound = try trivialOperand(arguments[1], as: .int64)
+                let source = try borrowOperand(
+                    arguments[2],
+                    as: collection,
+                    context: "collection subsequence"
+                )
                 let result = try allocate(type: collection)
                 appendInstruction(
                     .arraySubsequence(
                         result: result,
                         operation: operation,
-                        array: source,
+                        array: source.register,
                         bound: bound
                     )
                 )
+                destroyBorrowedOwners([source])
                 try storeConstructedValue(
                     result,
                     at: arguments[0],
@@ -9177,19 +9403,21 @@ public struct Lowerer: Sendable {
                         "Array range subscript requires Range<Int>"
                     )
                 }
-                let source = try materialize(
+                let source = try borrowOperand(
                     arguments[1],
-                    as: .array(element)
+                    as: .array(element),
+                    context: "Array range slice"
                 )
                 let result = try allocate(type: .array(element))
                 appendInstruction(
                     .arrayRangeSlice(
                         result: result,
-                        array: source,
+                        array: source.register,
                         lowerBound: range.start,
                         upperBound: range.end
                     )
                 )
+                destroyBorrowedOwners([source])
                 if !hasFutureSemanticUse(
                     of: arguments[0],
                     after: currentSILLineIndex
@@ -9204,8 +9432,8 @@ public struct Lowerer: Sendable {
                     .map(parseType)
                 guard sequences.count == 2,
                       arguments.count == 3,
-                      case let .array(lhsElement) = sequences[0],
-                      case let .array(rhsElement) = sequences[1]
+                      let lhsElement = sequences[0].managedCollectionElement,
+                      let rhsElement = sequences[1].managedCollectionElement
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "zip requires two supported sequence specializations"
@@ -9222,12 +9450,35 @@ public struct Lowerer: Sendable {
                         "zip storage does not match its sequence elements"
                     )
                 }
-                let lhs = try materialize(arguments[1], as: sequences[0])
-                let rhs = try materialize(arguments[2], as: sequences[1])
+                let lhsSource = try borrowOperand(
+                    arguments[1],
+                    as: sequences[0],
+                    context: "zip"
+                )
+                let rhsSource = try borrowOperand(
+                    arguments[2],
+                    as: sequences[1],
+                    context: "zip"
+                )
+                let lhs = try materializeManagedCollectionElements(
+                    lhsSource.register,
+                    sourceType: sequences[0],
+                    context: "zip"
+                )
+                let rhs = try materializeManagedCollectionElements(
+                    rhsSource.register,
+                    sourceType: sequences[1],
+                    context: "zip"
+                )
                 let result = try allocate(type: resultType)
                 appendInstruction(
-                    .arrayZip(result: result, lhs: lhs, rhs: rhs)
+                    .arrayZip(result: result, lhs: lhs.array, rhs: rhs.array)
                 )
+                for cleanupOwner in [lhs.cleanupOwner, rhs.cleanupOwner]
+                    .compactMap({ $0 }) {
+                    appendInstruction(.destroyValue(cleanupOwner))
+                }
+                destroyBorrowedOwners([lhsSource, rhsSource])
                 try storeConstructedValue(
                     result,
                     at: arguments[0],
@@ -9258,7 +9509,7 @@ public struct Lowerer: Sendable {
                         "joined storage does not match its nested sequence"
                     )
                 }
-                let separator: Bytecode.Register?
+                let separator: BorrowedStoredValue?
                 if hasSeparator {
                     guard sequences[1] == resultType,
                           stackType(at: arguments[1]) == resultType
@@ -9267,21 +9518,29 @@ public struct Lowerer: Sendable {
                             "joined separator does not match nested Element"
                         )
                     }
-                    separator = try materialize(arguments[1], as: resultType)
+                    separator = try borrowOperand(
+                        arguments[1],
+                        as: resultType,
+                        context: "joined separator"
+                    )
                 } else {
                     separator = nil
                 }
-                let source = try materialize(
+                let source = try borrowOperand(
                     arguments[sourceIndex],
-                    as: sequences[0]
+                    as: sequences[0],
+                    context: "joined source"
                 )
                 let result = try allocate(type: resultType)
                 appendInstruction(
                     .arrayJoined(
                         result: result,
-                        arrays: source,
-                        separator: separator
+                        arrays: source.register,
+                        separator: separator?.register
                     )
+                )
+                destroyBorrowedOwners(
+                    separator.map { [source, $0] } ?? [source]
                 )
                 try storeConstructedValue(
                     result,
@@ -9299,19 +9558,27 @@ public struct Lowerer: Sendable {
                         )
                     }
                     let element = try parseStoredType(genericArguments)
-                    let array = try materialize(
-                        arguments[0],
-                        as: .array(element)
-                    )
+                    let arrayType = Bytecode.ValueType.array(element)
                     let result: Bytecode.Register
                     switch operation {
                     case .start:
+                        try validateOperandType(
+                            arguments[0],
+                            as: arrayType,
+                            context: "Array boundary index"
+                        )
                         result = try allocate(type: .int64)
                         appendInstruction(
                             .constantInteger(result: result, bitPattern: 0)
                         )
                     case .end:
-                        result = try emitArrayCount(array)
+                        let array = try borrowOperand(
+                            arguments[0],
+                            as: arrayType,
+                            context: "Array boundary index"
+                        )
+                        result = try emitArrayCount(array.register)
+                        destroyBorrowedOwners([array])
                     case .distance, .indices, .after, .before, .offsetBy,
                          .offsetByLimited:
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -9327,11 +9594,12 @@ public struct Lowerer: Sendable {
                         )
                     }
                     let element = try parseStoredType(genericArguments)
-                    let from = try materialize(arguments[0], as: .int64)
-                    let to = try materialize(arguments[1], as: .int64)
-                    _ = try materialize(
+                    let from = try trivialOperand(arguments[0], as: .int64)
+                    let to = try trivialOperand(arguments[1], as: .int64)
+                    try validateOperandType(
                         arguments[2],
-                        as: .array(element)
+                        as: .array(element),
+                        context: "Array distance"
                     )
                     let result = try emitCheckedIndexArithmetic(
                         .subtract,
@@ -9364,7 +9632,11 @@ public struct Lowerer: Sendable {
                             "Array.indices storage does not match Range<Int>"
                         )
                     }
-                    let array = try materialize(arguments[1], as: collection)
+                    let array = try borrowOperand(
+                        arguments[1],
+                        as: collection,
+                        context: "Array.indices"
+                    )
                     let start = try allocate(type: .int64)
                     appendInstruction(
                         .constantInteger(result: start, bitPattern: 0)
@@ -9372,9 +9644,10 @@ public struct Lowerer: Sendable {
                     progressionAddressValues[output] = .init(
                         type: range,
                         start: start,
-                        end: try emitArrayCount(array),
+                        end: try emitArrayCount(array.register),
                         stride: nil
                     )
+                    destroyBorrowedOwners([array])
                     voidValues.insert(resultToken)
 
                 case .after, .before:
@@ -9384,10 +9657,11 @@ public struct Lowerer: Sendable {
                         )
                     }
                     let element = try parseStoredType(genericArguments)
-                    let index = try materialize(arguments[0], as: .int64)
-                    _ = try materialize(
+                    let index = try trivialOperand(arguments[0], as: .int64)
+                    try validateOperandType(
                         arguments[1],
-                        as: .array(element)
+                        as: .array(element),
+                        context: "Array index movement"
                     )
                     let one = try allocate(type: .int64)
                     appendInstruction(
@@ -9410,12 +9684,13 @@ public struct Lowerer: Sendable {
                         )
                     }
                     let element = try parseStoredType(genericArguments)
-                    let index = try materialize(arguments[0], as: .int64)
-                    let distance = try materialize(arguments[1], as: .int64)
+                    let index = try trivialOperand(arguments[0], as: .int64)
+                    let distance = try trivialOperand(arguments[1], as: .int64)
                     let arrayArgument = operation == .offsetBy ? 2 : 3
-                    _ = try materialize(
+                    try validateOperandType(
                         arguments[arrayArgument],
-                        as: .array(element)
+                        as: .array(element),
+                        context: "Array offset index"
                     )
                     guard operation == .offsetByLimited else {
                         values[resultToken] = try emitCheckedIndexArithmetic(
@@ -9426,7 +9701,7 @@ public struct Lowerer: Sendable {
                         break
                     }
 
-                    let limit = try materialize(arguments[2], as: .int64)
+                    let limit = try trivialOperand(arguments[2], as: .int64)
                     let destination = try allocate(type: .int64)
                     let overflow = try allocate(type: .bool)
                     appendInstruction(
@@ -9776,7 +10051,7 @@ public struct Lowerer: Sendable {
                     appendInstruction(
                         .makeArray(result: singleton, elements: [value])
                     )
-                    let index = try materialize(arguments[1], as: .int64)
+                    let index = try trivialOperand(arguments[1], as: .int64)
                     let destination = try borrowArray(at: arguments[2])
                     let result = try replace(
                         destination.register,
@@ -9802,7 +10077,7 @@ public struct Lowerer: Sendable {
                         )
                     }
                     let contents = try borrowArray(at: arguments[0])
-                    let index = try materialize(arguments[1], as: .int64)
+                    let index = try trivialOperand(arguments[1], as: .int64)
                     let destination = try borrowArray(at: arguments[2])
                     let result = try replace(
                         destination.register,
@@ -9863,7 +10138,7 @@ public struct Lowerer: Sendable {
                     let index: Bytecode.Register
                     switch operation {
                     case .removeAt:
-                        index = try materialize(arguments[1], as: .int64)
+                        index = try trivialOperand(arguments[1], as: .int64)
                     case .removeFirst:
                         index = try integerConstant(0)
                     case .removeLast:
@@ -9947,7 +10222,7 @@ public struct Lowerer: Sendable {
                             "Array counted removal has unsupported arguments"
                         )
                     }
-                    let count = try materialize(arguments[0], as: .int64)
+                    let count = try trivialOperand(arguments[0], as: .int64)
                     try appendNonnegativePrecondition(
                         count,
                         reason: "Array removal count must not be negative"
@@ -9992,7 +10267,7 @@ public struct Lowerer: Sendable {
                             "Array.removeAll has unsupported arguments"
                         )
                     }
-                    _ = try materialize(arguments[0], as: .bool)
+                    _ = try trivialOperand(arguments[0], as: .bool)
                     let destination = try borrowArray(at: arguments[1])
                     let result = try emptyArray()
                     destroyTemporaryOwners([destination])
@@ -10054,8 +10329,8 @@ public struct Lowerer: Sendable {
                             "Array.swapAt has unsupported arguments"
                         )
                     }
-                    let lhsIndex = try materialize(arguments[0], as: .int64)
-                    let rhsIndex = try materialize(arguments[1], as: .int64)
+                    let lhsIndex = try trivialOperand(arguments[0], as: .int64)
+                    let rhsIndex = try trivialOperand(arguments[1], as: .int64)
                     let destination = try borrowArray(at: arguments[2])
                     let result = try allocate(type: arrayType)
                     appendInstruction(
@@ -10485,7 +10760,7 @@ public struct Lowerer: Sendable {
                     line: line
                 )
             case let .ordering(operation) where !operation.usesClosure:
-                try lowerNaturalArrayOrdering(
+                try lowerNaturalCollectionOrdering(
                     operation,
                     resultToken: resultToken,
                     genericArguments: genericArguments,
@@ -12881,8 +13156,22 @@ public struct Lowerer: Sendable {
                                 )
                             }
                             indirectResultAddress = address
-                            indirectResultSlot = try allocateStackSlot(
+                            let slot = try allocateStackSlot(
                                 type: signature.result
+                            )
+                            let runtimeAddress = try allocate(
+                                type: .address(signature.result)
+                            )
+                            indirectResultSlot = slot
+                            runtimeStackSlots[address] = slot
+                            runtimeAddressValues[address] = runtimeAddress
+                            runtimeAddressPointees[address] = signature.result
+                            values[address] = runtimeAddress
+                            appendInstruction(
+                                .stackAddress(
+                                    result: runtimeAddress,
+                                    slot: slot
+                                )
                             )
                         }
                     } else if block.indirectResultAddress != nil {
@@ -15692,7 +15981,7 @@ public struct Lowerer: Sendable {
                 ], operation.usesClosure {
                     let normalTarget = try parseBlockID(call[4])
                     let errorTarget = try parseBlockID(call[5])
-                    try lowerArrayOrderingTryApply(
+                    try lowerCollectionOrderingTryApply(
                         operation: operation,
                         genericArguments: call[1],
                         argumentText: call[2],
@@ -16781,7 +17070,7 @@ public struct Lowerer: Sendable {
             if let component = match(
                 line,
                 pattern: #"^(%[0-9]+) = tuple_element_addr (%[0-9]+), ([0-9]+)$"#
-            ), case let .tuple(types) = stackType(at: component[1]),
+            ), case let .tuple(types) = compilerAddressType(component[1]),
                let index = Int(component[2]),
                types.indices.contains(index) {
                 tupleComponentAddresses[component[0]] = .init(
@@ -19986,12 +20275,12 @@ public struct Lowerer: Sendable {
         }
     }
 
-    private func parseArrayOrderingPlan(
+    private func parseCollectionOrderingPlan(
         operation: CanonicalSIL.OrderingIntrinsic,
         genericArguments: String,
         argumentText: String,
         line: Int
-    ) throws -> ArrayOrderingPlan {
+    ) throws -> CollectionOrderingPlan {
         guard operation.usesClosure else {
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "natural ordering does not use try_apply lowering"
@@ -20002,12 +20291,13 @@ public struct Lowerer: Sendable {
         let genericTypes = try genericSpellings.map(parseType)
         let arguments = try parseApplyValueTokens(argumentText, line: line)
         guard genericTypes.count == 1,
-              case let .array(element) = genericTypes[0]
+              let element = genericTypes[0].managedCollectionElement
         else {
             throw CanonicalSIL.LoweringError.unsupportedType(
-                "ordering requires a represented Array specialization"
+                "ordering requires a represented managed Collection specialization"
             )
         }
+        let sourceType = genericTypes[0]
 
         switch operation {
         case .sortedBy:
@@ -20019,6 +20309,7 @@ public struct Lowerer: Sendable {
             return .init(
                 operation: operation,
                 sourceToken: arguments[1],
+                sourceType: sourceType,
                 closureToken: arguments[0],
                 elementType: element
             )
@@ -20026,6 +20317,11 @@ public struct Lowerer: Sendable {
             guard arguments.count == 2 else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "MutableCollection.sort(by:) has unsupported arguments"
+                )
+            }
+            guard sourceType == .array(element) else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "mutating comparator ordering requires a represented Array"
                 )
             }
             switch typeEnvironment.collectionIndexModel(
@@ -20041,6 +20337,7 @@ public struct Lowerer: Sendable {
             return .init(
                 operation: operation,
                 sourceToken: arguments[1],
+                sourceType: sourceType,
                 closureToken: arguments[0],
                 elementType: element
             )
@@ -20151,16 +20448,12 @@ public struct Lowerer: Sendable {
         of type: Bytecode.ValueType,
         context: String
     ) throws -> Bytecode.ValueType {
-        switch type {
-        case let .array(element), let .set(element):
-            return element
-        case let .dictionary(key, value):
-            return .tuple([key, value])
-        default:
+        guard let element = type.managedCollectionElement else {
             throw CanonicalSIL.LoweringError.unsupportedType(
                 "\(context) requires a represented managed Collection, got \(type)"
             )
         }
+        return element
     }
 
     private func parseDictionaryAccumulationPlan(

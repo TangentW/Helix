@@ -169,7 +169,8 @@ includes common integer and floating-point operations and conversions,
 `min`/`max`/`abs`, Bool, Unicode String transforms and interpolation,
 one-grapheme Character literals for the bounded String predicate path,
 tuple/Optional including address projection, recursive Array/Dictionary equality,
-common Array index/search/extremum/sequence relations plus type-generic,
+common Array index/search plus represented managed Collection extrema,
+cross-container Sequence relations, and nonmutating ordering; type-generic,
 Array-backed structural concatenation/insertion/replacement/removal/reversal/
 swap, predicate removal, bidirectional partition, and capacity hints,
 Dictionary lookup/subscript mutation including lazy default
@@ -185,8 +186,9 @@ across Array, Dictionary, and Set; all three preserve their container through
 Frontend Array/Dictionary cast helpers may erase tuple labels only when the
 original types differ solely by those labels and both complete VM types match;
 real element, key, value, and reference conversions remain rejected.
-The subset additionally includes typed
-enumerated/reversed/repeated/sliced/zipped/joined Array-backed adapters,
+The subset additionally includes typed `enumerated`, `Array(sequence)`, and
+heterogeneous `zip` over represented managed Collections, plus
+reversed/repeated/sliced/joined Array-backed adapters,
 `Optional.map`/`flatMap`, concrete `Result` payload transforms and
 `Result.get()` for patch-local value payloads, VM-owned `Any`, and common
 dynamic casts, fixed-width integer `Range`/`ClosedRange` iteration,

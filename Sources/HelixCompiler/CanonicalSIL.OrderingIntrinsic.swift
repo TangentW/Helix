@@ -1,6 +1,7 @@
 extension CanonicalSIL {
-/// Array ordering operations share one lowering family even though Swift
-/// exposes them across Sequence and MutableCollection protocol extensions.
+/// Sequence ordering operations share one lowering family. Nonmutating forms
+/// accept every represented managed Collection; mutating forms remain limited
+/// to zero-based Array storage.
 enum OrderingIntrinsic: Equatable {
     case sorted
     case sortedBy

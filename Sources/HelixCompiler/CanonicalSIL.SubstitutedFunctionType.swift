@@ -68,17 +68,31 @@ enum SubstitutedFunctionType {
 
             guard let archetypes = archetypeParameters(
                 String(result[result.index(after: genericOpen)..<genericClose])
-            ), let substitutions = splitTopLevel(
-                String(result[result.index(after: substitutionOpen)..<trimmedEnd])
             ), !archetypes.isEmpty,
-                  archetypes.count == substitutions.count,
-                  archetypes.allSatisfy(isArchetype),
-                  substitutions.allSatisfy({
-                    !$0.isEmpty && !containsArchetypeSpelling(in: $0)
-                  })
+                  archetypes.allSatisfy(isArchetype)
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "substituted function type does not have a one-to-one concrete substitution"
+                    "substituted function type has an invalid archetype declaration"
+                )
+            }
+            guard let substitutions = splitTopLevel(
+                String(result[result.index(after: substitutionOpen)..<trimmedEnd])
+            ), substitutions.allSatisfy({ !$0.isEmpty })
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "substituted function type has an invalid concrete substitution list"
+                )
+            }
+            guard archetypes.count == substitutions.count else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "substituted function type declares \(archetypes.count) archetypes but supplies \(substitutions.count) substitutions"
+                )
+            }
+            if let unresolved = substitutions.first(where: {
+                containsArchetypeSpelling(in: $0)
+            }) {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "substituted function type retains a non-concrete substitution: \(unresolved)"
                 )
             }
 

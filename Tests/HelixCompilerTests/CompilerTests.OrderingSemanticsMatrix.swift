@@ -3,7 +3,7 @@ import Testing
 @testable import HelixCompiler
 
 extension CompilerTests {
-@Suite("Swift Array ordering semantics")
+@Suite("Swift Sequence ordering and Array mutation semantics")
 struct OrderingSemanticsMatrix {
     @Test("Natural sorted and sort cover scalar Comparable values")
     func lowersNaturalOrdering() throws {
@@ -91,6 +91,53 @@ struct OrderingSemanticsMatrix {
                 try integers([10, 11, 20, 21]),
                 try integers([20, 21, 10, 11]),
                 try integer(5),
+            ]))
+        )
+    }
+
+    @Test("Sequence ordering reuses one path for Set and Dictionary elements")
+    func lowersManagedCollectionOrdering() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            public func managedCollectionOrdering(
+                _ values: Set<Int>,
+                _ pairs: [String: Int]
+            ) -> ([Int], [Int], [String]) {
+                let ascending = values.sorted()
+                let descending = values.sorted { $0 > $1 }
+                let stableKeys = pairs.sorted { lhs, rhs in
+                    lhs.value < rhs.value
+                }.map { $0.key }
+                return (ascending, descending, stableKeys)
+            }
+            """,
+            functionName: "managedCollectionOrdering",
+            moduleName: "HelixManagedCollectionOrdering"
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [
+                    try set([3, 1, 2]),
+                    try dictionary([
+                        ("later-a", 1),
+                        ("later-b", 1),
+                        ("first", 0),
+                    ]),
+                ]
+            ) == .returned(.tuple([
+                try integers([1, 2, 3]),
+                try integers([3, 2, 1]),
+                .array(
+                    [
+                        .string("first"),
+                        .string("later-a"),
+                        .string("later-b"),
+                    ],
+                    elementType: .string
+                ),
             ]))
         )
     }
@@ -371,6 +418,27 @@ struct OrderingSemanticsMatrix {
 
     private func integers(_ values: [Int64]) throws -> VM.Value {
         .array(try values.map(integer), elementType: .int64)
+    }
+
+    private func set(_ values: [Int64]) throws -> VM.Value {
+        .set(
+            try .init(
+                elements: values.map(integer),
+                elementType: .int64
+            )
+        )
+    }
+
+    private func dictionary(
+        _ entries: [(String, Int64)]
+    ) throws -> VM.Value {
+        .dictionary(
+            try entries.map { key, value in
+                .init(key: .string(key), value: try integer(value))
+            },
+            keyType: .string,
+            valueType: .int64
+        )
     }
 
     private func doubles(_ values: [Double]) -> VM.Value {

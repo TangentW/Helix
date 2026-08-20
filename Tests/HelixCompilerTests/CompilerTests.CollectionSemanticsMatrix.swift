@@ -340,6 +340,51 @@ struct CollectionSemanticsMatrix {
         ])
     }
 
+    @Test("Extrema and relations accept heterogeneous managed Sequences")
+    func lowersManagedSequenceFacts() throws {
+        try run([
+            Probe(
+                name: "managedSequenceFacts",
+                source: """
+                public func managedSequenceFacts(
+                    _ lhs: Set<Int>,
+                    _ rhs: [Int]
+                ) -> (Int?, Int?, Bool, Bool, Bool) {
+                    (
+                        lhs.min(),
+                        lhs.max(),
+                        lhs.elementsEqual(rhs),
+                        lhs.starts(with: rhs),
+                        lhs.lexicographicallyPrecedes(rhs)
+                    )
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try set([2, 1, 3]), try integers([2, 1])],
+                        expected: .returned(.tuple([
+                            try optionalInteger(1),
+                            try optionalInteger(3),
+                            .bool(false),
+                            .bool(true),
+                            .bool(false),
+                        ]))
+                    ),
+                    .init(
+                        arguments: [try set([]), try integers([])],
+                        expected: .returned(.tuple([
+                            try optionalInteger(nil as Int?),
+                            try optionalInteger(nil as Int?),
+                            .bool(true),
+                            .bool(true),
+                            .bool(false),
+                        ]))
+                    ),
+                ]
+            ),
+        ])
+    }
+
     @Test("Array indices and distance lower to checked Int progressions")
     func lowersArrayIndexAPIs() throws {
         try run([
@@ -742,6 +787,15 @@ struct CollectionSemanticsMatrix {
 
     private func integers(_ values: [Int64]) throws -> VM.Value {
         .array(try values.map(integer), elementType: .int64)
+    }
+
+    private func set(_ values: [Int64]) throws -> VM.Value {
+        .set(
+            try .init(
+                elements: values.map(integer),
+                elementType: .int64
+            )
+        )
     }
 
     private func uint8(_ value: UInt8) throws -> VM.Value {

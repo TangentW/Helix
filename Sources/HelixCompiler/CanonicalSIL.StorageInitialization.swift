@@ -115,7 +115,9 @@ enum StorageInitialization {
     static func analyze(
         body: String,
         directCalls: CanonicalSIL.DirectCallTable,
-        typeEnvironment: CanonicalSIL.TypeEnvironment
+        typeEnvironment: CanonicalSIL.TypeEnvironment,
+        indirectResultType: Bytecode.ValueType? = nil,
+        indirectErrorType: Bytecode.ValueType? = nil
     ) throws -> Plan {
         let lines = body.split(
             separator: "\n",
@@ -129,6 +131,23 @@ enum StorageInitialization {
         var addressAliases: [String: String] = [:]
         var bindingByValue: [String: CanonicalSIL.DirectCallBinding] = [:]
         var pointees: [String: Bytecode.ValueType] = [:]
+
+        let hiddenOutputTypes = [indirectResultType, indirectErrorType]
+            .compactMap { $0 }
+        if !hiddenOutputTypes.isEmpty {
+            guard let parameters = entryBlockParameters(in: lines),
+                  parameters.count >= hiddenOutputTypes.count
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "indirect output storage is missing from the entry block"
+                )
+            }
+            for (parameter, type) in zip(parameters, hiddenOutputTypes)
+            where type != .void {
+                allocations.insert(parameter)
+                storagePointees[parameter] = type
+            }
+        }
 
         func root(of token: String) -> String {
             var current = token
@@ -1549,6 +1568,31 @@ enum StorageInitialization {
         result.append(
             String(text[start...]).trimmingCharacters(in: .whitespaces)
         )
+        return result
+    }
+
+    private static func entryBlockParameters(
+        in lines: [String]
+    ) -> [String]? {
+        guard let header = lines.first(where: {
+            $0.hasPrefix("bb") && $0.hasSuffix(":")
+        }), let open = header.firstIndex(of: "("),
+              let close = matchingClose(in: header, after: open)
+        else { return [] }
+        guard let components = splitTopLevelValidated(
+            String(header[header.index(after: open)..<close])
+        ) else { return nil }
+        var result: [String] = []
+        result.reserveCapacity(components.count)
+        for component in components {
+            guard let separator = component.range(of: " : ") else {
+                return nil
+            }
+            let token = component[..<separator.lowerBound]
+                .trimmingCharacters(in: .whitespaces)
+            guard token.hasPrefix("%") else { return nil }
+            result.append(token)
+        }
         return result
     }
 

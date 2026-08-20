@@ -113,7 +113,8 @@ enum SwiftCoreIntrinsic: Equatable {
             return
         }
         switch mangledName {
-        case "$sSlsE3mapySayqd__Gqd__7ElementQzqd_0_YKXEqd_0_YKs5ErrorRd_0_r0_lF":
+        case "$sSlsE3mapySayqd__Gqd__7ElementQzqd_0_YKXEqd_0_YKs5ErrorRd_0_r0_lF",
+             "$sSTsE3mapySayqd__Gqd__7ElementQzqd_0_YKXEqd_0_YKs5ErrorRd_0_r0_lF":
             self = .higherOrder(.map)
         case "$sSTsE7flatMapySay7ElementQyd__Gqd__ABQzKXEKSTRd__lF":
             self = .higherOrder(.flatMap)

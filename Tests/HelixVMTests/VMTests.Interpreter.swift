@@ -3846,6 +3846,390 @@ struct Interpreter {
         )
     }
 
+    @Test("Managed Collection materialization preserves element shape and order")
+    func materializesManagedCollections() throws {
+        func invoke(
+            collectionType: Bytecode.ValueType,
+            elementType: Bytecode.ValueType,
+            source: VM.Value,
+            limits: Core.ResourceLimits = .init(
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        ) throws -> VM.ExecutionResult {
+            let resultType = Bytecode.ValueType.array(elementType)
+            let function = Bytecode.Function(
+                id: .init(rawValue: 0),
+                name: "managedCollectionMaterialization",
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: resultType,
+                registerTypes: [collectionType, resultType],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .collectionMaterialize(
+                                result: .init(rawValue: 1),
+                                collection: .init(rawValue: 0)
+                            ),
+                            .returnValue(.init(rawValue: 1)),
+                        ]
+                    ),
+                ]
+            )
+            let image = try makeVerified(
+                function: function,
+                limits: limits,
+                capabilities: [.baselineV1, .collectionsV1, .stringsV1],
+                signature: .init(
+                    parameters: [collectionType.description],
+                    result: resultType.description
+                ),
+                parameterTypes: [collectionType],
+                resultType: resultType
+            )
+            return VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [source]
+            )
+        }
+
+        let three = VM.Value.integer(
+            try .init(signed: 3, bitWidth: 64, isSigned: true)
+        )
+        let five = VM.Value.integer(
+            try .init(signed: 5, bitWidth: 64, isSigned: true)
+        )
+        let integers = VM.Value.array(
+            [three, five],
+            elementType: .int64
+        )
+        #expect(
+            try invoke(
+                collectionType: .array(.int64),
+                elementType: .int64,
+                source: integers
+            ) == .returned(integers)
+        )
+        #expect(
+            try invoke(
+                collectionType: .set(.int64),
+                elementType: .int64,
+                source: .set(
+                    .init(elements: [five, three], elementType: .int64)
+                )
+            ) == .returned(
+                .array([five, three], elementType: .int64)
+            )
+        )
+        #expect(
+            try invoke(
+                collectionType: .set(.int64),
+                elementType: .int64,
+                source: .set(.init(elements: [], elementType: .int64))
+            ) == .returned(.array([], elementType: .int64))
+        )
+        let frameBytes = UInt64(2 * MemoryLayout<VM.Value?>.stride)
+        // Boundary storage, duplicate-element validation scratch, and the
+        // materialized result each hold the same two-element aggregate.
+        let setBoundaryScratchAndResultBytes = UInt64(3 * (2 + 1) * 16)
+        let exactSetHeap = frameBytes + setBoundaryScratchAndResultBytes
+        let setSource = VM.Value.set(
+            .init(elements: [five, three], elementType: .int64)
+        )
+        #expect(
+            try invoke(
+                collectionType: .set(.int64),
+                elementType: .int64,
+                source: setSource,
+                limits: .init(
+                    maxVMHeapBytes: exactSetHeap - 1,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                )
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+        #expect(
+            try invoke(
+                collectionType: .set(.int64),
+                elementType: .int64,
+                source: setSource,
+                limits: .init(
+                    maxVMHeapBytes: exactSetHeap,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                )
+            ) == .returned(.array([five, three], elementType: .int64))
+        )
+
+        let firstKey = VM.Value.string("first")
+        let secondKey = VM.Value.string("second")
+        let dictionaryType = Bytecode.ValueType.dictionary(
+            key: .string,
+            value: .int64
+        )
+        let pairType = Bytecode.ValueType.tuple([.string, .int64])
+        #expect(
+            try invoke(
+                collectionType: dictionaryType,
+                elementType: pairType,
+                source: .dictionary(
+                    [],
+                    keyType: .string,
+                    valueType: .int64
+                )
+            ) == .returned(.array([], elementType: pairType))
+        )
+        #expect(
+            try invoke(
+                collectionType: dictionaryType,
+                elementType: pairType,
+                source: .dictionary(
+                    [
+                        .init(key: firstKey, value: three),
+                        .init(key: secondKey, value: five),
+                    ],
+                    keyType: .string,
+                    valueType: .int64
+                )
+            ) == .returned(
+                .array(
+                    [
+                        .tuple([firstKey, three]),
+                        .tuple([secondKey, five]),
+                    ],
+                    elementType: pairType
+                )
+            )
+        )
+
+        let integerDictionaryType = Bytecode.ValueType.dictionary(
+            key: .int64,
+            value: .int64
+        )
+        let integerPairType = Bytecode.ValueType.tuple([.int64, .int64])
+        let integerDictionary = VM.Value.dictionary(
+            [
+                .init(key: three, value: five),
+                .init(key: five, value: three),
+            ],
+            keyType: .int64,
+            valueType: .int64
+        )
+        // Boundary Dictionary storage, duplicate-key scratch, and the output
+        // Array of two-field tuples consume 5, 3, and 9 aggregate slots.
+        let exactDictionaryHeap = frameBytes + UInt64((5 + 3 + 9) * 16)
+        #expect(
+            try invoke(
+                collectionType: integerDictionaryType,
+                elementType: integerPairType,
+                source: integerDictionary,
+                limits: .init(
+                    maxVMHeapBytes: exactDictionaryHeap - 1,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                )
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+        #expect(
+            try invoke(
+                collectionType: integerDictionaryType,
+                elementType: integerPairType,
+                source: integerDictionary,
+                limits: .init(
+                    maxVMHeapBytes: exactDictionaryHeap,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                )
+            ) == .returned(
+                .array(
+                    [
+                        .tuple([three, five]),
+                        .tuple([five, three]),
+                    ],
+                    elementType: integerPairType
+                )
+            )
+        )
+    }
+
+    @Test("Collection materialization copies native ownership within quota")
+    func materializesNativeCollectionOwnership() throws {
+        let pointType = Core.TypeID.derive(
+            namespace: namespace(),
+            canonicalType: "Fixture.MaterializedPoint"
+        )
+        let layout = Core.Digest.sha256(
+            "Fixture.MaterializedPoint.layout.v1"
+        )
+        let operations = VM.NativeTypeOperations(
+            id: pointType,
+            canonicalName: "Fixture.MaterializedPoint",
+            kind: .value,
+            layoutFingerprint: layout,
+            estimatedSize: 16,
+            estimatedByteCount: { (_: Point) -> UInt64 in 16 }
+        )
+        let catalog = try VM.NativeTypeCatalog([operations])
+        let boxed = try catalog.box(Point(x: 3, y: 5), as: pointType)
+        let native = Bytecode.ValueType.native(pointType)
+        let array = Bytecode.ValueType.array(native)
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1,
+            .collectionsV1,
+            .nativeTypesV1,
+        ]
+
+        func function(
+            name: String,
+            collectionType: Bytecode.ValueType,
+            resultType: Bytecode.ValueType
+        ) -> Bytecode.Function {
+            .init(
+                id: .init(rawValue: 0),
+                name: name,
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: resultType,
+                registerTypes: [collectionType, resultType],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .collectionMaterialize(
+                                result: .init(rawValue: 1),
+                                collection: .init(rawValue: 0)
+                            ),
+                            .destroyValue(.init(rawValue: 0)),
+                            .returnValue(.init(rawValue: 1)),
+                        ]
+                    ),
+                ]
+            )
+        }
+
+        func image(
+            function: Bytecode.Function,
+            collectionType: Bytecode.ValueType,
+            resultType: Bytecode.ValueType,
+            maximumNativeBytes: UInt64
+        ) throws -> Verification.Image {
+            let limits = Core.ResourceLimits(
+                maxNativeOwnedBytes: maximumNativeBytes,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+            return try makeVerified(
+                function: function,
+                limits: limits,
+                capabilities: capabilities,
+                signature: .init(
+                    parameters: [collectionType.description],
+                    result: resultType.description
+                ),
+                parameterTypes: [collectionType],
+                resultType: resultType,
+                shellTypes: [
+                    .init(
+                        id: pointType,
+                        canonicalName: "Fixture.MaterializedPoint",
+                        kind: .value,
+                        layoutFingerprint: layout,
+                        isCopyable: true,
+                        estimatedSize: 16
+                    ),
+                ]
+            )
+        }
+
+        func invoke(
+            function: Bytecode.Function,
+            collectionType: Bytecode.ValueType,
+            resultType: Bytecode.ValueType,
+            argument: VM.Value,
+            maximumNativeBytes: UInt64
+        ) throws -> VM.ExecutionResult {
+            VM.Interpreter(nativeTypeCatalog: catalog).invoke(
+                entry: .init(rawValue: 0),
+                image: try image(
+                    function: function,
+                    collectionType: collectionType,
+                    resultType: resultType,
+                    maximumNativeBytes: maximumNativeBytes
+                ),
+                arguments: [argument]
+            )
+        }
+
+        let arrayFunction = function(
+            name: "materializeNativeArray",
+            collectionType: array,
+            resultType: array
+        )
+        let arrayArgument = VM.Value.array(
+            [.native(boxed)],
+            elementType: native
+        )
+        #expect(
+            try invoke(
+                function: arrayFunction,
+                collectionType: array,
+                resultType: array,
+                argument: arrayArgument,
+                maximumNativeBytes: 32
+            ) == .returned(arrayArgument)
+        )
+        #expect(
+            try invoke(
+                function: arrayFunction,
+                collectionType: array,
+                resultType: array,
+                argument: arrayArgument,
+                maximumNativeBytes: 31
+            ) == .trapped(.nativeOwnedMemoryLimitExceeded)
+        )
+
+        let dictionary = Bytecode.ValueType.dictionary(
+            key: .int64,
+            value: native
+        )
+        let pair = Bytecode.ValueType.tuple([.int64, native])
+        let pairs = Bytecode.ValueType.array(pair)
+        let dictionaryFunction = function(
+            name: "materializeNativeDictionary",
+            collectionType: dictionary,
+            resultType: pairs
+        )
+        let key = VM.Value.integer(
+            try .init(signed: 1, bitWidth: 64, isSigned: true)
+        )
+        let dictionaryArgument = VM.Value.dictionary(
+            [.init(key: key, value: .native(boxed))],
+            keyType: .int64,
+            valueType: native
+        )
+        let expectedPairs = VM.Value.array(
+            [.tuple([key, .native(boxed)])],
+            elementType: pair
+        )
+        #expect(
+            try invoke(
+                function: dictionaryFunction,
+                collectionType: dictionary,
+                resultType: pairs,
+                argument: dictionaryArgument,
+                maximumNativeBytes: 32
+            ) == .returned(expectedPairs)
+        )
+        #expect(
+            try invoke(
+                function: dictionaryFunction,
+                collectionType: dictionary,
+                resultType: pairs,
+                argument: dictionaryArgument,
+                maximumNativeBytes: 31
+            ) == .trapped(.nativeOwnedMemoryLimitExceeded)
+        )
+    }
+
     @Test("Mutable capture projections update their enclosing local value")
     func executesProjectedMutableCapture() throws {
         let key = Bytecode.LocalTypeKey(rawValue: "Fixture.Pair")

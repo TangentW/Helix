@@ -318,6 +318,7 @@ struct Container {
             .arrayState(kind: .mutation, element: .int64),
             .int64,
             .array(.int64),
+            .array(.int64),
         ])
         module.functions[0].blocks[0].instructions.insert(contentsOf: [
             .makeArray(
@@ -390,6 +391,10 @@ struct Container {
                 result: .init(rawValue: 19),
                 state: .init(rawValue: 17)
             ),
+            .collectionMaterialize(
+                result: .init(rawValue: 20),
+                collection: .init(rawValue: 5)
+            ),
         ], at: 0)
 
         let bytes = try Bytecode.Encoder.encode(module)
@@ -412,6 +417,7 @@ struct Container {
         #expect(text.contains("array_mutation_get"))
         #expect(text.contains("array_mutation_swap"))
         #expect(text.contains("finish_array_mutation"))
+        #expect(text.contains("collection_materialize"))
     }
 
     @Test("HLBC 1.0 canonically carries Dictionary accumulation state")

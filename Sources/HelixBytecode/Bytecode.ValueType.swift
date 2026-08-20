@@ -1,4 +1,18 @@
 extension Bytecode.ValueType {
+    /// The element shape exposed by the managed Collection representations.
+    /// Dictionary iteration carries one `(key, value)` tuple, matching Swift's
+    /// `Dictionary.Element`; compiler-only adapters are represented as Arrays.
+    public var managedCollectionElement: Self? {
+        switch self {
+        case let .array(element), let .set(element):
+            element
+        case let .dictionary(key, value):
+            .tuple([key, value])
+        default:
+            nil
+        }
+    }
+
     /// Types whose Swift `Equatable` semantics are completely defined by the
     /// VM. The recursive family deliberately excludes native and local values:
     /// their equality may execute user or framework code.

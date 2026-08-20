@@ -684,7 +684,7 @@ public struct TypeEnvironment: Sendable {
                     relativeTo: parentScope
                 )
             )
-            guard case let .array(element) = base else {
+            guard let element = base.managedCollectionElement else {
                 throw CanonicalSIL.LoweringError.unsupportedType(type)
             }
             return .array(.tuple([.int64, element]))
@@ -704,8 +704,8 @@ public struct TypeEnvironment: Sendable {
                     try resolve($0, relativeTo: parentScope)
                 )
             }
-            guard case let .array(lhs) = sequences[0],
-                  case let .array(rhs) = sequences[1]
+            guard let lhs = sequences[0].managedCollectionElement,
+                  let rhs = sequences[1].managedCollectionElement
             else {
                 throw CanonicalSIL.LoweringError.unsupportedType(type)
             }

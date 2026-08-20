@@ -1,3 +1,5 @@
+import HelixCore
+import HelixInterface
 import HelixVM
 import Testing
 @testable import HelixCompiler
@@ -197,6 +199,214 @@ struct CollectionAdapterSemanticsMatrix {
                 ]
             ),
         ])
+    }
+
+    @Test("Managed Collection adapters share materialization semantics")
+    func lowersManagedCollectionAdapters() throws {
+        try run([
+            .init(
+                name: "arrayFromSet",
+                source: """
+                public func arrayFromSet(_ values: Set<Int>) -> [Int] {
+                    Array(values)
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try set([4, 1, 7])],
+                        expected: .returned(try integers([4, 1, 7]))
+                    ),
+                ]
+            ),
+            .init(
+                name: "arrayFromDictionary",
+                source: """
+                public func arrayFromDictionary(
+                    _ values: [String: Int]
+                ) -> [(key: String, value: Int)] {
+                    Array(values)
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try dictionary([("a", 4), ("b", 7)]),
+                        ],
+                        expected: .returned(
+                            .array(
+                                [
+                                    .tuple([.string("a"), try integer(4)]),
+                                    .tuple([.string("b"), try integer(7)]),
+                                ],
+                                elementType: .tuple([.string, .int64])
+                            )
+                        )
+                    ),
+                ]
+            ),
+            .init(
+                name: "setEnumerated",
+                source: """
+                public func setEnumerated(
+                    _ values: Set<Int>
+                ) -> [(Int, Int)] {
+                    Array(values.enumerated())
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try set([4, 1, 7])],
+                        expected: .returned(
+                            .array(
+                                [
+                                    .tuple([try integer(0), try integer(4)]),
+                                    .tuple([try integer(1), try integer(1)]),
+                                    .tuple([try integer(2), try integer(7)]),
+                                ],
+                                elementType: .tuple([.int64, .int64])
+                            )
+                        )
+                    ),
+                ]
+            ),
+            .init(
+                name: "dictionaryEnumerated",
+                source: """
+                public func dictionaryEnumerated(
+                    _ values: [String: Int]
+                ) -> [(Int, String, Int)] {
+                    values.enumerated().map {
+                        ($0.offset, $0.element.key, $0.element.value)
+                    }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try dictionary([("a", 4), ("b", 7)]),
+                        ],
+                        expected: .returned(
+                            .array(
+                                [
+                                    .tuple([
+                                        try integer(0),
+                                        .string("a"),
+                                        try integer(4),
+                                    ]),
+                                    .tuple([
+                                        try integer(1),
+                                        .string("b"),
+                                        try integer(7),
+                                    ]),
+                                ],
+                                elementType: .tuple([
+                                    .int64, .string, .int64,
+                                ])
+                            )
+                        )
+                    ),
+                ]
+            ),
+            .init(
+                name: "managedZip",
+                source: """
+                public func managedZip(
+                    _ lhs: Set<Int>,
+                    _ rhs: [String: Int]
+                ) -> [(Int, String, Int)] {
+                    zip(lhs, rhs).map {
+                        ($0.0, $0.1.key, $0.1.value)
+                    }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try set([2, 3, 4]),
+                            try dictionary([("x", 8), ("y", 9)]),
+                        ],
+                        expected: .returned(
+                            .array(
+                                [
+                                    .tuple([
+                                        try integer(2),
+                                        .string("x"),
+                                        try integer(8),
+                                    ]),
+                                    .tuple([
+                                        try integer(3),
+                                        .string("y"),
+                                        try integer(9),
+                                    ]),
+                                ],
+                                elementType: .tuple([
+                                    .int64, .string, .int64,
+                                ])
+                            )
+                        )
+                    ),
+                ]
+            ),
+        ])
+    }
+
+    @Test("Imported-reference adapters preserve borrowed and transferred owners")
+    func verifiesImportedReferenceAdapterOwnership() throws {
+        let typeID = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let nativeType = InterfaceArchive.TypeRecord(
+            id: typeID,
+            canonicalName: "Foundation.NSObject",
+            kind: .reference,
+            layoutFingerprint: .sha256("Foundation.NSObject.layout.v1"),
+            isCopyable: true,
+            isEmittedToDevice: true,
+            estimatedSize: 8
+        )
+        for probe in [
+            (
+                name: "copyImportedArray",
+                source: """
+                import Foundation
+
+                public func copyImportedArray(
+                    _ values: [NSObject]
+                ) -> [NSObject] {
+                    Array(values)
+                }
+                """
+            ),
+            (
+                name: "enumerateImportedArray",
+                source: """
+                import Foundation
+
+                public func enumerateImportedArray(
+                    _ values: [NSObject]
+                ) -> [(Int, NSObject)] {
+                    Array(values.enumerated())
+                }
+                """
+            ),
+            (
+                name: "importedArrayEndIndex",
+                source: """
+                import Foundation
+
+                public func importedArrayEndIndex(
+                    _ values: [NSObject]
+                ) -> Int {
+                    values.endIndex
+                }
+                """
+            ),
+        ] {
+            _ = try FrontendExecutionHarness.compile(
+                source: probe.source,
+                functionName: probe.name,
+                moduleName: "HelixAdapters_\(probe.name)",
+                nativeTypes: [nativeType]
+            )
+        }
     }
 
     @Test("Array-backed subsequences preserve clamping and index traps")
@@ -588,6 +798,27 @@ struct CollectionAdapterSemanticsMatrix {
 
     private func integers(_ values: [Int64]) throws -> VM.Value {
         .array(try values.map(integer), elementType: .int64)
+    }
+
+    private func set(_ values: [Int64]) throws -> VM.Value {
+        .set(
+            try .init(
+                elements: values.map(integer),
+                elementType: .int64
+            )
+        )
+    }
+
+    private func dictionary(
+        _ entries: [(String, Int64)]
+    ) throws -> VM.Value {
+        .dictionary(
+            try entries.map { key, value in
+                .init(key: .string(key), value: try integer(value))
+            },
+            keyType: .string,
+            valueType: .int64
+        )
     }
 
     private func integerArrays(_ values: [[Int64]]) throws -> VM.Value {

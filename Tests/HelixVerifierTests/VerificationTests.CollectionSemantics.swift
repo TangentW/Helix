@@ -17,10 +17,74 @@ struct CollectionSemantics {
         #expect(Bytecode.ValueType.string.isVMComparable)
         #expect(!Bytecode.ValueType.bool.isVMComparable)
         #expect(!Bytecode.ValueType.any.isVMEquatable)
+        #expect(
+            Bytecode.ValueType.dictionary(key: .string, value: .int64)
+                .managedCollectionElement == .tuple([.string, .int64])
+        )
+        #expect(Bytecode.ValueType.bool.managedCollectionElement == nil)
 
         var tooDeep = Bytecode.ValueType.int64
         for _ in 0..<33 { tooDeep = .optional(tooDeep) }
         #expect(!tooDeep.isVMEquatable)
+    }
+
+    @Test("Managed Collection materialization verifies one generic element shape")
+    func verifiesManagedCollectionMaterialization() throws {
+        let set = Bytecode.ValueType.set(.int64)
+        let integers = Bytecode.ValueType.array(.int64)
+        _ = try verify(
+            fixture(
+                parameterTypes: [set],
+                resultType: integers,
+                registerTypes: [set, integers],
+                instruction: .collectionMaterialize(
+                    result: register(1),
+                    collection: register(0)
+                )
+            )
+        )
+
+        let dictionary = Bytecode.ValueType.dictionary(
+            key: .string,
+            value: .int64
+        )
+        let pairs = Bytecode.ValueType.array(.tuple([.string, .int64]))
+        _ = try verify(
+            fixture(
+                parameterTypes: [dictionary],
+                resultType: pairs,
+                registerTypes: [dictionary, pairs],
+                instruction: .collectionMaterialize(
+                    result: register(1),
+                    collection: register(0)
+                )
+            )
+        )
+
+        try expectInvalid(
+            fixture(
+                parameterTypes: [set],
+                resultType: .array(.string),
+                registerTypes: [set, .array(.string)],
+                instruction: .collectionMaterialize(
+                    result: register(1),
+                    collection: register(0)
+                )
+            ),
+            reason: "collection_materialize requires an Array, Dictionary, or Set and its matching element Array"
+        )
+        try expectInvalid(
+            fixture(
+                parameterTypes: [.int64],
+                resultType: integers,
+                registerTypes: [.int64, integers],
+                instruction: .collectionMaterialize(
+                    result: register(1),
+                    collection: register(0)
+                )
+            ),
+            reason: "collection_materialize requires an Array, Dictionary, or Set and its matching element Array"
+        )
     }
 
     @Test("Recursive Array relations and equality are accepted")
@@ -226,8 +290,8 @@ struct CollectionSemantics {
         )
     }
 
-    @Test("Array adapters track recursively owned native results")
-    func tracksNativeAdapterResults() throws {
+    @Test("Collection adapters track recursively owned native results")
+    func tracksNativeCollectionResults() throws {
         let namespace = Core.ShellNamespaceID.derive(
             bundleID: "dev.helix.verifier.collection",
             buildNumber: "1",
@@ -239,7 +303,7 @@ struct CollectionSemantics {
         )
         let native = Bytecode.ValueType.native(typeID)
         let array = Bytecode.ValueType.array(native)
-        var fixture = try fixture(
+        var adapterFixture = try fixture(
             parameterTypes: [array],
             resultType: array,
             registerTypes: [array, array],
@@ -250,10 +314,10 @@ struct CollectionSemantics {
             ),
             cleanup: [.destroyValue(register(0))]
         )
-        fixture.module.capabilities.insert(.nativeTypesV1)
-        fixture.shell.capabilities.insert(.nativeTypesV1)
-        fixture.policy.acceptedCapabilities.insert(.nativeTypesV1)
-        fixture.shell.types[typeID] = .init(
+        adapterFixture.module.capabilities.insert(.nativeTypesV1)
+        adapterFixture.shell.capabilities.insert(.nativeTypesV1)
+        adapterFixture.policy.acceptedCapabilities.insert(.nativeTypesV1)
+        adapterFixture.shell.types[typeID] = .init(
             id: typeID,
             canonicalName: "Fixture.Reference",
             kind: .reference,
@@ -262,7 +326,38 @@ struct CollectionSemantics {
             estimatedSize: 8
         )
 
-        _ = try verify(fixture)
+        _ = try verify(adapterFixture)
+
+        var materializationFixture = try fixture(
+            parameterTypes: [array],
+            resultType: array,
+            registerTypes: [array, array],
+            instruction: .collectionMaterialize(
+                result: register(1),
+                collection: register(0)
+            ),
+            cleanup: [.destroyValue(register(0))]
+        )
+        materializationFixture.module.capabilities.insert(.nativeTypesV1)
+        materializationFixture.shell.capabilities.insert(.nativeTypesV1)
+        materializationFixture.policy.acceptedCapabilities.insert(.nativeTypesV1)
+        materializationFixture.shell.types = adapterFixture.shell.types
+
+        _ = try verify(materializationFixture)
+
+        var noncopyableFixture = materializationFixture
+        noncopyableFixture.shell.types[typeID] = .init(
+            id: typeID,
+            canonicalName: "Fixture.Reference",
+            kind: .reference,
+            layoutFingerprint: .sha256("Fixture.Reference.layout.v1"),
+            isCopyable: false,
+            estimatedSize: 8
+        )
+        try expectInvalid(
+            noncopyableFixture,
+            reason: "collection_materialize requires a copyable element type"
+        )
     }
 
     private struct Fixture {

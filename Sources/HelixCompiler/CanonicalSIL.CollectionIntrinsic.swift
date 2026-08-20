@@ -2,8 +2,9 @@ import HelixBytecode
 
 extension CanonicalSIL {
 /// Common collection operations classified by semantic shape instead of by
-/// one concrete element type. Lowering still validates every specialization
-/// and only accepts Array-backed Sequence/Collection forms the VM can model.
+/// one concrete element type. Sequence-wide operations accept represented
+/// Array, Dictionary, and Set values and materialize only when an Array-based
+/// VM algorithm requires random access.
 enum CollectionIntrinsic: Equatable {
     enum EqualityContainer: Equatable {
         case array

@@ -339,6 +339,8 @@ public enum Disassembler {
             "\(result) = array_update \(array)[\(index)] = \(value)"
         case let .arrayPopLast(elementResult, arrayResult, array):
             "(\(elementResult), \(arrayResult)) = array_pop_last \(array)"
+        case let .collectionMaterialize(result, collection):
+            "\(result) = collection_materialize \(collection)"
         case let .collectionNext(result, collection, indexSlot, direction):
             "\(result) = collection_next_\(direction.rawValue) "
                 + "\(collection), \(indexSlot)"

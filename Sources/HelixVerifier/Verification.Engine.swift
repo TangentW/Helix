@@ -2815,6 +2815,24 @@ public struct Engine: Verification.ImageVerifying {
             guard isCopyable(element, shell: shell) else {
                 throw fail("array_pop_last requires a copyable element type")
             }
+        case let .collectionMaterialize(result, collection):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail(
+                    "Collection materialization requires \(Core.Capability.collectionsV1)"
+                )
+            }
+            guard let element = type(collection).managedCollectionElement,
+                  type(result) == .array(element)
+            else {
+                throw fail(
+                    "collection_materialize requires an Array, Dictionary, or Set and its matching element Array"
+                )
+            }
+            guard isCopyable(element, shell: shell) else {
+                throw fail(
+                    "collection_materialize requires a copyable element type"
+                )
+            }
         case let .collectionNext(result, collection, indexSlot, direction):
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("Collection iteration requires \(Core.Capability.collectionsV1)")
@@ -3835,6 +3853,7 @@ public struct Engine: Verification.ImageVerifying {
                      let .arraySplitSeparator(result, _, _, _, _),
                      let .arraySplitNextElement(result, _),
                      let .arrayAppend(result, _, _), let .arrayUpdate(result, _, _, _),
+                     let .collectionMaterialize(result, _),
                      let .collectionNext(result, _, _, _),
                      let .progressionNext(result, _, _, _, _),
                      let .makeDictionary(result, _), let .dictionaryGet(result, _, _),

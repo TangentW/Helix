@@ -134,12 +134,19 @@ Both workflows depend on stable, build-specific identities:
   order. It recursively transitions between one aggregate owner and disjoint
   field owners, so early projections, nested tuples, whole-value assignment,
   destruction, and mutable capture all share the same initialization and
-  ownership rules.
-- Common Array-backed standard-library views are normalized at the compiler/VM
-  boundary instead of importing their private storage layouts. Reversed,
-  enumerated, repeated, `Slice<Base>`, zipped, and joined sequences become
-  verified typed Array operations with operation-specific result shapes and
-  bounded pre-allocation accounting. Only element-sequence semantics are
+  ownership rules. Aggregate `@out` results use the same field paths over one
+  typed frame slot, allowing independent tuple-component initialization while
+  the verifier still observes one complete value at the return boundary.
+- Represented managed Collections share one verified materialization boundary
+  instead of importing Swift's private generic Collection ABI. Array storage is
+  reused; Set and Dictionary are copied into `Array<Element>` while preserving
+  their deterministic VM iteration order, with Dictionary exposing its native
+  `(Key, Value)` element tuple. `enumerated`, `Array(sequence)`, heterogeneous
+  `zip`, extrema, cross-container Sequence relations, and natural or
+  comparator-driven nonmutating ordering all reuse this boundary and the
+  existing typed Array algorithms. Reversed, repeated, sliced, and joined
+  views remain Array-backed where their index or nested-sequence semantics need
+  that stronger representation. Only element-sequence semantics are
   normalized; an ArraySlice's non-zero-based index identity is not erased into
   an Array index, so unsupported slice-index APIs still fail closed.
 - Canonical SIL may spell tuple-label erasure through generic Array and

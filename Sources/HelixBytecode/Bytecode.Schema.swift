@@ -832,6 +832,13 @@ public enum Instruction: Codable, Hashable, Sendable {
         arrayResult: Bytecode.Register,
         array: Bytecode.Register
     )
+    /// Copies any represented managed Collection into an Array while
+    /// preserving its VM iteration order. Sequence algorithms use this one
+    /// boundary when they require random-access storage.
+    case collectionMaterialize(
+        result: Bytecode.Register,
+        collection: Bytecode.Register
+    )
     /// Advances a managed collection cursor. A forward cursor is the next
     /// element offset and starts at zero. Array also supports a reverse cursor,
     /// represented as an exclusive upper bound starting at its element count.
@@ -1075,6 +1082,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .arraySwap(result, _, _, _),
              let .arrayAppend(result, _, _),
              let .arrayUpdate(result, _, _, _),
+             let .collectionMaterialize(result, _),
              let .collectionNext(result, _, _, _),
              let .progressionNext(result, _, _, _, _),
              let .makeDictionary(result, _),
@@ -1331,6 +1339,8 @@ public enum Instruction: Codable, Hashable, Sendable {
             [array, index, value]
         case let .arrayPopLast(_, _, array):
             [array]
+        case let .collectionMaterialize(_, collection):
+            [collection]
         case let .collectionNext(_, collection, _, _):
             [collection]
         case let .progressionNext(_, _, end, stride, _):

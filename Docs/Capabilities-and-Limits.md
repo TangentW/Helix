@@ -129,11 +129,13 @@ does not by itself certify a physical device or distribution channel.
   Optional, Array, Dictionary, and Set values. Dictionary and Set comparison is
   order-independent, collection equality preserves Swift's shared-storage fast
   path, and Float/Double preserve Swift NaN and signed-zero behavior.
-  Natural `sorted()`/`sort()` ordering remains limited to the scalar integer,
-  floating-point, and String types that the VM can compare without executing a
-  user witness. Comparator-driven `sorted(by:)`/`sort(by:)` instead accepts any
-  represented copyable Array element because the callback runs through the
-  ordinary verified closure ABI. Set supports empty, literal,
+  Natural ordering remains limited to scalar integer, floating-point, and
+  String elements that the VM can compare without executing a user witness.
+  Nonmutating `sorted()` accepts any represented managed Collection with such
+  an element, while mutating `sort()` remains Array-only. Comparator-driven
+  `sorted(by:)` accepts represented copyable Array, Set, and Dictionary
+  elements because the callback runs through the ordinary verified closure
+  ABI; mutating `sort(by:)` remains Array-only. Set supports empty, literal,
   Array, and Set construction;
   `count`, `isEmpty`, `first`, `contains`, `insert`, `update`, `remove`,
   `popFirst`, `removeFirst`, `removeAll`, the capacity hint, iteration, the
@@ -153,9 +155,13 @@ does not by itself certify a physical device or distribution channel.
   `(key: Key, value: Value)` tuple shape. Container-preserving `filter` is
   supported for all three containers, and Dictionary additionally supports
   `mapValues` and `compactMapValues`; their specialized key/value callback ABI
-  is projected from the same tuple traversal. Array-only reverse
+  is projected from the same tuple traversal. Nonmutating `min()`/`max()` and
+  `elementsEqual`/`starts(with:)`/`lexicographicallyPrecedes` also accept
+  represented managed Collections when the required VM-defined Comparable or
+  Equatable semantics exist; the two relation operands may use different
+  container types when their element shapes match. Array-only reverse
   `last(where:)`, zero-based `firstIndex(where:)`/`lastIndex(where:)`,
-  `prefix(while:)`, Collection `drop(while:)`, `sorted(by:)`/`sort(by:)`,
+  `prefix(while:)`, Collection `drop(while:)`, mutating `sort(by:)`,
   zero-based `reverse()`, `removeAll(where:)`, and zero-based `partition(by:)`
   retain their existing constraints. Producing
   variants use one linear invocation-local element buffer followed by a typed
@@ -181,13 +187,14 @@ does not by itself certify a physical device or distribution channel.
   Sequence `prefix(while:)` is also supported when its concrete source has an
   Array-backed normalization. The lazy Sequence `drop(while:)` overload remains
   rejected: eagerly materializing it would change predicate side-effect timing.
-  Common Array-backed
-  adapter paths also support `enumerated()`, `reversed()`, `repeatElement`,
-  `Array(repeating:count:)`, count-based `dropFirst`/`dropLast`/`prefix`/
-  `suffix`, concrete Array index prefixes/suffixes, `Range<Int>` slicing,
-  `zip`, `joined()`, `joined(separator:)`, iteration, and Array
-  materialization, including composed `Slice<Base>` when `Base` is already
-  Array-backed. These views are normalized by element sequence; index-based
+  `enumerated()`, `Array(sequence)`, and heterogeneous `zip` accept represented
+  managed Array, Set, and Dictionary sources through one verified
+  materialization path. Array-backed adapters additionally support
+  `reversed()`, `repeatElement`, `Array(repeating:count:)`, count-based
+  `dropFirst`/`dropLast`/`prefix`/`suffix`, concrete Array index
+  prefixes/suffixes, `Range<Int>` slicing, `joined()`,
+  `joined(separator:)`, iteration, and composed `Slice<Base>` when `Base` is
+  already Array-backed. These views are normalized by element sequence; index-based
   operations on a derived ArraySlice remain rejected until its preserved base
   index is modeled, rather than being treated incorrectly as zero-based.
   `Optional.map`/`flatMap`

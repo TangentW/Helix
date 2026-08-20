@@ -346,9 +346,13 @@ traversal for common `map`/`flatMap`/`compactMap`, reduction, visit, predicate,
 and comparator-selection operations. Container-preserving `filter` uses the
 same traversal for all three; Dictionary `mapValues` and `compactMapValues`
 project their specialized value callback from each represented `(Key, Value)`
-element, while `reduce(into:_:)` uses scoped inout accumulation. Array-only
-short-circuiting prefix/drop predicates, reverse `last` searches, and stable
-comparator `sorted(by:)`/`sort(by:)` retain their specialized verified CFGs.
+element, while `reduce(into:_:)` uses scoped inout accumulation. Represented
+managed Collections also share one typed materialization boundary for
+`enumerated`, `Array(sequence)`, heterogeneous `zip`, extrema, cross-container
+relations, and nonmutating ordering. Stable comparator `sorted(by:)` accepts
+Array, Set, and Dictionary elements through the same verified sort CFG;
+short-circuiting prefix/drop predicates, reverse `last` searches, and mutating
+`sort(by:)` remain Array-only.
 Array `partition(by:)` and `removeAll(where:)` share a typed linear mutable
 snapshot while their predicate calls remain ordinary verified CFG edges;
 partition preserves Swift's low/high scan, removal preserves forward visits,
@@ -378,9 +382,10 @@ expresses label erasure with an Array or Dictionary cast helper, Helix removes
 the call only after proving that the source types differ solely by those
 labels and both recursively normalized managed types are identical. A real
 collection element conversion still fails closed.
-Natural `sorted()`/`sort()` is available
-for VM-comparable scalar elements. Mutating ordering commits only on its normal
-continuation, so a throwing callback leaves the original Array unchanged.
+Natural `sorted()` is available across represented managed Collections whose
+elements are VM-comparable scalars; mutating `sort()` remains Array-only.
+Mutating ordering commits only on its normal continuation, so a throwing
+callback leaves the original Array unchanged.
 Multi-branch local initialization
 uses field-sensitive definite/possible state, so conditional replacement and
 cleanup are supported while reads remain fail-closed until every field is

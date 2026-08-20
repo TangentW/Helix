@@ -2990,6 +2990,26 @@ public struct Interpreter: Sendable {
                         register: arrayResult,
                         registers: &registers
                     )
+                case let .collectionMaterialize(result, collectionRegister):
+                    let collection = try read(
+                        collectionRegister,
+                        registers: registers
+                    )
+                    let materialized = try materializeManagedCollection(
+                        collection,
+                        budget: budget
+                    )
+                    guard materialized.type == function.type(of: result) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: materialized.type
+                        )
+                    }
+                    try initialize(
+                        materialized,
+                        register: result,
+                        registers: &registers
+                    )
                 case let .collectionNext(
                     result,
                     collectionRegister,
@@ -5143,6 +5163,70 @@ public struct Interpreter: Sendable {
             )
         }
         return set
+    }
+
+    private func materializeManagedCollection(
+        _ collection: VM.Value,
+        budget: VM.InvocationBudget
+    ) throws -> VM.Value {
+        let elements: [VM.Value]
+        let elementType: Bytecode.ValueType
+        switch collection {
+        case let .array(source, sourceElementType):
+            elements = source
+            elementType = sourceElementType
+        case let .set(source):
+            elements = source.elements
+            elementType = source.elementType
+        case let .dictionary(entries, keyType, valueType):
+            // Each output entry occupies one Array element slot plus one
+            // two-field tuple (header and fields). The aggregate charge adds
+            // the outer Array header once, so four slots per entry is exact.
+            let aggregateCount = entries.count.multipliedReportingOverflow(
+                by: 4
+            )
+            guard !aggregateCount.overflow else {
+                throw VM.RuntimeTrap.vmHeapLimitExceeded
+            }
+            try chargeAggregate(
+                elementCount: aggregateCount.partialValue,
+                budget: budget
+            )
+            try budget.consumeLinearWork(elementCount: entries.count)
+            for entry in entries {
+                try prepareCopy(entry.key, budget: budget)
+                try prepareCopy(entry.value, budget: budget)
+            }
+            var pairs: [VM.Value] = []
+            pairs.reserveCapacity(entries.count)
+            for entry in entries {
+                pairs.append(
+                    .tuple([
+                        try copy(entry.key),
+                        try copy(entry.value),
+                    ])
+                )
+            }
+            try budget.checkDeadline()
+            return .array(
+                pairs,
+                elementType: .tuple([keyType, valueType])
+            )
+        default:
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: .array(.never),
+                actual: collection.type
+            )
+        }
+
+        try budget.consumeLinearWork(elementCount: elements.count)
+        try chargeAggregate(elementCount: elements.count, budget: budget)
+        for element in elements {
+            try prepareCopy(element, budget: budget)
+        }
+        let copied = try elements.map(copy)
+        try budget.checkDeadline()
+        return .array(copied, elementType: elementType)
     }
 
     private func normalizedSetValue(

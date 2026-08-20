@@ -562,6 +562,52 @@ struct StorageInitialization {
         #expect(plan.storeMode(at: call.key, address: "%3") == .initialize)
     }
 
+    @Test("Indirect tuple output fields share field-sensitive initialization")
+    func classifiesIndirectTupleOutputFields() throws {
+        let plan = try CanonicalSIL.StorageInitialization.analyze(
+            body: """
+            bb0(%0 : $*(Int, String), %1 : $Int, %2 : $Int, %3 : $String):
+              %4 = tuple_element_addr %0, 0
+              %5 = tuple_element_addr %0, 1
+              store %1 to [init] %4
+              store %2 to [assign] %4
+              store %3 to [init] %5
+              %6 = tuple ()
+              return %6
+            """,
+            directCalls: .empty,
+            typeEnvironment: .empty,
+            indirectResultType: .tuple([.int64, .string])
+        )
+
+        let writes = plan.storeModes.sorted { $0.key < $1.key }
+        let firstFieldModes = writes.compactMap { item in
+            item.value.first { $0.key.path == [0] }?.value
+        }
+        let secondFieldModes = writes.compactMap { item in
+            item.value.first { $0.key.path == [1] }?.value
+        }
+        #expect(firstFieldModes == [.initialize, .assign])
+        #expect(secondFieldModes == [.initialize])
+        #expect(plan.addressTargets["%4"]?.root == "%0")
+        #expect(plan.addressTargets["%5"]?.root == "%0")
+    }
+
+    @Test("Malformed indirect output parameters fail closed")
+    func rejectsMalformedIndirectOutputParameters() {
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.StorageInitialization.analyze(
+                body: """
+                bb0(invalid, %0 : $Int):
+                  return %0
+                """,
+                directCalls: .empty,
+                typeEnvironment: .empty,
+                indirectResultType: .int64
+            )
+        }
+    }
+
     @Test("Store modes resolve through equivalent projected addresses")
     func resolvesProjectedStoreAliases() throws {
         let plan = try CanonicalSIL.StorageInitialization.analyze(
