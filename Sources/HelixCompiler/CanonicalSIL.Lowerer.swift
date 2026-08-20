@@ -220,6 +220,17 @@ public struct Lowerer: Sendable {
         var requiresInitialization = true
     }
 
+    /// Canonical SIL may spell the unmentioned Optional case as `default`.
+    /// Keep the semantic case mapping independent of clause order and retain
+    /// whether `.some` is explicit, because only an explicit case forwards the
+    /// wrapped payload to its successor block.
+    private struct OptionalSwitchPlan {
+        var operand: String
+        var someTarget: Bytecode.BlockID
+        var noneTarget: Bytecode.BlockID
+        var someCaseIsExplicit: Bool
+    }
+
     private struct CollectionHigherOrderPlan {
         var operation: CanonicalSIL.HigherOrderIntrinsic
         var sourceToken: String
@@ -18887,13 +18898,12 @@ public struct Lowerer: Sendable {
                 continue
             }
 
-            if let branch = match(
+            if let branch = try parseOptionalSwitch(
                 line,
-                pattern: #"^switch_enum_addr (%[0-9]+), case #Optional\.(some|none)!enumelt: bb([0-9]+), case #Optional\.(some|none)!enumelt: bb([0-9]+)$"#
+                opcode: "switch_enum_addr"
             ) {
-                guard branch[1] != branch[3],
-                      let borrowed = try borrowStoredValue(
-                        at: branch[0],
+                guard let borrowed = try borrowStoredValue(
+                        at: branch.operand,
                         line: sourceLine
                       ),
                       case .optional = registerTypes[
@@ -18905,35 +18915,35 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let optional = borrowed.register
-                let firstTarget = try parseBlockID(branch[2])
-                let secondTarget = try parseBlockID(branch[4])
-                let someTarget = branch[1] == "some" ? firstTarget : secondTarget
-                let noneTarget = branch[1] == "none" ? firstTarget : secondTarget
-                guard knownSomeOptionalAddresses[someTarget] == nil else {
+                guard branch.someTarget == branch.noneTarget
+                    || knownSomeOptionalAddresses[branch.someTarget] == nil
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "multiple Optional address switches share a case block"
                     )
                 }
                 // An enum-address branch only inspects storage. Ownership moves
                 // when a proven `.some` address is explicitly taken below.
-                setKnownSomeOptionalAddress(
-                    branch[0],
-                    in: someTarget,
-                    isKnownSome: true
-                )
-                if let source = optionalValueSource(at: branch[0]) {
-                    setKnownSomeOptionalValue(
-                        source,
-                        in: someTarget,
+                if branch.someTarget != branch.noneTarget {
+                    setKnownSomeOptionalAddress(
+                        branch.operand,
+                        in: branch.someTarget,
                         isKnownSome: true
                     )
+                    if let source = optionalValueSource(at: branch.operand) {
+                        setKnownSomeOptionalValue(
+                            source,
+                            in: branch.someTarget,
+                            isKnownSome: true
+                        )
+                    }
                 }
-                if runtimeAddress(at: branch[0]) == nil,
-                   mutableCell(at: branch[0]) == nil {
+                if runtimeAddress(at: branch.operand) == nil,
+                   mutableCell(at: branch.operand) == nil {
                     try inheritCompilerAddressValue(
                         optional,
-                        at: branch[0],
-                        into: [someTarget, noneTarget]
+                        at: branch.operand,
+                        into: [branch.someTarget, branch.noneTarget]
                     )
                 }
                 let isSome = try allocate(type: .bool)
@@ -18946,30 +18956,21 @@ public struct Lowerer: Sendable {
                 appendInstruction(
                     .conditionalBranch(
                         condition: isSome,
-                        trueTarget: someTarget,
+                        trueTarget: branch.someTarget,
                         trueArguments: [],
-                        falseTarget: noneTarget,
+                        falseTarget: branch.noneTarget,
                         falseArguments: []
                     )
                 )
                 continue
             }
 
-            if let branch = match(
+            if let branch = try parseOptionalSwitch(
                 line,
-                pattern: #"^switch_enum (%[0-9]+), case #Optional\.(some|none)!enumelt: bb([0-9]+), case #Optional\.(some|none)!enumelt: bb([0-9]+)$"#
+                opcode: "switch_enum"
             ) {
-                guard branch[1] != branch[3] else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "switch_enum must contain one some and one none case"
-                    )
-                }
-                let firstTarget = try parseBlockID(branch[2])
-                let secondTarget = try parseBlockID(branch[4])
-                let someTarget = branch[1] == "some" ? firstTarget : secondTarget
-                let noneTarget = branch[1] == "none" ? firstTarget : secondTarget
                 let optional = try prepareOwnedValue(
-                    branch[0],
+                    branch.operand,
                     line: sourceLine
                 )
                 guard case .optional = registerTypes[Int(optional.rawValue)] else {
@@ -18977,22 +18978,59 @@ public struct Lowerer: Sendable {
                         "Optional switch operand has a non-Optional type"
                     )
                 }
-                guard optionalSourceBySomeBlock[someTarget] == nil,
-                      optionalSourceByNoneBlock[noneTarget] == nil
+                guard branch.someTarget != branch.noneTarget else {
+                    guard !branch.someCaseIsExplicit else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "an explicit Optional.some case cannot share its payload block with none"
+                        )
+                    }
+                    if registerTypes[Int(optional.rawValue)]
+                        .requiresLinearOwnership {
+                        appendInstruction(.destroyValue(optional))
+                    }
+                    appendInstruction(
+                        .branch(target: branch.someTarget, arguments: [])
+                    )
+                    continue
+                }
+                guard optionalSourceByNoneBlock[branch.noneTarget] == nil,
+                      !branch.someCaseIsExplicit
+                        || optionalSourceBySomeBlock[branch.someTarget] == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "multiple Optional switches share a case block"
                     )
                 }
-                optionalSourceBySomeBlock[someTarget] = branch[0]
-                optionalSourceByNoneBlock[noneTarget] = branch[0]
-                appendInstruction(
-                    .switchOptional(
-                        optional: optional,
-                        someTarget: someTarget,
-                        noneTarget: noneTarget
+                optionalSourceByNoneBlock[branch.noneTarget] = branch.operand
+                if branch.someCaseIsExplicit {
+                    optionalSourceBySomeBlock[branch.someTarget]
+                        = branch.operand
+                    appendInstruction(
+                        .switchOptional(
+                            optional: optional,
+                            someTarget: branch.someTarget,
+                            noneTarget: branch.noneTarget
+                        )
                     )
-                )
+                } else {
+                    let isSome = try allocate(type: .bool)
+                    appendInstruction(
+                        .optionalIsSome(result: isSome, optional: optional)
+                    )
+                    if registerTypes[Int(optional.rawValue)]
+                        .requiresLinearOwnership {
+                        appendInstruction(.destroyValue(optional))
+                    }
+                    appendInstruction(
+                        .conditionalBranch(
+                            condition: isSome,
+                            trueTarget: branch.someTarget,
+                            trueArguments: [],
+                            falseTarget: branch.noneTarget,
+                            falseArguments: []
+                        )
+                    )
+                }
                 continue
             }
 
@@ -20892,6 +20930,75 @@ public struct Lowerer: Sendable {
             )
         }
         return .init(rawValue: value)
+    }
+
+    private func parseOptionalSwitch(
+        _ line: String,
+        opcode: String
+    ) throws -> OptionalSwitchPlan? {
+        let prefix = opcode + " "
+        guard line.hasPrefix(prefix) else { return nil }
+        let components = splitTopLevel(String(line.dropFirst(prefix.count)))
+        let clauses = components.dropFirst()
+        guard clauses.contains(where: {
+            $0.contains("#Optional.") || $0.contains("#Swift.Optional.")
+        }) else { return nil }
+        guard let operand = components.first,
+              match(operand, pattern: #"^%[0-9]+$"#) != nil
+        else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "Optional switch has an invalid operand"
+            )
+        }
+
+        var targets: [String: Bytecode.BlockID] = [:]
+        var defaultTarget: Bytecode.BlockID?
+        for clause in clauses {
+            if let item = match(
+                clause,
+                pattern: #"^case #(?:Swift\.)?Optional\.(some|none)!enumelt: bb([0-9]+)$"#
+            ) {
+                guard targets[item[0]] == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional switch repeats the \(item[0]) case"
+                    )
+                }
+                targets[item[0]] = try parseBlockID(item[1])
+            } else if let item = match(
+                clause,
+                pattern: #"^default bb([0-9]+)$"#
+            ), defaultTarget == nil {
+                defaultTarget = try parseBlockID(item[0])
+            } else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Optional switch contains an unsupported clause"
+                )
+            }
+        }
+
+        let hasSome = targets["some"] != nil
+        let hasNone = targets["none"] != nil
+        switch (hasSome, hasNone, defaultTarget) {
+        case (true, true, nil), (true, false, .some), (false, true, .some):
+            break
+        default:
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "Optional switch must cover some and none exactly once"
+            )
+        }
+        guard let someTarget = targets["some"] ?? defaultTarget,
+              let noneTarget = targets["none"] ?? defaultTarget
+        else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "Optional switch does not cover both cases"
+            )
+        }
+        return .init(
+            operand: operand,
+            someTarget: someTarget,
+            noneTarget: noneTarget,
+            someCaseIsExplicit: hasSome
+        )
     }
 
     private struct IntegerComparison {

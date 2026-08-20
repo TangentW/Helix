@@ -948,6 +948,147 @@ struct ImportedFrameworks {
         })
     }
 
+    @Test("Optional default cases discard unbound linear payloads exactly once")
+    func ownsDefaultOptionalSwitch() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture6isNilySbSo8NSObjectCSgF",
+                loweredType: "@convention(thin) "
+                    + "(@guaranteed Optional<NSObject>) -> Int",
+                body: """
+                bb0(%0 : @guaranteed $Optional<NSObject>):
+                  switch_enum %0, case #Optional.none!enumelt: bb1, default bb2
+                bb1:
+                  %1 = integer_literal $Builtin.Int64, 1
+                  return %1
+                bb2:
+                  %2 = integer_literal $Builtin.Int64, 0
+                  return %2
+                """
+            ),
+            displayName: "Fixture.isNil"
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let copy = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .copyValue(result, source) = instruction,
+                  source.rawValue == 0
+            else { return nil }
+            return result
+        }.first)
+        let selectionIndex = try #require(
+            instructions.firstIndex { instruction in
+                guard case let .optionalIsSome(_, optional) = instruction
+                else { return false }
+                return optional == copy
+            }
+        )
+        let destructionIndex = try #require(
+            instructions.firstIndex(of: .destroyValue(copy))
+        )
+        let branchIndex = try #require(
+            instructions.firstIndex { instruction in
+                if case .conditionalBranch = instruction { return true }
+                return false
+            }
+        )
+
+        #expect(selectionIndex < destructionIndex)
+        #expect(destructionIndex < branchIndex)
+        #expect(!instructions.contains { instruction in
+            if case .switchOptional = instruction { return true }
+            return false
+        })
+    }
+
+    @Test("Optional address switches accept Swift-qualified default coverage")
+    func lowersDefaultOptionalAddressSwitch() throws {
+        let lowered = try CanonicalSIL.Lowerer().lower(
+            .init(
+                mangledName: "$s7Fixture6isSomeySiSiSgF",
+                loweredType: "@convention(thin) (Optional<Int>) -> Int",
+                body: """
+                bb0(%0 : $Optional<Int>):
+                  %1 = alloc_stack $Optional<Int>
+                  store %0 to %1
+                  switch_enum_addr %1, case #Swift.Optional.some!enumelt: bb1, default bb2
+                bb1:
+                  destroy_addr %1
+                  dealloc_stack %1
+                  %2 = integer_literal $Builtin.Int64, 1
+                  return %2
+                bb2:
+                  destroy_addr %1
+                  dealloc_stack %1
+                  %3 = integer_literal $Builtin.Int64, 0
+                  return %3
+                """
+            ),
+            displayName: "Fixture.isSome"
+        )
+        let branch = try #require(
+            lowered.blocks.flatMap(\.instructions).compactMap { instruction
+                -> (Bytecode.BlockID, Bytecode.BlockID)? in
+                guard case let .conditionalBranch(
+                    _,
+                    trueTarget,
+                    trueArguments,
+                    falseTarget,
+                    falseArguments
+                ) = instruction,
+                    trueArguments.isEmpty,
+                    falseArguments.isEmpty
+                else { return nil }
+                return (trueTarget, falseTarget)
+            }.first
+        )
+
+        #expect(branch.0 == .init(rawValue: 1))
+        #expect(branch.1 == .init(rawValue: 2))
+    }
+
+    @Test("Malformed Optional default coverage fails closed")
+    func rejectsMalformedOptionalSwitchDefaults() throws {
+        for clauses in [
+            "case #Optional.some!enumelt: bb1, default bb2, default bb3",
+            "case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2, default bb3",
+            "case #Optional.some!enumelt: bb1, case #Optional.some!enumelt: bb2",
+        ] {
+            do {
+                _ = try CanonicalSIL.Lowerer().lower(
+                    .init(
+                        mangledName: "$s7Fixture7invalidySiSiSgF",
+                        loweredType: "@convention(thin) (Optional<Int>) -> Int",
+                        body: """
+                        bb0(%0 : $Optional<Int>):
+                          switch_enum %0, \(clauses)
+                        bb1(%1 : $Int):
+                          return %1
+                        bb2:
+                          %2 = integer_literal $Builtin.Int64, 0
+                          return %2
+                        bb3:
+                          %3 = integer_literal $Builtin.Int64, 1
+                          return %3
+                        """
+                    ),
+                    displayName: "Fixture.invalid"
+                )
+                Issue.record("malformed Optional switch was accepted: \(clauses)")
+            } catch let error as CanonicalSIL.LoweringError {
+                #expect(error.description.contains("Optional switch"))
+            }
+        }
+    }
+
     @Test("Owned direct-call edges consume a retained borrowed owner")
     func ownsBorrowedDirectCallArgument() throws {
         let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))

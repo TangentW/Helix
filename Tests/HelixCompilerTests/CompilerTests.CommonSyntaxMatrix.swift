@@ -210,6 +210,172 @@ struct CommonSyntaxMatrix {
                 arguments: [try integers([2, -1, 5])],
                 expected: try integer(4)
             ),
+            Probe(
+                name: "ifExpression",
+                source: """
+                public func ifExpression(_ value: Int) -> Int {
+                    let magnitude = if value >= 0 { value } else { -value }
+                    return magnitude
+                }
+                """,
+                arguments: [try integer(-8)],
+                expected: try integer(8)
+            ),
+            Probe(
+                name: "switchExpression",
+                source: """
+                public func switchExpression(_ value: Int) -> String {
+                    let description = switch value {
+                    case -1: "negative one"
+                    case 0: "zero"
+                    default: "other"
+                    }
+                    return description
+                }
+                """,
+                arguments: [try integer(-1)],
+                expected: .string("negative one")
+            ),
+            Probe(
+                name: "multipleOptionalBindings",
+                source: """
+                public func multipleOptionalBindings(
+                    _ first: Int?,
+                    _ second: Int?
+                ) -> Int {
+                    if let first, let second, first < second {
+                        return second - first
+                    }
+                    return 0
+                }
+                """,
+                arguments: [
+                    .optional(try integer(3)),
+                    .optional(try integer(9)),
+                ],
+                expected: try integer(6)
+            ),
+            Probe(
+                name: "filteredForLoop",
+                source: """
+                public func filteredForLoop(_ values: [Int]) -> Int {
+                    var total = 0
+                    for value in values where value > 0 {
+                        total += value
+                    }
+                    return total
+                }
+                """,
+                arguments: [try integers([-2, 3, 0, 5])],
+                expected: try integer(8)
+            ),
+            Probe(
+                name: "tuplePatternSwitch",
+                source: """
+                public func tuplePatternSwitch(
+                    _ first: Int?,
+                    _ second: Int?
+                ) -> Int {
+                    switch (first, second) {
+                    case let (.some(left), .some(right)):
+                        return left + right
+                    case (.some, .none):
+                        return 1
+                    default:
+                        return 0
+                    }
+                }
+                """,
+                arguments: [
+                    .optional(try integer(4)),
+                    .optional(try integer(7)),
+                ],
+                expected: try integer(11)
+            ),
+            Probe(
+                name: "localFunctionValue",
+                source: """
+                public func localFunctionValue(_ value: Int) -> Int {
+                    func adjusted(_ input: Int) -> Int {
+                        input * 2 + value
+                    }
+                    return adjusted(3)
+                }
+                """,
+                arguments: [try integer(4)],
+                expected: try integer(10)
+            ),
+            Probe(
+                name: "closureValue",
+                source: """
+                public func closureValue(_ value: Int) -> Int {
+                    let transform: (Int) -> Int = { input in
+                        input * 2 + value
+                    }
+                    return transform(3)
+                }
+                """,
+                arguments: [try integer(4)],
+                expected: try integer(10)
+            ),
+            Probe(
+                name: "guardCaseValue",
+                source: """
+                public func guardCaseValue(_ value: Int?) -> Int {
+                    guard case let .some(number) = value else { return 0 }
+                    return number
+                }
+                """,
+                arguments: [.optional(try integer(12))],
+                expected: try integer(12)
+            ),
+            Probe(
+                name: "whileCaseValue",
+                source: """
+                public func whileCaseValue(_ input: Int?) -> Int {
+                    var current = input
+                    var result = 0
+                    while case let value? = current {
+                        result += value
+                        current = nil
+                    }
+                    return result
+                }
+                """,
+                arguments: [.optional(try integer(6))],
+                expected: try integer(6)
+            ),
+            Probe(
+                name: "operatorReduction",
+                source: """
+                public func operatorReduction(_ values: [Int]) -> Int {
+                    values.reduce(0, +)
+                }
+                """,
+                arguments: [try integers([2, 3, 5])],
+                expected: try integer(10)
+            ),
+            Probe(
+                name: "operatorComparator",
+                source: """
+                public func operatorComparator(_ values: [Int]) -> [Int] {
+                    values.sorted(by: >)
+                }
+                """,
+                arguments: [try integers([2, 5, 3])],
+                expected: try integers([5, 3, 2])
+            ),
+            Probe(
+                name: "localFunctionTransform",
+                source: """
+                public func localFunctionTransform(_ values: [Int]) -> [Int] {
+                    func adjusted(_ value: Int) -> Int { value * 2 + 1 }
+                    return values.map(adjusted)
+                }
+                """,
+                arguments: [try integers([2, 4])],
+                expected: try integers([5, 9])
+            ),
         ]
 
         var failures: [String] = []

@@ -61,7 +61,11 @@ does not by itself certify a physical device or distribution channel.
   layout.
 - Tuple, `Void`, and `Optional`, including the ordinary control flow produced by
   `if let`, `guard let`, `??`, and `try?`, including address-based Optional
-  projection emitted by semantic Dictionary lookup SIL. Optional case evidence
+  projection emitted by semantic Dictionary lookup SIL. Explicit
+  `.some`/`.none` clauses and canonical SIL's exhaustive one-case-plus-`default`
+  spelling use the same semantic case plan. A `default` edge never invents an
+  unbound payload argument, and a discarded linear payload is released exactly
+  once. Optional case evidence
   is field-sensitive through Tuple and patch-local struct projections: a proven
   projected payload take consumes only that field, while sibling or
   caller-owned storage cannot borrow its proof. Definite and conditional
@@ -205,9 +209,13 @@ does not by itself certify a physical device or distribution channel.
   handle.
 - Structured branches, loops, switches, calls, recursion, checked business
   error edges, and local payload-carrying Error values. Real-frontend coverage
-  includes ternary expressions, `repeat-while`, labeled `break`/`continue`,
-  tuple and Optional pattern matching, `for case`, `while let`, `fallthrough`,
-  early returns, and `defer` on loop and return cleanup paths.
+  includes ternary, `if`, and `switch` expressions; multiple Optional bindings;
+  `repeat-while`; `for where`; labeled `break`/`continue`; tuple and Optional
+  pattern matching; `if case`, `guard case`, `for case`, `while let`, and
+  `while case`; `fallthrough`; early returns; and `defer` on loop and return
+  cleanup paths. Direct local functions, captured closure values, local
+  functions passed as transforms, and concrete operator function references
+  also use ordinary verified function and closure paths.
 - `Range` and `ClosedRange` `for` loops over every supported fixed-width signed
   or unsigned integer, plus `stride(from:to:by:)` and
   `stride(from:through:by:)` over those integers, `Float`, `Double`, and
