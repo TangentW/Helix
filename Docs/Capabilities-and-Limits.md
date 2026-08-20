@@ -143,12 +143,14 @@ does not by itself certify a physical device or distribution channel.
   path, and Float/Double preserve Swift NaN and signed-zero behavior.
   Natural ordering remains limited to scalar integer, floating-point, and
   String elements that the VM can compare without executing a user witness.
-  Nonmutating `sorted()` accepts any represented managed Collection with such
-  an element, while mutating `sort()` remains Array-only. Comparator-driven
-  `sorted(by:)` accepts represented copyable Array, Set, and Dictionary
-  elements because the callback runs through the ordinary verified closure
-  ABI; mutating `sort(by:)` remains Array-only. Set supports empty, literal,
-  Array, and Set construction;
+  Nonmutating `sorted()` accepts any represented managed Collection or
+  supported finite progression with such an element, while mutating `sort()`
+  remains Array-only. Comparator-driven `sorted(by:)` accepts represented
+  copyable Array, Set, and Dictionary elements plus supported finite
+  progressions because the callback runs through the ordinary verified closure
+  ABI; mutating `sort(by:)` remains Array-only. Set supports empty and literal
+  construction, plus construction from Array, Set, and supported finite
+  Sequences;
   `count`, `isEmpty`, `first`, `contains`, `insert`, `update`, `remove`,
   `popFirst`, `removeFirst`, `removeAll`, the capacity hint, iteration, the
   union/intersection/subtraction/symmetric-difference families, and the common
@@ -167,11 +169,14 @@ does not by itself certify a physical device or distribution channel.
   `(key: Key, value: Value)` tuple shape. Container-preserving `filter` is
   supported for all three containers, and Dictionary additionally supports
   `mapValues` and `compactMapValues`; their specialized key/value callback ABI
-  is projected from the same tuple traversal. Nonmutating `min()`/`max()` and
-  `elementsEqual`/`starts(with:)`/`lexicographicallyPrecedes` also accept
-  represented managed Collections when the required VM-defined Comparable or
+  is projected from the same tuple traversal. Natural `min()`/`max()`, equality
+  `contains(_:)`, and `elementsEqual`/`starts(with:)`/
+  `lexicographicallyPrecedes` also accept represented managed Collections and
+  supported finite progressions when the required VM-defined Comparable or
   Equatable semantics exist; the two relation operands may use different
-  container types when their element shapes match. Array-only reverse
+  source kinds when their element shapes match. These element-only consumers
+  stream the shared cursor and do not materialize an intermediate Array.
+  Array-only reverse
   `last(where:)`, zero-based `firstIndex(where:)`/`lastIndex(where:)`,
   `prefix(while:)`, Collection `drop(while:)`, mutating `sort(by:)`,
   zero-based `reverse()`, `removeAll(where:)`, and zero-based `partition(by:)`
@@ -191,11 +196,17 @@ does not by itself certify a physical device or distribution channel.
   sources reuse the same forward traversal for `map`, `flatMap`, `filter`,
   `compactMap`, `reduce`, `reduce(into:_:)`, `forEach`, `first(where:)`,
   `contains(where:)`, `allSatisfy`, and comparator-driven
-  `min(by:)`/`max(by:)`; producing transforms return Arrays. Their callbacks
-  retain the same short-circuit, throwing, and mutable-capture behavior as
-  managed Collections. Reverse predicate search, index-returning search, and
-  unbounded partial ranges remain rejected until their direction, index
-  identity, or termination can be represented exactly.
+  `min(by:)`/`max(by:)`; producing transforms return Arrays. They also support
+  equality `contains(_:)`, natural `min()`/`max()`, mixed-source Sequence
+  relations, natural/comparator `sorted`, `Set(sequence)`, and generic Set
+  algebra whose sequence operand is concrete and finite. Element-only
+  consumers retain cursor short-circuiting or one-candidate streaming, while
+  sorting and Set results materialize through the shared typed builder. Their
+  callbacks retain the same throwing and mutable-capture behavior as managed
+  Collections. Reverse predicate search, index-returning search, index-sensitive
+  Collection boundaries/subsequences, and unbounded partial ranges remain
+  rejected until their direction, index identity, complexity, or termination
+  can be represented exactly.
   Array-backed Collection `split` supports both the
   `separator:maxSplits:omittingEmptySubsequences:` overload for recursively
   VM-defined Equatable elements and the throwing `whereSeparator:` overload

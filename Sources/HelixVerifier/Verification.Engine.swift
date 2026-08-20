@@ -2312,19 +2312,6 @@ public struct Engine: Verification.ImageVerifying {
             guard isCopyable(element, shell: shell) else {
                 throw fail("array boundary lookup requires a copyable element type")
             }
-        case let .arrayContains(result, array, value):
-            guard capabilities.contains(.collectionsV1) else {
-                throw fail("Array.contains requires \(Core.Capability.collectionsV1)")
-            }
-            guard case let .array(element) = type(array),
-                  type(value) == element,
-                  type(result) == .bool,
-                  element.isVMEquatable
-            else {
-                throw fail(
-                    "array_contains requires VM-defined Equatable element semantics"
-                )
-            }
         case let .arraySearch(result, _, array, value):
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("Array index search requires \(Core.Capability.collectionsV1)")
@@ -2336,38 +2323,6 @@ public struct Engine: Verification.ImageVerifying {
             else {
                 throw fail(
                     "array_search requires a matching VM-Equatable element and Optional<Int> result"
-                )
-            }
-        case let .arrayExtremum(result, _, array):
-            guard capabilities.contains(.collectionsV1) else {
-                throw fail("Array extremum requires \(Core.Capability.collectionsV1)")
-            }
-            guard case let .array(element) = type(array),
-                  element.isVMComparable,
-                  type(result) == .optional(element),
-                  isCopyable(element, shell: shell)
-            else {
-                throw fail(
-                    "array_extremum requires a VM-Comparable Array and Optional<Element> result"
-                )
-            }
-        case let .arrayRelation(result, operation, lhs, rhs):
-            guard capabilities.contains(.collectionsV1) else {
-                throw fail("Array relation requires \(Core.Capability.collectionsV1)")
-            }
-            guard case let .array(element) = type(lhs),
-                  type(rhs) == type(lhs),
-                  type(result) == .bool
-            else {
-                throw fail("array_relation requires matching Arrays and Bool result")
-            }
-            let supportsElementOperation = switch operation {
-            case .elementsEqual, .startsWith: element.isVMEquatable
-            case .lexicographicallyPrecedes: element.isVMComparable
-            }
-            guard supportsElementOperation else {
-                throw fail(
-                    "array_relation element lacks the required VM value semantics"
                 )
             }
         case let .arrayAdapter(result, operation, array):
@@ -4047,8 +4002,7 @@ public struct Engine: Verification.ImageVerifying {
                      .floatingConvert,
                      .booleanBinary, .stringConcat, .stringCount, .stringIsEmpty,
                      .stringPredicate, .stringTransform, .stringify,
-                     .arrayCount, .arrayIsEmpty, .arrayContains,
-                     .arraySearch, .arrayExtremum, .arrayRelation,
+                     .arrayCount, .arrayIsEmpty, .arraySearch,
                      .dictionaryCount, .dictionaryIsEmpty,
                      .setCount, .setIsEmpty, .setContains, .setRelation,
                      .compare:

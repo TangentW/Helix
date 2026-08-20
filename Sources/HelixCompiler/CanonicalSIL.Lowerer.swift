@@ -281,10 +281,10 @@ public struct Lowerer: Sendable {
         case dictionaryKeyValue
     }
 
-    private struct CollectionOrderingPlan {
+    private struct SequenceOrderingPlan {
         var operation: CanonicalSIL.OrderingIntrinsic
         var sourceToken: String
-        var sourceType: Bytecode.ValueType
+        var source: CanonicalSIL.SequenceSpecialization
         var closureToken: String
         var elementType: Bytecode.ValueType
     }
@@ -3576,7 +3576,7 @@ public struct Lowerer: Sendable {
             )
         }
 
-        func lowerNaturalCollectionOrdering(
+        func lowerNaturalSequenceOrdering(
             _ operation: CanonicalSIL.OrderingIntrinsic,
             resultToken: String,
             genericArguments: String,
@@ -3587,24 +3587,29 @@ public struct Lowerer: Sendable {
                   arguments.count == 1
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "natural Collection ordering has unsupported arguments"
+                    "natural Sequence ordering has unsupported arguments"
                 )
             }
             let genericSpellings = splitTopLevel(genericArguments)
                 .filter { !$0.isEmpty }
-            let genericTypes = try genericSpellings.map(parseType)
-            guard genericTypes.count == 1,
-                  let element = genericTypes[0].managedCollectionElement,
-                  element.isVMComparable
-            else {
-                throw CanonicalSIL.LoweringError.unsupportedType(
-                    "natural ordering requires a represented Collection with VM-defined Comparable semantics"
+            guard genericSpellings.count == 1 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "natural ordering has an incomplete Sequence specialization"
                 )
             }
-            let sourceType = genericTypes[0]
+            let source = try parseSequenceSpecialization(
+                genericSpellings[0],
+                context: "natural ordering"
+            )
+            let element = source.element
+            guard element.isVMComparable else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "natural ordering requires VM-defined Comparable semantics for \(element)"
+                )
+            }
             let arrayType = Bytecode.ValueType.array(element)
             if operation.mutatesSource {
-                guard sourceType == arrayType,
+                guard source.managedCollectionType == arrayType,
                       compilerAddressType(arguments[0]) == arrayType
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -3623,31 +3628,18 @@ public struct Lowerer: Sendable {
                 }
             }
 
-            let borrowedSource = try borrowStoredValue(
-                at: arguments[0],
-                line: line
-            )
-            let source = try borrowedSource?.register
-                ?? resolve(arguments[0], line: line)
-            guard registerTypes[Int(source.rawValue)] == sourceType else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "natural ordering source does not match its specialization"
-                )
-            }
-            let materialized = try materializeManagedCollectionElements(
+            let materialized = try materializeSequenceOperand(
                 source,
-                sourceType: sourceType,
-                context: "natural ordering"
+                token: arguments[0],
+                context: "natural ordering",
+                line: line
             )
             let result = try allocate(type: arrayType)
             appendInstruction(
                 .arraySorted(result: result, array: materialized.array)
             )
-            if let cleanupOwner = materialized.cleanupOwner {
-                appendInstruction(.destroyValue(cleanupOwner))
-            }
-            if let owner = borrowedSource?.temporaryOwner {
-                appendInstruction(.destroyValue(owner))
+            for instruction in materialized.cleanup {
+                appendInstruction(instruction)
             }
 
             switch operation {
@@ -3733,8 +3725,8 @@ public struct Lowerer: Sendable {
             values[resultToken] = result
         }
 
-        func resolveCollectionOrderingClosure(
-            for plan: CollectionOrderingPlan,
+        func resolveSequenceOrderingClosure(
+            for plan: SequenceOrderingPlan,
             line: Int
         ) throws -> (Bytecode.Register, Bytecode.ClosureSignature) {
             let closure = try resolve(plan.closureToken, line: line)
@@ -3750,14 +3742,14 @@ public struct Lowerer: Sendable {
             else {
                 throw CanonicalSIL.LoweringError.callSignatureMismatch(
                     line: line,
-                    mangledName: "<Collection ordering closure>"
+                    mangledName: "<Sequence ordering closure>"
                 )
             }
             return (closure, signature)
         }
 
-        func prepareCollectionOrderingContinuations(
-            plan: CollectionOrderingPlan,
+        func prepareSequenceOrderingContinuations(
+            plan: SequenceOrderingPlan,
             normalTarget: Bytecode.BlockID
         ) throws {
             switch plan.operation {
@@ -3765,7 +3757,7 @@ public struct Lowerer: Sendable {
                 break
             case .sortBy:
                 let arrayType = Bytecode.ValueType.array(plan.elementType)
-                guard plan.sourceType == arrayType,
+                guard plan.source.managedCollectionType == arrayType,
                       compilerAddressType(plan.sourceToken) == arrayType,
                       implicitStackValues[normalTarget] == nil,
                       suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
@@ -3793,8 +3785,8 @@ public struct Lowerer: Sendable {
         /// the VM owns a bounded stable merge-sort state machine. This keeps
         /// captures, throwing callbacks, call depth, and linear values on the
         /// same paths as every other higher-order operation.
-        func lowerCollectionComparatorSortTryApply(
-            plan: CollectionOrderingPlan,
+        func lowerSequenceComparatorSortTryApply(
+            plan: SequenceOrderingPlan,
             normalTarget: Bytecode.BlockID,
             errorTarget: Bytecode.BlockID,
             line: Int
@@ -3806,27 +3798,17 @@ public struct Lowerer: Sendable {
                 )
             }
             let arrayType = Bytecode.ValueType.array(plan.elementType)
-            let borrowedSource = try borrowStoredValue(
-                at: plan.sourceToken,
+            let materialized = try materializeSequenceOperand(
+                plan.source,
+                token: plan.sourceToken,
+                context: "comparator ordering",
                 line: line
             )
-            let source = try borrowedSource?.register
-                ?? resolve(plan.sourceToken, line: line)
-            guard registerTypes[Int(source.rawValue)] == plan.sourceType else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "sort source does not match its Collection specialization"
-                )
-            }
-            let materialized = try materializeManagedCollectionElements(
-                source,
-                sourceType: plan.sourceType,
-                context: "comparator ordering"
-            )
-            let (closure, closureSignature) = try resolveCollectionOrderingClosure(
+            let (closure, closureSignature) = try resolveSequenceOrderingClosure(
                 for: plan,
                 line: line
             )
-            try prepareCollectionOrderingContinuations(
+            try prepareSequenceOrderingContinuations(
                 plan: plan,
                 normalTarget: normalTarget
             )
@@ -3859,11 +3841,8 @@ public struct Lowerer: Sendable {
             appendInstruction(
                 .makeArraySortState(result: state, array: materialized.array)
             )
-            if let cleanupOwner = materialized.cleanupOwner {
-                appendInstruction(.destroyValue(cleanupOwner))
-            }
-            if let owner = borrowedSource?.temporaryOwner {
-                appendInstruction(.destroyValue(owner))
+            for instruction in materialized.cleanup {
+                appendInstruction(instruction)
             }
             appendInstruction(.branch(target: loop, arguments: []))
             finishCurrent()
@@ -4715,7 +4694,7 @@ public struct Lowerer: Sendable {
             )
         }
 
-        func lowerCollectionOrderingTryApply(
+        func lowerSequenceOrderingTryApply(
             operation: CanonicalSIL.OrderingIntrinsic,
             genericArguments: String,
             argumentText: String,
@@ -4723,7 +4702,7 @@ public struct Lowerer: Sendable {
             errorTarget: Bytecode.BlockID,
             line: Int
         ) throws {
-            let plan = try parseCollectionOrderingPlan(
+            let plan = try parseSequenceOrderingPlan(
                 operation: operation,
                 genericArguments: genericArguments,
                 argumentText: argumentText,
@@ -4731,7 +4710,7 @@ public struct Lowerer: Sendable {
             )
             switch operation {
             case .sortedBy, .sortBy:
-                try lowerCollectionComparatorSortTryApply(
+                try lowerSequenceComparatorSortTryApply(
                     plan: plan,
                     normalTarget: normalTarget,
                     errorTarget: errorTarget,
@@ -8067,9 +8046,13 @@ public struct Lowerer: Sendable {
         ) {
             switch specialization {
             case let .managedCollection(sourceType, element):
-                guard sourceType.managedCollectionElement == element,
-                      stackType(at: token) == sourceType
-                else {
+                guard sourceType.managedCollectionElement == element else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "\(context) has an inconsistent managed Sequence specialization"
+                    )
+                }
+                if let storageType = stackType(at: token),
+                   storageType != sourceType {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "\(context) storage does not match its Sequence specialization"
                     )
@@ -8112,6 +8095,727 @@ public struct Lowerer: Sendable {
                         ? [.destroyValue(array)] : []
                 )
             }
+        }
+
+        /// Executes equality membership through the shared cursor so a finite
+        /// progression can short-circuit without first allocating its full
+        /// element sequence. The same CFG also remains valid for represented
+        /// managed Collections.
+        func lowerSequenceContainsElement(
+            _ specialization: CanonicalSIL.SequenceSpecialization,
+            sourceToken: String,
+            needleToken: String,
+            line: Int
+        ) throws -> Bytecode.Register {
+            let elementType = specialization.element
+            guard elementType.isVMEquatable else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "Sequence.contains element \(elementType) lacks VM-defined Equatable semantics"
+                )
+            }
+            let needle = try borrowStoredValue(
+                at: needleToken,
+                line: line
+            ) ?? .init(
+                register: try resolve(needleToken, line: line),
+                temporaryOwner: nil
+            )
+            guard registerTypes[Int(needle.register.rawValue)] == elementType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Sequence.contains value does not match Sequence.Element"
+                )
+            }
+            let traversal = try prepareSequenceTraversal(
+                specialization,
+                token: sourceToken,
+                consumesSource: false,
+                direction: .forward,
+                line: line
+            )
+
+            let loop = try allocateSyntheticBlockID()
+            let compare = try allocateSyntheticBlockID()
+            let found = try allocateSyntheticBlockID()
+            let advance = try allocateSyntheticBlockID()
+            let absent = try allocateSyntheticBlockID()
+            let completion = try allocateSyntheticBlockID()
+            let next = try allocate(type: .optional(elementType))
+            let element = try allocate(type: elementType)
+            let matches = try allocate(type: .bool)
+            let presentValue = try allocate(type: .bool)
+            let absentValue = try allocate(type: .bool)
+            let result = try allocate(type: .bool)
+            let elementCleanup: [IntermediateRepresentation.Instruction] =
+                elementType.requiresLinearOwnership
+                    ? [.destroyValue(element)] : []
+            let terminalCleanup = traversalCleanup(traversal)
+                + (needle.temporaryOwner.map { [.destroyValue($0)] } ?? [])
+
+            appendInstruction(.branch(target: loop, arguments: []))
+            finishCurrent()
+            appendSyntheticBlock(
+                id: loop,
+                instructions: [
+                    try sequenceNextInstruction(
+                        cursor: traversal.cursor,
+                        result: next,
+                        direction: .forward
+                    ),
+                    .switchOptional(
+                        optional: next,
+                        someTarget: compare,
+                        noneTarget: absent
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: compare,
+                parameters: [element],
+                instructions: [
+                    .compare(
+                        result: matches,
+                        predicate: .equal,
+                        lhs: element,
+                        rhs: needle.register
+                    ),
+                    .conditionalBranch(
+                        condition: matches,
+                        trueTarget: found,
+                        trueArguments: [],
+                        falseTarget: advance,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: found,
+                instructions: elementCleanup + terminalCleanup + [
+                    .constantBool(result: presentValue, value: true),
+                    .branch(
+                        target: completion,
+                        arguments: [presentValue]
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: advance,
+                instructions: elementCleanup + [
+                    .branch(target: loop, arguments: []),
+                ]
+            )
+            appendSyntheticBlock(
+                id: absent,
+                instructions: terminalCleanup + [
+                    .constantBool(result: absentValue, value: false),
+                    .branch(
+                        target: completion,
+                        arguments: [absentValue]
+                    ),
+                ]
+            )
+            current = .init(
+                id: completion,
+                parameters: [result],
+                instructions: []
+            )
+            return result
+        }
+
+        /// Natural extrema require a full scan but not a full materialization.
+        /// Keep one owned candidate in frame storage and replace it only for a
+        /// strict improvement, preserving Swift's first-element tie behavior.
+        func lowerNaturalSequenceExtremum(
+            _ operation: CanonicalSIL.CollectionIntrinsic.ExtremumOperation,
+            specialization: CanonicalSIL.SequenceSpecialization,
+            sourceToken: String,
+            line: Int
+        ) throws -> Bytecode.Register {
+            let elementType = specialization.element
+            guard elementType.isVMComparable else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "Sequence extremum element \(elementType) lacks VM-defined Comparable semantics"
+                )
+            }
+            let traversal = try prepareSequenceTraversal(
+                specialization,
+                token: sourceToken,
+                consumesSource: false,
+                direction: .forward,
+                line: line
+            )
+            let candidateSlot = try allocateStackSlot(type: elementType)
+            let readFirst = try allocateSyntheticBlockID()
+            let initialize = try allocateSyntheticBlockID()
+            let empty = try allocateSyntheticBlockID()
+            let scan = try allocateSyntheticBlockID()
+            let compare = try allocateSyntheticBlockID()
+            let replace = try allocateSyntheticBlockID()
+            let keep = try allocateSyntheticBlockID()
+            let finish = try allocateSyntheticBlockID()
+            let completion = try allocateSyntheticBlockID()
+            let first = try allocate(type: elementType)
+            let firstNext = try allocate(type: .optional(elementType))
+            let next = try allocate(type: .optional(elementType))
+            let element = try allocate(type: elementType)
+            let candidate = try allocate(type: elementType)
+            let improves = try allocate(type: .bool)
+            let finalCandidate = try allocate(type: elementType)
+            let selected = try allocate(type: .optional(elementType))
+            let noSelection = try allocate(type: .optional(elementType))
+            let result = try allocate(type: .optional(elementType))
+            let candidateCleanup: [IntermediateRepresentation.Instruction] =
+                elementType.requiresLinearOwnership
+                    ? [.destroyValue(candidate)] : []
+            let elementCleanup: [IntermediateRepresentation.Instruction] =
+                elementType.requiresLinearOwnership
+                    ? [.destroyValue(element)] : []
+            let terminalCleanup = traversalCleanup(traversal)
+
+            appendInstruction(.branch(target: readFirst, arguments: []))
+            finishCurrent()
+            appendSyntheticBlock(
+                id: readFirst,
+                instructions: [
+                    try sequenceNextInstruction(
+                        cursor: traversal.cursor,
+                        result: firstNext,
+                        direction: .forward
+                    ),
+                    .switchOptional(
+                        optional: firstNext,
+                        someTarget: initialize,
+                        noneTarget: empty
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: initialize,
+                parameters: [first],
+                instructions: [
+                    .storeStack(
+                        slot: candidateSlot,
+                        source: first,
+                        mode: .initialize
+                    ),
+                    .branch(target: scan, arguments: []),
+                ]
+            )
+            appendSyntheticBlock(
+                id: scan,
+                instructions: [
+                    try sequenceNextInstruction(
+                        cursor: traversal.cursor,
+                        result: next,
+                        direction: .forward
+                    ),
+                    .switchOptional(
+                        optional: next,
+                        someTarget: compare,
+                        noneTarget: finish
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: compare,
+                parameters: [element],
+                instructions: [
+                    .loadStack(
+                        result: candidate,
+                        slot: candidateSlot,
+                        mode: .copy
+                    ),
+                    .compare(
+                        result: improves,
+                        predicate: .lessThan,
+                        lhs: operation == .minimum ? element : candidate,
+                        rhs: operation == .minimum ? candidate : element
+                    ),
+                    .conditionalBranch(
+                        condition: improves,
+                        trueTarget: replace,
+                        trueArguments: [],
+                        falseTarget: keep,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: replace,
+                instructions: candidateCleanup + [
+                    .storeStack(
+                        slot: candidateSlot,
+                        source: element,
+                        mode: .assign
+                    ),
+                    .branch(target: scan, arguments: []),
+                ]
+            )
+            appendSyntheticBlock(
+                id: keep,
+                instructions: candidateCleanup + elementCleanup + [
+                    .branch(target: scan, arguments: []),
+                ]
+            )
+            appendSyntheticBlock(
+                id: finish,
+                instructions: [
+                    .loadStack(
+                        result: finalCandidate,
+                        slot: candidateSlot,
+                        mode: .take
+                    ),
+                    .makeOptionalSome(
+                        result: selected,
+                        value: finalCandidate
+                    ),
+                ] + terminalCleanup + [
+                    .branch(target: completion, arguments: [selected]),
+                ]
+            )
+            appendSyntheticBlock(
+                id: empty,
+                instructions: [
+                    .makeOptionalNone(result: noSelection),
+                ] + terminalCleanup + [
+                    .branch(target: completion, arguments: [noSelection]),
+                ]
+            )
+            current = .init(
+                id: completion,
+                parameters: [result],
+                instructions: []
+            )
+            return result
+        }
+
+        /// Compares two concrete element sequences directly through their
+        /// cursors. This preserves prefix and lexicographic short-circuiting
+        /// for progressions without introducing Sequence-specific bytecode or
+        /// invoking Swift witness-table ABI at runtime.
+        func lowerSequenceRelation(
+            _ operation: CanonicalSIL.CollectionIntrinsic.RelationOperation,
+            lhs: CanonicalSIL.SequenceSpecialization,
+            lhsToken: String,
+            rhs: CanonicalSIL.SequenceSpecialization,
+            rhsToken: String,
+            line: Int
+        ) throws -> Bytecode.Register {
+            let elementType = lhs.element
+            guard rhs.element == elementType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Sequence relation operands have different Element types"
+                )
+            }
+            let supportsElementOperation = switch operation {
+            case .elementsEqual, .startsWith: elementType.isVMEquatable
+            case .lexicographicallyPrecedes: elementType.isVMComparable
+            }
+            guard supportsElementOperation else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "Sequence relation element \(elementType)"
+                )
+            }
+            let lhsTraversal = try prepareSequenceTraversal(
+                lhs,
+                token: lhsToken,
+                consumesSource: false,
+                direction: .forward,
+                line: line
+            )
+            let rhsTraversal = try prepareSequenceTraversal(
+                rhs,
+                token: rhsToken,
+                consumesSource: false,
+                direction: .forward,
+                line: line
+            )
+            let succeed = try allocateSyntheticBlockID()
+            let fail = try allocateSyntheticBlockID()
+            let completion = try allocateSyntheticBlockID()
+            let trueValue = try allocate(type: .bool)
+            let falseValue = try allocate(type: .bool)
+            let result = try allocate(type: .bool)
+            let terminalCleanup = traversalCleanup(lhsTraversal)
+                + traversalCleanup(rhsTraversal)
+
+            switch operation {
+            case .elementsEqual:
+                let loop = try allocateSyntheticBlockID()
+                let readRHS = try allocateSyntheticBlockID()
+                let checkRHSEnd = try allocateSyntheticBlockID()
+                let compare = try allocateSyntheticBlockID()
+                let advance = try allocateSyntheticBlockID()
+                let mismatch = try allocateSyntheticBlockID()
+                let rhsEnded = try allocateSyntheticBlockID()
+                let rhsTrailing = try allocateSyntheticBlockID()
+                let lhsNext = try allocate(type: .optional(elementType))
+                let rhsNext = try allocate(type: .optional(elementType))
+                let trailingNext = try allocate(type: .optional(elementType))
+                let lhsElement = try allocate(type: elementType)
+                let rhsElement = try allocate(type: elementType)
+                let trailingElement = try allocate(type: elementType)
+                let equal = try allocate(type: .bool)
+                let lhsCleanup: [IntermediateRepresentation.Instruction] =
+                    elementType.requiresLinearOwnership
+                        ? [.destroyValue(lhsElement)] : []
+                let rhsCleanup: [IntermediateRepresentation.Instruction] =
+                    elementType.requiresLinearOwnership
+                        ? [.destroyValue(rhsElement)] : []
+                let trailingCleanup: [IntermediateRepresentation.Instruction] =
+                    elementType.requiresLinearOwnership
+                        ? [.destroyValue(trailingElement)] : []
+
+                appendInstruction(.branch(target: loop, arguments: []))
+                finishCurrent()
+                appendSyntheticBlock(
+                    id: loop,
+                    instructions: [
+                        try sequenceNextInstruction(
+                            cursor: lhsTraversal.cursor,
+                            result: lhsNext,
+                            direction: .forward
+                        ),
+                        .switchOptional(
+                            optional: lhsNext,
+                            someTarget: readRHS,
+                            noneTarget: checkRHSEnd
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: readRHS,
+                    parameters: [lhsElement],
+                    instructions: [
+                        try sequenceNextInstruction(
+                            cursor: rhsTraversal.cursor,
+                            result: rhsNext,
+                            direction: .forward
+                        ),
+                        .switchOptional(
+                            optional: rhsNext,
+                            someTarget: compare,
+                            noneTarget: rhsEnded
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: compare,
+                    parameters: [rhsElement],
+                    instructions: [
+                        .compare(
+                            result: equal,
+                            predicate: .equal,
+                            lhs: lhsElement,
+                            rhs: rhsElement
+                        ),
+                        .conditionalBranch(
+                            condition: equal,
+                            trueTarget: advance,
+                            trueArguments: [],
+                            falseTarget: mismatch,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: advance,
+                    instructions: lhsCleanup + rhsCleanup + [
+                        .branch(target: loop, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: mismatch,
+                    instructions: lhsCleanup + rhsCleanup + [
+                        .branch(target: fail, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: rhsEnded,
+                    instructions: lhsCleanup + [
+                        .branch(target: fail, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: checkRHSEnd,
+                    instructions: [
+                        try sequenceNextInstruction(
+                            cursor: rhsTraversal.cursor,
+                            result: trailingNext,
+                            direction: .forward
+                        ),
+                        .switchOptional(
+                            optional: trailingNext,
+                            someTarget: rhsTrailing,
+                            noneTarget: succeed
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: rhsTrailing,
+                    parameters: [trailingElement],
+                    instructions: trailingCleanup + [
+                        .branch(target: fail, arguments: []),
+                    ]
+                )
+
+            case .startsWith:
+                let loop = try allocateSyntheticBlockID()
+                let readLHS = try allocateSyntheticBlockID()
+                let compare = try allocateSyntheticBlockID()
+                let advance = try allocateSyntheticBlockID()
+                let mismatch = try allocateSyntheticBlockID()
+                let lhsEnded = try allocateSyntheticBlockID()
+                let rhsNext = try allocate(type: .optional(elementType))
+                let lhsNext = try allocate(type: .optional(elementType))
+                let rhsElement = try allocate(type: elementType)
+                let lhsElement = try allocate(type: elementType)
+                let equal = try allocate(type: .bool)
+                let rhsCleanup: [IntermediateRepresentation.Instruction] =
+                    elementType.requiresLinearOwnership
+                        ? [.destroyValue(rhsElement)] : []
+                let lhsCleanup: [IntermediateRepresentation.Instruction] =
+                    elementType.requiresLinearOwnership
+                        ? [.destroyValue(lhsElement)] : []
+
+                appendInstruction(.branch(target: loop, arguments: []))
+                finishCurrent()
+                appendSyntheticBlock(
+                    id: loop,
+                    instructions: [
+                        try sequenceNextInstruction(
+                            cursor: rhsTraversal.cursor,
+                            result: rhsNext,
+                            direction: .forward
+                        ),
+                        .switchOptional(
+                            optional: rhsNext,
+                            someTarget: readLHS,
+                            noneTarget: succeed
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: readLHS,
+                    parameters: [rhsElement],
+                    instructions: [
+                        try sequenceNextInstruction(
+                            cursor: lhsTraversal.cursor,
+                            result: lhsNext,
+                            direction: .forward
+                        ),
+                        .switchOptional(
+                            optional: lhsNext,
+                            someTarget: compare,
+                            noneTarget: lhsEnded
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: compare,
+                    parameters: [lhsElement],
+                    instructions: [
+                        .compare(
+                            result: equal,
+                            predicate: .equal,
+                            lhs: lhsElement,
+                            rhs: rhsElement
+                        ),
+                        .conditionalBranch(
+                            condition: equal,
+                            trueTarget: advance,
+                            trueArguments: [],
+                            falseTarget: mismatch,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: advance,
+                    instructions: lhsCleanup + rhsCleanup + [
+                        .branch(target: loop, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: mismatch,
+                    instructions: lhsCleanup + rhsCleanup + [
+                        .branch(target: fail, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: lhsEnded,
+                    instructions: rhsCleanup + [
+                        .branch(target: fail, arguments: []),
+                    ]
+                )
+
+            case .lexicographicallyPrecedes:
+                let loop = try allocateSyntheticBlockID()
+                let readRHS = try allocateSyntheticBlockID()
+                let checkRHSTrailing = try allocateSyntheticBlockID()
+                let compare = try allocateSyntheticBlockID()
+                let compareReverse = try allocateSyntheticBlockID()
+                let advance = try allocateSyntheticBlockID()
+                let precedes = try allocateSyntheticBlockID()
+                let doesNotPrecede = try allocateSyntheticBlockID()
+                let rhsEnded = try allocateSyntheticBlockID()
+                let rhsTrailing = try allocateSyntheticBlockID()
+                let lhsNext = try allocate(type: .optional(elementType))
+                let rhsNext = try allocate(type: .optional(elementType))
+                let trailingNext = try allocate(type: .optional(elementType))
+                let lhsElement = try allocate(type: elementType)
+                let rhsElement = try allocate(type: elementType)
+                let trailingElement = try allocate(type: elementType)
+                let lhsBefore = try allocate(type: .bool)
+                let rhsBefore = try allocate(type: .bool)
+                let lhsCleanup: [IntermediateRepresentation.Instruction] =
+                    elementType.requiresLinearOwnership
+                        ? [.destroyValue(lhsElement)] : []
+                let rhsCleanup: [IntermediateRepresentation.Instruction] =
+                    elementType.requiresLinearOwnership
+                        ? [.destroyValue(rhsElement)] : []
+                let trailingCleanup: [IntermediateRepresentation.Instruction] =
+                    elementType.requiresLinearOwnership
+                        ? [.destroyValue(trailingElement)] : []
+
+                appendInstruction(.branch(target: loop, arguments: []))
+                finishCurrent()
+                appendSyntheticBlock(
+                    id: loop,
+                    instructions: [
+                        try sequenceNextInstruction(
+                            cursor: lhsTraversal.cursor,
+                            result: lhsNext,
+                            direction: .forward
+                        ),
+                        .switchOptional(
+                            optional: lhsNext,
+                            someTarget: readRHS,
+                            noneTarget: checkRHSTrailing
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: readRHS,
+                    parameters: [lhsElement],
+                    instructions: [
+                        try sequenceNextInstruction(
+                            cursor: rhsTraversal.cursor,
+                            result: rhsNext,
+                            direction: .forward
+                        ),
+                        .switchOptional(
+                            optional: rhsNext,
+                            someTarget: compare,
+                            noneTarget: rhsEnded
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: compare,
+                    parameters: [rhsElement],
+                    instructions: [
+                        .compare(
+                            result: lhsBefore,
+                            predicate: .lessThan,
+                            lhs: lhsElement,
+                            rhs: rhsElement
+                        ),
+                        .conditionalBranch(
+                            condition: lhsBefore,
+                            trueTarget: precedes,
+                            trueArguments: [],
+                            falseTarget: compareReverse,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: compareReverse,
+                    instructions: [
+                        .compare(
+                            result: rhsBefore,
+                            predicate: .lessThan,
+                            lhs: rhsElement,
+                            rhs: lhsElement
+                        ),
+                        .conditionalBranch(
+                            condition: rhsBefore,
+                            trueTarget: doesNotPrecede,
+                            trueArguments: [],
+                            falseTarget: advance,
+                            falseArguments: []
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: advance,
+                    instructions: lhsCleanup + rhsCleanup + [
+                        .branch(target: loop, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: precedes,
+                    instructions: lhsCleanup + rhsCleanup + [
+                        .branch(target: succeed, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: doesNotPrecede,
+                    instructions: lhsCleanup + rhsCleanup + [
+                        .branch(target: fail, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: rhsEnded,
+                    instructions: lhsCleanup + [
+                        .branch(target: fail, arguments: []),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: checkRHSTrailing,
+                    instructions: [
+                        try sequenceNextInstruction(
+                            cursor: rhsTraversal.cursor,
+                            result: trailingNext,
+                            direction: .forward
+                        ),
+                        .switchOptional(
+                            optional: trailingNext,
+                            someTarget: rhsTrailing,
+                            noneTarget: fail
+                        ),
+                    ]
+                )
+                appendSyntheticBlock(
+                    id: rhsTrailing,
+                    parameters: [trailingElement],
+                    instructions: trailingCleanup + [
+                        .branch(target: succeed, arguments: []),
+                    ]
+                )
+            }
+
+            appendSyntheticBlock(
+                id: succeed,
+                instructions: terminalCleanup + [
+                    .constantBool(result: trueValue, value: true),
+                    .branch(target: completion, arguments: [trueValue]),
+                ]
+            )
+            appendSyntheticBlock(
+                id: fail,
+                instructions: terminalCleanup + [
+                    .constantBool(result: falseValue, value: false),
+                    .branch(target: completion, arguments: [falseValue]),
+                ]
+            )
+            current = .init(
+                id: completion,
+                parameters: [result],
+                instructions: []
+            )
+            return result
         }
 
         func lowerProgressionIteratorNext(
@@ -9382,38 +10086,24 @@ public struct Lowerer: Sendable {
                         "Sequence extremum has unsupported arguments"
                     )
                 }
-                let sequence = try parseType(genericArguments)
-                guard let element = sequence.managedCollectionElement,
-                      element.isVMComparable,
-                      compilerAddressType(arguments[0]) == .optional(element),
-                      stackType(at: arguments[1]) == sequence
+                let sequence = try parseSequenceSpecialization(
+                    genericArguments,
+                    context: "Sequence extremum"
+                )
+                let element = sequence.element
+                guard element.isVMComparable,
+                      compilerAddressType(arguments[0]) == .optional(element)
                 else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
                         "Sequence extremum specialization \(sequence)"
                     )
                 }
-                let source = try borrowOperand(
-                    arguments[1],
-                    as: sequence,
-                    context: "Sequence extremum"
+                let result = try lowerNaturalSequenceExtremum(
+                    operation,
+                    specialization: sequence,
+                    sourceToken: arguments[1],
+                    line: line
                 )
-                let materialized = try materializeManagedCollectionElements(
-                    source.register,
-                    sourceType: sequence,
-                    context: "Sequence extremum"
-                )
-                let result = try allocate(type: .optional(element))
-                appendInstruction(
-                    .arrayExtremum(
-                        result: result,
-                        operation: operation,
-                        array: materialized.array
-                    )
-                )
-                if let cleanupOwner = materialized.cleanupOwner {
-                    appendInstruction(.destroyValue(cleanupOwner))
-                }
-                destroyBorrowedOwners([source])
                 try storeConstructedValue(
                     result,
                     at: arguments[0],
@@ -9422,69 +10112,40 @@ public struct Lowerer: Sendable {
                 voidValues.insert(resultToken)
 
             case let .relation(operation):
-                let specializations = try splitTopLevel(genericArguments)
+                let specializationSpellings = splitTopLevel(genericArguments)
                     .filter { !$0.isEmpty }
-                    .map(parseType)
+                let specializations = try specializationSpellings.map {
+                    try parseSequenceSpecialization(
+                        $0,
+                        context: "Sequence relation"
+                    )
+                }
                 guard specializations.count == 2,
                       arguments.count == 2,
-                      let lhsElement = specializations[0]
-                        .managedCollectionElement,
-                      let rhsElement = specializations[1]
-                        .managedCollectionElement,
-                      lhsElement == rhsElement
+                      specializations[0].element == specializations[1].element
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Sequence relation has unsupported specializations"
                     )
                 }
-                let element = lhsElement
+                let element = specializations[0].element
                 let supportsElementOperation = switch operation {
                 case .elementsEqual, .startsWith: element.isVMEquatable
                 case .lexicographicallyPrecedes: element.isVMComparable
                 }
-                guard supportsElementOperation,
-                      stackType(at: arguments[0]) == specializations[1],
-                      stackType(at: arguments[1]) == specializations[0]
-                else {
+                guard supportsElementOperation else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
                         "Sequence relation element \(element)"
                     )
                 }
-                let rhsSource = try borrowOperand(
-                    arguments[0],
-                    as: specializations[1],
-                    context: "Sequence relation"
+                values[resultToken] = try lowerSequenceRelation(
+                    operation,
+                    lhs: specializations[0],
+                    lhsToken: arguments[1],
+                    rhs: specializations[1],
+                    rhsToken: arguments[0],
+                    line: line
                 )
-                let lhsSource = try borrowOperand(
-                    arguments[1],
-                    as: specializations[0],
-                    context: "Sequence relation"
-                )
-                let rhs = try materializeManagedCollectionElements(
-                    rhsSource.register,
-                    sourceType: specializations[1],
-                    context: "Sequence relation"
-                )
-                let lhs = try materializeManagedCollectionElements(
-                    lhsSource.register,
-                    sourceType: specializations[0],
-                    context: "Sequence relation"
-                )
-                let result = try allocate(type: .bool)
-                values[resultToken] = result
-                appendInstruction(
-                    .arrayRelation(
-                        result: result,
-                        operation: operation,
-                        lhs: lhs.array,
-                        rhs: rhs.array
-                    )
-                )
-                for cleanupOwner in [lhs.cleanupOwner, rhs.cleanupOwner]
-                    .compactMap({ $0 }) {
-                    appendInstruction(.destroyValue(cleanupOwner))
-                }
-                destroyBorrowedOwners([lhsSource, rhsSource])
 
             case let .adapter(.transform(operation)):
                 guard arguments.count == 2 else {
@@ -10902,15 +11563,31 @@ public struct Lowerer: Sendable {
             func materializeSetOperand(
                 _ token: String,
                 element expectedElement: Bytecode.ValueType,
-                expectedSequence: Bytecode.ValueType? = nil
+                expectedSequence: CanonicalSIL.SequenceSpecialization? = nil
             ) throws -> Bytecode.Register {
+                if let expectedSequence {
+                    guard expectedSequence.element == expectedElement else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Set Sequence.Element does not match Set.Element"
+                        )
+                    }
+                    let materialized = try materializeSequenceOperand(
+                        expectedSequence,
+                        token: token,
+                        context: "Set Sequence operand",
+                        line: line
+                    )
+                    let result = try allocate(type: .set(expectedElement))
+                    appendInstruction(
+                        .makeSet(result: result, source: materialized.array)
+                    )
+                    for instruction in materialized.cleanup {
+                        appendInstruction(instruction)
+                    }
+                    return result
+                }
                 let source = try materializeOwnedValue(at: token, line: line)
                 let sourceType = registerTypes[Int(source.rawValue)]
-                if let expectedSequence, sourceType != expectedSequence {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Set Sequence specialization does not match its operand"
-                    )
-                }
                 switch sourceType {
                 case .set(let element) where element == expectedElement:
                     return source
@@ -11056,7 +11733,7 @@ public struct Lowerer: Sendable {
                     line: line
                 )
             case let .ordering(operation) where !operation.usesClosure:
-                try lowerNaturalCollectionOrdering(
+                try lowerNaturalSequenceOrdering(
                     operation,
                     resultToken: resultToken,
                     genericArguments: genericArguments,
@@ -11911,12 +12588,20 @@ public struct Lowerer: Sendable {
                         "Sequence.contains has unsupported arguments"
                     )
                 }
-                let needle = try resolve(arguments[0], line: line)
-                let sequence = try resolve(arguments[1], line: line)
-                let sequenceType = try parseType(genericArguments)
-                if sequenceType == .string,
-                   registerTypes[Int(sequence.rawValue)] == .string,
-                   registerTypes[Int(needle.rawValue)] == .string {
+                let normalizedSequence = genericArguments
+                    .trimmingCharacters(in: .whitespaces)
+                    .trimmingPrefix("$")
+                if normalizedSequence == "String"
+                    || normalizedSequence == "Swift.String" {
+                    let needle = try resolve(arguments[0], line: line)
+                    let sequence = try resolve(arguments[1], line: line)
+                    guard registerTypes[Int(sequence.rawValue)] == .string,
+                          registerTypes[Int(needle.rawValue)] == .string
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "String.contains operands do not match String"
+                        )
+                    }
                     let result = try allocate(type: .bool)
                     values[resultToken] = result
                     appendInstruction(
@@ -11929,18 +12614,15 @@ public struct Lowerer: Sendable {
                     )
                     return
                 }
-                guard case let .array(element) = sequenceType,
-                      registerTypes[Int(sequence.rawValue)] == sequenceType,
-                      registerTypes[Int(needle.rawValue)] == element
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Sequence.contains types do not match Array.Element"
-                    )
-                }
-                let result = try allocate(type: .bool)
-                values[resultToken] = result
-                appendInstruction(
-                    .arrayContains(result: result, array: sequence, value: needle)
+                let specialization = try parseSequenceSpecialization(
+                    genericArguments,
+                    context: "Sequence.contains"
+                )
+                values[resultToken] = try lowerSequenceContainsElement(
+                    specialization,
+                    sourceToken: arguments[1],
+                    needleToken: arguments[0],
+                    line: line
                 )
 
             case .arrayAppend:
@@ -16372,7 +17054,7 @@ public struct Lowerer: Sendable {
                 ], operation.usesClosure {
                     let normalTarget = try parseBlockID(call[4])
                     let errorTarget = try parseBlockID(call[5])
-                    try lowerCollectionOrderingTryApply(
+                    try lowerSequenceOrderingTryApply(
                         operation: operation,
                         genericArguments: call[1],
                         argumentText: call[2],
@@ -20437,7 +21119,10 @@ public struct Lowerer: Sendable {
 
     private func parseSetGenericArguments(
         _ raw: String
-    ) throws -> (element: Bytecode.ValueType, sequence: Bytecode.ValueType?) {
+    ) throws -> (
+        element: Bytecode.ValueType,
+        sequence: CanonicalSIL.SequenceSpecialization?
+    ) {
         let components = splitTopLevel(raw)
         guard (1...2).contains(components.count) else {
             throw CanonicalSIL.LoweringError.malformedSIL(
@@ -20450,9 +21135,18 @@ public struct Lowerer: Sendable {
                 "Set element \(element) lacks VM-defined Hashable semantics"
             )
         }
-        let sequence: Bytecode.ValueType?
+        let sequence: CanonicalSIL.SequenceSpecialization?
         if components.count == 2 {
-            sequence = try parseStoredType(components[1])
+            let parsed = try parseSequenceSpecialization(
+                components[1],
+                context: "Set Sequence argument"
+            )
+            guard parsed.element == element else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Set Sequence.Element does not match Set.Element"
+                )
+            }
+            sequence = parsed
         } else {
             sequence = nil
         }
@@ -20730,12 +21424,12 @@ public struct Lowerer: Sendable {
         }
     }
 
-    private func parseCollectionOrderingPlan(
+    private func parseSequenceOrderingPlan(
         operation: CanonicalSIL.OrderingIntrinsic,
         genericArguments: String,
         argumentText: String,
         line: Int
-    ) throws -> CollectionOrderingPlan {
+    ) throws -> SequenceOrderingPlan {
         guard operation.usesClosure else {
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "natural ordering does not use try_apply lowering"
@@ -20743,16 +21437,17 @@ public struct Lowerer: Sendable {
         }
         let genericSpellings = splitTopLevel(genericArguments)
             .filter { !$0.isEmpty }
-        let genericTypes = try genericSpellings.map(parseType)
         let arguments = try parseApplyValueTokens(argumentText, line: line)
-        guard genericTypes.count == 1,
-              let element = genericTypes[0].managedCollectionElement
-        else {
-            throw CanonicalSIL.LoweringError.unsupportedType(
-                "ordering requires a represented managed Collection specialization"
+        guard genericSpellings.count == 1 else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "ordering requires one concrete Sequence specialization"
             )
         }
-        let sourceType = genericTypes[0]
+        let source = try parseSequenceSpecialization(
+            genericSpellings[0],
+            context: "comparator ordering"
+        )
+        let element = source.element
 
         switch operation {
         case .sortedBy:
@@ -20764,7 +21459,7 @@ public struct Lowerer: Sendable {
             return .init(
                 operation: operation,
                 sourceToken: arguments[1],
-                sourceType: sourceType,
+                source: source,
                 closureToken: arguments[0],
                 elementType: element
             )
@@ -20774,7 +21469,7 @@ public struct Lowerer: Sendable {
                     "MutableCollection.sort(by:) has unsupported arguments"
                 )
             }
-            guard sourceType == .array(element) else {
+            guard source.managedCollectionType == .array(element) else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
                     "mutating comparator ordering requires a represented Array"
                 )
@@ -20792,7 +21487,7 @@ public struct Lowerer: Sendable {
             return .init(
                 operation: operation,
                 sourceToken: arguments[1],
-                sourceType: sourceType,
+                source: source,
                 closureToken: arguments[0],
                 elementType: element
             )
@@ -20926,11 +21621,20 @@ public struct Lowerer: Sendable {
             }
             return .progression(progression)
         }
-        let type = try parseType(raw)
-        let element = try representedManagedCollectionElement(
-            of: type,
-            context: context
+        let unsupportedSource = CanonicalSIL.LoweringError.unsupportedType(
+            "\(context) requires a represented managed Collection or "
+                + "supported finite progression, got \(raw)"
         )
+        let type: Bytecode.ValueType
+        do {
+            type = try parseType(raw)
+        } catch let error as CanonicalSIL.LoweringError {
+            guard case .unsupportedType = error else { throw error }
+            throw unsupportedSource
+        }
+        guard let element = type.managedCollectionElement else {
+            throw unsupportedSource
+        }
         return .managedCollection(type: type, element: element)
     }
 

@@ -1,7 +1,7 @@
 extension CanonicalSIL {
 /// Sequence ordering operations share one lowering family. Nonmutating forms
-/// accept every represented managed Collection; mutating forms remain limited
-/// to zero-based Array storage.
+/// accept represented managed Collections and concrete finite progressions;
+/// mutating forms remain limited to zero-based Array storage.
 enum OrderingIntrinsic: Equatable {
     case sorted
     case sortedBy

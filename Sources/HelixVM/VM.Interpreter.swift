@@ -1765,25 +1765,6 @@ public struct Interpreter: Sendable {
                         value = nil
                     }
                     try initialize(.optional(value), register: result, registers: &registers)
-                case let .arrayContains(result, array, value):
-                    let (values, _) = try self.array(array, registers: registers)
-                    let needle = try read(value, registers: registers)
-                    var contains = false
-                    for element in values {
-                        if try vmValuesEqual(
-                            element,
-                            needle,
-                            budget: budget
-                        ) {
-                            contains = true
-                            break
-                        }
-                    }
-                    try initialize(
-                        .bool(contains),
-                        register: result,
-                        registers: &registers
-                    )
                 case let .arraySearch(result, operation, array, value):
                     let (values, _) = try self.array(
                         array,
@@ -1822,76 +1803,6 @@ public struct Interpreter: Sendable {
                     )
                     try initialize(
                         .optional(wrapped),
-                        register: result,
-                        registers: &registers
-                    )
-                case let .arrayExtremum(result, operation, array):
-                    let (values, elementType) = try self.array(
-                        array,
-                        registers: registers
-                    )
-                    let selected = try VM.CollectionSemantics.extremum(
-                        in: values,
-                        operation: operation
-                    ) { left, right in
-                        try compare(
-                            .lessThan,
-                            lhs: left,
-                            rhs: right,
-                            type: elementType,
-                            budget: budget
-                        )
-                    }
-                    try chargeAggregate(
-                        elementCount: selected == nil ? 0 : 1,
-                        budget: budget
-                    )
-                    let wrapped = try selected.map {
-                        try copyCharging($0, budget: budget)
-                    }
-                    try initialize(
-                        .optional(wrapped),
-                        register: result,
-                        registers: &registers
-                    )
-                case let .arrayRelation(result, operation, lhs, rhs):
-                    let (left, leftElement) = try self.array(
-                        lhs,
-                        registers: registers
-                    )
-                    let (right, rightElement) = try self.array(
-                        rhs,
-                        registers: registers
-                    )
-                    guard leftElement == rightElement else {
-                        throw VM.RuntimeTrap.typeMismatch(
-                            expected: .array(leftElement),
-                            actual: .array(rightElement)
-                        )
-                    }
-                    let relation = try VM.CollectionSemantics.relation(
-                        operation,
-                        lhs: left,
-                        rhs: right,
-                        areEqual: { left, right in
-                            try vmValuesEqual(
-                                left,
-                                right,
-                                budget: budget
-                            )
-                        },
-                        isOrderedBefore: { left, right in
-                            try compare(
-                                .lessThan,
-                                lhs: left,
-                                rhs: right,
-                                type: leftElement,
-                                budget: budget
-                            )
-                        }
-                    )
-                    try initialize(
-                        .bool(relation),
                         register: result,
                         registers: &registers
                     )

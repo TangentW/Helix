@@ -87,26 +87,13 @@ struct CollectionSemantics {
         )
     }
 
-    @Test("Recursive Array relations and equality are accepted")
+    @Test("Recursive Array equality is accepted")
     func acceptsRecursiveEquality() throws {
         let dictionary = Bytecode.ValueType.dictionary(
             key: .string,
             value: .int64
         )
         let array = Bytecode.ValueType.array(dictionary)
-        _ = try verify(
-            fixture(
-                parameterTypes: [array, array],
-                resultType: .bool,
-                registerTypes: [array, array, .bool],
-                instruction: .arrayRelation(
-                    result: register(2),
-                    operation: .startsWith,
-                    lhs: register(0),
-                    rhs: register(1)
-                )
-            )
-        )
         _ = try verify(
             fixture(
                 parameterTypes: [array, array],
@@ -140,34 +127,6 @@ struct CollectionSemantics {
             reason: "array_search requires a matching VM-Equatable element and Optional<Int> result"
         )
 
-        let boolArray = Bytecode.ValueType.array(.bool)
-        try expectInvalid(
-            fixture(
-                parameterTypes: [boolArray],
-                resultType: .optional(.bool),
-                registerTypes: [boolArray, .optional(.bool)],
-                instruction: .arrayExtremum(
-                    result: register(1),
-                    operation: .minimum,
-                    array: register(0)
-                )
-            ),
-            reason: "array_extremum requires a VM-Comparable Array and Optional<Element> result"
-        )
-        try expectInvalid(
-            fixture(
-                parameterTypes: [boolArray, boolArray],
-                resultType: .bool,
-                registerTypes: [boolArray, boolArray, .bool],
-                instruction: .arrayRelation(
-                    result: register(2),
-                    operation: .lexicographicallyPrecedes,
-                    lhs: register(0),
-                    rhs: register(1)
-                )
-            ),
-            reason: "array_relation element lacks the required VM value semantics"
-        )
     }
 
     @Test("Ordering predicates cannot manufacture Comparable for Bool")

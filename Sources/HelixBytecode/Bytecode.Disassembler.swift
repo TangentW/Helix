@@ -240,14 +240,8 @@ public enum Disassembler {
             "\(result) = array_get \(array)[\(index)]"
         case let .arrayBoundary(result, operation, array):
             "\(result) = array_\(operation.rawValue) \(array)"
-        case let .arrayContains(result, array, value):
-            "\(result) = array_contains \(array), \(value)"
         case let .arraySearch(result, operation, array, value):
             "\(result) = array_\(operation.rawValue) \(value) in \(array)"
-        case let .arrayExtremum(result, operation, array):
-            "\(result) = array_\(operation.rawValue) \(array)"
-        case let .arrayRelation(result, operation, lhs, rhs):
-            "\(result) = array_\(operation.rawValue) \(lhs), \(rhs)"
         case let .arrayAdapter(result, operation, array):
             "\(result) = array_\(operation.rawValue) \(array)"
         case let .arrayRepeat(result, value, count):

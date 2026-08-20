@@ -2,10 +2,21 @@ import HelixBytecode
 
 extension CanonicalSIL {
 /// Common collection operations classified by semantic shape instead of by
-/// one concrete element type. Sequence-wide operations accept represented
-/// Array, Dictionary, and Set values and materialize only when an Array-based
-/// VM algorithm requires random access.
+/// one concrete element type. Element-sequence operations may also accept
+/// finite concrete progressions through the shared Sequence specialization;
+/// index-sensitive operations retain their stricter Collection constraints.
 enum CollectionIntrinsic: Equatable {
+    enum ExtremumOperation: Equatable {
+        case minimum
+        case maximum
+    }
+
+    enum RelationOperation: Equatable {
+        case elementsEqual
+        case startsWith
+        case lexicographicallyPrecedes
+    }
+
     enum EqualityContainer: Equatable {
         case array
         case dictionary
@@ -123,8 +134,8 @@ enum CollectionIntrinsic: Equatable {
 
     case equality(EqualityContainer)
     case search(Bytecode.ArraySearchOperation)
-    case extremum(Bytecode.ArrayExtremumOperation)
-    case relation(Bytecode.ArrayRelationOperation)
+    case extremum(ExtremumOperation)
+    case relation(RelationOperation)
     case arrayIndex(ArrayIndexOperation)
     case adapter(Adapter)
     case arrayEdit(ArrayEdit)

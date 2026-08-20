@@ -170,8 +170,10 @@ includes common integer and floating-point operations and conversions,
 one-grapheme Character literals for the bounded String predicate path,
 tuple/Optional including address projection and verified force-unwrap traps,
 recursive Array/Dictionary equality,
-common Array index/search plus represented managed Collection extrema,
-cross-container Sequence relations, and nonmutating ordering; type-generic,
+common Array index/search plus streaming natural extrema, equality membership,
+and cross-source Sequence relations over represented managed Collections and
+finite concrete progressions, plus nonmutating ordering over both;
+type-generic,
 Array-backed structural concatenation/insertion/replacement/removal/reversal/
 swap, predicate removal, bidirectional partition, and capacity hints, including
 context-typed nil elements and generic indirect results written into
@@ -197,9 +199,11 @@ reversed/repeated/sliced/joined Array-backed adapters,
 dynamic casts, fixed-width integer `Range`/`ClosedRange` iteration,
 integer and floating-point `stride`, scalar Range containment, and common
 forward Sequence transforms, reductions, visits, predicates, comparator
-selection, and Array-backed adapters over those finite progression sources.
-They reuse the existing typed cursor/builder/closure semantics rather than
-Swift generic NativeImports or per-API opcodes. The subset also includes
+selection, natural extrema/order, relations, Set construction/algebra, and
+Array-backed adapters over those finite progression sources. Element-only
+consumers stream the existing typed cursor; only stored results reuse the typed
+builder. Neither path uses Swift generic NativeImports or per-API opcodes. The
+subset also includes
 structured control flow, newly introduced non-exported ordinary/private helpers,
 computed accessors, file- or module-scope patch-local struct/enum, pure HLVM classes, and
 concrete `Result` values,

@@ -143,25 +143,29 @@ Both workflows depend on stable, build-specific identities:
   ownership rules. Aggregate `@out` results use the same field paths over one
   typed frame slot, allowing independent tuple-component initialization while
   the verifier still observes one complete value at the return boundary.
-- Represented managed Collections share one verified materialization boundary
-  instead of importing Swift's private generic Collection ABI. Array storage is
-  reused; Set and Dictionary are copied into `Array<Element>` while preserving
-  their deterministic VM iteration order, with Dictionary exposing its native
-  `(Key, Value)` element tuple. `enumerated`, `Array(sequence)`, heterogeneous
-  `zip`, extrema, cross-container Sequence relations, and natural or
-  comparator-driven nonmutating ordering all reuse this boundary and the
-  existing typed Array algorithms. Reversed, repeated, sliced, and joined
-  views remain Array-backed where their index or nested-sequence semantics need
-  that stronger representation. Only element-sequence semantics are
-  normalized; an ArraySlice's non-zero-based index identity is not erased into
-  an Array index, so unsupported slice-index APIs still fail closed.
+- Represented managed Collections use one verified Sequence specialization
+  instead of importing Swift's private generic Collection ABI. Array, Set, and
+  Dictionary drive the same typed cursor, with Dictionary exposing its native
+  `(Key, Value)` element tuple and Set/Dictionary retaining deterministic VM
+  iteration. Element-only consumers such as equality membership, natural
+  extrema, and cross-container Sequence relations stream that cursor directly,
+  preserving short-circuiting and first-element ties without allocating an
+  intermediate Array. Operations whose result inherently needs complete
+  storage or random access—such as `sorted`, `Set(sequence)`, `enumerated`,
+  `Array(sequence)`, and heterogeneous `zip`—reuse one typed Array
+  materialization path and the existing bounded Array algorithms. Reversed,
+  repeated, sliced, and joined views remain Array-backed where their index or
+  nested-sequence semantics need that stronger representation. Only element-
+  sequence semantics are normalized; an ArraySlice's non-zero-based index
+  identity is not erased into an Array index, so unsupported slice-index APIs
+  still fail closed.
 - Finite integer `Range`/`ClosedRange` and supported numeric `StrideTo`/
   `StrideThrough` values form a second, compiler-only concrete Sequence
   specialization. They retain typed bounds and stride registers rather than a
-  Swift runtime object. Forward higher-order operations stream them directly;
-  only an API whose represented result requires random access or storage—such
-  as `Array(sequence)`, `enumerated`, `reversed`, or `zip`—materializes their
-  elements through the existing typed Array builder.
+  Swift runtime object. Forward higher-order operations, equality membership,
+  natural extrema, and Sequence relations stream them directly. Natural and
+  comparator sorting, Set construction/algebra, and other APIs whose result
+  requires complete storage materialize through the same typed Array builder.
 - Canonical SIL may spell tuple-label erasure through generic Array and
   Dictionary cast helpers. The compiler removes such a helper only when the
   original types differ only by tuple labels and their recursively normalized
@@ -223,6 +227,9 @@ Both workflows depend on stable, build-specific identities:
   iterator or witness-table ABI. The Verifier rejects unsupported reverse or
   unordered traversal, and the VM rejects corrupt cursor state instead of
   treating it as exhaustion.
+  Non-closure consumers compose the same cursor with ordinary compare and
+  branch instructions: `contains` and Sequence relations short-circuit, while
+  natural extrema carry one owned candidate and retain the first tied element.
   Comparator-driven `min(by:)`/`max(by:)` reuse the same traversal but carry
   one owned candidate through the CFG. Their two borrowed inputs are ordered
   exactly as Swift specifies, ties retain the earliest element, and both the

@@ -305,18 +305,6 @@ public enum ArraySearchOperation: String, Codable, Hashable, Sendable {
     case lastIndex
 }
 
-public enum ArrayExtremumOperation: String, Codable, Hashable, Sendable {
-    case minimum
-    case maximum
-}
-
-public enum ArrayRelationOperation: String, Codable, Hashable, Sendable {
-    /// Element-by-element equality without Array's shared-storage fast path.
-    case elementsEqual
-    case startsWith
-    case lexicographicallyPrecedes
-}
-
 public enum ArrayAdapterOperation: String, Codable, Hashable, Sendable {
     case reversed
     case enumerated
@@ -634,27 +622,11 @@ public enum Instruction: Codable, Hashable, Sendable {
         operation: Bytecode.ArrayBoundaryOperation,
         array: Bytecode.Register
     )
-    case arrayContains(
-        result: Bytecode.Register,
-        array: Bytecode.Register,
-        value: Bytecode.Register
-    )
     case arraySearch(
         result: Bytecode.Register,
         operation: Bytecode.ArraySearchOperation,
         array: Bytecode.Register,
         value: Bytecode.Register
-    )
-    case arrayExtremum(
-        result: Bytecode.Register,
-        operation: Bytecode.ArrayExtremumOperation,
-        array: Bytecode.Register
-    )
-    case arrayRelation(
-        result: Bytecode.Register,
-        operation: Bytecode.ArrayRelationOperation,
-        lhs: Bytecode.Register,
-        rhs: Bytecode.Register
     )
     case arrayAdapter(
         result: Bytecode.Register,
@@ -1070,10 +1042,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .arrayIsEmpty(result, _),
              let .arrayGet(result, _, _),
              let .arrayBoundary(result, _, _),
-             let .arrayContains(result, _, _),
              let .arraySearch(result, _, _, _),
-             let .arrayExtremum(result, _, _),
-             let .arrayRelation(result, _, _, _),
              let .arrayAdapter(result, _, _),
              let .arrayRepeat(result, _, _),
              let .arraySubsequence(result, _, _, _),
@@ -1253,14 +1222,8 @@ public enum Instruction: Codable, Hashable, Sendable {
             [array]
         case let .arrayGet(_, array, index):
             [array, index]
-        case let .arrayContains(_, array, value):
-            [array, value]
         case let .arraySearch(_, _, array, value):
             [array, value]
-        case let .arrayExtremum(_, _, array):
-            [array]
-        case let .arrayRelation(_, _, lhs, rhs):
-            [lhs, rhs]
         case let .arrayAdapter(_, _, array):
             [array]
         case let .arrayRepeat(_, value, count):
