@@ -184,10 +184,13 @@ lookup and scoped default-value writeback, `updateValue`,
 construction, uniquing construction, Dictionary/represented-Sequence
 `merging`/`merge`, represented-Collection grouping, and capacity hints; typed Set
 construction/query/mutation/iteration/algebra with recursively VM-defined
-Equatable/Hashable semantics. Common fully concrete transforms, reductions,
-visits, predicate queries, and comparator selection share one closure traversal
-across Array, Dictionary, and Set; all three preserve their container through
-`filter`, while Dictionary also supports `mapValues` and `compactMapValues`.
+Equatable/Hashable semantics. Managed Array, Dictionary, and Set share direct
+`count`, `isEmpty`, and `first` queries; represented Array additionally supports
+`last`, as do normalized Array-backed views. Common fully concrete transforms,
+reductions, visits, predicate queries including `count(where:)`, and comparator
+selection share one closure traversal across Array, Dictionary, and Set; all
+three preserve their container through `filter`, while Dictionary also supports
+`mapValues` and `compactMapValues`.
 Frontend Array/Dictionary cast helpers may erase tuple labels only when the
 original types differ solely by those labels and both complete VM types match;
 real element, key, value, and reference conversions remain rejected.
@@ -202,7 +205,11 @@ forward Sequence transforms, reductions, visits, predicates, comparator
 selection, natural extrema/order, relations, Set construction/algebra, and
 Array-backed adapters over those finite progression sources. Element-only
 consumers stream the existing typed cursor; only stored results reuse the typed
-builder. Neither path uses Swift generic NativeImports or per-API opcodes. The
+builder. Integer Range/ClosedRange boundary queries are constant-time, and their
+exact full-width count traps if it cannot fit `Int`; represented Comparable
+Range bounds also support `isEmpty`. Neither path uses Swift generic
+NativeImports or per-API opcodes. Reading VM storage as `Array.capacity` and
+unrepresented randomness through `randomElement()` remain rejected. The
 subset also includes
 structured control flow, newly introduced non-exported ordinary/private helpers,
 computed accessors, file- or module-scope patch-local struct/enum, pure HLVM classes, and

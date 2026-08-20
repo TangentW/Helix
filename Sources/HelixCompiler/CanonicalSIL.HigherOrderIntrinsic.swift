@@ -25,6 +25,7 @@ enum HigherOrderIntrinsic: Equatable {
     case lastIndexWhere
     case containsWhere
     case allSatisfy
+    case countWhere
     case minimumBy
     case maximumBy
 
@@ -35,7 +36,7 @@ enum HigherOrderIntrinsic: Equatable {
             true
         case .reduce, .reduceInto, .forEach, .firstWhere, .lastWhere,
              .firstIndexWhere, .lastIndexWhere, .containsWhere,
-             .allSatisfy, .minimumBy, .maximumBy:
+             .allSatisfy, .countWhere, .minimumBy, .maximumBy:
             false
         }
     }
@@ -49,7 +50,7 @@ enum HigherOrderIntrinsic: Equatable {
             true
         case .map, .flatMap, .compactMap, .mapValues, .compactMapValues,
              .reduce, .reduceInto, .forEach, .firstIndexWhere,
-             .lastIndexWhere, .containsWhere, .allSatisfy:
+             .lastIndexWhere, .containsWhere, .allSatisfy, .countWhere:
             false
         }
     }
@@ -61,7 +62,7 @@ enum HigherOrderIntrinsic: Equatable {
         case .map, .flatMap, .filter(_), .compactMap, .mapValues,
              .compactMapValues, .prefixWhile, .dropWhile, .reduce,
              .reduceInto, .forEach, .firstWhere,
-             .firstIndexWhere, .containsWhere, .allSatisfy,
+             .firstIndexWhere, .containsWhere, .allSatisfy, .countWhere,
              .minimumBy, .maximumBy:
             .forward
         }
@@ -69,6 +70,21 @@ enum HigherOrderIntrinsic: Equatable {
 
     var isComparatorSelection: Bool {
         self == .minimumBy || self == .maximumBy
+    }
+
+    /// Newer typed-throws stdlib entry points carry their concrete error type
+    /// as an explicit substitution. Older rethrows entry points do not.
+    var explicitErrorGenericIndex: Int? {
+        switch self {
+        case .map: 2
+        case .countWhere: 1
+        case .flatMap, .filter(_), .compactMap, .mapValues,
+             .compactMapValues, .prefixWhile, .dropWhile, .reduce,
+             .reduceInto, .forEach, .firstWhere, .lastWhere,
+             .firstIndexWhere, .lastIndexWhere, .containsWhere,
+             .allSatisfy, .minimumBy, .maximumBy:
+            nil
+        }
     }
 }
 }

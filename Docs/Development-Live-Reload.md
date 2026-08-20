@@ -393,12 +393,15 @@ NativeImports. Mutable captures use the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
 boxes. Fully concrete Array, Dictionary, and Set values share verified closure
 traversal for common `map`/`flatMap`/`compactMap`, reduction, visit, predicate,
-and comparator-selection operations. Container-preserving `filter` uses the
-same traversal for all three; Dictionary `mapValues` and `compactMapValues`
+`count(where:)`, and comparator-selection operations. Container-preserving
+`filter` uses the same traversal for all three; Dictionary `mapValues` and `compactMapValues`
 project their specialized value callback from each represented `(Key, Value)`
 element, while `reduce(into:_:)` uses scoped inout accumulation. Represented
 managed Collections and finite concrete progressions share one typed Sequence
-strategy. Equality `contains(_:)`, natural extrema, and cross-source relations
+strategy. Managed Array, Dictionary, and Set share direct `count`, `isEmpty`,
+and `first` queries, while represented Array storage additionally supplies
+`last`; normalized Array-backed views use the same query semantics. Equality
+`contains(_:)`, natural extrema, and cross-source relations
 drive its cursor directly, so short-circuiting and first-tie semantics do not
 require an intermediate Array. `enumerated`, `Array(sequence)`, heterogeneous
 `zip`, natural/comparator `sorted`, and `Set(sequence)` use the same typed
@@ -410,12 +413,15 @@ Finite integer ranges and supported numeric strides enter that same forward
 closure traversal for Array-producing transforms, reductions, visits,
 short-circuit predicates, and comparator selection. Equality membership,
 natural extrema, and mixed-source Sequence relations also stream those
-compiler-only typed bounds/stride values. Sorting, Set construction/algebra,
+compiler-only typed bounds/stride values. Integer Range/ClosedRange `count`,
+`isEmpty`, `first`, and `last` are constant-time bound operations with exact
+full-width cardinality and checked `Int` overflow; represented Comparable Range
+bounds also support `isEmpty`. Sorting, Set construction/algebra,
 `Array(sequence)`, `enumerated`, `reversed`, and `zip` reuse the typed Array
 builder when a complete stored or random-access representation is required.
-Unbounded partial ranges, progression index results, index-sensitive Collection
-operations, and reverse predicate traversal fail closed rather than acquiring
-guessed semantics.
+Unbounded partial ranges, progression index results, other index-sensitive
+Collection operations, and reverse predicate traversal fail closed rather than
+acquiring guessed semantics.
 Array `partition(by:)` and `removeAll(where:)` share a typed linear mutable
 snapshot while their predicate calls remain ordinary verified CFG edges;
 partition preserves Swift's low/high scan, removal preserves forward visits,
@@ -431,7 +437,9 @@ plan. Common Array structural edits—including concatenation, contents append
 and insertion, range replacement/removal, counted edge removal, clearing,
 reversal, swapping, and capacity hints—are also supported for matching Array-backed
 sources and represented copyable elements; they are type-driven rather than
-special-cased for a framework class. Dictionary default lookup invokes its
+special-cased for a framework class. Reading physical `Array.capacity` and
+requesting `randomElement()` remain rejected because those storage and
+randomness policies are not represented. Dictionary default lookup invokes its
 autoclosure only for a missing key. Its scoped `_modify` and Array element
 `_modify` share frame-backed lending and write back on normal `end_apply` and
 throwing `abort_apply`, including nested collections and imported references.

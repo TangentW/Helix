@@ -36,12 +36,9 @@ enum SwiftCoreIntrinsic: Equatable {
     case stringInterpolationAppendLiteral
     case stringInterpolationAppendValue
     case stringFromInterpolation
-    case arrayCount
-    case collectionIsEmpty
     case arrayEmpty
     case arraySubscript
     case arraySubscriptModify
-    case collectionBoundary(Bytecode.ArrayBoundaryOperation)
     case sequenceContains
     case arrayAppend
     case arrayPopLast
@@ -51,8 +48,6 @@ enum SwiftCoreIntrinsic: Equatable {
     case progressionMakeIterator(CanonicalSIL.Progression.Family)
     case progressionIteratorNext(CanonicalSIL.Progression.Family)
     case rangeContains(CanonicalSIL.Progression.Family)
-    case dictionaryCount
-    case dictionaryIsEmpty
     case dictionaryEmpty
     case dictionarySubscriptGet
     case dictionarySubscriptSet
@@ -67,8 +62,6 @@ enum SwiftCoreIntrinsic: Equatable {
     case dictionaryUniqueKeysWithValues
     case dictionaryMakeIterator
     case dictionaryIteratorNext
-    case setCount
-    case setIsEmpty
     case setEmpty
     case setContains
     case setInsert
@@ -156,6 +149,8 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .higherOrder(.containsWhere)
         case "$sSTsE10allSatisfyyS2b7ElementQzKXEKF":
             self = .higherOrder(.allSatisfy)
+        case "$sSTsE5count5whereSiSb7ElementQzqd__YKXE_tqd__YKs5ErrorRd__lF":
+            self = .higherOrder(.countWhere)
         case "$sSTsE3min2by7ElementQzSgSbAD_ADtKXE_tKF":
             self = .higherOrder(.minimumBy)
         case "$sSTsE3max2by7ElementQzSgSbAD_ADtKXE_tKF":
@@ -226,13 +221,9 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .stringInterpolationAppendValue
         case "$sSS19stringInterpolationSSs013DefaultStringB0V_tcfC":
             self = .stringFromInterpolation
-        case "$sSa5countSivg": self = .arrayCount
         case "$sS2ayxGycfC": self = .arrayEmpty
-        case "$sSlsE7isEmptySbvg": self = .collectionIsEmpty
         case "$sSayxSicig": self = .arraySubscript
         case "$sSayxSiciM": self = .arraySubscriptModify
-        case "$sSlsE5first7ElementQzSgvg": self = .collectionBoundary(.first)
-        case "$sSKsE4last7ElementQzSgvg": self = .collectionBoundary(.last)
         case "$sSTsSQ7ElementRpzrlE8containsySbABF": self = .sequenceContains
         case "$sSa6appendyyxnF": self = .arrayAppend
         case "$sSmsSKRzrlE7popLast7ElementSTQzSgyF": self = .arrayPopLast
@@ -274,8 +265,6 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .progressionIteratorNext(.strideThrough)
         case "$sSn8containsySbxF": self = .rangeContains(.range)
         case "$sSN8containsySbxF": self = .rangeContains(.closedRange)
-        case "$sSD5countSivg": self = .dictionaryCount
-        case "$sSD7isEmptySbvg": self = .dictionaryIsEmpty
         case "$sS2Dyxq_GycfC": self = .dictionaryEmpty
         case "$sSDyq_Sgxcig": self = .dictionarySubscriptGet
         case "$sSDyq_Sgxcis": self = .dictionarySubscriptSet
@@ -292,8 +281,6 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .dictionaryUniqueKeysWithValues
         case "$sSD12makeIteratorSD0B0Vyxq__GyF": self = .dictionaryMakeIterator
         case "$sSD8IteratorV4nextx3key_q_5valuetSgyF": self = .dictionaryIteratorNext
-        case "$sSh5countSivg": self = .setCount
-        case "$sSh7isEmptySbvg": self = .setIsEmpty
         case "$sS2hyxGycfC": self = .setEmpty
         case "$sSh8containsySbxF": self = .setContains
         case "$sSh6insertySb8inserted_x17memberAfterInserttxnF": self = .setInsert

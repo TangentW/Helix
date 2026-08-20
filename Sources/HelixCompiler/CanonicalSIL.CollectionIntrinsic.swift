@@ -6,6 +6,44 @@ extension CanonicalSIL {
 /// finite concrete progressions through the shared Sequence specialization;
 /// index-sensitive operations retain their stricter Collection constraints.
 enum CollectionIntrinsic: Equatable {
+    struct Query: Equatable {
+        enum Operation: Equatable {
+            case count
+            case isEmpty
+            case first
+            case last
+        }
+
+        /// Describes how a stdlib entry point carries its concrete source in
+        /// generic substitutions. This is frontend ABI shape, not runtime
+        /// behavior; every shape resolves to the same Sequence specialization.
+        enum Source: Equatable {
+            case collection
+            case arrayBackedElement
+            case dictionaryKeyValue
+            case setElement
+            case progressionElement(CanonicalSIL.Progression.Family)
+        }
+
+        var operation: Operation
+        var source: Source
+
+        /// Some concrete stdlib adapters expose a semantic Collection query
+        /// as a stored-field projection rather than a callable getter. Keep
+        /// that frontend spelling at the same query-classification boundary.
+        static func storedProjection(
+            owner: String,
+            field: String
+        ) -> Operation? {
+            switch (owner, field) {
+            case ("Repeated", "count"), ("Swift.Repeated", "count"):
+                .count
+            default:
+                nil
+            }
+        }
+    }
+
     enum ExtremumOperation: Equatable {
         case minimum
         case maximum
@@ -133,6 +171,7 @@ enum CollectionIntrinsic: Equatable {
     }
 
     case equality(EqualityContainer)
+    case query(Query)
     case search(Bytecode.ArraySearchOperation)
     case extremum(ExtremumOperation)
     case relation(RelationOperation)
@@ -142,6 +181,42 @@ enum CollectionIntrinsic: Equatable {
 
     init?(mangledName: String) {
         switch mangledName {
+        case "$sSa5countSivg":
+            self = .query(.init(operation: .count, source: .arrayBackedElement))
+        case "$ss10ArraySliceV5countSivg":
+            self = .query(.init(operation: .count, source: .arrayBackedElement))
+        case "$sSlsE5countSivg":
+            self = .query(.init(operation: .count, source: .collection))
+        case "$sSD5countSivg":
+            self = .query(.init(operation: .count, source: .dictionaryKeyValue))
+        case "$sSh5countSivg":
+            self = .query(.init(operation: .count, source: .setElement))
+        case "$sSlsE7isEmptySbvg":
+            self = .query(.init(operation: .isEmpty, source: .collection))
+        case "$sSn7isEmptySbvg":
+            self = .query(
+                .init(
+                    operation: .isEmpty,
+                    source: .progressionElement(.range)
+                )
+            )
+        case "$sSN7isEmptySbvg":
+            self = .query(
+                .init(
+                    operation: .isEmpty,
+                    source: .progressionElement(.closedRange)
+                )
+            )
+        case "$sSD7isEmptySbvg":
+            self = .query(
+                .init(operation: .isEmpty, source: .dictionaryKeyValue)
+            )
+        case "$sSh7isEmptySbvg":
+            self = .query(.init(operation: .isEmpty, source: .setElement))
+        case "$sSlsE5first7ElementQzSgvg":
+            self = .query(.init(operation: .first, source: .collection))
+        case "$sSKsE4last7ElementQzSgvg":
+            self = .query(.init(operation: .last, source: .collection))
         case "$sSasSQRzlE2eeoiySbSayxG_ABtFZ":
             self = .equality(.array)
         case "$sSDsSQR_rlE2eeoiySbSDyxq_G_ABtFZ":

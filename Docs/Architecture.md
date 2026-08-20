@@ -147,7 +147,12 @@ Both workflows depend on stable, build-specific identities:
   instead of importing Swift's private generic Collection ABI. Array, Set, and
   Dictionary drive the same typed cursor, with Dictionary exposing its native
   `(Key, Value)` element tuple and Set/Dictionary retaining deterministic VM
-  iteration. Element-only consumers such as equality membership, natural
+  iteration. Frontend-specific generic-substitution shapes for concrete and
+  protocol-extension entry points resolve to this same specialization before
+  lowering. Represented Array, Dictionary, and Set therefore share
+  `count`/`isEmpty`/`first`; Array additionally supplies its represented
+  bidirectional `last`, and normalized Array-backed views use the same Array
+  query semantics. Element-only consumers such as equality membership, natural
   extrema, and cross-container Sequence relations stream that cursor directly,
   preserving short-circuiting and first-element ties without allocating an
   intermediate Array. Operations whose result inherently needs complete
@@ -163,7 +168,12 @@ Both workflows depend on stable, build-specific identities:
   `StrideThrough` values form a second, compiler-only concrete Sequence
   specialization. They retain typed bounds and stride registers rather than a
   Swift runtime object. Forward higher-order operations, equality membership,
-  natural extrema, and Sequence relations stream them directly. Natural and
+  natural extrema, and Sequence relations stream them directly. Integer
+  `Range`/`ClosedRange` queries compute `count`, `isEmpty`, `first`, and `last`
+  directly from their bounds; full-width cardinality uses an unsigned order key
+  and traps if the exact value cannot fit `Int`, without walking the range.
+  Comparable represented `Range` bounds also support `isEmpty` without gaining
+  iteration semantics. Natural and
   comparator sorting, Set construction/algebra, and other APIs whose result
   requires complete storage materialize through the same typed Array builder.
 - Canonical SIL may spell tuple-label erasure through generic Array and
@@ -239,6 +249,9 @@ Both workflows depend on stable, build-specific identities:
   collection methods. Represented Array/Dictionary/Set and finite progression
   sources therefore share the same map/filter/reduction/predicate/comparator
   control flow, short-circuiting, throwing edges, and ownership cleanup.
+  `count(where:)` is another source-neutral cursor consumer: its predicate is
+  an ordinary closure CFG edge and its `Int` accumulator uses checked
+  arithmetic, with no result builder or API-specific opcode.
   One linear element buffer serves Array-producing transforms as well as
   container-preserving Array/Dictionary/Set `filter` and Dictionary value
   transforms; the result type selects the verified finalizer. Dictionary's

@@ -100,7 +100,10 @@ does not by itself certify a physical device or distribution channel.
   Array-backed sources. They share verified half-open range replacement and
   swap primitives, so bounds checks, overflow behavior, ownership, and
   allocation-before-copy charging do not depend on a particular element or
-  SDK type.
+  SDK type. Capacity-changing hints are supported, but reading `Array.capacity`
+  is intentionally rejected because physical VM storage capacity is not Swift
+  Array semantics. `randomElement()` is likewise rejected until randomness and
+  its observable policy are represented explicitly.
   Generic indirect results may initialize either a complete element or one
   tuple field in raw Array-literal construction storage through the same typed
   compiler-address sink used by ordinary stores.
@@ -161,9 +164,12 @@ does not by itself certify a physical device or distribution channel.
   Hashable domain. User-defined `Hashable` or equality witnesses remain
   fail-closed because downloaded code cannot invoke arbitrary hashing or
   equality. Generic `Array()` and `Dictionary()` construction is supported for
-  represented element/key/value types. Fully concrete `map`, `flatMap`,
+  represented element/key/value types. Array, Dictionary, and Set share direct
+  `count`, `isEmpty`, and `first` queries; Array additionally supports `last`
+  through its represented bidirectional storage, and normalized Array-backed
+  views use the same queries. Fully concrete `map`, `flatMap`,
   `compactMap`, `reduce`, `reduce(into:_:)`, `forEach`, `first(where:)`,
-  `contains(where:)`, `allSatisfy`, and comparator-driven
+  `contains(where:)`, `allSatisfy`, `count(where:)`, and comparator-driven
   `min(by:)`/`max(by:)` share verified closure traversal across represented
   Array, Dictionary, and Set values. Dictionary elements use their native
   `(key: Key, value: Value)` tuple shape. Container-preserving `filter` is
@@ -195,7 +201,7 @@ does not by itself certify a physical device or distribution channel.
   Finite concrete integer `Range`/`ClosedRange` and supported numeric stride
   sources reuse the same forward traversal for `map`, `flatMap`, `filter`,
   `compactMap`, `reduce`, `reduce(into:_:)`, `forEach`, `first(where:)`,
-  `contains(where:)`, `allSatisfy`, and comparator-driven
+  `contains(where:)`, `allSatisfy`, `count(where:)`, and comparator-driven
   `min(by:)`/`max(by:)`; producing transforms return Arrays. They also support
   equality `contains(_:)`, natural `min()`/`max()`, mixed-source Sequence
   relations, natural/comparator `sorted`, `Set(sequence)`, and generic Set
@@ -203,7 +209,11 @@ does not by itself certify a physical device or distribution channel.
   consumers retain cursor short-circuiting or one-candidate streaming, while
   sorting and Set results materialize through the shared typed builder. Their
   callbacks retain the same throwing and mutable-capture behavior as managed
-  Collections. Reverse predicate search, index-returning search, index-sensitive
+  Collections. Integer Range/ClosedRange `count`, `isEmpty`, `first`, and
+  `last` are constant-time bound queries; count is exact across the full
+  element width and traps when its cardinality exceeds `Int.max`. Represented
+  Comparable Range bounds also support `isEmpty` without implying iteration.
+  Reverse predicate search, index-returning search, other index-sensitive
   Collection boundaries/subsequences, and unbounded partial ranges remain
   rejected until their direction, index identity, complexity, or termination
   can be represented exactly.
