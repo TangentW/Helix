@@ -27,10 +27,8 @@ enum ValueRepresentation {
             .address(storable(pointee))
         case let .mutableCell(pointee):
             .mutableCell(storable(pointee))
-        case let .arrayBuilder(element):
-            .arrayBuilder(storable(element))
-        case let .arraySortState(element):
-            .arraySortState(storable(element))
+        case let .arrayState(kind, element):
+            .arrayState(kind: kind, element: storable(element))
         case let .closure(signature):
             .closure(
                 .init(

@@ -514,13 +514,9 @@ public final class InvocationBudget: @unchecked Sendable {
             throw VM.RuntimeTrap.explicit(
                 "mutable capture cells cannot cross a VM boundary"
             )
-        case .arrayBuilder:
+        case .arrayBuilder, .arraySortState, .arraySplitState:
             throw VM.RuntimeTrap.explicit(
-                "Array builders cannot cross a VM boundary"
-            )
-        case .arraySortState:
-            throw VM.RuntimeTrap.explicit(
-                "Array sort states cannot cross a VM boundary"
+                "Array operation states cannot cross a VM boundary"
             )
         case .closure:
             throw VM.RuntimeTrap.explicit("closure values cannot cross a VM boundary")

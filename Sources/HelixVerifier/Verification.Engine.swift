@@ -350,13 +350,9 @@ public struct Engine: Verification.ImageVerifying {
                 throw Verification.Error.invalidModule(
                     "local type members cannot contain mutable capture cells"
                 )
-            case .arrayBuilder:
+            case .arrayState:
                 throw Verification.Error.invalidModule(
-                    "local type members cannot contain Array builders"
-                )
-            case .arraySortState:
-                throw Verification.Error.invalidModule(
-                    "local type members cannot contain Array sort states"
+                    "local type members cannot contain Array operation states"
                 )
             case .closure:
                 throw Verification.Error.invalidModule(
@@ -499,8 +495,7 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 }
             case let .array(element), let .optional(element), let .set(element),
-                 let .mutableCell(element), let .arrayBuilder(element),
-                 let .arraySortState(element):
+                 let .mutableCell(element), let .arrayState(_, element):
                 try typeDepth(element) + 1
             case let .dictionary(key, value):
                 try max(typeDepth(key), typeDepth(value)) + 1
@@ -543,7 +538,7 @@ public struct Engine: Verification.ImageVerifying {
             case let .array(element), let .optional(element), let .set(element):
                 try visit(element)
             case let .address(pointee), let .mutableCell(pointee),
-                 let .arrayBuilder(pointee), let .arraySortState(pointee):
+                 let .arrayState(_, pointee):
                 try visit(pointee)
             case let .closure(signature):
                 for component in signature.parameters + [signature.result] {
@@ -855,9 +850,8 @@ public struct Engine: Verification.ImageVerifying {
         switch type {
         case let .native(id): shell.types[id]?.requiresMainActor == true
         case let .array(element), let .optional(element), let .set(element),
-             let .address(element),
-             let .mutableCell(element), let .arrayBuilder(element),
-             let .arraySortState(element):
+             let .address(element), let .mutableCell(element),
+             let .arrayState(_, element):
             usesMainActorNativeType(element, shell: shell)
         case let .dictionary(key, value):
             usesMainActorNativeType(key, shell: shell)
@@ -881,8 +875,7 @@ public struct Engine: Verification.ImageVerifying {
         case let .tuple(elements):
             for element in elements { try verifyNativeTypes(element, shell: shell) }
         case let .optional(wrapped), let .address(wrapped),
-             let .mutableCell(wrapped), let .arrayBuilder(wrapped),
-             let .arraySortState(wrapped):
+             let .mutableCell(wrapped), let .arrayState(_, wrapped):
             try verifyNativeTypes(wrapped, shell: shell)
         case let .array(element):
             try verifyNativeTypes(element, shell: shell)
@@ -938,12 +931,7 @@ public struct Engine: Verification.ImageVerifying {
                     throw Verification.Error.capabilityDenied(.mutableCapturesV1)
                 }
                 try visit(pointee)
-            case let .arrayBuilder(element):
-                guard capabilities.contains(.collectionsV1) else {
-                    throw Verification.Error.capabilityDenied(.collectionsV1)
-                }
-                try visit(element)
-            case let .arraySortState(element):
+            case let .arrayState(_, element):
                 guard capabilities.contains(.collectionsV1) else {
                     throw Verification.Error.capabilityDenied(.collectionsV1)
                 }
@@ -1307,8 +1295,8 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 }
                 switch pointee {
-                case .void, .never, .address, .mutableCell, .arrayBuilder,
-                     .arraySortState, .closure:
+                case .void, .never, .address, .mutableCell, .arrayState,
+                     .closure:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "address pointee must be a concrete non-address value type"
@@ -1324,8 +1312,8 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 }
                 switch pointee {
-                case .void, .never, .address, .mutableCell, .arrayBuilder,
-                     .arraySortState, .closure:
+                case .void, .never, .address, .mutableCell, .arrayState,
+                     .closure:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "mutable-cell pointee must be a concrete value type"
@@ -1333,36 +1321,19 @@ public struct Engine: Verification.ImageVerifying {
                 default:
                     try verify(pointee, depth: depth + 1, isRegister: false)
                 }
-            case let .arrayBuilder(element):
+            case let .arrayState(_, element):
                 guard isRegister, depth == 0 else {
                     throw Verification.Error.invalidFunction(
                         function: function.id,
-                        reason: "Array builders must be top-level registers"
+                        reason: "Array operation states must be top-level registers"
                     )
                 }
                 switch element {
-                case .void, .never, .address, .mutableCell, .arrayBuilder,
-                     .arraySortState, .closure:
+                case .void, .never, .address, .mutableCell, .arrayState,
+                     .closure:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
-                        reason: "Array-builder element must be a concrete value type"
-                    )
-                default:
-                    try verify(element, depth: depth + 1, isRegister: false)
-                }
-            case let .arraySortState(element):
-                guard isRegister, depth == 0 else {
-                    throw Verification.Error.invalidFunction(
-                        function: function.id,
-                        reason: "Array sort states must be top-level registers"
-                    )
-                }
-                switch element {
-                case .void, .never, .address, .mutableCell, .arrayBuilder,
-                     .arraySortState, .closure:
-                    throw Verification.Error.invalidFunction(
-                        function: function.id,
-                        reason: "Array-sort element must be a concrete value type"
+                        reason: "Array-state element must be a concrete value type"
                     )
                 default:
                     try verify(element, depth: depth + 1, isRegister: false)
@@ -1406,8 +1377,7 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 for parameter in signature.parameters {
                     switch parameter {
-                    case .void, .never, .mutableCell, .arrayBuilder,
-                         .arraySortState, .closure:
+                    case .void, .never, .mutableCell, .arrayState, .closure:
                         throw Verification.Error.invalidFunction(
                             function: function.id,
                             reason: "closure parameters must be concrete values or inout addresses"
@@ -1415,7 +1385,7 @@ public struct Engine: Verification.ImageVerifying {
                     case let .address(pointee):
                         switch pointee {
                         case .void, .never, .address, .mutableCell,
-                             .arrayBuilder, .arraySortState, .closure:
+                             .arrayState, .closure:
                             throw Verification.Error.invalidFunction(
                                 function: function.id,
                                 reason: "inout closure pointee must be a concrete value type"
@@ -1432,8 +1402,7 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 }
                 switch signature.result {
-                case .never, .address, .mutableCell, .arrayBuilder,
-                     .arraySortState, .closure:
+                case .never, .address, .mutableCell, .arrayState, .closure:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "closure result must be Void or a concrete non-address value"
@@ -1474,16 +1443,10 @@ public struct Engine: Verification.ImageVerifying {
                     reason: "mutable cells cannot be stored in stack slots"
                 )
             }
-            if case .arrayBuilder = type {
+            if case .arrayState = type {
                 throw Verification.Error.invalidFunction(
                     function: function.id,
-                    reason: "Array builders cannot be stored in stack slots"
-                )
-            }
-            if case .arraySortState = type {
-                throw Verification.Error.invalidFunction(
-                    function: function.id,
-                    reason: "Array sort states cannot be stored in stack slots"
+                    reason: "Array operation states cannot be stored in stack slots"
                 )
             }
             try verify(type, depth: 0, isRegister: true)
@@ -1500,28 +1463,22 @@ public struct Engine: Verification.ImageVerifying {
                 reason: "mutable cells cannot be returned"
             )
         }
-        if case .arrayBuilder = function.resultType {
+        if case .arrayState = function.resultType {
             throw Verification.Error.invalidFunction(
                 function: function.id,
-                reason: "Array builders cannot be returned"
-            )
-        }
-        if case .arraySortState = function.resultType {
-            throw Verification.Error.invalidFunction(
-                function: function.id,
-                reason: "Array sort states cannot be returned"
+                reason: "Array operation states cannot be returned"
             )
         }
         if function.parameterRegisters.contains(where: { parameter in
             guard let type = function.type(of: parameter) else { return false }
             return switch type {
-            case .arrayBuilder, .arraySortState: true
+            case .arrayState: true
             default: false
             }
         }) {
             throw Verification.Error.invalidFunction(
                 function: function.id,
-                reason: "Array builders cannot be function parameters"
+                reason: "Array operation states cannot be function parameters"
             )
         }
         try verify(function.resultType, depth: 0, isRegister: false)
@@ -2490,7 +2447,7 @@ public struct Engine: Verification.ImageVerifying {
                     "make_array_builder requires \(Core.Capability.collectionsV1)"
                 )
             }
-            guard case let .arrayBuilder(element) = type(result),
+            guard case let .arrayState(.builder, element) = type(result),
                   isCopyable(element, shell: shell)
             else {
                 throw fail(
@@ -2499,7 +2456,7 @@ public struct Engine: Verification.ImageVerifying {
             }
         case let .arrayBuilderAppend(builder, value):
             guard capabilities.contains(.collectionsV1),
-                  case let .arrayBuilder(element) = type(builder),
+                  case let .arrayState(.builder, element) = type(builder),
                   type(value) == element,
                   isCopyable(element, shell: shell)
             else {
@@ -2509,7 +2466,7 @@ public struct Engine: Verification.ImageVerifying {
             }
         case let .arrayBuilderAppendContents(builder, array):
             guard capabilities.contains(.collectionsV1),
-                  case let .arrayBuilder(element) = type(builder),
+                  case let .arrayState(.builder, element) = type(builder),
                   type(array) == .array(element),
                   isCopyable(element, shell: shell)
             else {
@@ -2519,7 +2476,7 @@ public struct Engine: Verification.ImageVerifying {
             }
         case let .finishArrayBuilder(result, builder):
             guard capabilities.contains(.collectionsV1),
-                  case let .arrayBuilder(element) = type(builder),
+                  case let .arrayState(.builder, element) = type(builder),
                   type(result) == .array(element),
                   isCopyable(element, shell: shell)
             else {
@@ -2545,7 +2502,10 @@ public struct Engine: Verification.ImageVerifying {
                 throw fail("Array sorting requires \(Core.Capability.collectionsV1)")
             }
             guard case let .array(element) = type(array),
-                  type(result) == .arraySortState(element),
+                  type(result) == .arrayState(
+                    kind: .stableSort,
+                    element: element
+                  ),
                   isCopyable(element, shell: shell)
             else {
                 throw fail(
@@ -2556,7 +2516,7 @@ public struct Engine: Verification.ImageVerifying {
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("Array sorting requires \(Core.Capability.collectionsV1)")
             }
-            guard case let .arraySortState(element) = type(state),
+            guard case let .arrayState(.stableSort, element) = type(state),
                   type(result) == .optional(.tuple([element, element])),
                   isCopyable(element, shell: shell)
             else {
@@ -2566,7 +2526,7 @@ public struct Engine: Verification.ImageVerifying {
             }
         case let .arraySortAcceptComparison(state, rightPrecedesLeft):
             guard capabilities.contains(.collectionsV1),
-                  case .arraySortState = type(state),
+                  case .arrayState(.stableSort, _) = type(state),
                   type(rightPrecedesLeft) == .bool
             else {
                 throw fail(
@@ -2575,12 +2535,84 @@ public struct Engine: Verification.ImageVerifying {
             }
         case let .finishArraySort(result, state):
             guard capabilities.contains(.collectionsV1),
-                  case let .arraySortState(element) = type(state),
+                  case let .arrayState(.stableSort, element) = type(state),
                   type(result) == .array(element),
                   isCopyable(element, shell: shell)
             else {
                 throw fail(
                     "finish_array_sort must produce its matching Array"
+                )
+            }
+        case let .arraySplitSeparator(
+            result,
+            array,
+            separator,
+            maximumSplits,
+            omittingEmptySubsequences
+        ):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array splitting requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(separator) == element,
+                  type(maximumSplits) == .int64,
+                  type(omittingEmptySubsequences) == .bool,
+                  type(result) == .array(.array(element)),
+                  element.isVMEquatable,
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_split requires matching VM-Equatable Array, "
+                        + "separator, Int maximum, and Bool omission flag"
+                )
+            }
+        case let .makeArraySplitState(
+            result,
+            array,
+            maximumSplits,
+            omittingEmptySubsequences
+        ):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array splitting requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(result) == .arrayState(kind: .split, element: element),
+                  type(maximumSplits) == .int64,
+                  type(omittingEmptySubsequences) == .bool,
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "make_array_split_state requires a matching copyable "
+                        + "Array, Int maximum, and Bool omission flag"
+                )
+            }
+        case let .arraySplitNextElement(result, state):
+            guard capabilities.contains(.collectionsV1),
+                  case let .arrayState(.split, element) = type(state),
+                  type(result) == .optional(element),
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_split_next_element requires its matching split state"
+                )
+            }
+        case let .arraySplitAcceptElement(state, isSeparator):
+            guard capabilities.contains(.collectionsV1),
+                  case .arrayState(.split, _) = type(state),
+                  type(isSeparator) == .bool
+            else {
+                throw fail(
+                    "array_split_accept_element requires split state and Bool"
+                )
+            }
+        case let .finishArraySplit(result, state):
+            guard capabilities.contains(.collectionsV1),
+                  case let .arrayState(.split, element) = type(state),
+                  type(result) == .array(.array(element)),
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "finish_array_split must produce its matching nested Array"
                 )
             }
         case let .arrayUpdate(result, array, index, value):
@@ -3160,7 +3192,7 @@ public struct Engine: Verification.ImageVerifying {
             shell.types[id]?.isCopyable == true
         case .closure, .mutableCell:
             true
-        case .arrayBuilder, .arraySortState:
+        case .arrayState:
             false
         case let .tuple(elements):
             elements.allSatisfy { isCopyable($0, shell: shell) }
@@ -3509,6 +3541,20 @@ public struct Engine: Verification.ImageVerifying {
                         == true {
                         live.insert(result)
                     }
+                case let .makeArraySplitState(result, _, _, _):
+                    live.insert(result)
+                case .arraySplitAcceptElement:
+                    break
+                case let .finishArraySplit(result, state):
+                    guard live.remove(state) != nil else {
+                        throw fail(
+                            "finish_array_split consumes a non-live state"
+                        )
+                    }
+                    if function.type(of: result)?.requiresLinearOwnership
+                        == true {
+                        live.insert(result)
+                    }
                 case let .loadAddress(result, _, _):
                     if function.type(of: result)?.requiresLinearOwnership == true {
                         live.insert(result)
@@ -3560,6 +3606,8 @@ public struct Engine: Verification.ImageVerifying {
                      let .arraySwap(result, _, _, _),
                      let .arraySorted(result, _),
                      let .arraySortNextComparison(result, _),
+                     let .arraySplitSeparator(result, _, _, _, _),
+                     let .arraySplitNextElement(result, _),
                      let .arrayAppend(result, _, _), let .arrayUpdate(result, _, _, _),
                      let .arrayNext(result, _, _, _),
                      let .progressionNext(result, _, _, _, _),

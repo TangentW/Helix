@@ -105,8 +105,10 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
     case error
     case address(Bytecode.ValueType)
     case mutableCell(Bytecode.ValueType)
-    case arrayBuilder(Bytecode.ValueType)
-    case arraySortState(Bytecode.ValueType)
+    case arrayState(
+        kind: Bytecode.ArrayStateKind,
+        element: Bytecode.ValueType
+    )
     case closure(Bytecode.ClosureSignature)
     case tuple([Bytecode.ValueType])
     case optional(Bytecode.ValueType)
@@ -122,7 +124,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case let .optional(wrapped):
             wrapped.isTrivial
         case .string, .any, .array, .dictionary, .set, .native, .local, .error,
-             .address, .mutableCell, .arrayBuilder, .arraySortState, .closure:
+             .address, .mutableCell, .arrayState, .closure:
             false
         }
     }
@@ -144,7 +146,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
             key.requiresLinearOwnership || value.requiresLinearOwnership
         case let .set(element):
             element.requiresLinearOwnership
-        case .arrayBuilder, .arraySortState:
+        case .arrayState:
             true
         case .void, .never, .bool, .integer, .float, .string, .any, .local,
              .error, .address, .mutableCell, .closure:
@@ -169,8 +171,8 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case .error: "any Error"
         case let .address(pointee): "@address<\(pointee)>"
         case let .mutableCell(pointee): "@mutableCell<\(pointee)>"
-        case let .arrayBuilder(element): "@arrayBuilder<\(element)>"
-        case let .arraySortState(element): "@arraySortState<\(element)>"
+        case let .arrayState(kind, element):
+            "@arrayState.\(kind)<\(element)>"
         case let .closure(signature): "@closure\(signature)"
         case let .tuple(elements): "(\(elements.map(\.description).joined(separator: ", ")))"
         case let .optional(wrapped): "Optional<\(wrapped)>"
@@ -735,6 +737,35 @@ public enum Instruction: Codable, Hashable, Sendable {
         result: Bytecode.Register,
         state: Bytecode.Register
     )
+    /// Splits an Array by VM-defined Equatable semantics. Predicate-driven
+    /// splitting uses the linear state-machine instructions below.
+    case arraySplitSeparator(
+        result: Bytecode.Register,
+        array: Bytecode.Register,
+        separator: Bytecode.Register,
+        maxSplits: Bytecode.Register,
+        omittingEmptySubsequences: Bytecode.Register
+    )
+    case makeArraySplitState(
+        result: Bytecode.Register,
+        array: Bytecode.Register,
+        maxSplits: Bytecode.Register,
+        omittingEmptySubsequences: Bytecode.Register
+    )
+    /// Produces the next predicate input, or `nil` once the input is exhausted
+    /// or the requested number of splits has already been performed.
+    case arraySplitNextElement(
+        result: Bytecode.Register,
+        state: Bytecode.Register
+    )
+    case arraySplitAcceptElement(
+        state: Bytecode.Register,
+        isSeparator: Bytecode.Register
+    )
+    case finishArraySplit(
+        result: Bytecode.Register,
+        state: Bytecode.Register
+    )
     case arrayUpdate(
         result: Bytecode.Register,
         array: Bytecode.Register,
@@ -942,6 +973,10 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .makeArraySortState(result, _),
              let .arraySortNextComparison(result, _),
              let .finishArraySort(result, _),
+             let .arraySplitSeparator(result, _, _, _, _),
+             let .makeArraySplitState(result, _, _, _),
+             let .arraySplitNextElement(result, _),
+             let .finishArraySplit(result, _),
              let .allocateObject(result),
              let .projectObjectAddress(result, _, _),
              let .projectHostedObject(result, _),
@@ -1032,6 +1067,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              .storeMutableCell, .arrayBuilderAppend,
              .arrayBuilderAppendContents,
              .arraySortAcceptComparison,
+             .arraySplitAcceptElement,
              .hostedSuperApply, .endAccess,
              .storeAddress, .destroyAddress,
              .destroyAddressIfInitialized, .switchOptional, .branch,
@@ -1192,6 +1228,26 @@ public enum Instruction: Codable, Hashable, Sendable {
             [state]
         case let .arraySortAcceptComparison(state, rightPrecedesLeft):
             [state, rightPrecedesLeft]
+        case let .arraySplitSeparator(
+            _,
+            array,
+            separator,
+            maxSplits,
+            omittingEmptySubsequences
+        ):
+            [array, separator, maxSplits, omittingEmptySubsequences]
+        case let .makeArraySplitState(
+            _,
+            array,
+            maxSplits,
+            omittingEmptySubsequences
+        ):
+            [array, maxSplits, omittingEmptySubsequences]
+        case let .arraySplitNextElement(_, state),
+             let .finishArraySplit(_, state):
+            [state]
+        case let .arraySplitAcceptElement(state, isSeparator):
+            [state, isSeparator]
         case let .arrayUpdate(_, array, index, value):
             [array, index, value]
         case let .arrayPopLast(_, _, array):

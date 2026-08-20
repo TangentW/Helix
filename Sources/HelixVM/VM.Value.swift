@@ -89,6 +89,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
     case mutableCell(VM.MutableCell)
     case arrayBuilder(VM.ArrayBuilder)
     case arraySortState(VM.ArraySortState)
+    case arraySplitState(VM.ArraySplitState)
     case closure(VM.Closure)
 
     public var type: Bytecode.ValueType {
@@ -110,8 +111,12 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case .error: .error
         case let .address(address): .address(address.pointee)
         case let .mutableCell(cell): .mutableCell(cell.pointee)
-        case let .arrayBuilder(builder): .arrayBuilder(builder.elementType)
-        case let .arraySortState(state): .arraySortState(state.elementType)
+        case let .arrayBuilder(builder):
+            .arrayState(kind: .builder, element: builder.elementType)
+        case let .arraySortState(state):
+            .arrayState(kind: .stableSort, element: state.elementType)
+        case let .arraySplitState(state):
+            .arrayState(kind: .split, element: state.elementType)
         case let .closure(closure): .closure(closure.signature)
         }
     }
@@ -140,6 +145,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .mutableCell(cell): cell.description
         case let .arrayBuilder(builder): builder.description
         case let .arraySortState(state): state.description
+        case let .arraySplitState(state): state.description
         case let .closure(closure): closure.description
         }
     }
@@ -258,9 +264,11 @@ extension VM.Value {
             address.pointee == pointee && address.isScoped
         case let (.mutableCell(cell), .mutableCell(pointee)):
             cell.pointee == pointee
-        case let (.arrayBuilder(builder), .arrayBuilder(element)):
+        case let (.arrayBuilder(builder), .arrayState(kind: .builder, element)):
             builder.elementType == element
-        case let (.arraySortState(state), .arraySortState(element)):
+        case let (.arraySortState(state), .arrayState(kind: .stableSort, element)):
+            state.elementType == element
+        case let (.arraySplitState(state), .arrayState(kind: .split, element)):
             state.elementType == element
         case let (.closure(closure), .closure(signature)):
             closure.signature == signature

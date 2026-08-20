@@ -109,11 +109,15 @@ Both workflows depend on stable, build-specific identities:
   removes frozen declarations and rebuilds the tables strictly. Imported field
   types are never guessed to be patch-local merely because Swift emitted their
   storage attributes in the declaration summary.
-- Array-producing closure traversals use one invocation-local linear builder.
+- Array algorithms expose one invocation-local linear state type whose verifier
+  kind distinguishes builder, stable-sort, and split machines. This keeps the
+  noncopyable boundary rules and recursive element typing in one abstraction
+  while preventing one algorithm's instructions from consuming another's
+  state. Array-producing closure traversals use its builder kind.
   Scalar appends and bounded whole-Array appends share the same verifier-owned
   element type and precharge copied storage before allocation; this supports
   Sequence-returning `flatMap` without an intermediate nested Array.
-- Comparator sorting uses a second invocation-local linear value: a bounded
+- Comparator sorting uses the stable-sort kind: a bounded
   stable merge-state machine that owns copied elements and index buffers while
   each comparison remains an ordinary closure call in verified control flow.
   The Verifier requires the state to be created, finished, or destroyed on
@@ -123,6 +127,10 @@ Both workflows depend on stable, build-specific identities:
   two-builder stable partition propagate their completed Array through the
   normal continuation with an explicit assignment writeback; throwing edges
   destroy transient state and leave the original inout storage untouched.
+  Separator- and predicate-driven splitting use the split kind, which owns one
+  copied source and records segment ranges until completion. Predicate calls
+  remain ordinary closure CFG edges; reaching `maxSplits` stops evaluation and
+  appends the untouched suffix, while a throwing edge destroys the state.
 - Array-backed predicate traversal uses one direction-aware cursor operation.
   Forward cursors hold the next index and reverse cursors hold an exclusive
   upper bound, so both directions preserve Swift's predicate order without

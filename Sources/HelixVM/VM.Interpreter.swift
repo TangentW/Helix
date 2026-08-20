@@ -134,8 +134,7 @@ public struct Interpreter: Sendable {
                   !rootFunction.parameterRegisters.contains(where: {
                       guard let type = rootFunction.type(of: $0) else { return false }
                       return switch type {
-                      case .address, .mutableCell, .arrayBuilder,
-                           .arraySortState: true
+                      case .address, .mutableCell, .arrayState: true
                       default: false
                       }
                   })
@@ -243,8 +242,7 @@ public struct Interpreter: Sendable {
             case let .tuple(elements):
                 elements.forEach(visit)
             case let .optional(wrapped), let .address(wrapped),
-                 let .mutableCell(wrapped), let .arrayBuilder(wrapped),
-                 let .arraySortState(wrapped):
+                 let .mutableCell(wrapped), let .arrayState(_, wrapped):
                 visit(wrapped)
             case let .array(element), let .set(element):
                 visit(element)
@@ -2176,11 +2174,14 @@ public struct Interpreter: Sendable {
                         registers: &registers
                     )
                 case let .makeArrayBuilder(result):
-                    guard case let .arrayBuilder(element) = function.type(
+                    guard case let .arrayState(.builder, element) = function.type(
                         of: result
                     ) else {
                         throw VM.RuntimeTrap.typeMismatch(
-                            expected: .arrayBuilder(.never),
+                            expected: .arrayState(
+                                kind: .builder,
+                                element: .never
+                            ),
                             actual: function.type(of: result)
                         )
                     }
@@ -2243,12 +2244,12 @@ public struct Interpreter: Sendable {
                     try builder.append(contentsOf: copied)
                     try budget.checkDeadline()
                 case let .finishArrayBuilder(result, builderRegister):
-                    guard case let .arrayBuilder(element) = function.type(
+                    guard case let .arrayState(.builder, element) = function.type(
                         of: builderRegister
                     ), function.type(of: result) == .array(element),
                        case let .arrayBuilder(builder) = try consume(
                         builderRegister,
-                        type: .arrayBuilder(element),
+                        type: .arrayState(kind: .builder, element: element),
                         registers: &registers
                        )
                     else {
@@ -2386,12 +2387,15 @@ public struct Interpreter: Sendable {
                         budget: budget
                     )
                 case let .finishArraySort(result, stateRegister):
-                    guard case let .arraySortState(element) = function.type(
+                    guard case let .arrayState(.stableSort, element) = function.type(
                         of: stateRegister
                     ), function.type(of: result) == .array(element),
                        case let .arraySortState(state) = try consume(
                         stateRegister,
-                        type: .arraySortState(element),
+                        type: .arrayState(
+                            kind: .stableSort,
+                            element: element
+                        ),
                         registers: &registers
                        )
                     else {
@@ -2406,6 +2410,158 @@ public struct Interpreter: Sendable {
                     )
                     try initialize(
                         .array(sorted, elementType: element),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arraySplitSeparator(
+                    result,
+                    arrayRegister,
+                    separatorRegister,
+                    maximumSplitsRegister,
+                    omittingEmptyRegister
+                ):
+                    let (elements, elementType) = try array(
+                        arrayRegister,
+                        registers: registers
+                    )
+                    let maximumSplits = try splitMaximum(
+                        maximumSplitsRegister,
+                        registers: registers
+                    )
+                    let omitsEmpty = try boolean(
+                        omittingEmptyRegister,
+                        registers: registers
+                    )
+                    let separator = try read(
+                        separatorRegister,
+                        registers: registers
+                    )
+                    let state = try makeArraySplitState(
+                        elements,
+                        elementType: elementType,
+                        maximumSplits: maximumSplits,
+                        omitsEmptySubsequences: omitsEmpty,
+                        budget: budget
+                    )
+                    while let element = try state.nextElement() {
+                        try state.acceptElement(
+                            isSeparator: try compare(
+                                .equal,
+                                lhs: element,
+                                rhs: separator,
+                                budget: budget
+                            ),
+                            budget: budget
+                        )
+                    }
+                    let segments = try state.finish(budget: budget)
+                    try budget.checkDeadline()
+                    try initialize(
+                        .array(
+                            segments,
+                            elementType: .array(elementType)
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .makeArraySplitState(
+                    result,
+                    arrayRegister,
+                    maximumSplitsRegister,
+                    omittingEmptyRegister
+                ):
+                    let (elements, elementType) = try array(
+                        arrayRegister,
+                        registers: registers
+                    )
+                    let state = try makeArraySplitState(
+                        elements,
+                        elementType: elementType,
+                        maximumSplits: try splitMaximum(
+                            maximumSplitsRegister,
+                            registers: registers
+                        ),
+                        omitsEmptySubsequences: try boolean(
+                            omittingEmptyRegister,
+                            registers: registers
+                        ),
+                        budget: budget
+                    )
+                    try initialize(
+                        .arraySplitState(state),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arraySplitNextElement(result, stateRegister):
+                    guard case let .arraySplitState(state) = try read(
+                        stateRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: stateRegister) ?? .never,
+                            actual: try read(
+                                stateRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    let value: VM.Value
+                    if let element = try state.nextElement() {
+                        try chargeAggregate(elementCount: 1, budget: budget)
+                        value = .optional(
+                            try copyCharging(element, budget: budget)
+                        )
+                    } else {
+                        try chargeAggregate(elementCount: 0, budget: budget)
+                        value = .optional(nil)
+                    }
+                    try initialize(
+                        value,
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arraySplitAcceptElement(
+                    stateRegister,
+                    predicateRegister
+                ):
+                    guard case let .arraySplitState(state) = try read(
+                        stateRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: stateRegister) ?? .never,
+                            actual: try read(
+                                stateRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    try state.acceptElement(
+                        isSeparator: try boolean(
+                            predicateRegister,
+                            registers: registers
+                        ),
+                        budget: budget
+                    )
+                case let .finishArraySplit(result, stateRegister):
+                    guard case let .arrayState(.split, element) = function.type(
+                        of: stateRegister
+                    ), function.type(of: result) == .array(.array(element)),
+                       case let .arraySplitState(state) = try consume(
+                        stateRegister,
+                        type: .arrayState(kind: .split, element: element),
+                        registers: &registers
+                       )
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: function.type(of: stateRegister)
+                        )
+                    }
+                    let segments = try state.finish(budget: budget)
+                    try budget.checkDeadline()
+                    try initialize(
+                        .array(segments, elementType: .array(element)),
                         register: result,
                         registers: &registers
                     )
@@ -3700,14 +3856,21 @@ public struct Interpreter: Sendable {
                     actual: value.type
                 )
             }
-        case let (.arrayBuilder(builder), .arrayBuilder(element)):
+        case let (.arrayBuilder(builder), .arrayState(.builder, element)):
             guard builder.elementType == element else {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: expected,
                     actual: value.type
                 )
             }
-        case let (.arraySortState(state), .arraySortState(element)):
+        case let (.arraySortState(state), .arrayState(.stableSort, element)):
+            guard state.elementType == element else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: expected,
+                    actual: value.type
+                )
+            }
+        case let (.arraySplitState(state), .arrayState(.split, element)):
             guard state.elementType == element else {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: expected,
@@ -4013,6 +4176,30 @@ public struct Interpreter: Sendable {
         return integer
     }
 
+    private func boolean(
+        _ register: Bytecode.Register,
+        registers: [VM.Value?]
+    ) throws -> Bool {
+        let value = try read(register, registers: registers)
+        guard case let .bool(boolean) = value else {
+            throw VM.RuntimeTrap.typeMismatch(expected: .bool, actual: value.type)
+        }
+        return boolean
+    }
+
+    private func splitMaximum(
+        _ register: Bytecode.Register,
+        registers: [VM.Value?]
+    ) throws -> Int {
+        let value = try integer(register, registers: registers).signedValue
+        guard value >= 0, let exact = Int(exactly: value) else {
+            throw VM.RuntimeTrap.explicit(
+                "maximum split count cannot be negative"
+            )
+        }
+        return exact
+    }
+
     private func copy(_ value: VM.Value) throws -> VM.Value {
         if value.type.isVMHashable {
             // This closed family contains no native handles or mutable cells.
@@ -4078,7 +4265,7 @@ public struct Interpreter: Sendable {
             )
         case .mutableCell:
             value
-        case .arrayBuilder, .arraySortState:
+        case .arrayBuilder, .arraySortState, .arraySplitState:
             throw VM.RuntimeTrap.explicit(
                 "Array construction state cannot be copied"
             )
@@ -4252,7 +4439,7 @@ public struct Interpreter: Sendable {
                 try chargeCopiedValue(capture, budget: budget, depth: depth + 1)
             }
         case .bool, .integer, .float, .string, .address, .mutableCell,
-             .arrayBuilder, .arraySortState:
+             .arrayBuilder, .arraySortState, .arraySplitState:
             break
         }
     }
@@ -4312,7 +4499,7 @@ public struct Interpreter: Sendable {
                 try chargeValueTraversal(capture, budget: budget, depth: depth + 1)
             }
         case .optional(nil), .native, .bool, .integer, .float, .address,
-             .mutableCell, .arrayBuilder, .arraySortState:
+             .mutableCell, .arrayBuilder, .arraySortState, .arraySplitState:
             break
         }
     }
@@ -4381,7 +4568,8 @@ public struct Interpreter: Sendable {
                 try chargeShapeValidation(capture, budget: budget, depth: depth + 1)
             }
         case .optional(nil), .native, .bool, .integer, .float, .string,
-             .address, .mutableCell, .arrayBuilder, .arraySortState:
+             .address, .mutableCell, .arrayBuilder, .arraySortState,
+             .arraySplitState:
             break
         }
     }
@@ -4922,6 +5110,28 @@ public struct Interpreter: Sendable {
         let copied = try elements.map(copy)
         try budget.checkDeadline()
         return try .init(elementType: elementType, elements: copied)
+    }
+
+    private func makeArraySplitState(
+        _ elements: [VM.Value],
+        elementType: Bytecode.ValueType,
+        maximumSplits: Int,
+        omitsEmptySubsequences: Bool,
+        budget: VM.InvocationBudget
+    ) throws -> VM.ArraySplitState {
+        try budget.consumeLinearWork(elementCount: elements.count)
+        try chargeAggregate(elementCount: elements.count, budget: budget)
+        for element in elements {
+            try prepareCopy(element, budget: budget)
+        }
+        let copied = try elements.map(copy)
+        try budget.checkDeadline()
+        return try .init(
+            elementType: elementType,
+            elements: copied,
+            maximumSplits: maximumSplits,
+            omitsEmptySubsequences: omitsEmptySubsequences
+        )
     }
 
     private func finishArraySort(

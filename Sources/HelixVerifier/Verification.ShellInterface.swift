@@ -161,8 +161,7 @@ public struct ShellInterface: Sendable {
                     "Any in \(owner) signature requires \(Core.Capability.anyValuesV1)"
                 )
             }
-        case .local, .error, .address, .mutableCell, .arrayBuilder,
-             .arraySortState, .closure:
+        case .local, .error, .address, .mutableCell, .arrayState, .closure:
             // Local nominal identities exist only inside one verified image and
             // therefore cannot be frozen into a Shell ABI or NativeImport catalog.
             throw Verification.Error.invalidShellInterface(

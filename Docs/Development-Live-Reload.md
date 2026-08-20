@@ -344,6 +344,10 @@ first/last searches, comparator-driven `min(by:)`/`max(by:)`, and scoped
 inout accumulation through `reduce(into:_:)`, stable comparator
 `sorted(by:)`/`sort(by:)`, and stable `partition(by:)`—use
 verified closure CFGs; Array-producing variants use a linear builder, while
+separator- and predicate-driven Array-backed `split` use one kind-checked
+linear range state with exact `maxSplits`, empty-segment, and throwing-edge
+semantics. Split subsequences are normalized by element sequence and therefore
+do not preserve a source view's public index identity. Meanwhile,
 supported Optional and Result payload transforms use the same selected-case
 plan. Common Array structural edits—including concatenation, contents append
 and insertion, range replacement/removal, counted edge removal, clearing,

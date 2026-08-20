@@ -2901,9 +2901,127 @@ struct Interpreter {
         )
     }
 
+    @Test("Direct Array splitting is typed and fuel-bounded")
+    func executesDirectArraySplitting() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let resultType = Bytecode.ValueType.array(arrayType)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "directArraySplitting",
+            parameterRegisters: [
+                .init(rawValue: 0),
+                .init(rawValue: 1),
+                .init(rawValue: 2),
+                .init(rawValue: 3),
+            ],
+            resultType: resultType,
+            registerTypes: [
+                arrayType,
+                .int64,
+                .int64,
+                .bool,
+                resultType,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0),
+                        .init(rawValue: 1),
+                        .init(rawValue: 2),
+                        .init(rawValue: 3),
+                    ],
+                    instructions: [
+                        .arraySplitSeparator(
+                            result: .init(rawValue: 4),
+                            array: .init(rawValue: 0),
+                            separator: .init(rawValue: 1),
+                            maxSplits: .init(rawValue: 2),
+                            omittingEmptySubsequences: .init(rawValue: 3)
+                        ),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .collectionsV1],
+            signature: .init(
+                parameters: [
+                    "Swift.Array<Swift.Int>",
+                    "Swift.Int",
+                    "Swift.Int",
+                    "Swift.Bool",
+                ],
+                result: "Swift.Array<Swift.Array<Swift.Int>>"
+            ),
+            parameterTypes: [arrayType, .int64, .int64, .bool],
+            resultType: resultType
+        )
+        func integer(_ value: Int64) throws -> VM.Value {
+            .integer(
+                try .init(signed: value, bitWidth: 64, isSigned: true)
+            )
+        }
+        func array(_ values: [Int64]) throws -> VM.Value {
+            .array(try values.map(integer), elementType: .int64)
+        }
+        let input = try array([0, 1, 0, 2, 0])
+        let arguments = [
+            input,
+            try integer(0),
+            try integer(2),
+            .bool(true),
+        ]
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: arguments
+            ) == .returned(
+                .array(
+                    [try array([1]), try array([2])],
+                    elementType: arrayType
+                )
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: arguments,
+                budget: .init(
+                    limits: .init(
+                        instructionFuelPerEntry: 3,
+                        maxWallTimeMainThreadMilliseconds: 1_000
+                    )
+                )
+            ) == .trapped(.instructionFuelExhausted)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    input,
+                    try integer(0),
+                    try integer(-1),
+                    .bool(true),
+                ]
+            ) == .trapped(
+                .explicit("maximum split count cannot be negative")
+            )
+        )
+    }
+
     @Test("Linear Array builders accumulate and finish exactly once")
     func executesLinearArrayBuilder() throws {
-        let builderType = Bytecode.ValueType.arrayBuilder(.int64)
+        let builderType = Bytecode.ValueType.arrayState(
+            kind: .builder,
+            element: .int64
+        )
         let function = Bytecode.Function(
             id: .init(rawValue: 0),
             name: "linearArrayBuilder",
@@ -3017,7 +3135,10 @@ struct Interpreter {
     @Test("Array builders append Array contents with bounded copied storage")
     func executesArrayBuilderBatchAppend() throws {
         let sourceType = Bytecode.ValueType.array(.int64)
-        let builderType = Bytecode.ValueType.arrayBuilder(.int64)
+        let builderType = Bytecode.ValueType.arrayState(
+            kind: .builder,
+            element: .int64
+        )
         let function = Bytecode.Function(
             id: .init(rawValue: 0),
             name: "batchArrayBuilder",

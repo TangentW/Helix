@@ -292,6 +292,30 @@ public enum Disassembler {
             "array_sort_accept_comparison \(rightPrecedesLeft) in \(state)"
         case let .finishArraySort(result, state):
             "\(result) = finish_array_sort \(state)"
+        case let .arraySplitSeparator(
+            result,
+            array,
+            separator,
+            maxSplits,
+            omittingEmptySubsequences
+        ):
+            "\(result) = array_split \(array), separator: \(separator), "
+                + "max: \(maxSplits), omit-empty: "
+                + "\(omittingEmptySubsequences)"
+        case let .makeArraySplitState(
+            result,
+            array,
+            maxSplits,
+            omittingEmptySubsequences
+        ):
+            "\(result) = make_array_split_state \(array), max: "
+                + "\(maxSplits), omit-empty: \(omittingEmptySubsequences)"
+        case let .arraySplitNextElement(result, state):
+            "\(result) = array_split_next_element \(state)"
+        case let .arraySplitAcceptElement(state, isSeparator):
+            "array_split_accept_element \(isSeparator) in \(state)"
+        case let .finishArraySplit(result, state):
+            "\(result) = finish_array_split \(state)"
         case let .arrayUpdate(result, array, index, value):
             "\(result) = array_update \(array)[\(index)] = \(value)"
         case let .arrayPopLast(elementResult, arrayResult, array):

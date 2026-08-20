@@ -240,17 +240,23 @@ struct Container {
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
     }
 
-    @Test("HLBC 1.0 canonically carries bounded Array ordering state")
-    func arrayOrderingWireFormat() throws {
+    @Test("HLBC 1.0 canonically carries bounded Array algorithm states")
+    func arrayAlgorithmStateWireFormat() throws {
         var module = try makeAddModule()
         module.capabilities.insert(.collectionsV1)
         module.functions[0].registerTypes.append(contentsOf: [
             .array(.int64),
-            .arraySortState(.int64),
+            .arrayState(kind: .stableSort, element: .int64),
             .optional(.tuple([.int64, .int64])),
             .bool,
             .array(.int64),
             .array(.int64),
+            .arrayState(kind: .split, element: .int64),
+            .int64,
+            .bool,
+            .optional(.int64),
+            .array(.array(.int64)),
+            .array(.array(.int64)),
         ])
         module.functions[0].blocks[0].instructions.insert(contentsOf: [
             .makeArray(
@@ -278,6 +284,33 @@ struct Container {
                 result: .init(rawValue: 10),
                 array: .init(rawValue: 5)
             ),
+            .constantInteger(result: .init(rawValue: 12), bitPattern: 1),
+            .constantBool(result: .init(rawValue: 13), value: true),
+            .makeArraySplitState(
+                result: .init(rawValue: 11),
+                array: .init(rawValue: 5),
+                maxSplits: .init(rawValue: 12),
+                omittingEmptySubsequences: .init(rawValue: 13)
+            ),
+            .arraySplitNextElement(
+                result: .init(rawValue: 14),
+                state: .init(rawValue: 11)
+            ),
+            .arraySplitAcceptElement(
+                state: .init(rawValue: 11),
+                isSeparator: .init(rawValue: 13)
+            ),
+            .finishArraySplit(
+                result: .init(rawValue: 15),
+                state: .init(rawValue: 11)
+            ),
+            .arraySplitSeparator(
+                result: .init(rawValue: 16),
+                array: .init(rawValue: 5),
+                separator: .init(rawValue: 0),
+                maxSplits: .init(rawValue: 12),
+                omittingEmptySubsequences: .init(rawValue: 13)
+            ),
         ], at: 0)
 
         let bytes = try Bytecode.Encoder.encode(module)
@@ -291,6 +324,11 @@ struct Container {
         #expect(text.contains("array_sort_next_comparison"))
         #expect(text.contains("finish_array_sort"))
         #expect(text.contains("array_sorted"))
+        #expect(text.contains("make_array_split_state"))
+        #expect(text.contains("array_split_next_element"))
+        #expect(text.contains("array_split_accept_element"))
+        #expect(text.contains("finish_array_split"))
+        #expect(text.contains("array_split %5"))
     }
 
     @Test("HLBC 1.0 canonically carries closure values and function kinds")

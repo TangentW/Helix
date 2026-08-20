@@ -2285,7 +2285,10 @@ struct SemanticVerifier {
 
     @Test("Array builders are linear invocation-local implementation values")
     func validatesLinearArrayBuilders() throws {
-        let builderType = Bytecode.ValueType.arrayBuilder(.int64)
+        let builderType = Bytecode.ValueType.arrayState(
+            kind: .builder,
+            element: .int64
+        )
         var fixture = try makeFixture { function in
             function.resultType = .array(.int64)
             function.registerTypes = [
@@ -2457,7 +2460,10 @@ struct SemanticVerifier {
     @Test("Array sort state is typed, linear, and invocation-local")
     func validatesLinearArraySortState() throws {
         let arrayType = Bytecode.ValueType.array(.int64)
-        let stateType = Bytecode.ValueType.arraySortState(.int64)
+        let stateType = Bytecode.ValueType.arrayState(
+            kind: .stableSort,
+            element: .int64
+        )
         let pairType = Bytecode.ValueType.tuple([.int64, .int64])
         var fixture = try makeFixture { function in
             function.resultType = arrayType
@@ -2625,6 +2631,235 @@ struct SemanticVerifier {
             .finishArraySort(
                 result: .init(rawValue: 9),
                 state: .init(rawValue: 2)
+            ),
+            at: 1
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 3),
+                offset: 1,
+                reason: "instruction uses a consumed owned value"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(finishedTwice),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var noCapability = fixture
+        noCapability.module.capabilities.remove(.collectionsV1)
+        noCapability.shell.capabilities.remove(.collectionsV1)
+        noCapability.policy.acceptedCapabilities.remove(.collectionsV1)
+        #expect(throws: Verification.Error.self) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(noCapability.module),
+                shell: noCapability.shell,
+                policy: noCapability.policy
+            )
+        }
+
+        var boundaryShell = fixture.shell
+        boundaryShell.entries[entry.index]?.parameterTypes = [stateType]
+        #expect(throws: Verification.Error.self) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: boundaryShell,
+                policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("Array split state is kind-safe, linear, and invocation-local")
+    func validatesLinearArraySplitState() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let resultType = Bytecode.ValueType.array(arrayType)
+        let stateType = Bytecode.ValueType.arrayState(
+            kind: .split,
+            element: .int64
+        )
+        var fixture = try makeFixture { function in
+            function.resultType = resultType
+            function.registerTypes = [
+                .int64,
+                arrayType,
+                .int64,
+                .bool,
+                stateType,
+                .optional(.int64),
+                .int64,
+                resultType,
+            ]
+            function.blocks = [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeArray(
+                            result: .init(rawValue: 1),
+                            elements: [.init(rawValue: 0)]
+                        ),
+                        .constantInteger(
+                            result: .init(rawValue: 2),
+                            bitPattern: 1
+                        ),
+                        .constantBool(
+                            result: .init(rawValue: 3),
+                            value: true
+                        ),
+                        .makeArraySplitState(
+                            result: .init(rawValue: 4),
+                            array: .init(rawValue: 1),
+                            maxSplits: .init(rawValue: 2),
+                            omittingEmptySubsequences: .init(rawValue: 3)
+                        ),
+                        .branch(target: .init(rawValue: 1), arguments: []),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    instructions: [
+                        .arraySplitNextElement(
+                            result: .init(rawValue: 5),
+                            state: .init(rawValue: 4)
+                        ),
+                        .switchOptional(
+                            optional: .init(rawValue: 5),
+                            someTarget: .init(rawValue: 2),
+                            noneTarget: .init(rawValue: 3)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 6)],
+                    instructions: [
+                        .arraySplitAcceptElement(
+                            state: .init(rawValue: 4),
+                            isSeparator: .init(rawValue: 3)
+                        ),
+                        .branch(target: .init(rawValue: 1), arguments: []),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 3),
+                    instructions: [
+                        .finishArraySplit(
+                            result: .init(rawValue: 7),
+                            state: .init(rawValue: 4)
+                        ),
+                        .returnValue(.init(rawValue: 7)),
+                    ]
+                ),
+            ]
+        }
+        fixture.module.capabilities.insert(.collectionsV1)
+        fixture.shell.capabilities.insert(.collectionsV1)
+        fixture.policy.acceptedCapabilities.insert(.collectionsV1)
+        let entry = try #require(fixture.shell.entries[.init(rawValue: 0)])
+        fixture.shell.entries[entry.index] = .init(
+            index: entry.index,
+            key: entry.key,
+            parameterTypes: entry.parameterTypes,
+            resultType: resultType,
+            effects: entry.effects
+        )
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var wrongKind = fixture.module
+        wrongKind.functions[0].registerTypes[4] = .arrayState(
+            kind: .stableSort,
+            element: .int64
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 3,
+                reason: "make_array_split_state requires a matching copyable Array, Int maximum, and Bool omission flag"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(wrongKind),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var wrongNext = fixture.module
+        wrongNext.functions[0].registerTypes[5] = .optional(.bool)
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 1),
+                offset: 0,
+                reason: "array_split_next_element requires its matching split state"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(wrongNext),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var copied = fixture.module
+        copied.functions[0].registerTypes.append(stateType)
+        copied.functions[0].blocks[0].instructions.insert(
+            .copyValue(
+                result: .init(rawValue: 8),
+                source: .init(rawValue: 4)
+            ),
+            at: 4
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 4,
+                reason: "copy_value requires a copyable type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(copied),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var leaked = fixture.module
+        leaked.functions[0].blocks[3].instructions = [
+            .makeArray(result: .init(rawValue: 7), elements: []),
+            .returnValue(.init(rawValue: 7)),
+        ]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 3),
+                offset: 1,
+                reason: "owned values remain live at return"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(leaked),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var finishedTwice = fixture.module
+        finishedTwice.functions[0].registerTypes.append(resultType)
+        finishedTwice.functions[0].blocks[3].instructions.insert(
+            .finishArraySplit(
+                result: .init(rawValue: 8),
+                state: .init(rawValue: 4)
             ),
             at: 1
         )

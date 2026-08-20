@@ -153,10 +153,7 @@ extension CompilerCapabilities {
         case let .mutableCell(pointee):
             capabilities.insert(.mutableCapturesV1)
             collect(pointee, into: &capabilities)
-        case let .arrayBuilder(element):
-            capabilities.insert(.collectionsV1)
-            collect(element, into: &capabilities)
-        case let .arraySortState(element):
+        case let .arrayState(_, element):
             capabilities.insert(.collectionsV1)
             collect(element, into: &capabilities)
         case let .array(element):

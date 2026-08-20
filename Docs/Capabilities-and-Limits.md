@@ -132,6 +132,15 @@ does not by itself certify a physical device or distribution channel.
   their boundary. Mutating ordering writes back only after every callback
   succeeds; if a comparator or predicate throws, the original Array remains
   unchanged even though callback side effects already performed remain visible.
+  Array-backed Collection `split` supports both the
+  `separator:maxSplits:omittingEmptySubsequences:` overload for recursively
+  VM-defined Equatable elements and the throwing `whereSeparator:` overload
+  for any represented copyable element. Both use one kind-checked linear range
+  state: omitted empty segments do not consume `maxSplits`, predicate calls
+  stop as soon as the limit is reached, a negative limit traps before any
+  callback, and throwing edges destroy all transient ownership. Returned
+  subsequences preserve element order but are normalized to Arrays; their
+  original collection index identity is not retained.
   Sequence `prefix(while:)` is also supported when its concrete source has an
   Array-backed normalization. The lazy Sequence `drop(while:)` overload remains
   rejected: eagerly materializing it would change predicate side-effect timing.

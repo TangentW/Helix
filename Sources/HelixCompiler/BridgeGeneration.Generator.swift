@@ -1727,7 +1727,7 @@ public struct Generator: Sendable {
         case let .tuple(elements):
             !elements.isEmpty && elements.allSatisfy(isGeneratedValueType)
         case .void, .never, .local, .error, .address, .mutableCell,
-             .arrayBuilder, .arraySortState, .closure:
+             .arrayState, .closure:
             false
         }
     }
@@ -2004,9 +2004,8 @@ public struct Generator: Sendable {
         case .error: ".error"
         case let .address(pointee): ".address(\(render(pointee)))"
         case let .mutableCell(pointee): ".mutableCell(\(render(pointee)))"
-        case let .arrayBuilder(element): ".arrayBuilder(\(render(element)))"
-        case let .arraySortState(element):
-            ".arraySortState(\(render(element)))"
+        case let .arrayState(kind, element):
+            ".arrayState(kind: .\(kind.rawValue), element: \(render(element)))"
         case let .closure(signature):
             ".closure(Bytecode.ClosureSignature(parameters: "
                 + "\(renderValueTypes(signature.parameters)), parameterConventions: "

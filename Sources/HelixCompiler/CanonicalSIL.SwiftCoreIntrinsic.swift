@@ -6,6 +6,7 @@ enum SwiftCoreIntrinsic: Equatable {
     case collection(CanonicalSIL.CollectionIntrinsic)
     case higherOrder(CanonicalSIL.HigherOrderIntrinsic)
     case ordering(CanonicalSIL.OrderingIntrinsic)
+    case split(CanonicalSIL.SplitIntrinsic)
     case algebraic(CanonicalSIL.AlgebraicIntrinsic)
     case minimum
     case maximum
@@ -130,6 +131,10 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .ordering(.sortBy)
         case "$sSMsSKRzrlE9partition2by5IndexSlQzSb7ElementSTQzKXE_tKF":
             self = .ordering(.partition)
+        case "$sSlsSQ7ElementRpzrlE5split9separator9maxSplits25omittingEmptySubsequencesSay11SubSequenceQzGAB_SiSbtF":
+            self = .split(.separator)
+        case "$sSlsE5split9maxSplits25omittingEmptySubsequences14whereSeparatorSay11SubSequenceQzGSi_S2b7ElementQzKXEtKF":
+            self = .split(.predicate)
         case "$sSq3mapyqd_0_Sgqd_0_xqd__YKXEqd__YKs5ErrorRd__Ri_d_0_r0_lF":
             self = .algebraic(.optional(.map))
         case "$sSq7flatMapyqd_0_SgABxqd__YKXEqd__YKs5ErrorRd__Ri_d_0_r0_lF":

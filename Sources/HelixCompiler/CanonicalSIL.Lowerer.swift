@@ -227,6 +227,14 @@ public struct Lowerer: Sendable {
         var elementType: Bytecode.ValueType
     }
 
+    private struct ArraySplitPlan {
+        var sourceToken: String
+        var decisionToken: String
+        var maximumSplitsToken: String
+        var omittingEmptySubsequencesToken: String
+        var elementType: Bytecode.ValueType
+    }
+
     private struct ImplicitStackValue {
         var address: String
         var register: Bytecode.Register
@@ -3474,6 +3482,72 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func lowerSeparatorArraySplit(
+            resultToken: String,
+            genericArguments: String,
+            argumentText: String,
+            line: Int
+        ) throws {
+            let plan = try parseArraySplitPlan(
+                operation: .separator,
+                genericArguments: genericArguments,
+                argumentText: argumentText,
+                line: line
+            )
+            guard plan.elementType.isVMEquatable else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "split(separator:) requires VM-defined Equatable semantics"
+                )
+            }
+            let arrayType = Bytecode.ValueType.array(plan.elementType)
+            let borrowedSource = try borrowStoredValue(
+                at: plan.sourceToken,
+                line: line
+            )
+            let source = try borrowedSource?.register
+                ?? resolve(plan.sourceToken, line: line)
+            let borrowedSeparator = try borrowStoredValue(
+                at: plan.decisionToken,
+                line: line
+            )
+            let separator = try borrowedSeparator?.register
+                ?? resolve(plan.decisionToken, line: line)
+            let maximumSplits = try resolve(
+                plan.maximumSplitsToken,
+                line: line
+            )
+            let omittingEmptySubsequences = try resolve(
+                plan.omittingEmptySubsequencesToken,
+                line: line
+            )
+            guard registerTypes[Int(source.rawValue)] == arrayType,
+                  registerTypes[Int(separator.rawValue)] == plan.elementType,
+                  registerTypes[Int(maximumSplits.rawValue)] == .int64,
+                  registerTypes[Int(omittingEmptySubsequences.rawValue)] == .bool
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "split(separator:) arguments do not match its specialization"
+                )
+            }
+            let result = try allocate(type: .array(arrayType))
+            appendInstruction(
+                .arraySplitSeparator(
+                    result: result,
+                    array: source,
+                    separator: separator,
+                    maxSplits: maximumSplits,
+                    omittingEmptySubsequences: omittingEmptySubsequences
+                )
+            )
+            for owner in [
+                borrowedSeparator?.temporaryOwner,
+                borrowedSource?.temporaryOwner,
+            ].compactMap({ $0 }) {
+                appendInstruction(.destroyValue(owner))
+            }
+            values[resultToken] = result
+        }
+
         func resolveArrayOrderingClosure(
             for plan: ArrayOrderingPlan,
             line: Int
@@ -3594,7 +3668,10 @@ public struct Lowerer: Sendable {
             let errorType: Bytecode.ValueType = typeEnvironment
                 .preservesTypedErrors ? .error : .string
             let errorParameter = try allocate(type: errorType)
-            let stateType = Bytecode.ValueType.arraySortState(plan.elementType)
+            let stateType = Bytecode.ValueType.arrayState(
+                kind: .stableSort,
+                element: plan.elementType
+            )
             let state = try allocate(type: stateType)
             let comparisonType = Bytecode.ValueType.tuple([
                 plan.elementType,
@@ -3734,7 +3811,10 @@ public struct Lowerer: Sendable {
             let errorType: Bytecode.ValueType = typeEnvironment
                 .preservesTypedErrors ? .error : .string
             let errorParameter = try allocate(type: errorType)
-            let builderType = Bytecode.ValueType.arrayBuilder(plan.elementType)
+            let builderType = Bytecode.ValueType.arrayState(
+                kind: .builder,
+                element: plan.elementType
+            )
             let falseBuilder = try allocate(type: builderType)
             let trueBuilder = try allocate(type: builderType)
             let indexSlot = try allocateStackSlot(type: .int64)
@@ -3992,6 +4072,141 @@ public struct Lowerer: Sendable {
                     "natural ordering unexpectedly used try_apply"
                 )
             }
+        }
+
+        func lowerArraySplitTryApply(
+            genericArguments: String,
+            argumentText: String,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            let plan = try parseArraySplitPlan(
+                operation: .predicate,
+                genericArguments: genericArguments,
+                argumentText: argumentText,
+                line: line
+            )
+            let arrayType = Bytecode.ValueType.array(plan.elementType)
+            let borrowedSource = try borrowStoredValue(
+                at: plan.sourceToken,
+                line: line
+            )
+            let source = try borrowedSource?.register
+                ?? resolve(plan.sourceToken, line: line)
+            let maximumSplits = try resolve(
+                plan.maximumSplitsToken,
+                line: line
+            )
+            let omittingEmptySubsequences = try resolve(
+                plan.omittingEmptySubsequencesToken,
+                line: line
+            )
+            let closure = try resolve(plan.decisionToken, line: line)
+            guard registerTypes[Int(source.rawValue)] == arrayType,
+                  registerTypes[Int(maximumSplits.rawValue)] == .int64,
+                  registerTypes[Int(omittingEmptySubsequences.rawValue)] == .bool,
+                  case let .closure(signature) = registerTypes[
+                    Int(closure.rawValue)
+                  ], signature.parameters == [plan.elementType],
+                  signature.parameterConventions.count == 1,
+                  signature.parameterConventions[0] != .inout,
+                  signature.result == .bool,
+                  signature.effects.mayThrow,
+                  !signature.effects.isAsync
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<Array split predicate>"
+                )
+            }
+
+            let errorType: Bytecode.ValueType = typeEnvironment
+                .preservesTypedErrors ? .error : .string
+            let error = try allocate(type: errorType)
+            let state = try allocate(
+                type: .arrayState(kind: .split, element: plan.elementType)
+            )
+            let next = try allocate(type: .optional(plan.elementType))
+            let element = try allocate(type: plan.elementType)
+            let isSeparator = try allocate(type: .bool)
+            let result = try allocate(type: .array(arrayType))
+            let loop = try allocateSyntheticBlockID()
+            let evaluate = try allocateSyntheticBlockID()
+            let accepted = try allocateSyntheticBlockID()
+            let complete = try allocateSyntheticBlockID()
+            let failed = try allocateSyntheticBlockID()
+
+            appendInstruction(
+                .makeArraySplitState(
+                    result: state,
+                    array: source,
+                    maxSplits: maximumSplits,
+                    omittingEmptySubsequences: omittingEmptySubsequences
+                )
+            )
+            if let owner = borrowedSource?.temporaryOwner {
+                appendInstruction(.destroyValue(owner))
+            }
+            appendInstruction(.branch(target: loop, arguments: []))
+            finishCurrent()
+
+            appendSyntheticBlock(
+                id: loop,
+                instructions: [
+                    .arraySplitNextElement(result: next, state: state),
+                    .switchOptional(
+                        optional: next,
+                        someTarget: evaluate,
+                        noneTarget: complete
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: evaluate,
+                parameters: [element],
+                instructions: [
+                    .closureTryApply(
+                        closure: closure,
+                        arguments: [element],
+                        normalTarget: accepted,
+                        errorTarget: failed
+                    ),
+                ]
+            )
+            let borrowedElementCleanup: [IntermediateRepresentation.Instruction]
+            if plan.elementType.requiresLinearOwnership,
+               signature.parameterConventions[0] == .borrowed {
+                borrowedElementCleanup = [.destroyValue(element)]
+            } else {
+                borrowedElementCleanup = []
+            }
+            appendSyntheticBlock(
+                id: accepted,
+                parameters: [isSeparator],
+                instructions: borrowedElementCleanup + [
+                    .arraySplitAcceptElement(
+                        state: state,
+                        isSeparator: isSeparator
+                    ),
+                    .branch(target: loop, arguments: []),
+                ]
+            )
+            appendSyntheticBlock(
+                id: complete,
+                instructions: [
+                    .finishArraySplit(result: result, state: state),
+                    .branch(target: normalTarget, arguments: [result]),
+                ]
+            )
+            appendSyntheticBlock(
+                id: failed,
+                parameters: [error],
+                instructions: borrowedElementCleanup + [
+                    .destroyValue(state),
+                    .branch(target: errorTarget, arguments: [error]),
+                ]
+            )
         }
 
         /// `Sequence.reduce(into:_:)` is the standard-library operation whose
@@ -4425,7 +4640,9 @@ public struct Lowerer: Sendable {
                         "higher-order Array builder has a non-Array result"
                     )
                 }
-                let register = try allocate(type: .arrayBuilder(element))
+                let register = try allocate(
+                    type: .arrayState(kind: .builder, element: element)
+                )
                 appendInstruction(.makeArrayBuilder(result: register))
                 builder = register
             } else {
@@ -8563,7 +8780,14 @@ public struct Lowerer: Sendable {
                     arguments: arguments,
                     line: line
                 )
-            case .higherOrder, .ordering, .algebraic:
+            case let .split(operation) where !operation.usesClosure:
+                try lowerSeparatorArraySplit(
+                    resultToken: resultToken,
+                    genericArguments: genericArguments,
+                    argumentText: argumentText,
+                    line: line
+                )
+            case .higherOrder, .ordering, .split, .algebraic:
                 throw CanonicalSIL.LoweringError.unsupportedInstruction(
                     line: line,
                     text: "Swift intrinsic requires control-flow lowering"
@@ -13400,6 +13624,18 @@ public struct Lowerer: Sendable {
                     )
                     continue
                 }
+                if case .split(.predicate)? = swiftCoreReferences[call[0]] {
+                    let normalTarget = try parseBlockID(call[4])
+                    let errorTarget = try parseBlockID(call[5])
+                    try lowerArraySplitTryApply(
+                        genericArguments: call[1],
+                        argumentText: call[2],
+                        normalTarget: normalTarget,
+                        errorTarget: errorTarget,
+                        line: sourceLine
+                    )
+                    continue
+                }
                 if case let .algebraic(intrinsic)? = swiftCoreReferences[
                     call[0]
                 ] {
@@ -17087,8 +17323,7 @@ public struct Lowerer: Sendable {
 
     private func supportsIndirectResult(_ type: Bytecode.ValueType) -> Bool {
         switch type {
-        case .void, .never, .address, .mutableCell, .arrayBuilder,
-             .arraySortState:
+        case .void, .never, .address, .mutableCell, .arrayState:
             false
         case .bool, .integer, .float, .string, .any, .array, .dictionary, .set,
              .tuple, .native, .local, .error, .closure, .optional:
@@ -17739,6 +17974,44 @@ public struct Lowerer: Sendable {
         case .sorted, .sort:
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "natural ordering reached comparator plan parsing"
+            )
+        }
+    }
+
+    private func parseArraySplitPlan(
+        operation: CanonicalSIL.SplitIntrinsic,
+        genericArguments: String,
+        argumentText: String,
+        line: Int
+    ) throws -> ArraySplitPlan {
+        let genericTypes = try splitTopLevel(genericArguments)
+            .filter { !$0.isEmpty }
+            .map(parseType)
+        let arguments = try parseApplyValueTokens(argumentText, line: line)
+        guard genericTypes.count == 1,
+              case let .array(element) = genericTypes[0],
+              arguments.count == 4
+        else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "split requires a represented Array-backed Collection"
+            )
+        }
+        switch operation {
+        case .separator:
+            return .init(
+                sourceToken: arguments[3],
+                decisionToken: arguments[0],
+                maximumSplitsToken: arguments[1],
+                omittingEmptySubsequencesToken: arguments[2],
+                elementType: element
+            )
+        case .predicate:
+            return .init(
+                sourceToken: arguments[3],
+                decisionToken: arguments[2],
+                maximumSplitsToken: arguments[0],
+                omittingEmptySubsequencesToken: arguments[1],
+                elementType: element
             )
         }
     }
