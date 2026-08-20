@@ -2389,6 +2389,43 @@ public struct Engine: Verification.ImageVerifying {
                     "array_joined requires nested Arrays and a matching separator"
                 )
             }
+        case let .arrayReplaceSubrange(
+            result,
+            array,
+            lowerBound,
+            upperBound,
+            replacement
+        ):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail(
+                    "Array range replacement requires \(Core.Capability.collectionsV1)"
+                )
+            }
+            guard case let .array(element) = type(array),
+                  type(result) == type(array),
+                  type(replacement) == type(array),
+                  type(lowerBound) == .int64,
+                  type(upperBound) == .int64,
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_replace requires matching Arrays and Int bounds"
+                )
+            }
+        case let .arraySwap(result, array, lhsIndex, rhsIndex):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail("Array swap requires \(Core.Capability.collectionsV1)")
+            }
+            guard case let .array(element) = type(array),
+                  type(result) == type(array),
+                  type(lhsIndex) == .int64,
+                  type(rhsIndex) == .int64,
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_swap requires a copyable Array and two Int indices"
+                )
+            }
         case let .arrayAppend(result, array, value):
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("Array.append requires \(Core.Capability.collectionsV1)")
@@ -3404,6 +3441,8 @@ public struct Engine: Verification.ImageVerifying {
                      let .arrayRangeSlice(result, _, _, _),
                      let .arrayZip(result, _, _),
                      let .arrayJoined(result, _, _),
+                     let .arrayReplaceSubrange(result, _, _, _, _),
+                     let .arraySwap(result, _, _, _),
                      let .arrayAppend(result, _, _), let .arrayUpdate(result, _, _, _),
                      let .arrayNext(result, _, _, _),
                      let .progressionNext(result, _, _, _, _),

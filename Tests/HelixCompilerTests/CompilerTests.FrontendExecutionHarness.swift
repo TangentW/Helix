@@ -1,5 +1,6 @@
 import Foundation
 import HelixCore
+import HelixInterface
 import HelixVerifier
 import Testing
 @testable import HelixCompiler
@@ -14,7 +15,8 @@ struct FrontendExecutionHarness {
     static func compile(
         source: String,
         functionName: String,
-        moduleName: String = "HelixFrontendExecutionFixture"
+        moduleName: String = "HelixFrontendExecutionFixture",
+        nativeTypes: [InterfaceArchive.TypeRecord] = []
     ) throws -> Fixture {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-frontend-execution-\(UUID().uuidString)",
@@ -35,6 +37,30 @@ struct FrontendExecutionHarness {
             purpose: .semanticLowering
         )
         let file = try CanonicalSIL.File(text: sil)
+        var nativeTypeIDs: [String: Core.TypeID] = [:]
+        var nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:]
+        var mainActorNativeTypes = Set<Core.TypeID>()
+        for record in nativeTypes {
+            guard nativeTypeIDs.updateValue(
+                record.id,
+                forKey: record.canonicalName
+            ) == nil, nativeTypeKinds.updateValue(
+                record.kind,
+                forKey: record.id
+            ) == nil else {
+                throw CanonicalSIL.LoweringError.invalidCallTable(
+                    "frontend fixture contains duplicate native types"
+                )
+            }
+            if record.requiresMainActor {
+                mainActorNativeTypes.insert(record.id)
+            }
+        }
+        let typeEnvironment = try file.typeEnvironment.includingNativeTypes(
+            nativeTypeIDs,
+            kinds: nativeTypeKinds,
+            requiresMainActor: mainActorNativeTypes
+        )
         let nameMatches = file.functions.filter {
             $0.mangledName.contains(functionName)
         }
@@ -66,7 +92,7 @@ struct FrontendExecutionHarness {
         }
         let function = try #require(functions.first)
         let signature = try CanonicalSIL.Lowerer(
-            typeEnvironment: file.typeEnvironment
+            typeEnvironment: typeEnvironment
         ).parseFunctionType(function.loweredType)
         let namespace = Core.ShellNamespaceID.derive(
             bundleID: "dev.helix.frontend-execution",
@@ -99,7 +125,10 @@ struct FrontendExecutionHarness {
                 functionKey: key,
                 entryIndex: entry,
                 shellInterfaceHash: shellHash,
-                compatibility: compatibility
+                compatibility: compatibility,
+                nativeTypes: nativeTypeIDs,
+                nativeTypeKinds: nativeTypeKinds,
+                mainActorNativeTypes: mainActorNativeTypes
             )
         )
         let shell = try Verification.ShellInterface(
@@ -114,7 +143,23 @@ struct FrontendExecutionHarness {
                     resultType: signature.result,
                     effects: signature.effects
                 ),
-            ]
+            ],
+            types: nativeTypes.map { record in
+                let kind: Verification.NativeTypeKind = switch record.kind {
+                case .value: .value
+                case .reference: .reference
+                case .enumeration: .enumeration
+                }
+                return .init(
+                    id: record.id,
+                    canonicalName: record.canonicalName,
+                    kind: kind,
+                    layoutFingerprint: record.layoutFingerprint,
+                    isCopyable: record.isCopyable,
+                    requiresMainActor: record.requiresMainActor,
+                    estimatedSize: record.estimatedSize
+                )
+            }
         )
         let image = try Verification.Engine().verify(
             bytes: compiled.bytecode,

@@ -749,6 +749,82 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Array structural edits require matching Arrays and Int indices")
+    func rejectsMismatchedArrayStructuralEdits() throws {
+        var fixture = try makeFixture { function in
+            function.registerTypes.append(contentsOf: [
+                .array(.int64),
+                .array(.bool),
+                .bool,
+                .int64,
+                .array(.int64),
+            ])
+            function.blocks[0].instructions = [
+                .makeArray(
+                    result: .init(rawValue: 1),
+                    elements: [.init(rawValue: 0)]
+                ),
+                .makeArray(result: .init(rawValue: 2), elements: []),
+                .constantBool(result: .init(rawValue: 3), value: false),
+                .constantInteger(result: .init(rawValue: 4), bitPattern: 0),
+                .arrayReplaceSubrange(
+                    result: .init(rawValue: 5),
+                    array: .init(rawValue: 1),
+                    lowerBound: .init(rawValue: 3),
+                    upperBound: .init(rawValue: 4),
+                    replacement: .init(rawValue: 2)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        fixture.module.capabilities.insert(.collectionsV1)
+        fixture.shell.capabilities.insert(.collectionsV1)
+        fixture.policy.acceptedCapabilities.insert(.collectionsV1)
+
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 4,
+                reason: "array_replace requires matching Arrays and Int bounds"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        fixture.module.functions[0].registerTypes[2] = .array(.int64)
+        fixture.module.functions[0].registerTypes[3] = .int64
+        fixture.module.functions[0].blocks[0].instructions[2] =
+            .constantInteger(result: .init(rawValue: 3), bitPattern: 0)
+        fixture.module.functions[0].registerTypes[4] = .bool
+        fixture.module.functions[0].blocks[0].instructions[3] =
+            .constantBool(result: .init(rawValue: 4), value: false)
+        fixture.module.functions[0].blocks[0].instructions[4] = .arraySwap(
+            result: .init(rawValue: 5),
+            array: .init(rawValue: 1),
+            lhsIndex: .init(rawValue: 3),
+            rhsIndex: .init(rawValue: 4)
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 4,
+                reason: "array_swap requires a copyable Array and two Int indices"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+    }
+
     @Test("Array popLast cannot forge either result type")
     func rejectsMismatchedArrayPopLastResults() throws {
         var fixture = try makeFixture { function in

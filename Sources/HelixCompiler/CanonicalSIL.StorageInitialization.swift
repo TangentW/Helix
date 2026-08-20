@@ -26,6 +26,7 @@ enum StorageInitialization {
         var runtimeStorageRoots: Set<String>
         var consumingApplicationArguments: [Int: Set<String>]
         var deallocationModes: [Int: DeallocationMode]
+        var forwardingLoadLines: Set<Int>
         var detachedPayloadUses: [String: DetachedPayloadUse]
 
         static let empty = Self(
@@ -36,6 +37,7 @@ enum StorageInitialization {
             runtimeStorageRoots: [],
             consumingApplicationArguments: [:],
             deallocationModes: [:],
+            forwardingLoadLines: [],
             detachedPayloadUses: [:]
         )
 
@@ -243,12 +245,17 @@ enum StorageInitialization {
             targets: targets,
             rootsByAddress: detachedPayloads.rootsByAddress
         )
+        let forwardingLoadLines = forwardingUnqualifiedLoadLines(
+            lines: lines,
+            targets: targets
+        )
         let blocks = try initializationBlocks(
             lines: lines,
             pointees: storagePointees,
             targets: targets,
             detachedPayloadWritebacks: detachedPayloadWritebacks,
-            applicationEffects: applicationEffects
+            applicationEffects: applicationEffects,
+            forwardingLoadLines: forwardingLoadLines
         )
         guard Set(blocks.map(\.id)).count == blocks.count else {
             throw CanonicalSIL.LoweringError.malformedSIL(
@@ -273,6 +280,7 @@ enum StorageInitialization {
             ),
             consumingApplicationArguments: consumingApplicationArguments,
             deallocationModes: classification.deallocationModes,
+            forwardingLoadLines: forwardingLoadLines,
             detachedPayloadUses: detachedPayloads.uses
         )
     }
@@ -522,7 +530,8 @@ enum StorageInitialization {
         pointees: [String: Bytecode.ValueType],
         targets: [String: AddressTarget],
         detachedPayloadWritebacks: [String: AddressTarget],
-        applicationEffects: [Int: ApplicationStorageEffects]
+        applicationEffects: [Int: ApplicationStorageEffects],
+        forwardingLoadLines: Set<Int>
     ) throws -> [InitializationBlock] {
         var result: [InitializationBlock] = []
         var current: InitializationBlock?
@@ -552,6 +561,10 @@ enum StorageInitialization {
             if let source = takenAddress(in: line),
                let target = targets[source]
                     ?? detachedPayloadWritebacks[source] {
+                current?.actions.append(.take(target: target, line: lineIndex))
+            } else if forwardingLoadLines.contains(lineIndex),
+                      let source = unqualifiedLoadAddress(in: line),
+                      let target = targets[source] {
                 current?.actions.append(.take(target: target, line: lineIndex))
             }
             if let destination = writtenAddress(in: line) {
@@ -649,6 +662,62 @@ enum StorageInitialization {
             current?.successors.formUnion(blockReferences(in: line))
         }
         finishCurrent()
+        return result
+    }
+
+    /// Mandatory SIL optimizations erase ownership qualifiers. A SILGen
+    /// `load [take]` from a temporary therefore appears as an unqualified
+    /// `load` followed by `dealloc_stack`, while a read that leaves storage
+    /// initialized retains another owner and eventually destroys the address.
+    /// Recover only the unambiguous forwarding form: the load must be the last
+    /// operation on that exact storage target before its lexical deallocation.
+    private static func forwardingUnqualifiedLoadLines(
+        lines: [String],
+        targets: [String: AddressTarget]
+    ) -> Set<Int> {
+        var result = Set<Int>()
+        var candidates: [AddressTarget: Int] = [:]
+
+        func overlaps(_ lhs: AddressTarget, _ rhs: AddressTarget) -> Bool {
+            guard lhs.root == rhs.root else { return false }
+            return lhs.path.starts(with: rhs.path)
+                || rhs.path.starts(with: lhs.path)
+        }
+
+        func invalidate(overlapping target: AddressTarget) {
+            candidates = candidates.filter { !overlaps($0.key, target) }
+        }
+
+        for (lineIndex, line) in lines.enumerated() {
+            if blockNumber(in: line) != nil {
+                candidates.removeAll(keepingCapacity: true)
+                continue
+            }
+            if let address = deallocatedAddress(in: line),
+               let target = targets[address] {
+                if let candidate = candidates[target] {
+                    result.insert(candidate)
+                }
+                invalidate(overlapping: target)
+                continue
+            }
+            if let address = unqualifiedLoadAddress(in: line),
+               let target = targets[address] {
+                invalidate(overlapping: target)
+                candidates[target] = lineIndex
+                continue
+            }
+
+            // Any intervening access to the same address proves that an
+            // earlier load did not end that storage lifetime. SSA value uses
+            // are absent from `targets`, so they do not invalidate a candidate.
+            let referencedTargets = Set(
+                silValues(in: line).compactMap { targets[$0] }
+            )
+            for target in referencedTargets {
+                invalidate(overlapping: target)
+            }
+        }
         return result
     }
 
@@ -1491,6 +1560,14 @@ enum StorageInitialization {
             return silValues(in: line).last
         }
         return nil
+    }
+
+    private static func unqualifiedLoadAddress(in line: String) -> String? {
+        guard captures(
+            line,
+            pattern: #"^%[0-9]+ = load (%[0-9]+)$"#
+        ) != nil else { return nil }
+        return silValues(in: line).last
     }
 
     private static func destroyedAddress(in line: String) -> String? {

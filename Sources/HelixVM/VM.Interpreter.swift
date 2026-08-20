@@ -2071,6 +2071,80 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
+                case let .arrayReplaceSubrange(
+                    result,
+                    array,
+                    lowerBound,
+                    upperBound,
+                    replacement
+                ):
+                    let (elements, elementType) = try self.array(
+                        array,
+                        registers: registers
+                    )
+                    let (replacementElements, replacementElementType) =
+                        try self.array(replacement, registers: registers)
+                    guard replacementElementType == elementType else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .array(elementType),
+                            actual: .array(replacementElementType)
+                        )
+                    }
+                    let lower = try integer(
+                        lowerBound,
+                        registers: registers
+                    )
+                    let upper = try integer(
+                        upperBound,
+                        registers: registers
+                    )
+                    let bounds = try VM.ArrayAdapters.rangeBounds(
+                        count: elements.count,
+                        lowerBound: lower.signedValue,
+                        upperBound: upper.signedValue
+                    )
+                    let replaced = try replacingArraySubrange(
+                        elements,
+                        elementType: elementType,
+                        bounds: bounds,
+                        with: replacementElements,
+                        budget: budget
+                    )
+                    try initialize(
+                        replaced,
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arraySwap(
+                    result,
+                    array,
+                    lhsIndex,
+                    rhsIndex
+                ):
+                    let (elements, elementType) = try self.array(
+                        array,
+                        registers: registers
+                    )
+                    let lhs = try integer(
+                        lhsIndex,
+                        registers: registers
+                    )
+                    let rhs = try integer(
+                        rhsIndex,
+                        registers: registers
+                    )
+                    let swapped = try swappingArrayElements(
+                        elements,
+                        elementType: elementType,
+                        lhsIndex: lhs.signedValue,
+                        rhsIndex: rhs.signedValue,
+                        budget: budget
+                    )
+                    try initialize(
+                        swapped,
+                        register: result,
+                        registers: &registers
+                    )
                 case let .arrayAppend(result, array, value):
                     let (elements, elementType) = try self.array(
                         array,
@@ -4623,6 +4697,85 @@ public struct Interpreter: Sendable {
             try prepareCopy(element, budget: budget)
         }
         let result = try elements[bounds].map(copy)
+        try budget.checkDeadline()
+        return .array(result, elementType: elementType)
+    }
+
+    private func replacingArraySubrange(
+        _ elements: [VM.Value],
+        elementType: Bytecode.ValueType,
+        bounds: Range<Int>,
+        with replacement: [VM.Value],
+        budget: VM.InvocationBudget
+    ) throws -> VM.Value {
+        guard bounds.lowerBound >= 0,
+              bounds.upperBound <= elements.count
+        else {
+            throw VM.RuntimeTrap.invalidProgramCounter
+        }
+        let remainingCount = elements.count - bounds.count
+        let newCount = remainingCount.addingReportingOverflow(
+            replacement.count
+        )
+        guard !newCount.overflow else {
+            throw VM.RuntimeTrap.vmHeapLimitExceeded
+        }
+        let outputCount = newCount.partialValue
+        try budget.consumeLinearWork(elementCount: outputCount)
+        try chargeAggregate(elementCount: outputCount, budget: budget)
+        for element in elements[..<bounds.lowerBound] {
+            try prepareCopy(element, budget: budget)
+        }
+        for element in replacement {
+            try prepareCopy(element, budget: budget)
+        }
+        for element in elements[bounds.upperBound...] {
+            try prepareCopy(element, budget: budget)
+        }
+        var result: [VM.Value] = []
+        result.reserveCapacity(outputCount)
+        for element in elements[..<bounds.lowerBound] {
+            result.append(try copy(element))
+        }
+        for element in replacement {
+            result.append(try copy(element))
+        }
+        for element in elements[bounds.upperBound...] {
+            result.append(try copy(element))
+        }
+        try budget.checkDeadline()
+        return .array(result, elementType: elementType)
+    }
+
+    private func swappingArrayElements(
+        _ elements: [VM.Value],
+        elementType: Bytecode.ValueType,
+        lhsIndex: Int64,
+        rhsIndex: Int64,
+        budget: VM.InvocationBudget
+    ) throws -> VM.Value {
+        func validatedIndex(_ index: Int64) throws -> Int {
+            guard index >= 0,
+                  let exact = Int(exactly: index),
+                  elements.indices.contains(exact)
+            else {
+                throw VM.RuntimeTrap.arrayIndexOutOfBounds(
+                    index: index,
+                    count: elements.count
+                )
+            }
+            return exact
+        }
+
+        let lhs = try validatedIndex(lhsIndex)
+        let rhs = try validatedIndex(rhsIndex)
+        try budget.consumeLinearWork(elementCount: elements.count)
+        try chargeAggregate(elementCount: elements.count, budget: budget)
+        for element in elements {
+            try prepareCopy(element, budget: budget)
+        }
+        var result = try elements.map(copy)
+        result.swapAt(lhs, rhs)
         try budget.checkDeadline()
         return .array(result, elementType: elementType)
     }

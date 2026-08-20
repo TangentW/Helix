@@ -40,12 +40,92 @@ enum CollectionIntrinsic: Equatable {
         case joined(hasSeparator: Bool)
     }
 
+    /// Array-backed structural edits share value-semantic VM primitives. The
+    /// cases describe frontend call shapes only; lowering does not specialize
+    /// behavior by element type.
+    enum ArrayEdit: Equatable {
+        case concatenating
+        case concatenateInPlace
+        case appendContents
+        case insertElement
+        case insertContents
+        case replaceSubrange
+        case removeAt
+        case removeFirst
+        case removeLast
+        case removeFirstCount
+        case removeLastCount
+        case removeSubrange
+        case removeAll
+        case swapAt
+        case reserveCapacity
+
+        func resolveSpecialization(
+            _ specializations: [Bytecode.ValueType]
+        ) throws -> (array: Bytecode.ValueType, element: Bytecode.ValueType) {
+            let array: Bytecode.ValueType
+            switch self {
+            case .concatenating, .concatenateInPlace, .insertElement,
+                 .removeAt, .removeAll, .reserveCapacity:
+                guard specializations.count == 1 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array edit has unsupported specializations"
+                    )
+                }
+                array = .array(
+                    CanonicalSIL.ValueRepresentation.storable(
+                        specializations[0]
+                    )
+                )
+            case .appendContents, .replaceSubrange:
+                guard specializations.count == 2,
+                      case let .array(sourceElement) = specializations[1],
+                      sourceElement == CanonicalSIL.ValueRepresentation.storable(
+                        specializations[0]
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Array edit requires a matching Array-backed collection"
+                    )
+                }
+                array = .array(sourceElement)
+            case .insertContents:
+                guard specializations.count == 2,
+                      case let .array(element) = specializations[0],
+                      specializations[1] == .array(element)
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "insert(contentsOf:at:) requires matching Array-backed collections"
+                    )
+                }
+                array = .array(element)
+            case .removeFirst, .removeLast, .removeFirstCount,
+                 .removeLastCount, .removeSubrange, .swapAt:
+                guard specializations.count == 1,
+                      case .array = specializations[0]
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "RangeReplaceableCollection edit requires an Array-backed specialization"
+                    )
+                }
+                array = specializations[0]
+            }
+            guard case let .array(element) = array else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Array edit specialization is not an Array"
+                )
+            }
+            return (array, element)
+        }
+    }
+
     case equality(EqualityContainer)
     case search(Bytecode.ArraySearchOperation)
     case extremum(Bytecode.ArrayExtremumOperation)
     case relation(Bytecode.ArrayRelationOperation)
     case arrayIndex(ArrayIndexOperation)
     case adapter(Adapter)
+    case arrayEdit(ArrayEdit)
 
     init?(mangledName: String) {
         switch mangledName {
@@ -115,6 +195,36 @@ enum CollectionIntrinsic: Equatable {
             self = .adapter(.joined(hasSeparator: false))
         case "$sSTsST7ElementRpzrlE6joined9separators14JoinedSequenceVyxGqd___tSTRd__AA_AAQZAARtd__lF":
             self = .adapter(.joined(hasSeparator: true))
+        case "$sSa1poiySayxGAB_ABtFZ":
+            self = .arrayEdit(.concatenating)
+        case "$sSa2peoiyySayxGz_ABtFZ":
+            self = .arrayEdit(.concatenateInPlace)
+        case "$sSa6append10contentsOfyqd__n_t7ElementQyd__RszSTRd__lF":
+            self = .arrayEdit(.appendContents)
+        case "$sSa6insert_2atyxn_SitF":
+            self = .arrayEdit(.insertElement)
+        case "$sSmsE6insert10contentsOf2atyqd__n_5IndexQztSlRd__7ElementQyd__AFRtzlF":
+            self = .arrayEdit(.insertContents)
+        case "$sSa15replaceSubrange_4withySnySiG_qd__nt7ElementQyd__RszSlRd__lF":
+            self = .arrayEdit(.replaceSubrange)
+        case "$sSa6remove2atxSi_tF":
+            self = .arrayEdit(.removeAt)
+        case "$sSmsE11removeFirst7ElementQzyF":
+            self = .arrayEdit(.removeFirst)
+        case "$sSmsSKRzrlE10removeLast7ElementSTQzyF":
+            self = .arrayEdit(.removeLast)
+        case "$sSmsE11removeFirstyySiF":
+            self = .arrayEdit(.removeFirstCount)
+        case "$sSmsSKRzrlE10removeLastyySiF":
+            self = .arrayEdit(.removeLastCount)
+        case "$sSmsE14removeSubrangeyySny5IndexQzGF":
+            self = .arrayEdit(.removeSubrange)
+        case "$sSa9removeAll15keepingCapacityySb_tF":
+            self = .arrayEdit(.removeAll)
+        case "$sSMsE6swapAtyy5IndexQz_ACtF":
+            self = .arrayEdit(.swapAt)
+        case "$sSa15reserveCapacityyySiF":
+            self = .arrayEdit(.reserveCapacity)
         default:
             return nil
         }

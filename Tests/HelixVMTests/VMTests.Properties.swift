@@ -1107,6 +1107,208 @@ struct Properties {
         }
     }
 
+    @Test("Seeded Array range replacement and swap agree with Swift")
+    func arrayStructuralEditsMatchSwiftReferenceModel() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let replacementFunction = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "replaceSubrange",
+            parameterRegisters: (0..<4).map {
+                .init(rawValue: UInt32($0))
+            },
+            resultType: arrayType,
+            registerTypes: [arrayType, .int64, .int64, arrayType, arrayType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: (0..<4).map {
+                        .init(rawValue: UInt32($0))
+                    },
+                    instructions: [
+                        .arrayReplaceSubrange(
+                            result: .init(rawValue: 4),
+                            array: .init(rawValue: 0),
+                            lowerBound: .init(rawValue: 1),
+                            upperBound: .init(rawValue: 2),
+                            replacement: .init(rawValue: 3)
+                        ),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ]
+        )
+        let replacementImage = try makeVerified(
+            function: replacementFunction,
+            signature: .init(
+                parameters: [
+                    "Swift.Array<Swift.Int>",
+                    "Swift.Int",
+                    "Swift.Int",
+                    "Swift.Array<Swift.Int>",
+                ],
+                result: "Swift.Array<Swift.Int>"
+            ),
+            parameterTypes: [arrayType, .int64, .int64, arrayType],
+            resultType: arrayType,
+            capabilities: [.baselineV1, .collectionsV1]
+        )
+        let swapFunction = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "swapAt",
+            parameterRegisters: (0..<3).map {
+                .init(rawValue: UInt32($0))
+            },
+            resultType: arrayType,
+            registerTypes: [arrayType, .int64, .int64, arrayType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: (0..<3).map {
+                        .init(rawValue: UInt32($0))
+                    },
+                    instructions: [
+                        .arraySwap(
+                            result: .init(rawValue: 3),
+                            array: .init(rawValue: 0),
+                            lhsIndex: .init(rawValue: 1),
+                            rhsIndex: .init(rawValue: 2)
+                        ),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+        let swapImage = try makeVerified(
+            function: swapFunction,
+            signature: .init(
+                parameters: [
+                    "Swift.Array<Swift.Int>", "Swift.Int", "Swift.Int",
+                ],
+                result: "Swift.Array<Swift.Int>"
+            ),
+            parameterTypes: [arrayType, .int64, .int64],
+            resultType: arrayType,
+            capabilities: [.baselineV1, .collectionsV1]
+        )
+        var generator = Generator(seed: 0x484c_5852_4550_4c43)
+
+        for caseID in 0..<300 {
+            let sourceCount = Int(generator.next() % 13)
+            let source = (0..<sourceCount).map { _ in
+                generator.integer(in: -50...50)
+            }
+            let lower = Int(generator.next() % UInt64(sourceCount + 1))
+            let upper = lower + Int(
+                generator.next() % UInt64(sourceCount - lower + 1)
+            )
+            let replacementCount = Int(generator.next() % 8)
+            let replacement = (0..<replacementCount).map { _ in
+                generator.integer(in: -50...50)
+            }
+            var expected = source
+            expected.replaceSubrange(lower..<upper, with: replacement)
+            #expect(
+                VM.Interpreter().invoke(
+                    entry: .init(rawValue: 0),
+                    image: replacementImage,
+                    arguments: [
+                        .array(try source.map(integerValue), elementType: .int64),
+                        try integerValue(Int64(lower)),
+                        try integerValue(Int64(upper)),
+                        .array(
+                            try replacement.map(integerValue),
+                            elementType: .int64
+                        ),
+                    ]
+                ) == .returned(
+                    .array(try expected.map(integerValue), elementType: .int64)
+                ),
+                Comment(rawValue: "Array replacement mismatch for case \(caseID)")
+            )
+
+            let swapCount = Int(generator.next() % 12) + 1
+            var swapped = (0..<swapCount).map { _ in
+                generator.integer(in: -50...50)
+            }
+            let lhs = Int(generator.next() % UInt64(swapCount))
+            let rhs = Int(generator.next() % UInt64(swapCount))
+            let swapInput = swapped
+            swapped.swapAt(lhs, rhs)
+            #expect(
+                VM.Interpreter().invoke(
+                    entry: .init(rawValue: 0),
+                    image: swapImage,
+                    arguments: [
+                        .array(try swapInput.map(integerValue), elementType: .int64),
+                        try integerValue(Int64(lhs)),
+                        try integerValue(Int64(rhs)),
+                    ]
+                ) == .returned(
+                    .array(try swapped.map(integerValue), elementType: .int64)
+                ),
+                Comment(rawValue: "Array swap mismatch for case \(caseID)")
+            )
+        }
+
+        let pair = VM.Value.array(
+            try [1, 2].map(integerValue),
+            elementType: .int64
+        )
+        let empty = VM.Value.array([], elementType: .int64)
+        func replace(
+            lower: Int64,
+            upper: Int64
+        ) throws -> VM.ExecutionResult {
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: replacementImage,
+                arguments: [
+                    pair, try integerValue(lower), try integerValue(upper),
+                    empty,
+                ]
+            )
+        }
+        func swap(
+            lhs: Int64,
+            rhs: Int64
+        ) throws -> VM.ExecutionResult {
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: swapImage,
+                arguments: [
+                    pair, try integerValue(lhs), try integerValue(rhs),
+                ]
+            )
+        }
+
+        #expect(
+            try replace(lower: 2, upper: 1)
+                == .trapped(
+                    .explicit(
+                        "Array range lower bound exceeds its upper bound"
+                    )
+                )
+        )
+        #expect(
+            try replace(lower: -1, upper: 1)
+                == .trapped(.arrayIndexOutOfBounds(index: -1, count: 2))
+        )
+        #expect(
+            try replace(lower: 0, upper: 3)
+                == .trapped(.arrayIndexOutOfBounds(index: 3, count: 2))
+        )
+        #expect(
+            try swap(lhs: -1, rhs: 0)
+                == .trapped(.arrayIndexOutOfBounds(index: -1, count: 2))
+        )
+        #expect(
+            try swap(lhs: 0, rhs: 2)
+                == .trapped(.arrayIndexOutOfBounds(index: 2, count: 2))
+        )
+    }
+
     @Test("Seeded Array updates agree with Swift value semantics")
     func arrayUpdatesMatchSwiftReferenceModel() throws {
         let arrayType = Bytecode.ValueType.array(.int64)

@@ -46,6 +46,7 @@ enum SwiftCoreIntrinsic: Equatable {
     case dictionarySubscriptGet
     case dictionarySubscriptSet
     case dictionaryRemoveValue
+    case dictionaryReserveCapacity
     case dictionaryLiteral
     case dictionaryMakeIterator
     case dictionaryIteratorNext
@@ -222,6 +223,7 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sSDyq_Sgxcig": self = .dictionarySubscriptGet
         case "$sSDyq_Sgxcis": self = .dictionarySubscriptSet
         case "$sSD11removeValue6forKeyq_Sgx_tF": self = .dictionaryRemoveValue
+        case "$sSD15reserveCapacityyySiF": self = .dictionaryReserveCapacity
         case "$sSD17dictionaryLiteralSDyxq_Gx_q_td_tcfC": self = .dictionaryLiteral
         case "$sSD12makeIteratorSD0B0Vyxq__GyF": self = .dictionaryMakeIterator
         case "$sSD8IteratorV4nextx3key_q_5valuetSgyF": self = .dictionaryIteratorNext

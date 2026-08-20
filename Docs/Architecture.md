@@ -73,6 +73,29 @@ Both workflows depend on stable, build-specific identities:
   equality and hashing are order-independent. Verification, boundary
   validation, comparison-work charging, and pre-allocation resource charging
   enforce the same model end to end.
+- Array structural mutation is represented by immutable, typed value
+  transforms. Concatenation, insertion, removal, and `replaceSubrange` share
+  one half-open range-replacement instruction; `swapAt` uses one swap
+  instruction. The Verifier proves matching copyable element types, the VM
+  validates every bound before mutation, precharges output work/storage, and
+  compiler-only assignment releases the replaced linear owner in the shared
+  storage sink.
+- Mandatory SIL can erase `load [take]` and express ownership through separate
+  retain/release traffic. A type-driven normalization recovers an unqualified
+  forwarding load only when it is the last operation on the exact temporary
+  before deallocation. Retained owners are then consumed at aggregate, store,
+  call, and return edges; a borrowed or subsequently reused linear source gets
+  a distinct VM owner. Native operations that must materialize an owned VM
+  value for a SIL `+0` view register that value as a borrowed temporary: retain
+  promotion, an owned boundary, or the final borrowed use closes it exactly
+  once, and representation-preserving reference aliases share that lifetime.
+  This applies equally to imported references, Arrays, Optionals, tuples, and
+  other represented linear values.
+- Compiler-only tuple storage uses semantic field paths rather than projection
+  order. It recursively transitions between one aggregate owner and disjoint
+  field owners, so early projections, nested tuples, whole-value assignment,
+  destruction, and mutable capture all share the same initialization and
+  ownership rules.
 - Common Array-backed standard-library views are normalized at the compiler/VM
   boundary instead of importing their private storage layouts. Reversed,
   enumerated, repeated, `Slice<Base>`, zipped, and joined sequences become

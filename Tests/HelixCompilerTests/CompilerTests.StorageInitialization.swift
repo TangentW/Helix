@@ -229,6 +229,269 @@ struct StorageInitialization {
         #expect(Set(empty.deallocationModes.values) == [.none])
     }
 
+    @Test("Canonical unqualified loads recover erased take ownership")
+    func recoversForwardingUnqualifiedLoads() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let body = """
+        bb0(%0 : @owned $NSObject):
+          %1 = alloc_stack $NSObject
+          store %0 to %1
+          %2 = load %1
+          dealloc_stack %1
+          return %2
+        """
+        let plan = try CanonicalSIL.StorageInitialization.analyze(
+            body: body,
+            directCalls: .empty,
+            typeEnvironment: environment
+        )
+
+        #expect(plan.forwardingLoadLines.count == 1)
+        #expect(Set(plan.deallocationModes.values) == [.none])
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture7forwardySo8NSObjectCADF",
+                loweredType: "@convention(thin) (@owned NSObject) -> @owned NSObject",
+                body: body
+            ),
+            displayName: "forward"
+        )
+        #expect(!lowered.blocks.flatMap(\.instructions).contains {
+            if case .copyValue = $0 { return true }
+            return false
+        })
+        #expect(!lowered.blocks.flatMap(\.instructions).contains {
+            if case .destroyValue = $0 { return true }
+            return false
+        })
+    }
+
+    @Test("Address use prevents unqualified load forwarding")
+    func preservesReadOnlyUnqualifiedLoads() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let body = """
+        bb0(%0 : @owned $NSObject):
+          %1 = alloc_stack $NSObject
+          store %0 to %1
+          %2 = load %1
+          strong_retain %2
+          destroy_addr %1
+          dealloc_stack %1
+          return %2
+        """
+        let plan = try CanonicalSIL.StorageInitialization.analyze(
+            body: body,
+            directCalls: .empty,
+            typeEnvironment: environment
+        )
+
+        #expect(plan.forwardingLoadLines.isEmpty)
+        #expect(Set(plan.deallocationModes.values) == [.none])
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture4copyySo8NSObjectCADF",
+                loweredType: "@convention(thin) (@owned NSObject) "
+                    + "-> @owned NSObject",
+                body: body
+            ),
+            displayName: "copy"
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        #expect(instructions.filter { instruction in
+            if case .copyValue = instruction { return true }
+            return false
+        }.count == 1)
+        #expect(instructions.filter { instruction in
+            if case .destroyValue = instruction { return true }
+            return false
+        }.count == 1)
+    }
+
+    @Test("Compiler-only assignment releases the replaced linear owner")
+    func releasesReplacedCompilerStorage() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture7replaceySo8NSObjectCAD_ADtF",
+                loweredType: "@convention(thin) (@owned NSObject, @owned NSObject) -> @owned NSObject",
+                body: """
+                bb0(%0 : @owned $NSObject, %1 : @owned $NSObject):
+                  %2 = alloc_stack $NSObject
+                  store %0 to %2
+                  store %1 to %2
+                  %3 = load [take] %2
+                  dealloc_stack %2
+                  return %3
+                """
+            ),
+            displayName: "replace"
+        )
+        let destroyed = lowered.blocks.flatMap(\.instructions).compactMap {
+            instruction -> Bytecode.Register? in
+            if case let .destroyValue(value) = instruction { return value }
+            return nil
+        }
+
+        #expect(destroyed == [.init(rawValue: 0)])
+    }
+
+    @Test("Nested tuple storage materializes projections formed before initialization")
+    func materializesEarlyNestedTupleProjection() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture6nestedSo8NSObjectCAD_SitF",
+                loweredType: "@convention(thin) (@owned NSObject, Int) "
+                    + "-> @owned NSObject",
+                body: """
+                bb0(%0 : @owned $NSObject, %1 : $Int):
+                  %2 = alloc_stack $((Int, NSObject), Int)
+                  %3 = tuple_element_addr %2, 0
+                  %4 = tuple_element_addr %3, 1
+                  %5 = tuple_element_addr %3, 0
+                  %6 = tuple_element_addr %2, 1
+                  %7 = tuple (%1, %0)
+                  %8 = tuple (%7, %1)
+                  store %8 to %2
+                  %9 = load [take] %4
+                  %10 = load [take] %5
+                  %11 = load [take] %6
+                  dealloc_stack %2
+                  return %9
+                """
+            ),
+            displayName: "nested"
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let unpacks = instructions.compactMap { instruction
+            -> (results: [Bytecode.Register], tuple: Bytecode.Register)? in
+            guard case let .unpackTuple(results, tuple) = instruction else {
+                return nil
+            }
+            return (results, tuple)
+        }
+        let outer = try #require(unpacks.first)
+        let inner = try #require(unpacks.dropFirst().first)
+        let returned = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .returnValue(value) = instruction else { return nil }
+            return value
+        }.first)
+
+        #expect(unpacks.count == 2)
+        #expect(inner.tuple == outer.results[0])
+        #expect(returned == inner.results[1])
+        #expect(!instructions.contains { instruction in
+            guard case let .destroyValue(value) = instruction else {
+                return false
+            }
+            return value == inner.tuple
+        })
+    }
+
+    @Test("Aggregate assignment destroys a recursively rebuilt prior owner")
+    func releasesRebuiltTupleStorageOnAssignment() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let nativeType = Bytecode.ValueType.native(objectType)
+        let tupleType = Bytecode.ValueType.tuple([nativeType, nativeType])
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture7replaceSo8NSObjectC_ADtAF_AFtF",
+                loweredType: "@convention(thin) "
+                    + "(@owned NSObject, @owned NSObject, "
+                    + "@owned NSObject, @owned NSObject) "
+                    + "-> @owned (NSObject, NSObject)",
+                body: """
+                bb0(%0 : @owned $NSObject, %1 : @owned $NSObject, %2 : @owned $NSObject, %3 : @owned $NSObject):
+                  %4 = alloc_stack $(NSObject, NSObject)
+                  %5 = tuple_element_addr %4, 0
+                  %6 = tuple_element_addr %4, 1
+                  store %0 to %5
+                  store %1 to %6
+                  %7 = tuple (%2, %3)
+                  store %7 to [assign] %4
+                  %8 = load [take] %4
+                  dealloc_stack %4
+                  return %8
+                """
+            ),
+            displayName: "replace"
+        )
+        let destroyed = lowered.blocks.flatMap(\.instructions).compactMap {
+            instruction -> Bytecode.Register? in
+            guard case let .destroyValue(value) = instruction else { return nil }
+            return value
+        }
+
+        #expect(destroyed.count == 1)
+        let priorOwner = try #require(destroyed.first)
+        #expect(lowered.registerTypes[Int(priorOwner.rawValue)] == tupleType)
+        #expect(!lowered.parameterRegisters.contains(priorOwner))
+    }
+
+    @Test("Nested tuple mutable captures share recursive storage reconstruction")
+    func executesNestedTupleMutableCapture() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            public func updateNestedCapture(_ value: String) -> String {
+                var state = ((1, value), 2)
+                let update = {
+                    state.0.1 += "!"
+                }
+                update()
+                return state.0.1
+            }
+            """,
+            functionName: "updateNestedCapture",
+            moduleName: "HelixNestedTupleCapture"
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [.string("value")]
+            ) == .returned(.string("value!"))
+        )
+    }
+
     @Test("Duplicate CFG block identifiers fail as a stable diagnostic")
     func rejectsDuplicateBlockIdentifiers() {
         #expect(throws: CanonicalSIL.LoweringError.self) {

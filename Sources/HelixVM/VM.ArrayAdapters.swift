@@ -66,7 +66,7 @@ enum ArrayAdapters {
         }
         guard lowerBound <= upperBound else {
             throw VM.RuntimeTrap.explicit(
-                "Array slice lower bound exceeds its upper bound"
+                "Array range lower bound exceeds its upper bound"
             )
         }
         guard lowerBound >= 0, lowerBound <= count64 else {

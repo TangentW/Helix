@@ -572,6 +572,243 @@ struct ImportedFrameworks {
         } == 1)
     }
 
+    @Test("Explicit retain owners follow native reference conversion aliases")
+    func forwardsRetainedOwnersAcrossNativeUpcastAliases() throws {
+        let labelType = Core.TypeID(rawValue: .sha256("UIKit.UILabel"))
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let requirement = importRequirement(id: 27)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: CanonicalSIL.NativeBridgeSymbols.upcast(
+                    from: labelType,
+                    to: objectType
+                ),
+                parameterTypes: [.native(labelType)],
+                resultType: .native(objectType),
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            ["UILabel": labelType, "NSObject": objectType],
+            kinds: [labelType: .reference, objectType: .reference]
+        )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture7inspectyySo7UILabelCF",
+                loweredType: "@convention(thin) (@guaranteed UILabel) -> ()",
+                body: """
+                bb0(%0 : @guaranteed $UILabel):
+                  strong_retain %0
+                  strong_retain %0
+                  %1 = upcast %0 to $NSObject
+                  strong_release %1
+                  strong_release %0
+                  %2 = tuple ()
+                  return %2
+                """
+            ),
+            displayName: "Fixture.inspect",
+            directCalls: calls
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let parameter = try #require(lowered.parameterRegisters.first)
+        let conversion = try #require(instructions.compactMap { instruction
+            -> (result: Bytecode.Register, argument: Bytecode.Register)? in
+            guard case let .nativeApply(result, id, arguments) = instruction,
+                  let result,
+                  id == requirement.id,
+                  let argument = arguments.first
+            else { return nil }
+            return (result, argument)
+        }.first)
+        let retainedCopies = instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .copyValue(result, source) = instruction,
+                  source == parameter
+            else { return nil }
+            return result
+        }
+        let destroyed = instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .destroyValue(value) = instruction else { return nil }
+            return value
+        }
+
+        #expect(retainedCopies.count == 2)
+        #expect(retainedCopies.contains(conversion.argument))
+        #expect(destroyed.contains(conversion.result))
+        #expect(destroyed.contains { retainedCopies.contains($0) })
+        #expect(!destroyed.contains(parameter))
+    }
+
+    @Test("Explicit retain owners follow same-type reference aliases")
+    func forwardsRetainedOwnersAcrossSameTypeReferenceAliases() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            ["NSObject": objectType],
+            kinds: [objectType: .reference]
+        )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture7inspectyySo8NSObjectCF",
+                loweredType: "@convention(thin) (@guaranteed NSObject) -> ()",
+                body: """
+                bb0(%0 : @guaranteed $NSObject):
+                  strong_retain %0
+                  %1 = unchecked_ref_cast %0 to $NSObject
+                  strong_release %1
+                  %2 = tuple ()
+                  return %2
+                """
+            ),
+            displayName: "Fixture.inspect"
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let parameter = try #require(lowered.parameterRegisters.first)
+        let retained = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .copyValue(result, source) = instruction,
+                  source == parameter
+            else { return nil }
+            return result
+        }.first)
+
+        #expect(instructions.contains(.destroyValue(retained)))
+        #expect(!instructions.contains(.destroyValue(parameter)))
+    }
+
+    @Test("Unqualified imported reference loads promote retained owners")
+    func promotesRetainedImportedGlobalLoad() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let globalSymbol = "$s7Fixture12sharedObjectSo8NSObjectCvp"
+        let loweredGlobalType = "NSObject"
+        let requirement = importRequirement(id: 28)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: CanonicalSIL.NativeBridgeSymbols.importedGlobal(
+                    symbol: globalSymbol,
+                    loweredType: loweredGlobalType
+                ),
+                parameterTypes: [],
+                resultType: .native(objectType),
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            ["NSObject": objectType],
+            kinds: [objectType: .reference]
+        )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture6sharedSo8NSObjectCyF",
+                loweredType: "@convention(thin) () -> @owned NSObject",
+                body: """
+                bb0:
+                  %0 = global_addr @\(globalSymbol) : $*NSObject
+                  %1 = load %0
+                  strong_retain %1
+                  return %1
+                """
+            ),
+            displayName: "Fixture.shared",
+            directCalls: calls
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let loaded = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .nativeApply(result, id, _) = instruction,
+                  id == requirement.id
+            else { return nil }
+            return result
+        }.first)
+        let retained = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .copyValue(result, source) = instruction,
+                  source == loaded
+            else { return nil }
+            return result
+        }.first)
+
+        #expect(instructions.contains(.destroyValue(loaded)))
+        #expect(instructions.contains(.returnValue(retained)))
+    }
+
+    @Test("Unqualified imported reference loads clean up after borrowed calls")
+    func cleansBorrowedImportedGlobalLoadAfterCall() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let globalSymbol = "$s7Fixture12sharedObjectSo8NSObjectCvp"
+        let loweredGlobalType = "NSObject"
+        let inspectSymbol = "$s7Fixture7inspectyySo8NSObjectCF"
+        let requirement = importRequirement(id: 29)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: CanonicalSIL.NativeBridgeSymbols.importedGlobal(
+                    symbol: globalSymbol,
+                    loweredType: loweredGlobalType
+                ),
+                parameterTypes: [],
+                resultType: .native(objectType),
+                target: .nativeImport(requirement)
+            ),
+            .init(
+                mangledName: inspectSymbol,
+                parameterTypes: [.native(objectType)],
+                parameterConventions: [.borrowed],
+                resultType: .void,
+                target: .function(.init(rawValue: 1))
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            ["NSObject": objectType],
+            kinds: [objectType: .reference]
+        )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture3runyyF",
+                loweredType: "@convention(thin) () -> ()",
+                body: """
+                bb0:
+                  %0 = global_addr @\(globalSymbol) : $*NSObject
+                  %1 = load %0
+                  %2 = unchecked_ref_cast %1 to $NSObject
+                  %3 = function_ref @\(inspectSymbol) : $@convention(thin) (@guaranteed NSObject) -> ()
+                  %4 = apply %3(%2) : $@convention(thin) (@guaranteed NSObject) -> ()
+                  %5 = tuple ()
+                  return %5
+                """
+            ),
+            displayName: "Fixture.run",
+            directCalls: calls
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let loaded = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .nativeApply(result, id, _) = instruction,
+                  id == requirement.id
+            else { return nil }
+            return result
+        }.first)
+        let callIndex = try #require(instructions.firstIndex { instruction in
+            guard case let .apply(_, function, arguments) = instruction else {
+                return false
+            }
+            return function.rawValue == 1 && arguments == [loaded]
+        })
+        let cleanupIndex = try #require(
+            instructions.firstIndex(of: .destroyValue(loaded))
+        )
+
+        #expect(callIndex < cleanupIndex)
+    }
+
     @Test("Optional.some assumes ownership of a borrowed native conversion")
     func transfersBorrowedNativeUpcastIntoOptional() throws {
         let labelType = Core.TypeID(rawValue: .sha256("UIKit.UILabel"))
@@ -623,6 +860,145 @@ struct ImportedFrameworks {
             guard case let .destroyValue(value) = instruction else { return false }
             return value == optional
         } == 1)
+    }
+
+    @Test("Optional.some materializes one owner for a borrowed linear payload")
+    func ownsBorrowedOptionalPayload() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture8optionalySo8NSObjectCSgADF",
+                loweredType: "@convention(thin) (@guaranteed NSObject) -> @owned Optional<NSObject>",
+                body: """
+                bb0(%0 : @guaranteed $NSObject):
+                  strong_retain %0
+                  %1 = enum $Optional<NSObject>, #Optional.some!enumelt, %0
+                  return %1
+                """
+            ),
+            displayName: "Fixture.optional"
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let copy = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .copyValue(result, source) = instruction,
+                  source.rawValue == 0
+            else { return nil }
+            return result
+        }.first)
+
+        #expect(instructions.contains { instruction in
+            guard case let .makeOptionalSome(_, payload) = instruction else {
+                return false
+            }
+            return payload == copy
+        })
+    }
+
+    @Test("Optional switch materializes one owner for a borrowed linear value")
+    func ownsBorrowedOptionalSwitch() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture8identityySo8NSObjectCSgAEF",
+                loweredType: "@convention(thin) (@guaranteed Optional<NSObject>) "
+                    + "-> @owned Optional<NSObject>",
+                body: """
+                bb0(%0 : @guaranteed $Optional<NSObject>):
+                  switch_enum %0, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
+                bb1(%1 : @owned $NSObject):
+                  %2 = unchecked_enum_data %0, #Optional.some!enumelt
+                  %3 = enum $Optional<NSObject>, #Optional.some!enumelt, %2
+                  return %3
+                bb2:
+                  %4 = enum $Optional<NSObject>, #Optional.none!enumelt
+                  return %4
+                """
+            ),
+            displayName: "Fixture.identity"
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let copy = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .copyValue(result, source) = instruction,
+                  source.rawValue == 0
+            else { return nil }
+            return result
+        }.first)
+
+        #expect(instructions.contains { instruction in
+            guard case let .switchOptional(optional, _, _) = instruction else {
+                return false
+            }
+            return optional == copy
+        })
+    }
+
+    @Test("Owned direct-call edges consume a retained borrowed owner")
+    func ownsBorrowedDirectCallArgument() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let symbol = "$s7Fixture7consumeyySo8NSObjectCF"
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.native(objectType)],
+                parameterConventions: [.owned],
+                resultType: .void,
+                target: .function(.init(rawValue: 1))
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture3runyySo8NSObjectCF",
+                loweredType: "@convention(thin) (@guaranteed NSObject) -> ()",
+                body: """
+                bb0(%0 : @guaranteed $NSObject):
+                  strong_retain %0
+                  %1 = function_ref @\(symbol) : $@convention(thin) (@owned NSObject) -> ()
+                  %2 = apply %1(%0) : $@convention(thin) (@owned NSObject) -> ()
+                  %3 = tuple ()
+                  return %3
+                """
+            ),
+            displayName: "Fixture.run",
+            directCalls: calls
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let copy = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .copyValue(result, source) = instruction,
+                  source.rawValue == 0
+            else { return nil }
+            return result
+        }.first)
+
+        #expect(instructions.contains { instruction in
+            guard case let .apply(_, _, arguments) = instruction else {
+                return false
+            }
+            return arguments == [copy]
+        })
     }
 
     @Test("Objective-C pseudogenerics bridge to one frozen concrete specialization")

@@ -261,6 +261,17 @@ public enum Disassembler {
         case let .arrayJoined(result, arrays, separator):
             "\(result) = array_joined \(arrays)"
                 + (separator.map { ", separator: \($0)" } ?? "")
+        case let .arrayReplaceSubrange(
+            result,
+            array,
+            lowerBound,
+            upperBound,
+            replacement
+        ):
+            "\(result) = array_replace \(array)[\(lowerBound)..<\(upperBound)] "
+                + "with \(replacement)"
+        case let .arraySwap(result, array, lhsIndex, rhsIndex):
+            "\(result) = array_swap \(array)[\(lhsIndex)], \(array)[\(rhsIndex)]"
         case let .arrayAppend(result, array, value):
             "\(result) = array_append \(array), \(value)"
         case let .makeArrayBuilder(result):

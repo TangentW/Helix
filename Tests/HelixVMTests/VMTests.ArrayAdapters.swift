@@ -91,7 +91,7 @@ struct ArrayAdapters {
             ) == 3..<3
         )
         #expect(throws: VM.RuntimeTrap.explicit(
-            "Array slice lower bound exceeds its upper bound"
+            "Array range lower bound exceeds its upper bound"
         )) {
             try VM.ArrayAdapters.rangeBounds(
                 count: 3,

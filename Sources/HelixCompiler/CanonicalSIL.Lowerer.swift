@@ -137,6 +137,12 @@ public struct Lowerer: Sendable {
         var unavailableSetter: CanonicalSIL.UnavailableDirectCall?
     }
 
+    private struct NativeReferenceConversion {
+        var argument: Bytecode.Register
+        var tracksCompilerTemporary: Bool
+        var forwardsExplicitOwner: Bool
+    }
+
     enum MetatypeIdentity: Equatable, Sendable {
         case native(Core.TypeID)
         case local(Bytecode.LocalTypeKey)
@@ -530,7 +536,10 @@ public struct Lowerer: Sendable {
         var borrowedAddressValues: [String: Bytecode.Register] = [:]
         var borrowedValueTokens = Set<String>()
         var borrowedLoadTokens = Set<String>()
-        var preservedNativeConversionValues: [String: Bytecode.Register] = [:]
+        var pendingRetainedValues: [String: [Bytecode.Register]] = [:]
+        var retainedValueAliasRoots: [String: String] = [:]
+        var borrowedTemporaryValues: [String: Bytecode.Register] = [:]
+        var borrowedTemporaryAliasRoots: [String: String] = [:]
         var addressAliases: [String: String] = [:]
         var nativePropertyAddresses: [String: NativePropertyAddress] = [:]
         var pendingArrayIteratorTypes: [String: Bytecode.ValueType] = [:]
@@ -573,7 +582,7 @@ public struct Lowerer: Sendable {
         var tupleComponentValues: [TupleComponentStorageKey: Bytecode.Register] = [:]
         var aggregateComponentAddresses: [String: AggregateComponentAddress] = [:]
         var tupleValues: [String: (Bytecode.Register, Bytecode.Register)] = [:]
-        var unpackedTuples: [String: [Bytecode.Register]] = [:]
+        var unpackedTuples: [Bytecode.Register: [Bytecode.Register]] = [:]
         var onStackClosureValues = Set<String>()
         var voidValues = Set<String>()
         var optionalSourceBySomeBlock: [Bytecode.BlockID: String] = [:]
@@ -685,7 +694,7 @@ public struct Lowerer: Sendable {
             return .init(rawValue: raw)
         }
 
-        func copyOwnedCallArgument(
+        func copyOwnedValue(
             _ source: Bytecode.Register
         ) throws -> Bytecode.Register {
             let type = registerTypes[Int(source.rawValue)]
@@ -695,24 +704,123 @@ public struct Lowerer: Sendable {
             return copy
         }
 
-        func prepareReturnValue(
-            _ token: String,
-            line: Int
-        ) throws -> Bytecode.Register {
-            let value = try resolve(token, line: line)
-            let type = registerTypes[Int(value.rawValue)]
-            guard type.requiresLinearOwnership,
-                  isBorrowedValue(token: token, register: value)
-            else { return value }
-            // HLBC return transfers ownership. SIL may return a guaranteed
-            // reference directly because ARC retains are implicit at that ABI
-            // boundary, so materialize the corresponding VM ownership edge.
-            return try copyOwnedCallArgument(value)
+        func retainedValueAliasRoot(for token: String) -> String {
+            var current = token
+            var visited = Set<String>()
+            while let next = retainedValueAliasRoots[current],
+                  visited.insert(current).inserted {
+                current = next
+            }
+            return current
         }
 
-        func prepareStoredValue(
+        func aliasRetainedValue(
+            _ resultToken: String,
+            to sourceToken: String
+        ) {
+            let sourceRoot = retainedValueAliasRoot(for: sourceToken)
+            let resultRoot = retainedValueAliasRoot(for: resultToken)
+            guard resultRoot != sourceRoot else { return }
+            if let pending = pendingRetainedValues.removeValue(
+                forKey: resultRoot
+            ) {
+                pendingRetainedValues[sourceRoot, default: []]
+                    .append(contentsOf: pending)
+            }
+            retainedValueAliasRoots[resultRoot] = sourceRoot
+            retainedValueAliasRoots[resultToken] = sourceRoot
+        }
+
+        func recordPendingRetainedValue(
+            _ value: Bytecode.Register,
+            for token: String
+        ) {
+            let root = retainedValueAliasRoot(for: token)
+            pendingRetainedValues[root, default: []].append(value)
+        }
+
+        func takePendingRetainedValue(
+            for token: String
+        ) -> Bytecode.Register? {
+            let root = retainedValueAliasRoot(for: token)
+            guard var pending = pendingRetainedValues[root],
+                  let retained = pending.popLast()
+            else { return nil }
+            if pending.isEmpty {
+                pendingRetainedValues.removeValue(forKey: root)
+            } else {
+                pendingRetainedValues[root] = pending
+            }
+            return retained
+        }
+
+        func borrowedTemporaryAliasRoot(for token: String) -> String {
+            var current = token
+            var visited = Set<String>()
+            while let next = borrowedTemporaryAliasRoots[current],
+                  visited.insert(current).inserted {
+                current = next
+            }
+            return current
+        }
+
+        func aliasBorrowedTemporary(
+            _ resultToken: String,
+            to sourceToken: String
+        ) {
+            let sourceRoot = borrowedTemporaryAliasRoot(for: sourceToken)
+            let resultRoot = borrowedTemporaryAliasRoot(for: resultToken)
+            guard resultRoot != sourceRoot else { return }
+            borrowedTemporaryAliasRoots[resultRoot] = sourceRoot
+            borrowedTemporaryAliasRoots[resultToken] = sourceRoot
+        }
+
+        func borrowedTemporaryValue(for token: String) -> Bytecode.Register? {
+            borrowedTemporaryValues[borrowedTemporaryAliasRoot(for: token)]
+        }
+
+        func borrowedTemporaryAliasTokens(for token: String) -> Set<String> {
+            let root = borrowedTemporaryAliasRoot(for: token)
+            var aliases: Set<String> = [root, token]
+            for candidate in borrowedTemporaryAliasRoots.keys
+            where borrowedTemporaryAliasRoot(for: candidate) == root {
+                aliases.insert(candidate)
+            }
+            return aliases
+        }
+
+        func clearBorrowedTemporaryClassification(for token: String) {
+            for alias in borrowedTemporaryAliasTokens(for: token) {
+                borrowedValueTokens.remove(alias)
+                borrowedLoadTokens.remove(alias)
+            }
+        }
+
+        func recordBorrowedTemporaryValue(
+            _ value: Bytecode.Register,
+            for token: String
+        ) throws {
+            let root = borrowedTemporaryAliasRoot(for: token)
+            guard borrowedTemporaryValues[root] == nil else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "borrowed temporary token already owns a VM value"
+                )
+            }
+            borrowedTemporaryValues[root] = value
+        }
+
+        @discardableResult
+        func removeBorrowedTemporaryValue(
+            for token: String
+        ) -> Bytecode.Register? {
+            borrowedTemporaryValues.removeValue(
+                forKey: borrowedTemporaryAliasRoot(for: token)
+            )
+        }
+
+        func prepareOwnedValue(
             _ token: String,
-            expectedType: Bytecode.ValueType,
+            expectedType: Bytecode.ValueType? = nil,
             line: Int
         ) throws -> Bytecode.Register {
             let value = try resolveStorableValue(
@@ -721,14 +829,62 @@ public struct Lowerer: Sendable {
                 line: line
             )
             let type = registerTypes[Int(value.rawValue)]
-            guard type.requiresLinearOwnership,
-                  isBorrowedValue(token: token, register: value)
-            else { return value }
-            // Compiler and runtime addresses have one uniform invariant: a
-            // materialized linear value is owned by its storage. Canonical SIL
-            // may use a borrowed loadable value as temporary `@in_guaranteed`
-            // storage, so create the VM ownership edge at that boundary.
-            return try copyOwnedCallArgument(value)
+            if let retained = takePendingRetainedValue(for: token) {
+                guard registerTypes[Int(retained.rawValue)] == type else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "retained owned value has the wrong type"
+                    )
+                }
+                return retained
+            }
+            guard type.requiresLinearOwnership else { return value }
+            if let temporary = borrowedTemporaryValue(for: token) {
+                guard temporary == value else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "borrowed temporary ownership does not match its SIL value"
+                    )
+                }
+                let owned = try copyOwnedValue(value)
+                if !hasFutureSemanticUse(
+                    ofBorrowedTemporaryAliasedTo: token,
+                    after: currentSILLineIndex
+                ) {
+                    removeBorrowedTemporaryValue(for: token)
+                    clearBorrowedTemporaryClassification(for: token)
+                    appendInstruction(.destroyValue(temporary))
+                }
+                return owned
+            }
+            let preservesSource = isBorrowedValue(token: token, register: value)
+                || hasFutureSemanticUse(
+                    of: token,
+                    after: currentSILLineIndex
+                )
+            guard preservesSource else { return value }
+            // Every HLBC aggregate/call/return ownership edge is explicit.
+            // Canonical SIL may express that edge as ARC traffic around a
+            // borrowed or subsequently reused SSA value, so materialize a VM
+            // owner when no explicit retained owner is available.
+            return try copyOwnedValue(value)
+        }
+
+        func prepareReturnValue(
+            _ token: String,
+            line: Int
+        ) throws -> Bytecode.Register {
+            try prepareOwnedValue(token, line: line)
+        }
+
+        func prepareStoredValue(
+            _ token: String,
+            expectedType: Bytecode.ValueType,
+            line: Int
+        ) throws -> Bytecode.Register {
+            try prepareOwnedValue(
+                token,
+                expectedType: expectedType,
+                line: line
+            )
         }
 
         func materializeRetain(
@@ -736,13 +892,24 @@ public struct Lowerer: Sendable {
             value: Bytecode.Register
         ) throws {
             let type = registerTypes[Int(value.rawValue)]
-            guard type.requiresLinearOwnership,
-                  isBorrowedValue(token: token, register: value)
-            else { return }
-            let retained = try copyOwnedCallArgument(value)
-            values[token] = retained
-            borrowedValueTokens.remove(token)
-            borrowedLoadTokens.remove(token)
+            guard type.requiresLinearOwnership else { return }
+            let retained = try copyOwnedValue(value)
+            if let temporary = borrowedTemporaryValue(for: token) {
+                guard temporary == value else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "borrowed temporary retain does not match its SIL value"
+                    )
+                }
+                removeBorrowedTemporaryValue(for: token)
+                for alias in borrowedTemporaryAliasTokens(for: token)
+                where values[alias] == temporary {
+                    values[alias] = retained
+                }
+                clearBorrowedTemporaryClassification(for: token)
+                appendInstruction(.destroyValue(temporary))
+                return
+            }
+            recordPendingRetainedValue(retained, for: token)
         }
 
         func isBorrowedParameter(_ register: Bytecode.Register) -> Bool {
@@ -784,6 +951,15 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func hasFutureSemanticUse(
+            ofBorrowedTemporaryAliasedTo token: String,
+            after lineIndex: Int
+        ) -> Bool {
+            borrowedTemporaryAliasTokens(for: token).contains {
+                hasFutureSemanticUse(of: $0, after: lineIndex)
+            }
+        }
+
         func removeAccessMetadata(_ token: String) {
             passthroughRuntimeAccesses.remove(token)
             initializingRuntimeAccesses.remove(token)
@@ -799,7 +975,21 @@ public struct Lowerer: Sendable {
             sourceToken: String,
             source: Bytecode.Register,
             lineIndex: Int
-        ) throws -> (argument: Bytecode.Register, tracksResultLifetime: Bool) {
+        ) throws -> NativeReferenceConversion {
+            if let retained = takePendingRetainedValue(for: sourceToken) {
+                guard registerTypes[Int(retained.rawValue)]
+                        == registerTypes[Int(source.rawValue)]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "retained native conversion owner has the wrong type"
+                    )
+                }
+                return .init(
+                    argument: retained,
+                    tracksCompilerTemporary: false,
+                    forwardsExplicitOwner: true
+                )
+            }
             // Native bridge calls consume their argument. Preserve a borrowed
             // or subsequently reused SIL source and own the conversion result
             // as a compiler-generated temporary until its final semantic use.
@@ -809,58 +999,59 @@ public struct Lowerer: Sendable {
             )
             let preservesSource = sourceIsBorrowed
                 || hasFutureSemanticUse(of: sourceToken, after: lineIndex)
-            return (
-                preservesSource ? try copyOwnedCallArgument(source) : source,
-                preservesSource
+            return .init(
+                argument: preservesSource
+                    ? try copyOwnedValue(source)
+                    : source,
+                tracksCompilerTemporary: preservesSource,
+                forwardsExplicitOwner: false
             )
         }
 
-        func releasePreservedNativeConversionsAfterLastUse(
+        func releaseBorrowedTemporariesAfterLastUse(
             _ tokens: some Sequence<String>,
             after lineIndex: Int
         ) {
             for token in Set(tokens) where !hasFutureSemanticUse(
-                of: token,
+                ofBorrowedTemporaryAliasedTo: token,
                 after: lineIndex
             ) {
-                guard let value = preservedNativeConversionValues.removeValue(
-                    forKey: token
-                ) else { continue }
+                guard let value = removeBorrowedTemporaryValue(for: token)
+                else { continue }
+                clearBorrowedTemporaryClassification(for: token)
                 appendInstruction(.destroyValue(value))
             }
         }
 
-        func closePreservedNativeConversionLifetime(
+        func closeBorrowedTemporaryLifetime(
             for token: String,
             resolved value: Bytecode.Register
         ) throws {
-            guard let tracked = preservedNativeConversionValues.removeValue(
-                forKey: token
-            ) else { return }
+            guard let tracked = removeBorrowedTemporaryValue(for: token)
+            else { return }
             guard tracked == value else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "preserved native conversion ownership does not match its SIL value"
+                    "borrowed temporary ownership does not match its SIL value"
                 )
             }
+            clearBorrowedTemporaryClassification(for: token)
         }
 
-        func transferPreservedNativeConversionLifetime(
+        func transferBorrowedTemporaryLifetime(
             from sourceToken: String,
             resolved source: Bytecode.Register,
             to resultToken: String,
             result: Bytecode.Register
         ) throws {
-            guard let tracked = preservedNativeConversionValues.removeValue(
-                forKey: sourceToken
-            ) else { return }
-            guard tracked == source,
-                  preservedNativeConversionValues[resultToken] == nil
-            else {
+            guard let tracked = removeBorrowedTemporaryValue(for: sourceToken)
+            else { return }
+            guard tracked == source else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "preserved native conversion cannot transfer into its owner"
+                    "borrowed temporary cannot transfer into a different owner"
                 )
             }
-            preservedNativeConversionValues[resultToken] = result
+            clearBorrowedTemporaryClassification(for: sourceToken)
+            try recordBorrowedTemporaryValue(result, for: resultToken)
         }
 
         func addressBase(_ token: String) -> String {
@@ -971,18 +1162,6 @@ public struct Lowerer: Sendable {
             tupleComponentValues = tupleComponentValues.filter { $0.key.root != root }
         }
 
-        func cacheTupleComponentValue(
-            _ value: Bytecode.Register,
-            at token: String
-        ) throws {
-            guard let key = tupleComponentStorageKey(for: token) else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "tuple component cache requires a projected address"
-                )
-            }
-            tupleComponentValues[key] = value
-        }
-
         @discardableResult
         func removeCompilerAddressValue(at token: String) -> Bytecode.Register? {
             if let key = tupleComponentStorageKey(for: token) {
@@ -1019,6 +1198,169 @@ public struct Lowerer: Sendable {
                 root: addressBase(current),
                 path: Array(reversedPath.reversed())
             )
+        }
+
+        func unpackTupleValue(
+            _ tuple: Bytecode.Register
+        ) throws -> [Bytecode.Register] {
+            guard case let .tuple(types) = registerTypes[Int(tuple.rawValue)]
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "tuple storage does not contain a tuple VM value"
+                )
+            }
+            if let existing = unpackedTuples[tuple] {
+                return existing
+            }
+            let elements = try types.map { try allocate(type: $0) }
+            unpackedTuples[tuple] = elements
+            appendInstruction(.unpackTuple(results: elements, tuple: tuple))
+            return elements
+        }
+
+        /// Compiler-only tuple storage may alternate between one aggregate
+        /// register and field registers. Rebuild the requested aggregate only
+        /// when every leaf is initialized; making that transition explicit
+        /// preserves linear ownership for nested tuples as well as scalars.
+        func rebuildTupleStorageValue(
+            root: String,
+            type: Bytecode.ValueType,
+            path: [Int] = []
+        ) throws -> Bytecode.Register? {
+            if path.isEmpty, let aggregate = stackAddressValues[root] {
+                return aggregate
+            }
+            if !path.isEmpty,
+               let aggregate = tupleComponentValues[
+                .init(root: root, path: path)
+               ] {
+                return aggregate
+            }
+            guard case let .tuple(types) = type else { return nil }
+
+            var elements: [Bytecode.Register] = []
+            elements.reserveCapacity(types.count)
+            for (index, elementType) in types.enumerated() {
+                let childPath = path + [index]
+                let childKey = TupleComponentStorageKey(
+                    root: root,
+                    path: childPath
+                )
+                let child: Bytecode.Register? = if let value = tupleComponentValues[
+                    childKey
+                ] {
+                    value
+                } else if case .tuple = elementType {
+                    try rebuildTupleStorageValue(
+                        root: root,
+                        type: elementType,
+                        path: childPath
+                    )
+                } else {
+                    nil
+                }
+                guard let child,
+                      registerTypes[Int(child.rawValue)] == elementType
+                else { return nil }
+                elements.append(child)
+            }
+
+            let result = try allocate(type: type)
+            appendInstruction(.makeTuple(result: result, elements: elements))
+            tupleComponentValues = tupleComponentValues.filter {
+                candidate,
+                _ in
+                guard candidate.root == root else { return true }
+                return !candidate.path.starts(with: path)
+                    || candidate.path.count <= path.count
+            }
+            if path.isEmpty {
+                stackAddressValues[root] = result
+            } else {
+                tupleComponentValues[.init(root: root, path: path)] = result
+            }
+            return result
+        }
+
+        /// Materializes every declared descendant projection from an aggregate
+        /// regardless of whether the projection address was formed before or
+        /// after the aggregate became initialized.
+        func materializeTupleComponents(
+            at base: String,
+            tuple: Bytecode.Register
+        ) throws {
+            guard case .tuple = registerTypes[Int(tuple.rawValue)] else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "tuple address does not contain a tuple VM value"
+                )
+            }
+            let baseKey = tupleComponentStorageKey(for: base)
+            let root = baseKey?.root ?? addressBase(base)
+            let basePath = baseKey?.path ?? []
+            let targets = Set(tupleComponentAddresses.keys.compactMap {
+                tupleComponentStorageKey(for: $0)
+            }.filter {
+                $0.root == root
+                    && $0.path.count > basePath.count
+                    && $0.path.starts(with: basePath)
+            }).sorted { lhs, rhs in
+                if lhs.path.count != rhs.path.count {
+                    return lhs.path.count < rhs.path.count
+                }
+                for (left, right) in zip(lhs.path, rhs.path)
+                where left != right {
+                    return left < right
+                }
+                return false
+            }
+            guard !targets.isEmpty else { return }
+
+            for target in targets {
+                var current = tuple
+                var currentPath = basePath
+                for index in target.path.dropFirst(basePath.count) {
+                    let childPath = currentPath + [index]
+                    let childKey = TupleComponentStorageKey(
+                        root: root,
+                        path: childPath
+                    )
+                    if let cached = tupleComponentValues[childKey] {
+                        current = cached
+                    } else {
+                        let elements = try unpackTupleValue(current)
+                        if currentPath.isEmpty {
+                            stackAddressValues.removeValue(forKey: root)
+                        } else {
+                            tupleComponentValues.removeValue(
+                                forKey: .init(
+                                    root: root,
+                                    path: currentPath
+                                )
+                            )
+                        }
+                        guard elements.indices.contains(index) else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "tuple component address is out of bounds"
+                            )
+                        }
+                        for (childIndex, element) in elements.enumerated() {
+                            tupleComponentValues[
+                                .init(
+                                    root: root,
+                                    path: currentPath + [childIndex]
+                                )
+                            ] = element
+                        }
+                        current = elements[index]
+                    }
+                    currentPath = childPath
+                }
+            }
+            if let baseKey {
+                tupleComponentValues.removeValue(forKey: baseKey)
+            } else {
+                stackAddressValues.removeValue(forKey: root)
+            }
         }
 
         func compilerStorageIdentity(
@@ -1163,7 +1505,34 @@ public struct Lowerer: Sendable {
             ) {
                 return replacement
             }
-            return stackValue(at: token)
+            if let value = stackValue(at: token) {
+                return value
+            }
+            guard runtimeAddress(at: token) == nil,
+                  mutableCell(at: token) == nil
+            else { return nil }
+            if let key = tupleComponentStorageKey(for: token) {
+                if let rootAggregate = stackAddressValues[key.root] {
+                    try materializeTupleComponents(
+                        at: key.root,
+                        tuple: rootAggregate
+                    )
+                    return tupleComponentValues[key]
+                }
+                guard let componentType = stackType(at: token),
+                      case .tuple = componentType
+                else { return nil }
+                return try rebuildTupleStorageValue(
+                    root: key.root,
+                    type: componentType,
+                    path: key.path
+                )
+            }
+            let root = addressBase(token)
+            guard let rootType = stackAddressTypes[root],
+                  case .tuple = rootType
+            else { return nil }
+            return try rebuildTupleStorageValue(root: root, type: rootType)
         }
 
         func copyStoredValue(
@@ -1252,10 +1621,7 @@ public struct Lowerer: Sendable {
                 }
                 return copy
             }
-            let value = try resolve(token, line: line)
-            return registerTypes[Int(value.rawValue)].requiresLinearOwnership
-                ? try copyOwnedCallArgument(value)
-                : value
+            return try prepareOwnedValue(token, line: line)
         }
 
         func takeStoredValue(
@@ -1425,6 +1791,23 @@ public struct Lowerer: Sendable {
                 // later read bypass load/copy semantics after ownership moved.
                 stackAddressValues.removeValue(forKey: root)
                 return
+            }
+            let mode = requestedMode ?? storageInitializationPlan.storeMode(
+                at: currentSILLineIndex,
+                address: token
+            )
+            if mode != .initialize,
+               let previous = try resolvedStackValue(
+                at: token,
+                line: currentSILLineIndex + 1
+               ),
+               previous != value,
+               registerTypes[Int(previous.rawValue)].requiresLinearOwnership {
+                // Compiler-only addresses elide VM storage instructions, but
+                // assignment still ends the previous stored ownership. Keep
+                // that release in the shared storage sink so every synthesized
+                // mutating operation follows the same rule.
+                appendInstruction(.destroyValue(previous))
             }
             recordCompilerAddressValue(value, at: token)
             values[token] = value
@@ -1681,11 +2064,17 @@ public struct Lowerer: Sendable {
                     }
                     value = stored
                 } else {
-                    value = try resolveStorableValue(
-                        token,
-                        expectedType: logicalType,
-                        line: line
-                    )
+                    value = convention == .owned
+                        ? try prepareOwnedValue(
+                            token,
+                            expectedType: logicalType,
+                            line: line
+                        )
+                        : try resolveStorableValue(
+                            token,
+                            expectedType: logicalType,
+                            line: line
+                        )
                 }
                 guard convention == .inout else {
                     arguments.append(value)
@@ -1928,7 +2317,7 @@ public struct Lowerer: Sendable {
                 return try zip(arguments, physicalConventions).map {
                     argument, convention in
                     convention == .borrowed
-                        ? try copyOwnedCallArgument(argument)
+                        ? try copyOwnedValue(argument)
                         : argument
                 }
             }
@@ -2496,50 +2885,20 @@ public struct Lowerer: Sendable {
                         "mutable closure capture references unsupported storage"
                     )
                 }
-                if let value = stackAddressValues[root] {
-                    guard registerTypes[Int(value.rawValue)] == pointee else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "mutable closure capture storage has the wrong type"
-                        )
-                    }
-                    initialValue = value
-                } else if case let .tuple(types) = pointee {
-                    var elements = [Bytecode.Register?](
-                        repeating: nil,
-                        count: types.count
-                    )
-                    for (key, value) in tupleComponentValues
-                    where key.root == root && key.path.count == 1 {
-                        let index = key.path[0]
-                        guard types.indices.contains(index),
-                              elements[index] == nil,
-                              registerTypes[Int(value.rawValue)] == types[index]
-                        else {
-                            throw CanonicalSIL.LoweringError.malformedSIL(
-                                "mutable tuple capture has invalid component storage"
-                            )
-                        }
-                        elements[index] = value
-                    }
-                    let initializedElements = elements.compactMap { $0 }
-                    guard initializedElements.count == types.count else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "mutable tuple capture references uninitialized storage"
-                        )
-                    }
-                    let tuple = try allocate(type: pointee)
-                    appendInstruction(
-                        .makeTuple(
-                            result: tuple,
-                            elements: initializedElements
-                        )
-                    )
-                    initialValue = tuple
-                } else {
+                guard let value = try resolvedStackValue(
+                    at: root,
+                    line: line
+                ) else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "mutable closure capture references unsupported storage"
                     )
                 }
+                guard registerTypes[Int(value.rawValue)] == pointee else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "mutable closure capture storage has the wrong type"
+                    )
+                }
+                initialValue = value
             }
             stackAddressValues.removeValue(forKey: root)
             removeTupleComponentValues(rootedAt: root)
@@ -2870,7 +3229,7 @@ public struct Lowerer: Sendable {
             var arguments = try zip(prepared.arguments, valueConventions).map {
                 argument, convention in
                 convention == .borrowed
-                    ? try copyOwnedCallArgument(argument)
+                    ? try copyOwnedValue(argument)
                     : argument
             }
             let receiver: Bytecode.Register
@@ -2946,35 +3305,6 @@ public struct Lowerer: Sendable {
             try storeConstructedValue(mutated, at: receiverToken)
             try finishPreparedAccessesAndWritebacks(prepared)
             voidValues.insert(resultToken)
-        }
-
-        func materializeTupleComponents(
-            at base: String,
-            tuple: Bytecode.Register
-        ) throws {
-            guard case let .tuple(types) = registerTypes[Int(tuple.rawValue)] else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "tuple address does not contain a tuple VM value"
-                )
-            }
-            let elements: [Bytecode.Register]
-            if let existing = unpackedTuples[base] {
-                elements = existing
-            } else {
-                elements = try types.map { try allocate(type: $0) }
-                unpackedTuples[base] = elements
-                appendInstruction(.unpackTuple(results: elements, tuple: tuple))
-            }
-            for (token, component) in tupleComponentAddresses
-            where addressBase(component.base) == addressBase(base) {
-                guard types.indices.contains(component.index) else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "tuple component address is out of bounds"
-                    )
-                }
-                stackAddressTypes[token] = types[component.index]
-                try cacheTupleComponentValue(elements[component.index], at: token)
-            }
         }
 
         func storeExistential(
@@ -6213,6 +6543,81 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func lowerCapacityHint(
+            capacityToken: String,
+            storageToken: String,
+            expectedType: Bytecode.ValueType,
+            displayName: String,
+            resultToken: String,
+            line: Int
+        ) throws {
+            guard compilerAddressType(storageToken) == expectedType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(displayName) storage does not match its specialization"
+                )
+            }
+            let capacity: Bytecode.Register
+            if let stored = try copyStoredValue(
+                at: capacityToken,
+                line: line
+            ) {
+                capacity = stored
+            } else {
+                capacity = try resolve(capacityToken, line: line)
+            }
+            guard registerTypes[Int(capacity.rawValue)] == .int64 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(displayName) has unsupported arguments"
+                )
+            }
+            try appendNonnegativePrecondition(
+                capacity,
+                reason: "\(displayName) must not be negative"
+            )
+            guard let collection = try borrowStoredValue(
+                at: storageToken,
+                line: line
+            ), registerTypes[Int(collection.register.rawValue)] == expectedType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(displayName) has unsupported arguments"
+                )
+            }
+            if let owner = collection.temporaryOwner {
+                appendInstruction(.destroyValue(owner))
+            }
+            // Capacity is not observable through the supported collection
+            // APIs. Validate Swift's precondition while retaining immutable
+            // VM value storage.
+            voidValues.insert(resultToken)
+        }
+
+        func appendNonnegativePrecondition(
+            _ value: Bytecode.Register,
+            reason: String
+        ) throws {
+            guard registerTypes[Int(value.rawValue)] == .int64 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "nonnegative precondition requires Int"
+                )
+            }
+            let zero = try allocate(type: .int64)
+            appendInstruction(.constantInteger(result: zero, bitPattern: 0))
+            let isNegative = try allocate(type: .bool)
+            appendInstruction(
+                .compare(
+                    result: isNegative,
+                    predicate: .lessThan,
+                    lhs: value,
+                    rhs: zero
+                )
+            )
+            try appendConditionalTrap(
+                condition: isNegative,
+                reason: .explicit(reason)
+            )
+        }
+
         func lowerCollectionIntrinsic(
             _ intrinsic: CanonicalSIL.CollectionIntrinsic,
             resultToken: String,
@@ -6995,6 +7400,478 @@ public struct Lowerer: Sendable {
                         )
                     )
                     values[resultToken] = result
+                }
+
+            case let .arrayEdit(operation):
+                let specializations = try splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                    .map(parseType)
+                let specialization = try operation.resolveSpecialization(
+                    specializations
+                )
+                let arrayType = specialization.array
+                let element = specialization.element
+
+                func borrowArray(
+                    at token: String
+                ) throws -> BorrowedStoredValue {
+                    let borrowed: BorrowedStoredValue
+                    if let stored = try borrowStoredValue(
+                        at: token,
+                        line: line
+                    ) {
+                        borrowed = stored
+                    } else {
+                        borrowed = .init(
+                            register: try resolve(token, line: line),
+                            temporaryOwner: nil
+                        )
+                    }
+                    guard registerTypes[Int(borrowed.register.rawValue)]
+                            == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array edit operand does not match its specialization"
+                        )
+                    }
+                    return borrowed
+                }
+
+                func destroyTemporaryOwners(
+                    _ values: [BorrowedStoredValue]
+                ) {
+                    var destroyed = Set<Bytecode.Register>()
+                    for owner in values.compactMap(\.temporaryOwner)
+                    where destroyed.insert(owner).inserted {
+                        appendInstruction(.destroyValue(owner))
+                    }
+                }
+
+                func integerConstant(
+                    _ bitPattern: UInt64
+                ) throws -> Bytecode.Register {
+                    let result = try allocate(type: .int64)
+                    appendInstruction(
+                        .constantInteger(
+                            result: result,
+                            bitPattern: bitPattern
+                        )
+                    )
+                    return result
+                }
+
+                func emptyArray() throws -> Bytecode.Register {
+                    let result = try allocate(type: arrayType)
+                    appendInstruction(.makeArray(result: result, elements: []))
+                    return result
+                }
+
+                func replace(
+                    _ array: Bytecode.Register,
+                    from lowerBound: Bytecode.Register,
+                    to upperBound: Bytecode.Register,
+                    with replacement: Bytecode.Register
+                ) throws -> Bytecode.Register {
+                    let result = try allocate(type: arrayType)
+                    appendInstruction(
+                        .arrayReplaceSubrange(
+                            result: result,
+                            array: array,
+                            lowerBound: lowerBound,
+                            upperBound: upperBound,
+                            replacement: replacement
+                        )
+                    )
+                    return result
+                }
+
+                func destroyLinearTemporary(_ value: Bytecode.Register) {
+                    if registerTypes[Int(value.rawValue)]
+                        .requiresLinearOwnership {
+                        appendInstruction(.destroyValue(value))
+                    }
+                }
+
+                func rangeValue(
+                    at token: String
+                ) throws -> CanonicalSIL.Progression.Value {
+                    let isDirect = progressionValues[token] != nil
+                    let value = if let direct = progressionValues[token] {
+                        direct
+                    } else {
+                        try progressionValue(at: token, line: line)
+                    }
+                    guard value.type == .init(
+                        family: .range,
+                        element: .int64
+                    ), value.stride == nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array range edit requires Range<Int>"
+                        )
+                    }
+                    if isDirect, !hasFutureSemanticUse(
+                        of: token,
+                        after: currentSILLineIndex
+                    ) {
+                        progressionValues.removeValue(forKey: token)
+                    }
+                    return value
+                }
+
+                switch operation {
+                case .concatenating:
+                    guard arguments.count == 3,
+                          arrayMetatypeValues[arguments[2]] == element
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array concatenation has unsupported arguments"
+                        )
+                    }
+                    let lhs = try borrowArray(at: arguments[0])
+                    let rhs = try borrowArray(at: arguments[1])
+                    let end = try emitArrayCount(lhs.register)
+                    let result = try replace(
+                        lhs.register,
+                        from: end,
+                        to: end,
+                        with: rhs.register
+                    )
+                    destroyTemporaryOwners([lhs, rhs])
+                    values[resultToken] = result
+
+                case .concatenateInPlace, .appendContents:
+                    guard arguments.count == (operation == .concatenateInPlace
+                        ? 3 : 2)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array append-contents edit has unsupported arguments"
+                        )
+                    }
+                    let destinationToken = operation == .concatenateInPlace
+                        ? arguments[0] : arguments[1]
+                    let sourceToken = operation == .concatenateInPlace
+                        ? arguments[1] : arguments[0]
+                    if operation == .concatenateInPlace,
+                       arrayMetatypeValues[arguments[2]] != element {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array += metatype does not match Element"
+                        )
+                    }
+                    guard compilerAddressType(destinationToken) == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array append-contents destination has the wrong type"
+                        )
+                    }
+                    let destination = try borrowArray(at: destinationToken)
+                    let source = try borrowArray(at: sourceToken)
+                    let end = try emitArrayCount(destination.register)
+                    let result = try replace(
+                        destination.register,
+                        from: end,
+                        to: end,
+                        with: source.register
+                    )
+                    destroyTemporaryOwners([destination, source])
+                    try storeConstructedValue(
+                        result,
+                        at: destinationToken,
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .insertElement:
+                    guard arguments.count == 3,
+                          compilerAddressType(arguments[2]) == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array.insert has unsupported arguments"
+                        )
+                    }
+                    let value = try materializeOwnedValue(
+                        at: arguments[0],
+                        line: line
+                    )
+                    guard registerTypes[Int(value.rawValue)] == element else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array.insert value does not match Element"
+                        )
+                    }
+                    let singleton = try allocate(type: arrayType)
+                    appendInstruction(
+                        .makeArray(result: singleton, elements: [value])
+                    )
+                    let index = try materialize(arguments[1], as: .int64)
+                    let destination = try borrowArray(at: arguments[2])
+                    let result = try replace(
+                        destination.register,
+                        from: index,
+                        to: index,
+                        with: singleton
+                    )
+                    destroyLinearTemporary(singleton)
+                    destroyTemporaryOwners([destination])
+                    try storeConstructedValue(
+                        result,
+                        at: arguments[2],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .insertContents:
+                    guard arguments.count == 3,
+                          compilerAddressType(arguments[2]) == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "insert(contentsOf:at:) has unsupported arguments"
+                        )
+                    }
+                    let contents = try borrowArray(at: arguments[0])
+                    let index = try materialize(arguments[1], as: .int64)
+                    let destination = try borrowArray(at: arguments[2])
+                    let result = try replace(
+                        destination.register,
+                        from: index,
+                        to: index,
+                        with: contents.register
+                    )
+                    destroyTemporaryOwners([contents, destination])
+                    try storeConstructedValue(
+                        result,
+                        at: arguments[2],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .replaceSubrange:
+                    guard arguments.count == 3,
+                          compilerAddressType(arguments[2]) == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array.replaceSubrange has unsupported arguments"
+                        )
+                    }
+                    let bounds = try rangeValue(at: arguments[0])
+                    let replacement = try borrowArray(at: arguments[1])
+                    let destination = try borrowArray(at: arguments[2])
+                    let result = try replace(
+                        destination.register,
+                        from: bounds.start,
+                        to: bounds.end,
+                        with: replacement.register
+                    )
+                    destroyTemporaryOwners([replacement, destination])
+                    try storeConstructedValue(
+                        result,
+                        at: arguments[2],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .removeAt, .removeFirst, .removeLast:
+                    let expectedCount = operation == .removeAt ? 3 : 2
+                    guard arguments.count == expectedCount else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array element removal has unsupported arguments"
+                        )
+                    }
+                    let outputToken = arguments[0]
+                    let destinationToken = arguments[expectedCount - 1]
+                    guard compilerAddressType(outputToken) == element,
+                          compilerAddressType(destinationToken) == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array element removal storage has the wrong type"
+                        )
+                    }
+                    let destination = try borrowArray(at: destinationToken)
+                    let index: Bytecode.Register
+                    switch operation {
+                    case .removeAt:
+                        index = try materialize(arguments[1], as: .int64)
+                    case .removeFirst:
+                        index = try integerConstant(0)
+                    case .removeLast:
+                        let end = try emitArrayCount(destination.register)
+                        index = try emitCheckedIndexArithmetic(
+                            .subtract,
+                            end,
+                            integerConstant(1)
+                        )
+                    default:
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array removal dispatch is inconsistent"
+                        )
+                    }
+                    let removed = try allocate(type: element)
+                    appendInstruction(
+                        .arrayGet(
+                            result: removed,
+                            array: destination.register,
+                            index: index
+                        )
+                    )
+                    let one = try integerConstant(1)
+                    let upperBound = try emitCheckedIndexArithmetic(
+                        .add,
+                        index,
+                        one
+                    )
+                    let empty = try emptyArray()
+                    let result = try replace(
+                        destination.register,
+                        from: index,
+                        to: upperBound,
+                        with: empty
+                    )
+                    destroyLinearTemporary(empty)
+                    destroyTemporaryOwners([destination])
+                    try storeConstructedValue(
+                        removed,
+                        at: outputToken,
+                        mode: .initialize
+                    )
+                    try storeConstructedValue(
+                        result,
+                        at: destinationToken,
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .removeSubrange:
+                    guard arguments.count == 2,
+                          compilerAddressType(arguments[1]) == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array.removeSubrange has unsupported arguments"
+                        )
+                    }
+                    let bounds = try rangeValue(at: arguments[0])
+                    let destination = try borrowArray(at: arguments[1])
+                    let empty = try emptyArray()
+                    let result = try replace(
+                        destination.register,
+                        from: bounds.start,
+                        to: bounds.end,
+                        with: empty
+                    )
+                    destroyLinearTemporary(empty)
+                    destroyTemporaryOwners([destination])
+                    try storeConstructedValue(
+                        result,
+                        at: arguments[1],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .removeFirstCount, .removeLastCount:
+                    guard arguments.count == 2,
+                          compilerAddressType(arguments[1]) == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array counted removal has unsupported arguments"
+                        )
+                    }
+                    let count = try materialize(arguments[0], as: .int64)
+                    try appendNonnegativePrecondition(
+                        count,
+                        reason: "Array removal count must not be negative"
+                    )
+                    let destination = try borrowArray(at: arguments[1])
+                    let zero = try integerConstant(0)
+                    let end = try emitArrayCount(destination.register)
+                    let lowerBound: Bytecode.Register
+                    let upperBound: Bytecode.Register
+                    if operation == .removeFirstCount {
+                        lowerBound = zero
+                        upperBound = count
+                    } else {
+                        lowerBound = try emitCheckedIndexArithmetic(
+                            .subtract,
+                            end,
+                            count
+                        )
+                        upperBound = end
+                    }
+                    let empty = try emptyArray()
+                    let result = try replace(
+                        destination.register,
+                        from: lowerBound,
+                        to: upperBound,
+                        with: empty
+                    )
+                    destroyLinearTemporary(empty)
+                    destroyTemporaryOwners([destination])
+                    try storeConstructedValue(
+                        result,
+                        at: arguments[1],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .removeAll:
+                    guard arguments.count == 2,
+                          compilerAddressType(arguments[1]) == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array.removeAll has unsupported arguments"
+                        )
+                    }
+                    _ = try materialize(arguments[0], as: .bool)
+                    let destination = try borrowArray(at: arguments[1])
+                    let result = try emptyArray()
+                    destroyTemporaryOwners([destination])
+                    try storeConstructedValue(
+                        result,
+                        at: arguments[1],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .swapAt:
+                    guard arguments.count == 3,
+                          compilerAddressType(arguments[2]) == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array.swapAt has unsupported arguments"
+                        )
+                    }
+                    let lhsIndex = try materialize(arguments[0], as: .int64)
+                    let rhsIndex = try materialize(arguments[1], as: .int64)
+                    let destination = try borrowArray(at: arguments[2])
+                    let result = try allocate(type: arrayType)
+                    appendInstruction(
+                        .arraySwap(
+                            result: result,
+                            array: destination.register,
+                            lhsIndex: lhsIndex,
+                            rhsIndex: rhsIndex
+                        )
+                    )
+                    destroyTemporaryOwners([destination])
+                    try storeConstructedValue(
+                        result,
+                        at: arguments[2],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .reserveCapacity:
+                    guard arguments.count == 2,
+                          compilerAddressType(arguments[1]) == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array.reserveCapacity has unsupported arguments"
+                        )
+                    }
+                    try lowerCapacityHint(
+                        capacityToken: arguments[0],
+                        storageToken: arguments[1],
+                        expectedType: arrayType,
+                        displayName: "Array capacity",
+                        resultToken: resultToken,
+                        line: line
+                    )
                 }
             }
         }
@@ -8298,6 +9175,27 @@ public struct Lowerer: Sendable {
                 )
                 voidValues.insert(resultToken)
 
+            case .dictionaryReserveCapacity:
+                guard arguments.count == 2 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary.reserveCapacity has unsupported arguments"
+                    )
+                }
+                let types = try parseDictionaryGenericArguments(
+                    genericArguments
+                )
+                try lowerCapacityHint(
+                    capacityToken: arguments[0],
+                    storageToken: arguments[1],
+                    expectedType: .dictionary(
+                        key: types.key,
+                        value: types.value
+                    ),
+                    displayName: "Dictionary capacity",
+                    resultToken: resultToken,
+                    line: line
+                )
+
             case .dictionaryLiteral:
                 guard arguments.count == 2 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -8618,38 +9516,19 @@ public struct Lowerer: Sendable {
 
             case .setReserveCapacity:
                 let types = try parseSetGenericArguments(genericArguments)
-                guard arguments.count == 2,
-                      compilerAddressType(arguments[1]) == .set(types.element),
-                      let capacity = try? resolve(arguments[0], line: line),
-                      registerTypes[Int(capacity.rawValue)] == .int64,
-                      let source = try copyStoredValue(
-                        at: arguments[1],
-                        line: line
-                      ),
-                      registerTypes[Int(source.rawValue)] == .set(types.element)
-                else {
+                guard arguments.count == 2 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Set.reserveCapacity has unsupported arguments"
                     )
                 }
-                let zero = try allocate(type: .int64)
-                appendInstruction(.constantInteger(result: zero, bitPattern: 0))
-                let isNegative = try allocate(type: .bool)
-                appendInstruction(
-                    .compare(
-                        result: isNegative,
-                        predicate: .lessThan,
-                        lhs: capacity,
-                        rhs: zero
-                    )
+                try lowerCapacityHint(
+                    capacityToken: arguments[0],
+                    storageToken: arguments[1],
+                    expectedType: .set(types.element),
+                    displayName: "Set capacity",
+                    resultToken: resultToken,
+                    line: line
                 )
-                try appendConditionalTrap(
-                    condition: isNegative,
-                    reason: .explicit("Set capacity must not be negative")
-                )
-                // Capacity is an implementation detail unless queried; the VM
-                // keeps immutable value storage and therefore needs no mutation.
-                voidValues.insert(resultToken)
 
             case .setLiteral, .setSequenceInit:
                 guard arguments.count == 2 else {
@@ -9039,9 +9918,8 @@ public struct Lowerer: Sendable {
                 ), registerTypes[Int(value.rawValue)].requiresLinearOwnership {
                     appendInstruction(.destroyValue(value))
                 }
-                if let value = preservedNativeConversionValues.removeValue(
-                    forKey: borrowEnd[0]
-                ) {
+                if let value = removeBorrowedTemporaryValue(for: borrowEnd[0]) {
+                    clearBorrowedTemporaryClassification(for: borrowEnd[0])
                     appendInstruction(.destroyValue(value))
                 }
                 continue
@@ -9320,7 +10198,9 @@ public struct Lowerer: Sendable {
                     in: [bridge.normalTarget, bridge.errorTarget]
                 )
                 for token in bridge.argumentTokens {
-                    preservedNativeConversionValues.removeValue(forKey: token)
+                    if removeBorrowedTemporaryValue(for: token) != nil {
+                        clearBorrowedTemporaryClassification(for: token)
+                    }
                 }
                 continue
             }
@@ -11037,7 +11917,7 @@ public struct Lowerer: Sendable {
                     .nativeApply(
                         result: result,
                         importID: requirement.id,
-                        arguments: [try copyOwnedCallArgument(operand)]
+                        arguments: [try copyOwnedValue(operand)]
                     )
                 )
                 continue
@@ -11079,8 +11959,12 @@ public struct Lowerer: Sendable {
                 )
                 let result = try allocate(type: .native(targetType))
                 values[cast[0]] = result
-                if conversion.tracksResultLifetime {
-                    preservedNativeConversionValues[cast[0]] = result
+                aliasRetainedValue(cast[0], to: cast[1])
+                if conversion.forwardsExplicitOwner {
+                    recordPendingRetainedValue(result, for: cast[0])
+                }
+                if conversion.tracksCompilerTemporary {
+                    try recordBorrowedTemporaryValue(result, for: cast[0])
                 }
                 appendInstruction(
                     .nativeApply(
@@ -11089,7 +11973,7 @@ public struct Lowerer: Sendable {
                         arguments: [conversion.argument]
                     )
                 )
-                releasePreservedNativeConversionsAfterLastUse(
+                releaseBorrowedTemporariesAfterLastUse(
                     [cast[1]],
                     after: lineIndex
                 )
@@ -11156,8 +12040,12 @@ public struct Lowerer: Sendable {
                 )
                 let result = try allocate(type: .native(targetType))
                 values[cast[0]] = result
-                if conversion.tracksResultLifetime {
-                    preservedNativeConversionValues[cast[0]] = result
+                aliasRetainedValue(cast[0], to: cast[1])
+                if conversion.forwardsExplicitOwner {
+                    recordPendingRetainedValue(result, for: cast[0])
+                }
+                if conversion.tracksCompilerTemporary {
+                    try recordBorrowedTemporaryValue(result, for: cast[0])
                 }
                 appendInstruction(
                     .nativeApply(
@@ -11166,7 +12054,7 @@ public struct Lowerer: Sendable {
                         arguments: [conversion.argument]
                     )
                 )
-                releasePreservedNativeConversionsAfterLastUse(
+                releaseBorrowedTemporariesAfterLastUse(
                     [cast[1]],
                     after: lineIndex
                 )
@@ -12593,7 +13481,7 @@ public struct Lowerer: Sendable {
                     }
                 }
                 try finishPreparedAccessesAndWritebacks(prepared)
-                releasePreservedNativeConversionsAfterLastUse(
+                releaseBorrowedTemporariesAfterLastUse(
                     zip(
                         argumentTokens,
                         reference.physicalParameterConventions
@@ -12698,6 +13586,8 @@ public struct Lowerer: Sendable {
                 if sourceType == targetType,
                    typeEnvironment.containsReferenceNativeValue(sourceType) {
                     values[cast[0]] = source
+                    aliasRetainedValue(cast[0], to: cast[1])
+                    aliasBorrowedTemporary(cast[0], to: cast[1])
                     continue
                 }
             }
@@ -12715,16 +13605,28 @@ public struct Lowerer: Sendable {
                         "unchecked reference-to-Optional cast changes its frozen VM type"
                     )
                 }
+                let payload = try prepareOwnedValue(
+                    cast[1],
+                    expectedType: sourceType,
+                    line: sourceLine
+                )
                 let result = try allocate(type: .optional(sourceType))
                 values[cast[0]] = result
-                knownOptionalSomePayloads[cast[0]] = source
-                appendInstruction(.makeOptionalSome(result: result, value: source))
-                try transferPreservedNativeConversionLifetime(
-                    from: cast[1],
-                    resolved: source,
-                    to: cast[0],
-                    result: result
-                )
+                knownOptionalSomePayloads[cast[0]] = payload
+                appendInstruction(.makeOptionalSome(result: result, value: payload))
+                if payload == source {
+                    try transferBorrowedTemporaryLifetime(
+                        from: cast[1],
+                        resolved: source,
+                        to: cast[0],
+                        result: result
+                    )
+                } else {
+                    releaseBorrowedTemporariesAfterLastUse(
+                        [cast[1]],
+                        after: lineIndex
+                    )
+                }
                 continue
             }
 
@@ -13023,6 +13925,7 @@ public struct Lowerer: Sendable {
                 pattern: #"^(%[0-9]+) = enum \$Optional<(.+)>, #Optional\.some!enumelt, (%[0-9]+)$"#
             ) {
                 let payload: Bytecode.Register
+                let source: Bytecode.Register
                 let wrapped: Bytecode.ValueType
                 if voidValues.contains(optional[2]) {
                     wrapped = try parseStoredType(optional[1])
@@ -13031,14 +13934,20 @@ public struct Lowerer: Sendable {
                         expectedType: wrapped,
                         line: sourceLine
                     )
+                    source = payload
                 } else {
-                    payload = try resolve(optional[2], line: sourceLine)
-                    let payloadType = registerTypes[Int(payload.rawValue)]
+                    source = try resolve(optional[2], line: sourceLine)
+                    let payloadType = registerTypes[Int(source.rawValue)]
                     wrapped = ValueRepresentation.storable(
                         try parsePhysicalType(
                             optional[1],
                             bridgedTo: payloadType
                         )
+                    )
+                    payload = try prepareOwnedValue(
+                        optional[2],
+                        expectedType: wrapped,
+                        line: sourceLine
                     )
                 }
                 guard registerTypes[Int(payload.rawValue)] == wrapped else {
@@ -13050,12 +13959,19 @@ public struct Lowerer: Sendable {
                 values[optional[0]] = result
                 knownOptionalSomePayloads[optional[0]] = payload
                 appendInstruction(.makeOptionalSome(result: result, value: payload))
-                try transferPreservedNativeConversionLifetime(
-                    from: optional[2],
-                    resolved: payload,
-                    to: optional[0],
-                    result: result
-                )
+                if payload == source {
+                    try transferBorrowedTemporaryLifetime(
+                        from: optional[2],
+                        resolved: source,
+                        to: optional[0],
+                        result: result
+                    )
+                } else {
+                    releaseBorrowedTemporariesAfterLastUse(
+                        [optional[2]],
+                        after: lineIndex
+                    )
+                }
                 continue
             }
 
@@ -13474,8 +14390,8 @@ public struct Lowerer: Sendable {
                         mangledName: binding.mangledName
                     )
                 }
-                let ownedValue = try copyOwnedCallArgument(value)
-                let receiver = try copyOwnedCallArgument(property.receiver)
+                let ownedValue = try copyOwnedValue(value)
+                let receiver = try copyOwnedValue(property.receiver)
                 appendInstruction(
                     .nativeApply(
                         result: nil,
@@ -13639,7 +14555,7 @@ public struct Lowerer: Sendable {
                         "Array tuple component store is out of bounds"
                     )
                 }
-                let value = try resolveStorableValue(
+                let value = try prepareStoredValue(
                     store[0],
                     expectedType: types[address.component],
                     line: sourceLine
@@ -13663,7 +14579,7 @@ public struct Lowerer: Sendable {
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
             ), let address = arrayLiteralAddresses[store[1]],
                var pending = pendingArrayLiterals[address.allocation] {
-                let value = try resolveStorableValue(
+                let value = try prepareStoredValue(
                     store[0],
                     expectedType: pending.elementType,
                     line: sourceLine
@@ -13749,6 +14665,11 @@ public struct Lowerer: Sendable {
                         arguments: []
                     )
                 )
+                if load[1].isEmpty,
+                   binding.resultType.requiresLinearOwnership {
+                    borrowedLoadTokens.insert(load[0])
+                    try recordBorrowedTemporaryValue(result, for: load[0])
+                }
                 continue
             }
 
@@ -13757,6 +14678,9 @@ public struct Lowerer: Sendable {
                 pattern: #"^(%[0-9]+) = load(?: \[(trivial|copy|take)\])? (%[0-9]+)$"#
             ) {
                 let mode = load[1]
+                let isTakingLoad = mode == "take"
+                    || storageInitializationPlan.forwardingLoadLines
+                        .contains(currentSILLineIndex)
                 let address = addressBase(load[2])
                 if let property = nativePropertyAddresses[address] {
                     guard mode != "take" else {
@@ -13786,7 +14710,7 @@ public struct Lowerer: Sendable {
                     }
                     let result = try allocate(type: property.valueType)
                     values[load[0]] = result
-                    let receiver = try copyOwnedCallArgument(property.receiver)
+                    let receiver = try copyOwnedValue(property.receiver)
                     appendInstruction(
                         .nativeApply(
                             result: result,
@@ -13794,6 +14718,11 @@ public struct Lowerer: Sendable {
                             arguments: [receiver]
                         )
                     )
+                    if mode.isEmpty,
+                       property.valueType.requiresLinearOwnership {
+                        borrowedLoadTokens.insert(load[0])
+                        try recordBorrowedTemporaryValue(result, for: load[0])
+                    }
                     continue
                 }
                 if pendingStringInterpolationAddresses.contains(address) {
@@ -13802,10 +14731,10 @@ public struct Lowerer: Sendable {
                             "String interpolation load references uninitialized storage"
                         )
                     }
-                    switch mode {
-                    case "take":
+                    switch (mode, isTakingLoad) {
+                    case (_, true):
                         stringInterpolationAddressValues.removeValue(forKey: address)
-                    case "", "copy":
+                    case ("", false), ("copy", false):
                         // Unoptimized SIL spells the same ownership transfer as
                         // load + retain_value + destroy_addr instead of load [take].
                         break
@@ -13826,7 +14755,7 @@ public struct Lowerer: Sendable {
                             "progression load references mismatched storage"
                         )
                     }
-                    if mode == "take" {
+                    if isTakingLoad {
                         progressionAddressValues.removeValue(forKey: address)
                     }
                     progressionValues[load[0]] = progression
@@ -13854,7 +14783,7 @@ public struct Lowerer: Sendable {
                 }
                 if let addressRegister = runtimeAddress(at: load[2]),
                    let addressType = stackType(at: load[2]) {
-                    if mode == "take" {
+                    if isTakingLoad {
                         let blockID = current?.id
                         let wasKnownSome = isKnownSomeOptionalAddress(
                             load[2],
@@ -13884,7 +14813,8 @@ public struct Lowerer: Sendable {
                             .loadAddress(result: result, address: addressRegister, mode: .copy)
                         )
                     } else if let slot = runtimeStackSlots[address], load[2] == address {
-                        let loadMode: Bytecode.StackLoadMode = mode == "take" ? .take : .copy
+                        let loadMode: Bytecode.StackLoadMode = isTakingLoad
+                            ? .take : .copy
                         appendInstruction(
                             .loadStack(result: result, slot: slot, mode: loadMode)
                         )
@@ -13923,7 +14853,7 @@ public struct Lowerer: Sendable {
                     load[2],
                     in: blockID
                 )
-                if mode == "take" {
+                if isTakingLoad {
                     guard !addressType.requiresLinearOwnership
                             || !isBorrowedValue(
                                 token: load[2],
@@ -13945,13 +14875,7 @@ public struct Lowerer: Sendable {
                             isKnownSome: true
                         )
                     }
-                } else if mode == "copy"
-                            || (mode.isEmpty
-                                && !addressType.isTrivial
-                                && !isBorrowedValue(
-                                    token: load[2],
-                                    register: value
-                                )) {
+                } else if mode == "copy" {
                     let copy = try allocate(type: addressType)
                     appendInstruction(.copyValue(result: copy, source: value))
                     values[load[0]] = copy
@@ -13964,7 +14888,7 @@ public struct Lowerer: Sendable {
                         borrowedLoadTokens.insert(load[0])
                     }
                 }
-                if mode != "take" {
+                if !isTakingLoad {
                     recordOptionalLoadCase(
                         from: load[2],
                         to: load[0],
@@ -14073,9 +14997,18 @@ public struct Lowerer: Sendable {
                 // Compiler-only storage owns the SSA value transferred into
                 // it. Native boxes need an explicit HLBC destroy even when the
                 // physical Swift value has trivial SIL ownership.
-                if let value = removeCompilerAddressValue(at: destroy[0]),
-                   registerTypes[Int(value.rawValue)].requiresLinearOwnership {
-                    appendInstruction(.destroyValue(value))
+                if let value = try resolvedStackValue(
+                    at: destroy[0],
+                    line: sourceLine
+                ) {
+                    removeCompilerAddressValue(at: destroy[0])
+                    if registerTypes[Int(value.rawValue)].requiresLinearOwnership {
+                        appendInstruction(.destroyValue(value))
+                    }
+                } else if stackType(at: destroy[0])?.requiresLinearOwnership == true {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "destroy_addr references uninitialized compiler storage"
+                    )
                 }
                 continue
             }
@@ -14210,7 +15143,10 @@ public struct Lowerer: Sendable {
                 let elements = try components.map { component in
                     let token = component.split(separator: ":", maxSplits: 1)[0]
                         .trimmingCharacters(in: .whitespaces)
-                    return try resolveStorableValue(token, line: sourceLine)
+                    return try prepareOwnedValue(
+                        token,
+                        line: sourceLine
+                    )
                 }
                 let result = try allocate(
                     type: .tuple(elements.map { registerTypes[Int($0.rawValue)] })
@@ -14277,14 +15213,7 @@ public struct Lowerer: Sendable {
                         "tuple_extract index does not match its operand type"
                     )
                 }
-                let elements: [Bytecode.Register]
-                if let existing = unpackedTuples[extract[1]] {
-                    elements = existing
-                } else {
-                    elements = try elementTypes.map { try allocate(type: $0) }
-                    unpackedTuples[extract[1]] = elements
-                    appendInstruction(.unpackTuple(results: elements, tuple: tuple))
-                }
+                let elements = try unpackTupleValue(tuple)
                 values[extract[0]] = elements[index]
                 continue
             }
@@ -14349,7 +15278,7 @@ public struct Lowerer: Sendable {
                     optionalAddressSelectionConditions[copy[0]] = selection
                 }
                 appendInstruction(.copyValue(result: result, source: source))
-                releasePreservedNativeConversionsAfterLastUse(
+                releaseBorrowedTemporariesAfterLastUse(
                     [copy[1]],
                     after: lineIndex
                 )
@@ -14450,7 +15379,7 @@ public struct Lowerer: Sendable {
                 knownOptionalSomePayloads.removeValue(forKey: destroy[0])
                 optionalAddressSelectionConditions.removeValue(forKey: destroy[0])
                 let value = try resolve(destroy[0], line: sourceLine)
-                try closePreservedNativeConversionLifetime(
+                try closeBorrowedTemporaryLifetime(
                     for: destroy[0],
                     resolved: value
                 )
@@ -14472,6 +15401,13 @@ public struct Lowerer: Sendable {
                     }
                     continue
                 }
+                if ownership[0] == "release_value",
+                   let retained = takePendingRetainedValue(
+                    for: ownership[1]
+                   ) {
+                    appendInstruction(.destroyValue(retained))
+                    continue
+                }
                 let value = try resolve(ownership[1], line: sourceLine)
                 if registerTypes[Int(value.rawValue)].requiresLinearOwnership {
                     if ownership[0] == "retain_value" {
@@ -14480,7 +15416,7 @@ public struct Lowerer: Sendable {
                         token: ownership[1],
                         register: value
                     ) {
-                        try closePreservedNativeConversionLifetime(
+                        try closeBorrowedTemporaryLifetime(
                             for: ownership[1],
                             resolved: value
                         )
@@ -14493,6 +15429,13 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^strong_(retain|release) (%[0-9]+)$"#
             ) {
+                if ownership[0] == "release",
+                   let retained = takePendingRetainedValue(
+                    for: ownership[1]
+                   ) {
+                    appendInstruction(.destroyValue(retained))
+                    continue
+                }
                 let value = try resolve(ownership[1], line: sourceLine)
                 let type = registerTypes[Int(value.rawValue)]
                 if case .closure = type { continue }
@@ -14516,7 +15459,7 @@ public struct Lowerer: Sendable {
                     token: ownership[1],
                     register: value
                 ) {
-                    try closePreservedNativeConversionLifetime(
+                    try closeBorrowedTemporaryLifetime(
                         for: ownership[1],
                         resolved: value
                     )
@@ -14774,7 +15717,10 @@ public struct Lowerer: Sendable {
                 let secondTarget = try parseBlockID(branch[4])
                 let someTarget = branch[1] == "some" ? firstTarget : secondTarget
                 let noneTarget = branch[1] == "none" ? firstTarget : secondTarget
-                let optional = try resolve(branch[0], line: sourceLine)
+                let optional = try prepareOwnedValue(
+                    branch[0],
+                    line: sourceLine
+                )
                 guard case .optional = registerTypes[Int(optional.rawValue)] else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Optional switch operand has a non-Optional type"
@@ -15193,6 +16139,13 @@ public struct Lowerer: Sendable {
             "borrow",
             count: borrowedValueTokens.count
         )
+        let retainedValueTokens = pendingRetainedValues.flatMap { token, values in
+            Array(repeating: token, count: values.count)
+        }.sorted()
+        recordIncompleteLifetime(
+            "retained-value[\(retainedValueTokens.joined(separator: "|"))]",
+            count: retainedValueTokens.count
+        )
         recordIncompleteLifetime(
             "lexical-dealloc",
             count: remainingDeallocStackUses.values.reduce(0, +)
@@ -15214,14 +16167,14 @@ public struct Lowerer: Sendable {
                 $0 + $1.count
             }
         )
-        let nativeConversionTokens = preservedNativeConversionValues.keys.sorted()
+        let borrowedTemporaryTokens = borrowedTemporaryValues.keys.sorted()
         recordIncompleteLifetime(
-            "native-conversion[\(nativeConversionTokens.joined(separator: "|"))]",
-            count: nativeConversionTokens.count
+            "borrowed-temporary[\(borrowedTemporaryTokens.joined(separator: "|"))]",
+            count: borrowedTemporaryTokens.count
         )
         guard incompleteCompilerLifetimes.isEmpty else {
             throw CanonicalSIL.LoweringError.malformedSIL(
-                "compiler-only lifetime is incomplete: "
+                "compiler-only lifetime is incomplete in \(displayName): "
                     + incompleteCompilerLifetimes.joined(separator: ", ")
             )
         }

@@ -673,6 +673,22 @@ public enum Instruction: Codable, Hashable, Sendable {
         arrays: Bytecode.Register,
         separator: Bytecode.Register?
     )
+    /// Replaces a validated half-open range with another Array of the same
+    /// element type. Insertions, removals, concatenation, and
+    /// `replaceSubrange` all lower through this value-semantic primitive.
+    case arrayReplaceSubrange(
+        result: Bytecode.Register,
+        array: Bytecode.Register,
+        lowerBound: Bytecode.Register,
+        upperBound: Bytecode.Register,
+        replacement: Bytecode.Register
+    )
+    case arraySwap(
+        result: Bytecode.Register,
+        array: Bytecode.Register,
+        lhsIndex: Bytecode.Register,
+        rhsIndex: Bytecode.Register
+    )
     case arrayAppend(
         result: Bytecode.Register,
         array: Bytecode.Register,
@@ -932,6 +948,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .arrayRangeSlice(result, _, _, _),
              let .arrayZip(result, _, _),
              let .arrayJoined(result, _, _),
+             let .arrayReplaceSubrange(result, _, _, _, _),
+             let .arraySwap(result, _, _, _),
              let .arrayAppend(result, _, _),
              let .arrayUpdate(result, _, _, _),
              let .arrayNext(result, _, _, _),
@@ -1113,6 +1131,16 @@ public enum Instruction: Codable, Hashable, Sendable {
             [lhs, rhs]
         case let .arrayJoined(_, arrays, separator):
             [arrays] + (separator.map { [$0] } ?? [])
+        case let .arrayReplaceSubrange(
+            _,
+            array,
+            lowerBound,
+            upperBound,
+            replacement
+        ):
+            [array, lowerBound, upperBound, replacement]
+        case let .arraySwap(_, array, lhsIndex, rhsIndex):
+            [array, lhsIndex, rhsIndex]
         case let .arrayAppend(_, array, value):
             [array, value]
         case .makeArrayBuilder:

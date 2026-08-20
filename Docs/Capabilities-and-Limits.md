@@ -79,13 +79,21 @@ does not by itself certify a physical device or distribution channel.
   such as `T?`, `T!`, `[T]`, `[K: V]`, and redundant grouping parentheses
   normalize recursively to the same typed representation, including in
   patch-local stored fields.
-- Array value semantics and equality, append, `first`/`last`,
+- Array value semantics and equality, single-element append, `+`, `+=`,
+  `append(contentsOf:)`, element and contents insertion, `replaceSubrange`,
+  positional/first/last/range removal (including counted edge removal),
+  `removeAll(keepingCapacity:)`, `swapAt`, `reserveCapacity`, `first`/`last`,
   `firstIndex(of:)`/`lastIndex(of:)`, `min`/`max`, `elementsEqual`,
   `starts(with:)`, `lexicographicallyPrecedes`, `startIndex`/`endIndex`,
   `distance(from:to:)`, index movement and limited offsets, `indices`,
   `popLast`, iteration, checked subscript access, and value-returning updates.
+  Structural edits accept represented copyable element types and matching
+  Array-backed sources. They share verified half-open range replacement and
+  swap primitives, so bounds checks, overflow behavior, ownership, and
+  allocation-before-copy charging do not depend on a particular element or
+  SDK type.
   Dictionary construction, equality, lookup, update, `removeValue(forKey:)`,
-  and iteration are supported for
+  `reserveCapacity`, and iteration are supported for
   eligible key and value types. Append accepts represented copyable elements,
   including frozen imported reference values. Equality is defined recursively
   for Bool, fixed-width integers, floating-point values, String, and supported
