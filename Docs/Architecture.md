@@ -9,7 +9,7 @@ share compiler facts and identity contracts; they do not share a delivery
 channel.
 
 This document describes the implementation available in the repository as of
-August 16, 2026. It does not turn unfinished qualification work into a product
+August 20, 2026. It does not turn unfinished qualification work into a product
 claim.
 
 ## The two workflows
@@ -75,11 +75,17 @@ Both workflows depend on stable, build-specific identities:
   enforce the same model end to end.
 - Common Array-backed standard-library views are normalized at the compiler/VM
   boundary instead of importing their private storage layouts. Reversed,
-  enumerated, repeated, sliced, zipped, and joined sequences become verified
-  typed Array operations with operation-specific result shapes and bounded
-  pre-allocation accounting. Only element-sequence semantics are normalized;
-  an ArraySlice's non-zero-based index identity is not erased into an Array
-  index, so unsupported slice-index APIs still fail closed.
+  enumerated, repeated, `Slice<Base>`, zipped, and joined sequences become
+  verified typed Array operations with operation-specific result shapes and
+  bounded pre-allocation accounting. Only element-sequence semantics are
+  normalized; an ArraySlice's non-zero-based index identity is not erased into
+  an Array index, so unsupported slice-index APIs still fail closed.
+- Textual declaration summaries are collected before frozen Shell type aliases
+  are available. Local factory tables therefore resolve in two phases: an
+  initial pass admits already-complete local graphs, then native-type injection
+  removes frozen declarations and rebuilds the tables strictly. Imported field
+  types are never guessed to be patch-local merely because Swift emitted their
+  storage attributes in the declaration summary.
 - Array-producing closure traversals use one invocation-local linear builder.
   Scalar appends and bounded whole-Array appends share the same verifier-owned
   element type and precharge copied storage before allocation; this supports
@@ -93,10 +99,18 @@ Both workflows depend on stable, build-specific identities:
   one owned candidate through the CFG. Their two borrowed inputs are ordered
   exactly as Swift specifies, ties retain the earliest element, and both the
   candidate and challenger are closed on a throwing edge.
+- Mutating higher-order callbacks use the same address model as ordinary
+  calls. `reduce(into:_:)` keeps an arbitrary represented accumulator in one
+  frame-owned slot, opens a narrow modify scope for each callback, and closes
+  that scope on both normal and throwing edges before returning or destroying
+  the accumulator. No accumulator type receives a special lowering path.
 - A closure signature carries an ownership convention for every invocation
-  parameter. The compiler preserves concrete Swift `@in_guaranteed` inputs as
-  borrowed VM values, materializes copies only at owned boundaries, and the
-  Verifier requires the signature to match the closure-body prefix exactly.
+  parameter, including an address type paired with `inout`. The compiler
+  preserves concrete Swift `@in_guaranteed` inputs as borrowed VM values,
+  materializes copies only at owned boundaries, and the Verifier requires the
+  signature to match the closure-body prefix exactly. Dynamic calls may carry
+  a live inout scope across normal/error continuations, but every continuation
+  must close the same scope and overlapping arguments remain invalid.
   This rule is type-directed and also covers linear imported SDK values; it is
   not a list of API- or framework-specific exceptions.
 - Frame-local and heap-promoted storage share one field-sensitive aggregate

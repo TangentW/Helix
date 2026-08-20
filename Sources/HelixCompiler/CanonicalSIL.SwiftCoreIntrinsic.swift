@@ -27,6 +27,7 @@ enum SwiftCoreIntrinsic: Equatable {
     case stringFromInterpolation
     case arrayCount
     case collectionIsEmpty
+    case arrayEmpty
     case arraySubscript
     case arraySubscriptModify
     case collectionBoundary(Bytecode.ArrayBoundaryOperation)
@@ -41,6 +42,7 @@ enum SwiftCoreIntrinsic: Equatable {
     case rangeContains(CanonicalSIL.Progression.Family)
     case dictionaryCount
     case dictionaryIsEmpty
+    case dictionaryEmpty
     case dictionarySubscriptGet
     case dictionarySubscriptSet
     case dictionaryRemoveValue
@@ -96,6 +98,8 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .higherOrder(.dropWhile)
         case "$sSTsE6reduceyqd__qd___qd__qd___7ElementQztKXEtKlF":
             self = .higherOrder(.reduce)
+        case "$sSTsE6reduce4into_qd__qd__n_yqd__z_7ElementQztKXEtKlF":
+            self = .higherOrder(.reduceInto)
         case "$sSTsE7forEachyyy7ElementQzKXEKF":
             self = .higherOrder(.forEach)
         case "$sSTsE5first5where7ElementQzSgSbADKXE_tKF":
@@ -165,6 +169,7 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sSS19stringInterpolationSSs013DefaultStringB0V_tcfC":
             self = .stringFromInterpolation
         case "$sSa5countSivg": self = .arrayCount
+        case "$sS2ayxGycfC": self = .arrayEmpty
         case "$sSlsE7isEmptySbvg": self = .collectionIsEmpty
         case "$sSayxSicig": self = .arraySubscript
         case "$sSayxSiciM": self = .arraySubscriptModify
@@ -213,6 +218,7 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sSN8containsySbxF": self = .rangeContains(.closedRange)
         case "$sSD5countSivg": self = .dictionaryCount
         case "$sSD7isEmptySbvg": self = .dictionaryIsEmpty
+        case "$sS2Dyxq_GycfC": self = .dictionaryEmpty
         case "$sSDyq_Sgxcig": self = .dictionarySubscriptGet
         case "$sSDyq_Sgxcis": self = .dictionarySubscriptSet
         case "$sSD11removeValue6forKeyq_Sgx_tF": self = .dictionaryRemoveValue

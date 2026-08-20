@@ -35,9 +35,32 @@ struct FrontendExecutionHarness {
             purpose: .semanticLowering
         )
         let file = try CanonicalSIL.File(text: sil)
-        let functions = file.functions.filter {
+        let nameMatches = file.functions.filter {
             $0.mangledName.contains(functionName)
-        }.sorted {
+        }
+        let declarationPattern = try NSRegularExpression(
+            pattern: #"\bfunc\s+"#
+                + NSRegularExpression.escapedPattern(for: functionName)
+                + #"\b"#
+        )
+        let declarationLines = Set(
+            source.split(separator: "\n", omittingEmptySubsequences: false)
+                .enumerated().compactMap { offset, line -> Int? in
+                    let text = String(line)
+                    let range = NSRange(text.startIndex..., in: text)
+                    return declarationPattern.firstMatch(
+                        in: text,
+                        range: range
+                    ).map { _ in offset + 1 }
+                }
+        )
+        let locatedMatches = file.functions.filter {
+            $0.declarationLocation.map {
+                declarationLines.contains($0.line)
+            } == true
+        }
+        let candidates = locatedMatches.isEmpty ? nameMatches : locatedMatches
+        let functions = candidates.sorted {
             ($0.mangledName.utf8.count, $0.mangledName)
                 < ($1.mangledName.utf8.count, $1.mangledName)
         }

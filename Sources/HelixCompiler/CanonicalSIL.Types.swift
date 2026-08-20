@@ -250,6 +250,7 @@ public struct TypeEnvironment: Sendable {
     }
 
     private var rawDefinitions: [Bytecode.LocalTypeKey: RawDefinition]
+    private var factoryCandidates: [CanonicalSIL.Function]
     private var structFactories: [String: StructFactory]
     private var classAllocators: [String: Bytecode.LocalTypeKey]
     private var requiresTypedErrors: Bool
@@ -277,6 +278,7 @@ public struct TypeEnvironment: Sendable {
 
     public init() {
         rawDefinitions = [:]
+        factoryCandidates = []
         structFactories = [:]
         classAllocators = [:]
         requiresTypedErrors = false
@@ -287,6 +289,7 @@ public struct TypeEnvironment: Sendable {
 
     init(text: String, functions: [CanonicalSIL.Function]) throws {
         rawDefinitions = try Self.extractDefinitions(text)
+        factoryCandidates = functions
         structFactories = [:]
         classAllocators = [:]
         nativeTypes = [:]
@@ -297,14 +300,10 @@ public struct TypeEnvironment: Sendable {
         requiresTypedErrors = text.contains("checked_cast_addr_br")
             || text.contains("Result<")
             || rawDefinitions.values.contains(where: Self.hasStoredErrorPayload)
-        for function in functions {
-            if let factory = try detectStructFactory(function) {
-                structFactories[function.mangledName] = factory
-            }
-            if let key = try detectClassAllocator(function) {
-                classAllocators[function.mangledName] = key
-            }
-        }
+        // Native aliases arrive from the frozen Shell after textual SIL is
+        // parsed. Build everything whose field graph is already resolvable,
+        // then rebuild strictly once those aliases have been injected.
+        try rebuildFactoryTables(allowingUnresolvedTypes: true)
     }
 
     /// Returns an environment that resolves the exact native types frozen in
@@ -365,7 +364,30 @@ public struct TypeEnvironment: Sendable {
                 result.nativeTypes[alias] = id
             }
         }
+        try result.rebuildFactoryTables(allowingUnresolvedTypes: false)
         return result
+    }
+
+    private mutating func rebuildFactoryTables(
+        allowingUnresolvedTypes: Bool
+    ) throws {
+        structFactories.removeAll(keepingCapacity: true)
+        classAllocators.removeAll(keepingCapacity: true)
+        for function in factoryCandidates {
+            do {
+                if let factory = try detectStructFactory(function) {
+                    structFactories[function.mangledName] = factory
+                }
+            } catch {
+                guard allowingUnresolvedTypes,
+                      let loweringError = error as? CanonicalSIL.LoweringError,
+                      case .unsupportedType = loweringError
+                else { throw error }
+            }
+            if let key = try detectClassAllocator(function) {
+                classAllocators[function.mangledName] = key
+            }
+        }
     }
 
     func containsReferenceNativeValue(_ type: Bytecode.ValueType) -> Bool {
@@ -533,9 +555,44 @@ public struct TypeEnvironment: Sendable {
             )
         }
 
-        if type.contains(" -> ") {
+        if type.contains(" -> "), outerClosureArrow(in: type) != nil {
             return .closure(
                 try resolveClosureSignature(type, relativeTo: parentScope)
+            )
+        }
+
+        // Declaration summaries preserve Swift's postfix Optional spelling,
+        // while function ABIs usually print the equivalent generic form.
+        if type.last == "?" || type.last == "!" {
+            let wrapped = String(type.dropLast())
+                .trimmingCharacters(in: .whitespaces)
+            guard !wrapped.isEmpty else {
+                throw CanonicalSIL.LoweringError.unsupportedType(raw)
+            }
+            return .optional(
+                ValueRepresentation.storable(
+                    try resolve(wrapped, relativeTo: parentScope)
+                )
+            )
+        }
+
+        if type.hasPrefix("["), type.hasSuffix("]") {
+            let body = String(type.dropFirst().dropLast())
+                .trimmingCharacters(in: .whitespaces)
+            guard !body.isEmpty else {
+                throw CanonicalSIL.LoweringError.unsupportedType(raw)
+            }
+            if let pair = splitTopLevelKeyValue(body) {
+                return try dictionaryType(
+                    key: pair.key,
+                    value: pair.value,
+                    relativeTo: parentScope
+                )
+            }
+            return .array(
+                ValueRepresentation.storable(
+                    try resolve(body, relativeTo: parentScope)
+                )
             )
         }
 
@@ -566,6 +623,19 @@ public struct TypeEnvironment: Sendable {
         // Their supported APIs observe sequence elements, not private storage
         // or index wrappers, so lowering normalizes them to the VM's typed
         // Array representation and keeps unsupported index APIs fail-closed.
+        for slicePrefix in ["Slice<", "Swift.Slice<"]
+        where type.hasPrefix(slicePrefix) && type.hasSuffix(">") {
+            let base = ValueRepresentation.storable(
+                try resolve(
+                    genericBody(type, prefix: slicePrefix),
+                    relativeTo: parentScope
+                )
+            )
+            guard case .array = base else {
+                throw CanonicalSIL.LoweringError.unsupportedType(type)
+            }
+            return base
+        }
         for slicePrefix in ["ArraySlice<", "Swift.ArraySlice<"]
         where type.hasPrefix(slicePrefix) && type.hasSuffix(">") {
             return .array(
@@ -676,19 +746,10 @@ public struct TypeEnvironment: Sendable {
                     "Dictionary generic arguments must contain Key and Value"
                 )
             }
-            let key = ValueRepresentation.storable(
-                try resolve(components[0], relativeTo: parentScope)
-            )
-            guard key.isVMHashable else {
-                throw CanonicalSIL.LoweringError.unsupportedType(
-                    "Dictionary key \(key) does not have VM-defined Hashable semantics"
-                )
-            }
-            return .dictionary(
-                key: key,
-                value: ValueRepresentation.storable(
-                    try resolve(components[1], relativeTo: parentScope)
-                )
+            return try dictionaryType(
+                key: components[0],
+                value: components[1],
+                relativeTo: parentScope
             )
         }
         for resultPrefix in ["Result<", "Swift.Result<"]
@@ -709,7 +770,16 @@ public struct TypeEnvironment: Sendable {
         }
         if type.hasPrefix("("), type.hasSuffix(")") {
             let elements = splitTopLevelTuple(type)
-            if elements.count == 1, elements[0].isEmpty { return .void }
+            if elements.count == 1 {
+                if elements[0].isEmpty { return .void }
+                // Swift has no single-element tuple type. Parentheses around
+                // one type are grouping, which is common around Optional
+                // closure spellings such as `((Int) -> String)?`.
+                return try resolve(
+                    removeTupleLabel(elements[0]),
+                    relativeTo: parentScope
+                )
+            }
             return .tuple(
                 try elements.map {
                     ValueRepresentation.storable(
@@ -898,6 +968,7 @@ public struct TypeEnvironment: Sendable {
         _ raw: String,
         parameter: Bytecode.ValueType
     ) -> Bytecode.ParameterConvention {
+        if case .address = parameter { return .inout }
         let spelling = raw.trimmingCharacters(in: .whitespaces)
             .trimmingPrefix("$")
         let explicitlyBorrowed = spelling.hasPrefix("@guaranteed ")
@@ -1793,7 +1864,7 @@ public struct TypeEnvironment: Sendable {
     private static let extensionHeaderPattern =
         #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate)\s+)*extension\s+([^\s:{]+)(?:\s*:\s*[^\{]+)?(?:\s+where\s+[^\{]+)?\s*\{$"#
     private static let storedFieldPattern =
-        #"^(?:@[^\s]+\s+)*@_hasStorage\s+(?:(?:public|internal|package|private|fileprivate)\s+)?(?:final\s+)?(?:var|let)\s+([^:]+):\s*(.+?)(?:\s*\{.*)?$"#
+        #"^(?:@[^\s]+\s+)*@_hasStorage\s+(?:@[^\s]+\s+)*(?:(?:public|internal|package|private|fileprivate)\s+)?(?:final\s+)?(?:var|let)\s+([^:]+):\s*(.+?)(?:\s*\{.*)?$"#
     private static let enumCasePattern =
         #"^(?:indirect )?case\s+([^\s(]+)(?:\((.*)\))?$"#
 
@@ -1914,6 +1985,53 @@ public struct TypeEnvironment: Sendable {
     private func genericBody(_ type: String, prefix: String) -> String {
         let start = type.index(type.startIndex, offsetBy: prefix.count)
         return String(type[start..<type.index(before: type.endIndex)])
+    }
+
+    private func dictionaryType(
+        key rawKey: String,
+        value rawValue: String,
+        relativeTo parentScope: String?
+    ) throws -> Bytecode.ValueType {
+        let key = ValueRepresentation.storable(
+            try resolve(rawKey, relativeTo: parentScope)
+        )
+        guard key.isVMHashable else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "Dictionary key \(key) does not have VM-defined Hashable semantics"
+            )
+        }
+        return .dictionary(
+            key: key,
+            value: ValueRepresentation.storable(
+                try resolve(rawValue, relativeTo: parentScope)
+            )
+        )
+    }
+
+    private func splitTopLevelKeyValue(
+        _ raw: String
+    ) -> (key: String, value: String)? {
+        var depth = 0
+        for index in raw.indices {
+            switch raw[index] {
+            case "(", "<", "[": depth += 1
+            case ")", "]": depth -= 1
+            case ">":
+                let previous = index > raw.startIndex
+                    ? raw[raw.index(before: index)]
+                    : nil
+                if previous != "-" { depth -= 1 }
+            case ":" where depth == 0:
+                let key = String(raw[..<index])
+                    .trimmingCharacters(in: .whitespaces)
+                let value = String(raw[raw.index(after: index)...])
+                    .trimmingCharacters(in: .whitespaces)
+                guard !key.isEmpty, !value.isEmpty else { return nil }
+                return (key, value)
+            default: break
+            }
+        }
+        return nil
     }
 
     private func splitTopLevelTuple(_ raw: String) -> [String] {

@@ -528,6 +528,24 @@ struct CollectionAdapterSemanticsMatrix {
         }
     }
 
+    @Test("Composed slices normalize only an Array-backed base")
+    func resolvesComposedSliceTypes() throws {
+        let environment = CanonicalSIL.TypeEnvironment()
+        #expect(
+            try environment.resolve(
+                "Slice<ReversedCollection<Array<Int>>>"
+            ) == .array(.int64)
+        )
+        #expect(
+            environment.collectionIndexModel(
+                for: "Slice<ReversedCollection<Array<Int>>>"
+            ) == .opaque
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try environment.resolve("Slice<Set<Int>>")
+        }
+    }
+
     private func run(_ probes: [Probe]) throws {
         var failures: [String] = []
         for probe in probes {

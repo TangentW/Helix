@@ -340,7 +340,8 @@ throwing paths. Mutable captures use the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
 boxes; common fully concrete Array-backed higher-order operations—including
 `flatMap`, short-circuiting prefix/drop predicates, and direction-preserving
-first/last searches, including comparator-driven `min(by:)`/`max(by:)`—use
+first/last searches, comparator-driven `min(by:)`/`max(by:)`, and scoped
+inout accumulation through `reduce(into:_:)`—use
 verified closure CFGs; Array-producing variants use a linear builder, while
 supported Optional and Result payload transforms use the same selected-case
 plan. Multi-branch local initialization
@@ -351,9 +352,11 @@ effects for every supported call, and Optional payload projection distinguishes
 read, consume, and mutation before rebuilding nested represented values; these
 rules are type- and ABI-driven rather than UIKit-specific. Ordinary nonthrowing
 mutating helpers use verified temporary address storage when their receiver is
-a compiler-only projection; overlapping or throwing projected `inout` calls
-fail closed. The closure still cannot cross the Shell/Native boundary or
-survive the current pinned VM invocation.
+a compiler-only projection. Frame/runtime-backed inout helpers and closures may
+throw because their access scopes close on both continuations; overlapping or
+throwing compiler-only projections without symmetric writeback still fail
+closed. The closure cannot cross the Shell/Native boundary or survive the
+current pinned VM invocation.
 
 The current generator collects reachable ordinary functions, private class
 instance methods, computed accessors, and their non-exported patch-local types

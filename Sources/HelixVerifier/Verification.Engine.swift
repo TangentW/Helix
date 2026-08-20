@@ -1353,7 +1353,16 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 guard signature.parameterConventions.count
                         == signature.parameters.count,
-                      !signature.parameterConventions.contains(.inout)
+                      zip(
+                        signature.parameters,
+                        signature.parameterConventions
+                      ).allSatisfy({ parameter, convention in
+                        switch (parameter, convention) {
+                        case (.address, .inout): true
+                        case (.address, _), (_, .inout): false
+                        default: true
+                        }
+                      })
                 else {
                     throw Verification.Error.invalidFunction(
                         function: function.id,
@@ -1368,12 +1377,26 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 for parameter in signature.parameters {
                     switch parameter {
-                    case .void, .never, .address, .mutableCell, .arrayBuilder,
-                         .closure:
+                    case .void, .never, .mutableCell, .arrayBuilder, .closure:
                         throw Verification.Error.invalidFunction(
                             function: function.id,
-                            reason: "closure parameters must be concrete non-address values"
+                            reason: "closure parameters must be concrete values or inout addresses"
                         )
+                    case let .address(pointee):
+                        switch pointee {
+                        case .void, .never, .address, .mutableCell,
+                             .arrayBuilder, .closure:
+                            throw Verification.Error.invalidFunction(
+                                function: function.id,
+                                reason: "inout closure pointee must be a concrete value type"
+                            )
+                        default:
+                            try verify(
+                                pointee,
+                                depth: depth + 1,
+                                isRegister: false
+                            )
+                        }
                     default:
                         try verify(parameter, depth: depth + 1, isRegister: false)
                     }
@@ -2777,8 +2800,10 @@ public struct Engine: Verification.ImageVerifying {
                     "closure body invocation ownership does not match its closure signature"
                 )
             }
-            guard callee.parameterConventions.allSatisfy({ $0 != .inout }) else {
-                throw fail("HLBC closure bodies cannot carry inout parameters")
+            guard callee.parameterConventions.dropFirst(
+                signature.parameters.count
+            ).allSatisfy({ $0 != .inout }) else {
+                throw fail("closure captures cannot carry inout parameters")
             }
             for captureType in captureTypes {
                 if case .address = captureType {
@@ -3835,6 +3860,40 @@ public struct Engine: Verification.ImageVerifying {
                     }
                     return value
                 }
+                func verifyCallAddresses(
+                    arguments: [Bytecode.Register],
+                    conventions: [Bytecode.ParameterConvention]
+                ) throws {
+                    guard arguments.count == conventions.count else {
+                        throw fail("call address convention count mismatch")
+                    }
+                    var inoutValues: [AddressProvenance] = []
+                    for (argument, convention) in zip(
+                        arguments,
+                        conventions
+                    ) {
+                        if convention == .inout {
+                            inoutValues.append(
+                                try requireScoped(argument, modify: true)
+                            )
+                        } else if case .address = function.type(of: argument) {
+                            throw fail(
+                                "address argument requires an inout callee parameter"
+                            )
+                        }
+                    }
+                    for left in inoutValues.indices {
+                        for right in inoutValues.indices where right > left {
+                            guard !inoutValues[left].overlaps(
+                                inoutValues[right]
+                            ) else {
+                                throw fail(
+                                    "call has overlapping inout arguments"
+                                )
+                            }
+                        }
+                    }
+                }
 
                 switch instruction {
                 case let .beginAccess(result, address, kind):
@@ -3901,25 +3960,25 @@ public struct Engine: Verification.ImageVerifying {
                     break
                 case let .apply(_, calleeID, arguments):
                     guard let callee = functions[calleeID] else { break }
-                    var inoutValues: [AddressProvenance] = []
-                    for (argument, convention) in zip(arguments, callee.parameterConventions) {
-                        if convention == .inout {
-                            inoutValues.append(try requireScoped(argument, modify: true))
-                        } else if case .address = function.type(of: argument) {
-                            throw fail("address argument requires an inout callee parameter")
-                        }
-                    }
-                    for left in inoutValues.indices {
-                        for right in inoutValues.indices where right > left {
-                            guard !inoutValues[left].overlaps(inoutValues[right]) else {
-                                throw fail("call has overlapping inout arguments")
-                            }
-                        }
-                    }
-                case let .tryApply(calleeID, _, _, _):
-                    if functions[calleeID]?.parameterConventions.contains(.inout) == true {
-                        throw fail("HLBC does not carry inout access scopes across try_apply")
-                    }
+                    try verifyCallAddresses(
+                        arguments: arguments,
+                        conventions: callee.parameterConventions
+                    )
+                case let .tryApply(calleeID, arguments, _, _):
+                    guard let callee = functions[calleeID] else { break }
+                    try verifyCallAddresses(
+                        arguments: arguments,
+                        conventions: callee.parameterConventions
+                    )
+                case let .closureApply(_, closure, arguments),
+                     let .closureTryApply(closure, arguments, _, _):
+                    guard case let .closure(signature)? = function.type(
+                        of: closure
+                    ) else { break }
+                    try verifyCallAddresses(
+                        arguments: arguments,
+                        conventions: signature.parameterConventions
+                    )
                 case let .storeStack(slot, _, _), let .loadStack(_, slot, _),
                      let .destroyStack(slot):
                     let root = AddressProvenance(root: .stack(slot), path: [], scope: nil)

@@ -1275,6 +1275,16 @@ struct HigherOrderSemanticsMatrix {
             values.reduce(initial) { accumulator, _ in accumulator }
         }
 
+        public func reducedObjects(_ values: [NSObject]) -> [NSObject] {
+            values.reduce(into: []) { result, value in
+                result.append(value)
+            }
+        }
+
+        public func emptyObjectDictionary() -> [String: NSObject] {
+            [String: NSObject]()
+        }
+
         public func firstObject(_ values: [NSObject]) -> NSObject? {
             values.first { _ in true }
         }
@@ -1371,7 +1381,8 @@ struct HigherOrderSemanticsMatrix {
         let names = [
             "mappedObjects", "flatMappedObjects", "filteredObjects",
             "compactedObjects", "prefixedObjects", "droppedObjects",
-            "reducedObject", "firstObject", "firstObjectIndex",
+            "reducedObject", "reducedObjects", "emptyObjectDictionary",
+            "firstObject", "firstObjectIndex",
             "lastObject", "lastObjectIndex", "minimumObject",
             "maximumObject", "containsObject", "visitsObjects",
             "optionalMappedObject",
@@ -1456,6 +1467,15 @@ struct HigherOrderSemanticsMatrix {
                 Issue.record("\(name): \(error)")
                 continue
             }
+            if name == "emptyObjectDictionary" {
+                #expect(
+                    signature.result == .dictionary(
+                        key: .string,
+                        value: .native(nativeType)
+                    )
+                )
+                continue
+            }
             let closureBodies = compiled.module.functions.filter {
                 $0.kind == .closureBody
             }
@@ -1472,6 +1492,14 @@ struct HigherOrderSemanticsMatrix {
                         && convention == .borrowed
                 }
             })
+            if name == "reducedObjects" {
+                #expect(closureBodies.contains { body in
+                    body.parameterRegisters.map { body.type(of: $0) } == [
+                        .address(.array(.native(nativeType))),
+                        .native(nativeType),
+                    ] && body.parameterConventions == [.inout, .borrowed]
+                })
+            }
         }
     }
 

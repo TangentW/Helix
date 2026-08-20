@@ -70,10 +70,15 @@ does not by itself certify a physical device or distribution channel.
   consumers rather than their opcode spelling: read-only loads preserve the
   parent, consuming loads and `@in` take it, and stores or `@inout` mutation
   rebuild nested Tuple/local-struct fields before writeback. A destructive and
-  modifying lifetime on the same detached payload is rejected. Nonthrowing
-  compiler-only `inout` calls use verified temporary address storage and reject
-  overlapping projections; their throwing form remains unsupported because it
-  requires writeback on both continuations.
+  modifying lifetime on the same detached payload is rejected. Frame- and
+  runtime-backed `inout` scopes may cross throwing same-image calls and close
+  symmetrically on both continuations. Nonthrowing compiler-only `inout` calls
+  also use verified temporary address storage and reject overlapping
+  projections; their throwing form remains unsupported because it requires
+  reconstructed writeback on both continuations. Declaration-summary spellings
+  such as `T?`, `T!`, `[T]`, `[K: V]`, and redundant grouping parentheses
+  normalize recursively to the same typed representation, including in
+  patch-local stored fields.
 - Array value semantics and equality, append, `first`/`last`,
   `firstIndex(of:)`/`lastIndex(of:)`, `min`/`max`, `elementsEqual`,
   `starts(with:)`, `lexicographicallyPrecedes`, `startIndex`/`endIndex`,
@@ -81,9 +86,10 @@ does not by itself certify a physical device or distribution channel.
   `popLast`, iteration, checked subscript access, and value-returning updates.
   Dictionary construction, equality, lookup, update, `removeValue(forKey:)`,
   and iteration are supported for
-  eligible key and value types. Equality is defined recursively for Bool,
-  fixed-width integers, floating-point values, String, and supported Optional,
-  Array, Dictionary, and Set values. Dictionary and Set comparison is
+  eligible key and value types. Append accepts represented copyable elements,
+  including frozen imported reference values. Equality is defined recursively
+  for Bool, fixed-width integers, floating-point values, String, and supported
+  Optional, Array, Dictionary, and Set values. Dictionary and Set comparison is
   order-independent, collection equality preserves Swift's shared-storage fast
   path, and Float/Double preserve Swift NaN and signed-zero behavior.
   Collection ordering operations remain
@@ -99,8 +105,10 @@ does not by itself certify a physical device or distribution channel.
   and Set elements use the same recursively VM-defined value family as their
   Hashable domain. User-defined `Hashable` or equality witnesses remain
   fail-closed because downloaded code cannot invoke arbitrary hashing or
-  equality. Fully concrete Array-backed `map`, `flatMap`, `filter`,
-  `compactMap`, `prefix(while:)`, Collection `drop(while:)`, `reduce`,
+  equality. Generic `Array()` and `Dictionary()` construction is supported for
+  represented element/key/value types. Fully concrete Array-backed `map`,
+  `flatMap`, `filter`, `compactMap`, `prefix(while:)`, Collection
+  `drop(while:)`, `reduce`, `reduce(into:_:)`,
   `forEach`, `first(where:)`, `last(where:)`, zero-based Array-backed
   `firstIndex(where:)`/`lastIndex(where:)`, `contains(where:)`, and
   `allSatisfy`, plus comparator-driven `min(by:)`/`max(by:)`, use verified
@@ -116,7 +124,8 @@ does not by itself certify a physical device or distribution channel.
   `Array(repeating:count:)`, count-based `dropFirst`/`dropLast`/`prefix`/
   `suffix`, concrete Array index prefixes/suffixes, `Range<Int>` slicing,
   `zip`, `joined()`, `joined(separator:)`, iteration, and Array
-  materialization. These views are normalized by element sequence; index-based
+  materialization, including composed `Slice<Base>` when `Base` is already
+  Array-backed. These views are normalized by element sequence; index-based
   operations on a derived ArraySlice remain rejected until its preserved base
   index is modeled, rather than being treated incorrectly as zero-based.
   `Optional.map`/`flatMap`
@@ -171,9 +180,11 @@ does not by itself certify a physical device or distribution channel.
   `@escaping` parameters on same-image
   helpers, returning a closure from one same-image function to its caller, and
   a closure capturing another closure. Concrete closure ABIs preserve
-  per-parameter owned/borrowed conventions, including `@in_guaranteed`
+  per-parameter owned/borrowed/inout conventions, including `@in_guaranteed`
   Optional and imported SDK reference values used by the supported higher-order
-  operations. The value must be consumed inside the
+  operations, ordinary same-image inout closures on normal/throwing paths, and
+  scoped frame-owned mutation used by `reduce(into:_:)`. The value must be
+  consumed inside the
   same pinned HLVM invocation; `escaping-closure-values-1` gates return and
   nested-capture semantics, while `mutable-captures-1` gates managed cells.
   Compiler-emitted fully concrete specializations are also supported when no

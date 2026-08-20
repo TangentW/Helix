@@ -127,6 +127,196 @@ struct AddressSemantics {
         #expect(image.module.functions.count == 2)
     }
 
+    @Test("Dynamic inout closure calls preserve access across both try edges")
+    func acceptsThrowingInoutClosureCall() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.address(.int64)],
+            parameterConventions: [.inout],
+            result: .void,
+            effects: .init(mayThrow: true)
+        )
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "invokeInoutClosure",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64,
+                .address(.int64),
+                .address(.int64),
+                .closure(signature),
+                .string,
+                .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .storeStack(
+                            slot: .init(rawValue: 0),
+                            source: .init(rawValue: 0),
+                            mode: .initialize
+                        ),
+                        .stackAddress(
+                            result: .init(rawValue: 1),
+                            slot: .init(rawValue: 0)
+                        ),
+                        .beginAccess(
+                            result: .init(rawValue: 2),
+                            address: .init(rawValue: 1),
+                            kind: .modify
+                        ),
+                        .makeClosure(
+                            result: .init(rawValue: 3),
+                            function: .init(rawValue: 1),
+                            captures: []
+                        ),
+                        .closureTryApply(
+                            closure: .init(rawValue: 3),
+                            arguments: [.init(rawValue: 2)],
+                            normalTarget: .init(rawValue: 1),
+                            errorTarget: .init(rawValue: 2)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    instructions: [
+                        .endAccess(.init(rawValue: 2)),
+                        .loadStack(
+                            result: .init(rawValue: 5),
+                            slot: .init(rawValue: 0),
+                            mode: .take
+                        ),
+                        .returnValue(.init(rawValue: 5)),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 4)],
+                    instructions: [
+                        .endAccess(.init(rawValue: 2)),
+                        .destroyStack(.init(rawValue: 0)),
+                        .trap(.explicit("unexpected callback error")),
+                    ]
+                ),
+            ],
+            stackSlotTypes: [.int64]
+        )
+        let callback = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "mutatingCallback",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            parameterConventions: [.inout],
+            resultType: .void,
+            registerTypes: [.address(.int64), .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            bitPattern: 41
+                        ),
+                        .storeAddress(
+                            address: .init(rawValue: 0),
+                            source: .init(rawValue: 1),
+                            mode: .assign
+                        ),
+                        .returnValue(nil),
+                    ]
+                ),
+            ],
+            effects: .init(mayThrow: true)
+        )
+
+        _ = try verify(
+            root: root,
+            additionalFunctions: [callback],
+            capabilities: [
+                .baselineV1,
+                .addressValuesV1,
+                .closureValuesV1,
+                .stringsV1,
+                .untypedThrowsV1,
+            ]
+        )
+
+        var directCallback = callback
+        directCallback.id = .init(rawValue: 2)
+        directCallback.kind = .ordinary
+        var directRoot = root
+        directRoot.blocks[0].instructions = Array(
+            directRoot.blocks[0].instructions.prefix(3)
+        ) + [
+            .tryApply(
+                function: directCallback.id,
+                arguments: [.init(rawValue: 2)],
+                normalTarget: .init(rawValue: 1),
+                errorTarget: .init(rawValue: 2)
+            ),
+        ]
+        _ = try verify(
+            root: directRoot,
+            additionalFunctions: [directCallback],
+            capabilities: [
+                .baselineV1,
+                .addressValuesV1,
+                .closureValuesV1,
+                .stringsV1,
+                .untypedThrowsV1,
+            ]
+        )
+
+        var malformedRoot = root
+        malformedRoot.registerTypes[3] = .closure(
+            .init(
+                parameters: [.address(.int64)],
+                parameterConventions: [.owned],
+                result: .void,
+                effects: .init(mayThrow: true)
+            )
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(
+                root: malformedRoot,
+                additionalFunctions: [callback],
+                capabilities: [
+                    .baselineV1,
+                    .addressValuesV1,
+                    .closureValuesV1,
+                    .stringsV1,
+                    .untypedThrowsV1,
+                ]
+            )
+        }
+
+        var readOnlyRoot = root
+        readOnlyRoot.blocks[0].instructions[2] = .beginAccess(
+            result: .init(rawValue: 2),
+            address: .init(rawValue: 1),
+            kind: .read
+        )
+        #expect(throws: Verification.Error.self) {
+            try verify(
+                root: readOnlyRoot,
+                additionalFunctions: [callback],
+                capabilities: [
+                    .baselineV1,
+                    .addressValuesV1,
+                    .closureValuesV1,
+                    .stringsV1,
+                    .untypedThrowsV1,
+                ]
+            )
+        }
+    }
+
     @Test("Address types cannot nest, escape as results, or use copy_value")
     func rejectsAddressShapeAndOwnershipMisuse() throws {
         let nested = Bytecode.Function(

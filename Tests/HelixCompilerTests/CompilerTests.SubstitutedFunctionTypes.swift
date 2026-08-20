@@ -108,6 +108,61 @@ struct SubstitutedFunctionTypes {
         #expect(owned.parameterConventions == [.owned])
     }
 
+    @Test("Concrete closure ABIs preserve inout address parameters")
+    func preservesInoutClosureConvention() throws {
+        guard case let .closure(signature) = try CanonicalSIL
+            .TypeEnvironment().resolve(
+                "@callee_guaranteed (@inout (Int, [String]), "
+                    + "@in_guaranteed Int) -> @error any Error"
+            )
+        else {
+            Issue.record("expected a concrete inout closure type")
+            return
+        }
+
+        #expect(signature.parameters == [
+            .address(.tuple([.int64, .array(.string)])),
+            .int64,
+        ])
+        #expect(signature.parameterConventions == [.inout, .owned])
+        #expect(signature.result == .void)
+        #expect(signature.effects.mayThrow)
+    }
+
+    @Test("Declaration collection and Optional sugar resolves recursively")
+    func resolvesDeclarationTypeSugar() throws {
+        let environment = CanonicalSIL.TypeEnvironment()
+
+        #expect(
+            try environment.resolve("[String?]")
+                == .array(.optional(.string))
+        )
+        #expect(
+            try environment.resolve("[String: [Int?]]")
+                == .dictionary(
+                    key: .string,
+                    value: .array(.optional(.int64))
+                )
+        )
+        #expect(try environment.resolve("String!") == .optional(.string))
+        guard case let .closure(returningOptional) = try environment.resolve(
+            "@callee_guaranteed (Int) -> String?"
+        ) else {
+            Issue.record("expected a closure returning Optional<String>")
+            return
+        }
+        #expect(returningOptional.result == .optional(.string))
+        guard case let .optional(.closure(optionalClosure)) = try environment
+            .resolve("((Int) -> String)?")
+        else {
+            Issue.record("expected an Optional closure type")
+            return
+        }
+        #expect(optionalClosure.parameters == [.int64])
+        #expect(optionalClosure.result == .string)
+        #expect(try environment.resolve("(((String)))") == .string)
+    }
+
     @Test("Current Swift map and filter closure ABIs are discovered concretely")
     func discoversCurrentFrontendClosureABIs() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(

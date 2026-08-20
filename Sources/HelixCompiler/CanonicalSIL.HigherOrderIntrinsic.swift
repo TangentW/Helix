@@ -9,6 +9,7 @@ enum HigherOrderIntrinsic: Equatable {
     case prefixWhile
     case dropWhile
     case reduce
+    case reduceInto
     case forEach
     case firstWhere
     case lastWhere
@@ -23,7 +24,7 @@ enum HigherOrderIntrinsic: Equatable {
         switch self {
         case .map, .flatMap, .filter, .compactMap, .prefixWhile, .dropWhile:
             true
-        case .reduce, .forEach, .firstWhere, .lastWhere,
+        case .reduce, .reduceInto, .forEach, .firstWhere, .lastWhere,
              .firstIndexWhere, .lastIndexWhere, .containsWhere,
              .allSatisfy, .minimumBy, .maximumBy:
             false
@@ -37,7 +38,7 @@ enum HigherOrderIntrinsic: Equatable {
         case .filter, .firstWhere, .lastWhere, .prefixWhile, .dropWhile,
              .minimumBy, .maximumBy:
             true
-        case .map, .flatMap, .compactMap, .reduce, .forEach,
+        case .map, .flatMap, .compactMap, .reduce, .reduceInto, .forEach,
              .firstIndexWhere, .lastIndexWhere, .containsWhere,
              .allSatisfy:
             false
@@ -49,7 +50,7 @@ enum HigherOrderIntrinsic: Equatable {
         case .lastWhere, .lastIndexWhere:
             .reverse
         case .map, .flatMap, .filter, .compactMap, .prefixWhile,
-             .dropWhile, .reduce, .forEach, .firstWhere,
+             .dropWhile, .reduce, .reduceInto, .forEach, .firstWhere,
              .firstIndexWhere, .containsWhere, .allSatisfy,
              .minimumBy, .maximumBy:
             .forward
