@@ -1155,7 +1155,7 @@ struct ReleaseDriver {
         let iterationResult = try driver.build(
             .init(archive: archive, sourceFiles: [sourceURL])
         )
-        #expect(iterationResult.disassembly.contains("array_next"))
+        #expect(iterationResult.disassembly.contains("collection_next_forward"))
         let iterationImage = try Verification.Engine().verify(
             bytes: iterationResult.bytecode,
             shell: Verification.ShellInterface(archive: archive),
@@ -1220,7 +1220,7 @@ struct ReleaseDriver {
         #expect(result.changedFunctions.map(\.key) == [record.key])
         #expect(result.module.capabilities.contains(.collectionsV1))
         #expect(result.module.capabilities.contains(.stringsV1))
-        #expect(result.disassembly.contains("dictionary_next"))
+        #expect(result.disassembly.contains("collection_next_forward"))
         let image = try Verification.Engine().verify(
             bytes: result.bytecode,
             shell: Verification.ShellInterface(archive: archive),

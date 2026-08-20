@@ -138,11 +138,15 @@ Both workflows depend on stable, build-specific identities:
   copied source and records segment ranges until completion. Predicate calls
   remain ordinary closure CFG edges; reaching `maxSplits` stops evaluation and
   appends the untouched suffix, while a throwing edge destroys the state.
-- Array-backed predicate traversal uses one direction-aware cursor operation.
-  Forward cursors hold the next index and reverse cursors hold an exclusive
-  upper bound, so both directions preserve Swift's predicate order without
-  importing a collection iterator ABI. The VM rejects cursors outside the
-  closed `0...count` boundary instead of treating corrupt state as exhaustion.
+- Managed Array, Dictionary, and Set traversal uses one type-checked cursor
+  operation instead of one instruction family per container. Forward cursors
+  hold the next element offset; Dictionary produces its `(Key, Value)` element
+  tuple and Set produces its element directly. Array additionally supports a
+  reverse cursor whose value is an exclusive upper bound, so both Array
+  directions preserve Swift's predicate order without importing a collection
+  iterator ABI. The Verifier rejects reverse traversal for unordered
+  containers, and the VM rejects cursors outside the closed `0...count`
+  boundary instead of treating corrupt state as exhaustion.
   Comparator-driven `min(by:)`/`max(by:)` reuse the same traversal but carry
   one owned candidate through the CFG. Their two borrowed inputs are ordered
   exactly as Swift specifies, ties retain the earliest element, and both the

@@ -1002,10 +1002,11 @@ struct SemanticVerifier {
             function.blocks[0].instructions = [
                 .makeArray(result: .init(rawValue: 1), elements: []),
                 .makeDictionary(result: .init(rawValue: 2), pairs: .init(rawValue: 1)),
-                .dictionaryNext(
+                .collectionNext(
                     result: .init(rawValue: 3),
-                    dictionary: .init(rawValue: 2),
-                    indexSlot: .init(rawValue: 0)
+                    collection: .init(rawValue: 2),
+                    indexSlot: .init(rawValue: 0),
+                    direction: .forward
                 ),
                 .returnValue(.init(rawValue: 0)),
             ]

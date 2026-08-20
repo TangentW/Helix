@@ -3890,9 +3890,9 @@ public struct Lowerer: Sendable {
             appendSyntheticBlock(
                 id: loop,
                 instructions: [
-                    .arrayNext(
+                    .collectionNext(
                         result: next,
-                        array: source,
+                        collection: source,
                         indexSlot: indexSlot,
                         direction: .forward
                     ),
@@ -4387,9 +4387,9 @@ public struct Lowerer: Sendable {
             appendSyntheticBlock(
                 id: loop,
                 instructions: [
-                    .arrayNext(
+                    .collectionNext(
                         result: next,
-                        array: source,
+                        collection: source,
                         indexSlot: indexSlot,
                         direction: .forward
                     ),
@@ -4757,9 +4757,9 @@ public struct Lowerer: Sendable {
                 appendSyntheticBlock(
                     id: seed,
                     instructions: [
-                        .arrayNext(
+                        .collectionNext(
                             result: seedNext,
-                            array: source,
+                            collection: source,
                             indexSlot: indexSlot,
                             direction: .forward
                         ),
@@ -4793,9 +4793,9 @@ public struct Lowerer: Sendable {
                 id: loop,
                 parameters: loopAccumulator.map { [$0] } ?? [],
                 instructions: [
-                    .arrayNext(
+                    .collectionNext(
                         result: next,
-                        array: source,
+                        collection: source,
                         indexSlot: indexSlot,
                         direction: traversalDirection
                     ),
@@ -5106,9 +5106,9 @@ public struct Lowerer: Sendable {
                 appendSyntheticBlock(
                     id: remainderLoop,
                     instructions: [
-                        .arrayNext(
+                        .collectionNext(
                             result: remainderNext,
-                            array: source,
+                            collection: source,
                             indexSlot: indexSlot,
                             direction: .forward
                         ),
@@ -9636,7 +9636,12 @@ public struct Lowerer: Sendable {
                     )
                     result = try allocate(type: outputType)
                     appendInstruction(
-                        .setNext(result: result, set: set, indexSlot: slot)
+                        .collectionNext(
+                            result: result,
+                            collection: set,
+                            indexSlot: slot,
+                            direction: .forward
+                        )
                     )
                     appendInstruction(.destroyStack(slot))
                 default:
@@ -9877,9 +9882,9 @@ public struct Lowerer: Sendable {
                 }
                 let result = try allocate(type: .optional(element))
                 appendInstruction(
-                    .arrayNext(
+                    .collectionNext(
                         result: result,
-                        array: state.array,
+                        collection: state.array,
                         indexSlot: state.indexSlot,
                         direction: .forward
                     )
@@ -10337,10 +10342,11 @@ public struct Lowerer: Sendable {
                 }
                 let result = try allocate(type: resultType)
                 appendInstruction(
-                    .dictionaryNext(
+                    .collectionNext(
                         result: result,
-                        dictionary: state.dictionary,
-                        indexSlot: state.indexSlot
+                        collection: state.dictionary,
+                        indexSlot: state.indexSlot,
+                        direction: .forward
                     )
                 )
                 try storeConstructedValue(result, at: arguments[0], mode: .initialize)
@@ -10663,10 +10669,11 @@ public struct Lowerer: Sendable {
                 }
                 let result = try allocate(type: resultType)
                 appendInstruction(
-                    .setNext(
+                    .collectionNext(
                         result: result,
-                        set: state.set,
-                        indexSlot: state.indexSlot
+                        collection: state.set,
+                        indexSlot: state.indexSlot,
+                        direction: .forward
                     )
                 )
                 try storeConstructedValue(

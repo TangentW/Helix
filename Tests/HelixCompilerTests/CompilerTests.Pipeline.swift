@@ -2687,7 +2687,7 @@ struct Pipeline {
             resultType: .int64,
             additionalFrontendArguments: semanticSILArguments
         )
-        #expect(loop.compiled.disassembly.contains("array_next"))
+        #expect(loop.compiled.disassembly.contains("collection_next_forward"))
         #expect(loop.compiled.disassembly.contains("destroy_stack"))
         #expect(
             VM.Interpreter().invoke(
@@ -3989,7 +3989,7 @@ struct Pipeline {
             resultType: .int64,
             additionalFrontendArguments: arguments
         )
-        #expect(loop.compiled.disassembly.contains("dictionary_next"))
+        #expect(loop.compiled.disassembly.contains("collection_next_forward"))
         #expect(
             VM.Interpreter().invoke(
                 entry: .init(rawValue: 0),

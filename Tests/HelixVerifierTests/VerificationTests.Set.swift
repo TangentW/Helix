@@ -160,6 +160,25 @@ struct SetSemantics {
         ) {
             try verify(uninitialized)
         }
+
+        var reverse = try makeFixture()
+        reverse.module.functions[0].blocks[0].instructions[4] =
+            .collectionNext(
+                result: .init(rawValue: 3),
+                collection: .init(rawValue: 5),
+                indexSlot: .init(rawValue: 0),
+                direction: .reverse
+            )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 4,
+                reason: "reverse collection iteration requires an Array"
+            )
+        ) {
+            try verify(reverse)
+        }
     }
 
     private struct Fixture {
@@ -199,10 +218,11 @@ struct SetSemantics {
                             source: .init(rawValue: 2),
                             mode: .initialize
                         ),
-                        .setNext(
+                        .collectionNext(
                             result: .init(rawValue: 3),
-                            set: .init(rawValue: 5),
-                            indexSlot: .init(rawValue: 0)
+                            collection: .init(rawValue: 5),
+                            indexSlot: .init(rawValue: 0),
+                            direction: .forward
                         ),
                         .destroyStack(.init(rawValue: 0)),
                         .returnValue(.init(rawValue: 3)),

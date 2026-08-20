@@ -585,7 +585,7 @@ public final class Engine: @unchecked Sendable {
             true
         case .integerOverflow, .divisionByZero, .optionalUnwrapOfNil,
              .dynamicCastFailure, .valueNestingDepthExceeded,
-             .arrayIndexOutOfBounds, .unknownEntry,
+             .arrayIndexOutOfBounds, .collectionCursorOutOfBounds, .unknownEntry,
              .instructionFuelExhausted, .callDepthExceeded, .nativeCallLimitExceeded,
              .vmHeapLimitExceeded, .nativeOwnedMemoryLimitExceeded,
              .wallTimeExceeded, .mainActorViolation, .nativeImportThreadViolation,

@@ -777,14 +777,15 @@ public enum Instruction: Codable, Hashable, Sendable {
         arrayResult: Bytecode.Register,
         array: Bytecode.Register
     )
-    /// Advances an Array cursor. A forward cursor is the next index and starts
-    /// at zero; a reverse cursor is an exclusive upper bound and starts at the
-    /// Array count. Both exhausted cursors remain at their boundary.
-    case arrayNext(
+    /// Advances a managed collection cursor. A forward cursor is the next
+    /// element offset and starts at zero. Array also supports a reverse cursor,
+    /// represented as an exclusive upper bound starting at its element count.
+    /// Exhausted cursors remain at their boundary.
+    case collectionNext(
         result: Bytecode.Register,
-        array: Bytecode.Register,
+        collection: Bytecode.Register,
         indexSlot: Bytecode.StackSlot,
-        direction: Bytecode.ArrayTraversalDirection
+        direction: Bytecode.CollectionTraversalDirection
     )
     /// Advances a compiler-lowered Range or Stride sequence. The cursor is an
     /// Optional<Element>: `nil` is the exhausted state, which also avoids a
@@ -820,11 +821,6 @@ public enum Instruction: Codable, Hashable, Sendable {
         dictionary: Bytecode.Register,
         projection: Bytecode.DictionaryProjection
     )
-    case dictionaryNext(
-        result: Bytecode.Register,
-        dictionary: Bytecode.Register,
-        indexSlot: Bytecode.StackSlot
-    )
     /// Builds a Set from an Array or Set with the same element type. The VM
     /// removes duplicate Array elements while preserving a deterministic
     /// iteration order; that order is not part of Set equality.
@@ -859,11 +855,6 @@ public enum Instruction: Codable, Hashable, Sendable {
         elementResult: Bytecode.Register,
         setResult: Bytecode.Register,
         set: Bytecode.Register
-    )
-    case setNext(
-        result: Bytecode.Register,
-        set: Bytecode.Register,
-        indexSlot: Bytecode.StackSlot
     )
     case setAlgebra(
         result: Bytecode.Register,
@@ -1023,19 +1014,17 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .arraySwap(result, _, _, _),
              let .arrayAppend(result, _, _),
              let .arrayUpdate(result, _, _, _),
-             let .arrayNext(result, _, _, _),
+             let .collectionNext(result, _, _, _),
              let .progressionNext(result, _, _, _, _),
              let .makeDictionary(result, _),
              let .dictionaryCount(result, _),
              let .dictionaryIsEmpty(result, _),
              let .dictionaryGet(result, _, _),
              let .dictionaryProject(result, _, _),
-             let .dictionaryNext(result, _, _),
              let .makeSet(result, _),
              let .setCount(result, _),
              let .setIsEmpty(result, _),
              let .setContains(result, _, _),
-             let .setNext(result, _, _),
              let .setAlgebra(result, _, _, _),
              let .setRelation(result, _, _, _),
              let .compare(result, _, _, _),
@@ -1262,15 +1251,14 @@ public enum Instruction: Codable, Hashable, Sendable {
             [array, index, value]
         case let .arrayPopLast(_, _, array):
             [array]
-        case let .arrayNext(_, array, _, _):
-            [array]
+        case let .collectionNext(_, collection, _, _):
+            [collection]
         case let .progressionNext(_, _, end, stride, _):
             [end, stride]
         case let .makeDictionary(_, pairs):
             [pairs]
         case let .dictionaryCount(_, dictionary),
-             let .dictionaryIsEmpty(_, dictionary),
-             let .dictionaryNext(_, dictionary, _):
+             let .dictionaryIsEmpty(_, dictionary):
             [dictionary]
         case let .dictionaryGet(_, dictionary, key):
             [dictionary, key]
@@ -1281,8 +1269,7 @@ public enum Instruction: Codable, Hashable, Sendable {
         case let .makeSet(_, source):
             [source]
         case let .setCount(_, set),
-             let .setIsEmpty(_, set),
-             let .setNext(_, set, _):
+             let .setIsEmpty(_, set):
             [set]
         case let .setContains(_, set, element),
              let .setInsert(_, _, _, set, element),

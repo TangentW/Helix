@@ -320,8 +320,9 @@ public enum Disassembler {
             "\(result) = array_update \(array)[\(index)] = \(value)"
         case let .arrayPopLast(elementResult, arrayResult, array):
             "(\(elementResult), \(arrayResult)) = array_pop_last \(array)"
-        case let .arrayNext(result, array, indexSlot, direction):
-            "\(result) = array_next_\(direction.rawValue) \(array), \(indexSlot)"
+        case let .collectionNext(result, collection, indexSlot, direction):
+            "\(result) = collection_next_\(direction.rawValue) "
+                + "\(collection), \(indexSlot)"
         case let .progressionNext(result, cursorSlot, end, stride, boundary):
             "\(result) = progression_next.\(boundary.rawValue) "
                 + "\(cursorSlot), end: \(end), stride: \(stride)"
@@ -344,8 +345,6 @@ public enum Disassembler {
                 + "\(dictionary)[\(key)] = \(value)"
         case let .dictionaryProject(result, dictionary, projection):
             "\(result) = dictionary_project.\(projection) \(dictionary)"
-        case let .dictionaryNext(result, dictionary, indexSlot):
-            "\(result) = dictionary_next \(dictionary), \(indexSlot)"
         case let .makeSet(result, source):
             "\(result) = make_set \(source)"
         case let .setCount(result, set):
@@ -362,8 +361,6 @@ public enum Disassembler {
             "(\(removed), \(updated)) = set_remove \(element) from \(set)"
         case let .setPopFirst(element, updated, set):
             "(\(element), \(updated)) = set_pop_first \(set)"
-        case let .setNext(result, set, indexSlot):
-            "\(result) = set_next \(set), \(indexSlot)"
         case let .setAlgebra(result, operation, lhs, rhs):
             "\(result) = set_\(operation.rawValue) \(lhs), \(rhs)"
         case let .setRelation(result, operation, lhs, rhs):

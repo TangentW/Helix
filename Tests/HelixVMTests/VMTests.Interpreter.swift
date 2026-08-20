@@ -3242,7 +3242,7 @@ struct Interpreter {
         let optionalType = Bytecode.ValueType.optional(.int64)
 
         func function(
-            direction: Bytecode.ArrayTraversalDirection,
+            direction: Bytecode.CollectionTraversalDirection,
             fixedCursor: Int64?
         ) -> Bytecode.Function {
             var instructions: [Bytecode.Instruction] = []
@@ -3267,9 +3267,9 @@ struct Interpreter {
                     source: .init(rawValue: 1),
                     mode: .initialize
                 ),
-                .arrayNext(
+                .collectionNext(
                     result: .init(rawValue: 2),
-                    array: .init(rawValue: 0),
+                    collection: .init(rawValue: 0),
                     indexSlot: .init(rawValue: 0),
                     direction: direction
                 ),
@@ -3295,7 +3295,7 @@ struct Interpreter {
         }
 
         func image(
-            direction: Bytecode.ArrayTraversalDirection,
+            direction: Bytecode.CollectionTraversalDirection,
             fixedCursor: Int64?
         ) throws -> Verification.Image {
             try makeVerified(
@@ -3356,7 +3356,7 @@ struct Interpreter {
             ) == .returned(.optional(nil))
         )
         for direction in [
-            Bytecode.ArrayTraversalDirection.forward, .reverse,
+            Bytecode.CollectionTraversalDirection.forward, .reverse,
         ] {
             for invalidCursor: Int64 in [-1, 3] {
                 #expect(
@@ -3368,7 +3368,7 @@ struct Interpreter {
                         ),
                         arguments: [values]
                     ) == .trapped(
-                        .arrayIndexOutOfBounds(
+                        .collectionCursorOutOfBounds(
                             index: invalidCursor,
                             count: 2
                         )
@@ -3376,6 +3376,93 @@ struct Interpreter {
                 )
             }
         }
+    }
+
+    @Test("One managed cursor preserves Dictionary and Set element shapes")
+    func executesManagedCollectionTraversal() throws {
+        func first(
+            collectionType: Bytecode.ValueType,
+            elementType: Bytecode.ValueType,
+            source: VM.Value
+        ) throws -> VM.ExecutionResult {
+            let optionalType = Bytecode.ValueType.optional(elementType)
+            let function = Bytecode.Function(
+                id: .init(rawValue: 0),
+                name: "managedCollectionTraversal",
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: optionalType,
+                registerTypes: [collectionType, .int64, optionalType],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .constantInteger(
+                                result: .init(rawValue: 1),
+                                bitPattern: 0
+                            ),
+                            .storeStack(
+                                slot: .init(rawValue: 0),
+                                source: .init(rawValue: 1),
+                                mode: .initialize
+                            ),
+                            .collectionNext(
+                                result: .init(rawValue: 2),
+                                collection: .init(rawValue: 0),
+                                indexSlot: .init(rawValue: 0),
+                                direction: .forward
+                            ),
+                            .destroyStack(.init(rawValue: 0)),
+                            .returnValue(.init(rawValue: 2)),
+                        ]
+                    ),
+                ],
+                stackSlotTypes: [.int64]
+            )
+            let image = try makeVerified(
+                function: function,
+                capabilities: [.baselineV1, .collectionsV1],
+                signature: .init(
+                    parameters: [collectionType.description],
+                    result: optionalType.description
+                ),
+                parameterTypes: [collectionType],
+                resultType: optionalType
+            )
+            return VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [source]
+            )
+        }
+
+        let key = VM.Value.integer(
+            try .init(signed: 3, bitWidth: 64, isSigned: true)
+        )
+        let value = VM.Value.integer(
+            try .init(signed: 5, bitWidth: 64, isSigned: true)
+        )
+        #expect(
+            try first(
+                collectionType: .dictionary(key: .int64, value: .int64),
+                elementType: .tuple([.int64, .int64]),
+                source: .dictionary(
+                    [.init(key: key, value: value)],
+                    keyType: .int64,
+                    valueType: .int64
+                )
+            ) == .returned(.optional(.tuple([key, value])))
+        )
+        #expect(
+            try first(
+                collectionType: .set(.int64),
+                elementType: .int64,
+                source: .set(
+                    .init(elements: [value], elementType: .int64)
+                )
+            ) == .returned(.optional(value))
+        )
     }
 
     @Test("Mutable capture projections update their enclosing local value")

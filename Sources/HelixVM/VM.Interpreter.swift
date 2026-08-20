@@ -2633,8 +2633,36 @@ public struct Interpreter: Sendable {
                         register: arrayResult,
                         registers: &registers
                     )
-                case let .arrayNext(result, array, indexSlot, direction):
-                    let (elements, _) = try self.array(array, registers: registers)
+                case let .collectionNext(
+                    result,
+                    collectionRegister,
+                    indexSlot,
+                    direction
+                ):
+                    let collection = try read(
+                        collectionRegister,
+                        registers: registers
+                    )
+                    let elementCount: Int
+                    switch collection {
+                    case let .array(elements, _):
+                        elementCount = elements.count
+                    case let .dictionary(entries, _, _):
+                        guard direction == .forward else {
+                            throw VM.RuntimeTrap.invalidProgramCounter
+                        }
+                        elementCount = entries.count
+                    case let .set(value):
+                        guard direction == .forward else {
+                            throw VM.RuntimeTrap.invalidProgramCounter
+                        }
+                        elementCount = value.elements.count
+                    default:
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: collectionRegister) ?? .never,
+                            actual: collection.type
+                        )
+                    }
                     let indexValue = try read(indexSlot, stackSlots: stackSlots)
                     guard case let .integer(integer) = indexValue,
                           integer.bitWidth == 64,
@@ -2648,17 +2676,17 @@ public struct Interpreter: Sendable {
                     let index = integer.signedValue
                     guard index >= 0,
                           let exactIndex = Int(exactly: index),
-                          exactIndex <= elements.count
+                          exactIndex <= elementCount
                     else {
-                        throw VM.RuntimeTrap.arrayIndexOutOfBounds(
+                        throw VM.RuntimeTrap.collectionCursorOutOfBounds(
                             index: index,
-                            count: elements.count
+                            count: elementCount
                         )
                     }
                     let selectedIndex: Int?
                     let advancedIndex: Int64?
                     switch direction {
-                    case .forward where exactIndex < elements.count:
+                    case .forward where exactIndex < elementCount:
                         selectedIndex = exactIndex
                         let advanced = index.addingReportingOverflow(1)
                         guard !advanced.overflow else {
@@ -2678,12 +2706,30 @@ public struct Interpreter: Sendable {
                     }
                     let next: VM.Value?
                     if let selectedIndex, let advancedIndex {
-                        try chargeAggregate(elementCount: 1, budget: budget)
-                        let copied = try copyCharging(
-                            elements[selectedIndex],
-                            budget: budget
-                        )
-                        next = copied
+                        switch collection {
+                        case let .array(elements, _):
+                            try chargeAggregate(elementCount: 1, budget: budget)
+                            next = try copyCharging(
+                                elements[selectedIndex],
+                                budget: budget
+                            )
+                        case let .dictionary(entries, _, _):
+                            try chargeAggregate(elementCount: 2, budget: budget)
+                            try chargeAggregate(elementCount: 1, budget: budget)
+                            let entry = entries[selectedIndex]
+                            next = .tuple([
+                                try copyCharging(entry.key, budget: budget),
+                                try copyCharging(entry.value, budget: budget),
+                            ])
+                        case let .set(value):
+                            try chargeAggregate(elementCount: 1, budget: budget)
+                            next = try copyCharging(
+                                value.elements[selectedIndex],
+                                budget: budget
+                            )
+                        default:
+                            throw VM.RuntimeTrap.invalidProgramCounter
+                        }
                         try store(
                             .integer(
                                 VM.Integer(
@@ -2960,51 +3006,6 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
-                case let .dictionaryNext(result, operand, indexSlot):
-                    let (entries, _, _) = try dictionary(operand, registers: registers)
-                    let indexValue = try read(indexSlot, stackSlots: stackSlots)
-                    guard case let .integer(integer) = indexValue,
-                          integer.bitWidth == 64,
-                          integer.isSigned,
-                          integer.signedValue >= 0,
-                          let index = Int(exactly: integer.signedValue)
-                    else {
-                        throw VM.RuntimeTrap.invalidProgramCounter
-                    }
-                    let next: VM.Value?
-                    if entries.indices.contains(index) {
-                        try chargeAggregate(elementCount: 2, budget: budget)
-                        try chargeAggregate(elementCount: 1, budget: budget)
-                        let key = try copyCharging(
-                            entries[index].key,
-                            budget: budget
-                        )
-                        let value = try copyCharging(
-                            entries[index].value,
-                            budget: budget
-                        )
-                        next = .tuple([key, value])
-                        let advanced = integer.signedValue.addingReportingOverflow(1)
-                        guard !advanced.overflow else {
-                            throw VM.RuntimeTrap.integerOverflow
-                        }
-                        try store(
-                            .integer(
-                                VM.Integer(
-                                    signed: advanced.partialValue,
-                                    bitWidth: 64,
-                                    isSigned: true
-                                )
-                            ),
-                            in: indexSlot,
-                            mode: .assign,
-                            stackSlots: &stackSlots
-                        )
-                    } else {
-                        try chargeAggregate(elementCount: 0, budget: budget)
-                        next = nil
-                    }
-                    try initialize(.optional(next), register: result, registers: &registers)
                 case let .makeSet(result, source):
                     guard case let .set(elementType) = function.type(of: result) else {
                         throw VM.RuntimeTrap.typeMismatch(
@@ -3206,42 +3207,6 @@ public struct Interpreter: Sendable {
                         register: setResult,
                         registers: &registers
                     )
-                case let .setNext(result, operand, indexSlot):
-                    let value = try set(operand, registers: registers)
-                    let indexValue = try read(indexSlot, stackSlots: stackSlots)
-                    guard case let .integer(integer) = indexValue,
-                          integer.bitWidth == 64,
-                          integer.isSigned,
-                          integer.signedValue >= 0,
-                          let index = Int(exactly: integer.signedValue)
-                    else {
-                        throw VM.RuntimeTrap.invalidProgramCounter
-                    }
-                    let next: VM.Value?
-                    if value.elements.indices.contains(index) {
-                        try chargeAggregate(elementCount: 1, budget: budget)
-                        next = try copyCharging(value.elements[index], budget: budget)
-                        let advanced = integer.signedValue.addingReportingOverflow(1)
-                        guard !advanced.overflow else {
-                            throw VM.RuntimeTrap.integerOverflow
-                        }
-                        try store(
-                            .integer(
-                                VM.Integer(
-                                    signed: advanced.partialValue,
-                                    bitWidth: 64,
-                                    isSigned: true
-                                )
-                            ),
-                            in: indexSlot,
-                            mode: .assign,
-                            stackSlots: &stackSlots
-                        )
-                    } else {
-                        try chargeAggregate(elementCount: 0, budget: budget)
-                        next = nil
-                    }
-                    try initialize(.optional(next), register: result, registers: &registers)
                 case let .setAlgebra(result, operation, lhs, rhs):
                     let left = try set(lhs, registers: registers)
                     let right = try set(rhs, registers: registers)

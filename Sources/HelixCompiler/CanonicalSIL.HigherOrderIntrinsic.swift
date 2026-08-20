@@ -45,7 +45,7 @@ enum HigherOrderIntrinsic: Equatable {
         }
     }
 
-    var traversalDirection: Bytecode.ArrayTraversalDirection {
+    var traversalDirection: Bytecode.CollectionTraversalDirection {
         switch self {
         case .lastWhere, .lastIndexWhere:
             .reverse

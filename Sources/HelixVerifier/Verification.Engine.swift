@@ -2642,18 +2642,36 @@ public struct Engine: Verification.ImageVerifying {
             guard isCopyable(element, shell: shell) else {
                 throw fail("array_pop_last requires a copyable element type")
             }
-        case let .arrayNext(result, array, indexSlot, _):
+        case let .collectionNext(result, collection, indexSlot, direction):
             guard capabilities.contains(.collectionsV1) else {
-                throw fail("Array iteration requires \(Core.Capability.collectionsV1)")
+                throw fail("Collection iteration requires \(Core.Capability.collectionsV1)")
             }
-            guard case let .array(element) = type(array),
-                  type(result) == .optional(element),
+            let element: Bytecode.ValueType
+            switch type(collection) {
+            case let .array(value):
+                element = value
+            case let .dictionary(key, value):
+                guard direction == .forward else {
+                    throw fail("reverse collection iteration requires an Array")
+                }
+                element = .tuple([key, value])
+            case let .set(value):
+                guard direction == .forward else {
+                    throw fail("reverse collection iteration requires an Array")
+                }
+                element = value
+            default:
+                throw fail("collection_next requires an Array, Dictionary, or Set")
+            }
+            guard type(result) == .optional(element),
                   function.type(of: indexSlot) == .int64
             else {
-                throw fail("array_next needs Array<T>, Optional<T>, and an Int64 index slot")
+                throw fail(
+                    "collection_next result and Int64 cursor must match Collection.Element"
+                )
             }
             guard isCopyable(element, shell: shell) else {
-                throw fail("array_next requires a copyable element type")
+                throw fail("collection_next requires a copyable element type")
             }
         case let .progressionNext(result, cursorSlot, end, stride, _):
             guard capabilities.contains(.collectionsV1) else {
@@ -2761,19 +2779,6 @@ public struct Engine: Verification.ImageVerifying {
             guard isCopyable(projectedType, shell: shell) else {
                 throw fail("dictionary_project requires a copyable projected type")
             }
-        case let .dictionaryNext(result, dictionary, indexSlot):
-            guard capabilities.contains(.collectionsV1) else {
-                throw fail("Dictionary iteration requires \(Core.Capability.collectionsV1)")
-            }
-            guard case let .dictionary(key, value) = type(dictionary),
-                  type(result) == .optional(.tuple([key, value])),
-                  function.type(of: indexSlot) == .int64
-            else {
-                throw fail("dictionary_next needs Dictionary<K,V>, Optional<(K,V)>, and Int64 slot")
-            }
-            guard isCopyable(key, shell: shell), isCopyable(value, shell: shell) else {
-                throw fail("dictionary_next requires copyable key and value types")
-            }
         case let .makeSet(result, source):
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("make_set requires \(Core.Capability.collectionsV1)")
@@ -2854,16 +2859,6 @@ public struct Engine: Verification.ImageVerifying {
                   type(updated) == type(set)
             else {
                 throw fail("set_pop_first results must match Set.Element")
-            }
-        case let .setNext(result, set, indexSlot):
-            guard capabilities.contains(.collectionsV1) else {
-                throw fail("Set iteration requires \(Core.Capability.collectionsV1)")
-            }
-            guard case let .set(element) = type(set),
-                  type(result) == .optional(element),
-                  function.type(of: indexSlot) == .int64
-            else {
-                throw fail("set_next needs Set<T>, Optional<T>, and an Int64 index slot")
             }
         case let .setAlgebra(result, _, lhs, rhs):
             guard capabilities.contains(.collectionsV1) else {
@@ -3617,12 +3612,11 @@ public struct Engine: Verification.ImageVerifying {
                      let .arraySplitSeparator(result, _, _, _, _),
                      let .arraySplitNextElement(result, _),
                      let .arrayAppend(result, _, _), let .arrayUpdate(result, _, _, _),
-                     let .arrayNext(result, _, _, _),
+                     let .collectionNext(result, _, _, _),
                      let .progressionNext(result, _, _, _, _),
                      let .makeDictionary(result, _), let .dictionaryGet(result, _, _),
                      let .dictionaryProject(result, _, _),
-                     let .dictionaryNext(result, _, _),
-                     let .makeSet(result, _), let .setNext(result, _, _),
+                     let .makeSet(result, _),
                      let .setAlgebra(result, _, _, _):
                     if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
                 case let .arrayPopLast(elementResult, arrayResult, _):
@@ -4854,13 +4848,9 @@ public struct Engine: Verification.ImageVerifying {
                                 )
                             )
                     }
-                case let .arrayNext(_, _, slot, _):
+                case let .collectionNext(_, _, slot, _):
                     try requireInitialized(slot: slot)
                 case let .progressionNext(_, slot, _, _, _):
-                    try requireInitialized(slot: slot)
-                case let .dictionaryNext(_, _, slot):
-                    try requireInitialized(slot: slot)
-                case let .setNext(_, _, slot):
                     try requireInitialized(slot: slot)
                 case .returnValue, .throwError:
                     guard initialized.values.allSatisfy({

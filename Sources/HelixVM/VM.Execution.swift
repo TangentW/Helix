@@ -28,6 +28,7 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
     case dynamicCastFailure(actual: Bytecode.ValueType, expected: Bytecode.ValueType)
     case valueNestingDepthExceeded(maximum: Int)
     case arrayIndexOutOfBounds(index: Int64, count: Int)
+    case collectionCursorOutOfBounds(index: Int64, count: Int)
     case unknownFunction(Bytecode.FunctionID)
     case unknownEntry(Core.EntryIndex)
     case unknownNativeImport(Core.NativeImportID)
@@ -79,6 +80,8 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
             "VM value nesting exceeds \(maximum) levels"
         case let .arrayIndexOutOfBounds(index, count):
             "Array index \(index) is outside 0..<\(count)"
+        case let .collectionCursorOutOfBounds(index, count):
+            "collection cursor \(index) is outside 0...\(count)"
         case let .unknownFunction(function): "unknown HLBC function \(function)"
         case let .unknownEntry(entry): "unknown Shell entry \(entry)"
         case let .unknownNativeImport(importID): "unknown native import \(importID)"
