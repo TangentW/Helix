@@ -80,6 +80,13 @@ Both workflows depend on stable, build-specific identities:
   validates every bound before mutation, precharges output work/storage, and
   compiler-only assignment releases the replaced linear owner in the shared
   storage sink.
+- Dictionary insertion, replacement, and removal lower to one immutable typed
+  transform whose Optional update selects set versus erase and whose two
+  results carry the previous value and updated Dictionary. `keys` and `values`
+  use one projection operation parameterized by the selected element type.
+  The Verifier proves the complete result/operand relationship, while the VM
+  finds a key once and precharges traversal, output storage, and every copy
+  before constructing either result.
 - Mandatory SIL can erase `load [take]` and express ownership through separate
   retain/release traffic. A type-driven normalization recovers an unqualified
   forwarding load only when it is the last operation on the exact temporary

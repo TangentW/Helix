@@ -2762,7 +2762,7 @@ public struct Interpreter: Sendable {
                             budget: budget
                         ) == nil else {
                             throw VM.RuntimeTrap.explicit(
-                                "Dictionary literal contains duplicate keys"
+                                "Dictionary construction contains duplicate keys"
                             )
                         }
                         uniqueKeys.append(elements[0])
@@ -2831,7 +2831,13 @@ public struct Interpreter: Sendable {
                         value = nil
                     }
                     try initialize(.optional(value), register: result, registers: &registers)
-                case let .dictionaryUpdate(result, operand, key, value):
+                case let .dictionarySet(
+                    previousValueResult,
+                    dictionaryResult,
+                    operand,
+                    key,
+                    value
+                ):
                     let (source, keyType, valueType) = try dictionary(
                         operand,
                         registers: registers
@@ -2862,22 +2868,33 @@ public struct Interpreter: Sendable {
                     default:
                         finalCount = source.count
                     }
-                    try budget.consumeLinearWork(elementCount: finalCount)
+                    try budget.consumeLinearWork(
+                        elementCount: max(source.count, finalCount)
+                    )
                     try chargeDictionaryStorage(entryCount: finalCount, budget: budget)
+                    try chargeAggregate(
+                        elementCount: matchingIndex == nil ? 0 : 1,
+                        budget: budget
+                    )
                     for (index, entry) in source.enumerated() {
-                        if index == matchingIndex, wrapped == nil { continue }
-                        let selectedValue: VM.Value
-                        if index == matchingIndex, let wrapped {
-                            selectedValue = wrapped
-                        } else {
-                            selectedValue = entry.value
+                        if index == matchingIndex {
+                            try prepareCopy(entry.value, budget: budget)
+                            guard let wrapped else { continue }
+                            try prepareCopy(entry.key, budget: budget)
+                            try prepareCopy(wrapped, budget: budget)
+                            continue
                         }
+                        let selectedValue: VM.Value
+                        selectedValue = entry.value
                         try prepareCopy(entry.key, budget: budget)
                         try prepareCopy(selectedValue, budget: budget)
                     }
                     if matchingIndex == nil, let wrapped {
                         try prepareCopy(needle, budget: budget)
                         try prepareCopy(wrapped, budget: budget)
+                    }
+                    let previous = try matchingIndex.map {
+                        try copy(source[$0].value)
                     }
                     var entries: [VM.DictionaryEntry] = []
                     entries.reserveCapacity(finalCount)
@@ -2903,61 +2920,44 @@ public struct Interpreter: Sendable {
                     }
                     try budget.checkDeadline()
                     try initialize(
-                        .dictionary(entries, keyType: keyType, valueType: valueType),
-                        register: result,
-                        registers: &registers
-                    )
-                case let .dictionaryRemove(
-                    valueResult,
-                    dictionaryResult,
-                    operand,
-                    key
-                ):
-                    let (source, keyType, valueType) = try dictionary(
-                        operand,
-                        registers: registers
-                    )
-                    let needle = try read(key, registers: registers)
-                    let matchingIndex = try dictionaryIndex(
-                        of: needle,
-                        in: source,
-                        budget: budget
-                    )
-                    let finalCount = source.count - (matchingIndex == nil ? 0 : 1)
-                    try budget.consumeLinearWork(elementCount: source.count)
-                    try chargeDictionaryStorage(entryCount: finalCount, budget: budget)
-                    try chargeAggregate(
-                        elementCount: matchingIndex == nil ? 0 : 1,
-                        budget: budget
-                    )
-                    for (index, entry) in source.enumerated() {
-                        if index == matchingIndex {
-                            try prepareCopy(entry.value, budget: budget)
-                        } else {
-                            try prepareCopy(entry.key, budget: budget)
-                            try prepareCopy(entry.value, budget: budget)
-                        }
-                    }
-                    let removed = try matchingIndex.map { try copy(source[$0].value) }
-                    var entries: [VM.DictionaryEntry] = []
-                    entries.reserveCapacity(finalCount)
-                    for (index, entry) in source.enumerated() where index != matchingIndex {
-                        entries.append(
-                            .init(
-                                key: try copy(entry.key),
-                                value: try copy(entry.value)
-                            )
-                        )
-                    }
-                    try budget.checkDeadline()
-                    try initialize(
-                        .optional(removed),
-                        register: valueResult,
+                        .optional(previous),
+                        register: previousValueResult,
                         registers: &registers
                     )
                     try initialize(
                         .dictionary(entries, keyType: keyType, valueType: valueType),
                         register: dictionaryResult,
+                        registers: &registers
+                    )
+                case let .dictionaryProject(result, operand, projection):
+                    let (source, keyType, valueType) = try dictionary(
+                        operand,
+                        registers: registers
+                    )
+                    let elementType = projection == .keys ? keyType : valueType
+                    try budget.consumeLinearWork(elementCount: source.count)
+                    try chargeAggregate(
+                        elementCount: source.count,
+                        budget: budget
+                    )
+                    for entry in source {
+                        let element = projection == .keys
+                            ? entry.key
+                            : entry.value
+                        try prepareCopy(element, budget: budget)
+                    }
+                    var projected: [VM.Value] = []
+                    projected.reserveCapacity(source.count)
+                    for entry in source {
+                        let element = projection == .keys
+                            ? entry.key
+                            : entry.value
+                        projected.append(try copy(element))
+                    }
+                    try budget.checkDeadline()
+                    try initialize(
+                        .array(projected, elementType: elementType),
+                        register: result,
                         registers: &registers
                     )
                 case let .dictionaryNext(result, operand, indexSlot):

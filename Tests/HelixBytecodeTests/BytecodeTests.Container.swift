@@ -40,6 +40,64 @@ struct Container {
         #expect(decoded == module)
     }
 
+    @Test("Dictionary mutation and projection share the current HLBC 1.0 wire format")
+    func dictionaryOperationsRoundTrip() throws {
+        let dictionary = Bytecode.ValueType.dictionary(
+            key: .string,
+            value: .int64
+        )
+        var module = try makeAddModule()
+        module.capabilities.formUnion([.collectionsV1, .stringsV1])
+        module.functions[0] = .init(
+            id: .init(rawValue: 0),
+            name: "dictionaryOperations",
+            parameterRegisters: [
+                .init(rawValue: 0), .init(rawValue: 1), .init(rawValue: 2),
+            ],
+            resultType: dictionary,
+            registerTypes: [
+                dictionary, .string, .optional(.int64), .optional(.int64),
+                dictionary, .array(.string), .array(.int64),
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                        .init(rawValue: 2),
+                    ],
+                    instructions: [
+                        .dictionarySet(
+                            previousValueResult: .init(rawValue: 3),
+                            dictionaryResult: .init(rawValue: 4),
+                            dictionary: .init(rawValue: 0),
+                            key: .init(rawValue: 1),
+                            value: .init(rawValue: 2)
+                        ),
+                        .dictionaryProject(
+                            result: .init(rawValue: 5),
+                            dictionary: .init(rawValue: 4),
+                            projection: .keys
+                        ),
+                        .dictionaryProject(
+                            result: .init(rawValue: 6),
+                            dictionary: .init(rawValue: 4),
+                            projection: .values
+                        ),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ]
+        )
+
+        let bytes = try Bytecode.Encoder.encode(module)
+        let decoded = try Bytecode.Decoder.decode(bytes).module
+
+        #expect(decoded == module)
+        #expect(try Bytecode.Encoder.encode(decoded) == bytes)
+    }
+
     @Test("Encoding is deterministic")
     func deterministicEncoding() throws {
         let module = try makeAddModule()

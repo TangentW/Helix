@@ -171,8 +171,9 @@ one-grapheme Character literals for the bounded String predicate path,
 tuple/Optional including address projection, recursive Array/Dictionary equality,
 common Array index/search/extremum/sequence relations plus type-generic,
 Array-backed structural concatenation/insertion/replacement/removal/swap and
-capacity hints, Dictionary
-removal/capacity hints, and typed Set construction/query/mutation/iteration/algebra with
+capacity hints, Dictionary lookup/subscript mutation, `updateValue`,
+`removeValue`, `removeAll`, key/value projection, unique-key sequence
+construction and capacity hints, and typed Set construction/query/mutation/iteration/algebra with
 recursively VM-defined Equatable/Hashable semantics, common fully concrete Array-backed
 `map`/`flatMap`/`filter`/`compactMap`/`reduce`/short-circuit predicate
 operations, plus typed

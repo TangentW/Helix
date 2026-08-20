@@ -804,17 +804,21 @@ public enum Instruction: Codable, Hashable, Sendable {
         dictionary: Bytecode.Register,
         key: Bytecode.Register
     )
-    case dictionaryUpdate(
-        result: Bytecode.Register,
+    /// Applies an Optional update and returns both the previous value and the
+    /// updated Dictionary. `nil` removes the key; a non-nil value inserts or
+    /// replaces it. This is the shared value-semantic mutation primitive for
+    /// subscript assignment, `updateValue`, and `removeValue`.
+    case dictionarySet(
+        previousValueResult: Bytecode.Register,
+        dictionaryResult: Bytecode.Register,
         dictionary: Bytecode.Register,
         key: Bytecode.Register,
         value: Bytecode.Register
     )
-    case dictionaryRemove(
-        valueResult: Bytecode.Register,
-        dictionaryResult: Bytecode.Register,
+    case dictionaryProject(
+        result: Bytecode.Register,
         dictionary: Bytecode.Register,
-        key: Bytecode.Register
+        projection: Bytecode.DictionaryProjection
     )
     case dictionaryNext(
         result: Bytecode.Register,
@@ -1025,7 +1029,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .dictionaryCount(result, _),
              let .dictionaryIsEmpty(result, _),
              let .dictionaryGet(result, _, _),
-             let .dictionaryUpdate(result, _, _, _),
+             let .dictionaryProject(result, _, _),
              let .dictionaryNext(result, _, _),
              let .makeSet(result, _),
              let .setCount(result, _),
@@ -1047,8 +1051,14 @@ public enum Instruction: Codable, Hashable, Sendable {
             [quotient, remainder]
         case let .arrayPopLast(elementResult, arrayResult, _):
             [elementResult, arrayResult]
-        case let .dictionaryRemove(valueResult, dictionaryResult, _, _):
-            [valueResult, dictionaryResult]
+        case let .dictionarySet(
+            previousValueResult,
+            dictionaryResult,
+            _,
+            _,
+            _
+        ):
+            [previousValueResult, dictionaryResult]
         case let .setInsert(insertedResult, memberResult, setResult, _, _):
             [insertedResult, memberResult, setResult]
         case let .setUpdate(oldMemberResult, setResult, _, _):
@@ -1264,10 +1274,10 @@ public enum Instruction: Codable, Hashable, Sendable {
             [dictionary]
         case let .dictionaryGet(_, dictionary, key):
             [dictionary, key]
-        case let .dictionaryUpdate(_, dictionary, key, value):
+        case let .dictionarySet(_, _, dictionary, key, value):
             [dictionary, key, value]
-        case let .dictionaryRemove(_, _, dictionary, key):
-            [dictionary, key]
+        case let .dictionaryProject(_, dictionary, _):
+            [dictionary]
         case let .makeSet(_, source):
             [source]
         case let .setCount(_, set),

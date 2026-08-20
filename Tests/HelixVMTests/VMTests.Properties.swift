@@ -1382,15 +1382,19 @@ struct Properties {
     @Test("Seeded Dictionary updates agree with Swift lookup and value semantics")
     func dictionaryUpdatesMatchSwiftReferenceModel() throws {
         let dictionaryType = Bytecode.ValueType.dictionary(key: .string, value: .int64)
+        let resultType = Bytecode.ValueType.tuple([
+            .optional(.int64), dictionaryType,
+        ])
         let function = Bytecode.Function(
             id: .init(rawValue: 0),
             name: "update",
             parameterRegisters: [
                 .init(rawValue: 0), .init(rawValue: 1), .init(rawValue: 2),
             ],
-            resultType: dictionaryType,
+            resultType: resultType,
             registerTypes: [
-                dictionaryType, .string, .optional(.int64), dictionaryType,
+                dictionaryType, .string, .optional(.int64),
+                .optional(.int64), dictionaryType, resultType,
             ],
             entryBlock: .init(rawValue: 0),
             blocks: [
@@ -1400,13 +1404,18 @@ struct Properties {
                         .init(rawValue: 0), .init(rawValue: 1), .init(rawValue: 2),
                     ],
                     instructions: [
-                        .dictionaryUpdate(
-                            result: .init(rawValue: 3),
+                        .dictionarySet(
+                            previousValueResult: .init(rawValue: 3),
+                            dictionaryResult: .init(rawValue: 4),
                             dictionary: .init(rawValue: 0),
                             key: .init(rawValue: 1),
                             value: .init(rawValue: 2)
                         ),
-                        .returnValue(.init(rawValue: 3)),
+                        .makeTuple(
+                            result: .init(rawValue: 5),
+                            elements: [.init(rawValue: 3), .init(rawValue: 4)]
+                        ),
+                        .returnValue(.init(rawValue: 5)),
                     ]
                 ),
             ]
@@ -1419,10 +1428,10 @@ struct Properties {
                     "Swift.String",
                     "Swift.Optional<Swift.Int>",
                 ],
-                result: "Swift.Dictionary<Swift.String, Swift.Int>"
+                result: "(Swift.Optional<Swift.Int>, Swift.Dictionary<Swift.String, Swift.Int>)"
             ),
             parameterTypes: [dictionaryType, .string, .optional(.int64)],
-            resultType: dictionaryType,
+            resultType: resultType,
             capabilities: [.baselineV1, .stringsV1, .collectionsV1]
         )
         var generator = Generator(seed: 0x484c_5844_4943_5421)
@@ -1436,6 +1445,7 @@ struct Properties {
             let key = "k\(generator.next() % 12)"
             let shouldDelete = generator.next() & 1 == 0
             let update = generator.integer(in: -50...50)
+            let expectedPrevious = source[key]
             var expected = source
             if shouldDelete {
                 expected.removeValue(forKey: key)
@@ -1457,10 +1467,19 @@ struct Properties {
                     updateValue,
                 ]
             )
-            guard case let .returned(.some(.dictionary(actualEntries, _, _))) = result else {
+            guard case let .returned(.some(.tuple(outputs))) = result,
+                  outputs.count == 2,
+                  case let .optional(actualPrevious) = outputs[0],
+                  case let .dictionary(actualEntries, _, _) = outputs[1]
+            else {
                 Issue.record("unexpected Dictionary result for case \(caseID): \(result)")
                 continue
             }
+            let expectedPreviousValue = try expectedPrevious.map(integerValue)
+            #expect(
+                actualPrevious == expectedPreviousValue,
+                Comment(rawValue: "Dictionary previous value mismatch for case \(caseID)")
+            )
             var actual: [String: Int64] = [:]
             for entry in actualEntries {
                 guard case let .string(actualKey) = entry.key,

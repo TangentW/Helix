@@ -8755,6 +8755,63 @@ public struct Lowerer: Sendable {
                 }
             }
 
+            func makeEmptyDictionary(
+                key: Bytecode.ValueType,
+                value: Bytecode.ValueType
+            ) throws -> Bytecode.Register {
+                let pairType = Bytecode.ValueType.tuple([key, value])
+                let pairs = try allocate(type: .array(pairType))
+                appendInstruction(.makeArray(result: pairs, elements: []))
+                let result = try allocate(type: .dictionary(key: key, value: value))
+                appendInstruction(.makeDictionary(result: result, pairs: pairs))
+                if registerTypes[Int(pairs.rawValue)].requiresLinearOwnership {
+                    appendInstruction(.destroyValue(pairs))
+                }
+                return result
+            }
+
+            func emitDictionarySet(
+                dictionary: Bytecode.Register,
+                key: Bytecode.Register,
+                update: Bytecode.Register,
+                keyType: Bytecode.ValueType,
+                valueType: Bytecode.ValueType
+            ) throws -> (
+                previous: Bytecode.Register,
+                updated: Bytecode.Register
+            ) {
+                let dictionaryType = Bytecode.ValueType.dictionary(
+                    key: keyType,
+                    value: valueType
+                )
+                guard registerTypes[Int(dictionary.rawValue)] == dictionaryType,
+                      registerTypes[Int(key.rawValue)] == keyType,
+                      registerTypes[Int(update.rawValue)] == .optional(valueType)
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary update operands do not match its specialization"
+                    )
+                }
+                let previous = try allocate(type: .optional(valueType))
+                let updated = try allocate(type: dictionaryType)
+                appendInstruction(
+                    .dictionarySet(
+                        previousValueResult: previous,
+                        dictionaryResult: updated,
+                        dictionary: dictionary,
+                        key: key,
+                        value: update
+                    )
+                )
+                return (previous, updated)
+            }
+
+            func destroyLinearTemporary(_ register: Bytecode.Register) {
+                if registerTypes[Int(register.rawValue)].requiresLinearOwnership {
+                    appendInstruction(.destroyValue(register))
+                }
+            }
+
             switch intrinsic {
             case let .scalar(scalar):
                 try lowerScalarIntrinsic(
@@ -9873,20 +9930,10 @@ public struct Lowerer: Sendable {
                         "Dictionary.init() metatype does not match Key and Value"
                     )
                 }
-                let pairs = try allocate(
-                    type: .array(.tuple([types.key, types.value]))
+                let result = try makeEmptyDictionary(
+                    key: types.key,
+                    value: types.value
                 )
-                appendInstruction(.makeArray(result: pairs, elements: []))
-                let result = try allocate(
-                    type: .dictionary(key: types.key, value: types.value)
-                )
-                appendInstruction(
-                    .makeDictionary(result: result, pairs: pairs)
-                )
-                if registerTypes[Int(pairs.rawValue)]
-                    .requiresLinearOwnership {
-                    appendInstruction(.destroyValue(pairs))
-                }
                 values[resultToken] = result
 
             case .dictionarySubscriptGet:
@@ -9959,16 +10006,84 @@ public struct Lowerer: Sendable {
                         "Dictionary subscript setter types do not match"
                     )
                 }
-                let result = try allocate(type: dictionaryType)
-                appendInstruction(
-                    .dictionaryUpdate(
-                        result: result,
-                        dictionary: dictionary,
-                        key: key,
-                        value: update
-                    )
+                let mutation = try emitDictionarySet(
+                    dictionary: dictionary,
+                    key: key,
+                    update: update,
+                    keyType: types.key,
+                    valueType: types.value
                 )
-                try storeConstructedValue(result, at: arguments[2], mode: .assign)
+                destroyLinearTemporary(update)
+                destroyLinearTemporary(dictionary)
+                destroyLinearTemporary(mutation.previous)
+                try storeConstructedValue(
+                    mutation.updated,
+                    at: arguments[2],
+                    mode: .assign
+                )
+                voidValues.insert(resultToken)
+
+            case .dictionaryUpdateValue:
+                guard arguments.count == 4,
+                      let outputType = compilerAddressType(arguments[0]),
+                      let valueType = compilerAddressType(arguments[1]),
+                      let keyType = compilerAddressType(arguments[2]),
+                      let dictionaryType = compilerAddressType(arguments[3]),
+                      let value = try copyStoredValue(
+                        at: arguments[1],
+                        line: line
+                      ),
+                      let key = try copyStoredValue(
+                        at: arguments[2],
+                        line: line
+                      ),
+                      let dictionary = try copyStoredValue(
+                        at: arguments[3],
+                        line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary.updateValue has unsupported arguments"
+                    )
+                }
+                let types = try parseDictionaryGenericArguments(genericArguments)
+                let expectedDictionary = Bytecode.ValueType.dictionary(
+                    key: types.key,
+                    value: types.value
+                )
+                guard outputType == .optional(types.value),
+                      valueType == types.value,
+                      registerTypes[Int(value.rawValue)] == valueType,
+                      keyType == types.key,
+                      registerTypes[Int(key.rawValue)] == keyType,
+                      dictionaryType == expectedDictionary,
+                      registerTypes[Int(dictionary.rawValue)] == dictionaryType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary.updateValue types do not match Dictionary"
+                    )
+                }
+                let update = try allocate(type: .optional(types.value))
+                appendInstruction(.makeOptionalSome(result: update, value: value))
+                let mutation = try emitDictionarySet(
+                    dictionary: dictionary,
+                    key: key,
+                    update: update,
+                    keyType: types.key,
+                    valueType: types.value
+                )
+                destroyLinearTemporary(update)
+                destroyLinearTemporary(dictionary)
+                try storeConstructedValue(
+                    mutation.previous,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                try storeConstructedValue(
+                    mutation.updated,
+                    at: arguments[3],
+                    mode: .assign
+                )
                 voidValues.insert(resultToken)
 
             case .dictionaryRemoveValue:
@@ -10007,27 +10122,88 @@ public struct Lowerer: Sendable {
                         "Dictionary.removeValue types do not match Dictionary"
                     )
                 }
-                let removed = try allocate(type: outputType)
-                let updated = try allocate(type: dictionaryType)
-                appendInstruction(
-                    .dictionaryRemove(
-                        valueResult: removed,
-                        dictionaryResult: updated,
-                        dictionary: dictionary,
-                        key: key
-                    )
+                let update = try allocate(type: .optional(types.value))
+                appendInstruction(.makeOptionalNone(result: update))
+                let mutation = try emitDictionarySet(
+                    dictionary: dictionary,
+                    key: key,
+                    update: update,
+                    keyType: types.key,
+                    valueType: types.value
                 )
+                destroyLinearTemporary(update)
+                destroyLinearTemporary(dictionary)
                 try storeConstructedValue(
-                    removed,
+                    mutation.previous,
                     at: arguments[0],
                     mode: .initialize
                 )
                 try storeConstructedValue(
-                    updated,
+                    mutation.updated,
                     at: arguments[2],
                     mode: .assign
                 )
                 voidValues.insert(resultToken)
+
+            case .dictionaryRemoveAll:
+                guard arguments.count == 2,
+                      let dictionaryType = compilerAddressType(arguments[1])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary.removeAll has unsupported arguments"
+                    )
+                }
+                let keepingCapacity = try resolve(arguments[0], line: line)
+                let types = try parseDictionaryGenericArguments(genericArguments)
+                let expectedDictionary = Bytecode.ValueType.dictionary(
+                    key: types.key,
+                    value: types.value
+                )
+                guard registerTypes[Int(keepingCapacity.rawValue)] == .bool,
+                      dictionaryType == expectedDictionary
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary.removeAll types do not match Dictionary"
+                    )
+                }
+                let empty = try makeEmptyDictionary(
+                    key: types.key,
+                    value: types.value
+                )
+                try storeConstructedValue(
+                    empty,
+                    at: arguments[1],
+                    mode: .assign
+                )
+                voidValues.insert(resultToken)
+
+            case let .dictionaryProjection(projection):
+                guard arguments.count == 1 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary projection getter has unsupported arguments"
+                    )
+                }
+                let types = try parseDictionaryGenericArguments(genericArguments)
+                let dictionary = try resolve(arguments[0], line: line)
+                let dictionaryType = Bytecode.ValueType.dictionary(
+                    key: types.key,
+                    value: types.value
+                )
+                guard registerTypes[Int(dictionary.rawValue)] == dictionaryType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary projection generic types do not match its operand"
+                    )
+                }
+                let element = projection == .keys ? types.key : types.value
+                let result = try allocate(type: .array(element))
+                appendInstruction(
+                    .dictionaryProject(
+                        result: result,
+                        dictionary: dictionary,
+                        projection: projection
+                    )
+                )
+                values[resultToken] = result
 
             case .dictionaryReserveCapacity:
                 guard arguments.count == 2 else {
@@ -10075,6 +10251,41 @@ public struct Lowerer: Sendable {
                 appendInstruction(
                     .makeDictionary(result: result, pairs: pairs)
                 )
+                destroyLinearTemporary(pairs)
+
+            case .dictionaryUniqueKeysWithValues:
+                guard arguments.count == 2 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary.init(uniqueKeysWithValues:) has unsupported arguments"
+                    )
+                }
+                let types = try parseDictionarySequenceGenericArguments(
+                    genericArguments
+                )
+                let pairSequence = Bytecode.ValueType.array(
+                    .tuple([types.key, types.value])
+                )
+                guard types.sequence == pairSequence,
+                      stackType(at: arguments[0]) == pairSequence,
+                      let metatype = dictionaryMetatypeValues[arguments[1]],
+                      metatype.0 == types.key,
+                      metatype.1 == types.value,
+                      let pairs = try copyStoredValue(
+                        at: arguments[0],
+                        line: line
+                      ),
+                      registerTypes[Int(pairs.rawValue)] == pairSequence
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary.init(uniqueKeysWithValues:) types do not match"
+                    )
+                }
+                let result = try allocate(
+                    type: .dictionary(key: types.key, value: types.value)
+                )
+                appendInstruction(.makeDictionary(result: result, pairs: pairs))
+                destroyLinearTemporary(pairs)
+                values[resultToken] = result
 
             case .dictionaryMakeIterator:
                 guard arguments.count == 1 else {
@@ -17654,6 +17865,26 @@ public struct Lowerer: Sendable {
         return (
             try parseStoredType(components[0]),
             try parseStoredType(components[1])
+        )
+    }
+
+    private func parseDictionarySequenceGenericArguments(
+        _ raw: String
+    ) throws -> (
+        key: Bytecode.ValueType,
+        value: Bytecode.ValueType,
+        sequence: Bytecode.ValueType
+    ) {
+        let components = splitTopLevel(raw)
+        guard components.count == 3 else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "Dictionary Sequence initializer requires Key, Value, and Sequence"
+            )
+        }
+        return (
+            try parseStoredType(components[0]),
+            try parseStoredType(components[1]),
+            try parseStoredType(components[2])
         )
     }
 

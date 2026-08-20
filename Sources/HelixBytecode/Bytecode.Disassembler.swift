@@ -333,10 +333,17 @@ public enum Disassembler {
             "\(result) = dictionary_is_empty \(dictionary)"
         case let .dictionaryGet(result, dictionary, key):
             "\(result) = dictionary_get \(dictionary)[\(key)]"
-        case let .dictionaryUpdate(result, dictionary, key, value):
-            "\(result) = dictionary_update \(dictionary)[\(key)] = \(value)"
-        case let .dictionaryRemove(valueResult, dictionaryResult, dictionary, key):
-            "(\(valueResult), \(dictionaryResult)) = dictionary_remove \(dictionary)[\(key)]"
+        case let .dictionarySet(
+            previousValueResult,
+            dictionaryResult,
+            dictionary,
+            key,
+            value
+        ):
+            "(\(previousValueResult), \(dictionaryResult)) = dictionary_set "
+                + "\(dictionary)[\(key)] = \(value)"
+        case let .dictionaryProject(result, dictionary, projection):
+            "\(result) = dictionary_project.\(projection) \(dictionary)"
         case let .dictionaryNext(result, dictionary, indexSlot):
             "\(result) = dictionary_next \(dictionary), \(indexSlot)"
         case let .makeSet(result, source):

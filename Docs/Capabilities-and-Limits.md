@@ -92,10 +92,16 @@ does not by itself certify a physical device or distribution channel.
   swap primitives, so bounds checks, overflow behavior, ownership, and
   allocation-before-copy charging do not depend on a particular element or
   SDK type.
-  Dictionary construction, equality, lookup, update, `removeValue(forKey:)`,
-  `reserveCapacity`, and iteration are supported for
-  eligible key and value types. Append accepts represented copyable elements,
-  including frozen imported reference values. Equality is defined recursively
+  Dictionary construction, equality, lookup, subscript assignment,
+  `updateValue(_:forKey:)`, `removeValue(forKey:)`,
+  `removeAll(keepingCapacity:)`, `keys`/`values` sequence materialization,
+  `init(uniqueKeysWithValues:)`, `reserveCapacity`, and iteration are supported
+  for eligible key and value types. Insertion, replacement, and removal share
+  one typed Optional-update primitive that returns both the previous value and
+  the updated Dictionary; key/value views share one typed projection primitive.
+  Both paths precharge work and output storage before copying. Array append
+  accepts represented copyable elements, including frozen imported reference
+  values. Equality is defined recursively
   for Bool, fixed-width integers, floating-point values, String, and supported
   Optional, Array, Dictionary, and Set values. Dictionary and Set comparison is
   order-independent, collection equality preserves Swift's shared-storage fast

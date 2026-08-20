@@ -738,6 +738,20 @@ public struct TypeEnvironment: Sendable {
             }
             return .set(element)
         }
+        // Dictionary.Keys and Dictionary.Values are compiler-only collection
+        // views. Their supported sequence surface is represented by an Array;
+        // private view storage and index APIs remain intentionally unavailable.
+        for (suffix, selectsKey) in [(".Keys", true), (".Values", false)]
+        where type.hasSuffix(suffix) {
+            let dictionaryName = String(type.dropLast(suffix.count))
+            let dictionary = ValueRepresentation.storable(
+                try resolve(dictionaryName, relativeTo: parentScope)
+            )
+            guard case let .dictionary(key, value) = dictionary else {
+                throw CanonicalSIL.LoweringError.unsupportedType(type)
+            }
+            return .array(selectsKey ? key : value)
+        }
         for dictionaryPrefix in ["Dictionary<", "Swift.Dictionary<"]
         where type.hasPrefix(dictionaryPrefix) && type.hasSuffix(">") {
             let components = splitTopLevel(genericBody(type, prefix: dictionaryPrefix))

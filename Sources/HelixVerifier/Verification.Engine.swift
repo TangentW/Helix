@@ -2725,33 +2725,41 @@ public struct Engine: Verification.ImageVerifying {
             guard isCopyable(valueType, shell: shell) else {
                 throw fail("dictionary_get requires a copyable value type")
             }
-        case let .dictionaryUpdate(result, dictionary, key, value):
+        case let .dictionarySet(
+            previousValueResult,
+            dictionaryResult,
+            dictionary,
+            key,
+            value
+        ):
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("Dictionary update requires \(Core.Capability.collectionsV1)")
             }
             guard case let .dictionary(keyType, valueType) = type(dictionary),
-                  type(result) == type(dictionary),
+                  type(previousValueResult) == .optional(valueType),
+                  type(dictionaryResult) == type(dictionary),
                   type(key) == keyType,
                   type(value) == .optional(valueType)
             else {
-                throw fail("dictionary_update operands and result must match Dictionary types")
+                throw fail("dictionary_set operands and results must match Dictionary types")
             }
             guard isCopyable(keyType, shell: shell), isCopyable(valueType, shell: shell) else {
-                throw fail("dictionary_update requires copyable key and value types")
+                throw fail("dictionary_set requires copyable key and value types")
             }
-        case let .dictionaryRemove(valueResult, dictionaryResult, dictionary, key):
+        case let .dictionaryProject(result, dictionary, projection):
             guard capabilities.contains(.collectionsV1) else {
-                throw fail("Dictionary.removeValue requires \(Core.Capability.collectionsV1)")
+                throw fail("Dictionary projection requires \(Core.Capability.collectionsV1)")
             }
             guard case let .dictionary(keyType, valueType) = type(dictionary),
-                  type(dictionaryResult) == type(dictionary),
-                  type(key) == keyType,
-                  type(valueResult) == .optional(valueType)
+                  type(result) == .array(
+                    projection == .keys ? keyType : valueType
+                  )
             else {
-                throw fail("dictionary_remove results must match Dictionary key and value types")
+                throw fail("dictionary_project result must match its selected element type")
             }
-            guard isCopyable(keyType, shell: shell), isCopyable(valueType, shell: shell) else {
-                throw fail("dictionary_remove requires copyable key and value types")
+            let projectedType = projection == .keys ? keyType : valueType
+            guard isCopyable(projectedType, shell: shell) else {
+                throw fail("dictionary_project requires a copyable projected type")
             }
         case let .dictionaryNext(result, dictionary, indexSlot):
             guard capabilities.contains(.collectionsV1) else {
@@ -3612,7 +3620,7 @@ public struct Engine: Verification.ImageVerifying {
                      let .arrayNext(result, _, _, _),
                      let .progressionNext(result, _, _, _, _),
                      let .makeDictionary(result, _), let .dictionaryGet(result, _, _),
-                     let .dictionaryUpdate(result, _, _, _),
+                     let .dictionaryProject(result, _, _),
                      let .dictionaryNext(result, _, _),
                      let .makeSet(result, _), let .setNext(result, _, _),
                      let .setAlgebra(result, _, _, _):
@@ -3622,8 +3630,14 @@ public struct Engine: Verification.ImageVerifying {
                     where function.type(of: result)?.requiresLinearOwnership == true {
                         live.insert(result)
                     }
-                case let .dictionaryRemove(valueResult, dictionaryResult, _, _):
-                    for result in [valueResult, dictionaryResult]
+                case let .dictionarySet(
+                    previousValueResult,
+                    dictionaryResult,
+                    _,
+                    _,
+                    _
+                ):
+                    for result in [previousValueResult, dictionaryResult]
                     where function.type(of: result)?.requiresLinearOwnership == true {
                         live.insert(result)
                     }

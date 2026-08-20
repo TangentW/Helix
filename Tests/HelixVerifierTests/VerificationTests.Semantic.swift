@@ -898,13 +898,14 @@ struct SemanticVerifier {
         }
     }
 
-    @Test("Dictionary removal cannot forge its optional value result")
-    func rejectsMismatchedDictionaryRemovalResults() throws {
+    @Test("Dictionary mutation cannot forge its previous-value result")
+    func rejectsMismatchedDictionarySetResults() throws {
         var fixture = try makeFixture { function in
             let pair = Bytecode.ValueType.tuple([.string, .int64])
             let dictionary = Bytecode.ValueType.dictionary(key: .string, value: .int64)
             function.registerTypes.append(contentsOf: [
                 .array(pair), dictionary, .string, .optional(.string), dictionary,
+                .optional(.int64),
             ])
             function.blocks[0].instructions = [
                 .makeArray(result: .init(rawValue: 1), elements: []),
@@ -913,11 +914,13 @@ struct SemanticVerifier {
                     pairs: .init(rawValue: 1)
                 ),
                 .constantString(result: .init(rawValue: 3), value: "key"),
-                .dictionaryRemove(
-                    valueResult: .init(rawValue: 4),
+                .makeOptionalNone(result: .init(rawValue: 6)),
+                .dictionarySet(
+                    previousValueResult: .init(rawValue: 4),
                     dictionaryResult: .init(rawValue: 5),
                     dictionary: .init(rawValue: 2),
-                    key: .init(rawValue: 3)
+                    key: .init(rawValue: 3),
+                    value: .init(rawValue: 6)
                 ),
                 .returnValue(.init(rawValue: 0)),
             ]
@@ -930,8 +933,53 @@ struct SemanticVerifier {
             throws: Verification.Error.invalidInstruction(
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
-                offset: 3,
-                reason: "dictionary_remove results must match Dictionary key and value types"
+                offset: 4,
+                reason: "dictionary_set operands and results must match Dictionary types"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("Dictionary projection cannot forge its selected element type")
+    func rejectsMismatchedDictionaryProjection() throws {
+        var fixture = try makeFixture { function in
+            let pair = Bytecode.ValueType.tuple([.string, .int64])
+            let dictionary = Bytecode.ValueType.dictionary(
+                key: .string,
+                value: .int64
+            )
+            function.registerTypes.append(contentsOf: [
+                .array(pair), dictionary, .array(.int64),
+            ])
+            function.blocks[0].instructions = [
+                .makeArray(result: .init(rawValue: 1), elements: []),
+                .makeDictionary(
+                    result: .init(rawValue: 2),
+                    pairs: .init(rawValue: 1)
+                ),
+                .dictionaryProject(
+                    result: .init(rawValue: 3),
+                    dictionary: .init(rawValue: 2),
+                    projection: .keys
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        fixture.module.capabilities.formUnion([.collectionsV1, .stringsV1])
+        fixture.shell.capabilities.formUnion([.collectionsV1, .stringsV1])
+        fixture.policy.acceptedCapabilities.formUnion([.collectionsV1, .stringsV1])
+
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "dictionary_project result must match its selected element type"
             )
         ) {
             try Verification.Engine().verify(

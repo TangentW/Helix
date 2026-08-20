@@ -2029,7 +2029,7 @@ struct Interpreter {
                 entry: .init(rawValue: 0),
                 image: image,
                 arguments: []
-            ) == .trapped(.explicit("Dictionary literal contains duplicate keys"))
+            ) == .trapped(.explicit("Dictionary construction contains duplicate keys"))
         )
     }
 

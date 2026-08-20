@@ -3938,7 +3938,7 @@ struct Pipeline {
             resultType: dictionaryType,
             additionalFrontendArguments: arguments
         )
-        #expect(set.compiled.disassembly.contains("dictionary_update"))
+        #expect(set.compiled.disassembly.contains("dictionary_set"))
         #expect(
             VM.Interpreter().invoke(
                 entry: .init(rawValue: 0),

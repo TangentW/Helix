@@ -47,9 +47,13 @@ enum SwiftCoreIntrinsic: Equatable {
     case dictionaryEmpty
     case dictionarySubscriptGet
     case dictionarySubscriptSet
+    case dictionaryUpdateValue
     case dictionaryRemoveValue
+    case dictionaryRemoveAll
+    case dictionaryProjection(Bytecode.DictionaryProjection)
     case dictionaryReserveCapacity
     case dictionaryLiteral
+    case dictionaryUniqueKeysWithValues
     case dictionaryMakeIterator
     case dictionaryIteratorNext
     case setCount
@@ -238,9 +242,15 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sS2Dyxq_GycfC": self = .dictionaryEmpty
         case "$sSDyq_Sgxcig": self = .dictionarySubscriptGet
         case "$sSDyq_Sgxcis": self = .dictionarySubscriptSet
+        case "$sSD11updateValue_6forKeyq_Sgq_n_xtF": self = .dictionaryUpdateValue
         case "$sSD11removeValue6forKeyq_Sgx_tF": self = .dictionaryRemoveValue
+        case "$sSD9removeAll15keepingCapacityySb_tF": self = .dictionaryRemoveAll
+        case "$sSD4keysSD4KeysVyxq__Gvg": self = .dictionaryProjection(.keys)
+        case "$sSD6valuesSD6ValuesVyxq__Gvg": self = .dictionaryProjection(.values)
         case "$sSD15reserveCapacityyySiF": self = .dictionaryReserveCapacity
         case "$sSD17dictionaryLiteralSDyxq_Gx_q_td_tcfC": self = .dictionaryLiteral
+        case "$sSD20uniqueKeysWithValuesSDyxq_Gqd__n_tcSTRd__x_q_t7ElementRtd__lufC":
+            self = .dictionaryUniqueKeysWithValues
         case "$sSD12makeIteratorSD0B0Vyxq__GyF": self = .dictionaryMakeIterator
         case "$sSD8IteratorV4nextx3key_q_5valuetSgyF": self = .dictionaryIteratorNext
         case "$sSh5countSivg": self = .setCount
