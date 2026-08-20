@@ -87,6 +87,7 @@ enum SwiftCoreIntrinsic: Equatable {
     case setRemoveAll
     case allocateUninitializedArray
     case finalizeUninitializedArray
+    case unexpectedNilOptional
     case assertionFailure
 
     init?(mangledName: String) {
@@ -330,6 +331,8 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .allocateUninitializedArray
         case "$ss27_finalizeUninitializedArrayySayxGABnlF":
             self = .finalizeUninitializedArray
+        case "$ss30_diagnoseUnexpectedNilOptional14_filenameStart01_E6Length01_E7IsASCII5_line17_isImplicitUnwrapyBp_BwBi1_BwBi1_tF":
+            self = .unexpectedNilOptional
         case "$ss17_assertionFailure__4file4line5flagss5NeverOs12StaticStringV_A2HSus6UInt32VtF":
             self = .assertionFailure
         default:

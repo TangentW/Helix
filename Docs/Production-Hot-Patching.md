@@ -168,11 +168,14 @@ The current wire versions are HLBC 1.0 and HLXI 1.0. The implemented subset
 includes common integer and floating-point operations and conversions,
 `min`/`max`/`abs`, Bool, Unicode String transforms and interpolation,
 one-grapheme Character literals for the bounded String predicate path,
-tuple/Optional including address projection, recursive Array/Dictionary equality,
+tuple/Optional including address projection and verified force-unwrap traps,
+recursive Array/Dictionary equality,
 common Array index/search plus represented managed Collection extrema,
 cross-container Sequence relations, and nonmutating ordering; type-generic,
 Array-backed structural concatenation/insertion/replacement/removal/reversal/
-swap, predicate removal, bidirectional partition, and capacity hints,
+swap, predicate removal, bidirectional partition, and capacity hints, including
+context-typed nil elements and generic indirect results written into
+Array-literal construction storage;
 Dictionary lookup/subscript mutation including lazy default
 lookup and scoped default-value writeback, `updateValue`,
 `removeValue`, `removeAll`, key/value projection, unique-key sequence

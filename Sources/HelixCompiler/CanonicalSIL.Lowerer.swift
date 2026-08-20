@@ -1849,6 +1849,56 @@ public struct Lowerer: Sendable {
             return true
         }
 
+        /// Records a value written through the raw storage returned by
+        /// `_allocateUninitializedArray`. Calls whose result convention is
+        /// indirect can target these addresses directly, including one field
+        /// of a tuple element, so every constructed-value path must share the
+        /// same pending-literal sink as an ordinary SIL `store`.
+        func storePendingArrayLiteralValue(
+            _ value: Bytecode.Register,
+            at token: String
+        ) throws -> Bool {
+            let valueType = registerTypes[Int(value.rawValue)]
+            if let address = arrayLiteralComponentAddresses[token] {
+                guard var pending = pendingArrayLiterals[address.allocation],
+                      case let .tuple(types) = pending.elementType,
+                      address.index >= 0,
+                      address.index < pending.count,
+                      types.indices.contains(address.component),
+                      types[address.component] == valueType,
+                      pending.elements[address.index] == nil,
+                      pending.elementComponents[address.index]?[address.component]
+                        == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array tuple component store is invalid, duplicated, or has the wrong type"
+                    )
+                }
+                pending.elementComponents[address.index, default: [:]][
+                    address.component
+                ] = value
+                pendingArrayLiterals[address.allocation] = pending
+                return true
+            }
+            if let address = arrayLiteralAddresses[token] {
+                guard var pending = pendingArrayLiterals[address.allocation],
+                      address.index >= 0,
+                      address.index < pending.count,
+                      pending.elementType == valueType,
+                      pending.elements[address.index] == nil,
+                      pending.elementComponents[address.index] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array literal store is invalid, duplicated, or has the wrong type"
+                    )
+                }
+                pending.elements[address.index] = value
+                pendingArrayLiterals[address.allocation] = pending
+                return true
+            }
+            return false
+        }
+
         // Materialized values must cross this single sink so compiler-only
         // storage, runtime stack slots, scoped accesses, and projected
         // addresses preserve the same SIL initialization semantics.
@@ -1857,14 +1907,22 @@ public struct Lowerer: Sendable {
             at token: String,
             requestedMode: Bytecode.StackStoreMode? = nil
         ) throws {
-            guard let addressType = stackType(at: token),
-                  registerTypes[Int(value.rawValue)] == addressType
+            let valueType = registerTypes[Int(value.rawValue)]
+            guard compilerAddressType(token) == valueType
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "store value does not match its stack address"
                 )
             }
             invalidateOptionalStorageFacts(at: token)
+            if try storePendingArrayLiteralValue(value, at: token) {
+                return
+            }
+            guard let addressType = stackType(at: token) else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "store value does not reference represented storage"
+                )
+            }
             if let addressRegister = runtimeAddress(at: token) {
                 let root = addressBase(token)
                 let inferredMode = storageInitializationPlan.storeMode(
@@ -3442,38 +3500,7 @@ public struct Lowerer: Sendable {
                     "existential projection did not produce Any"
                 )
             }
-            if let address = arrayLiteralAddresses[token],
-               var pending = pendingArrayLiterals[address.allocation] {
-                guard pending.elementType == .any,
-                      address.index >= 0,
-                      address.index < pending.count,
-                      pending.elements[address.index] == nil,
-                      pending.elementComponents[address.index] == nil
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Any array literal store is invalid or duplicated"
-                    )
-                }
-                pending.elements[address.index] = value
-                pendingArrayLiterals[address.allocation] = pending
-                return
-            }
-            if let address = arrayLiteralComponentAddresses[token],
-               var pending = pendingArrayLiterals[address.allocation],
-               case let .tuple(types) = pending.elementType {
-                guard address.index >= 0,
-                      address.index < pending.count,
-                      types.indices.contains(address.component),
-                      types[address.component] == .any,
-                      pending.elements[address.index] == nil,
-                      pending.elementComponents[address.index]?[address.component] == nil
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Any tuple component store is invalid or duplicated"
-                    )
-                }
-                pending.elementComponents[address.index, default: [:]][address.component] = value
-                pendingArrayLiterals[address.allocation] = pending
+            if try storePendingArrayLiteralValue(value, at: token) {
                 return
             }
             try storeConstructedValue(value, at: token)
@@ -11102,6 +11129,30 @@ public struct Lowerer: Sendable {
                 )
                 voidValues.insert(resultToken)
 
+            case .unexpectedNilOptional:
+                guard genericArguments.isEmpty,
+                      arguments.count == 5,
+                      let filename = stringLiterals[arguments[0]],
+                      let filenameLength = wordLiterals[arguments[1]],
+                      let filenameIsASCII = boolLiterals[arguments[2]],
+                      let sourceLine = wordLiterals[arguments[3]],
+                      boolLiterals[arguments[4]] != nil,
+                      UInt64(filename.utf8.count) == filenameLength,
+                      filename.utf8.allSatisfy({ $0 < 0x80 })
+                        == filenameIsASCII,
+                      sourceLine > 0,
+                      let blockID = current?.id,
+                      unreachableTrapReasons[blockID] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "unexpected-nil Optional diagnostic has unsupported metadata"
+                    )
+                }
+                // Source metadata is diagnostic-only. Preserve the semantic
+                // trap category on the following `unreachable` terminator.
+                unreachableTrapReasons[blockID] = .optionalUnwrapOfNil
+                voidValues.insert(resultToken)
+
             case .assertionFailure:
                 guard genericArguments.isEmpty,
                       arguments.count == 5,
@@ -11514,7 +11565,7 @@ public struct Lowerer: Sendable {
 
             case .arraySubscript:
                 guard arguments.count == 3, !genericArguments.isEmpty,
-                      let outputType = stackType(at: arguments[0])
+                      let outputType = compilerAddressType(arguments[0])
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Array subscript has unsupported arguments"
@@ -11543,7 +11594,7 @@ public struct Lowerer: Sendable {
 
             case let .collectionBoundary(operation):
                 guard arguments.count == 2, !genericArguments.isEmpty,
-                      let outputType = stackType(at: arguments[0])
+                      let outputType = compilerAddressType(arguments[0])
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Collection boundary getter has unsupported arguments"
@@ -11822,7 +11873,7 @@ public struct Lowerer: Sendable {
                           genericArguments: genericArguments
                       ),
                       case let .array(element) = collectionType,
-                      stackType(at: arguments[0]) == .optional(element),
+                      compilerAddressType(arguments[0]) == .optional(element),
                       let state = arrayIteratorStates[addressBase(arguments[1])],
                       state.elementType == element,
                       registerTypes[Int(state.array.rawValue)] == collectionType
@@ -11894,7 +11945,7 @@ public struct Lowerer: Sendable {
 
             case .dictionarySubscriptGet:
                 guard arguments.count == 3,
-                      let outputType = stackType(at: arguments[0]),
+                      let outputType = compilerAddressType(arguments[0]),
                       let key = try copyStoredValue(
                         at: arguments[1],
                         line: line
@@ -12342,7 +12393,7 @@ public struct Lowerer: Sendable {
                 let resultType = Bytecode.ValueType.optional(
                     .tuple([types.key, types.value])
                 )
-                guard stackType(at: arguments[0]) == resultType,
+                guard compilerAddressType(arguments[0]) == resultType,
                       let state = dictionaryIteratorStates[addressBase(arguments[1])],
                       state.keyType == types.key,
                       state.valueType == types.value
@@ -13325,9 +13376,16 @@ public struct Lowerer: Sendable {
             }
 
             if line == "unreachable" {
-                let reason = current.flatMap {
+                let explicitReason = current.flatMap {
                     unreachableTrapReasons.removeValue(forKey: $0.id)
-                } ?? .explicit("Swift unreachable")
+                }
+                let reason = explicitReason
+                    ?? current.flatMap {
+                        optionalSourceByNoneBlock[$0.id].map { _ in
+                            Bytecode.TrapReason.optionalUnwrapOfNil
+                        }
+                    }
+                    ?? .explicit("Swift unreachable")
                 appendInstruction(.trap(reason))
                 continue
             }
@@ -17871,57 +17929,23 @@ public struct Lowerer: Sendable {
             if let store = match(
                 line,
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
-            ), let address = arrayLiteralComponentAddresses[store[1]],
-               var pending = pendingArrayLiterals[address.allocation],
-               case let .tuple(types) = pending.elementType {
-                guard address.index >= 0,
-                      address.index < pending.count,
-                      types.indices.contains(address.component)
-                else {
+            ), arrayLiteralComponentAddresses[store[1]] != nil
+                || arrayLiteralAddresses[store[1]] != nil {
+                guard let expectedType = compilerAddressType(store[1]) else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array tuple component store is out of bounds"
+                        "Array literal store has no element type"
                     )
                 }
                 let value = try prepareStoredValue(
                     store[0],
-                    expectedType: types[address.component],
+                    expectedType: expectedType,
                     line: sourceLine
                 )
-                guard
-                      registerTypes[Int(value.rawValue)] == types[address.component],
-                      pending.elements[address.index] == nil,
-                      pending.elementComponents[address.index]?[address.component] == nil
-                else {
+                guard try storePendingArrayLiteralValue(value, at: store[1]) else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array tuple component store is invalid, duplicated, or has the wrong type"
+                        "Array literal store lost its pending allocation"
                     )
                 }
-                pending.elementComponents[address.index, default: [:]][address.component] = value
-                pendingArrayLiterals[address.allocation] = pending
-                continue
-            }
-
-            if let store = match(
-                line,
-                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
-            ), let address = arrayLiteralAddresses[store[1]],
-               var pending = pendingArrayLiterals[address.allocation] {
-                let value = try prepareStoredValue(
-                    store[0],
-                    expectedType: pending.elementType,
-                    line: sourceLine
-                )
-                guard address.index >= 0,
-                      address.index < pending.count,
-                      pending.elements[address.index] == nil,
-                      registerTypes[Int(value.rawValue)] == pending.elementType
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array literal store is out of bounds, duplicated, or has the wrong type"
-                    )
-                }
-                pending.elements[address.index] = value
-                pendingArrayLiterals[address.allocation] = pending
                 continue
             }
 
@@ -21385,6 +21409,10 @@ public struct Lowerer: Sendable {
     private func trapReason(for message: String) -> Bytecode.TrapReason {
         let normalized = message.lowercased()
         if normalized.contains("division by zero") { return .divisionByZero }
+        if normalized.contains("unexpectedly found nil")
+            || normalized.contains("unwrap a nil optional") {
+            return .optionalUnwrapOfNil
+        }
         if normalized.contains("overflow")
             || normalized.contains("not enough bits to represent")
             || normalized.contains("cannot be represented") {

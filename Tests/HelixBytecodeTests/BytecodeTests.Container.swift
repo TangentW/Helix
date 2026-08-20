@@ -27,6 +27,24 @@ struct Container {
         #expect(decoded.sections[.code] != nil)
     }
 
+    @Test("Optional unwrap traps survive the HLBC 1.0 wire format")
+    func optionalUnwrapTrapRoundTrip() throws {
+        var module = try makeAddModule()
+        module.functions[0].blocks[1].instructions = [
+            .trap(.optionalUnwrapOfNil),
+        ]
+
+        let decoded = try Bytecode.Decoder.decode(
+            Bytecode.Encoder.encode(module)
+        ).module
+
+        #expect(decoded == module)
+        #expect(
+            Bytecode.TrapReason.optionalUnwrapOfNil.description
+                == "attempted to unwrap a nil Optional"
+        )
+    }
+
     @Test("Function stack layout and effects survive the wire format")
     func stackAndEffectsRoundTrip() throws {
         var module = try makeAddModule()

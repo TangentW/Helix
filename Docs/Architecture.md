@@ -78,6 +78,12 @@ Both workflows depend on stable, build-specific identities:
   equality and hashing are order-independent. Verification, boundary
   validation, comparison-work charging, and pre-allocation resource charging
   enforce the same model end to end.
+- Runtime `nil` intentionally carries no invented wrapped type. Boundary
+  validation remains a deep, charged shape check; internal collection states
+  recover a payload-free Optional's type from verified bytecode context with a
+  depth-bounded runtime-type check. Generic indirect call results and ordinary
+  stores likewise share one compiler-address sink, including pending whole
+  Array-literal elements and tuple components.
 - Array structural mutation is represented by immutable, typed value
   transforms. Concatenation, insertion, removal, and `replaceSubrange` share
   one half-open range-replacement instruction; `swapAt` uses one swap

@@ -33,7 +33,7 @@ public final class ArraySortState: @unchecked Sendable, Hashable,
     private var isFinished = false
 
     init(elementType: Bytecode.ValueType, elements: [VM.Value]) throws {
-        if let mismatched = elements.first(where: { $0.type != elementType }) {
+        if let mismatched = elements.first(where: { !$0.hasRuntimeType(elementType) }) {
             throw VM.RuntimeTrap.typeMismatch(
                 expected: elementType,
                 actual: mismatched.type

@@ -1826,7 +1826,7 @@ public struct Interpreter: Sendable {
                         registers: &registers
                     )
                 case let .arrayExtremum(result, operation, array):
-                    let (values, _) = try self.array(
+                    let (values, elementType) = try self.array(
                         array,
                         registers: registers
                     )
@@ -1838,6 +1838,7 @@ public struct Interpreter: Sendable {
                             .lessThan,
                             lhs: left,
                             rhs: right,
+                            type: elementType,
                             budget: budget
                         )
                     }
@@ -1884,6 +1885,7 @@ public struct Interpreter: Sendable {
                                 .lessThan,
                                 lhs: left,
                                 rhs: right,
+                                type: leftElement,
                                 budget: budget
                             )
                         }
@@ -2640,6 +2642,7 @@ public struct Interpreter: Sendable {
                             .lessThan,
                             lhs: comparison.right,
                             rhs: comparison.left,
+                            type: elementType,
                             budget: budget
                         )
                         try state.acceptComparison(
@@ -2806,6 +2809,7 @@ public struct Interpreter: Sendable {
                                 .equal,
                                 lhs: element,
                                 rhs: separator,
+                                type: elementType,
                                 budget: budget
                             ),
                             budget: budget
@@ -3694,6 +3698,7 @@ public struct Interpreter: Sendable {
                         predicate,
                         lhs: read(lhs, registers: registers),
                         rhs: read(rhs, registers: registers),
+                        type: function.type(of: lhs)!,
                         budget: budget
                     )
                     try initialize(.bool(comparison), register: result, registers: &registers)
@@ -5880,14 +5885,19 @@ public struct Interpreter: Sendable {
         _ predicate: Bytecode.ComparisonPredicate,
         lhs: VM.Value,
         rhs: VM.Value,
+        type: Bytecode.ValueType,
         budget: VM.InvocationBudget
     ) throws -> Bool {
-        guard lhs.type == rhs.type else { throw VM.RuntimeTrap.typeMismatch(expected: lhs.type, actual: rhs.type) }
+        let lhsMatches = lhs.hasRuntimeType(type)
+        guard lhsMatches, rhs.hasRuntimeType(type) else {
+            let actual = lhsMatches ? rhs.type : lhs.type
+            throw VM.RuntimeTrap.typeMismatch(expected: type, actual: actual)
+        }
         switch predicate {
         case .equal, .notEqual:
-            guard lhs.type.isVMEquatable else {
+            guard type.isVMEquatable else {
                 throw VM.RuntimeTrap.nativeFailure(
-                    "equality is unsupported for \(lhs.type)"
+                    "equality is unsupported for \(type)"
                 )
             }
             let equal = try vmValuesEqual(
@@ -5898,9 +5908,9 @@ public struct Interpreter: Sendable {
             return predicate == .equal ? equal : !equal
         case .lessThan, .lessThanOrEqual,
              .greaterThan, .greaterThanOrEqual:
-            guard lhs.type.isVMComparable else {
+            guard type.isVMComparable else {
                 throw VM.RuntimeTrap.nativeFailure(
-                    "ordering is unsupported for \(lhs.type)"
+                    "ordering is unsupported for \(type)"
                 )
             }
         }
@@ -6006,6 +6016,7 @@ public struct Interpreter: Sendable {
         switch reason {
         case .integerOverflow: .integerOverflow
         case .divisionByZero: .divisionByZero
+        case .optionalUnwrapOfNil: .optionalUnwrapOfNil
         case .quotaExceeded: .instructionFuelExhausted
         case let .explicit(message): .explicit(message)
         }

@@ -83,6 +83,11 @@ does not by itself certify a physical device or distribution channel.
   such as `T?`, `T!`, `[T]`, `[K: V]`, and redundant grouping parentheses
   normalize recursively to the same typed representation, including in
   patch-local stored fields.
+- Direct Optional force unwrap is supported for represented payloads and a nil
+  unwrap retains its dedicated verified trap reason. A payload-free runtime
+  `nil` obtains `T` from its verified static context, including nested tuples,
+  collection builders, mutation/sort/split states, Dictionary keys and values,
+  and VM equality.
 - Array value semantics and equality, single-element append, `+`, `+=`,
   `append(contentsOf:)`, element and contents insertion, `replaceSubrange`,
   positional/first/last/range removal (including counted edge removal),
@@ -96,6 +101,9 @@ does not by itself certify a physical device or distribution channel.
   swap primitives, so bounds checks, overflow behavior, ownership, and
   allocation-before-copy charging do not depend on a particular element or
   SDK type.
+  Generic indirect results may initialize either a complete element or one
+  tuple field in raw Array-literal construction storage through the same typed
+  compiler-address sink used by ordinary stores.
   Dictionary construction, equality, lookup, subscript assignment,
   lazy `subscript(_:default:)` lookup and scoped mutation,
   `updateValue(_:forKey:)`, `removeValue(forKey:)`,
@@ -374,7 +382,7 @@ machine code.
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |
 | Use a supported local closure or an already indexed same-image helper with an `@escaping` closure parameter | Lowered into the same image; closure return/capture is allowed only inside the pinned VM invocation |
-| Use a fully static read-only KeyPath literal as a transform or direct projection | Stored patch-local struct/class fields and concrete getter chains—including an imported Objective-C property whose generated accessor resolves to an exact NativeImport—may compose into a typed zero-capture function; dynamic KeyPath values, captured/unproven components, and writable/reference-writable mutation are rejected because KeyPath objects are not HLBC runtime values |
+| Use a fully static read-only KeyPath literal as a transform or direct projection | Stored patch-local struct/class fields, concrete getter chains—including an imported Objective-C property whose generated accessor resolves to an exact NativeImport—and static Optional chain/force/wrap components may compose into a typed zero-capture function; dynamic KeyPath values, captured components such as subscript indices, unproven components, and writable/reference-writable mutation are rejected because KeyPath objects are not HLBC runtime values |
 | Use integer `Range`/`ClosedRange` iteration, numeric `stride`, or scalar `contains` | Supported for the concrete local families above; bounds, direction, inclusive/exclusive endpoints, zero-stride traps, and integer extrema retain their verified Swift semantics. Progression values remain image-local and cannot cross Shell/NativeImport boundaries |
 | Use a one-grapheme Character literal in supported `String.contains` | Supported as a compiler-only String representation; general Character storage/API is not implied |
 | Declare a patch-local struct or enum | A newly introduced non-exported type is supported at file/module scope, including namespace nesting and supported computed accessors; a function-local nominal is rejected with an exact type diagnostic |

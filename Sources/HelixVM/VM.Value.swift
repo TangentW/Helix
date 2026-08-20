@@ -227,6 +227,38 @@ public struct DictionaryEntry: Hashable, Sendable {
 }
 
 extension VM.Value {
+    /// Checks the type carried by an already validated runtime value.
+    ///
+    /// A payload-free Optional has no value from which to recover its wrapped
+    /// type, so `type` necessarily spells it as `Optional<Never>`. Internal VM
+    /// states instead supply that missing type from their verified bytecode
+    /// context. Tuples and nested Optionals are the only aggregate shapes that
+    /// need recursive recovery; collection values already carry explicit
+    /// element metadata.
+    func hasRuntimeType(_ expected: Bytecode.ValueType) -> Bool {
+        hasRuntimeType(expected, depth: 0)
+    }
+
+    private func hasRuntimeType(
+        _ expected: Bytecode.ValueType,
+        depth: Int
+    ) -> Bool {
+        guard depth <= VM.ValueLimits.maximumNestingDepth else { return false }
+        return switch (self, expected) {
+        case (.optional(nil), .optional):
+            true
+        case let (.optional(.some(value)), .optional(wrapped)):
+            value.hasRuntimeType(wrapped, depth: depth + 1)
+        case let (.tuple(values), .tuple(types)):
+            values.count == types.count
+                && zip(values, types).allSatisfy {
+                    $0.hasRuntimeType($1, depth: depth + 1)
+                }
+        default:
+            type == expected
+        }
+    }
+
     public func matches(_ expected: Bytecode.ValueType) -> Bool {
         matches(expected, depth: 0)
     }

@@ -514,6 +514,47 @@ struct CommonSyntaxMatrix {
         }
     }
 
+    @Test("Force unwrap preserves Optional payloads and nil traps")
+    func lowersForceUnwrap() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            public func forcedOptionals(
+                _ number: Int?,
+                _ text: String?
+            ) -> (Int, String) {
+                (number!, text!)
+            }
+            """,
+            functionName: "forcedOptionals",
+            moduleName: "HelixForcedOptionalsFixture"
+        )
+        let interpreter = VM.Interpreter()
+        #expect(
+            interpreter.invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [
+                    .optional(try integer(7)),
+                    .optional(.string("value")),
+                ]
+            ) == .returned(.tuple([try integer(7), .string("value")]))
+        )
+        #expect(
+            interpreter.invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [.optional(nil), .optional(.string("value"))]
+            ) == .trapped(.optionalUnwrapOfNil)
+        )
+        #expect(
+            interpreter.invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [.optional(try integer(7)), .optional(nil)]
+            ) == .trapped(.optionalUnwrapOfNil)
+        )
+    }
+
     private func integer(_ value: Int64) throws -> VM.Value {
         .integer(try VM.Integer(signed: value, bitWidth: 64, isSigned: true))
     }

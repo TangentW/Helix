@@ -49,13 +49,13 @@ public final class DictionaryBuilder: @unchecked Sendable, Hashable,
                     "Dictionary builder is already finished"
                 )
             }
-            guard key.type == keyType else {
+            guard key.hasRuntimeType(keyType) else {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: keyType,
                     actual: key.type
                 )
             }
-            guard value.type == valueType else {
+            guard value.hasRuntimeType(valueType) else {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: valueType,
                     actual: value.type
@@ -83,7 +83,7 @@ public final class DictionaryBuilder: @unchecked Sendable, Hashable,
                     "Dictionary builder is already finished"
                 )
             }
-            guard key.type == keyType else {
+            guard key.hasRuntimeType(keyType) else {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: keyType,
                     actual: key.type
@@ -95,7 +95,7 @@ public final class DictionaryBuilder: @unchecked Sendable, Hashable,
                     actual: valueType
                 )
             }
-            guard element.type == elementType else {
+            guard element.hasRuntimeType(elementType) else {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: elementType,
                     actual: element.type
@@ -111,7 +111,7 @@ public final class DictionaryBuilder: @unchecked Sendable, Hashable,
                 return
             }
             guard entries.indices.contains(matchingIndex),
-                  entries[matchingIndex].value.type == valueType
+                  entries[matchingIndex].value.hasRuntimeType(valueType)
             else {
                 throw VM.RuntimeTrap.invalidProgramCounter
             }

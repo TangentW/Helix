@@ -22,7 +22,7 @@ public final class ArrayBuilder: @unchecked Sendable, Hashable,
             guard !isFinished else {
                 throw VM.RuntimeTrap.explicit("Array builder is already finished")
             }
-            guard value.type == elementType else {
+            guard value.hasRuntimeType(elementType) else {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: elementType,
                     actual: value.type
@@ -37,7 +37,7 @@ public final class ArrayBuilder: @unchecked Sendable, Hashable,
             guard !isFinished else {
                 throw VM.RuntimeTrap.explicit("Array builder is already finished")
             }
-            if let mismatched = values.first(where: { $0.type != elementType }) {
+            if let mismatched = values.first(where: { !$0.hasRuntimeType(elementType) }) {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: elementType,
                     actual: mismatched.type

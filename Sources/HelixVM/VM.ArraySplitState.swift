@@ -33,7 +33,7 @@ public final class ArraySplitState: @unchecked Sendable, Hashable,
                 "maximum split count cannot be negative"
             )
         }
-        if let mismatched = elements.first(where: { $0.type != elementType }) {
+        if let mismatched = elements.first(where: { !$0.hasRuntimeType(elementType) }) {
             throw VM.RuntimeTrap.typeMismatch(
                 expected: elementType,
                 actual: mismatched.type

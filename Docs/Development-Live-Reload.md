@@ -142,6 +142,13 @@ Representation conversion, ownership, effects, re-entrancy, and resource
 budgeting are therefore checked at one of those explicit boundaries rather than
 hidden behind a name-based native dispatch.
 
+Payload-free `nil` values recover their wrapped type from verified bytecode
+context, so the same Array/Dictionary builders, mutation/sort/split states, and
+VM equality path work for every represented `Optional<T>` without a
+type-specific adapter. Generic indirect results also use one compiler-address
+sink, including whole elements and tuple fields inside an in-progress Array
+literal.
+
 A save may introduce a reachable ordinary top-level helper, private class
 instance method, or computed accessor in an existing source file. It may also
 introduce non-exported file/module-scope struct, enum, and pure class types used
@@ -157,9 +164,12 @@ compiler-generated `swift_getAtKeyPath` thunk and its ownership skeleton, proves
 the exact stored-property/getter chain, and replaces it with a typed,
 zero-capture projection function. This covers composed patch-local struct/class
 fields and concrete computed or SDK getters already available through the
-normal same-image/NativeImport call table. Dynamic KeyPath parameters, captured
-or otherwise unproven components, and writable/reference-writable mutation
-remain fail-closed; no KeyPath metadata object enters the artifact.
+normal same-image/NativeImport call table. The same projection CFG represents
+static Optional chaining, force, and final wrapping, preserving both payload
+ownership and nil traps. Dynamic KeyPath parameters, captured components such
+as subscript indices, otherwise unproven components, and
+writable/reference-writable mutation remain fail-closed; no KeyPath metadata
+object enters the artifact.
 For an imported Objective-C property descriptor, the generated concrete
 accessor remains in the image while its physical framework call resolves to the
 exact frozen NativeImport. Physical `NSString`/`Optional<NSString>` results are

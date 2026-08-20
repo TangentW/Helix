@@ -380,6 +380,7 @@ public enum StackLoadMode: String, Codable, Hashable, Sendable {
 public enum TrapReason: Codable, Hashable, Sendable, CustomStringConvertible {
     case integerOverflow
     case divisionByZero
+    case optionalUnwrapOfNil
     case quotaExceeded
     case explicit(String)
 
@@ -387,6 +388,7 @@ public enum TrapReason: Codable, Hashable, Sendable, CustomStringConvertible {
         switch self {
         case .integerOverflow: "integer overflow"
         case .divisionByZero: "division by zero"
+        case .optionalUnwrapOfNil: "attempted to unwrap a nil Optional"
         case .quotaExceeded: "execution quota exceeded"
         case let .explicit(message): message
         }

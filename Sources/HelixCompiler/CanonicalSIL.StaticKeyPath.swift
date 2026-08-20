@@ -35,11 +35,13 @@ enum StaticKeyPath {
     private enum Component: Sendable {
         case stored(StoredComponent)
         case getter(GetterComponent)
+        case optional(OptionalComponent)
 
         var outputType: Bytecode.ValueType {
             switch self {
             case let .stored(value): value.outputType
             case let .getter(value): value.outputType
+            case let .optional(value): value.outputType
             }
         }
 
@@ -47,6 +49,7 @@ enum StaticKeyPath {
             switch self {
             case let .stored(value): value.outputSpelling
             case let .getter(value): value.outputSpelling
+            case let .optional(value): value.outputSpelling
             }
         }
 
@@ -58,8 +61,23 @@ enum StaticKeyPath {
                 "getter:\(value.propertyIdentity):\(value.symbol):\(value.loweredType)"
                     + ":\(value.inputConvention):\(value.hasIndirectResult)"
                     + ":\(value.inputType)->\(value.outputType)"
+            case let .optional(value):
+                "optional:\(value.operation.rawValue):\(value.inputType)->\(value.outputType)"
             }
         }
+    }
+
+    private struct OptionalComponent: Sendable {
+        enum Operation: String, Sendable {
+            case chain
+            case force
+            case wrap
+        }
+
+        var operation: Operation
+        var inputType: Bytecode.ValueType
+        var outputType: Bytecode.ValueType
+        var outputSpelling: String
     }
 
     private struct StoredComponent: Sendable {
@@ -90,6 +108,7 @@ enum StaticKeyPath {
 
     private struct Builder {
         var nextValue = 1
+        var nextBlock = 1
         var lines: [String]
 
         init(rootSpelling: String) {
@@ -103,6 +122,20 @@ enum StaticKeyPath {
 
         mutating func append(_ instruction: String) {
             lines.append("  \(instruction)")
+        }
+
+        mutating func reserveBlock() -> Int {
+            defer { nextBlock += 1 }
+            return nextBlock
+        }
+
+        mutating func beginBlock(_ id: Int, parameter: (String, String)? = nil) {
+            lines.append("")
+            if let parameter {
+                lines.append("bb\(id)(\(parameter.0) : $\(parameter.1)):")
+            } else {
+                lines.append("bb\(id):")
+            }
         }
     }
 
@@ -278,20 +311,29 @@ enum StaticKeyPath {
         let descriptorStart = suffix.index(after: typeEnd)
         let descriptorSuffix = suffix[descriptorStart...]
             .trimmingCharacters(in: .whitespaces)
-        guard descriptorSuffix.hasPrefix(","),
-              descriptorSuffix.dropFirst().trimmingCharacters(in: .whitespaces)
-                .hasPrefix("("),
-              descriptorSuffix.dropFirst().trimmingCharacters(in: .whitespaces)
-                .hasSuffix(")")
-        else {
+        guard descriptorSuffix.hasPrefix(",") else {
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "KeyPath literal has no static component descriptor"
             )
         }
-        var descriptor = descriptorSuffix.dropFirst()
+        let descriptorBody = descriptorSuffix.dropFirst()
             .trimmingCharacters(in: .whitespaces)
-        descriptor.removeFirst()
-        descriptor.removeLast()
+        guard descriptorBody.hasPrefix("("),
+              let descriptorEnd = matchingParenthesisEnd(in: descriptorBody)
+        else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "KeyPath literal has a malformed component descriptor"
+            )
+        }
+        let trailing = descriptorBody[descriptorBody.index(after: descriptorEnd)...]
+            .trimmingCharacters(in: .whitespaces)
+        guard trailing.isEmpty else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "static KeyPath components with captured values"
+            )
+        }
+        let componentStart = descriptorBody.index(after: descriptorBody.startIndex)
+        let descriptor = descriptorBody[componentStart..<descriptorEnd]
         let clauses = try splitTopLevel(String(descriptor), separator: ";")
         let rootIndices = clauses.indices.filter {
             clauses[$0].hasPrefix("root $")
@@ -332,6 +374,31 @@ enum StaticKeyPath {
             )
             components.append(component)
             currentType = component.outputType
+        }
+        let optionalOperations = components.enumerated().compactMap {
+            index, component -> (Int, OptionalComponent.Operation)? in
+            guard case let .optional(value) = component else { return nil }
+            return (index, value.operation)
+        }
+        let chainCount = optionalOperations.count { $0.1 == .chain }
+        let wrapIndices = optionalOperations.compactMap {
+            $0.1 == .wrap ? $0.0 : nil
+        }
+        if chainCount > 0 {
+            guard case .optional = endpoints.value else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "optional KeyPath chaining does not produce an Optional value"
+                )
+            }
+        }
+        guard wrapIndices.count <= 1,
+              wrapIndices.first.map({
+                  chainCount > 0 && $0 == components.index(before: components.endIndex)
+              }) ?? true
+        else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "optional KeyPath wrap is not the final chained component"
+            )
         }
         guard currentType == endpoints.value,
               let valueSpelling = components.last?.outputSpelling
@@ -379,6 +446,45 @@ enum StaticKeyPath {
                     component,
                     inputType: inputType,
                     environment: environment
+                )
+            )
+        }
+        for (prefix, operation) in [
+            ("optional_chain : $", OptionalComponent.Operation.chain),
+            ("optional_force : $", OptionalComponent.Operation.force),
+            ("optional_wrap : $", OptionalComponent.Operation.wrap),
+        ] where component.hasPrefix(prefix) {
+            let outputSpelling = String(component.dropFirst(prefix.count))
+                .trimmingCharacters(in: .whitespaces)
+            guard !outputSpelling.isEmpty else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "optional KeyPath component has no result type"
+                )
+            }
+            let outputType = ValueRepresentation.storable(
+                try environment.resolve(outputSpelling)
+            )
+            switch operation {
+            case .chain, .force:
+                guard inputType == .optional(outputType) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "optional KeyPath projection does not unwrap its input"
+                    )
+                }
+            case .wrap:
+                guard outputType == .optional(inputType) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "optional KeyPath wrap does not contain its input"
+                    )
+                }
+            }
+            try validateEndpoint(outputType, role: "component value")
+            return .optional(
+                .init(
+                    operation: operation,
+                    inputType: inputType,
+                    outputType: outputType,
+                    outputSpelling: outputSpelling
                 )
             )
         }
@@ -700,6 +806,63 @@ enum StaticKeyPath {
                 currentToken = next
                 currentType = getter.outputType
                 currentIsOwned = currentType.requiresLinearOwnership
+
+            case let .optional(optional):
+                guard optional.inputType == currentType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "static KeyPath optional projection changes input type"
+                    )
+                }
+                switch optional.operation {
+                case .chain, .force:
+                    let someBlock = builder.reserveBlock()
+                    let noneBlock = builder.reserveBlock()
+                    builder.append(
+                        "switch_enum \(currentToken), "
+                            + "case #Optional.some!enumelt: bb\(someBlock), "
+                            + "case #Optional.none!enumelt: bb\(noneBlock)"
+                    )
+                    builder.beginBlock(noneBlock)
+                    if optional.operation == .chain {
+                        guard case .optional = literal.capture.valueType else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "optional KeyPath chain has a non-Optional result"
+                            )
+                        }
+                        let none = builder.value()
+                        builder.append(
+                            "\(none) = enum $\(literal.valueSpelling), "
+                                + "#Optional.none!enumelt"
+                        )
+                        builder.append("return \(none)")
+                    } else {
+                        builder.append("unreachable")
+                    }
+                    let payload = builder.value()
+                    builder.beginBlock(
+                        someBlock,
+                        parameter: (payload, optional.outputSpelling)
+                    )
+                    currentToken = payload
+                    currentType = optional.outputType
+                    currentIsOwned = currentType.requiresLinearOwnership
+
+                case .wrap:
+                    var payload = currentToken
+                    if currentType.requiresLinearOwnership, !currentIsOwned {
+                        let copy = builder.value()
+                        builder.append("\(copy) = copy_value \(currentToken)")
+                        payload = copy
+                    }
+                    let next = builder.value()
+                    builder.append(
+                        "\(next) = enum $\(optional.outputSpelling), "
+                            + "#Optional.some!enumelt, \(payload)"
+                    )
+                    currentToken = next
+                    currentType = optional.outputType
+                    currentIsOwned = currentType.requiresLinearOwnership
+                }
             }
         }
         guard currentType == literal.capture.valueType else {
@@ -988,6 +1151,40 @@ enum StaticKeyPath {
                     if depth == 0 { return index }
                 }
             default: break
+            }
+            index = value.index(after: index)
+        }
+        return nil
+    }
+
+    private static func matchingParenthesisEnd(
+        in value: String
+    ) -> String.Index? {
+        guard value.first == "(" else { return nil }
+        var depth = 0
+        var quoted = false
+        var escaped = false
+        var index = value.startIndex
+        while index < value.endIndex {
+            let character = value[index]
+            if quoted {
+                if escaped {
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    quoted = false
+                }
+            } else {
+                switch character {
+                case "\"": quoted = true
+                case "(": depth += 1
+                case ")":
+                    depth -= 1
+                    if depth == 0 { return index }
+                    if depth < 0 { return nil }
+                default: break
+                }
             }
             index = value.index(after: index)
         }

@@ -141,6 +141,159 @@ struct StaticKeyPath {
         #expect(result == .returned(.string("Helix")))
     }
 
+    @Test("Optional KeyPath chains lower to explicit typed control flow")
+    func lowersOptionalChainComponents() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private struct Leaf {
+                let value: Int
+                let optionalValue: Int?
+            }
+            private struct Middle { let leaf: Leaf? }
+            private struct Box { let middle: Middle? }
+            public func optionalPaths(_ value: Int, _ present: Bool) -> Int {
+                let leaf = Leaf(value: value, optionalValue: value + 1)
+                let box = Box(
+                    middle: present ? Middle(leaf: leaf) : nil
+                )
+                let values = [box]
+                let wrapped = values.map(\\.middle?.leaf?.value)[0] ?? -1
+                let flattened = values.map(
+                    \\.middle?.leaf?.optionalValue
+                )[0] ?? -2
+                return wrapped * 100 + flattened
+            }
+            """,
+            functionName: "optionalPaths"
+        )
+        let interpreter = VM.Interpreter()
+        #expect(
+            interpreter.invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [try integer(7), .bool(true)]
+            ) == .returned(try integer(708))
+        )
+        let absentResult = interpreter.invoke(
+            entry: fixture.entry,
+            image: fixture.image,
+            arguments: [try integer(7), .bool(false)]
+        )
+        let expectedAbsent = VM.ExecutionResult.returned(try integer(-102))
+        if absentResult != expectedAbsent {
+            Issue.record(
+                "optional nil paths: expected \(expectedAbsent), got \(absentResult)"
+            )
+        }
+        let projections = fixture.image.module.functions.filter {
+            $0.kind == .closureBody
+                && $0.blocks.flatMap(\.instructions).contains {
+                    if case .switchOptional = $0 { return true }
+                    return false
+                }
+        }
+        #expect(projections.count == 2)
+        #expect(projections.allSatisfy { function in
+            function.blocks.flatMap(\.instructions).allSatisfy {
+                if case let .makeClosure(_, _, captures) = $0 {
+                    return captures.isEmpty
+                }
+                return true
+            }
+        })
+    }
+
+    @Test("Optional KeyPath chains preserve owned payloads and flattening")
+    func lowersOwnedOptionalChainComponents() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private struct Leaf {
+                let name: String
+                let nickname: String?
+            }
+            private struct Box { let leaf: Leaf? }
+            public func ownedOptionalPaths(
+                _ value: String,
+                _ leafPresent: Bool,
+                _ nicknamePresent: Bool
+            ) -> (String?, String?) {
+                let leaf = Leaf(
+                    name: value,
+                    nickname: nicknamePresent ? value + "!" : nil
+                )
+                let box = Box(leaf: leafPresent ? leaf : nil)
+                let values = [box]
+                return (
+                    values.map(\\.leaf?.name)[0],
+                    values.map(\\.leaf?.nickname)[0]
+                )
+            }
+            """,
+            functionName: "ownedOptionalPaths"
+        )
+        let interpreter = VM.Interpreter()
+        #expect(
+            interpreter.invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [.string("Helix"), .bool(true), .bool(true)]
+            ) == .returned(.tuple([
+                .optional(.string("Helix")),
+                .optional(.string("Helix!")),
+            ]))
+        )
+        #expect(
+            interpreter.invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [.string("Helix"), .bool(true), .bool(false)]
+            ) == .returned(.tuple([
+                .optional(.string("Helix")),
+                .optional(nil),
+            ]))
+        )
+        #expect(
+            interpreter.invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [.string("Helix"), .bool(false), .bool(true)]
+            ) == .returned(.tuple([
+                .optional(nil),
+                .optional(nil),
+            ]))
+        )
+    }
+
+    @Test("Optional-force KeyPath components preserve nil trapping")
+    func lowersOptionalForceComponent() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private struct Leaf { let value: String }
+            private struct Box { let leaf: Leaf? }
+            public func forcedPath(_ value: String, _ present: Bool) -> String {
+                let box = Box(leaf: present ? Leaf(value: value) : nil)
+                return [box].map(\\.leaf!.value)[0]
+            }
+            """,
+            functionName: "forcedPath"
+        )
+        let interpreter = VM.Interpreter()
+        #expect(
+            interpreter.invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [.string("owned"), .bool(true)]
+            ) == .returned(.string("owned"))
+        )
+        #expect(
+            interpreter.invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [.string("owned"), .bool(false)]
+            ) == .trapped(.optionalUnwrapOfNil)
+        )
+    }
+
     @Test("Class stored projections preserve imported-reference ownership")
     func projectsNativeClassField() throws {
         let typeID = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
@@ -378,6 +531,69 @@ struct StaticKeyPath {
             Issue.record("dynamic KeyPath unexpectedly entered HLBC")
         } catch {
             #expect(String(describing: error).contains("KeyPath"))
+        }
+    }
+
+    @Test("Captured KeyPath components remain explicit and fail closed")
+    func rejectsCapturedSubscriptComponent() throws {
+        do {
+            _ = try FrontendExecutionHarness.compile(
+                source: """
+                private struct Box { let values: [Int] }
+                public func capturedPath(_ value: Int, _ index: Int) -> Int {
+                    [Box(values: [value, value + 1])].map(
+                        \\.values[index]
+                    )[0]
+                }
+                """,
+                functionName: "capturedPath"
+            )
+            Issue.record("a captured KeyPath index entered HLBC without a capture ABI")
+        } catch {
+            #expect(
+                String(describing: error).contains(
+                    "static KeyPath components with captured values"
+                )
+            )
+        }
+    }
+
+    @Test("Optional KeyPath descriptors validate each unwrap type")
+    func rejectsMalformedOptionalComponent() throws {
+        let sil = try canonicalSIL(
+            source: """
+            struct Leaf { let value: Int }
+            struct Box { let leaf: Leaf? }
+            func optionalPath(_ values: [Box]) -> [Int?] {
+                values.map(\\.leaf?.value)
+            }
+            """,
+            moduleName: "HelixMalformedOptionalKeyPathFixture"
+        )
+        let modified = sil.replacingOccurrences(
+            of: "optional_chain : $Leaf",
+            with: "optional_chain : $Int"
+        )
+        #expect(modified != sil)
+        let file = try CanonicalSIL.File(text: modified)
+        let root = try #require(
+            file.functions.first { $0.body.contains("optional_chain : $Int") }
+        )
+        do {
+            _ = try CanonicalSIL.ImageFunctions.discover(
+                in: file,
+                startingAt: [root.mangledName],
+                excluding: [],
+                environment: file.typeEnvironment,
+                kindForSymbol: { _ in .ordinary }
+            )
+            Issue.record("a malformed Optional KeyPath descriptor was trusted")
+        } catch {
+            #expect(
+                String(describing: error).contains(
+                    "does not unwrap its input"
+                )
+            )
         }
     }
 
