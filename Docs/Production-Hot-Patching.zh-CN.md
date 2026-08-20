@@ -103,6 +103,8 @@ sequenceDiagram
 
 Dictionary 的具体能力还包括 uniquing 构造、Dictionary/可表示 Sequence 两种 `merging`/`merge`，以及可表示 Collection 的 grouping；这些 API 共用受验证的线性 accumulator 和普通 closure CFG，不绑定 Swift 标准库的私有泛型 ABI。
 
+frontend 的 Array/Dictionary cast helper 只有在原始类型仅有 Tuple label 差异、且两端完整 VM 类型也相同时才可被消除；真正的 element、key、value 或 reference 转换仍会被拒绝。
+
 它并非任意 Swift。generic root、运行时 metadata/witness 分派、原生可识别的补丁具体 Swift 类型、函数内部 nominal 声明、hosted stored property/自定义 initializer/任意 callback ABI、已有原生类型的 stored layout 变化、closure 持久化或跨 Native/Shell 边界、async closure、调用者 `inout` 捕获、真正的 `await`/continuation、actor-isolated `self`、custom global actor、不受限指针、基于反射的字段访问和未注册原生 API 都会被拒绝。实用矩阵见[能力与限制](Capabilities-and-Limits.zh-CN.md)。
 
 HLBC 会携带经过 Verifier 检查的 function/block/instruction → 逻辑 Swift 位置映射；生产打包会移除构建机绝对路径。执行发生 trap 时，HLVM 会给出精确 program counter，Runtime 再补充固定的 generation、Shell entry、函数和逻辑文件/行/列。这是诊断映射，不是支持 breakpoint、单步或表达式求值的交互式调试器。

@@ -105,7 +105,13 @@ does not by itself certify a physical device or distribution channel.
   bucket. Combining callbacks run only for duplicate keys; first-key identity,
   insertion order, source traversal order, and `rethrows` behavior are
   preserved. A throwing mutating `merge` retains successful prefix mutations,
-  while value-returning construction discards its partial result. Insertion,
+  while value-returning construction discards its partial result.
+  Frontend-generated `_arrayForceCast` and `_dictionaryUpCast` calls are
+  accepted only when the original types differ by tuple labels and their
+  complete recursively normalized source and destination VM types are also
+  identical, covering label erasure in direct and nested
+  containers. Casts that actually change an element, key, value, or reference
+  type remain rejected. Insertion,
   replacement, and removal share
   one typed Optional-update primitive that returns both the previous value and
   the updated Dictionary; key/value views share one typed projection primitive.

@@ -402,7 +402,7 @@ struct DictionaryAccumulationSemanticsMatrix {
             public func groupsManagedCollections(
                 _ values: Set<Int>,
                 _ keyed: [String: Int]
-            ) -> ([Int: [Int]], [Int: [(key: String, value: Int)]]) {
+            ) -> ([Int: [Int]], [Int: [(String, Int)]]) {
                 let groupedSet = Dictionary(grouping: values) { $0 % 2 }
                 let groupedDictionary = Dictionary(grouping: keyed) {
                     $0.value % 2

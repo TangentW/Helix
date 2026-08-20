@@ -142,6 +142,14 @@ Both workflows depend on stable, build-specific identities:
   bounded pre-allocation accounting. Only element-sequence semantics are
   normalized; an ArraySlice's non-zero-based index identity is not erased into
   an Array index, so unsupported slice-index APIs still fail closed.
+- Canonical SIL may spell tuple-label erasure through generic Array and
+  Dictionary cast helpers. The compiler removes such a helper only when the
+  original types differ only by tuple labels and their recursively normalized
+  source and destination are the exact same VM type;
+  it then preserves the ordinary owned-result edge without a cast opcode or
+  NativeImport. Any real element, key, value, or reference-type conversion
+  remains a distinct unsupported operation rather than being mistaken for an
+  identity cast.
 - Textual declaration summaries are collected before frozen Shell type aliases
   are available. Local factory tables therefore resolve in two phases: an
   initial pass admits already-complete local graphs, then native-type injection

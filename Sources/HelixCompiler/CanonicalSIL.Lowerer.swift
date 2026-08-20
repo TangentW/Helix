@@ -9843,6 +9843,62 @@ public struct Lowerer: Sendable {
                 }
             }
 
+            func lowerRepresentationIdenticalCollectionCast(
+                _ cast: CanonicalSIL.ManagedCollectionCastIntrinsic
+            ) throws {
+                let genericSpellings = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                let substitutions = try genericSpellings.map(parseStoredType)
+                let sourceType: Bytecode.ValueType
+                let destinationType: Bytecode.ValueType
+                switch cast {
+                case .arrayForce:
+                    guard substitutions.count == 2 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array cast requires source and destination element types"
+                        )
+                    }
+                    sourceType = .array(substitutions[0])
+                    destinationType = .array(substitutions[1])
+                case .dictionaryUp:
+                    guard substitutions.count == 4 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Dictionary cast requires source and destination key/value types"
+                        )
+                    }
+                    sourceType = .dictionary(
+                        key: substitutions[0],
+                        value: substitutions[1]
+                    )
+                    destinationType = .dictionary(
+                        key: substitutions[2],
+                        value: substitutions[3]
+                    )
+                }
+                guard arguments.count == 1 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "managed Collection cast has unsupported arguments"
+                    )
+                }
+                guard cast.isTupleLabelErasure(genericSpellings),
+                      sourceType == destinationType
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "managed Collection cast is not a representation-identical Tuple-label erasure"
+                    )
+                }
+                let result = try materializeOwnedValue(
+                    at: arguments[0],
+                    line: line
+                )
+                guard registerTypes[Int(result.rawValue)] == sourceType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "managed Collection cast operand does not match its specialization"
+                    )
+                }
+                values[resultToken] = result
+            }
+
             switch intrinsic {
             case let .scalar(scalar):
                 try lowerScalarIntrinsic(
@@ -9875,6 +9931,8 @@ public struct Lowerer: Sendable {
                     argumentText: argumentText,
                     line: line
                 )
+            case let .managedCollectionCast(cast):
+                try lowerRepresentationIdenticalCollectionCast(cast)
             case .higherOrder, .ordering, .split, .algebraic,
                  .dictionaryAccumulation:
                 throw CanonicalSIL.LoweringError.unsupportedInstruction(

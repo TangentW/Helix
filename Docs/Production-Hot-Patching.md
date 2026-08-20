@@ -181,6 +181,9 @@ Equatable/Hashable semantics. Common fully concrete transforms, reductions,
 visits, predicate queries, and comparator selection share one closure traversal
 across Array, Dictionary, and Set; all three preserve their container through
 `filter`, while Dictionary also supports `mapValues` and `compactMapValues`.
+Frontend Array/Dictionary cast helpers may erase tuple labels only when the
+original types differ solely by those labels and both complete VM types match;
+real element, key, value, and reference conversions remain rejected.
 The subset additionally includes typed
 enumerated/reversed/repeated/sliced/zipped/joined Array-backed adapters,
 `Optional.map`/`flatMap`, concrete `Result` payload transforms and

@@ -369,6 +369,11 @@ one typed linear accumulator and the ordinary closure CFG. These operations
 therefore preserve duplicate-only combining, traversal order, partial mutating
 writeback on error, and imported-reference ownership without a per-API opcode
 or a Swift-standard-library NativeImport.
+Tuple labels are likewise treated as compile-time structure: if the frontend
+expresses label erasure with an Array or Dictionary cast helper, Helix removes
+the call only after proving that the source types differ solely by those
+labels and both recursively normalized managed types are identical. A real
+collection element conversion still fails closed.
 Natural `sorted()`/`sort()` is available
 for VM-comparable scalar elements. Mutating ordering commits only on its normal
 continuation, so a throwing callback leaves the original Array unchanged.

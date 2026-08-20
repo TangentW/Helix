@@ -11,6 +11,9 @@ enum SwiftCoreIntrinsic: Equatable {
     case dictionaryAccumulation(
         CanonicalSIL.DictionaryAccumulationIntrinsic
     )
+    case managedCollectionCast(
+        CanonicalSIL.ManagedCollectionCastIntrinsic
+    )
     case minimum
     case maximum
     case absoluteValue
@@ -98,6 +101,12 @@ enum SwiftCoreIntrinsic: Equatable {
             mangledName: mangledName
         ) {
             self = .dictionaryAccumulation(accumulation)
+            return
+        }
+        if let cast = CanonicalSIL.ManagedCollectionCastIntrinsic(
+            mangledName: mangledName
+        ) {
+            self = .managedCollectionCast(cast)
             return
         }
         switch mangledName {
