@@ -411,6 +411,8 @@ public struct Indexer: Sendable {
             containsNativeType(element, ids: ids)
         case let .dictionary(key, value):
             containsNativeType(key, ids: ids) || containsNativeType(value, ids: ids)
+        case let .dictionaryState(key, value):
+            containsNativeType(key, ids: ids) || containsNativeType(value, ids: ids)
         case let .tuple(elements):
             elements.contains { containsNativeType($0, ids: ids) }
         case let .closure(signature):
@@ -427,7 +429,8 @@ public struct Indexer: Sendable {
         switch type {
         case .void: allowVoid
         case .never: false
-        case .address, .mutableCell, .arrayState, .closure: false
+        case .address, .mutableCell, .arrayState, .dictionaryState,
+             .closure: false
         case .bool, .integer, .float, .string, .any, .native: true
         case .local, .error: false
         case let .tuple(elements):

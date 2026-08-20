@@ -3132,6 +3132,232 @@ struct Interpreter {
         #expect(try atomicBuilder.finish() == [value])
     }
 
+    @Test("Linear Dictionary builders preserve lookup, replacement, and order")
+    func executesLinearDictionaryBuilder() throws {
+        let dictionaryType = Bytecode.ValueType.dictionary(
+            key: .int64,
+            value: .int64
+        )
+        let builderType = Bytecode.ValueType.dictionaryState(
+            key: .int64,
+            value: .int64
+        )
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "linearDictionaryBuilder",
+            parameterRegisters: (0..<5).map {
+                .init(rawValue: UInt32($0))
+            },
+            resultType: dictionaryType,
+            registerTypes: [
+                dictionaryType,
+                .int64,
+                .int64,
+                .int64,
+                .int64,
+                builderType,
+                .optional(.int64),
+                dictionaryType,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: (0..<5).map {
+                        .init(rawValue: UInt32($0))
+                    },
+                    instructions: [
+                        .makeDictionaryBuilder(
+                            result: .init(rawValue: 5),
+                            initialValue: .init(rawValue: 0)
+                        ),
+                        .dictionaryBuilderGet(
+                            result: .init(rawValue: 6),
+                            builder: .init(rawValue: 5),
+                            key: .init(rawValue: 1)
+                        ),
+                        .dictionaryBuilderSet(
+                            builder: .init(rawValue: 5),
+                            key: .init(rawValue: 1),
+                            value: .init(rawValue: 2)
+                        ),
+                        .dictionaryBuilderSet(
+                            builder: .init(rawValue: 5),
+                            key: .init(rawValue: 3),
+                            value: .init(rawValue: 4)
+                        ),
+                        .finishDictionaryBuilder(
+                            result: .init(rawValue: 7),
+                            builder: .init(rawValue: 5)
+                        ),
+                        .returnValue(.init(rawValue: 7)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .collectionsV1],
+            signature: .init(
+                parameters: [
+                    "Swift.Dictionary<Swift.Int, Swift.Int>",
+                    "Swift.Int", "Swift.Int", "Swift.Int", "Swift.Int",
+                ],
+                result: "Swift.Dictionary<Swift.Int, Swift.Int>"
+            ),
+            parameterTypes: [
+                dictionaryType, .int64, .int64, .int64, .int64,
+            ],
+            resultType: dictionaryType
+        )
+        let one = VM.Value.integer(
+            try VM.Integer(signed: 1, bitWidth: 64, isSigned: true)
+        )
+        let two = VM.Value.integer(
+            try VM.Integer(signed: 2, bitWidth: 64, isSigned: true)
+        )
+        let ten = VM.Value.integer(
+            try VM.Integer(signed: 10, bitWidth: 64, isSigned: true)
+        )
+        let twenty = VM.Value.integer(
+            try VM.Integer(signed: 20, bitWidth: 64, isSigned: true)
+        )
+        let thirty = VM.Value.integer(
+            try VM.Integer(signed: 30, bitWidth: 64, isSigned: true)
+        )
+        let initial = VM.Value.dictionary(
+            [.init(key: one, value: ten)],
+            keyType: .int64,
+            valueType: .int64
+        )
+        let expected = VM.Value.dictionary(
+            [
+                .init(key: one, value: twenty),
+                .init(key: two, value: thirty),
+            ],
+            keyType: .int64,
+            valueType: .int64
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [initial, one, twenty, two, thirty]
+            ) == .returned(expected)
+        )
+
+        let emptyFunction = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "emptyDictionaryBuilder",
+            parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+            resultType: dictionaryType,
+            registerTypes: [.int64, .int64, builderType, dictionaryType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .makeDictionaryBuilder(
+                            result: .init(rawValue: 2),
+                            initialValue: nil
+                        ),
+                        .dictionaryBuilderSet(
+                            builder: .init(rawValue: 2),
+                            key: .init(rawValue: 0),
+                            value: .init(rawValue: 1)
+                        ),
+                        .finishDictionaryBuilder(
+                            result: .init(rawValue: 3),
+                            builder: .init(rawValue: 2)
+                        ),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+        let emptyImage = try makeVerified(
+            function: emptyFunction,
+            capabilities: [.baselineV1, .collectionsV1],
+            signature: .init(
+                parameters: ["Swift.Int", "Swift.Int"],
+                result: "Swift.Dictionary<Swift.Int, Swift.Int>"
+            ),
+            parameterTypes: [.int64, .int64],
+            resultType: dictionaryType
+        )
+        let singleton = VM.Value.dictionary(
+            [.init(key: one, value: ten)],
+            keyType: .int64,
+            valueType: .int64
+        )
+        let frameBytes = UInt64(
+            emptyFunction.registerTypes.count
+                * MemoryLayout<VM.Value?>.stride
+        )
+        let exactHeapBytes = frameBytes + 16 + (2 * 16)
+        let exactBudget = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: exactHeapBytes,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: emptyImage,
+                arguments: [one, ten],
+                budget: exactBudget
+            ) == .returned(singleton)
+        )
+        let insufficientBudget = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: exactHeapBytes - 1,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: emptyImage,
+                arguments: [one, ten],
+                budget: insufficientBudget
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+
+        let direct = VM.DictionaryBuilder(
+            keyType: .int64,
+            valueType: .int64,
+            entries: [.init(key: one, value: ten)]
+        )
+        #expect(
+            throws: VM.RuntimeTrap.typeMismatch(
+                expected: .int64,
+                actual: .bool
+            )
+        ) {
+            try direct.set(
+                key: one,
+                value: VM.Value.bool(true),
+                matchingIndex: 0
+            )
+        }
+        try direct.set(key: one, value: twenty, matchingIndex: 0)
+        try direct.set(key: two, value: thirty, matchingIndex: nil)
+        let expectedEntries: [VM.DictionaryEntry] = [
+            .init(key: one, value: twenty),
+            .init(key: two, value: thirty),
+        ]
+        #expect(try direct.finish() == expectedEntries)
+        #expect(throws: VM.RuntimeTrap.self) {
+            _ = try direct.withEntries(\.count)
+        }
+        #expect(throws: VM.RuntimeTrap.self) {
+            _ = try direct.finish()
+        }
+    }
+
     @Test("Array builders append Array contents with bounded copied storage")
     func executesArrayBuilderBatchAppend() throws {
         let sourceType = Bytecode.ValueType.array(.int64)

@@ -400,6 +400,9 @@ public struct TypeEnvironment: Sendable {
             containsReferenceNativeValue(pointee)
         case let .arrayState(_, element):
             containsReferenceNativeValue(element)
+        case let .dictionaryState(key, value):
+            containsReferenceNativeValue(key)
+                || containsReferenceNativeValue(value)
         case let .tuple(elements):
             elements.contains(where: containsReferenceNativeValue)
         case .array, .dictionary, .set:
@@ -1224,6 +1227,9 @@ public struct TypeEnvironment: Sendable {
             case let .dictionary(key, value):
                 collect(key)
                 collect(value)
+            case let .dictionaryState(key, value):
+                collect(key)
+                collect(value)
             case let .tuple(elements):
                 elements.forEach(collect)
             case let .closure(signature):
@@ -1318,6 +1324,8 @@ public struct TypeEnvironment: Sendable {
                  let .arrayState(_, element):
                 try typeDepth(element) + 1
             case let .dictionary(key, value):
+                try max(typeDepth(key), typeDepth(value)) + 1
+            case let .dictionaryState(key, value):
                 try max(typeDepth(key), typeDepth(value)) + 1
             case let .tuple(elements):
                 try (elements.map(typeDepth).max() ?? 0) + 1

@@ -29,6 +29,8 @@ enum ValueRepresentation {
             .mutableCell(storable(pointee))
         case let .arrayState(kind, element):
             .arrayState(kind: kind, element: storable(element))
+        case let .dictionaryState(key, value):
+            .dictionaryState(key: storable(key), value: storable(value))
         case let .closure(signature):
             .closure(
                 .init(

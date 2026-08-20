@@ -389,6 +389,51 @@ struct Container {
         #expect(text.contains("array_split %5"))
     }
 
+    @Test("HLBC 1.0 canonically carries Dictionary accumulation state")
+    func dictionaryAccumulationStateWireFormat() throws {
+        var module = try makeAddModule()
+        module.capabilities.formUnion([.collectionsV1, .stringsV1])
+        module.functions[0].registerTypes.append(contentsOf: [
+            .dictionaryState(key: .string, value: .int64),
+            .string,
+            .optional(.int64),
+            .dictionary(key: .string, value: .int64),
+        ])
+        module.functions[0].blocks[0].instructions.insert(contentsOf: [
+            .makeDictionaryBuilder(
+                result: .init(rawValue: 5),
+                initialValue: nil
+            ),
+            .constantString(result: .init(rawValue: 6), value: "key"),
+            .dictionaryBuilderGet(
+                result: .init(rawValue: 7),
+                builder: .init(rawValue: 5),
+                key: .init(rawValue: 6)
+            ),
+            .dictionaryBuilderSet(
+                builder: .init(rawValue: 5),
+                key: .init(rawValue: 6),
+                value: .init(rawValue: 0)
+            ),
+            .finishDictionaryBuilder(
+                result: .init(rawValue: 8),
+                builder: .init(rawValue: 5)
+            ),
+        ], at: 0)
+
+        let bytes = try Bytecode.Encoder.encode(module)
+        let decoded = try Bytecode.Decoder.decode(bytes)
+        let text = Bytecode.Disassembler.disassemble(decoded.module)
+
+        #expect(decoded.header.formatMinor == Bytecode.Format.minorVersion)
+        #expect(decoded.module == module)
+        #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
+        #expect(text.contains("make_dictionary_builder"))
+        #expect(text.contains("dictionary_builder_get"))
+        #expect(text.contains("dictionary_builder_set"))
+        #expect(text.contains("finish_dictionary_builder"))
+    }
+
     @Test("HLBC 1.0 canonically carries closure values and function kinds")
     func closureWireFormat() throws {
         var module = try makeAddModule()

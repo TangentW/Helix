@@ -727,7 +727,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         case let .tuple(elements):
             !elements.isEmpty && elements.allSatisfy(isAutomaticallyBridgeable)
         case .void, .never, .local, .error, .address, .mutableCell,
-             .arrayState, .closure:
+             .arrayState, .dictionaryState, .closure:
             false
         }
     }
@@ -780,6 +780,9 @@ extension FrontendReceipt.ManagedDebugSurface {
              let .arrayState(_, element):
             containsNativeType(element, in: typeIDs)
         case let .dictionary(key, value):
+            containsNativeType(key, in: typeIDs)
+                || containsNativeType(value, in: typeIDs)
+        case let .dictionaryState(key, value):
             containsNativeType(key, in: typeIDs)
                 || containsNativeType(value, in: typeIDs)
         case let .tuple(elements):

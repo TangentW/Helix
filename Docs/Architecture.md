@@ -62,9 +62,10 @@ Both workflows depend on stable, build-specific identities:
   during concurrent activation or rollback.
 - Mutable closure captures and collection transforms use verifier-private
   storage values rather than Swift runtime layout: managed cells may be shared
-  only by same-image closures, while Array builders are linear and must be
-  finished or destroyed on every control-flow path. Neither form can enter a
-  Shell/Native boundary, local value layout, stack slot, or function result.
+  only by same-image closures, while Array builders and Dictionary accumulators
+  are linear and must be finished or destroyed on every control-flow path.
+  None can enter a Shell/Native boundary, local value layout, stack slot, or
+  function result.
   Immutable closure contexts may also copy a represented linear capture when
   its frozen TypeOps are copyable and the closure body receives that capture
   with a borrowed ABI. `make_closure` charges and performs the copy; owned or
@@ -99,6 +100,15 @@ Both workflows depend on stable, build-specific identities:
   typed value-semantic writeback. Nested and throwing inout calls therefore do
   not require a collection-API opcode, and copyable imported reference values
   follow the same ownership path as managed values.
+- Dictionary accumulation uses one verifier-private linear state rather than an
+  opcode or NativeImport for each standard-library API. The state can start
+  empty or from a copied Dictionary, supports typed lookup and replacement in
+  ordinary verified control flow, preserves the first equivalent key and its
+  insertion position, then moves its storage into one finished Dictionary.
+  The Verifier proves VM-defined key hashing and copyable key/value types; the
+  VM charges lookup work, copied values, and new entry storage before mutation.
+  This lets compiler lowering share one bounded mechanism without repeatedly
+  copying the whole Dictionary or depending on Swift's private generic ABI.
 - Mandatory SIL can erase `load [take]` and express ownership through separate
   retain/release traffic. A type-driven normalization recovers an unqualified
   forwarding load only when it is the last operation on the exact temporary

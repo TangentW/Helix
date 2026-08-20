@@ -354,6 +354,10 @@ public struct Engine: Verification.ImageVerifying {
                 throw Verification.Error.invalidModule(
                     "local type members cannot contain Array operation states"
                 )
+            case .dictionaryState:
+                throw Verification.Error.invalidModule(
+                    "local type members cannot contain Dictionary operation states"
+                )
             case .closure:
                 throw Verification.Error.invalidModule(
                     "local type members cannot contain closure values"
@@ -499,6 +503,8 @@ public struct Engine: Verification.ImageVerifying {
                 try typeDepth(element) + 1
             case let .dictionary(key, value):
                 try max(typeDepth(key), typeDepth(value)) + 1
+            case let .dictionaryState(key, value):
+                try max(typeDepth(key), typeDepth(value)) + 1
             case let .tuple(elements):
                 try (elements.map(typeDepth).max() ?? 0) + 1
             case .void, .never, .bool, .integer, .float, .string, .any, .native,
@@ -545,6 +551,9 @@ public struct Engine: Verification.ImageVerifying {
                     try visit(component)
                 }
             case let .dictionary(key, value):
+                try visit(key)
+                try visit(value)
+            case let .dictionaryState(key, value):
                 try visit(key)
                 try visit(value)
             case let .tuple(elements):
@@ -856,6 +865,9 @@ public struct Engine: Verification.ImageVerifying {
         case let .dictionary(key, value):
             usesMainActorNativeType(key, shell: shell)
                 || usesMainActorNativeType(value, shell: shell)
+        case let .dictionaryState(key, value):
+            usesMainActorNativeType(key, shell: shell)
+                || usesMainActorNativeType(value, shell: shell)
         case let .tuple(elements):
             elements.contains { usesMainActorNativeType($0, shell: shell) }
         case let .closure(signature):
@@ -882,6 +894,9 @@ public struct Engine: Verification.ImageVerifying {
         case let .set(element):
             try verifyNativeTypes(element, shell: shell)
         case let .dictionary(key, value):
+            try verifyNativeTypes(key, shell: shell)
+            try verifyNativeTypes(value, shell: shell)
+        case let .dictionaryState(key, value):
             try verifyNativeTypes(key, shell: shell)
             try verifyNativeTypes(value, shell: shell)
         case let .closure(signature):
@@ -936,6 +951,12 @@ public struct Engine: Verification.ImageVerifying {
                     throw Verification.Error.capabilityDenied(.collectionsV1)
                 }
                 try visit(element)
+            case let .dictionaryState(key, value):
+                guard capabilities.contains(.collectionsV1) else {
+                    throw Verification.Error.capabilityDenied(.collectionsV1)
+                }
+                try visit(key)
+                try visit(value)
             case let .closure(signature):
                 guard capabilities.contains(.closureValuesV1) else {
                     throw Verification.Error.capabilityDenied(.closureValuesV1)
@@ -1296,7 +1317,7 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 switch pointee {
                 case .void, .never, .address, .mutableCell, .arrayState,
-                     .closure:
+                     .dictionaryState, .closure:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "address pointee must be a concrete non-address value type"
@@ -1313,7 +1334,7 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 switch pointee {
                 case .void, .never, .address, .mutableCell, .arrayState,
-                     .closure:
+                     .dictionaryState, .closure:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "mutable-cell pointee must be a concrete value type"
@@ -1330,13 +1351,42 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 switch element {
                 case .void, .never, .address, .mutableCell, .arrayState,
-                     .closure:
+                     .dictionaryState, .closure:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "Array-state element must be a concrete value type"
                     )
                 default:
                     try verify(element, depth: depth + 1, isRegister: false)
+                }
+            case let .dictionaryState(key, value):
+                guard isRegister, depth == 0 else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "Dictionary operation states must be top-level registers"
+                    )
+                }
+                guard key.isVMHashable else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "Dictionary-state key lacks VM-defined Hashable semantics"
+                    )
+                }
+                for component in [key, value] {
+                    switch component {
+                    case .void, .never, .address, .mutableCell, .arrayState,
+                         .dictionaryState, .closure:
+                        throw Verification.Error.invalidFunction(
+                            function: function.id,
+                            reason: "Dictionary-state components must be concrete value types"
+                        )
+                    default:
+                        try verify(
+                            component,
+                            depth: depth + 1,
+                            isRegister: false
+                        )
+                    }
                 }
             case let .closure(signature):
                 guard depth == 0 else {
@@ -1377,7 +1427,8 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 for parameter in signature.parameters {
                     switch parameter {
-                    case .void, .never, .mutableCell, .arrayState, .closure:
+                    case .void, .never, .mutableCell, .arrayState,
+                         .dictionaryState, .closure:
                         throw Verification.Error.invalidFunction(
                             function: function.id,
                             reason: "closure parameters must be concrete values or inout addresses"
@@ -1385,7 +1436,7 @@ public struct Engine: Verification.ImageVerifying {
                     case let .address(pointee):
                         switch pointee {
                         case .void, .never, .address, .mutableCell,
-                             .arrayState, .closure:
+                             .arrayState, .dictionaryState, .closure:
                             throw Verification.Error.invalidFunction(
                                 function: function.id,
                                 reason: "inout closure pointee must be a concrete value type"
@@ -1402,7 +1453,8 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 }
                 switch signature.result {
-                case .never, .address, .mutableCell, .arrayState, .closure:
+                case .never, .address, .mutableCell, .arrayState,
+                     .dictionaryState, .closure:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "closure result must be Void or a concrete non-address value"
@@ -1449,6 +1501,12 @@ public struct Engine: Verification.ImageVerifying {
                     reason: "Array operation states cannot be stored in stack slots"
                 )
             }
+            if case .dictionaryState = type {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "Dictionary operation states cannot be stored in stack slots"
+                )
+            }
             try verify(type, depth: 0, isRegister: true)
         }
         if case .address = function.resultType {
@@ -1469,16 +1527,22 @@ public struct Engine: Verification.ImageVerifying {
                 reason: "Array operation states cannot be returned"
             )
         }
+        if case .dictionaryState = function.resultType {
+            throw Verification.Error.invalidFunction(
+                function: function.id,
+                reason: "Dictionary operation states cannot be returned"
+            )
+        }
         if function.parameterRegisters.contains(where: { parameter in
             guard let type = function.type(of: parameter) else { return false }
             return switch type {
-            case .arrayState: true
+            case .arrayState, .dictionaryState: true
             default: false
             }
         }) {
             throw Verification.Error.invalidFunction(
                 function: function.id,
-                reason: "Array operation states cannot be function parameters"
+                reason: "collection operation states cannot be function parameters"
             )
         }
         try verify(function.resultType, depth: 0, isRegister: false)
@@ -2484,6 +2548,57 @@ public struct Engine: Verification.ImageVerifying {
                     "finish_array_builder must produce its matching Array"
                 )
             }
+        case let .makeDictionaryBuilder(result, initialValue):
+            guard capabilities.contains(.collectionsV1),
+                  case let .dictionaryState(key, value) = type(result),
+                  key.isVMHashable,
+                  isCopyable(key, shell: shell),
+                  isCopyable(value, shell: shell),
+                  initialValue.map({
+                      type($0) == .dictionary(key: key, value: value)
+                  }) ?? true
+            else {
+                throw fail(
+                    "make_dictionary_builder requires matching copyable Dictionary types"
+                )
+            }
+        case let .dictionaryBuilderGet(result, builder, key):
+            guard capabilities.contains(.collectionsV1),
+                  case let .dictionaryState(keyType, valueType) = type(builder),
+                  type(key) == keyType,
+                  type(result) == .optional(valueType),
+                  keyType.isVMHashable,
+                  isCopyable(valueType, shell: shell)
+            else {
+                throw fail(
+                    "dictionary_builder_get requires matching key and Optional value types"
+                )
+            }
+        case let .dictionaryBuilderSet(builder, key, value):
+            guard capabilities.contains(.collectionsV1),
+                  case let .dictionaryState(keyType, valueType) = type(builder),
+                  type(key) == keyType,
+                  type(value) == valueType,
+                  keyType.isVMHashable,
+                  isCopyable(keyType, shell: shell),
+                  isCopyable(valueType, shell: shell)
+            else {
+                throw fail(
+                    "dictionary_builder_set requires matching copyable key/value types"
+                )
+            }
+        case let .finishDictionaryBuilder(result, builder):
+            guard capabilities.contains(.collectionsV1),
+                  case let .dictionaryState(key, value) = type(builder),
+                  type(result) == .dictionary(key: key, value: value),
+                  key.isVMHashable,
+                  isCopyable(key, shell: shell),
+                  isCopyable(value, shell: shell)
+            else {
+                throw fail(
+                    "finish_dictionary_builder must produce its matching Dictionary"
+                )
+            }
         case let .arraySorted(result, array):
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("Array sorting requires \(Core.Capability.collectionsV1)")
@@ -3205,7 +3320,7 @@ public struct Engine: Verification.ImageVerifying {
             shell.types[id]?.isCopyable == true
         case .closure, .mutableCell:
             true
-        case .arrayState:
+        case .arrayState, .dictionaryState:
             false
         case let .tuple(elements):
             elements.allSatisfy { isCopyable($0, shell: shell) }
@@ -3534,6 +3649,25 @@ public struct Engine: Verification.ImageVerifying {
                     guard live.remove(builder) != nil else {
                         throw fail(
                             "finish_array_builder consumes a non-live builder"
+                        )
+                    }
+                    if function.type(of: result)?.requiresLinearOwnership
+                        == true {
+                        live.insert(result)
+                    }
+                case let .makeDictionaryBuilder(result, _):
+                    live.insert(result)
+                case let .dictionaryBuilderGet(result, _, _):
+                    if function.type(of: result)?.requiresLinearOwnership
+                        == true {
+                        live.insert(result)
+                    }
+                case .dictionaryBuilderSet:
+                    break
+                case let .finishDictionaryBuilder(result, builder):
+                    guard live.remove(builder) != nil else {
+                        throw fail(
+                            "finish_dictionary_builder consumes a non-live builder"
                         )
                     }
                     if function.type(of: result)?.requiresLinearOwnership

@@ -163,6 +163,10 @@ extension CompilerCapabilities {
             capabilities.insert(.collectionsV1)
             collect(key, into: &capabilities)
             collect(value, into: &capabilities)
+        case let .dictionaryState(key, value):
+            capabilities.insert(.collectionsV1)
+            collect(key, into: &capabilities)
+            collect(value, into: &capabilities)
         case let .set(element):
             capabilities.insert(.collectionsV1)
             collect(element, into: &capabilities)

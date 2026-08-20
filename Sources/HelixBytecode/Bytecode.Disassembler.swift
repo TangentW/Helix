@@ -282,6 +282,15 @@ public enum Disassembler {
             "array_builder_append_contents \(array) to \(builder)"
         case let .finishArrayBuilder(result, builder):
             "\(result) = finish_array_builder \(builder)"
+        case let .makeDictionaryBuilder(result, initialValue):
+            "\(result) = make_dictionary_builder"
+                + (initialValue.map { " \($0)" } ?? "")
+        case let .dictionaryBuilderGet(result, builder, key):
+            "\(result) = dictionary_builder_get \(builder), \(key)"
+        case let .dictionaryBuilderSet(builder, key, value):
+            "dictionary_builder_set \(builder), \(key), \(value)"
+        case let .finishDictionaryBuilder(result, builder):
+            "\(result) = finish_dictionary_builder \(builder)"
         case let .arraySorted(result, array):
             "\(result) = array_sorted \(array)"
         case let .makeArraySortState(result, array):

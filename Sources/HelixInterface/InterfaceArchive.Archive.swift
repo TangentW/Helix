@@ -654,7 +654,8 @@ public struct Archive: Codable, Hashable, Sendable {
                 try validateDeviceType(wrapped, depth: depth + 1)
             case .float:
                 break
-            case .local, .error, .address, .mutableCell, .arrayState, .closure:
+            case .local, .error, .address, .mutableCell, .arrayState,
+                 .dictionaryState, .closure:
                 throw InterfaceArchive.Error.invalidArchive(
                     "patch-local nominal, Error, internal storage, and closure values cannot appear in a Shell signature"
                 )
@@ -690,6 +691,8 @@ public struct Archive: Codable, Hashable, Sendable {
                 usesMainActorType(pointee)
             case let .arrayState(_, element):
                 usesMainActorType(element)
+            case let .dictionaryState(key, value):
+                usesMainActorType(key) || usesMainActorType(value)
             case .void, .never, .bool, .integer, .float, .string, .any, .local,
                  .error, .address:
                 false

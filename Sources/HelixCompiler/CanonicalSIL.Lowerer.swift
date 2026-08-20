@@ -18343,7 +18343,8 @@ public struct Lowerer: Sendable {
 
     private func supportsIndirectResult(_ type: Bytecode.ValueType) -> Bool {
         switch type {
-        case .void, .never, .address, .mutableCell, .arrayState:
+        case .void, .never, .address, .mutableCell, .arrayState,
+             .dictionaryState:
             false
         case .bool, .integer, .float, .string, .any, .array, .dictionary, .set,
              .tuple, .native, .local, .error, .closure, .optional:

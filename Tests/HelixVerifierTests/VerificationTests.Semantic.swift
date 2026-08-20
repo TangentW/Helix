@@ -2506,6 +2506,160 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Dictionary builders are typed, linear, and invocation-local")
+    func validatesLinearDictionaryBuilders() throws {
+        let pairType = Bytecode.ValueType.tuple([.int64, .int64])
+        let dictionaryType = Bytecode.ValueType.dictionary(
+            key: .int64,
+            value: .int64
+        )
+        let builderType = Bytecode.ValueType.dictionaryState(
+            key: .int64,
+            value: .int64
+        )
+        var fixture = try makeFixture { function in
+            function.resultType = dictionaryType
+            function.registerTypes = [
+                .int64,
+                pairType,
+                .array(pairType),
+                dictionaryType,
+                builderType,
+                .optional(.int64),
+                dictionaryType,
+            ]
+            function.blocks[0].instructions = [
+                .makeTuple(
+                    result: .init(rawValue: 1),
+                    elements: [.init(rawValue: 0), .init(rawValue: 0)]
+                ),
+                .makeArray(
+                    result: .init(rawValue: 2),
+                    elements: [.init(rawValue: 1)]
+                ),
+                .makeDictionary(
+                    result: .init(rawValue: 3),
+                    pairs: .init(rawValue: 2)
+                ),
+                .makeDictionaryBuilder(
+                    result: .init(rawValue: 4),
+                    initialValue: .init(rawValue: 3)
+                ),
+                .dictionaryBuilderGet(
+                    result: .init(rawValue: 5),
+                    builder: .init(rawValue: 4),
+                    key: .init(rawValue: 0)
+                ),
+                .dictionaryBuilderSet(
+                    builder: .init(rawValue: 4),
+                    key: .init(rawValue: 0),
+                    value: .init(rawValue: 0)
+                ),
+                .finishDictionaryBuilder(
+                    result: .init(rawValue: 6),
+                    builder: .init(rawValue: 4)
+                ),
+                .returnValue(.init(rawValue: 6)),
+            ]
+        }
+        fixture.module.capabilities.insert(.collectionsV1)
+        fixture.shell.capabilities.insert(.collectionsV1)
+        fixture.policy.acceptedCapabilities.insert(.collectionsV1)
+        let entry = try #require(fixture.shell.entries[.init(rawValue: 0)])
+        fixture.shell.entries[entry.index] = .init(
+            index: entry.index,
+            key: entry.key,
+            parameterTypes: entry.parameterTypes,
+            resultType: dictionaryType,
+            effects: entry.effects
+        )
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var copied = fixture.module
+        copied.functions[0].registerTypes.append(builderType)
+        copied.functions[0].blocks[0].instructions.insert(
+            .copyValue(
+                result: .init(rawValue: 7),
+                source: .init(rawValue: 4)
+            ),
+            at: 4
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 4,
+                reason: "copy_value requires a copyable type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(copied),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var unfinished = fixture.module
+        unfinished.functions[0].blocks[0].instructions = Array(
+            unfinished.functions[0].blocks[0].instructions.prefix(4)
+        ) + [.returnValue(.init(rawValue: 3))]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 4,
+                reason: "owned values remain live at return"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(unfinished),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var finishedTwice = fixture.module
+        finishedTwice.functions[0].registerTypes.append(dictionaryType)
+        finishedTwice.functions[0].blocks[0].instructions.insert(
+            .finishDictionaryBuilder(
+                result: .init(rawValue: 7),
+                builder: .init(rawValue: 4)
+            ),
+            at: 7
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 7,
+                reason: "instruction uses a consumed owned value"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(finishedTwice),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var parameter = fixture.module
+        parameter.functions[0].parameterRegisters = [.init(rawValue: 4)]
+        parameter.functions[0].parameterConventions = [.owned]
+        parameter.functions[0].blocks[0].parameters = [.init(rawValue: 4)]
+        #expect(throws: Verification.Error.self) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(parameter),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+    }
+
     @Test("Array sort state is typed, linear, and invocation-local")
     func validatesLinearArraySortState() throws {
         let arrayType = Bytecode.ValueType.array(.int64)

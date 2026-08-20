@@ -188,7 +188,7 @@ enum DynamicAny {
             }
             return .init(type: type, value: encoded)
         case .any, .set, .tuple, .native, .local, .error, .address, .mutableCell,
-             .arrayState, .closure,
+             .arrayState, .dictionaryState, .closure,
              .void, .never:
             throw Runtime.BridgeInputError.unsupportedAnyType(reflectedType)
         }
@@ -256,7 +256,7 @@ enum DynamicAny {
                 depth: depth + 1
             )
         case .set, .tuple, .native, .local, .error, .address, .mutableCell,
-             .arrayState, .closure, .void, .never:
+             .arrayState, .dictionaryState, .closure, .void, .never:
             throw VM.RuntimeTrap.nativeFailure(
                 "Swift Any boundary cannot materialize \(type)"
             )

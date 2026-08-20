@@ -134,7 +134,8 @@ public struct Interpreter: Sendable {
                   !rootFunction.parameterRegisters.contains(where: {
                       guard let type = rootFunction.type(of: $0) else { return false }
                       return switch type {
-                      case .address, .mutableCell, .arrayState: true
+                      case .address, .mutableCell, .arrayState,
+                           .dictionaryState: true
                       default: false
                       }
                   })
@@ -247,6 +248,9 @@ public struct Interpreter: Sendable {
             case let .array(element), let .set(element):
                 visit(element)
             case let .dictionary(key, value):
+                visit(key)
+                visit(value)
+            case let .dictionaryState(key, value):
                 visit(key)
                 visit(value)
             case let .closure(signature):
@@ -2266,6 +2270,190 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
+                case let .makeDictionaryBuilder(result, initialValue):
+                    guard case let .dictionaryState(keyType, valueType) =
+                            function.type(of: result),
+                          keyType.isVMHashable
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .dictionaryState(
+                                key: .never,
+                                value: .never
+                            ),
+                            actual: function.type(of: result)
+                        )
+                    }
+                    var entries: [VM.DictionaryEntry] = []
+                    try chargeAggregate(elementCount: 0, budget: budget)
+                    if let initialValue {
+                        let (source, sourceKey, sourceValue) = try dictionary(
+                            initialValue,
+                            registers: registers
+                        )
+                        guard sourceKey == keyType, sourceValue == valueType else {
+                            throw VM.RuntimeTrap.typeMismatch(
+                                expected: .dictionary(
+                                    key: keyType,
+                                    value: valueType
+                                ),
+                                actual: function.type(of: initialValue)
+                            )
+                        }
+                        let elementCount = source.count
+                            .multipliedReportingOverflow(by: 2)
+                        guard !elementCount.overflow else {
+                            throw VM.RuntimeTrap.vmHeapLimitExceeded
+                        }
+                        try budget.consumeLinearWork(
+                            elementCount: source.count
+                        )
+                        try budget.consumeAggregateElementStorage(
+                            elementCount: elementCount.partialValue
+                        )
+                        for entry in source {
+                            try prepareCopy(entry.key, budget: budget)
+                            try prepareCopy(entry.value, budget: budget)
+                        }
+                        entries.reserveCapacity(source.count)
+                        for entry in source {
+                            entries.append(
+                                .init(
+                                    key: try copy(entry.key),
+                                    value: try copy(entry.value)
+                                )
+                            )
+                        }
+                    }
+                    try budget.checkDeadline()
+                    try initialize(
+                        .dictionaryBuilder(
+                            .init(
+                                keyType: keyType,
+                                valueType: valueType,
+                                entries: entries
+                            )
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .dictionaryBuilderGet(result, builderRegister, key):
+                    guard case let .dictionaryState(keyType, valueType) =
+                            function.type(of: builderRegister),
+                          function.type(of: key) == keyType,
+                          function.type(of: result) == .optional(valueType),
+                          case let .dictionaryBuilder(builder) = try read(
+                            builderRegister,
+                            registers: registers
+                          )
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: function.type(of: builderRegister)
+                        )
+                    }
+                    let needle = try read(key, registers: registers)
+                    let match = try builder.withEntries { entries in
+                        let index = try dictionaryIndex(
+                            of: needle,
+                            in: entries,
+                            budget: budget
+                        )
+                        return (
+                            index: index,
+                            value: index.map { entries[$0].value }
+                        )
+                    }
+                    try chargeAggregate(
+                        elementCount: match.index == nil ? 0 : 1,
+                        budget: budget
+                    )
+                    let value = try match.value.map {
+                        try copyCharging($0, budget: budget)
+                    }
+                    try initialize(
+                        .optional(value),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .dictionaryBuilderSet(builderRegister, key, value):
+                    guard case let .dictionaryState(keyType, valueType) =
+                            function.type(of: builderRegister),
+                          function.type(of: key) == keyType,
+                          function.type(of: value) == valueType,
+                          case let .dictionaryBuilder(builder) = try read(
+                            builderRegister,
+                            registers: registers
+                          )
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: builderRegister)
+                                ?? .never,
+                            actual: try read(
+                                builderRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    let sourceKey = try read(key, registers: registers)
+                    let sourceValue = try read(value, registers: registers)
+                    let matchingIndex = try builder.withEntries { entries in
+                        try dictionaryIndex(
+                            of: sourceKey,
+                            in: entries,
+                            budget: budget
+                        )
+                    }
+                    try budget.consumeLinearWork(elementCount: 1)
+                    if matchingIndex == nil {
+                        try budget.consumeAggregateElementStorage(
+                            elementCount: 2
+                        )
+                        try prepareCopy(sourceKey, budget: budget)
+                    }
+                    try prepareCopy(sourceValue, budget: budget)
+                    let copiedKey: VM.Value
+                    if matchingIndex == nil {
+                        copiedKey = try copy(sourceKey)
+                    } else {
+                        copiedKey = sourceKey
+                    }
+                    let copiedValue = try copy(sourceValue)
+                    try budget.checkDeadline()
+                    try builder.set(
+                        key: copiedKey,
+                        value: copiedValue,
+                        matchingIndex: matchingIndex
+                    )
+                case let .finishDictionaryBuilder(result, builderRegister):
+                    guard case let .dictionaryState(keyType, valueType) =
+                            function.type(of: builderRegister),
+                          function.type(of: result) == .dictionary(
+                            key: keyType,
+                            value: valueType
+                          ),
+                          case let .dictionaryBuilder(builder) = try consume(
+                            builderRegister,
+                            type: .dictionaryState(
+                                key: keyType,
+                                value: valueType
+                            ),
+                            registers: &registers
+                          )
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: function.type(of: builderRegister)
+                        )
+                    }
+                    try initialize(
+                        .dictionary(
+                            try builder.finish(),
+                            keyType: keyType,
+                            valueType: valueType
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .arraySorted(result, arrayRegister):
                     let (elements, elementType) = try array(
                         arrayRegister,
@@ -3828,6 +4016,16 @@ public struct Interpreter: Sendable {
                     actual: value.type
                 )
             }
+        case let (
+            .dictionaryBuilder(builder),
+            .dictionaryState(key, valueType)
+        ):
+            guard builder.keyType == key, builder.valueType == valueType else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: expected,
+                    actual: value.type
+                )
+            }
         case let (.arraySortState(state), .arrayState(.stableSort, element)):
             guard state.elementType == element else {
                 throw VM.RuntimeTrap.typeMismatch(
@@ -4230,9 +4428,10 @@ public struct Interpreter: Sendable {
             )
         case .mutableCell:
             value
-        case .arrayBuilder, .arraySortState, .arraySplitState:
+        case .arrayBuilder, .dictionaryBuilder, .arraySortState,
+             .arraySplitState:
             throw VM.RuntimeTrap.explicit(
-                "Array construction state cannot be copied"
+                "collection construction state cannot be copied"
             )
         case .address:
             throw VM.RuntimeTrap.inactiveAddressAccess
@@ -4404,7 +4603,8 @@ public struct Interpreter: Sendable {
                 try chargeCopiedValue(capture, budget: budget, depth: depth + 1)
             }
         case .bool, .integer, .float, .string, .address, .mutableCell,
-             .arrayBuilder, .arraySortState, .arraySplitState:
+             .arrayBuilder, .dictionaryBuilder, .arraySortState,
+             .arraySplitState:
             break
         }
     }
@@ -4464,7 +4664,8 @@ public struct Interpreter: Sendable {
                 try chargeValueTraversal(capture, budget: budget, depth: depth + 1)
             }
         case .optional(nil), .native, .bool, .integer, .float, .address,
-             .mutableCell, .arrayBuilder, .arraySortState, .arraySplitState:
+             .mutableCell, .arrayBuilder, .dictionaryBuilder,
+             .arraySortState, .arraySplitState:
             break
         }
     }
@@ -4533,8 +4734,8 @@ public struct Interpreter: Sendable {
                 try chargeShapeValidation(capture, budget: budget, depth: depth + 1)
             }
         case .optional(nil), .native, .bool, .integer, .float, .string,
-             .address, .mutableCell, .arrayBuilder, .arraySortState,
-             .arraySplitState:
+             .address, .mutableCell, .arrayBuilder, .dictionaryBuilder,
+             .arraySortState, .arraySplitState:
             break
         }
     }

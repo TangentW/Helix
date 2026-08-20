@@ -109,6 +109,12 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         kind: Bytecode.ArrayStateKind,
         element: Bytecode.ValueType
     )
+    /// Invocation-local, single-owner storage used while accumulating a
+    /// Dictionary. It is verifier-private and cannot cross an ABI boundary.
+    case dictionaryState(
+        key: Bytecode.ValueType,
+        value: Bytecode.ValueType
+    )
     case closure(Bytecode.ClosureSignature)
     case tuple([Bytecode.ValueType])
     case optional(Bytecode.ValueType)
@@ -124,7 +130,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case let .optional(wrapped):
             wrapped.isTrivial
         case .string, .any, .array, .dictionary, .set, .native, .local, .error,
-             .address, .mutableCell, .arrayState, .closure:
+             .address, .mutableCell, .arrayState, .dictionaryState, .closure:
             false
         }
     }
@@ -146,7 +152,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
             key.requiresLinearOwnership || value.requiresLinearOwnership
         case let .set(element):
             element.requiresLinearOwnership
-        case .arrayState:
+        case .arrayState, .dictionaryState:
             true
         case .void, .never, .bool, .integer, .float, .string, .any, .local,
              .error, .address, .mutableCell, .closure:
@@ -173,6 +179,8 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case let .mutableCell(pointee): "@mutableCell<\(pointee)>"
         case let .arrayState(kind, element):
             "@arrayState.\(kind)<\(element)>"
+        case let .dictionaryState(key, value):
+            "@dictionaryState<\(key), \(value)>"
         case let .closure(signature): "@closure\(signature)"
         case let .tuple(elements): "(\(elements.map(\.description).joined(separator: ", ")))"
         case let .optional(wrapped): "Optional<\(wrapped)>"
@@ -712,6 +720,26 @@ public enum Instruction: Codable, Hashable, Sendable {
         result: Bytecode.Register,
         builder: Bytecode.Register
     )
+    /// Creates an invocation-local Dictionary accumulator. A missing initial
+    /// value starts empty; a present value is copied before any mutation.
+    case makeDictionaryBuilder(
+        result: Bytecode.Register,
+        initialValue: Bytecode.Register?
+    )
+    case dictionaryBuilderGet(
+        result: Bytecode.Register,
+        builder: Bytecode.Register,
+        key: Bytecode.Register
+    )
+    case dictionaryBuilderSet(
+        builder: Bytecode.Register,
+        key: Bytecode.Register,
+        value: Bytecode.Register
+    )
+    case finishDictionaryBuilder(
+        result: Bytecode.Register,
+        builder: Bytecode.Register
+    )
     /// Sorts VM-comparable elements without crossing a callback boundary.
     /// Comparator-driven APIs use the state-machine instructions below so
     /// arbitrary Swift closures remain ordinary verified calls.
@@ -964,6 +992,9 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .loadMutableCell(result, _),
              let .makeArrayBuilder(result),
              let .finishArrayBuilder(result, _),
+             let .makeDictionaryBuilder(result, _),
+             let .dictionaryBuilderGet(result, _, _),
+             let .finishDictionaryBuilder(result, _),
              let .arraySorted(result, _),
              let .makeArraySortState(result, _),
              let .arraySortNextComparison(result, _),
@@ -1065,6 +1096,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              .destroyStackIfInitialized,
              .storeMutableCell, .arrayBuilderAppend,
              .arrayBuilderAppendContents,
+             .dictionaryBuilderSet,
              .arraySortAcceptComparison,
              .arraySplitAcceptElement,
              .hostedSuperApply, .endAccess,
@@ -1082,7 +1114,7 @@ public enum Instruction: Codable, Hashable, Sendable {
         case .constantInteger, .constantBool, .constantFloat, .constantString,
              .makeOptionalNone, .loadStack, .destroyStack,
              .destroyStackIfInitialized, .stackAddress,
-             .allocateObject, .trap:
+             .makeArrayBuilder, .allocateObject, .trap:
             []
         case let .copyValue(_, source), let .moveValue(_, source), let .destroyValue(source):
             [source]
@@ -1211,13 +1243,19 @@ public enum Instruction: Codable, Hashable, Sendable {
             [array, lhsIndex, rhsIndex]
         case let .arrayAppend(_, array, value):
             [array, value]
-        case .makeArrayBuilder:
-            []
         case let .arrayBuilderAppend(builder, value):
             [builder, value]
         case let .arrayBuilderAppendContents(builder, array):
             [builder, array]
         case let .finishArrayBuilder(_, builder):
+            [builder]
+        case let .makeDictionaryBuilder(_, initialValue):
+            initialValue.map { [$0] } ?? []
+        case let .dictionaryBuilderGet(_, builder, key):
+            [builder, key]
+        case let .dictionaryBuilderSet(builder, key, value):
+            [builder, key, value]
+        case let .finishDictionaryBuilder(_, builder):
             [builder]
         case let .arraySorted(_, array),
              let .makeArraySortState(_, array):
