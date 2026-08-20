@@ -186,6 +186,490 @@ struct HigherOrderSemanticsMatrix {
         try run(probes)
     }
 
+    @Test("Dictionary and Set reuse generic Sequence higher-order lowering")
+    func lowersManagedCollectionHigherOrderAPIs() throws {
+        try run([
+            Probe(
+                name: "dictionaryTransforms",
+                source: """
+                public func dictionaryTransforms(
+                    _ source: [String: Int]
+                ) -> ([Int], [Int], [Int]) {
+                    let mapped = source.map { $0.value * 2 }
+                    let flattened = source.flatMap {
+                        [$0.value, $0.value + 1]
+                    }
+                    let compacted = source.compactMap {
+                        $0.value > 0 ? $0.value : nil
+                    }
+                    return (mapped, flattened, compacted)
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try dictionary([
+                            ("a", 1), ("bb", 4), ("c", -2),
+                        ])],
+                        expected: .returned(.tuple([
+                            try integers([2, 8, -4]),
+                            try integers([1, 2, 4, 5, -2, -1]),
+                            try integers([1, 4]),
+                        ]))
+                    ),
+                    .init(
+                        arguments: [try dictionary([])],
+                        expected: .returned(.tuple([
+                            try integers([]),
+                            try integers([]),
+                            try integers([]),
+                        ]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "dictionaryQueries",
+                source: """
+                public func dictionaryQueries(
+                    _ source: [String: Int],
+                    _ threshold: Int
+                ) -> (
+                    Int, Int, Bool, Bool,
+                    (key: String, value: Int)?,
+                    (key: String, value: Int)?
+                ) {
+                    let reduced = source.reduce(0) {
+                        $0 + $1.key.count + $1.value
+                    }
+                    var visited = 0
+                    source.forEach { visited += $0.value }
+                    let contains = source.contains { $0.value > threshold }
+                    let all = source.allSatisfy { !$0.key.isEmpty }
+                    let first = source.first { $0.value < 0 }
+                    let minimum = source.min { $0.value < $1.value }
+                    return (reduced, visited, contains, all, first, minimum)
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try dictionary([
+                                ("a", 1), ("bb", 4), ("c", -2),
+                            ]),
+                            try integer(3),
+                        ],
+                        expected: .returned(.tuple([
+                            try integer(7),
+                            try integer(3),
+                            .bool(true),
+                            .bool(true),
+                            .optional(.tuple([.string("c"), try integer(-2)])),
+                            .optional(.tuple([.string("c"), try integer(-2)])),
+                        ]))
+                    ),
+                    .init(
+                        arguments: [try dictionary([]), try integer(0)],
+                        expected: .returned(.tuple([
+                            try integer(0),
+                            try integer(0),
+                            .bool(false),
+                            .bool(true),
+                            .optional(nil),
+                            .optional(nil),
+                        ]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "dictionaryAccumulates",
+                source: """
+                public func dictionaryAccumulates(
+                    _ source: [String: Int]
+                ) -> [Int] {
+                    source.reduce(into: [Int]()) {
+                        $0.append($1.value)
+                    }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try dictionary([
+                            ("a", 1), ("bb", 4), ("c", -2),
+                        ])],
+                        expected: .returned(try integers([1, 4, -2]))
+                    ),
+                    .init(
+                        arguments: [try dictionary([])],
+                        expected: .returned(try integers([]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "setTransforms",
+                source: """
+                public func setTransforms(
+                    _ source: Set<Int>,
+                    _ threshold: Int
+                ) -> ([Int], [Int], [Int]) {
+                    let mapped = source.map { $0 * 2 }
+                    let flattened = source.flatMap { [$0, $0 + 1] }
+                    let compacted = source.compactMap {
+                        $0 > threshold ? $0 : nil
+                    }
+                    return (mapped, flattened, compacted)
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try set([4, 1, 7]), try integer(4)],
+                        expected: .returned(.tuple([
+                            try integers([8, 2, 14]),
+                            try integers([4, 5, 1, 2, 7, 8]),
+                            try integers([7]),
+                        ]))
+                    ),
+                    .init(
+                        arguments: [try set([]), try integer(0)],
+                        expected: .returned(.tuple([
+                            try integers([]),
+                            try integers([]),
+                            try integers([]),
+                        ]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "setQueries",
+                source: """
+                public func setQueries(
+                    _ source: Set<Int>,
+                    _ threshold: Int
+                ) -> (Int, Int, Bool, Bool, Int?, Int?) {
+                    let reduced = source.reduce(0, +)
+                    var visited = 0
+                    source.forEach { visited += $0 }
+                    let contains = source.contains { $0 > threshold }
+                    let all = source.allSatisfy { $0 > 0 }
+                    let first = source.first { $0 > threshold }
+                    let minimum = source.min { $0 < $1 }
+                    return (reduced, visited, contains, all, first, minimum)
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try set([4, 1, 7]), try integer(4)],
+                        expected: .returned(.tuple([
+                            try integer(12),
+                            try integer(12),
+                            .bool(true),
+                            .bool(true),
+                            .optional(try integer(7)),
+                            .optional(try integer(1)),
+                        ]))
+                    ),
+                    .init(
+                        arguments: [try set([]), try integer(0)],
+                        expected: .returned(.tuple([
+                            try integer(0),
+                            try integer(0),
+                            .bool(false),
+                            .bool(true),
+                            .optional(nil),
+                            .optional(nil),
+                        ]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "setAccumulates",
+                source: """
+                public func setAccumulates(_ source: Set<Int>) -> [Int] {
+                    source.reduce(into: [Int]()) { $0.append($1) }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try set([4, 1, 7])],
+                        expected: .returned(try integers([4, 1, 7]))
+                    ),
+                    .init(
+                        arguments: [try set([])],
+                        expected: .returned(try integers([]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "dictionaryPreservingTransforms",
+                source: """
+                public func dictionaryPreservingTransforms(
+                    _ source: [String: Int],
+                    _ threshold: Int
+                ) -> ([String: Int], [String: Int], [String: Int]) {
+                    let filtered = source.filter { $0.value > threshold }
+                    let mapped = source.mapValues { $0 + 10 }
+                    let compacted = source.compactMapValues {
+                        $0 > threshold ? $0 * 2 : nil
+                    }
+                    return (filtered, mapped, compacted)
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try dictionary([
+                                ("a", 1), ("bb", 4), ("c", -2),
+                            ]),
+                            try integer(0),
+                        ],
+                        expected: .returned(.tuple([
+                            try dictionary([("a", 1), ("bb", 4)]),
+                            try dictionary([
+                                ("a", 11), ("bb", 14), ("c", 8),
+                            ]),
+                            try dictionary([("a", 2), ("bb", 8)]),
+                        ]))
+                    ),
+                    .init(
+                        arguments: [try dictionary([]), try integer(0)],
+                        expected: .returned(.tuple([
+                            try dictionary([]),
+                            try dictionary([]),
+                            try dictionary([]),
+                        ]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "setFilterPreservesValueSemantics",
+                source: """
+                public func setFilterPreservesValueSemantics(
+                    _ source: Set<Int>,
+                    _ threshold: Int
+                ) -> (Set<Int>, Int) {
+                    (source.filter { $0 > threshold }, source.count)
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try set([4, 1, 7]), try integer(3)],
+                        expected: .returned(.tuple([
+                            try set([4, 7]),
+                            try integer(3),
+                        ]))
+                    ),
+                    .init(
+                        arguments: [try set([]), try integer(0)],
+                        expected: .returned(.tuple([
+                            try set([]),
+                            try integer(0),
+                        ]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "filterStringSet",
+                source: """
+                public func filterStringSet(
+                    _ source: Set<String>
+                ) -> (Set<String>, Int) {
+                    (source.filter { $0.count > 1 }, source.count)
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [stringSet(["a", "beta", "cc"])],
+                        expected: .returned(.tuple([
+                            stringSet(["beta", "cc"]),
+                            try integer(3),
+                        ]))
+                    ),
+                    .init(
+                        arguments: [stringSet([])],
+                        expected: .returned(.tuple([
+                            stringSet([]),
+                            try integer(0),
+                        ]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "transformStringDictionary",
+                source: """
+                enum StringTransformError: Error { case empty }
+
+                public func transformStringDictionary(
+                    _ source: [String: String]
+                ) -> (
+                    [String: String], [String: String],
+                    [String: String], [String: String]
+                ) {
+                    let filtered = source.filter { !$0.value.isEmpty }
+                    let mapped = source.mapValues { $0 + "!" }
+                    let compacted = source.compactMapValues {
+                        $0.isEmpty ? nil : $0
+                    }
+                    let safelyMapped: [String: String]
+                    do {
+                        safelyMapped = try source.mapValues {
+                            if $0.isEmpty { throw StringTransformError.empty }
+                            return $0 + "?"
+                        }
+                    } catch {
+                        safelyMapped = [:]
+                    }
+                    return (filtered, mapped, compacted, safelyMapped)
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [stringDictionary([
+                            ("a", "one"), ("b", ""),
+                        ])],
+                        expected: .returned(.tuple([
+                            stringDictionary([("a", "one")]),
+                            stringDictionary([
+                                ("a", "one!"), ("b", "!"),
+                            ]),
+                            stringDictionary([("a", "one")]),
+                            stringDictionary([]),
+                        ]))
+                    ),
+                    .init(
+                        arguments: [stringDictionary([("a", "one")])],
+                        expected: .returned(.tuple([
+                            stringDictionary([("a", "one")]),
+                            stringDictionary([("a", "one!")]),
+                            stringDictionary([("a", "one")]),
+                            stringDictionary([("a", "one?")]),
+                        ]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "safeDictionaryPreservingTransforms",
+                source: """
+                enum DictionaryTransformError: Error { case negative }
+
+                public func safeDictionaryPreservingTransforms(
+                    _ source: [String: Int]
+                ) -> ([String: Int], [String: Int], [String: Int]) {
+                    let filtered: [String: Int]
+                    do {
+                        filtered = try source.filter {
+                            if $0.value < 0 {
+                                throw DictionaryTransformError.negative
+                            }
+                            return true
+                        }
+                    } catch {
+                        filtered = [:]
+                    }
+
+                    let mapped: [String: Int]
+                    do {
+                        mapped = try source.mapValues {
+                            if $0 < 0 {
+                                throw DictionaryTransformError.negative
+                            }
+                            return $0 * 2
+                        }
+                    } catch {
+                        mapped = [:]
+                    }
+
+                    let compacted: [String: Int]
+                    do {
+                        compacted = try source.compactMapValues {
+                            if $0 < 0 {
+                                throw DictionaryTransformError.negative
+                            }
+                            return $0 > 1 ? $0 : nil
+                        }
+                    } catch {
+                        compacted = [:]
+                    }
+                    return (filtered, mapped, compacted)
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try dictionary([("a", 1), ("b", 3)])],
+                        expected: .returned(.tuple([
+                            try dictionary([("a", 1), ("b", 3)]),
+                            try dictionary([("a", 2), ("b", 6)]),
+                            try dictionary([("b", 3)]),
+                        ]))
+                    ),
+                    .init(
+                        arguments: [try dictionary([("a", 1), ("b", -3)])],
+                        expected: .returned(.tuple([
+                            try dictionary([]),
+                            try dictionary([]),
+                            try dictionary([]),
+                        ]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "safeSetFilter",
+                source: """
+                enum SetFilterError: Error { case negative }
+
+                public func safeSetFilter(_ source: Set<Int>) -> Set<Int> {
+                    do {
+                        return try source.filter {
+                            if $0 < 0 { throw SetFilterError.negative }
+                            return $0 > 1
+                        }
+                    } catch {
+                        return []
+                    }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try set([4, 1, 7])],
+                        expected: .returned(try set([4, 7]))
+                    ),
+                    .init(
+                        arguments: [try set([4, -1, 7])],
+                        expected: .returned(try set([]))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "safeDictionaryMap",
+                source: """
+                enum DictionaryMapError: Error { case negative }
+
+                public func safeDictionaryMap(
+                    _ source: [String: Int]
+                ) -> [Int] {
+                    do {
+                        return try source.map {
+                            if $0.value < 0 {
+                                throw DictionaryMapError.negative
+                            }
+                            return $0.value * 2
+                        }
+                    } catch {
+                        return []
+                    }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try dictionary([("a", 1), ("b", 3)])],
+                        expected: .returned(try integers([2, 6]))
+                    ),
+                    .init(
+                        arguments: [try dictionary([("a", 1), ("b", -3)])],
+                        expected: .returned(try integers([]))
+                    ),
+                ]
+            ),
+        ])
+    }
+
     @Test("Throwing map propagates its indirect Error channel")
     func lowersThrowingMap() throws {
         try run([
@@ -1285,6 +1769,30 @@ struct HigherOrderSemanticsMatrix {
             [String: NSObject]()
         }
 
+        public func mappedDictionaryObjects(
+            _ values: [String: NSObject]
+        ) -> [NSObject] {
+            values.map { $0.value }
+        }
+
+        public func filteredObjectDictionary(
+            _ values: [String: NSObject]
+        ) -> [String: NSObject] {
+            values.filter { _ in true }
+        }
+
+        public func mappedObjectDictionary(
+            _ values: [String: NSObject]
+        ) -> [String: NSObject] {
+            values.mapValues { $0 }
+        }
+
+        public func compactedObjectDictionary(
+            _ values: [String: NSObject]
+        ) -> [String: NSObject] {
+            values.compactMapValues { $0 }
+        }
+
         public func firstObject(_ values: [NSObject]) -> NSObject? {
             values.first { _ in true }
         }
@@ -1398,6 +1906,8 @@ struct HigherOrderSemanticsMatrix {
             "mappedObjects", "flatMappedObjects", "filteredObjects",
             "compactedObjects", "prefixedObjects", "droppedObjects",
             "reducedObject", "reducedObjects", "emptyObjectDictionary",
+            "mappedDictionaryObjects", "filteredObjectDictionary",
+            "mappedObjectDictionary", "compactedObjectDictionary",
             "firstObject", "firstObjectIndex",
             "lastObject", "lastObjectIndex", "minimumObject",
             "maximumObject", "containsObject", "visitsObjects",
@@ -1502,10 +2012,7 @@ struct HigherOrderSemanticsMatrix {
                     body.parameterRegisters,
                     body.parameterConventions
                 ).contains { register, convention in
-                    [
-                        Bytecode.ValueType.native(nativeType),
-                        .optional(.native(nativeType)),
-                    ].contains(body.type(of: register))
+                    body.type(of: register)?.requiresLinearOwnership == true
                         && convention == .borrowed
                 }
             })
@@ -1574,6 +2081,42 @@ struct HigherOrderSemanticsMatrix {
 
     private func strings(_ values: [String]) -> VM.Value {
         .array(values.map(VM.Value.string), elementType: .string)
+    }
+
+    private func dictionary(
+        _ pairs: [(String, Int64)]
+    ) throws -> VM.Value {
+        .dictionary(
+            try pairs.map {
+                .init(key: .string($0.0), value: try integer($0.1))
+            },
+            keyType: .string,
+            valueType: .int64
+        )
+    }
+
+    private func stringDictionary(
+        _ pairs: [(String, String)]
+    ) -> VM.Value {
+        .dictionary(
+            pairs.map {
+                .init(key: .string($0.0), value: .string($0.1))
+            },
+            keyType: .string,
+            valueType: .string
+        )
+    }
+
+    private func set(_ values: [Int64]) throws -> VM.Value {
+        .set(
+            .init(elements: try values.map(integer), elementType: .int64)
+        )
+    }
+
+    private func stringSet(_ values: [String]) -> VM.Value {
+        .set(
+            .init(elements: values.map(VM.Value.string), elementType: .string)
+        )
     }
 }
 }

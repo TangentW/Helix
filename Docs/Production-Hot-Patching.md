@@ -173,10 +173,13 @@ common Array index/search/extremum/sequence relations plus type-generic,
 Array-backed structural concatenation/insertion/replacement/removal/swap and
 capacity hints, Dictionary lookup/subscript mutation, `updateValue`,
 `removeValue`, `removeAll`, key/value projection, unique-key sequence
-construction and capacity hints, and typed Set construction/query/mutation/iteration/algebra with
-recursively VM-defined Equatable/Hashable semantics, common fully concrete Array-backed
-`map`/`flatMap`/`filter`/`compactMap`/`reduce`/short-circuit predicate
-operations, plus typed
+construction and capacity hints, and typed Set
+construction/query/mutation/iteration/algebra with recursively VM-defined
+Equatable/Hashable semantics. Common fully concrete transforms, reductions,
+visits, predicate queries, and comparator selection share one closure traversal
+across Array, Dictionary, and Set; all three preserve their container through
+`filter`, while Dictionary also supports `mapValues` and `compactMapValues`.
+The subset additionally includes typed
 enumerated/reversed/repeated/sliced/zipped/joined Array-backed adapters,
 `Optional.map`/`flatMap`, concrete `Result` payload transforms and
 `Result.get()` for patch-local value payloads, VM-owned `Any`, and common

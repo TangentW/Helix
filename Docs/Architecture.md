@@ -97,7 +97,11 @@ Both workflows depend on stable, build-specific identities:
   promotion, an owned boundary, or the final borrowed use closes it exactly
   once, and representation-preserving reference aliases share that lifetime.
   This applies equally to imported references, Arrays, Optionals, tuples, and
-  other represented linear values.
+  other represented linear values. When canonical SIL retains a tuple and then
+  releases or transfers its fields independently, lowering destructures that
+  explicit owner and distributes ownership to the projected values; an
+  aggregate assembled solely for erased debug metadata is not materialized as
+  a VM owner.
 - Compiler-only tuple storage uses semantic field paths rather than projection
   order. It recursively transitions between one aggregate owner and disjoint
   field owners, so early projections, nested tuples, whole-value assignment,
@@ -120,7 +124,8 @@ Both workflows depend on stable, build-specific identities:
   kind distinguishes builder, stable-sort, and split machines. This keeps the
   noncopyable boundary rules and recursive element typing in one abstraction
   while preventing one algorithm's instructions from consuming another's
-  state. Array-producing closure traversals use its builder kind.
+  state. Element-producing traversals and typed collection finalization use
+  its builder kind.
   Scalar appends and bounded whole-Array appends share the same verifier-owned
   element type and precharge copied storage before allocation; this supports
   Sequence-returning `flatMap` without an intermediate nested Array.
@@ -151,6 +156,16 @@ Both workflows depend on stable, build-specific identities:
   one owned candidate through the CFG. Their two borrowed inputs are ordered
   exactly as Swift specifies, ties retain the earliest element, and both the
   candidate and challenger are closed on a throwing edge.
+- Common fully concrete Sequence transformations compose that cursor with the
+  ordinary closure ABI instead of importing Swift generic collection methods.
+  One linear element buffer serves Array-producing transforms as well as
+  container-preserving Array/Dictionary/Set `filter` and Dictionary value
+  transforms; the result type selects the verified finalizer. Dictionary's
+  generic callback receives the represented `(Key, Value)` tuple, while its
+  specialized filter and value-transform ABIs project key/value fields before
+  re-entering the same closure CFG. Consuming standard-library overloads take
+  the frontend's explicit retained source owner, and every normal, empty, and
+  throwing exit closes the source, cursor, fields, and builder exactly once.
 - Mutating higher-order callbacks use the same address model as ordinary
   calls. `reduce(into:_:)` keeps an arbitrary represented accumulator in one
   frame-owned slot, opens a narrow modify scope for each callback, and closes

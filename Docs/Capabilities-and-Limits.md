@@ -122,16 +122,21 @@ does not by itself certify a physical device or distribution channel.
   Hashable domain. User-defined `Hashable` or equality witnesses remain
   fail-closed because downloaded code cannot invoke arbitrary hashing or
   equality. Generic `Array()` and `Dictionary()` construction is supported for
-  represented element/key/value types. Fully concrete Array-backed `map`,
-  `flatMap`, `filter`, `compactMap`, `prefix(while:)`, Collection
-  `drop(while:)`, `reduce`, `reduce(into:_:)`,
-  `forEach`, `first(where:)`, `last(where:)`, zero-based Array-backed
-  `firstIndex(where:)`/`lastIndex(where:)`, `contains(where:)`, and
-  `allSatisfy`, comparator-driven `min(by:)`/`max(by:)`,
-  `sorted(by:)`/`sort(by:)`, and zero-based Array `partition(by:)`, use verified
-  closure control flow; Array-producing variants use a linear,
-  invocation-local builder instead of repeated copy-on-write append. The
-  `last` searches invoke their predicates from the end; comparator selection
+  represented element/key/value types. Fully concrete `map`, `flatMap`,
+  `compactMap`, `reduce`, `reduce(into:_:)`, `forEach`, `first(where:)`,
+  `contains(where:)`, `allSatisfy`, and comparator-driven
+  `min(by:)`/`max(by:)` share verified closure traversal across represented
+  Array, Dictionary, and Set values. Dictionary elements use their native
+  `(key: Key, value: Value)` tuple shape. Container-preserving `filter` is
+  supported for all three containers, and Dictionary additionally supports
+  `mapValues` and `compactMapValues`; their specialized key/value callback ABI
+  is projected from the same tuple traversal. Array-only reverse
+  `last(where:)`, zero-based `firstIndex(where:)`/`lastIndex(where:)`,
+  `prefix(while:)`, Collection `drop(while:)`, `sorted(by:)`/`sort(by:)`, and
+  zero-based `partition(by:)` retain their existing constraints. Producing
+  variants use one linear invocation-local element buffer followed by a typed
+  Array, Dictionary, or Set finalizer instead of repeated copy-on-write edits.
+  The `last` searches invoke their predicates from the end; comparator selection
   preserves Swift's argument order and first-element tie behavior. Comparator
   sorting uses a bounded stable merge-state machine, while partition emits a
   deterministic stable false group followed by a stable true group and returns

@@ -96,8 +96,15 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .higherOrder(.flatMap)
         case "$ss14_ArrayProtocolPsE6filterySay7ElementQzGSbAEKXEKF":
             self = .higherOrder(.filter)
+        case "$sSD6filterySDyxq_GSbx3key_q_5valuet_tKXEKF",
+             "$sSh6filteryShyxGSbxKXEKF":
+            self = .higherOrder(.filter)
         case "$sSTsE10compactMapySayqd__Gqd__Sg7ElementQzKXEKlF":
             self = .higherOrder(.compactMap)
+        case "$sSD9mapValuesySDyxqd__Gqd__q_KXEKlF":
+            self = .higherOrder(.mapValues)
+        case "$sSD16compactMapValuesySDyxqd__Gqd__Sgq_KXEKlF":
+            self = .higherOrder(.compactMapValues)
         case "$sSlsE6prefix5while11SubSequenceQzSb7ElementQzKXE_tKF",
              "$sSTsE6prefix5whileSay7ElementQzGSbADKXE_tKF":
             self = .higherOrder(.prefixWhile)

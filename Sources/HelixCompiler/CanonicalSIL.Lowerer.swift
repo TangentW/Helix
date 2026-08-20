@@ -207,9 +207,10 @@ public struct Lowerer: Sendable {
         var requiresInitialization = true
     }
 
-    private struct ArrayHigherOrderPlan {
+    private struct CollectionHigherOrderPlan {
         var operation: CanonicalSIL.HigherOrderIntrinsic
         var sourceToken: String
+        var sourceType: Bytecode.ValueType
         var closureToken: String
         var initialToken: String?
         var resultDestination: String?
@@ -217,6 +218,18 @@ public struct Lowerer: Sendable {
         var inputType: Bytecode.ValueType
         var closureResultType: Bytecode.ValueType
         var callResultType: Bytecode.ValueType
+        var callbackShape: CollectionCallbackShape = .element
+        var consumesSource = false
+    }
+
+    private enum CollectionCallbackShape: Equatable {
+        /// The closure receives the collection's represented `Element`.
+        case element
+        /// `Dictionary.mapValues` callbacks receive only the value field.
+        case dictionaryValue
+        /// `Dictionary.filter` has a two-argument key/value callback ABI even
+        /// though the represented sequence element is one tuple.
+        case dictionaryKeyValue
     }
 
     private struct ArrayOrderingPlan {
@@ -1233,7 +1246,8 @@ public struct Lowerer: Sendable {
         }
 
         func unpackTupleValue(
-            _ tuple: Bytecode.Register
+            _ tuple: Bytecode.Register,
+            retainedOwnerFor token: String? = nil
         ) throws -> [Bytecode.Register] {
             guard case let .tuple(types) = registerTypes[Int(tuple.rawValue)]
             else {
@@ -1244,9 +1258,21 @@ public struct Lowerer: Sendable {
             if let existing = unpackedTuples[tuple] {
                 return existing
             }
+            let owner = token.flatMap(takePendingRetainedValue) ?? tuple
+            guard registerTypes[Int(owner.rawValue)] == .tuple(types) else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "retained tuple projection owner has the wrong type"
+                )
+            }
             let elements = try types.map { try allocate(type: $0) }
             unpackedTuples[tuple] = elements
-            appendInstruction(.unpackTuple(results: elements, tuple: tuple))
+            unpackedTuples[owner] = elements
+            // Canonical SIL commonly retains an aggregate before projecting
+            // fields whose ownership is then released or transferred
+            // independently. Destructure that explicit owner so the borrowed
+            // aggregate itself remains untouched and ownership is distributed
+            // to the projected VM values.
+            appendInstruction(.unpackTuple(results: elements, tuple: owner))
             return elements
         }
 
@@ -4214,8 +4240,8 @@ public struct Lowerer: Sendable {
         /// in one frame slot and pass a scoped address into each invocation;
         /// this models Swift's inout exclusivity without copying the
         /// accumulator or teaching the VM about a particular accumulator type.
-        func lowerArrayReduceIntoTryApply(
-            plan: ArrayHigherOrderPlan,
+        func lowerCollectionReduceIntoTryApply(
+            plan: CollectionHigherOrderPlan,
             normalTarget: Bytecode.BlockID,
             errorTarget: Bytecode.BlockID,
             line: Int
@@ -4235,11 +4261,10 @@ public struct Lowerer: Sendable {
             )
             let source = try borrowedSource?.register
                 ?? resolve(plan.sourceToken, line: line)
-            guard registerTypes[Int(source.rawValue)]
-                    == .array(plan.inputType)
+            guard registerTypes[Int(source.rawValue)] == plan.sourceType
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "reduce(into:_:) source does not match its Array specialization"
+                    "reduce(into:_:) source does not match its Collection specialization"
                 )
             }
 
@@ -4458,7 +4483,7 @@ public struct Lowerer: Sendable {
             )
         }
 
-        func lowerArrayHigherOrderTryApply(
+        func lowerCollectionHigherOrderTryApply(
             operation: CanonicalSIL.HigherOrderIntrinsic,
             genericArguments: String,
             argumentText: String,
@@ -4466,14 +4491,14 @@ public struct Lowerer: Sendable {
             errorTarget: Bytecode.BlockID,
             line: Int
         ) throws {
-            let plan = try parseArrayHigherOrderPlan(
+            let plan = try parseCollectionHigherOrderPlan(
                 operation: operation,
                 genericArguments: genericArguments,
                 argumentText: argumentText,
                 line: line
             )
             if operation == .reduceInto {
-                try lowerArrayReduceIntoTryApply(
+                try lowerCollectionReduceIntoTryApply(
                     plan: plan,
                     normalTarget: normalTarget,
                     errorTarget: errorTarget,
@@ -4492,17 +4517,26 @@ public struct Lowerer: Sendable {
                 }
                 return register
             }
-            let borrowedSource = try borrowStoredValue(
-                at: plan.sourceToken,
-                line: line
-            )
-            let source = try borrowedSource?.register
-                ?? resolve(plan.sourceToken, line: line)
-            guard registerTypes[Int(source.rawValue)]
-                    == .array(plan.inputType)
+            let borrowedSource: BorrowedStoredValue?
+            let source: Bytecode.Register
+            if plan.consumesSource {
+                borrowedSource = nil
+                source = try materializeOwnedValue(
+                    at: plan.sourceToken,
+                    line: line
+                )
+            } else {
+                borrowedSource = try borrowStoredValue(
+                    at: plan.sourceToken,
+                    line: line
+                )
+                source = try borrowedSource?.register
+                    ?? resolve(plan.sourceToken, line: line)
+            }
+            guard registerTypes[Int(source.rawValue)] == plan.sourceType
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "higher-order source does not match its Array specialization"
+                    "higher-order source does not match its Collection specialization"
                 )
             }
             let closure = try resolve(plan.closureToken, line: line)
@@ -4516,16 +4550,49 @@ public struct Lowerer: Sendable {
                     mangledName: "<higher-order closure>"
                 )
             }
-            let expectedClosureParameters: [Bytecode.ValueType] = switch plan.operation {
-            case .reduce:
-                [plan.callResultType, plan.inputType]
-            case .minimumBy, .maximumBy:
-                [plan.inputType, plan.inputType]
-            case .map, .flatMap, .filter, .compactMap, .prefixWhile,
-                 .dropWhile, .forEach, .firstWhere, .lastWhere,
-                 .firstIndexWhere, .lastIndexWhere, .containsWhere,
-                 .allSatisfy, .reduceInto:
-                [plan.inputType]
+            let dictionaryTypes: (
+                key: Bytecode.ValueType,
+                value: Bytecode.ValueType
+            )? = if case let .dictionary(key, value) = plan.sourceType {
+                (key, value)
+            } else {
+                nil
+            }
+            let expectedClosureParameters: [Bytecode.ValueType]
+            switch plan.callbackShape {
+            case .dictionaryValue:
+                guard let dictionaryTypes else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary value callback has a non-Dictionary source"
+                    )
+                }
+                expectedClosureParameters = [dictionaryTypes.value]
+            case .dictionaryKeyValue:
+                guard let dictionaryTypes else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary key/value callback has a non-Dictionary source"
+                    )
+                }
+                expectedClosureParameters = [
+                    dictionaryTypes.key,
+                    dictionaryTypes.value,
+                ]
+            case .element:
+                expectedClosureParameters = switch plan.operation {
+                case .reduce:
+                    [plan.callResultType, plan.inputType]
+                case .minimumBy, .maximumBy:
+                    [plan.inputType, plan.inputType]
+                case .map, .flatMap, .filter, .compactMap, .prefixWhile,
+                     .dropWhile, .forEach, .firstWhere, .lastWhere,
+                     .firstIndexWhere, .lastIndexWhere, .containsWhere,
+                     .allSatisfy, .reduceInto:
+                    [plan.inputType]
+                case .mapValues, .compactMapValues:
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary value transform lost its callback projection"
+                    )
+                }
             }
             guard closureSignature.parameters == expectedClosureParameters,
                   closureSignature.parameterConventions.count
@@ -4634,10 +4701,15 @@ public struct Lowerer: Sendable {
             )
 
             let builder: Bytecode.Register?
-            if plan.operation.usesArrayBuilder {
-                guard case let .array(element) = plan.callResultType else {
+            if plan.operation.usesElementBuilder {
+                let element: Bytecode.ValueType = switch plan.callResultType {
+                case let .array(element), let .set(element):
+                    element
+                case let .dictionary(key, value):
+                    .tuple([key, value])
+                default:
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "higher-order Array builder has a non-Array result"
+                        "higher-order builder has an unsupported result container"
                     )
                 }
                 let register = try allocate(
@@ -4647,6 +4719,74 @@ public struct Lowerer: Sendable {
                 builder = register
             } else {
                 builder = nil
+            }
+            func finishCollectionBuilder(
+                _ builder: Bytecode.Register
+            ) throws -> (
+                result: Bytecode.Register,
+                instructions: [IntermediateRepresentation.Instruction]
+            ) {
+                let result = try allocate(type: plan.callResultType)
+                switch plan.callResultType {
+                case .array:
+                    return (
+                        result,
+                        [.finishArrayBuilder(result: result, builder: builder)]
+                    )
+                case let .dictionary(key, value):
+                    let bufferedType = Bytecode.ValueType.array(
+                        .tuple([key, value])
+                    )
+                    let buffered = try allocate(type: bufferedType)
+                    var instructions: [IntermediateRepresentation.Instruction] = [
+                        .finishArrayBuilder(result: buffered, builder: builder),
+                        .makeDictionary(result: result, pairs: buffered),
+                    ]
+                    if bufferedType.requiresLinearOwnership {
+                        instructions.append(.destroyValue(buffered))
+                    }
+                    return (result, instructions)
+                case let .set(element):
+                    let bufferedType = Bytecode.ValueType.array(element)
+                    let buffered = try allocate(type: bufferedType)
+                    var instructions: [IntermediateRepresentation.Instruction] = [
+                        .finishArrayBuilder(result: buffered, builder: builder),
+                        .makeSet(result: result, source: buffered),
+                    ]
+                    if bufferedType.requiresLinearOwnership {
+                        instructions.append(.destroyValue(buffered))
+                    }
+                    return (result, instructions)
+                default:
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "higher-order builder has an unsupported result container"
+                    )
+                }
+            }
+            func appendDictionaryPair(
+                key: Bytecode.Register,
+                value: Bytecode.Register,
+                to builder: Bytecode.Register
+            ) throws -> [IntermediateRepresentation.Instruction] {
+                guard case let .dictionary(keyType, valueType) =
+                    plan.callResultType,
+                    registerTypes[Int(key.rawValue)] == keyType,
+                    registerTypes[Int(value.rawValue)] == valueType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary builder pair does not match its result type"
+                    )
+                }
+                let pairType = Bytecode.ValueType.tuple([keyType, valueType])
+                let pair = try allocate(type: pairType)
+                var instructions: [IntermediateRepresentation.Instruction] = [
+                    .makeTuple(result: pair, elements: [key, value]),
+                    .arrayBuilderAppend(builder: builder, value: pair),
+                ]
+                if pairType.requiresLinearOwnership {
+                    instructions.append(.destroyValue(pair))
+                }
+                return instructions
             }
             let accumulatorType: Bytecode.ValueType? = if plan.operation == .reduce {
                 plan.callResultType
@@ -4701,35 +4841,122 @@ public struct Lowerer: Sendable {
                 ? nil
                 : allocate(type: plan.closureResultType)
 
-            let inputConvention = closureSignature.parameterConventions[
-                plan.operation == .reduce ? 1 : 0
-            ]
-            let closureInput: Bytecode.Register
             var closureArgumentPreparation: [
                 IntermediateRepresentation.Instruction
             ] = []
-            if plan.inputType.requiresLinearOwnership,
-               inputConvention == .owned,
-               plan.operation.retainsInputAfterCall {
-                let copy = try allocate(type: plan.inputType)
-                closureArgumentPreparation.append(
-                    .copyValue(result: copy, source: element)
-                )
-                closureInput = copy
+            var dictionaryProjectionInstructions: [
+                IntermediateRepresentation.Instruction
+            ] = []
+            var projectedFieldCleanup: [
+                IntermediateRepresentation.Instruction
+            ] = []
+            let closureInput: Bytecode.Register?
+            let projectedClosureArguments: [Bytecode.Register]
+            let inputNeedsCleanup: Bool
+            let dictionaryKey: Bytecode.Register?
+            let dictionaryValue: Bytecode.Register?
+            if plan.callbackShape == .element {
+                dictionaryKey = nil
+                dictionaryValue = nil
+                projectedClosureArguments = []
+                let inputConvention = closureSignature.parameterConventions[
+                    plan.operation == .reduce ? 1 : 0
+                ]
+                if plan.inputType.requiresLinearOwnership,
+                   inputConvention == .owned,
+                   plan.operation.retainsInputAfterCall {
+                    let copy = try allocate(type: plan.inputType)
+                    closureArgumentPreparation.append(
+                        .copyValue(result: copy, source: element)
+                    )
+                    closureInput = copy
+                } else {
+                    closureInput = element
+                }
+                inputNeedsCleanup = plan.inputType.requiresLinearOwnership
+                    && (inputConvention == .borrowed
+                        || plan.operation.retainsInputAfterCall)
             } else {
-                closureInput = element
+                guard let dictionaryTypes,
+                      plan.inputType == .tuple([
+                        dictionaryTypes.key,
+                        dictionaryTypes.value,
+                      ])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary callback projection has a mismatched element"
+                    )
+                }
+                let key = try allocate(type: dictionaryTypes.key)
+                let value = try allocate(type: dictionaryTypes.value)
+                dictionaryKey = key
+                dictionaryValue = value
+                dictionaryProjectionInstructions = [
+                    .unpackTuple(results: [key, value], tuple: element),
+                ]
+                if dictionaryTypes.key.requiresLinearOwnership {
+                    projectedFieldCleanup.append(.destroyValue(key))
+                }
+                if dictionaryTypes.value.requiresLinearOwnership {
+                    projectedFieldCleanup.append(.destroyValue(value))
+                }
+                func retainedClosureArgument(
+                    _ register: Bytecode.Register,
+                    type: Bytecode.ValueType,
+                    convention: Bytecode.ParameterConvention
+                ) throws -> Bytecode.Register {
+                    guard type.requiresLinearOwnership,
+                          convention == .owned
+                    else { return register }
+                    let copy = try allocate(type: type)
+                    closureArgumentPreparation.append(
+                        .copyValue(result: copy, source: register)
+                    )
+                    return copy
+                }
+                switch plan.callbackShape {
+                case .dictionaryValue:
+                    projectedClosureArguments = [
+                        try retainedClosureArgument(
+                            value,
+                            type: dictionaryTypes.value,
+                            convention: closureSignature.parameterConventions[0]
+                        ),
+                    ]
+                case .dictionaryKeyValue:
+                    projectedClosureArguments = [
+                        try retainedClosureArgument(
+                            key,
+                            type: dictionaryTypes.key,
+                            convention: closureSignature.parameterConventions[0]
+                        ),
+                        try retainedClosureArgument(
+                            value,
+                            type: dictionaryTypes.value,
+                            convention: closureSignature.parameterConventions[1]
+                        ),
+                    ]
+                case .element:
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "element callback entered Dictionary projection"
+                    )
+                }
+                closureInput = nil
+                inputNeedsCleanup = false
             }
-            let inputNeedsCleanup = plan.inputType.requiresLinearOwnership
-                && (inputConvention == .borrowed
-                    || plan.operation.retainsInputAfterCall)
             let accumulatorNeedsCleanup = accumulatorType?
                 .requiresLinearOwnership == true
                 && (plan.operation.isComparatorSelection
                     || closureSignature.parameterConventions[0] == .borrowed)
-            let sourceCleanup: [IntermediateRepresentation.Instruction] =
-                borrowedSource?.temporaryOwner.map {
+            let sourceCleanup: [IntermediateRepresentation.Instruction]
+            if plan.consumesSource,
+               plan.sourceType.requiresLinearOwnership {
+                sourceCleanup = [.destroyValue(source)]
+            } else {
+                sourceCleanup = borrowedSource?.temporaryOwner.map {
                     [.destroyValue($0)]
                 } ?? []
+            }
 
             let loopArguments = initialAccumulator.map { [$0] } ?? []
             let initialTarget = seed ?? loop
@@ -4808,23 +5035,41 @@ public struct Lowerer: Sendable {
             )
 
             let closureArguments: [Bytecode.Register]
-            if plan.operation == .reduce {
-                closureArguments = [
-                    try requiredRegister(loopAccumulator, "loop accumulator"),
+            switch plan.callbackShape {
+            case .dictionaryValue, .dictionaryKeyValue:
+                closureArguments = projectedClosureArguments
+            case .element:
+                let closureInput = try requiredRegister(
                     closureInput,
-                ]
-            } else if plan.operation == .minimumBy {
-                closureArguments = [
-                    closureInput,
-                    try requiredRegister(loopAccumulator, "minimum candidate"),
-                ]
-            } else if plan.operation == .maximumBy {
-                closureArguments = [
-                    try requiredRegister(loopAccumulator, "maximum candidate"),
-                    closureInput,
-                ]
-            } else {
-                closureArguments = [closureInput]
+                    "collection element callback input"
+                )
+                if plan.operation == .reduce {
+                    closureArguments = [
+                        try requiredRegister(
+                            loopAccumulator,
+                            "loop accumulator"
+                        ),
+                        closureInput,
+                    ]
+                } else if plan.operation == .minimumBy {
+                    closureArguments = [
+                        closureInput,
+                        try requiredRegister(
+                            loopAccumulator,
+                            "minimum candidate"
+                        ),
+                    ]
+                } else if plan.operation == .maximumBy {
+                    closureArguments = [
+                        try requiredRegister(
+                            loopAccumulator,
+                            "maximum candidate"
+                        ),
+                        closureInput,
+                    ]
+                } else {
+                    closureArguments = [closureInput]
+                }
             }
             let closureContinuationArguments = directClosureResult.map {
                 [$0]
@@ -4855,7 +5100,8 @@ public struct Lowerer: Sendable {
             appendSyntheticBlock(
                 id: some,
                 parameters: [element],
-                instructions: closureInstructions
+                instructions: dictionaryProjectionInstructions
+                    + closureInstructions
             )
 
             let continuationResult = try plan.closureResultType == .void
@@ -4864,7 +5110,7 @@ public struct Lowerer: Sendable {
             let continuationParameters = continuationResult.map { [$0] } ?? []
             let materializedContinuationResult: Bytecode.Register?
             let resultMaterialization: [IntermediateRepresentation.Instruction]
-            if [.map, .reduce].contains(plan.operation),
+            if [.map, .mapValues, .reduce].contains(plan.operation),
                plan.closureResultType == .void {
                 let unit = try allocate(type: ValueRepresentation.unit)
                 materializedContinuationResult = unit
@@ -4899,7 +5145,7 @@ public struct Lowerer: Sendable {
                 )
                 var instructions = resultMaterialization + [
                     .arrayBuilderAppend(
-                        builder: try requiredRegister(builder, "Array builder"),
+                        builder: try requiredRegister(builder, "element builder"),
                         value: result
                     ),
                 ]
@@ -4922,7 +5168,7 @@ public struct Lowerer: Sendable {
                     .arrayBuilderAppendContents(
                         builder: try requiredRegister(
                             builder,
-                            "Array builder"
+                            "element builder"
                         ),
                         array: result
                     ),
@@ -4942,50 +5188,94 @@ public struct Lowerer: Sendable {
                     continuationResult,
                     "filter predicate"
                 )
-                let builder = try requiredRegister(builder, "Array builder")
+                let builder = try requiredRegister(builder, "element builder")
                 let append = try allocateSyntheticBlockID()
-                let skip = inputNeedsCleanup
-                    ? try allocateSyntheticBlockID()
-                    : loop
-                appendSyntheticBlock(
-                    id: closureContinuation,
-                    parameters: continuationParameters,
-                    instructions: [
-                        .conditionalBranch(
-                            condition: predicate,
-                            trueTarget: append,
-                            trueArguments: [],
-                            falseTarget: skip,
-                            falseArguments: []
-                        ),
-                    ]
-                )
-                appendSyntheticBlock(
-                    id: append,
-                    instructions: [
-                        .arrayBuilderAppend(
-                            builder: builder,
-                            value: element
-                        ),
-                    ] + (inputNeedsCleanup
-                        ? [.destroyValue(element)] : [])
-                        + [.branch(target: loop, arguments: [])]
-                )
-                if inputNeedsCleanup {
+                if plan.callbackShape == .dictionaryKeyValue {
+                    let skip = try allocateSyntheticBlockID()
+                    let key = try requiredRegister(
+                        dictionaryKey,
+                        "Dictionary.filter key"
+                    )
+                    let value = try requiredRegister(
+                        dictionaryValue,
+                        "Dictionary.filter value"
+                    )
+                    appendSyntheticBlock(
+                        id: closureContinuation,
+                        parameters: continuationParameters,
+                        instructions: [
+                            .conditionalBranch(
+                                condition: predicate,
+                                trueTarget: append,
+                                trueArguments: [],
+                                falseTarget: skip,
+                                falseArguments: []
+                            ),
+                        ]
+                    )
+                    appendSyntheticBlock(
+                        id: append,
+                        instructions: try appendDictionaryPair(
+                            key: key,
+                            value: value,
+                            to: builder
+                        ) + [.branch(target: loop, arguments: [])]
+                    )
                     appendSyntheticBlock(
                         id: skip,
-                        instructions: [
-                            .destroyValue(element),
+                        instructions: projectedFieldCleanup + [
                             .branch(target: loop, arguments: []),
                         ]
                     )
+                } else {
+                    guard plan.callbackShape == .element else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "filter has an unsupported callback projection"
+                        )
+                    }
+                    let skip = inputNeedsCleanup
+                        ? try allocateSyntheticBlockID()
+                        : loop
+                    appendSyntheticBlock(
+                        id: closureContinuation,
+                        parameters: continuationParameters,
+                        instructions: [
+                            .conditionalBranch(
+                                condition: predicate,
+                                trueTarget: append,
+                                trueArguments: [],
+                                falseTarget: skip,
+                                falseArguments: []
+                            ),
+                        ]
+                    )
+                    appendSyntheticBlock(
+                        id: append,
+                        instructions: [
+                            .arrayBuilderAppend(
+                                builder: builder,
+                                value: element
+                            ),
+                        ] + (inputNeedsCleanup
+                            ? [.destroyValue(element)] : [])
+                            + [.branch(target: loop, arguments: [])]
+                    )
+                    if inputNeedsCleanup {
+                        appendSyntheticBlock(
+                            id: skip,
+                            instructions: [
+                                .destroyValue(element),
+                                .branch(target: loop, arguments: []),
+                            ]
+                        )
+                    }
                 }
             case .compactMap:
                 let optional = try requiredRegister(
                     continuationResult,
                     "compactMap result"
                 )
-                let builder = try requiredRegister(builder, "Array builder")
+                let builder = try requiredRegister(builder, "element builder")
                 let append = try allocateSyntheticBlockID()
                 let skip = try allocateSyntheticBlockID()
                 guard case let .array(mappedType) = plan.callResultType else {
@@ -5023,15 +5313,119 @@ public struct Lowerer: Sendable {
                         .branch(target: loop, arguments: []),
                     ]
                 )
+            case .mapValues:
+                guard plan.callbackShape == .dictionaryValue,
+                      let dictionaryTypes,
+                      case let .dictionary(_, mappedType) = plan.callResultType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "mapValues has an invalid Dictionary lowering plan"
+                    )
+                }
+                let key = try requiredRegister(
+                    dictionaryKey,
+                    "mapValues key"
+                )
+                let originalValue = try requiredRegister(
+                    dictionaryValue,
+                    "mapValues original value"
+                )
+                let mapped = try requiredRegister(
+                    materializedContinuationResult,
+                    "mapValues result"
+                )
+                guard registerTypes[Int(mapped.rawValue)] == mappedType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "mapValues closure result does not match its Dictionary"
+                    )
+                }
+                var instructions = resultMaterialization
+                if dictionaryTypes.value.requiresLinearOwnership {
+                    instructions.append(.destroyValue(originalValue))
+                }
+                instructions.append(
+                    contentsOf: try appendDictionaryPair(
+                        key: key,
+                        value: mapped,
+                        to: try requiredRegister(builder, "element builder")
+                    )
+                )
+                instructions.append(.branch(target: loop, arguments: []))
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: instructions
+                )
+            case .compactMapValues:
+                guard plan.callbackShape == .dictionaryValue,
+                      let dictionaryTypes,
+                      case let .dictionary(_, mappedType) = plan.callResultType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "compactMapValues has an invalid Dictionary lowering plan"
+                    )
+                }
+                let optional = try requiredRegister(
+                    continuationResult,
+                    "compactMapValues result"
+                )
+                let key = try requiredRegister(
+                    dictionaryKey,
+                    "compactMapValues key"
+                )
+                let originalValue = try requiredRegister(
+                    dictionaryValue,
+                    "compactMapValues original value"
+                )
+                let builder = try requiredRegister(builder, "element builder")
+                let append = try allocateSyntheticBlockID()
+                let skip = try allocateSyntheticBlockID()
+                let mapped = try allocate(type: mappedType)
+                var continuationInstructions: [
+                    IntermediateRepresentation.Instruction
+                ] = []
+                if dictionaryTypes.value.requiresLinearOwnership {
+                    continuationInstructions.append(
+                        .destroyValue(originalValue)
+                    )
+                }
+                continuationInstructions.append(
+                    .switchOptional(
+                        optional: optional,
+                        someTarget: append,
+                        noneTarget: skip
+                    )
+                )
+                appendSyntheticBlock(
+                    id: closureContinuation,
+                    parameters: continuationParameters,
+                    instructions: continuationInstructions
+                )
+                appendSyntheticBlock(
+                    id: append,
+                    parameters: [mapped],
+                    instructions: try appendDictionaryPair(
+                        key: key,
+                        value: mapped,
+                        to: builder
+                    ) + [.branch(target: loop, arguments: [])]
+                )
+                appendSyntheticBlock(
+                    id: skip,
+                    instructions: (dictionaryTypes.key.requiresLinearOwnership
+                        ? [.destroyValue(key)] : []) + [
+                        .branch(target: loop, arguments: []),
+                    ]
+                )
             case .prefixWhile:
                 let predicate = try requiredRegister(
                     continuationResult,
                     "prefix(while:) predicate"
                 )
-                let builder = try requiredRegister(builder, "Array builder")
+                let builder = try requiredRegister(builder, "element builder")
                 let append = try allocateSyntheticBlockID()
                 let finish = try allocateSyntheticBlockID()
-                let result = try allocate(type: plan.callResultType)
+                let finished = try finishCollectionBuilder(builder)
                 appendSyntheticBlock(
                     id: closureContinuation,
                     parameters: continuationParameters,
@@ -5055,11 +5449,14 @@ public struct Lowerer: Sendable {
                 )
                 appendSyntheticBlock(
                     id: finish,
-                    instructions: closureArgumentCleanup + [
-                        .finishArrayBuilder(result: result, builder: builder),
+                    instructions: closureArgumentCleanup
+                        + finished.instructions + [
                         .destroyStack(indexSlot),
                     ] + sourceCleanup + [
-                        .branch(target: normalTarget, arguments: [result]),
+                        .branch(
+                            target: normalTarget,
+                            arguments: [finished.result]
+                        ),
                     ]
                 )
             case .dropWhile:
@@ -5067,7 +5464,7 @@ public struct Lowerer: Sendable {
                     continuationResult,
                     "drop(while:) predicate"
                 )
-                let builder = try requiredRegister(builder, "Array builder")
+                let builder = try requiredRegister(builder, "element builder")
                 let keepDropping = try allocateSyntheticBlockID()
                 let appendRemainder = try allocateSyntheticBlockID()
                 let remainderLoop = try allocateSyntheticBlockID()
@@ -5353,17 +5750,18 @@ public struct Lowerer: Sendable {
 
             let emptyInstructions: [IntermediateRepresentation.Instruction]
             switch plan.operation {
-            case .map, .flatMap, .filter, .compactMap, .prefixWhile,
-                 .dropWhile:
-                let result = try allocate(type: plan.callResultType)
-                emptyInstructions = [
-                    .finishArrayBuilder(
-                        result: result,
-                        builder: try requiredRegister(builder, "Array builder")
-                    ),
+            case .map, .flatMap, .filter, .compactMap, .mapValues,
+                 .compactMapValues, .prefixWhile, .dropWhile:
+                let finished = try finishCollectionBuilder(
+                    try requiredRegister(builder, "element builder")
+                )
+                emptyInstructions = finished.instructions + [
                     .destroyStack(indexSlot),
                 ] + sourceCleanup + [
-                    .branch(target: normalTarget, arguments: [result]),
+                    .branch(
+                        target: normalTarget,
+                        arguments: [finished.result]
+                    ),
                 ]
             case .reduce:
                 emptyInstructions = [
@@ -5429,7 +5827,10 @@ public struct Lowerer: Sendable {
             let propagatedArguments = errorParameter.map { [$0] } ?? []
             var cleanupInstructions: [IntermediateRepresentation.Instruction] = []
             if isThrowing {
-                cleanupInstructions.append(contentsOf: closureArgumentCleanup)
+                cleanupInstructions.append(
+                    contentsOf: plan.callbackShape == .element
+                        ? closureArgumentCleanup : projectedFieldCleanup
+                )
             }
             if let builder {
                 cleanupInstructions.append(.destroyValue(builder))
@@ -13817,7 +14218,7 @@ public struct Lowerer: Sendable {
                 ] {
                     let normalTarget = try parseBlockID(call[4])
                     let errorTarget = try parseBlockID(call[5])
-                    try lowerArrayHigherOrderTryApply(
+                    try lowerCollectionHigherOrderTryApply(
                         operation: operation,
                         genericArguments: call[1],
                         argumentText: call[2],
@@ -16244,6 +16645,15 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = tuple(?: \$\([^\n]*\))? \((.*)\)$"#
             ) {
+                if !hasFutureSemanticUse(
+                    of: tuple[0],
+                    after: currentSILLineIndex
+                ) {
+                    // Canonical SIL may assemble an aggregate solely for
+                    // `debug_value`. Lowering it would invent an owned VM
+                    // lifetime after debug metadata has been erased.
+                    continue
+                }
                 let components = splitTopLevel(tuple[1])
                 if components.count == 1, components[0].isEmpty {
                     voidValues.insert(tuple[0])
@@ -16322,7 +16732,10 @@ public struct Lowerer: Sendable {
                         "tuple_extract index does not match its operand type"
                     )
                 }
-                let elements = try unpackTupleValue(tuple)
+                let elements = try unpackTupleValue(
+                    tuple,
+                    retainedOwnerFor: extract[1]
+                )
                 values[extract[0]] = elements[index]
                 continue
             }
@@ -18254,23 +18667,38 @@ public struct Lowerer: Sendable {
         }
     }
 
-    private func parseArrayHigherOrderPlan(
+    private func parseCollectionHigherOrderPlan(
         operation: CanonicalSIL.HigherOrderIntrinsic,
         genericArguments: String,
         argumentText: String,
         line: Int
-    ) throws -> ArrayHigherOrderPlan {
+    ) throws -> CollectionHigherOrderPlan {
         let genericSpellings = splitTopLevel(genericArguments)
             .filter { !$0.isEmpty }
         let genericTypes = try genericSpellings.map(parseType)
         let arguments = try parseApplyValueTokens(argumentText, line: line)
+
+        func managedCollectionElement(
+            _ type: Bytecode.ValueType
+        ) throws -> Bytecode.ValueType {
+            switch type {
+            case let .array(element), let .set(element):
+                return element
+            case let .dictionary(key, value):
+                return .tuple([key, value])
+            default:
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "higher-order collection \(type)"
+                )
+            }
+        }
 
         func arrayElement(
             _ type: Bytecode.ValueType
         ) throws -> Bytecode.ValueType {
             guard case let .array(element) = type else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
-                    "higher-order collection \(type)"
+                    "Array-backed higher-order result \(type)"
                 )
             }
             return element
@@ -18283,11 +18711,12 @@ public struct Lowerer: Sendable {
                     "Collection.map has an unsupported specialization"
                 )
             }
-            let input = try arrayElement(genericTypes[0])
+            let input = try managedCollectionElement(genericTypes[0])
             let mapped = ValueRepresentation.storable(genericTypes[1])
             return .init(
                 operation: operation,
                 sourceToken: arguments[2],
+                sourceType: genericTypes[0],
                 closureToken: arguments[1],
                 initialToken: nil,
                 resultDestination: nil,
@@ -18302,11 +18731,12 @@ public struct Lowerer: Sendable {
                     "Sequence.flatMap has an unsupported specialization"
                 )
             }
-            let input = try arrayElement(genericTypes[0])
+            let input = try managedCollectionElement(genericTypes[0])
             let mapped = try arrayElement(genericTypes[1])
             return .init(
                 operation: operation,
                 sourceToken: arguments[1],
+                sourceType: genericTypes[0],
                 closureToken: arguments[0],
                 initialToken: nil,
                 resultDestination: nil,
@@ -18316,22 +18746,66 @@ public struct Lowerer: Sendable {
                 callResultType: .array(mapped)
             )
         case .filter:
-            guard genericTypes.count == 1, arguments.count == 2 else {
+            guard arguments.count == 2 else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "Array.filter has an unsupported specialization"
+                    "Collection.filter has an unsupported specialization"
                 )
             }
-            let input = try arrayElement(genericTypes[0])
-            return .init(
-                operation: operation,
-                sourceToken: arguments[1],
-                closureToken: arguments[0],
-                initialToken: nil,
-                resultDestination: nil,
-                errorDestination: nil,
-                inputType: input,
-                closureResultType: .bool,
-                callResultType: .array(input)
+            if genericTypes.count == 1 {
+                let input: Bytecode.ValueType
+                let sourceType: Bytecode.ValueType
+                let consumesSource: Bool
+                switch genericTypes[0] {
+                case let .array(element):
+                    input = element
+                    sourceType = genericTypes[0]
+                    consumesSource = false
+                default:
+                    // Unlike the generic `_ArrayProtocol` overload, the Set
+                    // specialization carries only `Element` as a generic
+                    // argument; reconstruct its concrete source container.
+                    input = ValueRepresentation.storable(genericTypes[0])
+                    sourceType = .set(input)
+                    consumesSource = true
+                }
+                return .init(
+                    operation: operation,
+                    sourceToken: arguments[1],
+                    sourceType: sourceType,
+                    closureToken: arguments[0],
+                    initialToken: nil,
+                    resultDestination: nil,
+                    errorDestination: nil,
+                    inputType: input,
+                    closureResultType: .bool,
+                    callResultType: sourceType,
+                    consumesSource: consumesSource
+                )
+            }
+            if genericTypes.count == 2 {
+                let key = ValueRepresentation.storable(genericTypes[0])
+                let value = ValueRepresentation.storable(genericTypes[1])
+                let sourceType = Bytecode.ValueType.dictionary(
+                    key: key,
+                    value: value
+                )
+                return .init(
+                    operation: operation,
+                    sourceToken: arguments[1],
+                    sourceType: sourceType,
+                    closureToken: arguments[0],
+                    initialToken: nil,
+                    resultDestination: nil,
+                    errorDestination: nil,
+                    inputType: .tuple([key, value]),
+                    closureResultType: .bool,
+                    callResultType: sourceType,
+                    callbackShape: .dictionaryKeyValue,
+                    consumesSource: true
+                )
+            }
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "Collection.filter has an unsupported specialization"
             )
         case .compactMap:
             guard genericTypes.count == 2, arguments.count == 2 else {
@@ -18339,11 +18813,12 @@ public struct Lowerer: Sendable {
                     "Sequence.compactMap has an unsupported specialization"
                 )
             }
-            let input = try arrayElement(genericTypes[0])
+            let input = try managedCollectionElement(genericTypes[0])
             let mapped = ValueRepresentation.storable(genericTypes[1])
             return .init(
                 operation: operation,
                 sourceToken: arguments[1],
+                sourceType: genericTypes[0],
                 closureToken: arguments[0],
                 initialToken: nil,
                 resultDestination: nil,
@@ -18351,6 +18826,29 @@ public struct Lowerer: Sendable {
                 inputType: input,
                 closureResultType: .optional(mapped),
                 callResultType: .array(mapped)
+            )
+        case .mapValues, .compactMapValues:
+            guard genericTypes.count == 3, arguments.count == 2 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Dictionary value transform has an unsupported specialization"
+                )
+            }
+            let key = ValueRepresentation.storable(genericTypes[0])
+            let value = ValueRepresentation.storable(genericTypes[1])
+            let mapped = ValueRepresentation.storable(genericTypes[2])
+            return .init(
+                operation: operation,
+                sourceToken: arguments[1],
+                sourceType: .dictionary(key: key, value: value),
+                closureToken: arguments[0],
+                initialToken: nil,
+                resultDestination: nil,
+                errorDestination: nil,
+                inputType: .tuple([key, value]),
+                closureResultType: operation == .mapValues
+                    ? mapped : .optional(mapped),
+                callResultType: .dictionary(key: key, value: mapped),
+                callbackShape: .dictionaryValue
             )
         case .prefixWhile, .dropWhile:
             let supportsDirectResult = operation == .prefixWhile
@@ -18367,6 +18865,7 @@ public struct Lowerer: Sendable {
             return .init(
                 operation: operation,
                 sourceToken: arguments[arguments.count - 1],
+                sourceType: genericTypes[0],
                 closureToken: arguments[arguments.count - 2],
                 initialToken: nil,
                 resultDestination: hasIndirectResult ? arguments[0] : nil,
@@ -18381,11 +18880,12 @@ public struct Lowerer: Sendable {
                     "Sequence.reduce has an unsupported specialization"
                 )
             }
-            let input = try arrayElement(genericTypes[0])
+            let input = try managedCollectionElement(genericTypes[0])
             let accumulator = ValueRepresentation.storable(genericTypes[1])
             return .init(
                 operation: operation,
                 sourceToken: arguments[3],
+                sourceType: genericTypes[0],
                 closureToken: arguments[2],
                 initialToken: arguments[1],
                 resultDestination: arguments[0],
@@ -18400,11 +18900,12 @@ public struct Lowerer: Sendable {
                     "Sequence.reduce(into:_:) has an unsupported specialization"
                 )
             }
-            let input = try arrayElement(genericTypes[0])
+            let input = try managedCollectionElement(genericTypes[0])
             let accumulator = ValueRepresentation.storable(genericTypes[1])
             return .init(
                 operation: operation,
                 sourceToken: arguments[3],
+                sourceType: genericTypes[0],
                 closureToken: arguments[2],
                 initialToken: arguments[1],
                 resultDestination: arguments[0],
@@ -18429,7 +18930,14 @@ public struct Lowerer: Sendable {
                     "Sequence predicate operation has an unsupported specialization"
                 )
             }
-            let input = try arrayElement(genericTypes[0])
+            let input = try managedCollectionElement(genericTypes[0])
+            if operation.traversalDirection == .reverse {
+                guard case .array = genericTypes[0] else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "reverse higher-order traversal requires a represented Array"
+                    )
+                }
+            }
             if operation == .firstIndexWhere
                 || operation == .lastIndexWhere {
                 switch typeEnvironment.collectionIndexModel(
@@ -18457,8 +18965,9 @@ public struct Lowerer: Sendable {
             case .firstIndexWhere, .lastIndexWhere: .optional(.int64)
             case .containsWhere, .allSatisfy: .bool
             case .minimumBy, .maximumBy: .optional(input)
-            case .map, .flatMap, .filter, .compactMap, .prefixWhile,
-                 .dropWhile, .reduce, .reduceInto:
+            case .map, .flatMap, .filter, .compactMap, .mapValues,
+                 .compactMapValues, .prefixWhile, .dropWhile, .reduce,
+                 .reduceInto:
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "predicate operation dispatch is inconsistent"
                 )
@@ -18466,6 +18975,7 @@ public struct Lowerer: Sendable {
             return .init(
                 operation: operation,
                 sourceToken: arguments[expectedArgumentCount - 1],
+                sourceType: genericTypes[0],
                 closureToken: arguments[expectedArgumentCount - 2],
                 initialToken: nil,
                 resultDestination: hasIndirectResult ? arguments[0] : nil,

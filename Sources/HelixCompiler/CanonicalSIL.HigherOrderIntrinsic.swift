@@ -6,6 +6,8 @@ enum HigherOrderIntrinsic: Equatable {
     case flatMap
     case filter
     case compactMap
+    case mapValues
+    case compactMapValues
     case prefixWhile
     case dropWhile
     case reduce
@@ -20,9 +22,10 @@ enum HigherOrderIntrinsic: Equatable {
     case minimumBy
     case maximumBy
 
-    var usesArrayBuilder: Bool {
+    var usesElementBuilder: Bool {
         switch self {
-        case .map, .flatMap, .filter, .compactMap, .prefixWhile, .dropWhile:
+        case .map, .flatMap, .filter, .compactMap, .mapValues,
+             .compactMapValues, .prefixWhile, .dropWhile:
             true
         case .reduce, .reduceInto, .forEach, .firstWhere, .lastWhere,
              .firstIndexWhere, .lastIndexWhere, .containsWhere,
@@ -38,9 +41,9 @@ enum HigherOrderIntrinsic: Equatable {
         case .filter, .firstWhere, .lastWhere, .prefixWhile, .dropWhile,
              .minimumBy, .maximumBy:
             true
-        case .map, .flatMap, .compactMap, .reduce, .reduceInto, .forEach,
-             .firstIndexWhere, .lastIndexWhere, .containsWhere,
-             .allSatisfy:
+        case .map, .flatMap, .compactMap, .mapValues, .compactMapValues,
+             .reduce, .reduceInto, .forEach, .firstIndexWhere,
+             .lastIndexWhere, .containsWhere, .allSatisfy:
             false
         }
     }
@@ -49,8 +52,9 @@ enum HigherOrderIntrinsic: Equatable {
         switch self {
         case .lastWhere, .lastIndexWhere:
             .reverse
-        case .map, .flatMap, .filter, .compactMap, .prefixWhile,
-             .dropWhile, .reduce, .reduceInto, .forEach, .firstWhere,
+        case .map, .flatMap, .filter, .compactMap, .mapValues,
+             .compactMapValues, .prefixWhile, .dropWhile, .reduce,
+             .reduceInto, .forEach, .firstWhere,
              .firstIndexWhere, .containsWhere, .allSatisfy,
              .minimumBy, .maximumBy:
             .forward

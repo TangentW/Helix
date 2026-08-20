@@ -338,12 +338,16 @@ closures and already indexed same-image helpers may use synchronous `@escaping`
 parameters, internal closure returns, nested closure captures, and synchronous
 throwing paths. Mutable captures use the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
-boxes; common fully concrete Array-backed higher-order operations—including
-`flatMap`, short-circuiting prefix/drop predicates, and direction-preserving
-first/last searches, comparator-driven `min(by:)`/`max(by:)`, and scoped
-inout accumulation through `reduce(into:_:)`, stable comparator
-`sorted(by:)`/`sort(by:)`, and stable `partition(by:)`—use
-verified closure CFGs; Array-producing variants use a linear builder, while
+boxes. Fully concrete Array, Dictionary, and Set values share verified closure
+traversal for common `map`/`flatMap`/`compactMap`, reduction, visit, predicate,
+and comparator-selection operations. Container-preserving `filter` uses the
+same traversal for all three; Dictionary `mapValues` and `compactMapValues`
+project their specialized value callback from each represented `(Key, Value)`
+element, while `reduce(into:_:)` uses scoped inout accumulation. Array-only
+short-circuiting prefix/drop predicates, reverse `last` searches, stable
+comparator `sorted(by:)`/`sort(by:)`, and stable `partition(by:)` retain their
+specialized verified CFGs. Producing variants use one linear element buffer
+and a typed Array/Dictionary/Set finalizer, while
 separator- and predicate-driven Array-backed `split` use one kind-checked
 linear range state with exact `maxSplits`, empty-segment, and throwing-edge
 semantics. Split subsequences are normalized by element sequence and therefore
