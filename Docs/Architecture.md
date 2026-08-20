@@ -113,6 +113,16 @@ Both workflows depend on stable, build-specific identities:
   Scalar appends and bounded whole-Array appends share the same verifier-owned
   element type and precharge copied storage before allocation; this supports
   Sequence-returning `flatMap` without an intermediate nested Array.
+- Comparator sorting uses a second invocation-local linear value: a bounded
+  stable merge-state machine that owns copied elements and index buffers while
+  each comparison remains an ordinary closure call in verified control flow.
+  The Verifier requires the state to be created, finished, or destroyed on
+  every path and forbids it in parameters, results, stack slots, local layouts,
+  and Shell/Native boundaries. Natural scalar sorting drives the same machine
+  inside one fuel- and deadline-charged VM operation. Mutating sort and the
+  two-builder stable partition propagate their completed Array through the
+  normal continuation with an explicit assignment writeback; throwing edges
+  destroy transient state and leave the original inout storage untouched.
 - Array-backed predicate traversal uses one direction-aware cursor operation.
   Forward cursors hold the next index and reverse cursors hold an exclusive
   upper bound, so both directions preserve Swift's predicate order without

@@ -134,7 +134,8 @@ public struct Interpreter: Sendable {
                   !rootFunction.parameterRegisters.contains(where: {
                       guard let type = rootFunction.type(of: $0) else { return false }
                       return switch type {
-                      case .address, .mutableCell, .arrayBuilder: true
+                      case .address, .mutableCell, .arrayBuilder,
+                           .arraySortState: true
                       default: false
                       }
                   })
@@ -242,7 +243,8 @@ public struct Interpreter: Sendable {
             case let .tuple(elements):
                 elements.forEach(visit)
             case let .optional(wrapped), let .address(wrapped),
-                 let .mutableCell(wrapped), let .arrayBuilder(wrapped):
+                 let .mutableCell(wrapped), let .arrayBuilder(wrapped),
+                 let .arraySortState(wrapped):
                 visit(wrapped)
             case let .array(element), let .set(element):
                 visit(element)
@@ -2263,6 +2265,150 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
+                case let .arraySorted(result, arrayRegister):
+                    let (elements, elementType) = try array(
+                        arrayRegister,
+                        registers: registers
+                    )
+                    let state = try makeArraySortState(
+                        elements,
+                        elementType: elementType,
+                        budget: budget
+                    )
+                    while let comparison = try state.nextComparison(
+                        budget: budget
+                    ) {
+                        let rightPrecedesLeft = try compare(
+                            .lessThan,
+                            lhs: comparison.right,
+                            rhs: comparison.left,
+                            budget: budget
+                        )
+                        try state.acceptComparison(
+                            rightPrecedesLeft: rightPrecedesLeft,
+                            budget: budget
+                        )
+                    }
+                    let sorted = try finishArraySort(
+                        state,
+                        budget: budget
+                    )
+                    try initialize(
+                        .array(sorted, elementType: elementType),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .makeArraySortState(result, arrayRegister):
+                    let (elements, elementType) = try array(
+                        arrayRegister,
+                        registers: registers
+                    )
+                    let state = try makeArraySortState(
+                        elements,
+                        elementType: elementType,
+                        budget: budget
+                    )
+                    try initialize(
+                        .arraySortState(state),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arraySortNextComparison(result, stateRegister):
+                    guard case let .arraySortState(state) = try read(
+                        stateRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: stateRegister) ?? .never,
+                            actual: try read(
+                                stateRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    let value: VM.Value
+                    if let comparison = try state.nextComparison(
+                        budget: budget
+                    ) {
+                        try chargeAggregate(elementCount: 2, budget: budget)
+                        try chargeAggregate(elementCount: 1, budget: budget)
+                        value = .optional(
+                            .tuple([
+                                try copyCharging(
+                                    comparison.right,
+                                    budget: budget
+                                ),
+                                try copyCharging(
+                                    comparison.left,
+                                    budget: budget
+                                ),
+                            ])
+                        )
+                    } else {
+                        try chargeAggregate(elementCount: 0, budget: budget)
+                        value = .optional(nil)
+                    }
+                    try initialize(
+                        value,
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arraySortAcceptComparison(
+                    stateRegister,
+                    predicateRegister
+                ):
+                    guard case let .arraySortState(state) = try read(
+                        stateRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: stateRegister) ?? .never,
+                            actual: try read(
+                                stateRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    guard case let .bool(rightPrecedesLeft) = try read(
+                        predicateRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .bool,
+                            actual: try read(
+                                predicateRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    try state.acceptComparison(
+                        rightPrecedesLeft: rightPrecedesLeft,
+                        budget: budget
+                    )
+                case let .finishArraySort(result, stateRegister):
+                    guard case let .arraySortState(element) = function.type(
+                        of: stateRegister
+                    ), function.type(of: result) == .array(element),
+                       case let .arraySortState(state) = try consume(
+                        stateRegister,
+                        type: .arraySortState(element),
+                        registers: &registers
+                       )
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: function.type(of: stateRegister)
+                        )
+                    }
+                    let sorted = try finishArraySort(
+                        state,
+                        budget: budget
+                    )
+                    try initialize(
+                        .array(sorted, elementType: element),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .arrayUpdate(result, array, index, value):
                     let (elements, elementType) = try self.array(
                         array,
@@ -3561,6 +3707,13 @@ public struct Interpreter: Sendable {
                     actual: value.type
                 )
             }
+        case let (.arraySortState(state), .arraySortState(element)):
+            guard state.elementType == element else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: expected,
+                    actual: value.type
+                )
+            }
         case let (.closure(closure), .closure(signature)):
             guard closure.signature == signature else {
                 throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
@@ -3925,8 +4078,10 @@ public struct Interpreter: Sendable {
             )
         case .mutableCell:
             value
-        case .arrayBuilder:
-            throw VM.RuntimeTrap.explicit("Array builders cannot be copied")
+        case .arrayBuilder, .arraySortState:
+            throw VM.RuntimeTrap.explicit(
+                "Array construction state cannot be copied"
+            )
         case .address:
             throw VM.RuntimeTrap.inactiveAddressAccess
         case .bool, .integer, .float, .string:
@@ -4097,7 +4252,7 @@ public struct Interpreter: Sendable {
                 try chargeCopiedValue(capture, budget: budget, depth: depth + 1)
             }
         case .bool, .integer, .float, .string, .address, .mutableCell,
-             .arrayBuilder:
+             .arrayBuilder, .arraySortState:
             break
         }
     }
@@ -4157,7 +4312,7 @@ public struct Interpreter: Sendable {
                 try chargeValueTraversal(capture, budget: budget, depth: depth + 1)
             }
         case .optional(nil), .native, .bool, .integer, .float, .address,
-             .mutableCell, .arrayBuilder:
+             .mutableCell, .arrayBuilder, .arraySortState:
             break
         }
     }
@@ -4226,7 +4381,7 @@ public struct Interpreter: Sendable {
                 try chargeShapeValidation(capture, budget: budget, depth: depth + 1)
             }
         case .optional(nil), .native, .bool, .integer, .float, .string,
-             .address, .mutableCell, .arrayBuilder:
+             .address, .mutableCell, .arrayBuilder, .arraySortState:
             break
         }
     }
@@ -4745,6 +4900,40 @@ public struct Interpreter: Sendable {
         }
         try budget.checkDeadline()
         return .array(result, elementType: elementType)
+    }
+
+    private func makeArraySortState(
+        _ elements: [VM.Value],
+        elementType: Bytecode.ValueType,
+        budget: VM.InvocationBudget
+    ) throws -> VM.ArraySortState {
+        let indexStorage = elements.count.multipliedReportingOverflow(by: 2)
+        guard !indexStorage.overflow else {
+            throw VM.RuntimeTrap.vmHeapLimitExceeded
+        }
+        try budget.consumeLinearWork(elementCount: elements.count)
+        try chargeAggregate(elementCount: elements.count, budget: budget)
+        try budget.consumeAggregateElementStorage(
+            elementCount: indexStorage.partialValue
+        )
+        for element in elements {
+            try prepareCopy(element, budget: budget)
+        }
+        let copied = try elements.map(copy)
+        try budget.checkDeadline()
+        return try .init(elementType: elementType, elements: copied)
+    }
+
+    private func finishArraySort(
+        _ state: VM.ArraySortState,
+        budget: VM.InvocationBudget
+    ) throws -> [VM.Value] {
+        let count = state.elementCount
+        try budget.consumeLinearWork(elementCount: count)
+        try chargeAggregate(elementCount: count, budget: budget)
+        let result = try state.finish()
+        try budget.checkDeadline()
+        return result
     }
 
     private func swappingArrayElements(

@@ -219,6 +219,30 @@ public struct Lowerer: Sendable {
         var callResultType: Bytecode.ValueType
     }
 
+    private struct ArrayOrderingPlan {
+        var operation: CanonicalSIL.OrderingIntrinsic
+        var sourceToken: String
+        var closureToken: String
+        var resultDestination: String?
+        var elementType: Bytecode.ValueType
+    }
+
+    private struct ImplicitStackValue {
+        var address: String
+        var register: Bytecode.Register
+        var storeMode: Bytecode.StackStoreMode
+
+        init(
+            _ address: String,
+            _ register: Bytecode.Register,
+            storeMode: Bytecode.StackStoreMode = .initialize
+        ) {
+            self.address = address
+            self.register = register
+            self.storeMode = storeMode
+        }
+    }
+
     private enum AlgebraicTransformInvocation {
         case direct(resultToken: String)
         case branching(
@@ -620,7 +644,7 @@ public struct Lowerer: Sendable {
         var errorMessageByBox: [String: String] = [:]
         var catchScratchAddresses = Set<String>()
         var implicitStackValues: [
-            Bytecode.BlockID: [(address: String, register: Bytecode.Register)]
+            Bytecode.BlockID: [ImplicitStackValue]
         ] = [:]
         var implicitOwnerCleanups: [
             Bytecode.BlockID: [Bytecode.Register]
@@ -2389,7 +2413,7 @@ public struct Lowerer: Sendable {
                     merge = try allocate(type: type)
                     compilerAddressMergeRegisters[target, default: [:]][address] = merge
                     implicitStackValues[target, default: []].append(
-                        (address, merge)
+                        .init(address, merge)
                     )
                 }
                 arguments.append(value)
@@ -2825,7 +2849,7 @@ public struct Lowerer: Sendable {
                 if let destination = destinations.result,
                    resultType != .void {
                     let result = try allocate(type: resultType)
-                    implicitStackValues[normalTarget] = [(destination, result)]
+                    implicitStackValues[normalTarget] = [.init(destination, result)]
                 }
             }
 
@@ -2840,7 +2864,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let error = try allocate(type: runtimeErrorType)
-                implicitStackValues[errorTarget] = [(destination, error)]
+                implicitStackValues[errorTarget] = [.init(destination, error)]
             }
         }
 
@@ -3372,6 +3396,604 @@ public struct Lowerer: Sendable {
             try storeExistential(erased, at: projection.destination)
         }
 
+        func lowerNaturalArrayOrdering(
+            _ operation: CanonicalSIL.OrderingIntrinsic,
+            resultToken: String,
+            genericArguments: String,
+            arguments: [String],
+            line: Int
+        ) throws {
+            guard !operation.usesClosure,
+                  arguments.count == 1
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "natural Array ordering has unsupported arguments"
+                )
+            }
+            let genericSpellings = splitTopLevel(genericArguments)
+                .filter { !$0.isEmpty }
+            let genericTypes = try genericSpellings.map(parseType)
+            guard genericTypes.count == 1,
+                  case let .array(element) = genericTypes[0],
+                  element.isVMComparable
+            else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "natural ordering requires an Array with VM-defined Comparable semantics"
+                )
+            }
+            let arrayType = Bytecode.ValueType.array(element)
+            if operation.mutatesSource {
+                guard compilerAddressType(arguments[0]) == arrayType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "MutableCollection.sort() requires matching inout storage"
+                    )
+                }
+                switch typeEnvironment.collectionIndexModel(
+                    for: genericSpellings[0]
+                ) {
+                case .zeroBasedInteger:
+                    break
+                case .preservedBaseInteger, .opaque:
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "mutating natural ordering requires zero-based Array indices"
+                    )
+                }
+            }
+
+            let borrowedSource = try borrowStoredValue(
+                at: arguments[0],
+                line: line
+            )
+            let source = try borrowedSource?.register
+                ?? resolve(arguments[0], line: line)
+            guard registerTypes[Int(source.rawValue)] == arrayType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "natural ordering source does not match its specialization"
+                )
+            }
+            let result = try allocate(type: arrayType)
+            appendInstruction(.arraySorted(result: result, array: source))
+            if let owner = borrowedSource?.temporaryOwner {
+                appendInstruction(.destroyValue(owner))
+            }
+
+            switch operation {
+            case .sorted:
+                values[resultToken] = result
+            case .sort:
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .assign
+                )
+                voidValues.insert(resultToken)
+            case .sortedBy, .sortBy, .partition:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "closure ordering reached natural ordering lowering"
+                )
+            }
+        }
+
+        func resolveArrayOrderingClosure(
+            for plan: ArrayOrderingPlan,
+            line: Int
+        ) throws -> (Bytecode.Register, Bytecode.ClosureSignature) {
+            let closure = try resolve(plan.closureToken, line: line)
+            let expectedParameters = Array(
+                repeating: plan.elementType,
+                count: plan.operation == .partition ? 1 : 2
+            )
+            guard case let .closure(signature) = registerTypes[
+                Int(closure.rawValue)
+            ], signature.parameters == expectedParameters,
+               signature.parameterConventions.count == expectedParameters.count,
+               !signature.parameterConventions.contains(.inout),
+               signature.result == .bool,
+               signature.effects.mayThrow,
+               !signature.effects.isAsync
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<Array ordering closure>"
+                )
+            }
+            return (closure, signature)
+        }
+
+        func prepareArrayOrderingContinuations(
+            plan: ArrayOrderingPlan,
+            normalTarget: Bytecode.BlockID
+        ) throws {
+            switch plan.operation {
+            case .sortedBy:
+                break
+            case .sortBy:
+                let arrayType = Bytecode.ValueType.array(plan.elementType)
+                guard compilerAddressType(plan.sourceToken) == arrayType,
+                      implicitStackValues[normalTarget] == nil,
+                      suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "sort(by:) requires one mutable Array continuation"
+                    )
+                }
+                let propagatedArray = try allocate(type: arrayType)
+                implicitStackValues[normalTarget] = [
+                    .init(
+                        plan.sourceToken,
+                        propagatedArray,
+                        storeMode: .assign
+                    ),
+                ]
+            case .partition:
+                let arrayType = Bytecode.ValueType.array(plan.elementType)
+                guard let destination = plan.resultDestination,
+                      compilerAddressType(destination) == .int64,
+                      compilerAddressType(plan.sourceToken) == arrayType,
+                      implicitStackValues[normalTarget] == nil,
+                      suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "partition(by:) requires an out Index and mutable Array"
+                    )
+                }
+                let propagatedIndex = try allocate(type: .int64)
+                let propagatedArray = try allocate(type: arrayType)
+                implicitStackValues[normalTarget] = [
+                    .init(destination, propagatedIndex),
+                    .init(
+                        plan.sourceToken,
+                        propagatedArray,
+                        storeMode: .assign
+                    ),
+                ]
+            case .sorted, .sort:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "natural ordering reached try_apply continuation setup"
+                )
+            }
+        }
+
+        /// Comparator evaluation remains ordinary closure control flow while
+        /// the VM owns a bounded stable merge-sort state machine. This keeps
+        /// captures, throwing callbacks, call depth, and linear values on the
+        /// same paths as every other higher-order operation.
+        func lowerArrayComparatorSortTryApply(
+            plan: ArrayOrderingPlan,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            guard plan.operation == .sortedBy || plan.operation == .sortBy
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "comparator sort received a different ordering operation"
+                )
+            }
+            let arrayType = Bytecode.ValueType.array(plan.elementType)
+            let borrowedSource = try borrowStoredValue(
+                at: plan.sourceToken,
+                line: line
+            )
+            let source = try borrowedSource?.register
+                ?? resolve(plan.sourceToken, line: line)
+            guard registerTypes[Int(source.rawValue)] == arrayType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "sort source does not match its Array specialization"
+                )
+            }
+            let (closure, closureSignature) = try resolveArrayOrderingClosure(
+                for: plan,
+                line: line
+            )
+            try prepareArrayOrderingContinuations(
+                plan: plan,
+                normalTarget: normalTarget
+            )
+
+            let errorType: Bytecode.ValueType = typeEnvironment
+                .preservesTypedErrors ? .error : .string
+            let errorParameter = try allocate(type: errorType)
+            let stateType = Bytecode.ValueType.arraySortState(plan.elementType)
+            let state = try allocate(type: stateType)
+            let comparisonType = Bytecode.ValueType.tuple([
+                plan.elementType,
+                plan.elementType,
+            ])
+            let nextType = Bytecode.ValueType.optional(comparisonType)
+            let next = try allocate(type: nextType)
+            let comparison = try allocate(type: comparisonType)
+            let right = try allocate(type: plan.elementType)
+            let left = try allocate(type: plan.elementType)
+            let predicate = try allocate(type: .bool)
+            let sorted = try allocate(type: arrayType)
+            let loop = try allocateSyntheticBlockID()
+            let compare = try allocateSyntheticBlockID()
+            let accepted = try allocateSyntheticBlockID()
+            let complete = try allocateSyntheticBlockID()
+            let failed = try allocateSyntheticBlockID()
+
+            appendInstruction(
+                .makeArraySortState(result: state, array: source)
+            )
+            if let owner = borrowedSource?.temporaryOwner {
+                appendInstruction(.destroyValue(owner))
+            }
+            appendInstruction(.branch(target: loop, arguments: []))
+            finishCurrent()
+
+            appendSyntheticBlock(
+                id: loop,
+                instructions: [
+                    .arraySortNextComparison(result: next, state: state),
+                    .switchOptional(
+                        optional: next,
+                        someTarget: compare,
+                        noneTarget: complete
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: compare,
+                parameters: [comparison],
+                instructions: [
+                    .unpackTuple(
+                        results: [right, left],
+                        tuple: comparison
+                    ),
+                    .closureTryApply(
+                        closure: closure,
+                        arguments: [right, left],
+                        normalTarget: accepted,
+                        errorTarget: failed
+                    ),
+                ]
+            )
+
+            let borrowedComparisonCleanup = zip(
+                [right, left],
+                closureSignature.parameterConventions
+            ).compactMap { register, convention in
+                plan.elementType.requiresLinearOwnership
+                    && convention == .borrowed
+                    ? IntermediateRepresentation.Instruction
+                        .destroyValue(register)
+                    : nil
+            }
+            appendSyntheticBlock(
+                id: accepted,
+                parameters: [predicate],
+                instructions: borrowedComparisonCleanup + [
+                    .arraySortAcceptComparison(
+                        state: state,
+                        rightPrecedesLeft: predicate
+                    ),
+                    .branch(target: loop, arguments: []),
+                ]
+            )
+
+            appendSyntheticBlock(
+                id: complete,
+                instructions: [
+                    .finishArraySort(result: sorted, state: state),
+                    .branch(
+                        target: normalTarget,
+                        arguments: [sorted]
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: failed,
+                parameters: [errorParameter],
+                instructions: borrowedComparisonCleanup + [
+                    .destroyValue(state),
+                    .branch(
+                        target: errorTarget,
+                        arguments: [errorParameter]
+                    ),
+                ]
+            )
+        }
+
+        /// A stable two-builder partition gives deterministic output while
+        /// preserving Swift's documented false-before-true postcondition. The
+        /// original inout value is replaced only after the predicate finishes,
+        /// so a thrown callback cannot expose half-written VM storage.
+        func lowerArrayPartitionTryApply(
+            plan: ArrayOrderingPlan,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            guard plan.operation == .partition else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "partition lowering received a different operation"
+                )
+            }
+            let arrayType = Bytecode.ValueType.array(plan.elementType)
+            let borrowedSource = try borrowStoredValue(
+                at: plan.sourceToken,
+                line: line
+            )
+            let source = try borrowedSource?.register
+                ?? resolve(plan.sourceToken, line: line)
+            guard registerTypes[Int(source.rawValue)] == arrayType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "partition source does not match its Array specialization"
+                )
+            }
+            let (closure, closureSignature) = try resolveArrayOrderingClosure(
+                for: plan,
+                line: line
+            )
+            try prepareArrayOrderingContinuations(
+                plan: plan,
+                normalTarget: normalTarget
+            )
+
+            let errorType: Bytecode.ValueType = typeEnvironment
+                .preservesTypedErrors ? .error : .string
+            let errorParameter = try allocate(type: errorType)
+            let builderType = Bytecode.ValueType.arrayBuilder(plan.elementType)
+            let falseBuilder = try allocate(type: builderType)
+            let trueBuilder = try allocate(type: builderType)
+            let indexSlot = try allocateStackSlot(type: .int64)
+            let falseCountSlot = try allocateStackSlot(type: .int64)
+            let zeroIndex = try allocate(type: .int64)
+            let zeroCount = try allocate(type: .int64)
+            let loop = try allocateSyntheticBlockID()
+            let some = try allocateSyntheticBlockID()
+            let closureContinuation = try allocateSyntheticBlockID()
+            let appendFalse = try allocateSyntheticBlockID()
+            let appendFalseChecked = try allocateSyntheticBlockID()
+            let appendTrue = try allocateSyntheticBlockID()
+            let complete = try allocateSyntheticBlockID()
+            let overflowTrap = try allocateSyntheticBlockID()
+            let failed = try allocateSyntheticBlockID()
+            let next = try allocate(type: .optional(plan.elementType))
+            let element = try allocate(type: plan.elementType)
+            let predicate = try allocate(type: .bool)
+            let currentCount = try allocate(type: .int64)
+            let one = try allocate(type: .int64)
+            let advancedCount = try allocate(type: .int64)
+            let overflow = try allocate(type: .bool)
+            let trueArray = try allocate(type: arrayType)
+            let partitioned = try allocate(type: arrayType)
+            let partitionIndex = try allocate(type: .int64)
+
+            let inputConvention = closureSignature.parameterConventions[0]
+            let closureInput: Bytecode.Register
+            var closurePreparation: [IntermediateRepresentation.Instruction] = []
+            if plan.elementType.requiresLinearOwnership,
+               inputConvention == .owned {
+                let copy = try allocate(type: plan.elementType)
+                closurePreparation.append(
+                    .copyValue(result: copy, source: element)
+                )
+                closureInput = copy
+            } else {
+                closureInput = element
+            }
+            let elementCleanup: [IntermediateRepresentation.Instruction] =
+                plan.elementType.requiresLinearOwnership
+                    ? [.destroyValue(element)] : []
+            let sourceCleanup: [IntermediateRepresentation.Instruction] =
+                borrowedSource?.temporaryOwner.map {
+                    [.destroyValue($0)]
+                } ?? []
+
+            appendInstruction(.makeArrayBuilder(result: falseBuilder))
+            appendInstruction(.makeArrayBuilder(result: trueBuilder))
+            appendInstruction(
+                .constantInteger(result: zeroIndex, bitPattern: 0)
+            )
+            appendInstruction(
+                .storeStack(
+                    slot: indexSlot,
+                    source: zeroIndex,
+                    mode: .initialize
+                )
+            )
+            appendInstruction(
+                .constantInteger(result: zeroCount, bitPattern: 0)
+            )
+            appendInstruction(
+                .storeStack(
+                    slot: falseCountSlot,
+                    source: zeroCount,
+                    mode: .initialize
+                )
+            )
+            appendInstruction(.branch(target: loop, arguments: []))
+            finishCurrent()
+
+            appendSyntheticBlock(
+                id: loop,
+                instructions: [
+                    .arrayNext(
+                        result: next,
+                        array: source,
+                        indexSlot: indexSlot,
+                        direction: .forward
+                    ),
+                    .switchOptional(
+                        optional: next,
+                        someTarget: some,
+                        noneTarget: complete
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: some,
+                parameters: [element],
+                instructions: closurePreparation + [
+                    .closureTryApply(
+                        closure: closure,
+                        arguments: [closureInput],
+                        normalTarget: closureContinuation,
+                        errorTarget: failed
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: closureContinuation,
+                parameters: [predicate],
+                instructions: [
+                    .conditionalBranch(
+                        condition: predicate,
+                        trueTarget: appendTrue,
+                        trueArguments: [],
+                        falseTarget: appendFalse,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: appendFalse,
+                instructions: [
+                    .loadStack(
+                        result: currentCount,
+                        slot: falseCountSlot,
+                        mode: .copy
+                    ),
+                    .constantInteger(result: one, bitPattern: 1),
+                    .checkedBinary(
+                        result: advancedCount,
+                        overflow: overflow,
+                        operation: .add,
+                        lhs: currentCount,
+                        rhs: one
+                    ),
+                    .conditionalBranch(
+                        condition: overflow,
+                        trueTarget: overflowTrap,
+                        trueArguments: [],
+                        falseTarget: appendFalseChecked,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: appendFalseChecked,
+                instructions: [
+                    .storeStack(
+                        slot: falseCountSlot,
+                        source: advancedCount,
+                        mode: .assign
+                    ),
+                    .arrayBuilderAppend(
+                        builder: falseBuilder,
+                        value: element
+                    ),
+                ] + elementCleanup + [
+                    .branch(target: loop, arguments: []),
+                ]
+            )
+            appendSyntheticBlock(
+                id: appendTrue,
+                instructions: [
+                    .arrayBuilderAppend(
+                        builder: trueBuilder,
+                        value: element
+                    ),
+                ] + elementCleanup + [
+                    .branch(target: loop, arguments: []),
+                ]
+            )
+
+            var completionInstructions: [IntermediateRepresentation.Instruction] = [
+                .finishArrayBuilder(
+                    result: trueArray,
+                    builder: trueBuilder
+                ),
+                .arrayBuilderAppendContents(
+                    builder: falseBuilder,
+                    array: trueArray
+                ),
+            ]
+            if arrayType.requiresLinearOwnership {
+                completionInstructions.append(.destroyValue(trueArray))
+            }
+            completionInstructions.append(contentsOf: [
+                .finishArrayBuilder(
+                    result: partitioned,
+                    builder: falseBuilder
+                ),
+                .loadStack(
+                    result: partitionIndex,
+                    slot: falseCountSlot,
+                    mode: .take
+                ),
+                .destroyStack(indexSlot),
+            ])
+            completionInstructions.append(contentsOf: sourceCleanup)
+            completionInstructions.append(
+                .branch(
+                    target: normalTarget,
+                    arguments: [partitionIndex, partitioned]
+                )
+            )
+            appendSyntheticBlock(
+                id: complete,
+                instructions: completionInstructions
+            )
+            appendSyntheticBlock(
+                id: overflowTrap,
+                instructions: [.trap(.integerOverflow)]
+            )
+            appendSyntheticBlock(
+                id: failed,
+                parameters: [errorParameter],
+                instructions: elementCleanup + [
+                    .destroyValue(falseBuilder),
+                    .destroyValue(trueBuilder),
+                    .destroyStack(indexSlot),
+                    .destroyStack(falseCountSlot),
+                ] + sourceCleanup + [
+                    .branch(
+                        target: errorTarget,
+                        arguments: [errorParameter]
+                    ),
+                ]
+            )
+        }
+
+        func lowerArrayOrderingTryApply(
+            operation: CanonicalSIL.OrderingIntrinsic,
+            genericArguments: String,
+            argumentText: String,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            let plan = try parseArrayOrderingPlan(
+                operation: operation,
+                genericArguments: genericArguments,
+                argumentText: argumentText,
+                line: line
+            )
+            switch operation {
+            case .sortedBy, .sortBy:
+                try lowerArrayComparatorSortTryApply(
+                    plan: plan,
+                    normalTarget: normalTarget,
+                    errorTarget: errorTarget,
+                    line: line
+                )
+            case .partition:
+                try lowerArrayPartitionTryApply(
+                    plan: plan,
+                    normalTarget: normalTarget,
+                    errorTarget: errorTarget,
+                    line: line
+                )
+            case .sorted, .sort:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "natural ordering unexpectedly used try_apply"
+                )
+            }
+        }
+
         /// `Sequence.reduce(into:_:)` is the standard-library operation whose
         /// callback receives caller-owned mutable storage. Keep that storage
         /// in one frame slot and pass a scoped address into each invocation;
@@ -3447,7 +4069,7 @@ public struct Lowerer: Sendable {
             }
             let propagatedResult = try allocate(type: plan.callResultType)
             implicitStackValues[normalTarget] = [
-                (resultDestination, propagatedResult),
+                .init(resultDestination, propagatedResult),
             ]
 
             let errorValueType: Bytecode.ValueType = typeEnvironment
@@ -3463,7 +4085,7 @@ public struct Lowerer: Sendable {
                 }
                 let propagatedError = try allocate(type: errorValueType)
                 implicitStackValues[errorTarget] = [
-                    (errorDestination, propagatedError),
+                    .init(errorDestination, propagatedError),
                 ]
             }
 
@@ -3742,7 +4364,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let parameter = try allocate(type: plan.callResultType)
-                implicitStackValues[normalTarget] = [(destination, parameter)]
+                implicitStackValues[normalTarget] = [.init(destination, parameter)]
             } else if plan.callResultType == .void {
                 guard suppressedVoidTryNormalBlocks
                     .insert(normalTarget).inserted
@@ -3769,7 +4391,7 @@ public struct Lowerer: Sendable {
                     }
                     let propagated = try allocate(type: errorValueType)
                     implicitStackValues[errorTarget] = [
-                        (destination, propagated),
+                        .init(destination, propagated),
                     ]
                 }
             } else {
@@ -5120,7 +5742,7 @@ public struct Lowerer: Sendable {
                 }
                 let propagatedResult = try allocate(type: plan.output.type)
                 implicitStackValues[normalTarget] = [
-                    (plan.resultDestination, propagatedResult),
+                    .init(plan.resultDestination, propagatedResult),
                 ]
                 completionTarget = normalTarget
                 directResultToken = nil
@@ -5147,7 +5769,7 @@ public struct Lowerer: Sendable {
                     let parameter = try allocate(type: expectedErrorType)
                     let propagated = try allocate(type: expectedErrorType)
                     implicitStackValues[errorTarget] = [
-                        (errorDestination, propagated),
+                        .init(errorDestination, propagated),
                     ]
                     errorParameter = parameter
                 } else {
@@ -5434,10 +6056,10 @@ public struct Lowerer: Sendable {
             let propagatedSuccess = try allocate(type: successType)
             let propagatedFailure = try allocate(type: failureType)
             implicitStackValues[normalTarget] = [
-                (plan.resultDestination, propagatedSuccess),
+                .init(plan.resultDestination, propagatedSuccess),
             ]
             implicitStackValues[errorTarget] = [
-                (plan.errorDestination, propagatedFailure),
+                .init(plan.errorDestination, propagatedFailure),
             ]
 
             let success = try allocateSyntheticBlockID()
@@ -7933,7 +8555,15 @@ public struct Lowerer: Sendable {
                     arguments: arguments,
                     line: line
                 )
-            case .higherOrder, .algebraic:
+            case let .ordering(operation) where !operation.usesClosure:
+                try lowerNaturalArrayOrdering(
+                    operation,
+                    resultToken: resultToken,
+                    genericArguments: genericArguments,
+                    arguments: arguments,
+                    line: line
+                )
+            case .higherOrder, .ordering, .algebraic:
                 throw CanonicalSIL.LoweringError.unsupportedInstruction(
                     line: line,
                     text: "Swift intrinsic requires control-flow lowering"
@@ -10021,14 +10651,14 @@ public struct Lowerer: Sendable {
                     for item in implicit {
                         if runtimeAddress(at: item.address) != nil
                             || item.address == indirectResultAddress {
-                            // An indirect call initializes its destination on
-                            // one continuation edge. Preserve that write when
-                            // storage is runtime-backed or forwards the current
-                            // function's own `@out` result slot.
+                            // Continuation-carried values may initialize an
+                            // indirect result or assign a transactional inout
+                            // update. Preserve the recorded mode for runtime
+                            // storage and the current function's `@out` slot.
                             try storeConstructedValue(
                                 item.register,
                                 at: item.address,
-                                mode: .initialize
+                                mode: item.storeMode
                             )
                             continue
                         }
@@ -12755,6 +13385,21 @@ public struct Lowerer: Sendable {
                     )
                     continue
                 }
+                if case let .ordering(operation)? = swiftCoreReferences[
+                    call[0]
+                ], operation.usesClosure {
+                    let normalTarget = try parseBlockID(call[4])
+                    let errorTarget = try parseBlockID(call[5])
+                    try lowerArrayOrderingTryApply(
+                        operation: operation,
+                        genericArguments: call[1],
+                        argumentText: call[2],
+                        normalTarget: normalTarget,
+                        errorTarget: errorTarget,
+                        line: sourceLine
+                    )
+                    continue
+                }
                 if case let .algebraic(intrinsic)? = swiftCoreReferences[
                     call[0]
                 ] {
@@ -14830,6 +15475,16 @@ public struct Lowerer: Sendable {
                         appendInstruction(.endAccess(access))
                     }
                     values[load[0]] = result
+                    if mode.isEmpty,
+                       addressType.requiresLinearOwnership {
+                        // An unqualified canonical-SIL load is a +0 view even
+                        // when the address has been promoted to runtime storage.
+                        // `loadAddress.copy` supplies the temporary VM owner;
+                        // track it until the matching retain or final use so it
+                        // cannot leak beside the owner materialized for Swift.
+                        borrowedLoadTokens.insert(load[0])
+                        try recordBorrowedTemporaryValue(result, for: load[0])
+                    }
                     recordOptionalLoadCase(
                         from: load[2],
                         to: load[0],
@@ -15051,7 +15706,7 @@ public struct Lowerer: Sendable {
                         noneTarget: failureTarget
                     )
                 )
-                implicitStackValues[successTarget] = [(cast[2], projected)]
+                implicitStackValues[successTarget] = [.init(cast[2], projected)]
                 continue
             }
 
@@ -15118,7 +15773,7 @@ public struct Lowerer: Sendable {
                         noneTarget: failureTarget
                     )
                 )
-                implicitStackValues[successTarget] = [(cast[2], projected)]
+                implicitStackValues[successTarget] = [.init(cast[2], projected)]
                 catchScratchAddresses.insert(sourceAddress)
                 catchScratchAddresses.insert(destinationAddress)
                 continue
@@ -16432,7 +17087,8 @@ public struct Lowerer: Sendable {
 
     private func supportsIndirectResult(_ type: Bytecode.ValueType) -> Bool {
         switch type {
-        case .void, .never, .address, .mutableCell, .arrayBuilder:
+        case .void, .never, .address, .mutableCell, .arrayBuilder,
+             .arraySortState:
             false
         case .bool, .integer, .float, .string, .any, .array, .dictionary, .set,
              .tuple, .native, .local, .error, .closure, .optional:
@@ -16990,6 +17646,100 @@ public struct Lowerer: Sendable {
                 )
             }
             return value[1]
+        }
+    }
+
+    private func parseArrayOrderingPlan(
+        operation: CanonicalSIL.OrderingIntrinsic,
+        genericArguments: String,
+        argumentText: String,
+        line: Int
+    ) throws -> ArrayOrderingPlan {
+        guard operation.usesClosure else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "natural ordering does not use try_apply lowering"
+            )
+        }
+        let genericSpellings = splitTopLevel(genericArguments)
+            .filter { !$0.isEmpty }
+        let genericTypes = try genericSpellings.map(parseType)
+        let arguments = try parseApplyValueTokens(argumentText, line: line)
+        guard genericTypes.count == 1,
+              case let .array(element) = genericTypes[0]
+        else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "ordering requires a represented Array specialization"
+            )
+        }
+
+        switch operation {
+        case .sortedBy:
+            guard arguments.count == 2 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Sequence.sorted(by:) has unsupported arguments"
+                )
+            }
+            return .init(
+                operation: operation,
+                sourceToken: arguments[1],
+                closureToken: arguments[0],
+                resultDestination: nil,
+                elementType: element
+            )
+        case .sortBy:
+            guard arguments.count == 2 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "MutableCollection.sort(by:) has unsupported arguments"
+                )
+            }
+            switch typeEnvironment.collectionIndexModel(
+                for: genericSpellings[0]
+            ) {
+            case .zeroBasedInteger:
+                break
+            case .preservedBaseInteger, .opaque:
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "mutating comparator ordering requires zero-based Array indices"
+                )
+            }
+            return .init(
+                operation: operation,
+                sourceToken: arguments[1],
+                closureToken: arguments[0],
+                resultDestination: nil,
+                elementType: element
+            )
+        case .partition:
+            guard arguments.count == 3 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "MutableCollection.partition(by:) has unsupported arguments"
+                )
+            }
+            switch typeEnvironment.collectionIndexModel(
+                for: genericSpellings[0]
+            ) {
+            case .zeroBasedInteger:
+                break
+            case .preservedBaseInteger:
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "partition requires preserved indices for \(genericSpellings[0])"
+                )
+            case .opaque:
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "partition requires a represented index for \(genericSpellings[0])"
+                )
+            }
+            return .init(
+                operation: operation,
+                sourceToken: arguments[2],
+                closureToken: arguments[1],
+                resultDestination: arguments[0],
+                elementType: element
+            )
+        case .sorted, .sort:
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "natural ordering reached comparator plan parsing"
+            )
         }
     }
 

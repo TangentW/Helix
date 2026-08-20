@@ -37,7 +37,7 @@ extension Bytecode.ValueType {
                 pending.append((key, item.depth + 1))
                 pending.append((value, item.depth + 1))
             case .void, .never, .any, .native, .local, .error, .address,
-                 .mutableCell, .arrayBuilder, .closure, .tuple:
+                 .mutableCell, .arrayBuilder, .arraySortState, .closure, .tuple:
                 return false
             }
         }

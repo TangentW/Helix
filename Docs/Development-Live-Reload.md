@@ -341,14 +341,18 @@ collection, tuple, and patch-local struct storage, including Swift escape
 boxes; common fully concrete Array-backed higher-order operations—including
 `flatMap`, short-circuiting prefix/drop predicates, and direction-preserving
 first/last searches, comparator-driven `min(by:)`/`max(by:)`, and scoped
-inout accumulation through `reduce(into:_:)`—use
+inout accumulation through `reduce(into:_:)`, stable comparator
+`sorted(by:)`/`sort(by:)`, and stable `partition(by:)`—use
 verified closure CFGs; Array-producing variants use a linear builder, while
 supported Optional and Result payload transforms use the same selected-case
 plan. Common Array structural edits—including concatenation, contents append
 and insertion, range replacement/removal, counted edge removal, clearing,
 swapping, and capacity hints—are also supported for matching Array-backed
 sources and represented copyable elements; they are type-driven rather than
-special-cased for a framework class. Multi-branch local initialization
+special-cased for a framework class. Natural `sorted()`/`sort()` is available
+for VM-comparable scalar elements. Mutating ordering commits only on its normal
+continuation, so a throwing callback leaves the original Array unchanged.
+Multi-branch local initialization
 uses field-sensitive definite/possible state, so conditional replacement and
 cleanup are supported while reads remain fail-closed until every field is
 definitely initialized. Physical `@in` and `@inout` conventions drive storage

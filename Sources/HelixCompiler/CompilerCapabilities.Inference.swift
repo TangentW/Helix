@@ -156,6 +156,9 @@ extension CompilerCapabilities {
         case let .arrayBuilder(element):
             capabilities.insert(.collectionsV1)
             collect(element, into: &capabilities)
+        case let .arraySortState(element):
+            capabilities.insert(.collectionsV1)
+            collect(element, into: &capabilities)
         case let .array(element):
             capabilities.insert(.collectionsV1)
             collect(element, into: &capabilities)

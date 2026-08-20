@@ -88,6 +88,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
     case address(VM.Address)
     case mutableCell(VM.MutableCell)
     case arrayBuilder(VM.ArrayBuilder)
+    case arraySortState(VM.ArraySortState)
     case closure(VM.Closure)
 
     public var type: Bytecode.ValueType {
@@ -110,6 +111,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .address(address): .address(address.pointee)
         case let .mutableCell(cell): .mutableCell(cell.pointee)
         case let .arrayBuilder(builder): .arrayBuilder(builder.elementType)
+        case let .arraySortState(state): .arraySortState(state.elementType)
         case let .closure(closure): .closure(closure.signature)
         }
     }
@@ -137,6 +139,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .address(address): address.description
         case let .mutableCell(cell): cell.description
         case let .arrayBuilder(builder): builder.description
+        case let .arraySortState(state): state.description
         case let .closure(closure): closure.description
         }
     }
@@ -257,6 +260,8 @@ extension VM.Value {
             cell.pointee == pointee
         case let (.arrayBuilder(builder), .arrayBuilder(element)):
             builder.elementType == element
+        case let (.arraySortState(state), .arraySortState(element)):
+            state.elementType == element
         case let (.closure(closure), .closure(signature)):
             closure.signature == signature
         case let (.integer(value), .integer(width, signed)):

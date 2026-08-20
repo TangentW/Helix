@@ -282,6 +282,16 @@ public enum Disassembler {
             "array_builder_append_contents \(array) to \(builder)"
         case let .finishArrayBuilder(result, builder):
             "\(result) = finish_array_builder \(builder)"
+        case let .arraySorted(result, array):
+            "\(result) = array_sorted \(array)"
+        case let .makeArraySortState(result, array):
+            "\(result) = make_array_sort_state \(array)"
+        case let .arraySortNextComparison(result, state):
+            "\(result) = array_sort_next_comparison \(state)"
+        case let .arraySortAcceptComparison(state, rightPrecedesLeft):
+            "array_sort_accept_comparison \(rightPrecedesLeft) in \(state)"
+        case let .finishArraySort(result, state):
+            "\(result) = finish_array_sort \(state)"
         case let .arrayUpdate(result, array, index, value):
             "\(result) = array_update \(array)[\(index)] = \(value)"
         case let .arrayPopLast(elementResult, arrayResult, array):

@@ -106,6 +106,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
     case address(Bytecode.ValueType)
     case mutableCell(Bytecode.ValueType)
     case arrayBuilder(Bytecode.ValueType)
+    case arraySortState(Bytecode.ValueType)
     case closure(Bytecode.ClosureSignature)
     case tuple([Bytecode.ValueType])
     case optional(Bytecode.ValueType)
@@ -121,13 +122,14 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case let .optional(wrapped):
             wrapped.isTrivial
         case .string, .any, .array, .dictionary, .set, .native, .local, .error,
-             .address, .mutableCell, .arrayBuilder, .closure:
+             .address, .mutableCell, .arrayBuilder, .arraySortState, .closure:
             false
         }
     }
 
-    /// Native values and invocation-local builders need explicit linear
-    /// lifetime proof. Other Swift-managed values release with their register.
+    /// Native values and invocation-local construction states need explicit
+    /// linear lifetime proof. Other Swift-managed values release with their
+    /// register.
     public var requiresLinearOwnership: Bool {
         switch self {
         case .native:
@@ -142,7 +144,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
             key.requiresLinearOwnership || value.requiresLinearOwnership
         case let .set(element):
             element.requiresLinearOwnership
-        case .arrayBuilder:
+        case .arrayBuilder, .arraySortState:
             true
         case .void, .never, .bool, .integer, .float, .string, .any, .local,
              .error, .address, .mutableCell, .closure:
@@ -168,6 +170,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case let .address(pointee): "@address<\(pointee)>"
         case let .mutableCell(pointee): "@mutableCell<\(pointee)>"
         case let .arrayBuilder(element): "@arrayBuilder<\(element)>"
+        case let .arraySortState(element): "@arraySortState<\(element)>"
         case let .closure(signature): "@closure\(signature)"
         case let .tuple(elements): "(\(elements.map(\.description).joined(separator: ", ")))"
         case let .optional(wrapped): "Optional<\(wrapped)>"
@@ -707,6 +710,31 @@ public enum Instruction: Codable, Hashable, Sendable {
         result: Bytecode.Register,
         builder: Bytecode.Register
     )
+    /// Sorts VM-comparable elements without crossing a callback boundary.
+    /// Comparator-driven APIs use the state-machine instructions below so
+    /// arbitrary Swift closures remain ordinary verified calls.
+    case arraySorted(
+        result: Bytecode.Register,
+        array: Bytecode.Register
+    )
+    case makeArraySortState(
+        result: Bytecode.Register,
+        array: Bytecode.Register
+    )
+    /// Produces `(right, left)` for the next stable merge comparison. `nil`
+    /// means that every merge pass is complete.
+    case arraySortNextComparison(
+        result: Bytecode.Register,
+        state: Bytecode.Register
+    )
+    case arraySortAcceptComparison(
+        state: Bytecode.Register,
+        rightPrecedesLeft: Bytecode.Register
+    )
+    case finishArraySort(
+        result: Bytecode.Register,
+        state: Bytecode.Register
+    )
     case arrayUpdate(
         result: Bytecode.Register,
         array: Bytecode.Register,
@@ -910,6 +938,10 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .loadMutableCell(result, _),
              let .makeArrayBuilder(result),
              let .finishArrayBuilder(result, _),
+             let .arraySorted(result, _),
+             let .makeArraySortState(result, _),
+             let .arraySortNextComparison(result, _),
+             let .finishArraySort(result, _),
              let .allocateObject(result),
              let .projectObjectAddress(result, _, _),
              let .projectHostedObject(result, _),
@@ -999,6 +1031,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              .destroyStackIfInitialized,
              .storeMutableCell, .arrayBuilderAppend,
              .arrayBuilderAppendContents,
+             .arraySortAcceptComparison,
              .hostedSuperApply, .endAccess,
              .storeAddress, .destroyAddress,
              .destroyAddressIfInitialized, .switchOptional, .branch,
@@ -1151,6 +1184,14 @@ public enum Instruction: Codable, Hashable, Sendable {
             [builder, array]
         case let .finishArrayBuilder(_, builder):
             [builder]
+        case let .arraySorted(_, array),
+             let .makeArraySortState(_, array):
+            [array]
+        case let .arraySortNextComparison(_, state),
+             let .finishArraySort(_, state):
+            [state]
+        case let .arraySortAcceptComparison(state, rightPrecedesLeft):
+            [state, rightPrecedesLeft]
         case let .arrayUpdate(_, array, index, value):
             [array, index, value]
         case let .arrayPopLast(_, _, array):

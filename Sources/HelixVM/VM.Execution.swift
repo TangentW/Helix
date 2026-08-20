@@ -518,6 +518,10 @@ public final class InvocationBudget: @unchecked Sendable {
             throw VM.RuntimeTrap.explicit(
                 "Array builders cannot cross a VM boundary"
             )
+        case .arraySortState:
+            throw VM.RuntimeTrap.explicit(
+                "Array sort states cannot cross a VM boundary"
+            )
         case .closure:
             throw VM.RuntimeTrap.explicit("closure values cannot cross a VM boundary")
         case .bool, .integer, .float:

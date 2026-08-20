@@ -29,6 +29,8 @@ enum ValueRepresentation {
             .mutableCell(storable(pointee))
         case let .arrayBuilder(element):
             .arrayBuilder(storable(element))
+        case let .arraySortState(element):
+            .arraySortState(storable(element))
         case let .closure(signature):
             .closure(
                 .init(

@@ -2820,6 +2820,87 @@ struct Interpreter {
         )
     }
 
+    @Test("Natural Array sorting is typed and fuel-bounded")
+    func executesNaturalArraySorting() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "naturalArraySorting",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: arrayType,
+            registerTypes: [arrayType, arrayType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .arraySorted(
+                            result: .init(rawValue: 1),
+                            array: .init(rawValue: 0)
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .collectionsV1],
+            signature: .init(
+                parameters: ["Swift.Array<Swift.Int>"],
+                result: "Swift.Array<Swift.Int>"
+            ),
+            parameterTypes: [arrayType],
+            resultType: arrayType
+        )
+        let input = VM.Value.array(
+            try [8, 3, 5, 1, 3].map { value in
+                .integer(
+                    try .init(
+                        signed: Int64(value),
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
+            },
+            elementType: .int64
+        )
+        let expected = VM.Value.array(
+            try [1, 3, 3, 5, 8].map { value in
+                .integer(
+                    try .init(
+                        signed: Int64(value),
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
+            },
+            elementType: .int64
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [input]
+            ) == .returned(expected)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [input],
+                budget: .init(
+                    limits: .init(
+                        instructionFuelPerEntry: 3,
+                        maxWallTimeMainThreadMilliseconds: 1_000
+                    )
+                )
+            ) == .trapped(.instructionFuelExhausted)
+        )
+    }
+
     @Test("Linear Array builders accumulate and finish exactly once")
     func executesLinearArrayBuilder() throws {
         let builderType = Bytecode.ValueType.arrayBuilder(.int64)

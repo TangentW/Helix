@@ -655,7 +655,7 @@ public struct Archive: Codable, Hashable, Sendable {
             case .float:
                 break
             case .local, .error, .address, .mutableCell, .arrayBuilder,
-                 .closure:
+                 .arraySortState, .closure:
                 throw InterfaceArchive.Error.invalidArchive(
                     "patch-local nominal, Error, internal storage, and closure values cannot appear in a Shell signature"
                 )
@@ -690,6 +690,8 @@ public struct Archive: Codable, Hashable, Sendable {
             case let .mutableCell(pointee):
                 usesMainActorType(pointee)
             case let .arrayBuilder(element):
+                usesMainActorType(element)
+            case let .arraySortState(element):
                 usesMainActorType(element)
             case .void, .never, .bool, .integer, .float, .string, .any, .local,
                  .error, .address:

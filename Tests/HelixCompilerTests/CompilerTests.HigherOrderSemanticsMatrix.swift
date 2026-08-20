@@ -1317,6 +1317,22 @@ struct HigherOrderSemanticsMatrix {
             values.forEach { _ in }
         }
 
+        public func sortedObjects(_ values: [NSObject]) -> [NSObject] {
+            values.sorted { _, _ in false }
+        }
+
+        public func sortedObjectsInPlace(_ values: [NSObject]) -> [NSObject] {
+            var result = values
+            result.sort { _, _ in false }
+            return result
+        }
+
+        public func partitionedObjects(_ values: [NSObject]) -> [NSObject] {
+            var result = values
+            _ = result.partition { _ in false }
+            return result
+        }
+
         public func optionalMappedObject(_ value: NSObject?) -> NSObject? {
             value.map { $0 }
         }
@@ -1385,6 +1401,7 @@ struct HigherOrderSemanticsMatrix {
             "firstObject", "firstObjectIndex",
             "lastObject", "lastObjectIndex", "minimumObject",
             "maximumObject", "containsObject", "visitsObjects",
+            "sortedObjects", "sortedObjectsInPlace", "partitionedObjects",
             "optionalMappedObject",
             "optionalFlatMappedObject",
             "optionalThrowingFlatMappedObject",

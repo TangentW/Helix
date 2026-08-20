@@ -240,6 +240,59 @@ struct Container {
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
     }
 
+    @Test("HLBC 1.0 canonically carries bounded Array ordering state")
+    func arrayOrderingWireFormat() throws {
+        var module = try makeAddModule()
+        module.capabilities.insert(.collectionsV1)
+        module.functions[0].registerTypes.append(contentsOf: [
+            .array(.int64),
+            .arraySortState(.int64),
+            .optional(.tuple([.int64, .int64])),
+            .bool,
+            .array(.int64),
+            .array(.int64),
+        ])
+        module.functions[0].blocks[0].instructions.insert(contentsOf: [
+            .makeArray(
+                result: .init(rawValue: 5),
+                elements: [.init(rawValue: 0)]
+            ),
+            .makeArraySortState(
+                result: .init(rawValue: 6),
+                array: .init(rawValue: 5)
+            ),
+            .arraySortNextComparison(
+                result: .init(rawValue: 7),
+                state: .init(rawValue: 6)
+            ),
+            .constantBool(result: .init(rawValue: 8), value: true),
+            .arraySortAcceptComparison(
+                state: .init(rawValue: 6),
+                rightPrecedesLeft: .init(rawValue: 8)
+            ),
+            .finishArraySort(
+                result: .init(rawValue: 9),
+                state: .init(rawValue: 6)
+            ),
+            .arraySorted(
+                result: .init(rawValue: 10),
+                array: .init(rawValue: 5)
+            ),
+        ], at: 0)
+
+        let bytes = try Bytecode.Encoder.encode(module)
+        let decoded = try Bytecode.Decoder.decode(bytes)
+        let text = Bytecode.Disassembler.disassemble(decoded.module)
+
+        #expect(decoded.header.formatMinor == Bytecode.Format.minorVersion)
+        #expect(decoded.module == module)
+        #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
+        #expect(text.contains("make_array_sort_state"))
+        #expect(text.contains("array_sort_next_comparison"))
+        #expect(text.contains("finish_array_sort"))
+        #expect(text.contains("array_sorted"))
+    }
+
     @Test("HLBC 1.0 canonically carries closure values and function kinds")
     func closureWireFormat() throws {
         var module = try makeAddModule()

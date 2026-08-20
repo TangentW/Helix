@@ -400,6 +400,8 @@ public struct TypeEnvironment: Sendable {
             containsReferenceNativeValue(pointee)
         case let .arrayBuilder(element):
             containsReferenceNativeValue(element)
+        case let .arraySortState(element):
+            containsReferenceNativeValue(element)
         case let .tuple(elements):
             elements.contains(where: containsReferenceNativeValue)
         case .array, .dictionary, .set:
@@ -1205,7 +1207,7 @@ public struct TypeEnvironment: Sendable {
                 if seen.insert(key).inserted { pending.append(key) }
             case let .array(element), let .optional(element), let .set(element),
                  let .address(element), let .mutableCell(element),
-                 let .arrayBuilder(element):
+                 let .arrayBuilder(element), let .arraySortState(element):
                 collect(element)
             case let .dictionary(key, value):
                 collect(key)
@@ -1301,7 +1303,7 @@ public struct TypeEnvironment: Sendable {
                 }
             case let .array(element), let .optional(element), let .set(element),
                  let .address(element), let .mutableCell(element),
-                 let .arrayBuilder(element):
+                 let .arrayBuilder(element), let .arraySortState(element):
                 try typeDepth(element) + 1
             case let .dictionary(key, value):
                 try max(typeDepth(key), typeDepth(value)) + 1

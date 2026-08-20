@@ -100,9 +100,11 @@ does not by itself certify a physical device or distribution channel.
   Optional, Array, Dictionary, and Set values. Dictionary and Set comparison is
   order-independent, collection equality preserves Swift's shared-storage fast
   path, and Float/Double preserve Swift NaN and signed-zero behavior.
-  Collection ordering operations remain
-  limited to the scalar integer, floating-point, and String types that the VM
-  can compare without executing a user witness. Set supports empty, literal,
+  Natural `sorted()`/`sort()` ordering remains limited to the scalar integer,
+  floating-point, and String types that the VM can compare without executing a
+  user witness. Comparator-driven `sorted(by:)`/`sort(by:)` instead accepts any
+  represented copyable Array element because the callback runs through the
+  ordinary verified closure ABI. Set supports empty, literal,
   Array, and Set construction;
   `count`, `isEmpty`, `first`, `contains`, `insert`, `update`, `remove`,
   `popFirst`, `removeFirst`, `removeAll`, the capacity hint, iteration, the
@@ -119,11 +121,17 @@ does not by itself certify a physical device or distribution channel.
   `drop(while:)`, `reduce`, `reduce(into:_:)`,
   `forEach`, `first(where:)`, `last(where:)`, zero-based Array-backed
   `firstIndex(where:)`/`lastIndex(where:)`, `contains(where:)`, and
-  `allSatisfy`, plus comparator-driven `min(by:)`/`max(by:)`, use verified
+  `allSatisfy`, comparator-driven `min(by:)`/`max(by:)`,
+  `sorted(by:)`/`sort(by:)`, and zero-based Array `partition(by:)`, use verified
   closure control flow; Array-producing variants use a linear,
   invocation-local builder instead of repeated copy-on-write append. The
   `last` searches invoke their predicates from the end; comparator selection
-  preserves Swift's argument order and first-element tie behavior.
+  preserves Swift's argument order and first-element tie behavior. Comparator
+  sorting uses a bounded stable merge-state machine, while partition emits a
+  deterministic stable false group followed by a stable true group and returns
+  their boundary. Mutating ordering writes back only after every callback
+  succeeds; if a comparator or predicate throws, the original Array remains
+  unchanged even though callback side effects already performed remain visible.
   Sequence `prefix(while:)` is also supported when its concrete source has an
   Array-backed normalization. The lazy Sequence `drop(while:)` overload remains
   rejected: eagerly materializing it would change predicate side-effect timing.

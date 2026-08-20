@@ -13,7 +13,7 @@ extension Bytecode.ValueType {
             !elements.isEmpty
                 && elements.allSatisfy(\.isAnyPayloadOrExistentialV1)
         case .void, .never, .any, .set, .native, .error, .address, .mutableCell,
-             .arrayBuilder, .closure:
+             .arrayBuilder, .arraySortState, .closure:
             false
         }
     }

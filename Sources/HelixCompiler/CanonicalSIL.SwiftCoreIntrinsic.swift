@@ -5,6 +5,7 @@ enum SwiftCoreIntrinsic: Equatable {
     case scalar(CanonicalSIL.ScalarIntrinsic)
     case collection(CanonicalSIL.CollectionIntrinsic)
     case higherOrder(CanonicalSIL.HigherOrderIntrinsic)
+    case ordering(CanonicalSIL.OrderingIntrinsic)
     case algebraic(CanonicalSIL.AlgebraicIntrinsic)
     case minimum
     case maximum
@@ -119,6 +120,16 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .higherOrder(.minimumBy)
         case "$sSTsE3max2by7ElementQzSgSbAD_ADtKXE_tKF":
             self = .higherOrder(.maximumBy)
+        case "$sSTsSL7ElementRpzrlE6sortedSayABGyF":
+            self = .ordering(.sorted)
+        case "$sSTsE6sorted2bySay7ElementQzGSbAD_ADtKXE_tKF":
+            self = .ordering(.sortedBy)
+        case "$sSMsSkRzSL7ElementSTRpzrlE4sortyyF":
+            self = .ordering(.sort)
+        case "$sSMsSkRzrlE4sort2byySb7ElementSTQz_ADtKXE_tKF":
+            self = .ordering(.sortBy)
+        case "$sSMsSKRzrlE9partition2by5IndexSlQzSb7ElementSTQzKXE_tKF":
+            self = .ordering(.partition)
         case "$sSq3mapyqd_0_Sgqd_0_xqd__YKXEqd__YKs5ErrorRd__Ri_d_0_r0_lF":
             self = .algebraic(.optional(.map))
         case "$sSq7flatMapyqd_0_SgABxqd__YKXEqd__YKs5ErrorRd__Ri_d_0_r0_lF":

@@ -2454,6 +2454,218 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Array sort state is typed, linear, and invocation-local")
+    func validatesLinearArraySortState() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let stateType = Bytecode.ValueType.arraySortState(.int64)
+        let pairType = Bytecode.ValueType.tuple([.int64, .int64])
+        var fixture = try makeFixture { function in
+            function.resultType = arrayType
+            function.registerTypes = [
+                .int64,
+                arrayType,
+                stateType,
+                .optional(pairType),
+                pairType,
+                .int64,
+                .int64,
+                .bool,
+                arrayType,
+            ]
+            function.blocks = [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeArray(
+                            result: .init(rawValue: 1),
+                            elements: [.init(rawValue: 0)]
+                        ),
+                        .makeArraySortState(
+                            result: .init(rawValue: 2),
+                            array: .init(rawValue: 1)
+                        ),
+                        .branch(target: .init(rawValue: 1), arguments: []),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    instructions: [
+                        .arraySortNextComparison(
+                            result: .init(rawValue: 3),
+                            state: .init(rawValue: 2)
+                        ),
+                        .switchOptional(
+                            optional: .init(rawValue: 3),
+                            someTarget: .init(rawValue: 2),
+                            noneTarget: .init(rawValue: 3)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 4)],
+                    instructions: [
+                        .unpackTuple(
+                            results: [
+                                .init(rawValue: 5),
+                                .init(rawValue: 6),
+                            ],
+                            tuple: .init(rawValue: 4)
+                        ),
+                        .compare(
+                            result: .init(rawValue: 7),
+                            predicate: .lessThan,
+                            lhs: .init(rawValue: 5),
+                            rhs: .init(rawValue: 6)
+                        ),
+                        .arraySortAcceptComparison(
+                            state: .init(rawValue: 2),
+                            rightPrecedesLeft: .init(rawValue: 7)
+                        ),
+                        .branch(target: .init(rawValue: 1), arguments: []),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 3),
+                    instructions: [
+                        .finishArraySort(
+                            result: .init(rawValue: 8),
+                            state: .init(rawValue: 2)
+                        ),
+                        .returnValue(.init(rawValue: 8)),
+                    ]
+                ),
+            ]
+        }
+        fixture.module.capabilities.insert(.collectionsV1)
+        fixture.shell.capabilities.insert(.collectionsV1)
+        fixture.policy.acceptedCapabilities.insert(.collectionsV1)
+        let entry = try #require(fixture.shell.entries[.init(rawValue: 0)])
+        fixture.shell.entries[entry.index] = .init(
+            index: entry.index,
+            key: entry.key,
+            parameterTypes: entry.parameterTypes,
+            resultType: arrayType,
+            effects: entry.effects
+        )
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var copied = fixture.module
+        copied.functions[0].registerTypes.append(stateType)
+        copied.functions[0].blocks[0].instructions.insert(
+            .copyValue(
+                result: .init(rawValue: 9),
+                source: .init(rawValue: 2)
+            ),
+            at: 2
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "copy_value requires a copyable type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(copied),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var mismatched = fixture.module
+        mismatched.functions[0].registerTypes[3] = .optional(
+            .tuple([.bool, .int64])
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 1),
+                offset: 0,
+                reason: "array_sort_next_comparison requires its matching state"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(mismatched),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var leaked = fixture.module
+        leaked.functions[0].blocks[3].instructions = [
+            .makeArray(result: .init(rawValue: 8), elements: []),
+            .returnValue(.init(rawValue: 8)),
+        ]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 3),
+                offset: 1,
+                reason: "owned values remain live at return"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(leaked),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var finishedTwice = fixture.module
+        finishedTwice.functions[0].registerTypes.append(arrayType)
+        finishedTwice.functions[0].blocks[3].instructions.insert(
+            .finishArraySort(
+                result: .init(rawValue: 9),
+                state: .init(rawValue: 2)
+            ),
+            at: 1
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 3),
+                offset: 1,
+                reason: "instruction uses a consumed owned value"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(finishedTwice),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var noCapability = fixture
+        noCapability.module.capabilities.remove(.collectionsV1)
+        noCapability.shell.capabilities.remove(.collectionsV1)
+        noCapability.policy.acceptedCapabilities.remove(.collectionsV1)
+        #expect(throws: Verification.Error.self) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(noCapability.module),
+                shell: noCapability.shell,
+                policy: noCapability.policy
+            )
+        }
+
+        var boundaryShell = fixture.shell
+        boundaryShell.entries[entry.index]?.parameterTypes = [stateType]
+        #expect(throws: Verification.Error.self) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: boundaryShell,
+                policy: fixture.policy
+            )
+        }
+    }
+
     @Test("Borrowed closure ownership is explicit and exact")
     func validatesBorrowedLinearClosureParameter() throws {
         var fixture = try makeFixture { _ in }
