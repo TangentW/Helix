@@ -347,9 +347,13 @@ and comparator-selection operations. Container-preserving `filter` uses the
 same traversal for all three; Dictionary `mapValues` and `compactMapValues`
 project their specialized value callback from each represented `(Key, Value)`
 element, while `reduce(into:_:)` uses scoped inout accumulation. Array-only
-short-circuiting prefix/drop predicates, reverse `last` searches, stable
-comparator `sorted(by:)`/`sort(by:)`, and stable `partition(by:)` retain their
-specialized verified CFGs. Producing variants use one linear element buffer
+short-circuiting prefix/drop predicates, reverse `last` searches, and stable
+comparator `sorted(by:)`/`sort(by:)` retain their specialized verified CFGs.
+Array `partition(by:)` and `removeAll(where:)` share a typed linear mutable
+snapshot while their predicate calls remain ordinary verified CFG edges;
+partition preserves Swift's low/high scan, removal preserves forward visits,
+and both write back completed swaps if the predicate throws. Producing variants
+use one linear element buffer
 and a typed Array/Dictionary/Set finalizer, while
 separator- and predicate-driven Array-backed `split` use one kind-checked
 linear range state with exact `maxSplits`, empty-segment, and throwing-edge
@@ -358,7 +362,7 @@ do not preserve a source view's public index identity. Meanwhile,
 supported Optional and Result payload transforms use the same selected-case
 plan. Common Array structural edits—including concatenation, contents append
 and insertion, range replacement/removal, counted edge removal, clearing,
-swapping, and capacity hints—are also supported for matching Array-backed
+reversal, swapping, and capacity hints—are also supported for matching Array-backed
 sources and represented copyable elements; they are type-driven rather than
 special-cased for a framework class. Dictionary default lookup invokes its
 autoclosure only for a missing key. Its scoped `_modify` and Array element

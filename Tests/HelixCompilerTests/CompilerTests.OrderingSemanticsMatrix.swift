@@ -166,11 +166,11 @@ struct OrderingSemanticsMatrix {
         )
     }
 
-    @Test("Partition preserves the false/true boundary and stable groups")
+    @Test("Partition mirrors Array's bidirectional predicate order")
     func lowersPartition() throws {
         let fixture = try FrontendExecutionHarness.compile(
             source: """
-            public func stablePartition(_ values: [Int]) -> (Int, [Int]) {
+            public func partitionValues(_ values: [Int]) -> (Int, [Int]) {
                 var result = values
                 let boundary = result.partition { value in
                     value % 2 == 0
@@ -178,8 +178,8 @@ struct OrderingSemanticsMatrix {
                 return (boundary, result)
             }
             """,
-            functionName: "stablePartition",
-            moduleName: "HelixStablePartition"
+            functionName: "partitionValues",
+            moduleName: "HelixPartition"
         )
 
         #expect(
@@ -189,7 +189,7 @@ struct OrderingSemanticsMatrix {
                 arguments: [try integers([2, 1, 4, 3, 5, 6])]
             ) == .returned(.tuple([
                 try integer(3),
-                try integers([1, 3, 5, 2, 4, 6]),
+                try integers([5, 1, 3, 4, 2, 6]),
             ]))
         )
         #expect(
@@ -202,6 +202,54 @@ struct OrderingSemanticsMatrix {
                 try integers([]),
             ]))
         )
+    }
+
+    @Test("Partition matches Swift across every predicate pattern through length eight")
+    func matchesPartitionReferenceMatrix() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            public func partitionMatrix(
+                _ values: [Int]
+            ) -> (Int, [Int], [Int]) {
+                var result = values
+                var visits: [Int] = []
+                let boundary = result.partition { value in
+                    visits.append(value)
+                    return value % 2 == 0
+                }
+                return (boundary, result, visits)
+            }
+            """,
+            functionName: "partitionMatrix",
+            moduleName: "HelixPartitionMatrix"
+        )
+
+        for length in 0...8 {
+            for pattern in 0..<(1 << length) {
+                let input = (0..<length).map { index in
+                    let isEven = pattern & (1 << index) != 0
+                    return Int64(index * 2 + (isEven ? 0 : 1))
+                }
+                var expected = input
+                var visits: [Int64] = []
+                let boundary = expected.partition { value in
+                    visits.append(value)
+                    return value.isMultiple(of: 2)
+                }
+
+                #expect(
+                    VM.Interpreter().invoke(
+                        entry: fixture.entry,
+                        image: fixture.image,
+                        arguments: [try integers(input)]
+                    ) == .returned(.tuple([
+                        try integer(Int64(boundary)),
+                        try integers(expected),
+                        try integers(visits),
+                    ]))
+                )
+            }
+        }
     }
 
     @Test("Ordering callbacks handle empty and one-sided boundaries")
@@ -257,22 +305,23 @@ struct OrderingSemanticsMatrix {
         )
     }
 
-    @Test("Throwing partition preserves original inout storage")
-    func rollsBackThrowingPartition() throws {
+    @Test("Throwing partition writes back swaps completed before the error")
+    func writesBackPartialThrowingPartition() throws {
         let fixture = try FrontendExecutionHarness.compile(
             source: """
             enum PartitionFailure: Error { case stop }
 
-            public func rollbackPartition(
-                _ values: [Int]
+            public func partialPartition(
+                _ values: [Int],
+                stop: Int
             ) -> ([Int], [Int], Bool) {
                 var result = values
                 var visits: [Int] = []
                 do {
                     _ = try result.partition { value in
                         visits.append(value)
-                        if value == 0 { throw PartitionFailure.stop }
-                        return value < 0
+                        if value == stop { throw PartitionFailure.stop }
+                        return value % 2 == 0
                     }
                     return (result, visits, false)
                 } catch {
@@ -280,18 +329,35 @@ struct OrderingSemanticsMatrix {
                 }
             }
             """,
-            functionName: "rollbackPartition",
-            moduleName: "HelixThrowingPartitionRollback"
+            functionName: "partialPartition",
+            moduleName: "HelixThrowingPartitionPartial"
         )
 
         #expect(
             VM.Interpreter().invoke(
                 entry: fixture.entry,
                 image: fixture.image,
-                arguments: [try integers([3, -1, 0, -2])]
+                arguments: [
+                    try integers([2, 1, 4, 3, 5, 6]),
+                    try integer(4),
+                ]
             ) == .returned(.tuple([
-                try integers([3, -1, 0, -2]),
-                try integers([3, -1, 0]),
+                try integers([5, 1, 4, 3, 2, 6]),
+                try integers([2, 6, 5, 1, 4]),
+                .bool(true),
+            ]))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [
+                    try integers([2, 1, 4, 3, 5, 6]),
+                    try integer(6),
+                ]
+            ) == .returned(.tuple([
+                try integers([2, 1, 4, 3, 5, 6]),
+                try integers([2, 6]),
                 .bool(true),
             ]))
         )

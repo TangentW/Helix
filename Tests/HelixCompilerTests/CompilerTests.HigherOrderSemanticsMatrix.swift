@@ -1841,6 +1841,18 @@ struct HigherOrderSemanticsMatrix {
             return result
         }
 
+        public func reversedObjects(_ values: [NSObject]) -> [NSObject] {
+            var result = values
+            result.reverse()
+            return result
+        }
+
+        public func removedObjects(_ values: [NSObject]) -> [NSObject] {
+            var result = values
+            result.removeAll { _ in false }
+            return result
+        }
+
         public func optionalMappedObject(_ value: NSObject?) -> NSObject? {
             value.map { $0 }
         }
@@ -1912,6 +1924,7 @@ struct HigherOrderSemanticsMatrix {
             "lastObject", "lastObjectIndex", "minimumObject",
             "maximumObject", "containsObject", "visitsObjects",
             "sortedObjects", "sortedObjectsInPlace", "partitionedObjects",
+            "reversedObjects", "removedObjects",
             "optionalMappedObject",
             "optionalFlatMappedObject",
             "optionalThrowingFlatMappedObject",
@@ -2001,6 +2014,10 @@ struct HigherOrderSemanticsMatrix {
                         value: .native(nativeType)
                     )
                 )
+                continue
+            }
+            if name == "reversedObjects" {
+                #expect(signature.result == .array(.native(nativeType)))
                 continue
             }
             let closureBodies = compiled.module.functions.filter {

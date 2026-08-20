@@ -6,19 +6,18 @@ enum OrderingIntrinsic: Equatable {
     case sortedBy
     case sort
     case sortBy
-    case partition
 
     var usesClosure: Bool {
         switch self {
         case .sorted, .sort: false
-        case .sortedBy, .sortBy, .partition: true
+        case .sortedBy, .sortBy: true
         }
     }
 
     var mutatesSource: Bool {
         switch self {
         case .sorted, .sortedBy: false
-        case .sort, .sortBy, .partition: true
+        case .sort, .sortBy: true
         }
     }
 }

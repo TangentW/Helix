@@ -2721,6 +2721,202 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Array mutation state is typed, linear, and invocation-local")
+    func validatesLinearArrayMutationState() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let stateType = Bytecode.ValueType.arrayState(
+            kind: .mutation,
+            element: .int64
+        )
+        var fixture = try makeFixture { function in
+            function.resultType = arrayType
+            function.registerTypes = [
+                .int64,
+                arrayType,
+                stateType,
+                .int64,
+                arrayType,
+            ]
+            function.blocks[0].instructions = [
+                .makeArray(
+                    result: .init(rawValue: 1),
+                    elements: [.init(rawValue: 0)]
+                ),
+                .makeArrayMutationState(
+                    result: .init(rawValue: 2),
+                    array: .init(rawValue: 1)
+                ),
+                .arrayMutationGet(
+                    result: .init(rawValue: 3),
+                    state: .init(rawValue: 2),
+                    index: .init(rawValue: 0)
+                ),
+                .arrayMutationSwap(
+                    state: .init(rawValue: 2),
+                    lhsIndex: .init(rawValue: 0),
+                    rhsIndex: .init(rawValue: 0)
+                ),
+                .finishArrayMutation(
+                    result: .init(rawValue: 4),
+                    state: .init(rawValue: 2)
+                ),
+                .returnValue(.init(rawValue: 4)),
+            ]
+        }
+        fixture.module.capabilities.insert(.collectionsV1)
+        fixture.shell.capabilities.insert(.collectionsV1)
+        fixture.policy.acceptedCapabilities.insert(.collectionsV1)
+        let entry = try #require(fixture.shell.entries[.init(rawValue: 0)])
+        fixture.shell.entries[entry.index] = .init(
+            index: entry.index,
+            key: entry.key,
+            parameterTypes: entry.parameterTypes,
+            resultType: arrayType,
+            effects: entry.effects
+        )
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var wrongKind = fixture.module
+        wrongKind.functions[0].registerTypes[2] = .arrayState(
+            kind: .stableSort,
+            element: .int64
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "make_array_mutation_state requires a matching copyable Array"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(wrongKind),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var wrongElement = fixture.module
+        wrongElement.functions[0].registerTypes[3] = .bool
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "array_mutation_get requires its matching state, element, and Int index"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(wrongElement),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var copied = fixture.module
+        copied.functions[0].registerTypes.append(stateType)
+        copied.functions[0].blocks[0].instructions.insert(
+            .copyValue(
+                result: .init(rawValue: 5),
+                source: .init(rawValue: 2)
+            ),
+            at: 2
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "copy_value requires a copyable type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(copied),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var leaked = fixture.module
+        leaked.functions[0].blocks[0].instructions = [
+            .makeArray(
+                result: .init(rawValue: 1),
+                elements: [.init(rawValue: 0)]
+            ),
+            .makeArrayMutationState(
+                result: .init(rawValue: 2),
+                array: .init(rawValue: 1)
+            ),
+            .makeArray(result: .init(rawValue: 4), elements: []),
+            .returnValue(.init(rawValue: 4)),
+        ]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 3,
+                reason: "owned values remain live at return"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(leaked),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var finishedTwice = fixture.module
+        finishedTwice.functions[0].registerTypes.append(arrayType)
+        finishedTwice.functions[0].blocks[0].instructions.insert(
+            .finishArrayMutation(
+                result: .init(rawValue: 5),
+                state: .init(rawValue: 2)
+            ),
+            at: 5
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 5,
+                reason: "instruction uses a consumed owned value"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(finishedTwice),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var noCapability = fixture
+        noCapability.module.capabilities.remove(.collectionsV1)
+        noCapability.shell.capabilities.remove(.collectionsV1)
+        noCapability.policy.acceptedCapabilities.remove(.collectionsV1)
+        #expect(throws: Verification.Error.self) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(noCapability.module),
+                shell: noCapability.shell,
+                policy: noCapability.policy
+            )
+        }
+
+        var boundaryShell = fixture.shell
+        boundaryShell.entries[entry.index]?.parameterTypes = [stateType]
+        #expect(throws: Verification.Error.self) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: boundaryShell,
+                policy: fixture.policy
+            )
+        }
+    }
+
     @Test("Array sort state is typed, linear, and invocation-local")
     func validatesLinearArraySortState() throws {
         let arrayType = Bytecode.ValueType.array(.int64)

@@ -5,6 +5,7 @@ extension Bytecode {
 public enum ArrayStateKind: String, Codable, Hashable, Sendable,
     CustomStringConvertible {
     case builder
+    case mutation
     case stableSort
     case split
 

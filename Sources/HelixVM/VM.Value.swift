@@ -88,6 +88,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
     case address(VM.Address)
     case mutableCell(VM.MutableCell)
     case arrayBuilder(VM.ArrayBuilder)
+    case arrayMutationState(VM.ArrayMutationState)
     case dictionaryBuilder(VM.DictionaryBuilder)
     case arraySortState(VM.ArraySortState)
     case arraySplitState(VM.ArraySplitState)
@@ -114,6 +115,8 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .mutableCell(cell): .mutableCell(cell.pointee)
         case let .arrayBuilder(builder):
             .arrayState(kind: .builder, element: builder.elementType)
+        case let .arrayMutationState(state):
+            .arrayState(kind: .mutation, element: state.elementType)
         case let .dictionaryBuilder(builder):
             .dictionaryState(key: builder.keyType, value: builder.valueType)
         case let .arraySortState(state):
@@ -147,6 +150,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .address(address): address.description
         case let .mutableCell(cell): cell.description
         case let .arrayBuilder(builder): builder.description
+        case let .arrayMutationState(state): state.description
         case let .dictionaryBuilder(builder): builder.description
         case let .arraySortState(state): state.description
         case let .arraySplitState(state): state.description
@@ -270,6 +274,11 @@ extension VM.Value {
             cell.pointee == pointee
         case let (.arrayBuilder(builder), .arrayState(kind: .builder, element)):
             builder.elementType == element
+        case let (
+            .arrayMutationState(state),
+            .arrayState(kind: .mutation, element)
+        ):
+            state.elementType == element
         case let (
             .dictionaryBuilder(builder),
             .dictionaryState(key, value)

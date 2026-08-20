@@ -315,6 +315,9 @@ struct Container {
             .optional(.int64),
             .array(.array(.int64)),
             .array(.array(.int64)),
+            .arrayState(kind: .mutation, element: .int64),
+            .int64,
+            .array(.int64),
         ])
         module.functions[0].blocks[0].instructions.insert(contentsOf: [
             .makeArray(
@@ -369,6 +372,24 @@ struct Container {
                 maxSplits: .init(rawValue: 12),
                 omittingEmptySubsequences: .init(rawValue: 13)
             ),
+            .makeArrayMutationState(
+                result: .init(rawValue: 17),
+                array: .init(rawValue: 5)
+            ),
+            .arrayMutationGet(
+                result: .init(rawValue: 18),
+                state: .init(rawValue: 17),
+                index: .init(rawValue: 0)
+            ),
+            .arrayMutationSwap(
+                state: .init(rawValue: 17),
+                lhsIndex: .init(rawValue: 0),
+                rhsIndex: .init(rawValue: 0)
+            ),
+            .finishArrayMutation(
+                result: .init(rawValue: 19),
+                state: .init(rawValue: 17)
+            ),
         ], at: 0)
 
         let bytes = try Bytecode.Encoder.encode(module)
@@ -387,6 +408,10 @@ struct Container {
         #expect(text.contains("array_split_accept_element"))
         #expect(text.contains("finish_array_split"))
         #expect(text.contains("array_split %5"))
+        #expect(text.contains("make_array_mutation_state"))
+        #expect(text.contains("array_mutation_get"))
+        #expect(text.contains("array_mutation_swap"))
+        #expect(text.contains("finish_array_mutation"))
     }
 
     @Test("HLBC 1.0 canonically carries Dictionary accumulation state")

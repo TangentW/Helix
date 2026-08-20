@@ -57,6 +57,7 @@ enum CollectionIntrinsic: Equatable {
         case removeLastCount
         case removeSubrange
         case removeAll
+        case reverse
         case swapAt
         case reserveCapacity
 
@@ -100,7 +101,7 @@ enum CollectionIntrinsic: Equatable {
                 }
                 array = .array(element)
             case .removeFirst, .removeLast, .removeFirstCount,
-                 .removeLastCount, .removeSubrange, .swapAt:
+                 .removeLastCount, .removeSubrange, .reverse, .swapAt:
                 guard specializations.count == 1,
                       case .array = specializations[0]
                 else {
@@ -221,6 +222,8 @@ enum CollectionIntrinsic: Equatable {
             self = .arrayEdit(.removeSubrange)
         case "$sSa9removeAll15keepingCapacityySb_tF":
             self = .arrayEdit(.removeAll)
+        case "$sSMsSKRzrlE7reverseyyF":
+            self = .arrayEdit(.reverse)
         case "$sSMsE6swapAtyy5IndexQz_ACtF":
             self = .arrayEdit(.swapAt)
         case "$sSa15reserveCapacityyySiF":

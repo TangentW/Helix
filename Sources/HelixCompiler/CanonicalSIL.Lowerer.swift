@@ -249,8 +249,25 @@ public struct Lowerer: Sendable {
         var operation: CanonicalSIL.OrderingIntrinsic
         var sourceToken: String
         var closureToken: String
+        var elementType: Bytecode.ValueType
+    }
+
+    private struct ArrayPredicateMutationPlan {
+        var operation: CanonicalSIL.ArrayPredicateMutationIntrinsic
+        var sourceToken: String
+        var closureToken: String
         var resultDestination: String?
         var elementType: Bytecode.ValueType
+    }
+
+    private struct ArrayPredicateMutationContext {
+        var arrayType: Bytecode.ValueType
+        var closure: Bytecode.Register
+        var closureSignature: Bytecode.ClosureSignature
+        var state: Bytecode.Register
+        var count: Bytecode.Register
+        var errorType: Bytecode.ValueType
+        var traversalSource: Bytecode.Register?
     }
 
     private struct ArraySplitPlan {
@@ -3530,7 +3547,7 @@ public struct Lowerer: Sendable {
                     mode: .assign
                 )
                 voidValues.insert(resultToken)
-            case .sortedBy, .sortBy, .partition:
+            case .sortedBy, .sortBy:
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "closure ordering reached natural ordering lowering"
                 )
@@ -3608,10 +3625,7 @@ public struct Lowerer: Sendable {
             line: Int
         ) throws -> (Bytecode.Register, Bytecode.ClosureSignature) {
             let closure = try resolve(plan.closureToken, line: line)
-            let expectedParameters = Array(
-                repeating: plan.elementType,
-                count: plan.operation == .partition ? 1 : 2
-            )
+            let expectedParameters = Array(repeating: plan.elementType, count: 2)
             guard case let .closure(signature) = registerTypes[
                 Int(closure.rawValue)
             ], signature.parameters == expectedParameters,
@@ -3648,28 +3662,6 @@ public struct Lowerer: Sendable {
                 }
                 let propagatedArray = try allocate(type: arrayType)
                 implicitStackValues[normalTarget] = [
-                    .init(
-                        plan.sourceToken,
-                        propagatedArray,
-                        storeMode: .assign
-                    ),
-                ]
-            case .partition:
-                let arrayType = Bytecode.ValueType.array(plan.elementType)
-                guard let destination = plan.resultDestination,
-                      compilerAddressType(destination) == .int64,
-                      compilerAddressType(plan.sourceToken) == arrayType,
-                      implicitStackValues[normalTarget] == nil,
-                      suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "partition(by:) requires an out Index and mutable Array"
-                    )
-                }
-                let propagatedIndex = try allocate(type: .int64)
-                let propagatedArray = try allocate(type: arrayType)
-                implicitStackValues[normalTarget] = [
-                    .init(destination, propagatedIndex),
                     .init(
                         plan.sourceToken,
                         propagatedArray,
@@ -3827,98 +3819,459 @@ public struct Lowerer: Sendable {
             )
         }
 
-        /// A stable two-builder partition gives deterministic output while
-        /// preserving Swift's documented false-before-true postcondition. The
-        /// original inout value is replaced only after the predicate finishes,
-        /// so a thrown callback cannot expose half-written VM storage.
-        func lowerArrayPartitionTryApply(
-            plan: ArrayOrderingPlan,
+        func prepareArrayPredicateMutation(
+            plan: ArrayPredicateMutationPlan,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws -> ArrayPredicateMutationContext {
+            let arrayType = Bytecode.ValueType.array(plan.elementType)
+            guard compilerAddressType(plan.sourceToken) == arrayType,
+                  let source = try takeStoredValue(
+                    at: plan.sourceToken,
+                    line: line
+                  ),
+                  registerTypes[Int(source.rawValue)] == arrayType,
+                  implicitStackValues[normalTarget] == nil,
+                  implicitStackValues[errorTarget] == nil,
+                  suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "predicate mutation requires one mutable Array continuation"
+                )
+            }
+
+            let closure = try resolve(plan.closureToken, line: line)
+            guard case let .closure(signature) = registerTypes[
+                Int(closure.rawValue)
+            ], signature.parameters == [plan.elementType],
+               signature.parameterConventions.count == 1,
+               signature.parameterConventions[0] != .inout,
+               signature.result == .bool,
+               signature.effects.mayThrow,
+               !signature.effects.isAsync
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<Array predicate mutation closure>"
+                )
+            }
+
+            let normalArray = try allocate(type: arrayType)
+            switch plan.operation {
+            case .partition:
+                guard let destination = plan.resultDestination,
+                      compilerAddressType(destination) == .int64
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "partition(by:) requires an out Index"
+                    )
+                }
+                let normalBoundary = try allocate(type: .int64)
+                implicitStackValues[normalTarget] = [
+                    .init(destination, normalBoundary),
+                    .init(
+                        plan.sourceToken,
+                        normalArray,
+                        storeMode: .initialize
+                    ),
+                ]
+            case .removeAllWhere:
+                guard plan.resultDestination == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "removeAll(where:) unexpectedly has a result destination"
+                    )
+                }
+                implicitStackValues[normalTarget] = [
+                    .init(
+                        plan.sourceToken,
+                        normalArray,
+                        storeMode: .initialize
+                    ),
+                ]
+            }
+            let errorArray = try allocate(type: arrayType)
+            implicitStackValues[errorTarget] = [
+                .init(
+                    plan.sourceToken,
+                    errorArray,
+                    storeMode: .initialize
+                ),
+            ]
+
+            let count = try allocate(type: .int64)
+            appendInstruction(.arrayCount(result: count, array: source))
+            let state = try allocate(
+                type: .arrayState(kind: .mutation, element: plan.elementType)
+            )
+            appendInstruction(
+                .makeArrayMutationState(result: state, array: source)
+            )
+            let traversalSource: Bytecode.Register?
+            if plan.operation == .removeAllWhere {
+                traversalSource = source
+            } else {
+                appendInstruction(.destroyValue(source))
+                traversalSource = nil
+            }
+            return .init(
+                arrayType: arrayType,
+                closure: closure,
+                closureSignature: signature,
+                state: state,
+                count: count,
+                errorType: typeEnvironment.preservesTypedErrors
+                    ? .error : .string,
+                traversalSource: traversalSource
+            )
+        }
+
+        /// Array selects the bidirectional MutableCollection overload. Mirror
+        /// its low/high predicate order and write back completed swaps on both
+        /// continuations so a thrown predicate exposes the same partial value.
+        func lowerArrayBidirectionalPartitionTryApply(
+            plan: ArrayPredicateMutationPlan,
             normalTarget: Bytecode.BlockID,
             errorTarget: Bytecode.BlockID,
             line: Int
         ) throws {
             guard plan.operation == .partition else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "partition lowering received a different operation"
+                    "bidirectional partition received a different operation"
                 )
             }
-            let arrayType = Bytecode.ValueType.array(plan.elementType)
-            let borrowedSource = try borrowStoredValue(
-                at: plan.sourceToken,
-                line: line
-            )
-            let source = try borrowedSource?.register
-                ?? resolve(plan.sourceToken, line: line)
-            guard registerTypes[Int(source.rawValue)] == arrayType else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "partition source does not match its Array specialization"
-                )
-            }
-            let (closure, closureSignature) = try resolveArrayOrderingClosure(
-                for: plan,
-                line: line
-            )
-            try prepareArrayOrderingContinuations(
+            let context = try prepareArrayPredicateMutation(
                 plan: plan,
-                normalTarget: normalTarget
+                normalTarget: normalTarget,
+                errorTarget: errorTarget,
+                line: line
             )
+            let elementNeedsCleanup = plan.elementType.requiresLinearOwnership
+                && context.closureSignature.parameterConventions[0] != .owned
 
-            let errorType: Bytecode.ValueType = typeEnvironment
-                .preservesTypedErrors ? .error : .string
-            let errorParameter = try allocate(type: errorType)
-            let builderType = Bytecode.ValueType.arrayState(
-                kind: .builder,
-                element: plan.elementType
+            let lowSlot = try allocateStackSlot(type: .int64)
+            let highSlot = try allocateStackSlot(type: .int64)
+            let zero = try allocate(type: .int64)
+            appendInstruction(.constantInteger(result: zero, bitPattern: 0))
+            appendInstruction(
+                .storeStack(slot: lowSlot, source: zero, mode: .initialize)
             )
-            let falseBuilder = try allocate(type: builderType)
-            let trueBuilder = try allocate(type: builderType)
-            let indexSlot = try allocateStackSlot(type: .int64)
-            let falseCountSlot = try allocateStackSlot(type: .int64)
-            let zeroIndex = try allocate(type: .int64)
-            let zeroCount = try allocate(type: .int64)
-            let loop = try allocateSyntheticBlockID()
-            let some = try allocateSyntheticBlockID()
-            let closureContinuation = try allocateSyntheticBlockID()
-            let appendFalse = try allocateSyntheticBlockID()
-            let appendFalseChecked = try allocateSyntheticBlockID()
-            let appendTrue = try allocateSyntheticBlockID()
-            let complete = try allocateSyntheticBlockID()
-            let overflowTrap = try allocateSyntheticBlockID()
-            let failed = try allocateSyntheticBlockID()
-            let next = try allocate(type: .optional(plan.elementType))
-            let element = try allocate(type: plan.elementType)
-            let predicate = try allocate(type: .bool)
-            let currentCount = try allocate(type: .int64)
-            let one = try allocate(type: .int64)
-            let advancedCount = try allocate(type: .int64)
-            let overflow = try allocate(type: .bool)
-            let trueArray = try allocate(type: arrayType)
-            let partitioned = try allocate(type: arrayType)
-            let partitionIndex = try allocate(type: .int64)
-
-            let inputConvention = closureSignature.parameterConventions[0]
-            let closureInput: Bytecode.Register
-            var closurePreparation: [IntermediateRepresentation.Instruction] = []
-            if plan.elementType.requiresLinearOwnership,
-               inputConvention == .owned {
-                let copy = try allocate(type: plan.elementType)
-                closurePreparation.append(
-                    .copyValue(result: copy, source: element)
+            appendInstruction(
+                .storeStack(
+                    slot: highSlot,
+                    source: context.count,
+                    mode: .initialize
                 )
-                closureInput = copy
-            } else {
-                closureInput = element
-            }
-            let elementCleanup: [IntermediateRepresentation.Instruction] =
-                plan.elementType.requiresLinearOwnership
-                    ? [.destroyValue(element)] : []
-            let sourceCleanup: [IntermediateRepresentation.Instruction] =
-                borrowedSource?.temporaryOwner.map {
-                    [.destroyValue($0)]
-                } ?? []
+            )
 
-            appendInstruction(.makeArrayBuilder(result: falseBuilder))
-            appendInstruction(.makeArrayBuilder(result: trueBuilder))
+            let scanLow = try allocateSyntheticBlockID()
+            let readLow = try allocateSyntheticBlockID()
+            let lowDecision = try allocateSyntheticBlockID()
+            let advanceLow = try allocateSyntheticBlockID()
+            let storeAdvancedLow = try allocateSyntheticBlockID()
+            let decrementHigh = try allocateSyntheticBlockID()
+            let storeDecrementedHigh = try allocateSyntheticBlockID()
+            let readHigh = try allocateSyntheticBlockID()
+            let highDecision = try allocateSyntheticBlockID()
+            let swap = try allocateSyntheticBlockID()
+            let complete = try allocateSyntheticBlockID()
+            let lowFailed = try allocateSyntheticBlockID()
+            let highFailed = try allocateSyntheticBlockID()
+            let overflowTrap = try allocateSyntheticBlockID()
+
+            let lowIndex = try allocate(type: .int64)
+            let highIndex = try allocate(type: .int64)
+            let hasLow = try allocate(type: .bool)
+            let lowElement = try allocate(type: plan.elementType)
+            let lowPredicate = try allocate(type: .bool)
+            let lowToAdvance = try allocate(type: .int64)
+            let oneLow = try allocate(type: .int64)
+            let advancedLow = try allocate(type: .int64)
+            let lowOverflow = try allocate(type: .bool)
+            let currentHigh = try allocate(type: .int64)
+            let oneHigh = try allocate(type: .int64)
+            let decrementedHigh = try allocate(type: .int64)
+            let highOverflow = try allocate(type: .bool)
+            let currentLow = try allocate(type: .int64)
+            let hasHigh = try allocate(type: .bool)
+            let highElement = try allocate(type: plan.elementType)
+            let highPredicate = try allocate(type: .bool)
+            let boundary = try allocate(type: .int64)
+            let completedArray = try allocate(type: context.arrayType)
+            let lowError = try allocate(type: context.errorType)
+            let highError = try allocate(type: context.errorType)
+            let lowErrorArray = try allocate(type: context.arrayType)
+            let highErrorArray = try allocate(type: context.arrayType)
+
+            appendInstruction(.branch(target: scanLow, arguments: []))
+            finishCurrent()
+            appendSyntheticBlock(
+                id: scanLow,
+                instructions: [
+                    .loadStack(result: lowIndex, slot: lowSlot, mode: .copy),
+                    .loadStack(result: highIndex, slot: highSlot, mode: .copy),
+                    .compare(
+                        result: hasLow,
+                        predicate: .lessThan,
+                        lhs: lowIndex,
+                        rhs: highIndex
+                    ),
+                    .conditionalBranch(
+                        condition: hasLow,
+                        trueTarget: readLow,
+                        trueArguments: [],
+                        falseTarget: complete,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: readLow,
+                instructions: [
+                    .arrayMutationGet(
+                        result: lowElement,
+                        state: context.state,
+                        index: lowIndex
+                    ),
+                    .closureTryApply(
+                        closure: context.closure,
+                        arguments: [lowElement],
+                        normalTarget: lowDecision,
+                        errorTarget: lowFailed
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: lowDecision,
+                parameters: [lowPredicate],
+                instructions: (elementNeedsCleanup
+                    ? [.destroyValue(lowElement)] : []) + [
+                    .conditionalBranch(
+                        condition: lowPredicate,
+                        trueTarget: decrementHigh,
+                        trueArguments: [],
+                        falseTarget: advanceLow,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: advanceLow,
+                instructions: [
+                    .loadStack(
+                        result: lowToAdvance,
+                        slot: lowSlot,
+                        mode: .copy
+                    ),
+                    .constantInteger(result: oneLow, bitPattern: 1),
+                    .checkedBinary(
+                        result: advancedLow,
+                        overflow: lowOverflow,
+                        operation: .add,
+                        lhs: lowToAdvance,
+                        rhs: oneLow
+                    ),
+                    .conditionalBranch(
+                        condition: lowOverflow,
+                        trueTarget: overflowTrap,
+                        trueArguments: [],
+                        falseTarget: storeAdvancedLow,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: storeAdvancedLow,
+                instructions: [
+                    .storeStack(
+                        slot: lowSlot,
+                        source: advancedLow,
+                        mode: .assign
+                    ),
+                    .branch(target: scanLow, arguments: []),
+                ]
+            )
+            appendSyntheticBlock(
+                id: decrementHigh,
+                instructions: [
+                    .loadStack(
+                        result: currentHigh,
+                        slot: highSlot,
+                        mode: .copy
+                    ),
+                    .constantInteger(result: oneHigh, bitPattern: 1),
+                    .checkedBinary(
+                        result: decrementedHigh,
+                        overflow: highOverflow,
+                        operation: .subtract,
+                        lhs: currentHigh,
+                        rhs: oneHigh
+                    ),
+                    .conditionalBranch(
+                        condition: highOverflow,
+                        trueTarget: overflowTrap,
+                        trueArguments: [],
+                        falseTarget: storeDecrementedHigh,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: storeDecrementedHigh,
+                instructions: [
+                    .storeStack(
+                        slot: highSlot,
+                        source: decrementedHigh,
+                        mode: .assign
+                    ),
+                    .loadStack(
+                        result: currentLow,
+                        slot: lowSlot,
+                        mode: .copy
+                    ),
+                    .compare(
+                        result: hasHigh,
+                        predicate: .lessThan,
+                        lhs: currentLow,
+                        rhs: decrementedHigh
+                    ),
+                    .conditionalBranch(
+                        condition: hasHigh,
+                        trueTarget: readHigh,
+                        trueArguments: [],
+                        falseTarget: complete,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: readHigh,
+                instructions: [
+                    .arrayMutationGet(
+                        result: highElement,
+                        state: context.state,
+                        index: decrementedHigh
+                    ),
+                    .closureTryApply(
+                        closure: context.closure,
+                        arguments: [highElement],
+                        normalTarget: highDecision,
+                        errorTarget: highFailed
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: highDecision,
+                parameters: [highPredicate],
+                instructions: (elementNeedsCleanup
+                    ? [.destroyValue(highElement)] : []) + [
+                    .conditionalBranch(
+                        condition: highPredicate,
+                        trueTarget: decrementHigh,
+                        trueArguments: [],
+                        falseTarget: swap,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: swap,
+                instructions: [
+                    .arrayMutationSwap(
+                        state: context.state,
+                        lhsIndex: currentLow,
+                        rhsIndex: decrementedHigh
+                    ),
+                    .branch(target: advanceLow, arguments: []),
+                ]
+            )
+            appendSyntheticBlock(
+                id: complete,
+                instructions: [
+                    .loadStack(result: boundary, slot: lowSlot, mode: .take),
+                    .destroyStack(highSlot),
+                    .finishArrayMutation(
+                        result: completedArray,
+                        state: context.state
+                    ),
+                    .branch(
+                        target: normalTarget,
+                        arguments: [boundary, completedArray]
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: lowFailed,
+                parameters: [lowError],
+                instructions: (elementNeedsCleanup
+                    ? [.destroyValue(lowElement)] : []) + [
+                    .destroyStack(lowSlot),
+                    .destroyStack(highSlot),
+                    .finishArrayMutation(
+                        result: lowErrorArray,
+                        state: context.state
+                    ),
+                    .branch(
+                        target: errorTarget,
+                        arguments: [lowError, lowErrorArray]
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: highFailed,
+                parameters: [highError],
+                instructions: (elementNeedsCleanup
+                    ? [.destroyValue(highElement)] : []) + [
+                    .destroyStack(lowSlot),
+                    .destroyStack(highSlot),
+                    .finishArrayMutation(
+                        result: highErrorArray,
+                        state: context.state
+                    ),
+                    .branch(
+                        target: errorTarget,
+                        arguments: [highError, highErrorArray]
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: overflowTrap,
+                instructions: [.trap(.integerOverflow)]
+            )
+        }
+
+        /// `removeAll(where:)` on Array uses `_halfStablePartition`, then
+        /// removes the matching suffix. Traverse the immutable input sequence
+        /// while retaining the progressively swapped value for both exits.
+        func lowerArrayHalfStableRemovalTryApply(
+            plan: ArrayPredicateMutationPlan,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            guard plan.operation == .removeAllWhere else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "half-stable removal received a different operation"
+                )
+            }
+            let context = try prepareArrayPredicateMutation(
+                plan: plan,
+                normalTarget: normalTarget,
+                errorTarget: errorTarget,
+                line: line
+            )
+            guard let traversalSource = context.traversalSource else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "half-stable removal omitted its traversal snapshot"
+                )
+            }
+            let elementNeedsCleanup = plan.elementType.requiresLinearOwnership
+                && context.closureSignature.parameterConventions[0] != .owned
+
+            let indexSlot = try allocateStackSlot(type: .int64)
+            let pivotSlot = try allocateStackSlot(type: .int64)
+            let zeroIndex = try allocate(type: .int64)
+            let zeroPivot = try allocate(type: .int64)
             appendInstruction(
                 .constantInteger(result: zeroIndex, bitPattern: 0)
             )
@@ -3930,166 +4283,313 @@ public struct Lowerer: Sendable {
                 )
             )
             appendInstruction(
-                .constantInteger(result: zeroCount, bitPattern: 0)
+                .constantInteger(result: zeroPivot, bitPattern: 0)
             )
             appendInstruction(
                 .storeStack(
-                    slot: falseCountSlot,
-                    source: zeroCount,
+                    slot: pivotSlot,
+                    source: zeroPivot,
                     mode: .initialize
                 )
             )
-            appendInstruction(.branch(target: loop, arguments: []))
-            finishCurrent()
 
+            let initialLoop = try allocateSyntheticBlockID()
+            let initialSome = try allocateSyntheticBlockID()
+            let initialDecision = try allocateSyntheticBlockID()
+            let incrementPivot = try allocateSyntheticBlockID()
+            let storeIncrementedPivot = try allocateSyntheticBlockID()
+            let suffixLoop = try allocateSyntheticBlockID()
+            let suffixSome = try allocateSyntheticBlockID()
+            let suffixDecision = try allocateSyntheticBlockID()
+            let swap = try allocateSyntheticBlockID()
+            let performSwap = try allocateSyntheticBlockID()
+            let storeSwappedPivot = try allocateSyntheticBlockID()
+            let complete = try allocateSyntheticBlockID()
+            let initialFailed = try allocateSyntheticBlockID()
+            let suffixFailed = try allocateSyntheticBlockID()
+            let overflowTrap = try allocateSyntheticBlockID()
+
+            let initialNext = try allocate(type: .optional(plan.elementType))
+            let initialElement = try allocate(type: plan.elementType)
+            let initialPredicate = try allocate(type: .bool)
+            let suffixNext = try allocate(type: .optional(plan.elementType))
+            let suffixElement = try allocate(type: plan.elementType)
+            let suffixPredicate = try allocate(type: .bool)
+            let currentPivot = try allocate(type: .int64)
+            let onePivot = try allocate(type: .int64)
+            let incrementedPivot = try allocate(type: .int64)
+            let pivotOverflow = try allocate(type: .bool)
+            let currentCursor = try allocate(type: .int64)
+            let oneCursor = try allocate(type: .int64)
+            let elementIndex = try allocate(type: .int64)
+            let cursorOverflow = try allocate(type: .bool)
+            let currentSwapPivot = try allocate(type: .int64)
+            let oneSwap = try allocate(type: .int64)
+            let incrementedSwapPivot = try allocate(type: .int64)
+            let swapPivotOverflow = try allocate(type: .bool)
+            let boundary = try allocate(type: .int64)
+            let partitioned = try allocate(type: context.arrayType)
+            let empty = try allocate(type: context.arrayType)
+            let result = try allocate(type: context.arrayType)
+            let initialError = try allocate(type: context.errorType)
+            let suffixError = try allocate(type: context.errorType)
+            let initialErrorArray = try allocate(type: context.arrayType)
+            let suffixErrorArray = try allocate(type: context.arrayType)
+
+            appendInstruction(.branch(target: initialLoop, arguments: []))
+            finishCurrent()
             appendSyntheticBlock(
-                id: loop,
+                id: initialLoop,
                 instructions: [
                     .collectionNext(
-                        result: next,
-                        collection: source,
+                        result: initialNext,
+                        collection: traversalSource,
                         indexSlot: indexSlot,
                         direction: .forward
                     ),
                     .switchOptional(
-                        optional: next,
-                        someTarget: some,
+                        optional: initialNext,
+                        someTarget: initialSome,
                         noneTarget: complete
                     ),
                 ]
             )
             appendSyntheticBlock(
-                id: some,
-                parameters: [element],
-                instructions: closurePreparation + [
+                id: initialSome,
+                parameters: [initialElement],
+                instructions: [
                     .closureTryApply(
-                        closure: closure,
-                        arguments: [closureInput],
-                        normalTarget: closureContinuation,
-                        errorTarget: failed
+                        closure: context.closure,
+                        arguments: [initialElement],
+                        normalTarget: initialDecision,
+                        errorTarget: initialFailed
                     ),
                 ]
             )
             appendSyntheticBlock(
-                id: closureContinuation,
-                parameters: [predicate],
-                instructions: [
+                id: initialDecision,
+                parameters: [initialPredicate],
+                instructions: (elementNeedsCleanup
+                    ? [.destroyValue(initialElement)] : []) + [
                     .conditionalBranch(
-                        condition: predicate,
-                        trueTarget: appendTrue,
+                        condition: initialPredicate,
+                        trueTarget: suffixLoop,
                         trueArguments: [],
-                        falseTarget: appendFalse,
+                        falseTarget: incrementPivot,
                         falseArguments: []
                     ),
                 ]
             )
             appendSyntheticBlock(
-                id: appendFalse,
+                id: incrementPivot,
                 instructions: [
                     .loadStack(
-                        result: currentCount,
-                        slot: falseCountSlot,
+                        result: currentPivot,
+                        slot: pivotSlot,
                         mode: .copy
                     ),
-                    .constantInteger(result: one, bitPattern: 1),
+                    .constantInteger(result: onePivot, bitPattern: 1),
                     .checkedBinary(
-                        result: advancedCount,
-                        overflow: overflow,
+                        result: incrementedPivot,
+                        overflow: pivotOverflow,
                         operation: .add,
-                        lhs: currentCount,
-                        rhs: one
+                        lhs: currentPivot,
+                        rhs: onePivot
                     ),
                     .conditionalBranch(
-                        condition: overflow,
+                        condition: pivotOverflow,
                         trueTarget: overflowTrap,
                         trueArguments: [],
-                        falseTarget: appendFalseChecked,
+                        falseTarget: storeIncrementedPivot,
                         falseArguments: []
                     ),
                 ]
             )
             appendSyntheticBlock(
-                id: appendFalseChecked,
+                id: storeIncrementedPivot,
                 instructions: [
                     .storeStack(
-                        slot: falseCountSlot,
-                        source: advancedCount,
+                        slot: pivotSlot,
+                        source: incrementedPivot,
                         mode: .assign
                     ),
-                    .arrayBuilderAppend(
-                        builder: falseBuilder,
-                        value: element
-                    ),
-                ] + elementCleanup + [
-                    .branch(target: loop, arguments: []),
+                    .branch(target: initialLoop, arguments: []),
                 ]
             )
             appendSyntheticBlock(
-                id: appendTrue,
+                id: suffixLoop,
                 instructions: [
-                    .arrayBuilderAppend(
-                        builder: trueBuilder,
-                        value: element
+                    .collectionNext(
+                        result: suffixNext,
+                        collection: traversalSource,
+                        indexSlot: indexSlot,
+                        direction: .forward
                     ),
-                ] + elementCleanup + [
-                    .branch(target: loop, arguments: []),
+                    .switchOptional(
+                        optional: suffixNext,
+                        someTarget: suffixSome,
+                        noneTarget: complete
+                    ),
                 ]
             )
-
-            var completionInstructions: [IntermediateRepresentation.Instruction] = [
-                .finishArrayBuilder(
-                    result: trueArray,
-                    builder: trueBuilder
-                ),
-                .arrayBuilderAppendContents(
-                    builder: falseBuilder,
-                    array: trueArray
-                ),
-            ]
-            if arrayType.requiresLinearOwnership {
-                completionInstructions.append(.destroyValue(trueArray))
-            }
-            completionInstructions.append(contentsOf: [
-                .finishArrayBuilder(
-                    result: partitioned,
-                    builder: falseBuilder
-                ),
-                .loadStack(
-                    result: partitionIndex,
-                    slot: falseCountSlot,
-                    mode: .take
-                ),
-                .destroyStack(indexSlot),
-            ])
-            completionInstructions.append(contentsOf: sourceCleanup)
-            completionInstructions.append(
-                .branch(
-                    target: normalTarget,
-                    arguments: [partitionIndex, partitioned]
-                )
+            appendSyntheticBlock(
+                id: suffixSome,
+                parameters: [suffixElement],
+                instructions: [
+                    .closureTryApply(
+                        closure: context.closure,
+                        arguments: [suffixElement],
+                        normalTarget: suffixDecision,
+                        errorTarget: suffixFailed
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: suffixDecision,
+                parameters: [suffixPredicate],
+                instructions: (elementNeedsCleanup
+                    ? [.destroyValue(suffixElement)] : []) + [
+                    .conditionalBranch(
+                        condition: suffixPredicate,
+                        trueTarget: suffixLoop,
+                        trueArguments: [],
+                        falseTarget: swap,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: swap,
+                instructions: [
+                    .loadStack(
+                        result: currentCursor,
+                        slot: indexSlot,
+                        mode: .copy
+                    ),
+                    .constantInteger(result: oneCursor, bitPattern: 1),
+                    .checkedBinary(
+                        result: elementIndex,
+                        overflow: cursorOverflow,
+                        operation: .subtract,
+                        lhs: currentCursor,
+                        rhs: oneCursor
+                    ),
+                    .conditionalBranch(
+                        condition: cursorOverflow,
+                        trueTarget: overflowTrap,
+                        trueArguments: [],
+                        falseTarget: performSwap,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: performSwap,
+                instructions: [
+                    .loadStack(
+                        result: currentSwapPivot,
+                        slot: pivotSlot,
+                        mode: .copy
+                    ),
+                    .arrayMutationSwap(
+                        state: context.state,
+                        lhsIndex: currentSwapPivot,
+                        rhsIndex: elementIndex
+                    ),
+                    .constantInteger(result: oneSwap, bitPattern: 1),
+                    .checkedBinary(
+                        result: incrementedSwapPivot,
+                        overflow: swapPivotOverflow,
+                        operation: .add,
+                        lhs: currentSwapPivot,
+                        rhs: oneSwap
+                    ),
+                    .conditionalBranch(
+                        condition: swapPivotOverflow,
+                        trueTarget: overflowTrap,
+                        trueArguments: [],
+                        falseTarget: storeSwappedPivot,
+                        falseArguments: []
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: storeSwappedPivot,
+                instructions: [
+                    .storeStack(
+                        slot: pivotSlot,
+                        source: incrementedSwapPivot,
+                        mode: .assign
+                    ),
+                    .branch(target: suffixLoop, arguments: []),
+                ]
             )
             appendSyntheticBlock(
                 id: complete,
-                instructions: completionInstructions
+                instructions: [
+                    .loadStack(
+                        result: boundary,
+                        slot: pivotSlot,
+                        mode: .take
+                    ),
+                    .destroyStack(indexSlot),
+                    .finishArrayMutation(
+                        result: partitioned,
+                        state: context.state
+                    ),
+                    .makeArray(result: empty, elements: []),
+                    .arrayReplaceSubrange(
+                        result: result,
+                        array: partitioned,
+                        lowerBound: boundary,
+                        upperBound: context.count,
+                        replacement: empty
+                    ),
+                    .destroyValue(partitioned),
+                    .destroyValue(empty),
+                    .destroyValue(traversalSource),
+                    .branch(target: normalTarget, arguments: [result]),
+                ]
+            )
+            appendSyntheticBlock(
+                id: initialFailed,
+                parameters: [initialError],
+                instructions: (elementNeedsCleanup
+                    ? [.destroyValue(initialElement)] : []) + [
+                    .destroyStack(indexSlot),
+                    .destroyStack(pivotSlot),
+                    .destroyValue(traversalSource),
+                    .finishArrayMutation(
+                        result: initialErrorArray,
+                        state: context.state
+                    ),
+                    .branch(
+                        target: errorTarget,
+                        arguments: [initialError, initialErrorArray]
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: suffixFailed,
+                parameters: [suffixError],
+                instructions: (elementNeedsCleanup
+                    ? [.destroyValue(suffixElement)] : []) + [
+                    .destroyStack(indexSlot),
+                    .destroyStack(pivotSlot),
+                    .destroyValue(traversalSource),
+                    .finishArrayMutation(
+                        result: suffixErrorArray,
+                        state: context.state
+                    ),
+                    .branch(
+                        target: errorTarget,
+                        arguments: [suffixError, suffixErrorArray]
+                    ),
+                ]
             )
             appendSyntheticBlock(
                 id: overflowTrap,
                 instructions: [.trap(.integerOverflow)]
-            )
-            appendSyntheticBlock(
-                id: failed,
-                parameters: [errorParameter],
-                instructions: elementCleanup + [
-                    .destroyValue(falseBuilder),
-                    .destroyValue(trueBuilder),
-                    .destroyStack(indexSlot),
-                    .destroyStack(falseCountSlot),
-                ] + sourceCleanup + [
-                    .branch(
-                        target: errorTarget,
-                        arguments: [errorParameter]
-                    ),
-                ]
             )
         }
 
@@ -4115,16 +4615,41 @@ public struct Lowerer: Sendable {
                     errorTarget: errorTarget,
                     line: line
                 )
+            case .sorted, .sort:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "natural ordering unexpectedly used try_apply"
+                )
+            }
+        }
+
+        func lowerArrayPredicateMutationTryApply(
+            operation: CanonicalSIL.ArrayPredicateMutationIntrinsic,
+            genericArguments: String,
+            argumentText: String,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            let plan = try parseArrayPredicateMutationPlan(
+                operation: operation,
+                genericArguments: genericArguments,
+                argumentText: argumentText,
+                line: line
+            )
+            switch operation {
             case .partition:
-                try lowerArrayPartitionTryApply(
+                try lowerArrayBidirectionalPartitionTryApply(
                     plan: plan,
                     normalTarget: normalTarget,
                     errorTarget: errorTarget,
                     line: line
                 )
-            case .sorted, .sort:
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "natural ordering unexpectedly used try_apply"
+            case .removeAllWhere:
+                try lowerArrayHalfStableRemovalTryApply(
+                    plan: plan,
+                    normalTarget: normalTarget,
+                    errorTarget: errorTarget,
+                    line: line
                 )
             }
         }
@@ -9478,6 +10003,49 @@ public struct Lowerer: Sendable {
                     )
                     voidValues.insert(resultToken)
 
+                case .reverse:
+                    guard arguments.count == 1,
+                          compilerAddressType(arguments[0]) == arrayType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "MutableCollection.reverse has unsupported arguments"
+                        )
+                    }
+                    let genericSpellings = splitTopLevel(genericArguments)
+                        .filter { !$0.isEmpty }
+                    guard genericSpellings.count == 1 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "MutableCollection.reverse has unsupported specializations"
+                        )
+                    }
+                    switch typeEnvironment.collectionIndexModel(
+                        for: genericSpellings[0]
+                    ) {
+                    case .zeroBasedInteger:
+                        break
+                    case .preservedBaseInteger, .opaque:
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "reverse requires zero-based Array indices for "
+                                + genericSpellings[0]
+                        )
+                    }
+                    let destination = try borrowArray(at: arguments[0])
+                    let result = try allocate(type: arrayType)
+                    appendInstruction(
+                        .arrayAdapter(
+                            result: result,
+                            operation: .reversed,
+                            array: destination.register
+                        )
+                    )
+                    destroyTemporaryOwners([destination])
+                    try storeConstructedValue(
+                        result,
+                        at: arguments[0],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
                 case .swapAt:
                     guard arguments.count == 3,
                           compilerAddressType(arguments[2]) == arrayType
@@ -9933,8 +10501,8 @@ public struct Lowerer: Sendable {
                 )
             case let .managedCollectionCast(cast):
                 try lowerRepresentationIdenticalCollectionCast(cast)
-            case .higherOrder, .ordering, .split, .algebraic,
-                 .dictionaryAccumulation:
+            case .higherOrder, .ordering, .arrayPredicateMutation, .split,
+                 .algebraic, .dictionaryAccumulation:
                 throw CanonicalSIL.LoweringError.unsupportedInstruction(
                     line: line,
                     text: "Swift intrinsic requires control-flow lowering"
@@ -15134,6 +15702,20 @@ public struct Lowerer: Sendable {
                     )
                     continue
                 }
+                if case let .arrayPredicateMutation(operation)? =
+                    swiftCoreReferences[call[0]] {
+                    let normalTarget = try parseBlockID(call[4])
+                    let errorTarget = try parseBlockID(call[5])
+                    try lowerArrayPredicateMutationTryApply(
+                        operation: operation,
+                        genericArguments: call[1],
+                        argumentText: call[2],
+                        normalTarget: normalTarget,
+                        errorTarget: errorTarget,
+                        line: sourceLine
+                    )
+                    continue
+                }
                 if case .split(.predicate)? = swiftCoreReferences[call[0]] {
                     let normalTarget = try parseBlockID(call[4])
                     let errorTarget = try parseBlockID(call[5])
@@ -19438,7 +20020,6 @@ public struct Lowerer: Sendable {
                 operation: operation,
                 sourceToken: arguments[1],
                 closureToken: arguments[0],
-                resultDestination: nil,
                 elementType: element
             )
         case .sortBy:
@@ -19461,34 +20042,6 @@ public struct Lowerer: Sendable {
                 operation: operation,
                 sourceToken: arguments[1],
                 closureToken: arguments[0],
-                resultDestination: nil,
-                elementType: element
-            )
-        case .partition:
-            guard arguments.count == 3 else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "MutableCollection.partition(by:) has unsupported arguments"
-                )
-            }
-            switch typeEnvironment.collectionIndexModel(
-                for: genericSpellings[0]
-            ) {
-            case .zeroBasedInteger:
-                break
-            case .preservedBaseInteger:
-                throw CanonicalSIL.LoweringError.unsupportedType(
-                    "partition requires preserved indices for \(genericSpellings[0])"
-                )
-            case .opaque:
-                throw CanonicalSIL.LoweringError.unsupportedType(
-                    "partition requires a represented index for \(genericSpellings[0])"
-                )
-            }
-            return .init(
-                operation: operation,
-                sourceToken: arguments[2],
-                closureToken: arguments[1],
-                resultDestination: arguments[0],
                 elementType: element
             )
         case .sorted, .sort:
@@ -19531,6 +20084,64 @@ public struct Lowerer: Sendable {
                 decisionToken: arguments[2],
                 maximumSplitsToken: arguments[0],
                 omittingEmptySubsequencesToken: arguments[1],
+                elementType: element
+            )
+        }
+    }
+
+    private func parseArrayPredicateMutationPlan(
+        operation: CanonicalSIL.ArrayPredicateMutationIntrinsic,
+        genericArguments: String,
+        argumentText: String,
+        line: Int
+    ) throws -> ArrayPredicateMutationPlan {
+        let genericSpellings = splitTopLevel(genericArguments)
+            .filter { !$0.isEmpty }
+        let genericTypes = try genericSpellings.map(parseType)
+        let arguments = try parseApplyValueTokens(argumentText, line: line)
+        guard genericSpellings.count == 1,
+              genericTypes.count == 1,
+              case let .array(element) = genericTypes[0]
+        else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "predicate mutation requires a represented Array specialization"
+            )
+        }
+        switch typeEnvironment.collectionIndexModel(for: genericSpellings[0]) {
+        case .zeroBasedInteger:
+            break
+        case .preservedBaseInteger, .opaque:
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "predicate mutation requires zero-based Array indices for "
+                    + genericSpellings[0]
+            )
+        }
+
+        switch operation {
+        case .partition:
+            guard arguments.count == 3 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "MutableCollection.partition(by:) has unsupported arguments"
+                )
+            }
+            return .init(
+                operation: operation,
+                sourceToken: arguments[2],
+                closureToken: arguments[1],
+                resultDestination: arguments[0],
+                elementType: element
+            )
+        case .removeAllWhere:
+            guard arguments.count == 2 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "RangeReplaceableCollection.removeAll(where:) has unsupported arguments"
+                )
+            }
+            return .init(
+                operation: operation,
+                sourceToken: arguments[1],
+                closureToken: arguments[0],
+                resultDestination: nil,
                 elementType: element
             )
         }

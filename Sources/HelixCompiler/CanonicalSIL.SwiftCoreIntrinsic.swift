@@ -6,6 +6,9 @@ enum SwiftCoreIntrinsic: Equatable {
     case collection(CanonicalSIL.CollectionIntrinsic)
     case higherOrder(CanonicalSIL.HigherOrderIntrinsic)
     case ordering(CanonicalSIL.OrderingIntrinsic)
+    case arrayPredicateMutation(
+        CanonicalSIL.ArrayPredicateMutationIntrinsic
+    )
     case split(CanonicalSIL.SplitIntrinsic)
     case algebraic(CanonicalSIL.AlgebraicIntrinsic)
     case dictionaryAccumulation(
@@ -161,7 +164,9 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sSMsSkRzrlE4sort2byySb7ElementSTQz_ADtKXE_tKF":
             self = .ordering(.sortBy)
         case "$sSMsSKRzrlE9partition2by5IndexSlQzSb7ElementSTQzKXE_tKF":
-            self = .ordering(.partition)
+            self = .arrayPredicateMutation(.partition)
+        case "$sSmsSMRzrlE9removeAll5whereySb7ElementSTQzKXE_tKF":
+            self = .arrayPredicateMutation(.removeAllWhere)
         case "$sSlsSQ7ElementRpzrlE5split9separator9maxSplits25omittingEmptySubsequencesSay11SubSequenceQzGAB_SiSbtF":
             self = .split(.separator)
         case "$sSlsE5split9maxSplits25omittingEmptySubsequences14whereSeparatorSay11SubSequenceQzGSi_S2b7ElementQzKXEtKF":

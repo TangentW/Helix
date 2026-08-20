@@ -720,6 +720,26 @@ public enum Instruction: Codable, Hashable, Sendable {
         result: Bytecode.Register,
         builder: Bytecode.Register
     )
+    /// Single-owner mutable Array storage for compiler-expanded algorithms.
+    /// The state is invocation-local and must be finished or destroyed.
+    case makeArrayMutationState(
+        result: Bytecode.Register,
+        array: Bytecode.Register
+    )
+    case arrayMutationGet(
+        result: Bytecode.Register,
+        state: Bytecode.Register,
+        index: Bytecode.Register
+    )
+    case arrayMutationSwap(
+        state: Bytecode.Register,
+        lhsIndex: Bytecode.Register,
+        rhsIndex: Bytecode.Register
+    )
+    case finishArrayMutation(
+        result: Bytecode.Register,
+        state: Bytecode.Register
+    )
     /// Creates an invocation-local Dictionary accumulator. A missing initial
     /// value starts empty; a present value is copied before any mutation.
     case makeDictionaryBuilder(
@@ -999,6 +1019,9 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .loadMutableCell(result, _),
              let .makeArrayBuilder(result),
              let .finishArrayBuilder(result, _),
+             let .makeArrayMutationState(result, _),
+             let .arrayMutationGet(result, _, _),
+             let .finishArrayMutation(result, _),
              let .makeDictionaryBuilder(result, _),
              let .dictionaryBuilderGet(result, _, _),
              let .finishDictionaryBuilder(result, _),
@@ -1103,6 +1126,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              .destroyStackIfInitialized,
              .storeMutableCell, .arrayBuilderAppend,
              .arrayBuilderAppendContents,
+             .arrayMutationSwap,
              .dictionaryBuilderSet,
              .dictionaryBuilderAppendArrayElement,
              .arraySortAcceptComparison,
@@ -1257,6 +1281,14 @@ public enum Instruction: Codable, Hashable, Sendable {
             [builder, array]
         case let .finishArrayBuilder(_, builder):
             [builder]
+        case let .makeArrayMutationState(_, array):
+            [array]
+        case let .arrayMutationGet(_, state, index):
+            [state, index]
+        case let .arrayMutationSwap(state, lhsIndex, rhsIndex):
+            [state, lhsIndex, rhsIndex]
+        case let .finishArrayMutation(_, state):
+            [state]
         case let .makeDictionaryBuilder(_, initialValue):
             initialValue.map { [$0] } ?? []
         case let .dictionaryBuilderGet(_, builder, key):

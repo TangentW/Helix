@@ -157,7 +157,8 @@ Both workflows depend on stable, build-specific identities:
   types are never guessed to be patch-local merely because Swift emitted their
   storage attributes in the declaration summary.
 - Array algorithms expose one invocation-local linear state type whose verifier
-  kind distinguishes builder, stable-sort, and split machines. This keeps the
+  kind distinguishes builder, random-access mutation, stable-sort, and split
+  machines. This keeps the
   noncopyable boundary rules and recursive element typing in one abstraction
   while preventing one algorithm's instructions from consuming another's
   state. Element-producing traversals and typed collection finalization use
@@ -165,16 +166,28 @@ Both workflows depend on stable, build-specific identities:
   Scalar appends and bounded whole-Array appends share the same verifier-owned
   element type and precharge copied storage before allocation; this supports
   Sequence-returning `flatMap` without an intermediate nested Array.
+- The mutation kind owns one copied Array snapshot and exposes only typed
+  indexed reads, in-place swaps, and a consuming finalizer. Reads and swaps are
+  fuel charged, the state cannot be copied or cross a function/runtime
+  boundary, and every exit must finish or destroy it. Compiler-expanded
+  algorithms can therefore retain ordinary closure CFG and Swift ownership
+  semantics without either repeatedly rebuilding an immutable Array or adding
+  one opcode/NativeImport per standard-library API.
 - Comparator sorting uses the stable-sort kind: a bounded
   stable merge-state machine that owns copied elements and index buffers while
   each comparison remains an ordinary closure call in verified control flow.
   The Verifier requires the state to be created, finished, or destroyed on
   every path and forbids it in parameters, results, stack slots, local layouts,
   and Shell/Native boundaries. Natural scalar sorting drives the same machine
-  inside one fuel- and deadline-charged VM operation. Mutating sort and the
-  two-builder stable partition propagate their completed Array through the
-  normal continuation with an explicit assignment writeback; throwing edges
-  destroy transient state and leave the original inout storage untouched.
+  inside one fuel- and deadline-charged VM operation. Mutating sort propagates
+  its completed Array through the normal continuation with an explicit
+  assignment writeback; a throwing comparator destroys transient state and
+  leaves the original inout storage untouched. Array `partition(by:)` instead
+  drives the mutation kind with Swift's bidirectional low/high scan, while
+  `removeAll(where:)` drives the same state with Swift's half-stable partition
+  followed by one suffix removal. Both preserve predicate order and write back
+  swaps completed before a thrown predicate, matching the source operation's
+  observable partial-mutation semantics.
   Separator- and predicate-driven splitting use the split kind, which owns one
   copied source and records segment ranges until completion. Predicate calls
   remain ordinary closure CFG edges; reaching `maxSplits` stops evaluation and

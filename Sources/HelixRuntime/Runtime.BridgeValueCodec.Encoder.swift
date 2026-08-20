@@ -471,8 +471,9 @@ public final class Encoder {
                 try addAggregate(elements.count, to: &result, limits: limits)
                 try append(elements, below: depth, to: &pending, limits: limits)
             case .structure, .enumeration, .object, .error, .address,
-                 .mutableCell, .arrayBuilder, .dictionaryBuilder,
-                 .arraySortState, .arraySplitState, .closure:
+                 .mutableCell, .arrayBuilder, .arrayMutationState,
+                 .dictionaryBuilder, .arraySortState, .arraySplitState,
+                 .closure:
                 throw Runtime.BridgeInputError.encodedTypeMismatch(
                     expected: "Shell boundary value",
                     actual: value.type.description

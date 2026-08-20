@@ -282,6 +282,14 @@ public enum Disassembler {
             "array_builder_append_contents \(array) to \(builder)"
         case let .finishArrayBuilder(result, builder):
             "\(result) = finish_array_builder \(builder)"
+        case let .makeArrayMutationState(result, array):
+            "\(result) = make_array_mutation_state \(array)"
+        case let .arrayMutationGet(result, state, index):
+            "\(result) = array_mutation_get \(state)[\(index)]"
+        case let .arrayMutationSwap(state, lhsIndex, rhsIndex):
+            "array_mutation_swap \(state)[\(lhsIndex)], \(state)[\(rhsIndex)]"
+        case let .finishArrayMutation(result, state):
+            "\(result) = finish_array_mutation \(state)"
         case let .makeDictionaryBuilder(result, initialValue):
             "\(result) = make_dictionary_builder"
                 + (initialValue.map { " \($0)" } ?? "")

@@ -2270,6 +2270,112 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
+                case let .makeArrayMutationState(result, arrayRegister):
+                    guard case let .arrayState(.mutation, expectedElement) =
+                            function.type(of: result)
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .arrayState(
+                                kind: .mutation,
+                                element: .never
+                            ),
+                            actual: function.type(of: result)
+                        )
+                    }
+                    let (elements, elementType) = try array(
+                        arrayRegister,
+                        registers: registers
+                    )
+                    guard elementType == expectedElement else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .array(expectedElement),
+                            actual: .array(elementType)
+                        )
+                    }
+                    let state = try makeArrayMutationState(
+                        elements,
+                        elementType: elementType,
+                        budget: budget
+                    )
+                    try initialize(
+                        .arrayMutationState(state),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arrayMutationGet(result, stateRegister, indexRegister):
+                    guard case let .arrayMutationState(state) = try read(
+                        stateRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: stateRegister) ?? .never,
+                            actual: try read(
+                                stateRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    let index = try integer(
+                        indexRegister,
+                        registers: registers
+                    ).signedValue
+                    let element = try state.element(at: index, budget: budget)
+                    try initialize(
+                        try copyCharging(element, budget: budget),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arrayMutationSwap(
+                    stateRegister,
+                    lhsIndexRegister,
+                    rhsIndexRegister
+                ):
+                    guard case let .arrayMutationState(state) = try read(
+                        stateRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: stateRegister) ?? .never,
+                            actual: try read(
+                                stateRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    try state.swapAt(
+                        try integer(
+                            lhsIndexRegister,
+                            registers: registers
+                        ).signedValue,
+                        try integer(
+                            rhsIndexRegister,
+                            registers: registers
+                        ).signedValue,
+                        budget: budget
+                    )
+                    try budget.checkDeadline()
+                case let .finishArrayMutation(result, stateRegister):
+                    guard case let .arrayState(.mutation, element) = function.type(
+                        of: stateRegister
+                    ), function.type(of: result) == .array(element),
+                       case let .arrayMutationState(state) = try consume(
+                        stateRegister,
+                        type: .arrayState(kind: .mutation, element: element),
+                        registers: &registers
+                       )
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: function.type(of: stateRegister)
+                        )
+                    }
+                    let elements = try state.finish()
+                    try budget.checkDeadline()
+                    try initialize(
+                        .array(elements, elementType: element),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .makeDictionaryBuilder(result, initialValue):
                     guard case let .dictionaryState(keyType, valueType) =
                             function.type(of: result),
@@ -4080,6 +4186,16 @@ public struct Interpreter: Sendable {
                 )
             }
         case let (
+            .arrayMutationState(state),
+            .arrayState(.mutation, element)
+        ):
+            guard state.elementType == element else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: expected,
+                    actual: value.type
+                )
+            }
+        case let (
             .dictionaryBuilder(builder),
             .dictionaryState(key, valueType)
         ):
@@ -4491,8 +4607,8 @@ public struct Interpreter: Sendable {
             )
         case .mutableCell:
             value
-        case .arrayBuilder, .dictionaryBuilder, .arraySortState,
-             .arraySplitState:
+        case .arrayBuilder, .arrayMutationState, .dictionaryBuilder,
+             .arraySortState, .arraySplitState:
             throw VM.RuntimeTrap.explicit(
                 "collection construction state cannot be copied"
             )
@@ -4666,8 +4782,8 @@ public struct Interpreter: Sendable {
                 try chargeCopiedValue(capture, budget: budget, depth: depth + 1)
             }
         case .bool, .integer, .float, .string, .address, .mutableCell,
-             .arrayBuilder, .dictionaryBuilder, .arraySortState,
-             .arraySplitState:
+             .arrayBuilder, .arrayMutationState, .dictionaryBuilder,
+             .arraySortState, .arraySplitState:
             break
         }
     }
@@ -4727,8 +4843,8 @@ public struct Interpreter: Sendable {
                 try chargeValueTraversal(capture, budget: budget, depth: depth + 1)
             }
         case .optional(nil), .native, .bool, .integer, .float, .address,
-             .mutableCell, .arrayBuilder, .dictionaryBuilder,
-             .arraySortState, .arraySplitState:
+             .mutableCell, .arrayBuilder, .arrayMutationState,
+             .dictionaryBuilder, .arraySortState, .arraySplitState:
             break
         }
     }
@@ -4797,8 +4913,8 @@ public struct Interpreter: Sendable {
                 try chargeShapeValidation(capture, budget: budget, depth: depth + 1)
             }
         case .optional(nil), .native, .bool, .integer, .float, .string,
-             .address, .mutableCell, .arrayBuilder, .dictionaryBuilder,
-             .arraySortState, .arraySplitState:
+             .address, .mutableCell, .arrayBuilder, .arrayMutationState,
+             .dictionaryBuilder, .arraySortState, .arraySplitState:
             break
         }
     }
@@ -5333,6 +5449,21 @@ public struct Interpreter: Sendable {
         try budget.consumeAggregateElementStorage(
             elementCount: indexStorage.partialValue
         )
+        for element in elements {
+            try prepareCopy(element, budget: budget)
+        }
+        let copied = try elements.map(copy)
+        try budget.checkDeadline()
+        return try .init(elementType: elementType, elements: copied)
+    }
+
+    private func makeArrayMutationState(
+        _ elements: [VM.Value],
+        elementType: Bytecode.ValueType,
+        budget: VM.InvocationBudget
+    ) throws -> VM.ArrayMutationState {
+        try budget.consumeLinearWork(elementCount: elements.count)
+        try chargeAggregate(elementCount: elements.count, budget: budget)
         for element in elements {
             try prepareCopy(element, budget: budget)
         }

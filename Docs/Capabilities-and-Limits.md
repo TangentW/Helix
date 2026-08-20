@@ -122,7 +122,9 @@ does not by itself certify a physical device or distribution channel.
   writeback on both `end_apply` and `abort_apply`, covering nested and throwing
   inout mutation without collection-API-specific bytecode.
   Array append accepts represented copyable elements, including frozen imported
-  reference values. Equality is defined recursively
+  reference values. Array also supports zero-based `reverse()` and
+  `removeAll(where:)`; predicate removal is available for any represented
+  copyable element. Equality is defined recursively
   for Bool, fixed-width integers, floating-point values, String, and supported
   Optional, Array, Dictionary, and Set values. Dictionary and Set comparison is
   order-independent, collection equality preserves Swift's shared-storage fast
@@ -153,17 +155,20 @@ does not by itself certify a physical device or distribution channel.
   `mapValues` and `compactMapValues`; their specialized key/value callback ABI
   is projected from the same tuple traversal. Array-only reverse
   `last(where:)`, zero-based `firstIndex(where:)`/`lastIndex(where:)`,
-  `prefix(while:)`, Collection `drop(while:)`, `sorted(by:)`/`sort(by:)`, and
-  zero-based `partition(by:)` retain their existing constraints. Producing
+  `prefix(while:)`, Collection `drop(while:)`, `sorted(by:)`/`sort(by:)`,
+  zero-based `reverse()`, `removeAll(where:)`, and zero-based `partition(by:)`
+  retain their existing constraints. Producing
   variants use one linear invocation-local element buffer followed by a typed
   Array, Dictionary, or Set finalizer instead of repeated copy-on-write edits.
   The `last` searches invoke their predicates from the end; comparator selection
   preserves Swift's argument order and first-element tie behavior. Comparator
-  sorting uses a bounded stable merge-state machine, while partition emits a
-  deterministic stable false group followed by a stable true group and returns
-  their boundary. Mutating ordering writes back only after every callback
-  succeeds; if a comparator or predicate throws, the original Array remains
-  unchanged even though callback side effects already performed remain visible.
+  sorting uses a bounded stable merge-state machine. Partition uses Swift's
+  bidirectional low/high predicate order and in-place swap arrangement;
+  `removeAll(where:)` visits the source in forward order, uses the same generic
+  mutable snapshot for half-stable compaction, then removes one suffix.
+  Mutating sort writes back only after every comparator succeeds. Partition and
+  predicate removal instead write back swaps completed before a thrown
+  predicate, while callback side effects already performed remain visible.
   Array-backed Collection `split` supports both the
   `separator:maxSplits:omittingEmptySubsequences:` overload for recursively
   VM-defined Equatable elements and the throwing `whereSeparator:` overload

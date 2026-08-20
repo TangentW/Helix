@@ -2548,6 +2548,48 @@ public struct Engine: Verification.ImageVerifying {
                     "finish_array_builder must produce its matching Array"
                 )
             }
+        case let .makeArrayMutationState(result, array):
+            guard capabilities.contains(.collectionsV1),
+                  case let .arrayState(.mutation, element) = type(result),
+                  type(array) == .array(element),
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "make_array_mutation_state requires a matching copyable Array"
+                )
+            }
+        case let .arrayMutationGet(result, state, index):
+            guard capabilities.contains(.collectionsV1),
+                  case let .arrayState(.mutation, element) = type(state),
+                  type(result) == element,
+                  type(index) == .int64,
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_mutation_get requires its matching state, element, and Int index"
+                )
+            }
+        case let .arrayMutationSwap(state, lhsIndex, rhsIndex):
+            guard capabilities.contains(.collectionsV1),
+                  case let .arrayState(.mutation, element) = type(state),
+                  type(lhsIndex) == .int64,
+                  type(rhsIndex) == .int64,
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "array_mutation_swap requires a copyable mutation state and Int indices"
+                )
+            }
+        case let .finishArrayMutation(result, state):
+            guard capabilities.contains(.collectionsV1),
+                  case let .arrayState(.mutation, element) = type(state),
+                  type(result) == .array(element),
+                  isCopyable(element, shell: shell)
+            else {
+                throw fail(
+                    "finish_array_mutation must produce its matching Array"
+                )
+            }
         case let .makeDictionaryBuilder(result, initialValue):
             guard capabilities.contains(.collectionsV1),
                   case let .dictionaryState(key, value) = type(result),
@@ -3665,6 +3707,25 @@ public struct Engine: Verification.ImageVerifying {
                     guard live.remove(builder) != nil else {
                         throw fail(
                             "finish_array_builder consumes a non-live builder"
+                        )
+                    }
+                    if function.type(of: result)?.requiresLinearOwnership
+                        == true {
+                        live.insert(result)
+                    }
+                case let .makeArrayMutationState(result, _):
+                    live.insert(result)
+                case let .arrayMutationGet(result, _, _):
+                    if function.type(of: result)?.requiresLinearOwnership
+                        == true {
+                        live.insert(result)
+                    }
+                case .arrayMutationSwap:
+                    break
+                case let .finishArrayMutation(result, state):
+                    guard live.remove(state) != nil else {
+                        throw fail(
+                            "finish_array_mutation consumes a non-live state"
                         )
                     }
                     if function.type(of: result)?.requiresLinearOwnership

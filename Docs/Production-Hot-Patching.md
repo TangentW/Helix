@@ -170,8 +170,9 @@ includes common integer and floating-point operations and conversions,
 one-grapheme Character literals for the bounded String predicate path,
 tuple/Optional including address projection, recursive Array/Dictionary equality,
 common Array index/search/extremum/sequence relations plus type-generic,
-Array-backed structural concatenation/insertion/replacement/removal/swap and
-capacity hints, Dictionary lookup/subscript mutation including lazy default
+Array-backed structural concatenation/insertion/replacement/removal/reversal/
+swap, predicate removal, bidirectional partition, and capacity hints,
+Dictionary lookup/subscript mutation including lazy default
 lookup and scoped default-value writeback, `updateValue`,
 `removeValue`, `removeAll`, key/value projection, unique-key sequence
 construction, uniquing construction, Dictionary/represented-Sequence
