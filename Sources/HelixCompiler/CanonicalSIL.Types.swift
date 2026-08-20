@@ -664,29 +664,19 @@ public struct TypeEnvironment: Sendable {
         for reversedPrefix in [
             "ReversedCollection<", "Swift.ReversedCollection<",
         ] where type.hasPrefix(reversedPrefix) && type.hasSuffix(">") {
-            let base = ValueRepresentation.storable(
-                try resolve(
-                    genericBody(type, prefix: reversedPrefix),
-                    relativeTo: parentScope
-                )
+            let element = try representedSequenceElement(
+                genericBody(type, prefix: reversedPrefix),
+                relativeTo: parentScope
             )
-            guard case .array = base else {
-                throw CanonicalSIL.LoweringError.unsupportedType(type)
-            }
-            return base
+            return .array(element)
         }
         for enumeratedPrefix in [
             "EnumeratedSequence<", "Swift.EnumeratedSequence<",
         ] where type.hasPrefix(enumeratedPrefix) && type.hasSuffix(">") {
-            let base = ValueRepresentation.storable(
-                try resolve(
-                    genericBody(type, prefix: enumeratedPrefix),
-                    relativeTo: parentScope
-                )
+            let element = try representedSequenceElement(
+                genericBody(type, prefix: enumeratedPrefix),
+                relativeTo: parentScope
             )
-            guard let element = base.managedCollectionElement else {
-                throw CanonicalSIL.LoweringError.unsupportedType(type)
-            }
             return .array(.tuple([.int64, element]))
         }
         for zipPrefix in ["Zip2Sequence<", "Swift.Zip2Sequence<"]
@@ -699,16 +689,14 @@ public struct TypeEnvironment: Sendable {
                     "Zip2Sequence requires two sequence arguments"
                 )
             }
-            let sequences = try components.map {
-                ValueRepresentation.storable(
-                    try resolve($0, relativeTo: parentScope)
-                )
-            }
-            guard let lhs = sequences[0].managedCollectionElement,
-                  let rhs = sequences[1].managedCollectionElement
-            else {
-                throw CanonicalSIL.LoweringError.unsupportedType(type)
-            }
+            let lhs = try representedSequenceElement(
+                components[0],
+                relativeTo: parentScope
+            )
+            let rhs = try representedSequenceElement(
+                components[1],
+                relativeTo: parentScope
+            )
             return .array(.tuple([lhs, rhs]))
         }
         for joinedPrefix in [
@@ -844,6 +832,32 @@ public struct TypeEnvironment: Sendable {
             }
             throw CanonicalSIL.LoweringError.unsupportedType(type)
         }
+    }
+
+    private func representedSequenceElement(
+        _ raw: String,
+        relativeTo parentScope: String?
+    ) throws -> Bytecode.ValueType {
+        if let progression = try CanonicalSIL.Progression.sequenceType(
+            raw,
+            resolve: {
+                ValueRepresentation.storable(
+                    try resolve($0, relativeTo: parentScope)
+                )
+            }
+        ) {
+            guard progression.supportsIteration else {
+                throw CanonicalSIL.LoweringError.unsupportedType(raw)
+            }
+            return progression.element
+        }
+        let type = ValueRepresentation.storable(
+            try resolve(raw, relativeTo: parentScope)
+        )
+        guard let element = type.managedCollectionElement else {
+            throw CanonicalSIL.LoweringError.unsupportedType(raw)
+        }
+        return element
     }
 
     func localKey(for raw: String) -> Bytecode.LocalTypeKey? {

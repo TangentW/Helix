@@ -142,6 +142,16 @@ Representation conversion, ownership, effects, re-entrancy, and resource
 budgeting are therefore checked at one of those explicit boundaries rather than
 hidden behind a name-based native dispatch.
 
+A Swift generic collection method is not a safe NativeImport shortcut. Its
+physical ABI may carry concrete-type metadata, protocol witness tables,
+specialization-dependent ownership, indirect results, and private reabstraction
+details; its closure and collection values also do not share HLVM's runtime
+representation. Those details are toolchain contracts rather than stable Shell
+capabilities. NativeImport is therefore reserved for an exact generated bridge
+or a stable native C/Objective-C-shaped operation, while supported Swift
+Sequence APIs are recognized at the frontend and lowered onto a small set of
+typed cursors, builders, mutations, and ordinary closure calls.
+
 Payload-free `nil` values recover their wrapped type from verified bytecode
 context, so the same Array/Dictionary builders, mutation/sort/split states, and
 VM equality path work for every represented `Optional<T>` without a
@@ -393,6 +403,14 @@ relations, and nonmutating ordering. Stable comparator `sorted(by:)` accepts
 Array, Set, and Dictionary elements through the same verified sort CFG;
 short-circuiting prefix/drop predicates, reverse `last` searches, and mutating
 `sort(by:)` remain Array-only.
+Finite integer ranges and supported numeric strides enter that same forward
+closure traversal for Array-producing transforms, reductions, visits,
+short-circuit predicates, and comparator selection. They remain compiler-only
+typed bounds/stride values; direct operations stream them, while
+`Array(sequence)`, `enumerated`, `reversed`, and `zip` reuse the typed Array
+builder when a stored or random-access representation is required. Unbounded
+partial ranges, progression index results, and reverse predicate traversal fail
+closed rather than acquiring guessed semantics.
 Array `partition(by:)` and `removeAll(where:)` share a typed linear mutable
 snapshot while their predicate calls remain ordinary verified CFG edges;
 partition preserves Swift's low/high scan, removal preserves forward visits,

@@ -155,6 +155,13 @@ Both workflows depend on stable, build-specific identities:
   that stronger representation. Only element-sequence semantics are
   normalized; an ArraySlice's non-zero-based index identity is not erased into
   an Array index, so unsupported slice-index APIs still fail closed.
+- Finite integer `Range`/`ClosedRange` and supported numeric `StrideTo`/
+  `StrideThrough` values form a second, compiler-only concrete Sequence
+  specialization. They retain typed bounds and stride registers rather than a
+  Swift runtime object. Forward higher-order operations stream them directly;
+  only an API whose represented result requires random access or storage—such
+  as `Array(sequence)`, `enumerated`, `reversed`, or `zip`—materializes their
+  elements through the existing typed Array builder.
 - Canonical SIL may spell tuple-label erasure through generic Array and
   Dictionary cast helpers. The compiler removes such a helper only when the
   original types differ only by tuple labels and their recursively normalized
@@ -205,21 +212,26 @@ Both workflows depend on stable, build-specific identities:
   copied source and records segment ranges until completion. Predicate calls
   remain ordinary closure CFG edges; reaching `maxSplits` stops evaluation and
   appends the untouched suffix, while a throwing edge destroys the state.
-- Managed Array, Dictionary, and Set traversal uses one type-checked cursor
-  operation instead of one instruction family per container. Forward cursors
-  hold the next element offset; Dictionary produces its `(Key, Value)` element
-  tuple and Set produces its element directly. Array additionally supports a
-  reverse cursor whose value is an exclusive upper bound, so both Array
-  directions preserve Swift's predicate order without importing a collection
-  iterator ABI. The Verifier rejects reverse traversal for unordered
-  containers, and the VM rejects cursors outside the closed `0...count`
-  boundary instead of treating corrupt state as exhaustion.
+- Concrete Sequence traversal uses one compiler cursor abstraction rather than
+  one lowering path per source API. Its managed-Collection arm drives the
+  type-checked collection cursor: forward cursors hold the next element offset,
+  Dictionary produces its `(Key, Value)` element tuple, and Set produces its
+  element directly. Array additionally supports a reverse cursor whose value is
+  an exclusive upper bound. Its finite-progression arm drives the existing
+  Optional-valued progression cursor from typed start/end/stride registers.
+  Both arms therefore feed the same closure CFG without importing a Swift
+  iterator or witness-table ABI. The Verifier rejects unsupported reverse or
+  unordered traversal, and the VM rejects corrupt cursor state instead of
+  treating it as exhaustion.
   Comparator-driven `min(by:)`/`max(by:)` reuse the same traversal but carry
   one owned candidate through the CFG. Their two borrowed inputs are ordered
   exactly as Swift specifies, ties retain the earliest element, and both the
   candidate and challenger are closed on a throwing edge.
-- Common fully concrete Sequence transformations compose that cursor with the
-  ordinary closure ABI instead of importing Swift generic collection methods.
+- Common fully concrete Sequence transformations compose that source-neutral
+  cursor with the ordinary closure ABI instead of importing Swift generic
+  collection methods. Represented Array/Dictionary/Set and finite progression
+  sources therefore share the same map/filter/reduction/predicate/comparator
+  control flow, short-circuiting, throwing edges, and ownership cleanup.
   One linear element buffer serves Array-producing transforms as well as
   container-preserving Array/Dictionary/Set `filter` and Dictionary value
   transforms; the result type selects the verified finalizer. Dictionary's

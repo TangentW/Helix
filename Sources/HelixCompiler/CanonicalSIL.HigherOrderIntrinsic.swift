@@ -2,9 +2,15 @@ import HelixBytecode
 
 extension CanonicalSIL {
 enum HigherOrderIntrinsic: Equatable {
+    enum FilterResult: Equatable {
+        case array
+        case set
+        case dictionary
+    }
+
     case map
     case flatMap
-    case filter
+    case filter(FilterResult)
     case compactMap
     case mapValues
     case compactMapValues
@@ -24,7 +30,7 @@ enum HigherOrderIntrinsic: Equatable {
 
     var usesElementBuilder: Bool {
         switch self {
-        case .map, .flatMap, .filter, .compactMap, .mapValues,
+        case .map, .flatMap, .filter(_), .compactMap, .mapValues,
              .compactMapValues, .prefixWhile, .dropWhile:
             true
         case .reduce, .reduceInto, .forEach, .firstWhere, .lastWhere,
@@ -38,7 +44,7 @@ enum HigherOrderIntrinsic: Equatable {
     /// operation uses it again after the closure returns.
     var retainsInputAfterCall: Bool {
         switch self {
-        case .filter, .firstWhere, .lastWhere, .prefixWhile, .dropWhile,
+        case .filter(_), .firstWhere, .lastWhere, .prefixWhile, .dropWhile,
              .minimumBy, .maximumBy:
             true
         case .map, .flatMap, .compactMap, .mapValues, .compactMapValues,
@@ -52,7 +58,7 @@ enum HigherOrderIntrinsic: Equatable {
         switch self {
         case .lastWhere, .lastIndexWhere:
             .reverse
-        case .map, .flatMap, .filter, .compactMap, .mapValues,
+        case .map, .flatMap, .filter(_), .compactMap, .mapValues,
              .compactMapValues, .prefixWhile, .dropWhile, .reduce,
              .reduceInto, .forEach, .firstWhere,
              .firstIndexWhere, .containsWhere, .allSatisfy,

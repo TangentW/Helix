@@ -195,9 +195,13 @@ reversed/repeated/sliced/joined Array-backed adapters,
 `Optional.map`/`flatMap`, concrete `Result` payload transforms and
 `Result.get()` for patch-local value payloads, VM-owned `Any`, and common
 dynamic casts, fixed-width integer `Range`/`ClosedRange` iteration,
-integer and floating-point `stride`, scalar Range containment, structured
-control flow, newly introduced non-exported ordinary/private helpers, computed
-accessors, file- or module-scope patch-local struct/enum, pure HLVM classes, and
+integer and floating-point `stride`, scalar Range containment, and common
+forward Sequence transforms, reductions, visits, predicates, comparator
+selection, and Array-backed adapters over those finite progression sources.
+They reuse the existing typed cursor/builder/closure semantics rather than
+Swift generic NativeImports or per-API opcodes. The subset also includes
+structured control flow, newly introduced non-exported ordinary/private helpers,
+computed accessors, file- or module-scope patch-local struct/enum, pure HLVM classes, and
 concrete `Result` values,
 payload-carrying local errors, scoped patch-local `inout`/`mutating` helpers,
 synchronous nonthrowing or throwing patch-local closures, type-independent

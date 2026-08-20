@@ -120,10 +120,13 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sSTsE7flatMapySay7ElementQyd__Gqd__ABQzKXEKSTRd__lF":
             self = .higherOrder(.flatMap)
         case "$ss14_ArrayProtocolPsE6filterySay7ElementQzGSbAEKXEKF":
-            self = .higherOrder(.filter)
-        case "$sSD6filterySDyxq_GSbx3key_q_5valuet_tKXEKF",
-             "$sSh6filteryShyxGSbxKXEKF":
-            self = .higherOrder(.filter)
+            self = .higherOrder(.filter(.array))
+        case "$sSTsE6filterySay7ElementQzGSbACKXEKF":
+            self = .higherOrder(.filter(.array))
+        case "$sSD6filterySDyxq_GSbx3key_q_5valuet_tKXEKF":
+            self = .higherOrder(.filter(.dictionary))
+        case "$sSh6filteryShyxGSbxKXEKF":
+            self = .higherOrder(.filter(.set))
         case "$sSTsE10compactMapySayqd__Gqd__Sg7ElementQzKXEKlF":
             self = .higherOrder(.compactMap)
         case "$sSD9mapValuesySDyxqd__Gqd__q_KXEKlF":

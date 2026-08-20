@@ -187,6 +187,15 @@ does not by itself certify a physical device or distribution channel.
   Mutating sort writes back only after every comparator succeeds. Partition and
   predicate removal instead write back swaps completed before a thrown
   predicate, while callback side effects already performed remain visible.
+  Finite concrete integer `Range`/`ClosedRange` and supported numeric stride
+  sources reuse the same forward traversal for `map`, `flatMap`, `filter`,
+  `compactMap`, `reduce`, `reduce(into:_:)`, `forEach`, `first(where:)`,
+  `contains(where:)`, `allSatisfy`, and comparator-driven
+  `min(by:)`/`max(by:)`; producing transforms return Arrays. Their callbacks
+  retain the same short-circuit, throwing, and mutable-capture behavior as
+  managed Collections. Reverse predicate search, index-returning search, and
+  unbounded partial ranges remain rejected until their direction, index
+  identity, or termination can be represented exactly.
   Array-backed Collection `split` supports both the
   `separator:maxSplits:omittingEmptySubsequences:` overload for recursively
   VM-defined Equatable elements and the throwing `whereSeparator:` overload
@@ -199,9 +208,11 @@ does not by itself certify a physical device or distribution channel.
   Sequence `prefix(while:)` is also supported when its concrete source has an
   Array-backed normalization. The lazy Sequence `drop(while:)` overload remains
   rejected: eagerly materializing it would change predicate side-effect timing.
-  `enumerated()`, `Array(sequence)`, and heterogeneous `zip` accept represented
-  managed Array, Set, and Dictionary sources through one verified
-  materialization path. Array-backed adapters additionally support
+  `enumerated()`, `Array(sequence)`, heterogeneous `zip`, and `reversed()`
+  accept finite progression sources through the same typed builder used by the
+  verified managed-Collection materialization path. Managed Array, Set, and
+  Dictionary sources remain supported, and Array-backed adapters additionally
+  support
   `reversed()`, `repeatElement`, `Array(repeating:count:)`, count-based
   `dropFirst`/`dropLast`/`prefix`/`suffix`, concrete Array index
   prefixes/suffixes, `Range<Int>` slicing, `joined()`,
@@ -231,8 +242,10 @@ does not by itself certify a physical device or distribution channel.
   `Range.contains` and `ClosedRange.contains` also accept supported integer,
   floating, and String bounds. Lowering uses one typed, Optional-cursor HLBC
   progression operation rather than standard-library iterator ABI objects;
-  zero strides and invalid range bounds preserve Swift traps, and integer
-  extrema terminate without sentinel collisions.
+  the finite concrete Sequence operations listed above reuse that cursor
+  instead of adding API-specific opcodes. Zero strides and invalid range bounds
+  preserve Swift traps, and integer extrema terminate without sentinel
+  collisions.
 - Newly introduced, non-exported file- or module-scope patch-local nonrecursive
   stored struct and enum values, concrete `Result`, field extraction, enum
   switch, instance/static computed getters and setters, and supported mutating
