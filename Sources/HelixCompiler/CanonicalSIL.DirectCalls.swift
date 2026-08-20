@@ -8,6 +8,10 @@ public struct DirectCallBinding: Hashable, Sendable {
     public enum ABIAdapter: Hashable, Sendable {
         case direct
         case mutatingValueReceiver
+        /// A compiler-generated `(Root, KeyPath<Root, Value>) -> Value`
+        /// thunk whose proven static KeyPath capture is erased before HLBC.
+        /// The identity is build-time-only and never enters the wire format.
+        case staticKeyPathProjection(identity: String)
     }
 
     public enum Target: Hashable, Sendable {
@@ -85,6 +89,20 @@ public struct DirectCallTable: Sendable {
                 throw CanonicalSIL.LoweringError.invalidCallTable(
                     "native import \(requirement.id) effect descriptor disagrees with its call binding"
                 )
+            }
+            if case let .staticKeyPathProjection(identity) = value.abiAdapter {
+                guard !identity.isEmpty,
+                      value.parameterTypes.count == 1,
+                      value.parameterConventions.count == 1,
+                      value.resultType != .void,
+                      !value.effects.mayThrow,
+                      !value.effects.isAsync,
+                      case .function = value.target
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "static KeyPath projection @\(value.mangledName) has an invalid logical ABI"
+                    )
+                }
             }
         }
         var unavailableBySymbol: [String: CanonicalSIL.UnavailableDirectCall] = [:]

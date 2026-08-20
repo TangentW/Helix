@@ -401,6 +401,102 @@ struct ReleaseDriver {
         #expect(later.bodyFingerprints[transform.key] != result.bodyFingerprints[transform.key])
     }
 
+    @Test("Static KeyPaths keep the release image runtime-free and typed")
+    func buildsStaticKeyPathProjection() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-release-static-keypath-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        @inline(never)
+        public func transform(_ value: String) -> Int { value.count }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            transformSignature: .init(
+                parameters: ["Swift.String"],
+                result: "Swift.Int"
+            ),
+            transformParameterTypes: [.string],
+            transformParameterConventions: [.owned],
+            transformCanonicalDeclaration: "func transform(_: String) -> Int",
+            transformFormalType: "(Swift.String) -> Swift.Int",
+            transformLoweredSILType:
+                "@convention(thin) (@guaranteed String) -> Int",
+            optimization: "-Onone",
+            additionalCapabilities: [
+                .collectionsV1,
+                .closureValuesV1,
+                .localNominalsV1,
+            ]
+        )
+        let record = try #require(archive.functions.first)
+        let entry = try #require(record.entryIndex)
+        let changed = """
+        private struct Item { let text: String }
+        @inline(never)
+        public func transform(_ value: String) -> Int {
+            [Item(text: value)].map(\\.text.count)[0]
+        }
+        """
+        try Data(changed.utf8).write(to: sourceURL)
+
+        let result = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+        let closures = result.module.functions.flatMap(\.blocks)
+            .flatMap(\.instructions).compactMap {
+                instruction -> [Bytecode.Register]? in
+                guard case let .makeClosure(_, _, captures) = instruction else {
+                    return nil
+                }
+                return captures
+            }
+        #expect(result.changedFunctions.map(\.key) == [record.key])
+        #expect(!closures.isEmpty)
+        #expect(closures.allSatisfy { $0.isEmpty })
+        #expect(result.module.functions.contains { function in
+            function.kind == .closureBody
+                && function.blocks.flatMap(\.instructions).contains {
+                    if case .stringCount = $0 { return true }
+                    return false
+                }
+        })
+
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: entry,
+                image: image,
+                arguments: [.string("Helix")]
+            ) == .returned(
+                .integer(
+                    try VM.Integer(
+                        signed: 5,
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
+            )
+        )
+    }
+
     @Test("New private methods and computed getters receive frozen native self")
     func linksNewPrivateInstanceMethod() throws {
         final class NativeScreen: @unchecked Sendable {}

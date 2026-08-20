@@ -1285,6 +1285,118 @@ struct StorageInitialization {
         )
     }
 
+    @Test("Only the first local-class field write initializes storage")
+    func keepsPostInitializationMutationAsAssignment() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Box {
+                var value: Int
+                init(value: Int) {
+                    self.value = value
+                    self.value += 1
+                }
+            }
+            public func initializedThenMutated(_ value: Int) -> Int {
+                Box(value: value).value
+            }
+            """,
+            functionName: "initializedThenMutated"
+        )
+        let result = VM.Interpreter().invoke(
+            entry: fixture.entry,
+            image: fixture.image,
+            arguments: [try integer(23)]
+        )
+        #expect(result == .returned(try integer(24)))
+        let modes = fixture.image.module.functions.flatMap(\.blocks)
+            .flatMap(\.instructions)
+            .compactMap { instruction -> Bytecode.StackStoreMode? in
+                guard case let .storeAddress(_, _, mode) = instruction else {
+                    return nil
+                }
+                return mode
+            }
+        #expect(modes.contains(.initialize))
+        #expect(modes.contains(.assign))
+    }
+
+    @Test("A default-initialized class field is assigned rather than initialized twice")
+    func assignsDefaultInitializedClassField() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Box {
+                var value = 1
+                init(value: Int) { self.value = value }
+            }
+            public func replaceDefaultValue(_ value: Int) -> Int {
+                Box(value: value).value
+            }
+            """,
+            functionName: "replaceDefaultValue"
+        )
+        let result = VM.Interpreter().invoke(
+            entry: fixture.entry,
+            image: fixture.image,
+            arguments: [try integer(31)]
+        )
+        #expect(result == .returned(try integer(31)))
+    }
+
+    @Test("Class field initialization is definite across control-flow branches")
+    func initializesClassFieldAcrossBranches() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Box {
+                let value: Int
+                init(first: Int, second: Int, chooseFirst: Bool) {
+                    if chooseFirst {
+                        value = first
+                    } else {
+                        value = second
+                    }
+                }
+            }
+            public func chooseInitializedValue(
+                _ first: Int,
+                _ second: Int,
+                _ chooseFirst: Bool
+            ) -> Int {
+                Box(
+                    first: first,
+                    second: second,
+                    chooseFirst: chooseFirst
+                ).value
+            }
+            """,
+            functionName: "chooseInitializedValue"
+        )
+        let interpreter = VM.Interpreter()
+        #expect(
+            interpreter.invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [try integer(7), try integer(19), .bool(true)]
+            ) == .returned(try integer(7))
+        )
+        #expect(
+            interpreter.invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [try integer(7), try integer(19), .bool(false)]
+            ) == .returned(try integer(19))
+        )
+        let modes = fixture.image.module.functions.flatMap(\.blocks)
+            .flatMap(\.instructions)
+            .compactMap { instruction -> Bytecode.StackStoreMode? in
+                guard case let .storeAddress(_, _, mode) = instruction else {
+                    return nil
+                }
+                return mode
+            }
+        #expect(modes.filter { $0 == .initialize }.count == 2)
+        #expect(!modes.contains(.assign))
+    }
+
     @Test("A runtime-backed @in argument transfers with take semantics")
     func lowersRuntimeApplicationArgumentTake() throws {
         let function = CanonicalSIL.Function(
@@ -1359,6 +1471,10 @@ struct StorageInitialization {
                 typeEnvironment: .empty
             )
         }
+    }
+
+    private func integer(_ value: Int64) throws -> VM.Value {
+        .integer(try VM.Integer(signed: value, bitWidth: 64, isSigned: true))
     }
 }
 }

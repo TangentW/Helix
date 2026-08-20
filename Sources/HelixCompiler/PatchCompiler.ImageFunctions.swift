@@ -37,6 +37,7 @@ enum ImageFunctions {
                 in: file,
                 startingAt: rootSymbols,
                 excluding: directCalls.boundSymbols.union(rootSymbols),
+                environment: typeEnvironment,
                 kindForSymbol: { symbol in
                     kind(
                         for: symbol,
@@ -53,7 +54,8 @@ enum ImageFunctions {
         for candidate in hostedCandidates {
             discovered[candidate.symbol] = .init(
                 function: candidate.function,
-                kind: .ordinary
+                kind: .ordinary,
+                abiAdapter: .direct
             )
         }
 
@@ -93,7 +95,8 @@ enum ImageFunctions {
                     parameterConventions: signature.parameterConventions,
                     resultType: signature.result,
                     effects: signature.effects,
-                    target: .function(id)
+                    target: .function(id),
+                    abiAdapter: item.abiAdapter
                 )
             )
         }

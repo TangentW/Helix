@@ -7,6 +7,7 @@ enum ImageFunctions {
     struct Discovered: Sendable {
         var function: CanonicalSIL.Function
         var kind: Bytecode.FunctionKind
+        var abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter
     }
 
     struct Signature: Equatable, Sendable {
@@ -35,15 +36,27 @@ enum ImageFunctions {
         in file: CanonicalSIL.File,
         startingAt rootSymbols: Set<String>,
         excluding excludedSymbols: Set<String>,
+        environment: CanonicalSIL.TypeEnvironment,
         kindForSymbol: (String) -> Bytecode.FunctionKind?
     ) throws -> [String: Discovered] {
         var pending = try rootSymbols.sorted().flatMap { symbol in
             try file.function(mangledName: symbol)
-                .map { try references(in: $0.body, kindForSymbol: kindForSymbol) }
+                .map {
+                    try references(
+                        in: $0,
+                        file: file,
+                        environment: environment,
+                        kindForSymbol: kindForSymbol
+                    )
+                }
                 ?? []
         }
         var visited = Set<String>()
         var kindBySymbol: [String: Bytecode.FunctionKind] = [:]
+        var adapterBySymbol: [
+            String: CanonicalSIL.DirectCallBinding.ABIAdapter
+        ] = [:]
+        var replacementBySymbol: [String: CanonicalSIL.Function] = [:]
         var result: [String: Discovered] = [:]
 
         while let reference = pending.popLast() {
@@ -55,19 +68,50 @@ enum ImageFunctions {
                 )
             }
             kindBySymbol[symbol] = reference.kind
+            if let existingAdapter = adapterBySymbol[symbol],
+               existingAdapter != reference.abiAdapter {
+                throw DiscoveryError.unsupported(
+                    symbol: symbol,
+                    reason: "different callers require incompatible physical ABI adapters"
+                )
+            }
+            adapterBySymbol[symbol] = reference.abiAdapter
+            if let replacement = reference.replacement {
+                if let existing = replacementBySymbol[symbol],
+                   existing != replacement {
+                    throw DiscoveryError.unsupported(
+                        symbol: symbol,
+                        reason: "different callers synthesize incompatible replacement bodies"
+                    )
+                }
+                replacementBySymbol[symbol] = replacement
+            } else if case .staticKeyPathProjection = reference.abiAdapter {
+                throw DiscoveryError.unsupported(
+                    symbol: symbol,
+                    reason: "static KeyPath projection has no synthesized replacement body"
+                )
+            }
             guard visited.insert(symbol).inserted,
                   !excludedSymbols.contains(symbol)
             else { continue }
-            guard let function = file.function(mangledName: symbol) else {
+            guard let function = replacementBySymbol[symbol]
+                    ?? file.function(mangledName: symbol)
+            else {
                 // A generated symbol without a body remains eligible for a
                 // separately frozen Shell binding. Lowering reports an
                 // actionable unbound-callee diagnostic when none exists.
                 continue
             }
-            result[symbol] = .init(function: function, kind: reference.kind)
+            result[symbol] = .init(
+                function: function,
+                kind: reference.kind,
+                abiAdapter: reference.abiAdapter
+            )
             pending.append(
                 contentsOf: try references(
-                    in: function.body,
+                    in: function,
+                    file: file,
+                    environment: environment,
                     kindForSymbol: kindForSymbol
                 )
             )
@@ -128,14 +172,36 @@ enum ImageFunctions {
         case directCall
     }
 
+    private struct Reference: Sendable {
+        var symbol: String
+        var kind: Bytecode.FunctionKind
+        var replacement: CanonicalSIL.Function?
+        var abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter
+    }
+
     private static func references(
-        in body: String,
+        in function: CanonicalSIL.Function,
+        file: CanonicalSIL.File,
+        environment: CanonicalSIL.TypeEnvironment,
         kindForSymbol: (String) -> Bytecode.FunctionKind?
-    ) throws -> [(symbol: String, kind: Bytecode.FunctionKind)] {
+    ) throws -> [Reference] {
+        let rewrites: [String: CanonicalSIL.StaticKeyPath.Rewrite]
+        do {
+            rewrites = try CanonicalSIL.StaticKeyPath.rewrites(
+                in: function,
+                file: file,
+                environment: environment
+            )
+        } catch let error as CanonicalSIL.StaticKeyPath.RewriteError {
+            throw DiscoveryError.unsupported(
+                symbol: error.symbol,
+                reason: error.reason
+            )
+        }
         var symbolByValue: [String: String] = [:]
         var usageBySymbol: [String: Set<ReferenceUsage>] = [:]
 
-        for rawLine in body.split(separator: "\n") {
+        for rawLine in function.body.split(separator: "\n") {
             let line = String(rawLine).trimmingCharacters(in: .whitespaces)
             if let marker = line.range(of: "function_ref @"),
                let result = silResultValue(in: line) {
@@ -166,10 +232,24 @@ enum ImageFunctions {
             }
         }
 
+        // A static KeyPath descriptor mentions accessor thunks that are
+        // unreachable after a closure-form KeyPath object is erased. Remove
+        // metadata-only edges; an explicit function_ref used by direct
+        // subscript lowering remains visible in `usageBySymbol` below.
+        let executableBody = function.body.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ).filter { !$0.contains(" = keypath $") }.joined(separator: "\n")
         return ReleaseCompiler.ImplementationFingerprint
-            .referencedSymbols(in: body).sorted().compactMap { symbol in
-                guard let fallback = kindForSymbol(symbol) else { return nil }
+            .referencedSymbols(in: executableBody).sorted().compactMap { symbol in
                 let usages = usageBySymbol[symbol, default: []]
+                let fallback = kindForSymbol(symbol)
+                    ?? file.function(mangledName: symbol).flatMap {
+                        !usages.isEmpty
+                            && CanonicalSIL.StaticKeyPath.isAccessorThunk($0)
+                            ? .concreteSpecialization : nil
+                    }
+                guard let fallback else { return nil }
                 // Swift routinely materializes a no-capture closure for
                 // lifetime/debug semantics while devirtualizing its actual
                 // invocation to the same function_ref. Closure eligibility is
@@ -177,7 +257,12 @@ enum ImageFunctions {
                 let kind: Bytecode.FunctionKind = usages.contains(
                     .closureConstruction
                 ) ? .closureBody : fallback
-                return (symbol, kind)
+                return .init(
+                    symbol: symbol,
+                    kind: kind,
+                    replacement: rewrites[symbol]?.function,
+                    abiAdapter: rewrites[symbol]?.adapter ?? .direct
+                )
             }
     }
 

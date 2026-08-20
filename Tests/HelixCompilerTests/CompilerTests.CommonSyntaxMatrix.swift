@@ -376,6 +376,115 @@ struct CommonSyntaxMatrix {
                 arguments: [try integers([2, 4])],
                 expected: try integers([5, 9])
             ),
+            Probe(
+                name: "sdkPropertyKeyPath",
+                source: """
+                public func sdkPropertyKeyPath(_ values: [String]) -> Int {
+                    values.map(\\.count).reduce(0, +)
+                }
+                """,
+                arguments: [strings(["ab", "cde"])],
+                expected: try integer(5)
+            ),
+            Probe(
+                name: "storedPropertyKeyPath",
+                source: """
+                private struct KeyPathItem { let value: Int }
+                public func storedPropertyKeyPath(
+                    _ first: Int,
+                    _ second: Int
+                ) -> Int {
+                    [KeyPathItem(value: first), KeyPathItem(value: second)]
+                        .map(\\.value)
+                        .reduce(0, +)
+                }
+                """,
+                arguments: [try integer(4), try integer(7)],
+                expected: try integer(11)
+            ),
+            Probe(
+                name: "composedStoredKeyPath",
+                source: """
+                private struct KeyPathLeaf { let value: Int }
+                private struct KeyPathContainer { let leaf: KeyPathLeaf }
+                public func composedStoredKeyPath(
+                    _ first: Int,
+                    _ second: Int
+                ) -> Int {
+                    let values = [
+                        KeyPathContainer(leaf: KeyPathLeaf(value: first)),
+                        KeyPathContainer(leaf: KeyPathLeaf(value: second)),
+                    ]
+                    return values.map(\\.leaf.value).reduce(0, +)
+                }
+                """,
+                arguments: [try integer(3), try integer(8)],
+                expected: try integer(11)
+            ),
+            Probe(
+                name: "computedPropertyKeyPath",
+                source: """
+                private struct KeyPathMeasure {
+                    let value: Int
+                    var doubled: Int { value * 2 }
+                }
+                public func computedPropertyKeyPath(_ value: Int) -> Int {
+                    [KeyPathMeasure(value: value)].map(\\.doubled)[0]
+                }
+                """,
+                arguments: [try integer(6)],
+                expected: try integer(12)
+            ),
+            Probe(
+                name: "mixedPropertyKeyPath",
+                source: """
+                private struct KeyPathName { let text: String }
+                public func mixedPropertyKeyPath(_ values: [String]) -> Int {
+                    values.map(KeyPathName.init(text:))
+                        .map(\\.text.count)
+                        .reduce(0, +)
+                }
+                """,
+                arguments: [strings(["swift", "ui"])],
+                expected: try integer(7)
+            ),
+            Probe(
+                name: "classStoredPropertyKeyPath",
+                source: """
+                private final class KeyPathBox {
+                    let value: Int
+                    init(value: Int) { self.value = value }
+                }
+                public func classStoredPropertyKeyPath(_ value: Int) -> Int {
+                    [KeyPathBox(value: value)].map(\\.value)[0]
+                }
+                """,
+                arguments: [try integer(13)],
+                expected: try integer(13)
+            ),
+            Probe(
+                name: "directStoredKeyPath",
+                source: """
+                private struct DirectKeyPathItem { let value: Int }
+                public func directStoredKeyPath(_ value: Int) -> Int {
+                    let item = DirectKeyPathItem(value: value)
+                    return item[keyPath: \\DirectKeyPathItem.value]
+                }
+                """,
+                arguments: [try integer(17)],
+                expected: try integer(17)
+            ),
+            Probe(
+                name: "localKeyPathBinding",
+                source: """
+                public func localKeyPathBinding(_ value: String) -> Int {
+                    let path = \\String.count
+                    return value[keyPath: path]
+                }
+                """,
+                arguments: [.string("helix")],
+                expected: try integer(5)
+            ),
         ]
 
         var failures: [String] = []
@@ -420,6 +529,10 @@ struct CommonSyntaxMatrix {
             },
             elementType: .optional(.int64)
         )
+    }
+
+    private func strings(_ values: [String]) -> VM.Value {
+        .array(values.map(VM.Value.string), elementType: .string)
     }
 
     private func stringIntegerDictionary(

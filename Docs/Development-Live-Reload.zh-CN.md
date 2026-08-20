@@ -72,7 +72,15 @@ iOS 进程不会接收或执行 Swift 编译器、linker、JIT、dylib 或源文
 
 一个 Swift 符号仅仅存在于进程中，并不代表 HLBC 可以随意调用它。调用必须精确解析到同一 bytecode image 中的函数、eligible Shell Entry，或者已生成进 Shell 的精确 NativeImport。Entry 路由优先，因此可补丁 App 函数之间的普通调用仍然感知 generation；NativeImport 用来承载必须离开 HLVM 执行的有界原生 API。
 
+标准库 API 也遵循同一执行边界。受管集合算法使用通用、Verifier 可见的 HLBC 语义计划与 callback，不会按源码 API 一项配一个 opcode；状态属于原生 Runtime 的具体 framework member 使用实测得到的精确 NativeImport；patch-local Swift 实现仍是普通同 image 调用。表示转换、ownership、effect、重入和资源预算都会在这些明确边界上验证，而不会隐藏到按名字分发的原生调用后面。
+
 一次保存可以在现有源码文件中新增可达的普通顶层 helper、class private 实例方法或计算 accessor，也可以新增只被该调用图使用、且不导出原生 ABI 的文件/module scope struct/enum/pure class。编译器会沿当前 module 的直接调用图递归收集，为函数和完整限定 nominal 分配 image-local ID，逐一验证具体签名、ownership convention 与值形状，再与变化的 Shell root 一起下发闭合图。pure class 的引用 identity 与字段 storage 由 HLVM 持有，并不是动态注册的 Swift metadata。
+
+作为函数值使用的完全静态只读 `KeyPath` 字面量属于编译期 descriptor，不会成为新的 HLBC Runtime value。Helix 会验证编译器生成的 `swift_getAtKeyPath` thunk 及其 ownership skeleton，证明精确的 stored-property/getter 链，再把它替换为强类型、零捕获的投影函数。该路径覆盖可组合的 patch-local struct/class 字段，以及已经能通过普通同 image/NativeImport 调用表解析的具体计算属性或 SDK getter。动态 KeyPath 参数、带捕获或无法证明的 component，以及 writable/reference-writable mutation 都会 fail closed；artifact 中不会出现 KeyPath metadata 对象。
+
+对于 imported Objective-C property descriptor，generated concrete accessor 仍留在 image 内，其物理 framework 调用则解析到精确冻结的 NativeImport。只有 Swift-typed 边界能够证明并执行 bridge 时，物理 `NSString`/`Optional<NSString>` 返回才会被接纳为 `String`。
+
+局部 class 字段初始化使用跨 alias 与控制流合流的字段级 definite/possible-state 数据流，而不会把 `end_init_ref` 当作时间分界：空 storage 的第一次写入是 initialize，已有默认值的字段是 assign，initializer 中互斥分支则分别按各自 incoming state 分类。
 
 如果新增 `final` class 继承一个 HLXI 已冻结、`NSObject` 兼容的项目类或系统类，Helix 还可按 hosted profile 为它注册 Objective-C host，使对象以 superclass 身份交给 UIKit。首版只支持继承的无参初始化、无新增 stored property，以及 no-arg/Bool `Void` override；原生代码不能识别补丁具体 Swift 类型。这是验证过的闭合 selector/ABI 能力，不是开放任意 Objective-C IMP 或新原生 ABI。
 

@@ -70,6 +70,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | 普通直接递归 | 解析到同一不可变 HLBC image 内的函数 |
 | 从源码有意调用上一代 | HLBC 不支持；应保存/激活一个恢复 generation |
 | 使用受支持的局部 closure，或调用已经索引且带 `@escaping` closure 参数的同 image helper | 降入同一 image；closure 的返回和捕获只能发生在固定的 VM invocation 内 |
+| 把完全静态只读 KeyPath 字面量用作 transform 或直接投影 | patch-local struct/class stored field 与具体 getter 链（包括 generated accessor 能解析到精确 NativeImport 的 imported Objective-C property）可以组合成强类型零捕获函数；动态 KeyPath value、带捕获或无法证明的 component，以及 writable/reference-writable mutation 会被拒绝，因为 KeyPath 对象不是 HLBC Runtime value |
 | 使用整数 `Range`/`ClosedRange` 迭代、数值 `stride` 或标量 `contains` | 对上述具体且局部的类型族支持；边界、方向、开闭端点、零步长 trap 与整数极值均保留已验证的 Swift 语义。progression 值仍只属于 image，不能穿过 Shell/NativeImport 边界 |
 | 在受支持的 `String.contains` 中使用单 grapheme Character 字面量 | 以编译器内部 String 表示支持，不代表一般 Character 存储/API 已支持 |
 | 声明补丁内 struct 或 enum | 新增的不导出类型在文件/module scope 支持，包括 namespace 嵌套和受支持的计算 accessor；函数局部 nominal 会用精确类型诊断拒绝 |

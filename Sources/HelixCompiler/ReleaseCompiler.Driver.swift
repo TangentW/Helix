@@ -516,6 +516,13 @@ extension ReleaseCompiler {
                         reason: "optimized and semantic SIL disagree on function role"
                     )
                 }
+                if let optimized, let semantic,
+                   optimized.abiAdapter != semantic.abiAdapter {
+                    throw DriverError.generatedFunctionUnsupported(
+                        symbol,
+                        reason: "optimized and semantic SIL disagree on its physical ABI adapter"
+                    )
+                }
                 let optimizedSignature = try optimized.map {
                     try generatedSignature(
                         of: $0.function,
@@ -563,7 +570,8 @@ extension ReleaseCompiler {
                         parameterConventions: signature.parameterConventions,
                         resultType: signature.result,
                         effects: signature.effects,
-                        target: .function(functionID)
+                        target: .function(functionID),
+                        abiAdapter: selected.abiAdapter
                     )
                 )
             }
@@ -868,6 +876,7 @@ extension ReleaseCompiler {
                     in: file,
                     startingAt: archivedSymbols.union(hostedSymbols),
                     excluding: Set(archive.functions.map(\.mangledName)),
+                    environment: typeEnvironment,
                     kindForSymbol: { symbol in
                         generatedFunctionKind(
                             symbol,
@@ -881,7 +890,8 @@ extension ReleaseCompiler {
                 for candidate in hostedCandidates {
                     discovered[candidate.symbol] = .init(
                         function: candidate.function,
-                        kind: .ordinary
+                        kind: .ordinary,
+                        abiAdapter: .direct
                     )
                 }
                 return discovered

@@ -585,6 +585,8 @@ public struct Lowerer: Sendable {
         var registerTypes: [Bytecode.ValueType] = []
         var values: [String: Bytecode.Register] = [:]
         var functionReferences: [String: ResolvedFunctionReference] = [:]
+        var staticKeyPathValues: [String: CanonicalSIL.StaticKeyPath.Capture] = [:]
+        var frozenObjectiveCBridgeResults = Set<Bytecode.Register>()
         var hostedAllocatorReferences: [String: Core.TypeID] = [:]
         var hostedSuperReferences: [String: HostedSuperReference] = [:]
         var deferredForeignReferences: [String: (reference: String, loweredType: String)] = [:]
@@ -1869,14 +1871,15 @@ public struct Lowerer: Sendable {
                     at: currentSILLineIndex,
                     address: token
                 )
+                let effectiveMode = requestedMode
+                    ?? (initializingRuntimeAccesses.contains(token)
+                        ? .initialize : inferredMode)
                 if isScopedRuntimeAddress(token) {
                     appendInstruction(
                         .storeAddress(
                             address: addressRegister,
                             source: value,
-                            mode: requestedMode
-                                ?? (initializingRuntimeAccesses.contains(token)
-                                    ? .initialize : inferredMode)
+                            mode: effectiveMode
                         )
                     )
                 } else if let slot = runtimeStackSlots[root], token == root {
@@ -1884,7 +1887,7 @@ public struct Lowerer: Sendable {
                         .storeStack(
                             slot: slot,
                             source: value,
-                            mode: requestedMode ?? inferredMode
+                            mode: effectiveMode
                         )
                     )
                 } else {
@@ -1900,7 +1903,7 @@ public struct Lowerer: Sendable {
                         .storeAddress(
                             address: access,
                             source: value,
-                            mode: requestedMode ?? inferredMode
+                            mode: effectiveMode
                         )
                     )
                     appendInstruction(.endAccess(access))
@@ -1909,6 +1912,7 @@ public struct Lowerer: Sendable {
                 // register as a compiler-address value: doing so would let a
                 // later read bypass load/copy semantics after ownership moved.
                 stackAddressValues.removeValue(forKey: root)
+                initializingRuntimeAccesses.remove(token)
                 return
             }
             let mode = requestedMode ?? storageInitializationPlan.storeMode(
@@ -2316,6 +2320,9 @@ public struct Lowerer: Sendable {
                       !physical.dropLast().contains(.inout)
                 else { return false }
                 return binding.parameterConventions.allSatisfy { $0 == .owned }
+            case .staticKeyPathProjection:
+                guard case .function = binding.target else { return false }
+                return physical == binding.parameterConventions
             }
         }
 
@@ -12944,15 +12951,26 @@ public struct Lowerer: Sendable {
             case .stringFromObjectiveC:
                 guard arguments.count == 2,
                       metatypeValues.contains(arguments[1]),
-                      let optional = values[arguments[0]],
-                      registerTypes[Int(optional.rawValue)] == .optional(.string),
-                      let payload = knownOptionalSomePayloads[arguments[0]]
+                      let value = values[arguments[0]]
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Objective-C-to-String bridge is not fed by a proven Optional.some"
+                        "Objective-C-to-String bridge has unsupported arguments"
                     )
                 }
-                source = payload
+                if registerTypes[Int(value.rawValue)] == .string,
+                   frozenObjectiveCBridgeResults.contains(value) {
+                    // A frozen Swift-typed NativeImport has already performed
+                    // the physical NSString/Optional<NSString> bridge.
+                    source = value
+                } else if registerTypes[Int(value.rawValue)]
+                            == .optional(.string),
+                          let payload = knownOptionalSomePayloads[arguments[0]] {
+                    source = payload
+                } else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Objective-C-to-String bridge is not proven by its frozen boundary"
+                    )
+                }
             case .arrayToObjectiveC, .arrayFromObjectiveC:
                 preconditionFailure("handled before String bridge lowering")
             }
@@ -12988,6 +13006,9 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^end_borrow (%[0-9]+)$"#
             ) {
+                if staticKeyPathValues[borrowEnd[0]] != nil {
+                    continue
+                }
                 borrowedValueTokens.remove(borrowEnd[0])
                 if let value = mutableCaptureState.temporaryBorrowOwners.removeValue(
                     forKey: borrowEnd[0]
@@ -13006,6 +13027,14 @@ public struct Lowerer: Sendable {
                   !line.hasPrefix("debug_step"),
                   !line.hasPrefix("fix_lifetime")
             else { continue }
+
+            if let keyPath = try CanonicalSIL.StaticKeyPath.capture(
+                in: line,
+                environment: typeEnvironment
+            ) {
+                staticKeyPathValues[keyPath.token] = keyPath.value
+                continue
+            }
 
             let bridgedBlockParameterTypes: [Bytecode.ValueType]? = {
                 guard let number = parseBlockNumber(line),
@@ -15485,6 +15514,7 @@ public struct Lowerer: Sendable {
                 }
                 let binding = reference.binding
                 guard
+                      binding.abiAdapter == .direct,
                       !binding.effects.isAsync,
                       case let .closure(signature) = try parseType(conversion[2]),
                       signature.parameters == binding.parameterTypes,
@@ -15554,6 +15584,43 @@ public struct Lowerer: Sendable {
                     closure[2],
                     line: sourceLine
                 )
+                if case let .staticKeyPathProjection(identity) = binding.abiAdapter {
+                    guard captureTokens.count == 1,
+                          let keyPath = staticKeyPathValues[captureTokens[0]],
+                          keyPath.identity == identity,
+                          keyPath.rootType == binding.parameterTypes[0],
+                          keyPath.valueType == binding.resultType,
+                          reference.erasedMetatypes.isEmpty,
+                          !binding.effects.mayThrow,
+                          reference.indirectErrorType == .never
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "static KeyPath closure capture does not match its proven projection"
+                        )
+                    }
+                    let signature = Bytecode.ClosureSignature(
+                        parameters: binding.parameterTypes,
+                        parameterConventions: binding.parameterConventions,
+                        result: binding.resultType,
+                        effects: binding.effects
+                    )
+                    let result = try allocate(type: .closure(signature))
+                    values[closure[0]] = result
+                    if line.contains("[on_stack]") {
+                        onStackClosureValues.insert(closure[0])
+                    }
+                    // The generated target directly performs the proven
+                    // projection, so neither KeyPath metadata nor a capture
+                    // enters the VM closure context.
+                    appendInstruction(
+                        .makeClosure(
+                            result: result,
+                            function: functionID,
+                            captures: []
+                        )
+                    )
+                    continue
+                }
                 guard captureTokens.count <= binding.parameterTypes.count else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "partial_apply captures more values than its callee accepts"
@@ -15640,7 +15707,9 @@ public struct Lowerer: Sendable {
                 }
                 // Captures are copied into the VM closure context. Preserve the
                 // SIL value alias while validating that its dependency is live.
-                _ = try resolve(dependence[2], line: sourceLine)
+                if staticKeyPathValues[dependence[2]] == nil {
+                    _ = try resolve(dependence[2], line: sourceLine)
+                }
                 values[dependence[0]] = source
                 continue
             }
@@ -15684,7 +15753,9 @@ public struct Lowerer: Sendable {
             }
 
             if let borrowed = match(line, pattern: #"^(%[0-9]+) = begin_borrow (%[0-9]+)$"#) {
-                if let allocation = arrayLiteralAllocationByValue[borrowed[1]] {
+                if let keyPath = staticKeyPathValues[borrowed[1]] {
+                    staticKeyPathValues[borrowed[0]] = keyPath
+                } else if let allocation = arrayLiteralAllocationByValue[borrowed[1]] {
                     arrayLiteralAllocationByValue[borrowed[0]] = allocation
                     arrayLiteralStorageTokens[borrowed[0]] = allocation
                 } else if let reference = functionReferences[borrowed[1]] {
@@ -16086,6 +16157,12 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let binding = reference.binding
+                if case .staticKeyPathProjection = binding.abiAdapter {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: "static KeyPath projection must be formed by partial_apply"
+                    )
+                }
                 guard
                       binding.effects.mayThrow,
                       !binding.effects.isAsync
@@ -16626,6 +16703,12 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let binding = reference.binding
+                if case .staticKeyPathProjection = binding.abiAdapter {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: "static KeyPath projection must be formed by partial_apply"
+                    )
+                }
                 let appliedType = try parseFunctionType(
                     appliedLoweredType,
                     bridgingTo: (binding.parameterTypes, binding.resultType),
@@ -16737,6 +16820,12 @@ public struct Lowerer: Sendable {
                     .nativeApply(result: result, importID: requirement.id, arguments: arguments)
                 }
                 appendInstruction(instruction)
+                if reference.usesObjectiveCBridge,
+                   case .nativeImport = binding.target,
+                   binding.resultType == .string,
+                   let result {
+                    frozenObjectiveCBridgeResults.insert(result)
+                }
                 try transferOwnedCompilerAddressArguments(
                     tokens: argumentTokens,
                     resolvedArguments: prepared.arguments,
@@ -16905,7 +16994,7 @@ public struct Lowerer: Sendable {
 
             if let initialization = match(
                 line,
-                pattern: #"^(%[0-9]+) = end_init_let_ref (%[0-9]+)$"#
+                pattern: #"^(%[0-9]+) = end_init_(?:let_)?ref (%[0-9]+)$"#
             ) {
                 let object = try resolve(initialization[1], line: sourceLine)
                 guard case let .local(key) = registerTypes[Int(object.rawValue)],
@@ -18488,6 +18577,10 @@ public struct Lowerer: Sendable {
             }
 
             if let copy = match(line, pattern: #"^(%[0-9]+) = copy_value (%[0-9]+)$"#) {
+                if let keyPath = staticKeyPathValues[copy[1]] {
+                    staticKeyPathValues[copy[0]] = keyPath
+                    continue
+                }
                 if let progression = progressionValues[copy[1]] {
                     progressionValues[copy[0]] = progression
                     continue
@@ -18527,6 +18620,9 @@ public struct Lowerer: Sendable {
                 let source = try resolve(copy[1], line: sourceLine)
                 let result = try allocate(type: registerTypes[Int(source.rawValue)])
                 values[copy[0]] = result
+                if frozenObjectiveCBridgeResults.contains(source) {
+                    frozenObjectiveCBridgeResults.insert(result)
+                }
                 if let payload = knownOptionalSomePayloads[copy[1]] {
                     knownOptionalSomePayloads[copy[0]] = payload
                 }
@@ -18548,6 +18644,10 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = move_value(?: \[[^\]]+\])* (%[0-9]+)$"#
             ) {
+                if let keyPath = staticKeyPathValues[move[1]] {
+                    staticKeyPathValues[move[0]] = keyPath
+                    continue
+                }
                 if let progression = progressionValues[move[1]] {
                     progressionValues[move[0]] = progression
                     if !hasFutureSemanticUse(
@@ -18595,6 +18695,9 @@ public struct Lowerer: Sendable {
                 let source = try resolve(move[1], line: sourceLine)
                 let result = try allocate(type: registerTypes[Int(source.rawValue)])
                 values[move[0]] = result
+                if frozenObjectiveCBridgeResults.remove(source) != nil {
+                    frozenObjectiveCBridgeResults.insert(result)
+                }
                 if let payload = knownOptionalSomePayloads.removeValue(forKey: move[1]) {
                     knownOptionalSomePayloads[move[0]] = payload
                 }
@@ -18611,6 +18714,9 @@ public struct Lowerer: Sendable {
                 continue
             }
             if let destroy = match(line, pattern: #"^destroy_value (%[0-9]+)$"#) {
+                if staticKeyPathValues[destroy[0]] != nil {
+                    continue
+                }
                 if progressionValues[destroy[0]] != nil {
                     if !hasFutureSemanticUse(
                         of: destroy[0],
@@ -18651,6 +18757,9 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(retain_value|release_value) (%[0-9]+)$"#
             ) {
+                if staticKeyPathValues[ownership[1]] != nil {
+                    continue
+                }
                 if progressionValues[ownership[1]] != nil {
                     if ownership[0] == "release_value",
                        !hasFutureSemanticUse(
@@ -18690,6 +18799,9 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^strong_(retain|release) (%[0-9]+)$"#
             ) {
+                if staticKeyPathValues[ownership[1]] != nil {
+                    continue
+                }
                 if ownership[0] == "release",
                    let retained = takePendingRetainedValue(
                     for: ownership[1]
@@ -19578,6 +19690,29 @@ public struct Lowerer: Sendable {
                 physicalExpectations = Array(expected.parameters.dropLast())
                     + [.address(receiver)]
                 physicalResultExpectation = .void
+            case .staticKeyPathProjection:
+                let rawKeyPath = valueSpellings.count == 2
+                    ? valueSpellings[1].trimmingCharacters(in: .whitespaces)
+                        .trimmingPrefix("$")
+                    : ""
+                guard expected.parameters.count == 1,
+                      expected.result != .void,
+                      valueSpellings.count == 2,
+                      rawKeyPath.hasPrefix("@guaranteed "),
+                      let keyPath = try CanonicalSIL.StaticKeyPath.parameterTypes(
+                        in: valueSpellings[1],
+                        environment: typeEnvironment
+                      ),
+                      keyPath.root == expected.parameters[0],
+                      keyPath.value == expected.result
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "static KeyPath projection has an invalid physical function type"
+                    )
+                }
+                valueSpellings.removeLast()
+                physicalExpectations = expected.parameters
+                physicalResultExpectation = expected.result
             }
             guard valueSpellings.count == physicalExpectations.count else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
@@ -19800,8 +19935,15 @@ public struct Lowerer: Sendable {
         }
         switch expected {
         case .string:
-            return ["NSString", "Foundation.NSString", "__C.NSString"]
-                .contains(spelling)
+            let names = ["NSString", "Foundation.NSString", "__C.NSString"]
+            if names.contains(spelling) { return true }
+            for prefix in ["Optional<", "Swift.Optional<"]
+            where spelling.hasPrefix(prefix) && spelling.hasSuffix(">") {
+                return names.contains(
+                    String(spelling.dropFirst(prefix.count).dropLast())
+                )
+            }
+            return false
         case .array:
             if ["NSArray", "Foundation.NSArray", "__C.NSArray"]
                 .contains(spelling) {

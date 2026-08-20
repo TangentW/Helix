@@ -133,6 +133,15 @@ that Shell. Entry routes are preferred, so ordinary calls between patchable App
 functions remain generation-aware; NativeImport is for a bounded API whose
 native implementation must run outside HLVM.
 
+This is also the execution split for standard-library APIs. Managed collection
+algorithms use generic, verifier-visible HLBC semantic plans and callbacks; they
+are not reimplemented as one opcode per source API. A concrete framework member
+whose state belongs to the native runtime uses its exact measured NativeImport,
+while a patch-local Swift implementation remains an ordinary same-image call.
+Representation conversion, ownership, effects, re-entrancy, and resource
+budgeting are therefore checked at one of those explicit boundaries rather than
+hidden behind a name-based native dispatch.
+
 A save may introduce a reachable ordinary top-level helper, private class
 instance method, or computed accessor in an existing source file. It may also
 introduce non-exported file/module-scope struct, enum, and pure class types used
@@ -141,6 +150,27 @@ image-local function and qualified nominal IDs, verifies every signature,
 ownership convention, and value shape, and ships the closed graph with the
 changed Shell root. A pure class's reference identity and field storage belong
 to HLVM; they are not dynamically registered Swift metadata.
+
+A fully static, read-only `KeyPath` literal used as a function value is a
+compile-time descriptor, not a new HLBC runtime value. Helix validates the
+compiler-generated `swift_getAtKeyPath` thunk and its ownership skeleton, proves
+the exact stored-property/getter chain, and replaces it with a typed,
+zero-capture projection function. This covers composed patch-local struct/class
+fields and concrete computed or SDK getters already available through the
+normal same-image/NativeImport call table. Dynamic KeyPath parameters, captured
+or otherwise unproven components, and writable/reference-writable mutation
+remain fail-closed; no KeyPath metadata object enters the artifact.
+For an imported Objective-C property descriptor, the generated concrete
+accessor remains in the image while its physical framework call resolves to the
+exact frozen NativeImport. Physical `NSString`/`Optional<NSString>` results are
+accepted as `String` only when that Swift-typed boundary proves and performs the
+bridge.
+
+Local-class field initialization uses field-sensitive definite/possible-state
+dataflow across aliases and control-flow joins. It does not treat
+`end_init_ref` as a timestamp: a first write initializes empty storage, a
+default-initialized field is assigned, and mutually exclusive initializer
+branches are each classified from their incoming state.
 
 When a new `final` class inherits an HLXI-frozen, `NSObject`-compatible project
 or system type, Helix can register an Objective-C host under the closed hosted

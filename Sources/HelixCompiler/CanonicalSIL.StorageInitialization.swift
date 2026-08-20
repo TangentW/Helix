@@ -107,6 +107,18 @@ enum StorageInitialization {
         }
     }
 
+    /// Object values are not addresses, but a local class initializer projects
+    /// their fields into address storage whose initial state is empty. Both
+    /// sides of `end_init_(let_)ref` name the same object; treating that
+    /// instruction as a temporal boundary is incorrect because default-value
+    /// stores can legally follow it.
+    private struct InitializingObjects: Sendable {
+        var rootByAlias: [String: String]
+        var fieldShapeByRoot: [String: Bytecode.ValueType]
+
+        static let empty = Self(rootByAlias: [:], fieldShapeByRoot: [:])
+    }
+
     /// Proves which SIL writes initialize type-resolvable local stack storage
     /// and separately identifies roots that escape through a mutable closure
     /// capture. The initialization dataflow is deliberately type-shaped:
@@ -232,6 +244,18 @@ enum StorageInitialization {
             }
             storagePointees[root] = pointee
         }
+        let initializingObjects = try initializingObjects(
+            in: lines,
+            typeEnvironment: typeEnvironment
+        )
+        var analyzedPointees = storagePointees
+        for (root, shape) in initializingObjects.fieldShapeByRoot {
+            guard analyzedPointees.updateValue(shape, forKey: root) == nil else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "one SIL value is both local storage and an initializing object"
+                )
+            }
+        }
         var applicationEffects: [Int: ApplicationStorageEffects] = [:]
         for (line, text) in lines.enumerated() {
             if let effects = try applicationStorageEffects(in: text) {
@@ -247,7 +271,7 @@ enum StorageInitialization {
             lines: lines,
             applicationEffects: applicationEffects
         )
-        guard !storagePointees.isEmpty else {
+        guard !analyzedPointees.isEmpty else {
             var plan = Plan.empty
             plan.consumingApplicationArguments = consumingApplicationArguments
             plan.detachedPayloadUses = detachedPayloads.uses
@@ -256,7 +280,8 @@ enum StorageInitialization {
 
         let targets = try addressTargets(
             lines: lines,
-            pointees: storagePointees,
+            pointees: analyzedPointees,
+            initializingObjects: initializingObjects,
             typeEnvironment: typeEnvironment
         )
         let detachedPayloadWritebacks = detachedEnumPayloadWritebacks(
@@ -270,7 +295,7 @@ enum StorageInitialization {
         )
         let blocks = try initializationBlocks(
             lines: lines,
-            pointees: storagePointees,
+            pointees: analyzedPointees,
             targets: targets,
             detachedPayloadWritebacks: detachedPayloadWritebacks,
             applicationEffects: applicationEffects,
@@ -283,7 +308,7 @@ enum StorageInitialization {
         }
         let classification = try classifyActions(
             blocks: blocks,
-            pointees: storagePointees,
+            pointees: analyzedPointees,
             typeEnvironment: typeEnvironment
         )
         return .init(
@@ -359,7 +384,8 @@ enum StorageInitialization {
             }
         }
         return Set(blocksByRoot.compactMap { root, blocks in
-            blocks.count > 1
+            guard pointees[root] != nil else { return nil }
+            return blocks.count > 1
                 || !blocks.isDisjoint(with: cyclicBlocks)
                 || conditionallyDeallocatedRoots.contains(root)
                 ? root
@@ -459,6 +485,7 @@ enum StorageInitialization {
     private static func addressTargets(
         lines: [String],
         pointees: [String: Bytecode.ValueType],
+        initializingObjects: InitializingObjects,
         typeEnvironment: CanonicalSIL.TypeEnvironment
     ) throws -> [String: AddressTarget] {
         var result = Dictionary(
@@ -466,6 +493,10 @@ enum StorageInitialization {
                 ($0, AddressTarget(root: $0, path: []))
             }
         )
+        for (alias, root) in initializingObjects.rootByAlias
+        where initializingObjects.fieldShapeByRoot[root] != nil {
+            result[alias] = .init(root: root, path: [])
+        }
 
         for line in lines where !line.isEmpty {
             guard let destination = silResultValue(in: line) else { continue }
@@ -487,6 +518,35 @@ enum StorageInitialization {
                 else { continue }
                 result[destination] = target
                 break
+            }
+
+            if let projection = captures(
+                line,
+                pattern: #"^%[0-9]+ = ref_element_addr(?: \[[^\]]+\])* (%[0-9]+), #(.+)\.([^.]+)$"#
+            ), let parent = result[projection[0]],
+               parent.path.isEmpty,
+               initializingObjects.fieldShapeByRoot[parent.root] != nil,
+               let key = typeEnvironment.localKey(for: projection[1]),
+               typeEnvironment.isClass(key) {
+                let fields = try typeEnvironment.classFields(for: key)
+                let index = try typeEnvironment.storedFieldIndex(
+                    type: key,
+                    name: projection[2]
+                )
+                guard let fieldIndex = UInt32(exactly: index),
+                      case let .tuple(shape) = pointees[parent.root],
+                      shape.indices.contains(index),
+                      shape[index] == fields[index].type
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "initializing local class field projection has an invalid shape"
+                    )
+                }
+                result[destination] = .init(
+                    root: parent.root,
+                    path: [fieldIndex]
+                )
+                continue
             }
 
             if line.contains(" = tuple_element_addr "),
@@ -542,6 +602,98 @@ enum StorageInitialization {
             }
         }
         return result
+    }
+
+    private static func initializingObjects(
+        in lines: [String],
+        typeEnvironment: CanonicalSIL.TypeEnvironment
+    ) throws -> InitializingObjects {
+        var neighbors: [String: Set<String>] = [:]
+        var seeds = Set<String>()
+
+        func connect(_ lhs: String, _ rhs: String) {
+            neighbors[lhs, default: []].insert(rhs)
+            neighbors[rhs, default: []].insert(lhs)
+        }
+
+        for line in lines where !line.isEmpty {
+            if let initialization = captures(
+                line,
+                pattern: #"^(%[0-9]+) = end_init_(?:let_)?ref (%[0-9]+)$"#
+            ) {
+                connect(initialization[0], initialization[1])
+                seeds.formUnion(initialization)
+                continue
+            }
+            if let alias = captures(
+                line,
+                pattern: #"^(%[0-9]+) = (?:begin_borrow|copy_value|move_value)(?: \[[^\]]+\])* (%[0-9]+)$"#
+            ) {
+                connect(alias[0], alias[1])
+                continue
+            }
+            if let alias = captures(
+                line,
+                pattern: #"^(%[0-9]+) = mark_uninitialized(?: \[[^\]]+\])* (%[0-9]+)$"#
+            ) {
+                connect(alias[0], alias[1])
+            }
+        }
+        guard !seeds.isEmpty else { return .empty }
+
+        func tokenOrder(_ lhs: String, _ rhs: String) -> Bool {
+            let left = UInt64(lhs.dropFirst()) ?? .max
+            let right = UInt64(rhs.dropFirst()) ?? .max
+            return left == right ? lhs < rhs : left < right
+        }
+
+        var rootByAlias: [String: String] = [:]
+        var visited = Set<String>()
+        for seed in seeds.sorted(by: tokenOrder) where !visited.contains(seed) {
+            var component = Set<String>()
+            var pending = [seed]
+            while let token = pending.popLast() {
+                guard component.insert(token).inserted else { continue }
+                pending.append(contentsOf: neighbors[token, default: []])
+            }
+            visited.formUnion(component)
+            guard let root = component.sorted(by: tokenOrder).first else {
+                continue
+            }
+            for alias in component {
+                rootByAlias[alias] = root
+            }
+        }
+
+        var classKeyByRoot: [String: Bytecode.LocalTypeKey] = [:]
+        for line in lines where !line.isEmpty {
+            guard let projection = captures(
+                line,
+                pattern: #"^%[0-9]+ = ref_element_addr(?: \[[^\]]+\])* (%[0-9]+), #(.+)\.([^.]+)$"#
+            ), let root = rootByAlias[projection[0]],
+                  let key = typeEnvironment.localKey(for: projection[1]),
+                  typeEnvironment.isClass(key)
+            else { continue }
+            if let existing = classKeyByRoot[root], existing != key {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "one initializing object is projected as different local classes"
+                )
+            }
+            _ = try typeEnvironment.storedFieldIndex(
+                type: key,
+                name: projection[2]
+            )
+            classKeyByRoot[root] = key
+        }
+        let fieldShapeByRoot = try classKeyByRoot.mapValues { key in
+            Bytecode.ValueType.tuple(
+                try typeEnvironment.classFields(for: key).map(\.type)
+            )
+        }
+        return .init(
+            rootByAlias: rootByAlias,
+            fieldShapeByRoot: fieldShapeByRoot
+        )
     }
 
     private static func initializationBlocks(
