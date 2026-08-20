@@ -3063,6 +3063,130 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Copyable linear captures require a borrowed closure-capture ABI")
+    func validatesBorrowedLinearClosureCapture() throws {
+        var fixture = try makeFixture { _ in }
+        let typeID = Core.TypeID.derive(
+            namespace: .derive(
+                bundleID: "dev.helix.verifier",
+                buildNumber: "1",
+                seed: "linear-capture"
+            ),
+            canonicalType: "Fixture.CapturedReference"
+        )
+        let signature = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .int64
+        )
+        fixture.module.functions[0].registerTypes = [
+            .native(typeID), .closure(signature), .int64,
+        ]
+        fixture.module.functions[0].blocks[0].instructions = [
+            .makeClosure(
+                result: .init(rawValue: 1),
+                function: .init(rawValue: 1),
+                captures: [.init(rawValue: 0)]
+            ),
+            .closureApply(
+                result: .init(rawValue: 2),
+                closure: .init(rawValue: 1),
+                arguments: []
+            ),
+            .destroyValue(.init(rawValue: 0)),
+            .returnValue(.init(rawValue: 2)),
+        ]
+        fixture.module.functions.append(
+            .init(
+                id: .init(rawValue: 1),
+                name: "borrowedNativeCaptureBody",
+                kind: .closureBody,
+                parameterRegisters: [.init(rawValue: 0)],
+                parameterConventions: [.borrowed],
+                resultType: .int64,
+                registerTypes: [.native(typeID), .int64],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .constantInteger(
+                                result: .init(rawValue: 1),
+                                bitPattern: 1
+                            ),
+                            .returnValue(.init(rawValue: 1)),
+                        ]
+                    ),
+                ]
+            )
+        )
+        let capabilities: Set<Core.Capability> = [
+            .borrowCallsV1, .closureValuesV1, .nativeTypesV1,
+        ]
+        fixture.module.capabilities.formUnion(capabilities)
+        fixture.shell.capabilities.formUnion(capabilities)
+        fixture.policy.acceptedCapabilities.formUnion(capabilities)
+        fixture.shell.types[typeID] = .init(
+            id: typeID,
+            canonicalName: "Fixture.CapturedReference",
+            kind: .reference,
+            layoutFingerprint: .sha256("Fixture.CapturedReference.layout"),
+            isCopyable: true,
+            estimatedSize: 8
+        )
+        let entry = try #require(
+            fixture.shell.entries[.init(rawValue: 0)]
+        )
+        fixture.shell.entries[entry.index] = .init(
+            index: entry.index,
+            key: entry.key,
+            parameterTypes: [.native(typeID)],
+            resultType: entry.resultType,
+            effects: entry.effects
+        )
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var consuming = fixture.module
+        consuming.functions[1].parameterConventions = [.owned]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "linear closure captures require a borrowed capture ABI"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(consuming),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var noncopyableShell = fixture.shell
+        noncopyableShell.types[typeID]?.isCopyable = false
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "closure captures must be copyable"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: noncopyableShell,
+                policy: fixture.policy
+            )
+        }
+    }
+
     @Test("Closure construction requires an exact closure-body contract")
     func rejectsMalformedClosureBodyContract() throws {
         var wrongKind = try makeClosureFixture()

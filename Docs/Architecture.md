@@ -65,6 +65,10 @@ Both workflows depend on stable, build-specific identities:
   only by same-image closures, while Array builders are linear and must be
   finished or destroyed on every control-flow path. Neither form can enter a
   Shell/Native boundary, local value layout, stack slot, or function result.
+  Immutable closure contexts may also copy a represented linear capture when
+  its frozen TypeOps are copyable and the closure body receives that capture
+  with a borrowed ABI. `make_closure` charges and performs the copy; owned or
+  inout linear captures remain verifier errors.
 - Array, Dictionary, and Set are typed VM values rather than projections of
   private Swift runtime layouts. One bounded recursive value-semantics model
   supplies VM-defined Equatable and Hashable behavior for supported scalars and
@@ -87,6 +91,14 @@ Both workflows depend on stable, build-specific identities:
   The Verifier proves the complete result/operand relationship, while the VM
   finds a key once and precharges traversal, output storage, and every copy
   before constructing either result.
+- Dictionary's defaulted subscript is compiler control flow over that same
+  typed lookup/update surface. The getter switches on `dictionary_get` and
+  invokes its autoclosure only on the missing edge. Array element mutation and
+  Dictionary default-value mutation share one `_modify` loan: a frame slot and
+  scoped address hold the element, then `end_apply` or `abort_apply` performs
+  typed value-semantic writeback. Nested and throwing inout calls therefore do
+  not require a collection-API opcode, and copyable imported reference values
+  follow the same ownership path as managed values.
 - Mandatory SIL can erase `load [take]` and express ownership through separate
   retain/release traffic. A type-driven normalization recovers an unqualified
   forwarding load only when it is the last operation on the exact temporary

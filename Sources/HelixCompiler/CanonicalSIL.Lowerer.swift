@@ -79,12 +79,25 @@ public struct Lowerer: Sendable {
         var indexSlot: Bytecode.StackSlot
     }
 
-    private struct ArrayElementMutation {
-        var arrayAddress: String
-        var array: Bytecode.Register
-        var index: Bytecode.Register
+    /// A `_modify` coroutine lends one element address while retaining the
+    /// value-semantic collection snapshot needed for writeback. The yielded
+    /// element lives in a VM stack slot so arbitrary nested inout calls,
+    /// including throwing calls, use the ordinary address and exclusivity
+    /// machinery rather than an API-specific store pattern.
+    private struct CollectionElementMutation {
+        enum Source {
+            case array(array: Bytecode.Register, index: Bytecode.Register)
+            case dictionaryDefault(
+                dictionary: Bytecode.Register,
+                key: Bytecode.Register,
+                keyType: Bytecode.ValueType,
+                valueType: Bytecode.ValueType
+            )
+        }
+
+        var collectionAddress: String
+        var source: Source
         var elementType: Bytecode.ValueType
-        var didStore = false
     }
 
     private struct DictionaryIteratorState {
@@ -603,8 +616,8 @@ public struct Lowerer: Sendable {
         var progressionIteratorStates: [
             String: CanonicalSIL.Progression.IteratorState
         ] = [:]
-        var arrayElementMutations: [String: ArrayElementMutation] = [:]
-        var arrayMutationYieldByToken: [String: String] = [:]
+        var collectionElementMutations: [String: CollectionElementMutation] = [:]
+        var collectionMutationYieldByToken: [String: String] = [:]
         var integerConversionResults = Set<String>()
         var pendingDictionaryIteratorTypes: [String: (Bytecode.ValueType, Bytecode.ValueType)] = [:]
         var pendingDictionaryIteratorValues: [String: DictionaryIteratorState] = [:]
@@ -9116,6 +9129,226 @@ public struct Lowerer: Sendable {
             }
         }
 
+        /// Selects an existing Dictionary value or evaluates the default
+        /// closure lazily. Both the getter and `_modify` coroutine share this
+        /// CFG, which keeps autoclosure behavior in ordinary verified closure
+        /// control flow and needs no API-specific VM instruction.
+        func lowerDictionaryValueOrDefault(
+            dictionary: Bytecode.Register,
+            key: Bytecode.Register,
+            closureToken: String,
+            keyType: Bytecode.ValueType,
+            valueType: Bytecode.ValueType,
+            line: Int
+        ) throws -> Bytecode.Register {
+            let dictionaryType = Bytecode.ValueType.dictionary(
+                key: keyType,
+                value: valueType
+            )
+            let closure = try resolve(closureToken, line: line)
+            guard keyType.isVMHashable,
+                  registerTypes[Int(dictionary.rawValue)] == dictionaryType,
+                  registerTypes[Int(key.rawValue)] == keyType,
+                  case let .closure(signature) = registerTypes[
+                    Int(closure.rawValue)
+                  ], signature.parameters.isEmpty,
+                  signature.parameterConventions.isEmpty,
+                  signature.result == valueType,
+                  !signature.effects.mayThrow,
+                  !signature.effects.isAsync
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "Dictionary.subscript(default:)"
+                )
+            }
+
+            let lookup = try allocate(type: .optional(valueType))
+            let existingTarget = try allocateSyntheticBlockID()
+            let defaultTarget = try allocateSyntheticBlockID()
+            let mergeTarget = try allocateSyntheticBlockID()
+            appendInstruction(
+                .dictionaryGet(
+                    result: lookup,
+                    dictionary: dictionary,
+                    key: key
+                )
+            )
+            appendInstruction(
+                .switchOptional(
+                    optional: lookup,
+                    someTarget: existingTarget,
+                    noneTarget: defaultTarget
+                )
+            )
+            finishCurrent()
+
+            let existing = try allocate(type: valueType)
+            appendSyntheticBlock(
+                id: existingTarget,
+                parameters: [existing],
+                instructions: [
+                    .branch(target: mergeTarget, arguments: [existing]),
+                ]
+            )
+            let defaultValue = try allocate(type: valueType)
+            appendSyntheticBlock(
+                id: defaultTarget,
+                instructions: [
+                    .closureApply(
+                        result: defaultValue,
+                        closure: closure,
+                        arguments: []
+                    ),
+                    .branch(target: mergeTarget, arguments: [defaultValue]),
+                ]
+            )
+
+            let selected = try allocate(type: valueType)
+            current = .init(
+                id: mergeTarget,
+                parameters: [selected],
+                instructions: []
+            )
+            return selected
+        }
+
+        /// Completes either the normal or unwind edge of a collection
+        /// `_modify` coroutine. The stack slot is path-local at runtime even
+        /// though several textual exits share one lowering record.
+        func finalizeCollectionElementMutation(
+            yieldToken: String,
+            line: Int
+        ) throws {
+            guard let mutation = collectionElementMutations[yieldToken],
+                  let access = runtimeAddress(at: yieldToken),
+                  isScopedRuntimeAddress(yieldToken),
+                  let element = try takeStoredValue(
+                    at: yieldToken,
+                    line: line
+                  ),
+                  registerTypes[Int(element.rawValue)] == mutation.elementType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "collection _modify ended with uninitialized or mismatched element storage"
+                )
+            }
+            appendInstruction(.endAccess(access))
+
+            switch mutation.source {
+            case let .array(array, index):
+                let updated = try allocate(type: .array(mutation.elementType))
+                appendInstruction(
+                    .arrayUpdate(
+                        result: updated,
+                        array: array,
+                        index: index,
+                        value: element
+                    )
+                )
+                for temporary in [array, element]
+                where registerTypes[Int(temporary.rawValue)]
+                    .requiresLinearOwnership {
+                    appendInstruction(.destroyValue(temporary))
+                }
+                try storeConstructedValue(
+                    updated,
+                    at: mutation.collectionAddress,
+                    mode: .assign
+                )
+
+            case let .dictionaryDefault(
+                dictionary,
+                key,
+                keyType,
+                valueType
+            ):
+                let update = try allocate(type: .optional(valueType))
+                appendInstruction(
+                    .makeOptionalSome(result: update, value: element)
+                )
+                let previous = try allocate(type: .optional(valueType))
+                let updated = try allocate(
+                    type: .dictionary(key: keyType, value: valueType)
+                )
+                appendInstruction(
+                    .dictionarySet(
+                        previousValueResult: previous,
+                        dictionaryResult: updated,
+                        dictionary: dictionary,
+                        key: key,
+                        value: update
+                    )
+                )
+                for temporary in [dictionary, key, update, previous]
+                where registerTypes[Int(temporary.rawValue)]
+                    .requiresLinearOwnership {
+                    appendInstruction(.destroyValue(temporary))
+                }
+                try storeConstructedValue(
+                    updated,
+                    at: mutation.collectionAddress,
+                    mode: .assign
+                )
+            }
+        }
+
+        func removeCollectionMutationMetadata(yieldToken: String) {
+            collectionElementMutations.removeValue(forKey: yieldToken)
+            runtimeStackSlots.removeValue(forKey: yieldToken)
+            runtimeAddressValues.removeValue(forKey: yieldToken)
+            runtimeAddressPointees.removeValue(forKey: yieldToken)
+            scopedRuntimeAddresses.remove(yieldToken)
+            stackAddressTypes.removeValue(forKey: yieldToken)
+            stackAddressValues.removeValue(forKey: yieldToken)
+            values.removeValue(forKey: yieldToken)
+        }
+
+        func beginCollectionElementMutation(
+            yieldToken: String,
+            continuationToken: String,
+            initialElement: Bytecode.Register,
+            mutation: CollectionElementMutation
+        ) throws {
+            guard registerTypes[Int(initialElement.rawValue)]
+                    == mutation.elementType,
+                  collectionElementMutations[yieldToken] == nil,
+                  collectionMutationYieldByToken[continuationToken] == nil,
+                  stackType(at: yieldToken) == nil
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "collection _modify has mismatched or overlapping access state"
+                )
+            }
+            let slot = try allocateStackSlot(type: mutation.elementType)
+            appendInstruction(
+                .storeStack(
+                    slot: slot,
+                    source: initialElement,
+                    mode: .initialize
+                )
+            )
+            let address = try allocate(type: .address(mutation.elementType))
+            appendInstruction(.stackAddress(result: address, slot: slot))
+            let access = try allocate(type: .address(mutation.elementType))
+            appendInstruction(
+                .beginAccess(
+                    result: access,
+                    address: address,
+                    kind: .modify
+                )
+            )
+
+            stackAddressTypes[yieldToken] = mutation.elementType
+            runtimeStackSlots[yieldToken] = slot
+            runtimeAddressValues[yieldToken] = access
+            runtimeAddressPointees[yieldToken] = mutation.elementType
+            scopedRuntimeAddresses.insert(yieldToken)
+            values[yieldToken] = access
+            collectionElementMutations[yieldToken] = mutation
+            collectionMutationYieldByToken[continuationToken] = yieldToken
+        }
+
         func lowerSwiftCoreIntrinsic(
             _ intrinsic: SwiftCoreIntrinsic,
             resultToken: String,
@@ -10428,6 +10661,66 @@ public struct Lowerer: Sendable {
                     mode: .assign
                 )
                 voidValues.insert(resultToken)
+
+            case .dictionaryDefaultSubscriptGet:
+                guard arguments.count == 4,
+                      let outputType = compilerAddressType(arguments[0]),
+                      let keyType = compilerAddressType(arguments[1]),
+                      let borrowedKey = try borrowStoredValue(
+                        at: arguments[1],
+                        line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary default subscript getter has unsupported arguments"
+                    )
+                }
+                let types = try parseDictionaryGenericArguments(genericArguments)
+                let dictionaryType = Bytecode.ValueType.dictionary(
+                    key: types.key,
+                    value: types.value
+                )
+                let borrowedDictionary = try borrowStoredValue(
+                    at: arguments[3],
+                    line: line
+                )
+                let dictionary = try borrowedDictionary?.register
+                    ?? resolve(arguments[3], line: line)
+                guard outputType == types.value,
+                      keyType == types.key,
+                      registerTypes[Int(borrowedKey.register.rawValue)]
+                        == types.key,
+                      registerTypes[Int(dictionary.rawValue)] == dictionaryType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary default subscript getter types do not match"
+                    )
+                }
+                let result = try lowerDictionaryValueOrDefault(
+                    dictionary: dictionary,
+                    key: borrowedKey.register,
+                    closureToken: arguments[2],
+                    keyType: types.key,
+                    valueType: types.value,
+                    line: line
+                )
+                for owner in [
+                    borrowedKey.temporaryOwner,
+                    borrowedDictionary?.temporaryOwner,
+                ].compactMap({ $0 }) {
+                    appendInstruction(.destroyValue(owner))
+                }
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+
+            case .dictionaryDefaultSubscriptModify:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Dictionary.subscript(default:)._modify must be consumed by begin_apply"
+                )
 
             case .dictionaryUpdateValue:
                 guard arguments.count == 4,
@@ -13948,6 +14241,7 @@ public struct Lowerer: Sendable {
                 let expectedCaptureTypes = Array(
                     binding.parameterTypes.suffix(captureTokens.count)
                 )
+                var captureTemporaryOwners: [Bytecode.Register] = []
                 let captures = try zip(captureTokens, expectedCaptureTypes).map {
                     token, type in
                     if case let .mutableCell(pointee) = type {
@@ -13956,6 +14250,15 @@ public struct Lowerer: Sendable {
                             pointee: pointee,
                             line: sourceLine
                         )
+                    }
+                    if let retained = takePendingRetainedValue(for: token) {
+                        guard registerTypes[Int(retained.rawValue)] == type else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "retained closure capture has the wrong type"
+                            )
+                        }
+                        captureTemporaryOwners.append(retained)
+                        return retained
                     }
                     return try resolveStorableValue(
                         token,
@@ -13990,6 +14293,13 @@ public struct Lowerer: Sendable {
                         captures: captures
                     )
                 )
+                for owner in captureTemporaryOwners
+                where registerTypes[Int(owner.rawValue)]
+                    .requiresLinearOwnership {
+                    // make_closure copies captures into its managed context;
+                    // this owner represents Swift's explicit context retain.
+                    appendInstruction(.destroyValue(owner))
+                }
                 continue
             }
 
@@ -14008,6 +14318,27 @@ public struct Lowerer: Sendable {
                 // SIL value alias while validating that its dependency is live.
                 _ = try resolve(dependence[2], line: sourceLine)
                 values[dependence[0]] = source
+                continue
+            }
+
+            if let conversion = match(
+                line,
+                pattern: #"^(%[0-9]+) = convert_function (%[0-9]+) to \$(.+)$"#
+            ) {
+                let source = try resolve(conversion[1], line: sourceLine)
+                guard case let .closure(actual) = registerTypes[
+                    Int(source.rawValue)
+                ], case let .closure(expected) = try parseType(conversion[2]),
+                   actual == expected
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "convert_function changes the represented closure ABI"
+                    )
+                }
+                // Direct and indirect SIL results share one value result in
+                // HLBC. A fully concrete conversion that preserves the VM
+                // signature is therefore an ownership-neutral closure alias.
+                values[conversion[0]] = source
                 continue
             }
 
@@ -14064,7 +14395,7 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^\((%[0-9]+), (%[0-9]+)\) = begin_apply (%[0-9]+)(?:<(.+)>)?\((.*)\) : \$(.+)$"#
             ) {
-                guard swiftCoreReferences[call[2]] == .arraySubscriptModify else {
+                guard let intrinsic = swiftCoreReferences[call[2]] else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
                         text: line
@@ -14074,46 +14405,106 @@ public struct Lowerer: Sendable {
                     String(argument.split(separator: ":", maxSplits: 1)[0])
                         .trimmingCharacters(in: .whitespaces)
                 }
-                guard arguments.count == 2 else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array.subscript.modify has unsupported arguments"
+                switch intrinsic {
+                case .arraySubscriptModify:
+                    guard arguments.count == 2 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array.subscript.modify has unsupported arguments"
+                        )
+                    }
+                    let element = try parseStoredType(call[3])
+                    let index = try resolve(arguments[0], line: sourceLine)
+                    guard registerTypes[Int(index.rawValue)] == .int64,
+                          compilerAddressType(arguments[1]) == .array(element),
+                          let array = try copyStoredValue(
+                            at: arguments[1],
+                            line: sourceLine
+                          ),
+                          registerTypes[Int(array.rawValue)] == .array(element)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array.subscript.modify types do not match"
+                        )
+                    }
+                    let currentElement = try allocate(type: element)
+                    appendInstruction(
+                        .arrayGet(
+                            result: currentElement,
+                            array: array,
+                            index: index
+                        )
                     )
-                }
-                let element = try parseType(call[3])
-                let index = try resolve(arguments[0], line: sourceLine)
-                let arrayAddress = addressBase(arguments[1])
-                guard registerTypes[Int(index.rawValue)] == .int64,
-                      stackType(at: arguments[1]) == .array(element),
-                      let array = try copyStoredValue(
-                        at: arguments[1],
+                    try beginCollectionElementMutation(
+                        yieldToken: call[0],
+                        continuationToken: call[1],
+                        initialElement: currentElement,
+                        mutation: .init(
+                            collectionAddress: arguments[1],
+                            source: .array(array: array, index: index),
+                            elementType: element
+                        )
+                    )
+
+                case .dictionaryDefaultSubscriptModify:
+                    guard arguments.count == 3,
+                          let keyType = compilerAddressType(arguments[0]),
+                          let key = try copyStoredValue(
+                            at: arguments[0],
+                            line: sourceLine
+                          ),
+                          let dictionary = try copyStoredValue(
+                            at: arguments[2],
+                            line: sourceLine
+                          )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Dictionary default subscript modify has unsupported arguments"
+                        )
+                    }
+                    let types = try parseDictionaryGenericArguments(call[3])
+                    let dictionaryType = Bytecode.ValueType.dictionary(
+                        key: types.key,
+                        value: types.value
+                    )
+                    guard keyType == types.key,
+                          registerTypes[Int(key.rawValue)] == types.key,
+                          compilerAddressType(arguments[2]) == dictionaryType,
+                          registerTypes[Int(dictionary.rawValue)] == dictionaryType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Dictionary default subscript modify types do not match"
+                        )
+                    }
+                    let selected = try lowerDictionaryValueOrDefault(
+                        dictionary: dictionary,
+                        key: key,
+                        closureToken: arguments[1],
+                        keyType: types.key,
+                        valueType: types.value,
                         line: sourceLine
-                      ),
-                      registerTypes[Int(array.rawValue)] == .array(element),
-                      !element.requiresLinearOwnership,
-                      arrayElementMutations[call[0]] == nil,
-                      arrayMutationYieldByToken[call[1]] == nil
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array.subscript.modify types or access scope do not match"
+                    )
+                    try beginCollectionElementMutation(
+                        yieldToken: call[0],
+                        continuationToken: call[1],
+                        initialElement: selected,
+                        mutation: .init(
+                            collectionAddress: arguments[2],
+                            source: .dictionaryDefault(
+                                dictionary: dictionary,
+                                key: key,
+                                keyType: types.key,
+                                valueType: types.value
+                            ),
+                            elementType: types.value
+                        )
+                    )
+
+                default:
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: line
                     )
                 }
-                let currentElement = try allocate(type: element)
-                appendInstruction(
-                    .arrayGet(
-                        result: currentElement,
-                        array: array,
-                        index: index
-                    )
-                )
-                stackAddressTypes[call[0]] = element
-                stackAddressValues[call[0]] = currentElement
-                arrayElementMutations[call[0]] = .init(
-                    arrayAddress: arrayAddress,
-                    array: array,
-                    index: index,
-                    elementType: element
-                )
-                arrayMutationYieldByToken[call[1]] = call[0]
                 continue
             }
 
@@ -14121,16 +14512,46 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(?:(%[0-9]+) = )?end_apply (%[0-9]+) as \$\(\)$"#
             ) {
-                guard let yield = arrayMutationYieldByToken.removeValue(
-                    forKey: apply[1]
-                ), let mutation = arrayElementMutations.removeValue(forKey: yield),
-                   mutation.didStore
-                else {
+                guard let yield = collectionMutationYieldByToken[apply[1]] else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array.subscript.modify ended without exactly one store"
+                        "collection _modify end_apply has no matching begin_apply"
                     )
                 }
+                try finalizeCollectionElementMutation(
+                    yieldToken: yield,
+                    line: sourceLine
+                )
+                if !hasFutureSemanticUse(
+                    of: apply[1],
+                    after: currentSILLineIndex
+                ) {
+                    collectionMutationYieldByToken.removeValue(forKey: apply[1])
+                    removeCollectionMutationMetadata(yieldToken: yield)
+                }
                 if !apply[0].isEmpty { voidValues.insert(apply[0]) }
+                continue
+            }
+
+            if let apply = match(
+                line,
+                pattern: #"^abort_apply (%[0-9]+)$"#
+            ) {
+                guard let yield = collectionMutationYieldByToken[apply[0]] else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "collection _modify abort_apply has no matching begin_apply"
+                    )
+                }
+                try finalizeCollectionElementMutation(
+                    yieldToken: yield,
+                    line: sourceLine
+                )
+                if !hasFutureSemanticUse(
+                    of: apply[0],
+                    after: currentSILLineIndex
+                ) {
+                    collectionMutationYieldByToken.removeValue(forKey: apply[0])
+                    removeCollectionMutationMetadata(yieldToken: yield)
+                }
                 continue
             }
 
@@ -15905,41 +16326,6 @@ public struct Lowerer: Sendable {
             if let store = match(
                 line,
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
-            ), var mutation = arrayElementMutations[addressBase(store[1])] {
-                let mutationRoot = addressBase(store[1])
-                guard !mutation.didStore else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array.subscript.modify stores more than once"
-                    )
-                }
-                let value = try resolve(store[0], line: sourceLine)
-                guard registerTypes[Int(value.rawValue)] == mutation.elementType else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array subscript update value does not match Array.Element"
-                    )
-                }
-                let result = try allocate(type: .array(mutation.elementType))
-                appendInstruction(
-                    .arrayUpdate(
-                        result: result,
-                        array: mutation.array,
-                        index: mutation.index,
-                        value: value
-                    )
-                )
-                try storeConstructedValue(
-                    result,
-                    at: mutation.arrayAddress,
-                    mode: .assign
-                )
-                mutation.didStore = true
-                arrayElementMutations[mutationRoot] = mutation
-                continue
-            }
-
-            if let store = match(
-                line,
-                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
             ), let progression = progressionValues[store[0]] {
                 let address = addressBase(store[1])
                 guard progressionAddresses[address] == progression.type
@@ -16934,10 +17320,11 @@ public struct Lowerer: Sendable {
                 if registerTypes[Int(value.rawValue)].requiresLinearOwnership {
                     if ownership[0] == "retain_value" {
                         try materializeRetain(of: ownership[1], value: value)
-                    } else if !isBorrowedValue(
-                        token: ownership[1],
-                        register: value
-                    ) {
+                    } else if borrowedTemporaryValue(for: ownership[1]) != nil
+                        || !isBorrowedValue(
+                            token: ownership[1],
+                            register: value
+                        ) {
                         try closeBorrowedTemporaryLifetime(
                             for: ownership[1],
                             resolved: value
@@ -16977,10 +17364,11 @@ public struct Lowerer: Sendable {
                 }
                 if ownership[0] == "retain" {
                     try materializeRetain(of: ownership[1], value: value)
-                } else if !isBorrowedValue(
-                    token: ownership[1],
-                    register: value
-                ) {
+                } else if borrowedTemporaryValue(for: ownership[1]) != nil
+                    || !isBorrowedValue(
+                        token: ownership[1],
+                        register: value
+                    ) {
                     try closeBorrowedTemporaryLifetime(
                         for: ownership[1],
                         resolved: value
@@ -17630,8 +18018,9 @@ public struct Lowerer: Sendable {
             count: unreachableTrapReasons.count
         )
         recordIncompleteLifetime(
-            "array-mutation",
-            count: arrayElementMutations.count + arrayMutationYieldByToken.count
+            "collection-element-mutation",
+            count: collectionElementMutations.count
+                + collectionMutationYieldByToken.count
         )
         recordIncompleteLifetime(
             "mutable-box",
@@ -18282,10 +18671,13 @@ public struct Lowerer: Sendable {
                 "Dictionary generic arguments must contain Key and Value"
             )
         }
-        return (
-            try parseStoredType(components[0]),
-            try parseStoredType(components[1])
-        )
+        let key = try parseStoredType(components[0])
+        guard key.isVMHashable else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "Dictionary key \(key) lacks VM-defined Hashable semantics"
+            )
+        }
+        return (key, try parseStoredType(components[1]))
     }
 
     private func parseDictionarySequenceGenericArguments(
@@ -18301,8 +18693,14 @@ public struct Lowerer: Sendable {
                 "Dictionary Sequence initializer requires Key, Value, and Sequence"
             )
         }
+        let key = try parseStoredType(components[0])
+        guard key.isVMHashable else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "Dictionary key \(key) lacks VM-defined Hashable semantics"
+            )
+        }
         return (
-            try parseStoredType(components[0]),
+            key,
             try parseStoredType(components[1]),
             try parseStoredType(components[2])
         )

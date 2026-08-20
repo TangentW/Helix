@@ -63,7 +63,16 @@ public enum ImplementationFingerprint {
     static func isCompilerGeneratedSymbol(_ symbol: String) -> Bool {
         symbol.contains("cfU") || symbol.contains("fU")
             || symbol.contains("_Tg") || symbol.contains("Tf")
+            || isReabstractionThunk(symbol)
             || isDefaultArgumentGenerator(symbol)
+    }
+
+    /// Swift's mangling gives reabstraction thunks the stable `TR` suffix.
+    /// They adapt one fully concrete closure ABI to another and have a SIL
+    /// body in the same compilation unit, so they are image-local code rather
+    /// than candidates for native symbol lookup.
+    static func isReabstractionThunk(_ symbol: String) -> Bool {
+        symbol.hasSuffix("_TR")
     }
 
     /// Swift emits one directly callable helper for every default argument.

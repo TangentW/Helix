@@ -336,7 +336,10 @@ visibility alone does not create a VM capability: every native operation must
 also resolve through an eligible Entry or exact NativeImport. Supported local
 closures and already indexed same-image helpers may use synchronous `@escaping`
 parameters, internal closure returns, nested closure captures, and synchronous
-throwing paths. Mutable captures use the same VM-managed cell for scalar,
+throwing paths. Copyable linear captures such as frozen imported references are
+accepted when their closure-body capture convention is borrowed; fully concrete
+reabstraction thunks are linked into the image rather than treated as
+NativeImports. Mutable captures use the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
 boxes. Fully concrete Array, Dictionary, and Set values share verified closure
 traversal for common `map`/`flatMap`/`compactMap`, reduction, visit, predicate,
@@ -357,7 +360,11 @@ plan. Common Array structural edits—including concatenation, contents append
 and insertion, range replacement/removal, counted edge removal, clearing,
 swapping, and capacity hints—are also supported for matching Array-backed
 sources and represented copyable elements; they are type-driven rather than
-special-cased for a framework class. Natural `sorted()`/`sort()` is available
+special-cased for a framework class. Dictionary default lookup invokes its
+autoclosure only for a missing key. Its scoped `_modify` and Array element
+`_modify` share frame-backed lending and write back on normal `end_apply` and
+throwing `abort_apply`, including nested collections and imported references.
+Natural `sorted()`/`sort()` is available
 for VM-comparable scalar elements. Mutating ordering commits only on its normal
 continuation, so a throwing callback leaves the original Array unchanged.
 Multi-branch local initialization

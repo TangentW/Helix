@@ -937,6 +937,10 @@ extension ReleaseCompiler {
                 .isDefaultArgumentGenerator(symbol) {
                 return .concreteSpecialization
             }
+            if ReleaseCompiler.ImplementationFingerprint
+                .isReabstractionThunk(symbol) {
+                return .concreteSpecialization
+            }
             // A closure used by a default expression is rooted in the default
             // argument helper rather than in an archived App declaration.
             if symbol.contains("fA"), symbol.contains("cfU") || symbol.contains("fU") {

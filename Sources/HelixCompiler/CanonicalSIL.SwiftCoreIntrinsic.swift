@@ -47,6 +47,8 @@ enum SwiftCoreIntrinsic: Equatable {
     case dictionaryEmpty
     case dictionarySubscriptGet
     case dictionarySubscriptSet
+    case dictionaryDefaultSubscriptGet
+    case dictionaryDefaultSubscriptModify
     case dictionaryUpdateValue
     case dictionaryRemoveValue
     case dictionaryRemoveAll
@@ -249,6 +251,8 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sS2Dyxq_GycfC": self = .dictionaryEmpty
         case "$sSDyq_Sgxcig": self = .dictionarySubscriptGet
         case "$sSDyq_Sgxcis": self = .dictionarySubscriptSet
+        case "$sSD_7defaultq_x_q_yXKtcig": self = .dictionaryDefaultSubscriptGet
+        case "$sSD_7defaultq_x_q_yXKtciM": self = .dictionaryDefaultSubscriptModify
         case "$sSD11updateValue_6forKeyq_Sgq_n_xtF": self = .dictionaryUpdateValue
         case "$sSD11removeValue6forKeyq_Sgx_tF": self = .dictionaryRemoveValue
         case "$sSD9removeAll15keepingCapacityySb_tF": self = .dictionaryRemoveAll

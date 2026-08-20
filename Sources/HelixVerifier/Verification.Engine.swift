@@ -2978,7 +2978,13 @@ public struct Engine: Verification.ImageVerifying {
             ).allSatisfy({ $0 != .inout }) else {
                 throw fail("closure captures cannot carry inout parameters")
             }
-            for captureType in captureTypes {
+            let captureConventions = Array(
+                callee.parameterConventions.suffix(captureTypes.count)
+            )
+            for (captureType, convention) in zip(
+                captureTypes,
+                captureConventions
+            ) {
                 if case .address = captureType {
                     throw fail("closure captures cannot contain address values")
                 }
@@ -2988,10 +2994,14 @@ public struct Engine: Verification.ImageVerifying {
                         .escapingClosureValuesV1
                     )
                 }
-                guard !captureType.requiresLinearOwnership,
-                      isCopyable(captureType, shell: shell)
-                else {
-                    throw fail("closure captures must be copyable VM-managed values")
+                guard isCopyable(captureType, shell: shell) else {
+                    throw fail("closure captures must be copyable")
+                }
+                if captureType.requiresLinearOwnership,
+                   convention != .borrowed {
+                    throw fail(
+                        "linear closure captures require a borrowed capture ABI"
+                    )
                 }
             }
         case let .closureApply(result, closure, arguments):
@@ -3690,8 +3700,9 @@ public struct Engine: Verification.ImageVerifying {
                         live.insert(result)
                     }
                 case .makeClosure:
-                    // Captures are copied into a VM-managed closure context. The
-                    // type checker rejects addresses and explicit-linear values.
+                    // Captures are copied into a VM-managed closure context.
+                    // Type validation rejects addresses, noncopyable values,
+                    // and linear captures without a borrowed capture ABI.
                     break
                 case let .closureApply(result, closure, arguments):
                     let signature: Bytecode.ClosureSignature? = if case let .closure(value)

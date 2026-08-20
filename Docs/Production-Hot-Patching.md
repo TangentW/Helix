@@ -171,7 +171,8 @@ one-grapheme Character literals for the bounded String predicate path,
 tuple/Optional including address projection, recursive Array/Dictionary equality,
 common Array index/search/extremum/sequence relations plus type-generic,
 Array-backed structural concatenation/insertion/replacement/removal/swap and
-capacity hints, Dictionary lookup/subscript mutation, `updateValue`,
+capacity hints, Dictionary lookup/subscript mutation including lazy default
+lookup and scoped default-value writeback, `updateValue`,
 `removeValue`, `removeAll`, key/value projection, unique-key sequence
 construction and capacity hints, and typed Set
 construction/query/mutation/iteration/algebra with recursively VM-defined
@@ -190,15 +191,15 @@ accessors, file- or module-scope patch-local struct/enum, pure HLVM classes, and
 concrete `Result` values,
 payload-carrying local errors, scoped patch-local `inout`/`mutating` helpers,
 synchronous nonthrowing or throwing patch-local closures, type-independent
-managed mutable captures, and same-image `@escaping` return/capture flows,
-fully concrete compiler
-specializations and default-argument generators, an automatically frozen
-`Swift.print` NativeImport, and top-level non-suspending `async`, `async throws`,
-and `@MainActor async` entries. A new `final` class may also inherit an
-HLXI-frozen, `NSObject`-compatible project or system type under the closed hosted
-profile and cross into native code as that superclass. The current profile is
-limited to inherited no-argument initialization, no stored properties, and
-no-argument/Bool `Void` overrides.
+managed mutable captures, copyable linear captures with a borrowed capture ABI,
+and same-image `@escaping` return/capture flows, fully concrete compiler
+specializations, reabstraction thunks, and default-argument generators, an
+automatically frozen `Swift.print` NativeImport, and top-level non-suspending
+`async`, `async throws`, and `@MainActor async` entries. A new `final` class may
+also inherit an HLXI-frozen, `NSObject`-compatible project or system type under
+the closed hosted profile and cross into native code as that superclass. The
+current profile is limited to inherited no-argument initialization, no stored
+properties, and no-argument/Bool `Void` overrides.
 
 It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch, a
 patch concrete Swift type identity visible to native code, function-local

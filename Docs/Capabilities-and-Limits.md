@@ -93,15 +93,21 @@ does not by itself certify a physical device or distribution channel.
   allocation-before-copy charging do not depend on a particular element or
   SDK type.
   Dictionary construction, equality, lookup, subscript assignment,
+  lazy `subscript(_:default:)` lookup and scoped mutation,
   `updateValue(_:forKey:)`, `removeValue(forKey:)`,
   `removeAll(keepingCapacity:)`, `keys`/`values` sequence materialization,
   `init(uniqueKeysWithValues:)`, `reserveCapacity`, and iteration are supported
   for eligible key and value types. Insertion, replacement, and removal share
   one typed Optional-update primitive that returns both the previous value and
   the updated Dictionary; key/value views share one typed projection primitive.
-  Both paths precharge work and output storage before copying. Array append
-  accepts represented copyable elements, including frozen imported reference
-  values. Equality is defined recursively
+  Those update and projection paths precharge work and output storage before
+  copying.
+  Default lookup calls its autoclosure only on a missing key. Its `_modify`
+  path and Array element `_modify` share scoped frame storage and perform
+  writeback on both `end_apply` and `abort_apply`, covering nested and throwing
+  inout mutation without collection-API-specific bytecode.
+  Array append accepts represented copyable elements, including frozen imported
+  reference values. Equality is defined recursively
   for Bool, fixed-width integers, floating-point values, String, and supported
   Optional, Array, Dictionary, and Set values. Dictionary and Set comparison is
   order-independent, collection equality preserves Swift's shared-storage fast
@@ -205,7 +211,7 @@ does not by itself certify a physical device or distribution channel.
   access, aliasing, ownership, and same-frame/same-block restrictions. This
   includes the `@inout_aliasable`/`@closureCapture $*T` physical conventions
   emitted for mutable locals captured by compiler-generated `defer` helpers.
-- Synchronous patch-local closure values with copyable VM-managed captures,
+- Synchronous patch-local closure values with copyable represented captures,
   including nonthrowing and throwing invocation paths. Mutable local values
   are promoted through one type-independent VM cell model, covering scalar,
   String, Optional, Array, Dictionary, Set, tuple, and patch-local struct storage,
@@ -219,9 +225,15 @@ does not by itself certify a physical device or distribution channel.
   per-parameter owned/borrowed/inout conventions, including `@in_guaranteed`
   Optional and imported SDK reference values used by the supported higher-order
   operations, ordinary same-image inout closures on normal/throwing paths, and
-  scoped frame-owned mutation used by `reduce(into:_:)`. The value must be
-  consumed inside the
-  same pinned HLVM invocation; `escaping-closure-values-1` gates return and
+  scoped frame-owned mutation used by `reduce(into:_:)`. A copyable linear
+  capture, such as an imported reference, is copied into the
+  managed closure context only when the closure body receives it with a
+  borrowed capture ABI; owned and inout linear captures remain rejected. Fully
+  concrete direct/indirect-result reabstraction thunks are linked as image-local
+  compiler-generated functions, using the closure-body role when partially
+  applied, rather than resolved through NativeImport. The closure value must be
+  consumed inside the same pinned HLVM invocation;
+  `escaping-closure-values-1` gates return and
   nested-capture semantics, while `mutable-captures-1` gates managed cells.
   Compiler-emitted fully concrete specializations are also supported when no
   archetype, metadata, or witness dependency remains.
@@ -268,7 +280,7 @@ does not by itself certify a physical device or distribution channel.
 ### Rejected or intentionally incomplete
 
 - Generic roots or any execution that still requires runtime generic metadata,
-  witness tables, reabstraction, or dynamic specialization.
+  witness tables, unresolved/generic reabstraction, or dynamic specialization.
 - True suspension: `await`, continuations, tasks, async callees, async closures,
   cancellation, and cross-suspension ownership or generation leases.
 - Actor-isolated instance roots, custom global actors, and arbitrary executor

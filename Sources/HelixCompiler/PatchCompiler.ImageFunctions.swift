@@ -153,6 +153,10 @@ enum ImageFunctions {
             .isDefaultArgumentGenerator(symbol) {
             return .concreteSpecialization
         }
+        if ReleaseCompiler.ImplementationFingerprint
+            .isReabstractionThunk(symbol) {
+            return .concreteSpecialization
+        }
         // Default expressions may themselves create closures. Their symbols
         // are rooted in the fA thunk rather than in the App declaration.
         if symbol.contains("fA"), symbol.contains("cfU") || symbol.contains("fU") {
