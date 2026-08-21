@@ -406,9 +406,13 @@ does not by itself certify a physical device or distribution channel.
   escaping Swift closures. Field-sensitive definite/possible initialization
   also covers branch initialization, conditional replacement, and cleanup
   without treating a maybe-initialized value as readable. This includes
-  `@escaping` parameters on same-image
-  helpers, returning a closure from one same-image function to its caller, and
-  a closure capturing another closure. Concrete closure ABIs preserve
+  `@escaping` parameters on same-image helpers, returning a closure from one
+  same-image function to its caller, and a closure capturing another closure.
+  Closure values may appear in Optional, tuple, Array, Dictionary, patch-local
+  struct/enum/class storage, mutable closure variables, and higher-order
+  parameter/result signatures. Capture lists, recursive closure variables,
+  local and bound method references, multiple trailing closures, and escaping
+  autoclosures all use this same value model. Concrete closure ABIs preserve
   per-parameter owned/borrowed/inout conventions, including `@in_guaranteed`
   Optional and imported SDK reference values used by the supported higher-order
   operations, ordinary same-image inout closures on normal/throwing paths, and
@@ -417,9 +421,19 @@ does not by itself certify a physical device or distribution channel.
   managed closure context only when the closure body receives it with a
   borrowed capture ABI; owned and inout linear captures remain rejected. Fully
   concrete direct/indirect-result reabstraction thunks are linked as image-local
-  compiler-generated functions, using the closure-body role when partially
-  applied, rather than resolved through NativeImport. The closure value must be
-  consumed inside the same pinned HLVM invocation;
+  compiler-generated functions, using the closure-body role only when partially
+  applied; direct-only closure and `defer` helpers retain their physical capture
+  ABI as concrete specializations. They are never resolved through NativeImport.
+  On-stack `partial_apply` and `withoutActuallyEscaping` use explicit dynamic
+  scope identities. The Verifier proves that every normal and throwing CFG path
+  closes the scope, and the VM rejects a scoped closure still reachable through
+  explicit storage or a value with a later semantic use at scope end. Dead SSA
+  aliases do not become false escapes. A lexical nonescaping closure may borrow a
+  caller-owned `inout` address through the managed-cell capture ABI; the borrow
+  becomes invalid with the address access, and both static verification and the
+  VM require the closure to close first. An escaping capture of that address is
+  rejected. Other closure values must remain inside the same pinned HLVM
+  invocation;
   `escaping-closure-values-1` gates return and
   nested-capture semantics, while `mutable-captures-1` gates managed cells.
   Compiler-emitted fully concrete specializations are also supported when no
@@ -489,12 +503,11 @@ does not by itself certify a physical device or distribution channel.
 - Actor-isolated instance roots, custom global actors, and arbitrary executor
   hops. The limited `@MainActor async` leaf case above is distinct.
 - A closure crossing a Shell Entry or NativeImport boundary, being persisted in
-  native/global/property state, or outliving its pinned HLVM invocation or
-  generation. Async, `@Sendable`, and closure signatures whose own parameter
-  or result is another closure remain unsupported. Capturing a caller-owned
-  `inout` parameter also remains fail-closed because it requires explicit
-  writeback to the caller; ordinary mutable locals and Swift escape boxes use
-  the managed-cell path above.
+  native/global/native-property state, or outliving its pinned HLVM invocation
+  or generation. Async and `@Sendable` closure semantics remain unsupported.
+  Weak and unowned capture ownership is not yet represented. A caller-owned
+  `inout` value may be captured only by the verified lexical nonescaping path
+  above; an escaping capture remains fail-closed.
 - `String.Index`, index-based String subscripting or mutation, UTF-8/UTF-16/
   Unicode-scalar views, locale-sensitive or Foundation text APIs, and
   Character properties not listed above. These remain fail-closed rather than

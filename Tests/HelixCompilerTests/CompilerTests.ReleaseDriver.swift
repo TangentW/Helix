@@ -490,7 +490,7 @@ struct ReleaseDriver {
         let closures = result.module.functions.flatMap(\.blocks)
             .flatMap(\.instructions).compactMap {
                 instruction -> [Bytecode.Register]? in
-                guard case let .makeClosure(_, _, captures) = instruction else {
+                guard case let .makeClosure(_, _, captures, _) = instruction else {
                     return nil
                 }
                 return captures
@@ -2444,6 +2444,112 @@ struct ReleaseDriver {
                 ]
             ) == .returned(
                 .integer(try VM.Integer(signed: 6, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
+    @Test("Generic closure helpers link through concrete specializations")
+    func buildsGenericClosureSpecializationPatch() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-release-generic-closure-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        @inline(never)
+        func helper<T>(_ value: T, by transform: (T) -> T) -> T {
+            transform(value)
+        }
+        @inline(never)
+        public func transform(_ value: Int) -> Int {
+            helper(value, by: { $0 + 1 })
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+        let driver = ReleaseCompiler.Driver()
+        let closureType = Bytecode.ValueType.closure(
+            .init(
+                parameters: [.int64],
+                parameterConventions: [.owned],
+                result: .int64
+            )
+        )
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            helperSignature: .init(
+                parameters: ["T", "(T) -> T"],
+                result: "T"
+            ),
+            helperParameterTypes: [.int64, closureType],
+            helperEffects: .init(),
+            helperIsGeneric: true,
+            helperCanonicalDeclaration:
+                "func helper<T>(_: T, by: (T) -> T) -> T",
+            helperFormalType: "<T>(T, (T) -> T) -> T"
+        )
+        let helper = try #require(archive.functions.first {
+            $0.canonicalDeclaration.contains("helper")
+        })
+        let root = try #require(archive.functions.first {
+            $0.canonicalDeclaration.contains("transform")
+        })
+        let entry = try #require(root.entryIndex)
+        #expect(helper.patchability.reasonCode == "HLXIDX007")
+
+        let changed = """
+        @inline(never)
+        func helper<T>(_ value: T, by transform: (T) -> T) -> T {
+            transform(value)
+        }
+        @inline(never)
+        public func transform(_ value: Int) -> Int {
+            helper(value, by: { $0 + 3 })
+        }
+        """
+        try Data(changed.utf8).write(to: sourceURL)
+        let result = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+
+        #expect(result.changedFunctions.map(\.key) == [root.key])
+        #expect(result.module.functions.contains {
+            $0.kind == .concreteSpecialization
+        })
+        #expect(result.module.capabilities.contains(.compilerSpecializationsV1))
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: entry,
+                image: image,
+                arguments: [
+                    .integer(
+                        try VM.Integer(
+                            signed: 4,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    ),
+                ]
+            ) == .returned(
+                .integer(
+                    try VM.Integer(
+                        signed: 7,
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
             )
         )
     }

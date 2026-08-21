@@ -59,6 +59,10 @@ public final class ArrayBuilder: @unchecked Sendable, Hashable,
         }
     }
 
+    func valuesForInspection() -> [VM.Value] {
+        lock.withLock { elements }
+    }
+
     public static func == (lhs: VM.ArrayBuilder, rhs: VM.ArrayBuilder) -> Bool {
         lhs === rhs
     }

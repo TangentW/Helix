@@ -22,7 +22,9 @@ extension CompilerCapabilities {
             for type in function.registerTypes + function.stackSlotTypes + [function.resultType] {
                 collect(type, into: &capabilities)
             }
-            if case .closure = function.resultType {
+            if function.registerTypes.contains(where: \.containsNestedClosureValue)
+                || function.stackSlotTypes.contains(where: \.containsClosureValue)
+                || function.resultType.containsClosureValue {
                 capabilities.insert(.escapingClosureValuesV1)
             }
             if function.effects.requiresMainActor {
@@ -68,7 +70,7 @@ extension CompilerCapabilities {
                 if case .progressionNext = instruction {
                     capabilities.insert(.collectionsV1)
                 }
-                if case let .makeClosure(_, _, captures) = instruction,
+                if case let .makeClosure(_, _, captures, _) = instruction,
                    captures.contains(where: { register in
                        guard function.registerTypes.indices.contains(
                            Int(register.rawValue)
@@ -104,11 +106,19 @@ extension CompilerCapabilities {
         for definition in localTypes {
             switch definition.kind {
             case let .structure(fields):
-                for field in fields { collect(field.type, into: &capabilities) }
+                for field in fields {
+                    collect(field.type, into: &capabilities)
+                    if field.type.containsClosureValue {
+                        capabilities.insert(.escapingClosureValuesV1)
+                    }
+                }
             case let .enumeration(cases):
                 for item in cases {
                     if let payload = item.payloadType {
                         collect(payload, into: &capabilities)
+                        if payload.containsClosureValue {
+                            capabilities.insert(.escapingClosureValuesV1)
+                        }
                     }
                 }
             case let .class(fields, hostedSuperclass, _):
@@ -117,7 +127,12 @@ extension CompilerCapabilities {
                     capabilities.insert(.hostedObjectiveCClassesV1)
                     capabilities.insert(.nativeTypesV1)
                 }
-                for field in fields { collect(field.type, into: &capabilities) }
+                for field in fields {
+                    collect(field.type, into: &capabilities)
+                    if field.type.containsClosureValue {
+                        capabilities.insert(.escapingClosureValuesV1)
+                    }
+                }
             }
         }
         if !imports.isEmpty { capabilities.insert(.nativeImportsV1) }

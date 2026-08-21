@@ -4018,6 +4018,275 @@ struct SemanticVerifier {
         )
     }
 
+    @Test("Nested closure storage is capability-gated and shape-checked")
+    func validatesNestedClosureStorage() throws {
+        let leaf = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64
+        )
+        var gated = try makeClosureFixture()
+        gated.module.functions[0].registerTypes.append(
+            .optional(.closure(leaf))
+        )
+        #expect(
+            throws: Verification.Error.capabilityDenied(
+                .escapingClosureValuesV1
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(gated.module),
+                shell: gated.shell,
+                policy: gated.policy
+            )
+        }
+
+        gated.module.capabilities.insert(.escapingClosureValuesV1)
+        gated.shell.capabilities.insert(.escapingClosureValuesV1)
+        gated.policy.acceptedCapabilities.insert(.escapingClosureValuesV1)
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(gated.module),
+            shell: gated.shell,
+            policy: gated.policy
+        )
+
+        var malformed = gated
+        malformed.module.functions[0].registerTypes[3] = .optional(
+            .closure(
+                .init(
+                    parameters: [.closure(leaf)],
+                    parameterConventions: [],
+                    result: .closure(leaf)
+                )
+            )
+        )
+        #expect(
+            throws: Verification.Error.invalidFunction(
+                function: .init(rawValue: 0),
+                reason: "closure signature has invalid parameter ownership"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(malformed.module),
+                shell: malformed.shell,
+                policy: malformed.policy
+            )
+        }
+
+        var asynchronous = gated
+        asynchronous.module.functions[0].registerTypes[3] = .optional(
+            .closure(
+                .init(
+                    parameters: [],
+                    parameterConventions: [],
+                    result: .void,
+                    effects: .init(isAsync: true)
+                )
+            )
+        )
+        #expect(
+            throws: Verification.Error.invalidFunction(
+                function: .init(rawValue: 0),
+                reason: "async closures require a suspension-aware closure contract"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(asynchronous.module),
+                shell: asynchronous.shell,
+                policy: asynchronous.policy
+            )
+        }
+    }
+
+    @Test("Local nominal fields may store synchronous closure values")
+    func validatesClosureValuedLocalNominals() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .void
+        )
+        var fixture = try makeFixture()
+        fixture.module.localTypes = [
+            .init(
+                key: .init(rawValue: "Fixture.Callbacks"),
+                kind: .structure(
+                    fields: [
+                        .init(name: "callback", type: .closure(signature)),
+                    ]
+                )
+            ),
+        ]
+        for capability in [
+            Core.Capability.localNominalsV1,
+            .closureValuesV1,
+            .escapingClosureValuesV1,
+        ] {
+            fixture.module.capabilities.insert(capability)
+            fixture.shell.capabilities.insert(capability)
+            fixture.policy.acceptedCapabilities.insert(capability)
+        }
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        fixture.module.capabilities.remove(.escapingClosureValuesV1)
+        fixture.shell.capabilities.remove(.escapingClosureValuesV1)
+        fixture.policy.acceptedCapabilities.remove(.escapingClosureValuesV1)
+        #expect(
+            throws: Verification.Error.capabilityDenied(
+                .escapingClosureValuesV1
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("Dynamic closure scopes are paired and cannot be reused")
+    func validatesDynamicClosureScopes() throws {
+        var valid = try makeClosureFixture()
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64
+        )
+        valid.module.functions[0].registerTypes.append(.closure(signature))
+        valid.module.functions[0].blocks[0].instructions = [
+            .makeClosure(
+                result: .init(rawValue: 1),
+                function: .init(rawValue: 1),
+                captures: [.init(rawValue: 0)]
+            ),
+            .beginClosureScope(
+                result: .init(rawValue: 3),
+                closure: .init(rawValue: 1)
+            ),
+            .closureApply(
+                result: .init(rawValue: 2),
+                closure: .init(rawValue: 3),
+                arguments: [.init(rawValue: 0)]
+            ),
+            .endClosureScope(closure: .init(rawValue: 3)),
+            .returnValue(.init(rawValue: 2)),
+        ]
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(valid.module),
+            shell: valid.shell,
+            policy: valid.policy
+        )
+
+        var splitExit = valid
+        splitExit.module.functions[0].registerTypes.append(.bool)
+        splitExit.module.functions[0].blocks = [
+            .init(
+                id: .init(rawValue: 0),
+                parameters: [.init(rawValue: 0)],
+                instructions: [
+                    .makeClosure(
+                        result: .init(rawValue: 1),
+                        function: .init(rawValue: 1),
+                        captures: [.init(rawValue: 0)]
+                    ),
+                    .beginClosureScope(
+                        result: .init(rawValue: 3),
+                        closure: .init(rawValue: 1)
+                    ),
+                    .constantBool(result: .init(rawValue: 4), value: true),
+                    .conditionalBranch(
+                        condition: .init(rawValue: 4),
+                        trueTarget: .init(rawValue: 1),
+                        trueArguments: [],
+                        falseTarget: .init(rawValue: 2),
+                        falseArguments: []
+                    ),
+                ]
+            ),
+            .init(
+                id: .init(rawValue: 1),
+                instructions: [
+                    .endClosureScope(closure: .init(rawValue: 3)),
+                    .returnValue(.init(rawValue: 0)),
+                ]
+            ),
+            .init(
+                id: .init(rawValue: 2),
+                instructions: [
+                    .endClosureScope(closure: .init(rawValue: 3)),
+                    .returnValue(.init(rawValue: 0)),
+                ]
+            ),
+        ]
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(splitExit.module),
+            shell: splitExit.shell,
+            policy: splitExit.policy
+        )
+
+        var missingEnd = valid
+        missingEnd.module.functions[0].blocks[0].instructions.remove(at: 3)
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 3,
+                reason: "a dynamic closure scope reaches a normal function exit"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(missingEnd.module),
+                shell: missingEnd.shell,
+                policy: missingEnd.policy
+            )
+        }
+
+        var unmatchedEnd = valid
+        unmatchedEnd.module.functions[0].blocks[0].instructions.remove(at: 1)
+        unmatchedEnd.module.functions[0].blocks[0].instructions[1] =
+            .closureApply(
+                result: .init(rawValue: 2),
+                closure: .init(rawValue: 1),
+                arguments: [.init(rawValue: 0)]
+            )
+        unmatchedEnd.module.functions[0].blocks[0].instructions[2] =
+            .endClosureScope(closure: .init(rawValue: 1))
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "end_closure_scope has no matching open scope"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(unmatchedEnd.module),
+                shell: unmatchedEnd.shell,
+                policy: unmatchedEnd.policy
+            )
+        }
+
+        var useAfterEnd = valid
+        useAfterEnd.module.functions[0].blocks[0].instructions.swapAt(2, 3)
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 3,
+                reason: "closed dynamic closure scope %3 is reused"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(useAfterEnd.module),
+                shell: useAfterEnd.shell,
+                policy: useAfterEnd.policy
+            )
+        }
+    }
+
     @Test("Compiler-generated specializations cannot become Shell entries")
     func rejectsSpecializationEntry() throws {
         var fixture = try makeFixture()

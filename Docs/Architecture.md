@@ -74,7 +74,14 @@ Both workflows depend on stable, build-specific identities:
   Immutable closure contexts may also copy a represented linear capture when
   its frozen TypeOps are copyable and the closure body receives that capture
   with a borrowed ABI. `make_closure` charges and performs the copy; owned or
-  inout linear captures remain verifier errors.
+  inout linear captures remain verifier errors. A lexical `make_closure` is a
+  distinct lifetime class: it owns a dynamic scope that must close on every CFG
+  exit. For a nonescaping capture of caller-owned `inout`, `borrow_mutable_cell`
+  presents the already-active modify address through the same capture ABI
+  without copying it. Provenance verification prevents that cell from entering
+  an invocation-lifetime closure, and requires the lexical closure to end before
+  the address scope; the runtime address token independently invalidates stale
+  access.
 - Array, Dictionary, and Set are typed VM values rather than projections of
   private Swift runtime layouts. One bounded recursive value-semantics model
   supplies VM-defined Equatable and Hashable behavior for supported scalars and
@@ -366,7 +373,16 @@ Both workflows depend on stable, build-specific identities:
   a live inout scope across normal/error continuations, but every continuation
   must close the same scope and overlapping arguments remain invalid.
   This rule is type-directed and also covers linear imported SDK values; it is
-  not a list of API- or framework-specific exceptions.
+  not a list of API- or framework-specific exceptions. Synchronous closures are
+  recursively valid value shapes: higher-order signatures and Optional, tuple,
+  Array, Dictionary, or patch-local nominal storage use the same signature and
+  ownership verifier. `withoutActuallyEscaping` creates a separate dynamically
+  scoped view; CFG verification covers split normal/error exits, while a
+  budgeted, cycle-safe VM graph scan plus candidate-only CFG liveness rejects
+  explicit-storage and semantically live aggregate escape without treating dead
+  SSA aliases as roots. Direct-only closure and `defer` helpers retain
+  their physical address ABI as concrete specializations; only a body actually
+  used by `partial_apply` receives the managed closure-capture ABI.
 - Frame-local and heap-promoted storage share one field-sensitive aggregate
   shape. The compiler promotes multi-block lifetimes, classifies
   initialize/assign/replace and conditional cleanup, and the Verifier computes

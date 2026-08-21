@@ -76,6 +76,17 @@ public final class MemoryCell: @unchecked Sendable, Hashable {
         withExtendedLifetime(retained) {}
     }
 
+    /// Security inspection used when ending a dynamically scoped closure.
+    /// Raw initialized fragments are sufficient: every reachable value is
+    /// present either in whole storage or in one partial leaf.
+    func initializedValuesForInspection() -> [VM.Value] {
+        lock.withLock {
+            var values = Array(partialStorage.values)
+            if let storage { values.append(storage) }
+            return values
+        }
+    }
+
     func unscopedRead(path: [UInt32]) throws -> VM.Value {
         try lock.withLock {
             guard accesses.isEmpty else {

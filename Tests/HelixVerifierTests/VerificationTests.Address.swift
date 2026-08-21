@@ -317,6 +317,186 @@ struct AddressSemantics {
         }
     }
 
+    @Test("Borrowed inout cells remain inside lexical closure and access scopes")
+    func validatesBorrowedInoutClosureLifetime() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .void
+        )
+        let closureType = Bytecode.ValueType.closure(signature)
+        let body = Bytecode.Function(
+            id: .init(rawValue: 2),
+            name: "borrowedInoutBody",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .void,
+            registerTypes: [.mutableCell(.int64), .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .loadMutableCell(
+                            result: .init(rawValue: 1),
+                            cell: .init(rawValue: 0)
+                        ),
+                        .returnValue(nil),
+                    ]
+                ),
+            ]
+        )
+        func function(
+            lifetime: Bytecode.ClosureLifetime,
+            closesClosureBeforeAccess: Bool,
+            accessKind: Bytecode.AccessKind = .modify
+        ) -> Bytecode.Function {
+            let close: [Bytecode.Instruction] = closesClosureBeforeAccess
+                ? [
+                    .endClosureScope(closure: .init(rawValue: 4)),
+                    .endAccess(.init(rawValue: 2)),
+                ]
+                : [
+                    .endAccess(.init(rawValue: 2)),
+                    .endClosureScope(closure: .init(rawValue: 4)),
+                ]
+            return .init(
+                id: .init(rawValue: 1),
+                name: "borrowedInoutCapture",
+                parameterRegisters: [],
+                resultType: .void,
+                registerTypes: [
+                    .int64,
+                    .address(.int64),
+                    .address(.int64),
+                    .mutableCell(.int64),
+                    closureType,
+                ],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        instructions: [
+                            .constantInteger(
+                                result: .init(rawValue: 0),
+                                bitPattern: 1
+                            ),
+                            .storeStack(
+                                slot: .init(rawValue: 0),
+                                source: .init(rawValue: 0),
+                                mode: .initialize
+                            ),
+                            .stackAddress(
+                                result: .init(rawValue: 1),
+                                slot: .init(rawValue: 0)
+                            ),
+                            .beginAccess(
+                                result: .init(rawValue: 2),
+                                address: .init(rawValue: 1),
+                                kind: accessKind
+                            ),
+                            .borrowMutableCell(
+                                result: .init(rawValue: 3),
+                                address: .init(rawValue: 2)
+                            ),
+                            .makeClosure(
+                                result: .init(rawValue: 4),
+                                function: body.id,
+                                captures: [.init(rawValue: 3)],
+                                lifetime: lifetime
+                            ),
+                        ] + (lifetime == .lexical ? close : [
+                            .endAccess(.init(rawValue: 2)),
+                        ]) + [
+                            .destroyStack(.init(rawValue: 0)),
+                            .returnValue(nil),
+                        ]
+                    ),
+                ],
+                stackSlotTypes: [.int64]
+            )
+        }
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1,
+            .addressValuesV1,
+            .closureValuesV1,
+            .mutableCapturesV1,
+        ]
+
+        _ = try verify(
+            additionalFunctions: [
+                function(
+                    lifetime: .lexical,
+                    closesClosureBeforeAccess: true
+                ),
+                body,
+            ],
+            capabilities: capabilities
+        )
+
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 1),
+                block: .init(rawValue: 0),
+                offset: 5,
+                reason: "a borrowed mutable cell may only enter a lexical closure"
+            )
+        ) {
+            try verify(
+                additionalFunctions: [
+                    function(
+                        lifetime: .invocation,
+                        closesClosureBeforeAccess: true
+                    ),
+                    body,
+                ],
+                capabilities: capabilities
+            )
+        }
+
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 1),
+                block: .init(rawValue: 0),
+                offset: 7,
+                reason: "address access scope is not active on this path"
+            )
+        ) {
+            try verify(
+                additionalFunctions: [
+                    function(
+                        lifetime: .lexical,
+                        closesClosureBeforeAccess: false
+                    ),
+                    body,
+                ],
+                capabilities: capabilities
+            )
+        }
+
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 1),
+                block: .init(rawValue: 0),
+                offset: 4,
+                reason: "write requires a modify access"
+            )
+        ) {
+            try verify(
+                additionalFunctions: [
+                    function(
+                        lifetime: .lexical,
+                        closesClosureBeforeAccess: true,
+                        accessKind: .read
+                    ),
+                    body,
+                ],
+                capabilities: capabilities
+            )
+        }
+    }
+
     @Test("Address types cannot nest, escape as results, or use copy_value")
     func rejectsAddressShapeAndOwnershipMisuse() throws {
         let nested = Bytecode.Function(

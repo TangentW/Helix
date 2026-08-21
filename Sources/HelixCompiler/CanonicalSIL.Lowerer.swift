@@ -593,6 +593,7 @@ public struct Lowerer: Sendable {
         ).map(String.init)
         var remainingDeallocStackUses: [String: Int] = [:]
         var explicitlyDestroyedAddresses = Set<String>()
+        var dynamicClosureScopeEndCounts: [String: Int] = [:]
         for (index, rawLine) in rawLines.enumerated()
         where !nsErrorBridges.skippedLines.contains(index) {
             let instruction = CanonicalSIL.DebugMetadata.strippingMetadata(
@@ -609,6 +610,12 @@ public struct Lowerer: Sendable {
                 pattern: #"^destroy_addr (%[0-9]+)$"#
             ) {
                 explicitlyDestroyedAddresses.insert(destruction[0])
+            }
+            if let destruction = match(
+                instruction,
+                pattern: #"^%[0-9]+ = destroy_not_escaped_closure (%[0-9]+)$"#
+            ) {
+                dynamicClosureScopeEndCounts[destruction[0], default: 0] += 1
             }
         }
         // Reject a forbidden existential payload before incidental SIL such
@@ -804,7 +811,8 @@ public struct Lowerer: Sendable {
         var aggregateComponentAddresses: [String: AggregateComponentAddress] = [:]
         var tupleValues: [String: (Bytecode.Register, Bytecode.Register)] = [:]
         var unpackedTuples: [Bytecode.Register: [Bytecode.Register]] = [:]
-        var onStackClosureValues = Set<String>()
+        var onStackClosureValues: [String: Bytecode.Register] = [:]
+        var dynamicallyScopedClosureValues: [String: Int] = [:]
         var voidValues = Set<String>()
         var optionalSourceBySomeBlock: [Bytecode.BlockID: String] = [:]
         var optionalSourceByNoneBlock: [Bytecode.BlockID: String] = [:]
@@ -3169,7 +3177,8 @@ public struct Lowerer: Sendable {
         func materializeMutableCapture(
             at token: String,
             pointee: Bytecode.ValueType,
-            line: Int
+            line: Int,
+            permitsBorrowedInout: Bool
         ) throws -> Bytecode.Register {
             if let existing = mutableCell(at: token) {
                 guard mutableCellPointee(at: token) == pointee else {
@@ -3181,11 +3190,22 @@ public struct Lowerer: Sendable {
                 return existing
             }
             let root = addressBase(token)
-            guard !inoutParameterAddressBases.contains(root) else {
-                throw CanonicalSIL.LoweringError.unsupportedInstruction(
-                    line: line,
-                    text: "capturing an inout parameter requires caller writeback"
+            if inoutParameterAddressBases.contains(root) {
+                guard permitsBorrowedInout,
+                      let address = runtimeAddress(at: token),
+                      stackType(at: token) == pointee,
+                      isScopedRuntimeAddress(token)
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: line,
+                        text: "an escaping closure cannot capture caller-owned inout storage"
+                    )
+                }
+                let cell = try allocate(type: .mutableCell(pointee))
+                appendInstruction(
+                    .borrowMutableCell(result: cell, address: address)
                 )
+                return cell
             }
             guard token == root,
                   stackAddressTypes[root] == pointee
@@ -17808,10 +17828,13 @@ public struct Lowerer: Sendable {
                 }
                 return
             }
-            if onStackClosureValues.contains(address) {
+            if let closure = onStackClosureValues[address] {
                 // SIL models an on-stack partial_apply as storage. The VM owns
-                // the corresponding closure value for its frame lifetime.
-                if isFinalLexicalUse { onStackClosureValues.remove(address) }
+                // the corresponding closure value for its lexical lifetime.
+                emitCleanup(.endClosureScope(closure: closure))
+                if isFinalLexicalUse {
+                    onStackClosureValues.removeValue(forKey: address)
+                }
                 return
             }
             if catchScratchAddresses.contains(address),
@@ -20726,8 +20749,11 @@ public struct Lowerer: Sendable {
                     )
                     let result = try allocate(type: .closure(signature))
                     values[closure[0]] = result
-                    if line.contains("[on_stack]") {
-                        onStackClosureValues.insert(closure[0])
+                    let lifetime: Bytecode.ClosureLifetime = line.contains(
+                        "[on_stack]"
+                    ) ? .lexical : .invocation
+                    if lifetime == .lexical {
+                        onStackClosureValues[closure[0]] = result
                     }
                     // The generated target directly performs the proven
                     // projection, so neither KeyPath metadata nor a capture
@@ -20736,7 +20762,8 @@ public struct Lowerer: Sendable {
                         .makeClosure(
                             result: result,
                             function: functionID,
-                            captures: []
+                            captures: [],
+                            lifetime: lifetime
                         )
                     )
                     continue
@@ -20759,7 +20786,8 @@ public struct Lowerer: Sendable {
                         return try materializeMutableCapture(
                             at: token,
                             pointee: pointee,
-                            line: sourceLine
+                            line: sourceLine,
+                            permitsBorrowedInout: line.contains("[on_stack]")
                         )
                     }
                     if let retained = takePendingRetainedValue(for: token) {
@@ -20794,14 +20822,18 @@ public struct Lowerer: Sendable {
                 )
                 let result = try allocate(type: .closure(signature))
                 values[closure[0]] = result
-                if line.contains("[on_stack]") {
-                    onStackClosureValues.insert(closure[0])
+                let lifetime: Bytecode.ClosureLifetime = line.contains(
+                    "[on_stack]"
+                ) ? .lexical : .invocation
+                if lifetime == .lexical {
+                    onStackClosureValues[closure[0]] = result
                 }
                 appendInstruction(
                     .makeClosure(
                         result: result,
                         function: functionID,
-                        captures: captures
+                        captures: captures,
+                        lifetime: lifetime
                     )
                 )
                 for owner in captureTemporaryOwners
@@ -20830,7 +20862,54 @@ public struct Lowerer: Sendable {
                 if staticKeyPathValues[dependence[2]] == nil {
                     _ = try resolve(dependence[2], line: sourceLine)
                 }
-                values[dependence[0]] = source
+                if let endCount = dynamicClosureScopeEndCounts[dependence[0]] {
+                    let result = try allocate(
+                        type: registerTypes[Int(source.rawValue)]
+                    )
+                    values[dependence[0]] = result
+                    dynamicallyScopedClosureValues[dependence[0]] = endCount
+                    appendInstruction(
+                        .beginClosureScope(result: result, closure: source)
+                    )
+                } else {
+                    values[dependence[0]] = source
+                }
+                continue
+            }
+
+            if let scopeEnd = match(
+                line,
+                pattern: #"^(%[0-9]+) = destroy_not_escaped_closure (%[0-9]+)$"#
+            ) {
+                guard let remainingEnds = dynamicallyScopedClosureValues[
+                    scopeEnd[1]
+                ]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "destroy_not_escaped_closure has no matching dynamic scope"
+                    )
+                }
+                let closure = try resolve(scopeEnd[1], line: sourceLine)
+                guard case .closure = registerTypes[Int(closure.rawValue)]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "destroy_not_escaped_closure operand is not a closure"
+                    )
+                }
+                appendInstruction(.endClosureScope(closure: closure))
+                if remainingEnds == 1 {
+                    dynamicallyScopedClosureValues.removeValue(
+                        forKey: scopeEnd[1]
+                    )
+                } else {
+                    dynamicallyScopedClosureValues[scopeEnd[1]] =
+                        remainingEnds - 1
+                }
+                let escaped = try allocate(type: .bool)
+                values[scopeEnd[0]] = escaped
+                appendInstruction(
+                    .constantBool(result: escaped, value: false)
+                )
                 continue
             }
 
@@ -24815,6 +24894,14 @@ public struct Lowerer: Sendable {
         recordIncompleteLifetime(
             "borrow",
             count: borrowedValueTokens.count
+        )
+        recordIncompleteLifetime(
+            "dynamic-closure-scope",
+            count: dynamicallyScopedClosureValues.count
+        )
+        recordIncompleteLifetime(
+            "lexical-closure",
+            count: onStackClosureValues.count
         )
         let retainedValueTokens = pendingRetainedValues.flatMap { token, values in
             Array(repeating: token, count: values.count)

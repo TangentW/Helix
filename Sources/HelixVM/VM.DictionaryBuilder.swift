@@ -178,6 +178,10 @@ public final class DictionaryBuilder: @unchecked Sendable, Hashable,
         }
     }
 
+    func valuesForInspection() -> [VM.Value] {
+        withLock { entries.flatMap { [$0.key, $0.value] } }
+    }
+
     public static func == (
         lhs: VM.DictionaryBuilder,
         rhs: VM.DictionaryBuilder

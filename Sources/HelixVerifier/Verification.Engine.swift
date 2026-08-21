@@ -358,10 +358,70 @@ public struct Engine: Verification.ImageVerifying {
                 throw Verification.Error.invalidModule(
                     "local type members cannot contain Dictionary operation states"
                 )
-            case .closure:
-                throw Verification.Error.invalidModule(
-                    "local type members cannot contain closure values"
-                )
+            case let .closure(signature):
+                guard signature.parameters.count <= 64,
+                      signature.parameterConventions.count
+                        == signature.parameters.count,
+                      zip(
+                        signature.parameters,
+                        signature.parameterConventions
+                      ).allSatisfy({ parameter, convention in
+                        switch (parameter, convention) {
+                        case (.address, .inout): true
+                        case (.address, _), (_, .inout): false
+                        default: true
+                        }
+                      }),
+                      !signature.effects.isAsync
+                else {
+                    throw Verification.Error.invalidModule(
+                        "local type member contains an invalid closure signature"
+                    )
+                }
+                for parameter in signature.parameters {
+                    switch parameter {
+                    case .void, .never, .mutableCell, .arrayState,
+                         .dictionaryState:
+                        throw Verification.Error.invalidModule(
+                            "local type closure parameter has invalid storage"
+                        )
+                    case let .address(pointee):
+                        switch pointee {
+                        case .void, .never, .address, .mutableCell,
+                             .arrayState, .dictionaryState:
+                            throw Verification.Error.invalidModule(
+                                "local type inout closure parameter has invalid storage"
+                            )
+                        default:
+                            try verifyMemberType(
+                                pointee,
+                                depth: depth + 1,
+                                permitsNative: true
+                            )
+                        }
+                    default:
+                        try verifyMemberType(
+                            parameter,
+                            depth: depth + 1,
+                            permitsNative: true
+                        )
+                    }
+                }
+                switch signature.result {
+                case .void:
+                    break
+                case .never, .address, .mutableCell, .arrayState,
+                     .dictionaryState:
+                    throw Verification.Error.invalidModule(
+                        "local type closure result has invalid storage"
+                    )
+                default:
+                    try verifyMemberType(
+                        signature.result,
+                        depth: depth + 1,
+                        permitsNative: true
+                    )
+                }
             case let .local(key):
                 guard result[key] != nil else {
                     throw Verification.Error.invalidModule(
@@ -989,6 +1049,17 @@ public struct Engine: Verification.ImageVerifying {
             }
         }
         for function in functions {
+            let storesEscapingClosure = function.registerTypes.contains(
+                where: \.containsNestedClosureValue
+            ) || function.stackSlotTypes.contains(
+                where: \.containsClosureValue
+            ) || function.resultType.containsClosureValue
+            if storesEscapingClosure,
+               !capabilities.contains(.escapingClosureValuesV1) {
+                throw Verification.Error.capabilityDenied(
+                    .escapingClosureValuesV1
+                )
+            }
             for type in function.registerTypes + function.stackSlotTypes + [function.resultType] {
                 try visit(type)
             }
@@ -996,10 +1067,26 @@ public struct Engine: Verification.ImageVerifying {
         for definition in localTypes {
             switch definition.kind {
             case let .structure(fields):
-                for field in fields { try visit(field.type) }
+                for field in fields {
+                    if field.type.containsClosureValue,
+                       !capabilities.contains(.escapingClosureValuesV1) {
+                        throw Verification.Error.capabilityDenied(
+                            .escapingClosureValuesV1
+                        )
+                    }
+                    try visit(field.type)
+                }
             case let .enumeration(cases):
                 for item in cases {
-                    if let payload = item.payloadType { try visit(payload) }
+                    if let payload = item.payloadType {
+                        if payload.containsClosureValue,
+                           !capabilities.contains(.escapingClosureValuesV1) {
+                            throw Verification.Error.capabilityDenied(
+                                .escapingClosureValuesV1
+                            )
+                        }
+                        try visit(payload)
+                    }
                 }
             case let .class(fields, hostedSuperclass, _):
                 guard capabilities.contains(.localClassesV1) else {
@@ -1011,7 +1098,15 @@ public struct Engine: Verification.ImageVerifying {
                         .hostedObjectiveCClassesV1
                     )
                 }
-                for field in fields { try visit(field.type) }
+                for field in fields {
+                    if field.type.containsClosureValue,
+                       !capabilities.contains(.escapingClosureValuesV1) {
+                        throw Verification.Error.capabilityDenied(
+                            .escapingClosureValuesV1
+                        )
+                    }
+                    try visit(field.type)
+                }
             }
         }
     }
@@ -1100,10 +1195,6 @@ public struct Engine: Verification.ImageVerifying {
         guard !function.blocks.isEmpty else {
             throw Verification.Error.invalidFunction(function: function.id, reason: "function has no blocks")
         }
-        if case .closure = function.resultType,
-           !capabilities.contains(.escapingClosureValuesV1) {
-            throw Verification.Error.capabilityDenied(.escapingClosureValuesV1)
-        }
         try verifyTypeShapes(function)
 
         var blocks: [Bytecode.BlockID: Bytecode.Block] = [:]
@@ -1179,6 +1270,7 @@ public struct Engine: Verification.ImageVerifying {
                 }
             }
         }
+        try verifyClosureScopeLifetimes(function, blocks: blocks)
 
         let predecessors = try buildPredecessors(function: function, blocks: blocks)
         guard predecessors[function.entryBlock]?.isEmpty == true else {
@@ -1240,6 +1332,11 @@ public struct Engine: Verification.ImageVerifying {
                 )
             }
         }
+        let borrowedMutableCells = try borrowedMutableCellFacts(function)
+        try verifyBorrowedMutableCellLifetimes(
+            function,
+            facts: borrowedMutableCells
+        )
         try verifyOwnership(
             function: function,
             blocks: blocks,
@@ -1257,7 +1354,11 @@ public struct Engine: Verification.ImageVerifying {
             blocks: blocks,
             localTypes: localTypes
         )
-        try verifyAddressLifecycle(function: function, functions: functions)
+        try verifyAddressLifecycle(
+            function: function,
+            functions: functions,
+            borrowedMutableCells: borrowedMutableCells
+        )
     }
 
     private func verifyTypeShapes(_ function: Bytecode.Function) throws {
@@ -1317,7 +1418,7 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 switch pointee {
                 case .void, .never, .address, .mutableCell, .arrayState,
-                     .dictionaryState, .closure:
+                     .dictionaryState:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "address pointee must be a concrete non-address value type"
@@ -1334,7 +1435,7 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 switch pointee {
                 case .void, .never, .address, .mutableCell, .arrayState,
-                     .dictionaryState, .closure:
+                     .dictionaryState:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "mutable-cell pointee must be a concrete value type"
@@ -1351,7 +1452,7 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 switch element {
                 case .void, .never, .address, .mutableCell, .arrayState,
-                     .dictionaryState, .closure:
+                     .dictionaryState:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "Array-state element must be a concrete value type"
@@ -1375,7 +1476,7 @@ public struct Engine: Verification.ImageVerifying {
                 for component in [key, value] {
                     switch component {
                     case .void, .never, .address, .mutableCell, .arrayState,
-                         .dictionaryState, .closure:
+                         .dictionaryState:
                         throw Verification.Error.invalidFunction(
                             function: function.id,
                             reason: "Dictionary-state components must be concrete value types"
@@ -1389,12 +1490,6 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 }
             case let .closure(signature):
-                guard depth == 0 else {
-                    throw Verification.Error.invalidFunction(
-                        function: function.id,
-                        reason: "closure values must be top-level registers or internal function results"
-                    )
-                }
                 guard signature.parameters.count <= 64 else {
                     throw Verification.Error.invalidFunction(
                         function: function.id,
@@ -1428,7 +1523,7 @@ public struct Engine: Verification.ImageVerifying {
                 for parameter in signature.parameters {
                     switch parameter {
                     case .void, .never, .mutableCell, .arrayState,
-                         .dictionaryState, .closure:
+                         .dictionaryState:
                         throw Verification.Error.invalidFunction(
                             function: function.id,
                             reason: "closure parameters must be concrete values or inout addresses"
@@ -1436,7 +1531,7 @@ public struct Engine: Verification.ImageVerifying {
                     case let .address(pointee):
                         switch pointee {
                         case .void, .never, .address, .mutableCell,
-                             .arrayState, .dictionaryState, .closure:
+                             .arrayState, .dictionaryState:
                             throw Verification.Error.invalidFunction(
                                 function: function.id,
                                 reason: "inout closure pointee must be a concrete value type"
@@ -1454,7 +1549,7 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 switch signature.result {
                 case .never, .address, .mutableCell, .arrayState,
-                     .dictionaryState, .closure:
+                     .dictionaryState:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
                         reason: "closure result must be Void or a concrete non-address value"
@@ -1481,12 +1576,6 @@ public struct Engine: Verification.ImageVerifying {
                 throw Verification.Error.invalidFunction(
                     function: function.id,
                     reason: "stack slots store values rather than addresses"
-                )
-            }
-            if case .closure = type {
-                throw Verification.Error.invalidFunction(
-                    function: function.id,
-                    reason: "HLBC closure values cannot be stored in stack slots"
                 )
             }
             if case .mutableCell = type {
@@ -1546,6 +1635,305 @@ public struct Engine: Verification.ImageVerifying {
             )
         }
         try verify(function.resultType, depth: 0, isRegister: false)
+    }
+
+    /// Verifies lexical closure dynamic extents over the CFG, including Swift's
+    /// `withoutActuallyEscaping`. Throwing bodies close the same scope
+    /// independently on their normal and error edges, while loops may create a
+    /// fresh scope after the prior iteration closed. Closed values are
+    /// propagated only while live so a branch-local scope does not poison an
+    /// unrelated merge.
+    private func verifyClosureScopeLifetimes(
+        _ function: Bytecode.Function,
+        blocks: [Bytecode.BlockID: Bytecode.Block]
+    ) throws {
+        let scopedRegisters: Set<Bytecode.Register> = Set(
+            function.blocks.flatMap { block -> [Bytecode.Register] in
+                block.instructions.compactMap {
+                    instruction -> Bytecode.Register? in
+                    switch instruction {
+                    case let .beginClosureScope(result, _):
+                        result
+                    case let .makeClosure(result, _, _, lifetime)
+                        where lifetime == .lexical:
+                        result
+                    default:
+                        nil
+                    }
+                }
+            }
+        )
+        let hasScopeEnd = function.blocks.contains { block in
+            block.instructions.contains { instruction in
+                if case .endClosureScope = instruction { return true }
+                return false
+            }
+        }
+        guard !scopedRegisters.isEmpty || hasScopeEnd else { return }
+
+        var usesBeforeDefinition: [Bytecode.BlockID: Set<Bytecode.Register>]
+            = [:]
+        var definitions: [Bytecode.BlockID: Set<Bytecode.Register>] = [:]
+        for block in function.blocks {
+            var blockDefinitions = Set<Bytecode.Register>()
+            var blockUses = Set<Bytecode.Register>()
+            for instruction in block.instructions {
+                for operand in instruction.operandRegisters
+                where scopedRegisters.contains(operand)
+                    && !blockDefinitions.contains(operand) {
+                    blockUses.insert(operand)
+                }
+                switch instruction {
+                case let .beginClosureScope(result, _):
+                    blockDefinitions.insert(result)
+                case let .makeClosure(result, _, _, lifetime)
+                    where lifetime == .lexical:
+                    blockDefinitions.insert(result)
+                default:
+                    break
+                }
+            }
+            usesBeforeDefinition[block.id] = blockUses
+            definitions[block.id] = blockDefinitions
+        }
+
+        var liveIn = Dictionary(
+            uniqueKeysWithValues: function.blocks.map {
+                ($0.id, Set<Bytecode.Register>())
+            }
+        )
+        var changed = true
+        while changed {
+            changed = false
+            for block in function.blocks.reversed() {
+                let liveOut = Set(
+                    (block.instructions.last?.successorBlocks ?? []).flatMap {
+                        liveIn[$0] ?? []
+                    }
+                )
+                let next = (usesBeforeDefinition[block.id] ?? [])
+                    .union(liveOut.subtracting(definitions[block.id] ?? []))
+                if liveIn[block.id] != next {
+                    liveIn[block.id] = next
+                    changed = true
+                }
+            }
+        }
+
+        struct ScopeState: Equatable {
+            var open = Set<Bytecode.Register>()
+            var closed = Set<Bytecode.Register>()
+        }
+        var incoming: [Bytecode.BlockID: ScopeState] = [
+            function.entryBlock: .init(),
+        ]
+        var pending = [function.entryBlock]
+        var queued = Set(pending)
+
+        while let blockID = pending.popLast() {
+            queued.remove(blockID)
+            guard let block = blocks[blockID],
+                  var state = incoming[blockID]
+            else { continue }
+            for (offset, instruction) in block.instructions.enumerated() {
+                func fail(_ reason: String) -> Verification.Error {
+                    .invalidInstruction(
+                        function: function.id,
+                        block: block.id,
+                        offset: offset,
+                        reason: reason
+                    )
+                }
+                if let used = instruction.operandRegisters.first(
+                    where: state.closed.contains
+                ) {
+                    throw fail(
+                        "closed dynamic closure scope \(used) is reused"
+                    )
+                }
+                switch instruction {
+                case let .beginClosureScope(result, closure):
+                    guard !state.open.contains(closure),
+                          !state.open.contains(result)
+                    else {
+                        throw fail(
+                            "a scoped closure cannot be wrapped again before it closes"
+                        )
+                    }
+                    state.closed.remove(result)
+                    state.open.insert(result)
+                case let .makeClosure(result, _, _, lifetime)
+                    where lifetime == .lexical:
+                    guard !state.open.contains(result) else {
+                        throw fail(
+                            "a lexical closure scope is reentered before it closes"
+                        )
+                    }
+                    state.closed.remove(result)
+                    state.open.insert(result)
+                case let .endClosureScope(closure):
+                    guard state.open.remove(closure) != nil else {
+                        throw fail(
+                            "end_closure_scope has no matching open scope"
+                        )
+                    }
+                    state.closed.insert(closure)
+                case .returnValue, .throwError:
+                    guard state.open.isEmpty else {
+                        throw fail(
+                            "a dynamic closure scope reaches a normal function exit"
+                        )
+                    }
+                case .sourceFailure, .trap:
+                    // A fatal VM exit discards the entire frame; there is no
+                    // continuation from which a scoped closure can be used.
+                    state.open.removeAll()
+                    state.closed.removeAll()
+                default:
+                    break
+                }
+            }
+
+            for successor in block.instructions.last?.successorBlocks ?? [] {
+                var edge = state
+                edge.closed.formIntersection(liveIn[successor] ?? [])
+                if var existing = incoming[successor] {
+                    let old = existing
+                    existing.open.formUnion(edge.open)
+                    existing.closed.formUnion(edge.closed)
+                    guard existing != old else { continue }
+                    incoming[successor] = existing
+                } else {
+                    incoming[successor] = edge
+                }
+                if queued.insert(successor).inserted {
+                    pending.append(successor)
+                }
+            }
+        }
+    }
+
+    private struct BorrowedMutableCellFacts {
+        var sourceAddressByCell: [
+            Bytecode.Register: Bytecode.Register
+        ] = [:]
+        var sourceAddressesByClosure: [
+            Bytecode.Register: Set<Bytecode.Register>
+        ] = [:]
+
+        var isEmpty: Bool { sourceAddressByCell.isEmpty }
+    }
+
+    /// Resolves every borrowed-cell projection back to the active address that
+    /// owns its lifetime. Lexical closures retain those roots as verifier-only
+    /// facts; no address capability enters their runtime value representation.
+    private func borrowedMutableCellFacts(
+        _ function: Bytecode.Function
+    ) throws -> BorrowedMutableCellFacts {
+        var definitions: [Bytecode.Register: Bytecode.Instruction] = [:]
+        for block in function.blocks {
+            for instruction in block.instructions {
+                for result in instruction.resultRegisters {
+                    definitions[result] = instruction
+                }
+            }
+        }
+        var facts = BorrowedMutableCellFacts()
+        var resolving = Set<Bytecode.Register>()
+
+        func sourceAddress(
+            of register: Bytecode.Register
+        ) throws -> Bytecode.Register? {
+            if let cached = facts.sourceAddressByCell[register] {
+                return cached
+            }
+            guard resolving.insert(register).inserted else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "borrowed mutable-cell provenance contains a cycle"
+                )
+            }
+            defer { resolving.remove(register) }
+            let result: Bytecode.Register? = switch definitions[register] {
+            case let .borrowMutableCell(_, address):
+                address
+            case let .copyValue(_, source), let .moveValue(_, source):
+                try sourceAddress(of: source)
+            case let .projectMutableCell(_, cell, _):
+                try sourceAddress(of: cell)
+            default:
+                nil
+            }
+            if let result {
+                facts.sourceAddressByCell[register] = result
+            }
+            return result
+        }
+
+        for index in function.registerTypes.indices {
+            guard let raw = UInt32(exactly: index) else { continue }
+            _ = try sourceAddress(of: .init(rawValue: raw))
+        }
+        guard !facts.isEmpty else { return facts }
+
+        for block in function.blocks {
+            for instruction in block.instructions {
+                guard case let .makeClosure(
+                    result,
+                    _,
+                    captures,
+                    lifetime
+                ) = instruction,
+                    lifetime == .lexical
+                else { continue }
+                let sources = try Set(captures.compactMap { capture in
+                    try sourceAddress(of: capture)
+                })
+                if !sources.isEmpty {
+                    facts.sourceAddressesByClosure[result] = sources
+                }
+            }
+        }
+        return facts
+    }
+
+    /// A cell borrowed from caller-owned inout storage is only a representation
+    /// adapter for a lexical closure capture. It may be copied or projected
+    /// locally, but cannot enter an invocation-lifetime closure or any other
+    /// storage/call boundary.
+    private func verifyBorrowedMutableCellLifetimes(
+        _ function: Bytecode.Function,
+        facts: BorrowedMutableCellFacts
+    ) throws {
+        guard !facts.isEmpty else { return }
+
+        for block in function.blocks {
+            for (offset, instruction) in block.instructions.enumerated() {
+                let borrowedOperands = instruction.operandRegisters.filter(
+                    { facts.sourceAddressByCell[$0] != nil }
+                )
+                guard !borrowedOperands.isEmpty else { continue }
+                let permitted: Bool = switch instruction {
+                case .copyValue, .moveValue, .destroyValue,
+                     .projectMutableCell, .loadMutableCell,
+                     .storeMutableCell:
+                    true
+                case let .makeClosure(_, _, captures, lifetime):
+                    lifetime == .lexical
+                        && borrowedOperands.allSatisfy(captures.contains)
+                default:
+                    false
+                }
+                guard permitted else {
+                    throw Verification.Error.invalidInstruction(
+                        function: function.id,
+                        block: block.id,
+                        offset: offset,
+                        reason: "a borrowed mutable cell may only enter a lexical closure"
+                    )
+                }
+            }
+        }
     }
 
     private func buildPredecessors(
@@ -1915,6 +2303,17 @@ public struct Engine: Verification.ImageVerifying {
             else {
                 throw fail(
                     "make_mutable_cell requires a copyable matching pointee"
+                )
+            }
+        case let .borrowMutableCell(result, address):
+            guard capabilities.contains(.mutableCapturesV1),
+                  capabilities.contains(.addressValuesV1),
+                  case let .address(pointee) = type(address),
+                  type(result) == .mutableCell(pointee),
+                  isCopyable(pointee, shell: shell)
+            else {
+                throw fail(
+                    "borrow_mutable_cell requires a matching active address"
                 )
             }
         case let .projectMutableCell(result, cell, fieldIndex):
@@ -3187,7 +3586,7 @@ public struct Engine: Verification.ImageVerifying {
                 fail: fail
             )
             try verifyCall(arguments: arguments, result: result, parameterTypes: descriptor.parameterTypes, resultType: descriptor.resultType, function: function, block: block, offset: offset)
-        case let .makeClosure(result, calleeID, captures):
+        case let .makeClosure(result, calleeID, captures, _):
             guard capabilities.contains(.closureValuesV1) else {
                 throw fail("make_closure requires \(Core.Capability.closureValuesV1)")
             }
@@ -3247,6 +3646,27 @@ public struct Engine: Verification.ImageVerifying {
                         "linear closure captures require a borrowed capture ABI"
                     )
                 }
+            }
+        case let .beginClosureScope(result, closure):
+            guard capabilities.contains(.closureValuesV1) else {
+                throw fail(
+                    "begin_closure_scope requires \(Core.Capability.closureValuesV1)"
+                )
+            }
+            guard case .closure = type(closure), type(result) == type(closure)
+            else {
+                throw fail(
+                    "begin_closure_scope requires matching closure operands"
+                )
+            }
+        case let .endClosureScope(closure):
+            guard capabilities.contains(.closureValuesV1) else {
+                throw fail(
+                    "end_closure_scope requires \(Core.Capability.closureValuesV1)"
+                )
+            }
+            guard case .closure = type(closure) else {
+                throw fail("end_closure_scope operand must be a closure")
             }
         case let .closureApply(result, closure, arguments):
             guard capabilities.contains(.closureValuesV1) else {
@@ -3732,7 +4152,7 @@ public struct Engine: Verification.ImageVerifying {
                      .eraseToAny, .checkedCastAny, .forceCastAny, .stackAddress,
                      .projectAggregateAddress, .projectMutableCell, .allocateObject,
                      .projectObjectAddress, .hostedSuperApply, .beginAccess,
-                     .endAccess:
+                     .endAccess, .beginClosureScope, .endClosureScope:
                     // Allocation and address projection do not transfer a
                     // native handle. A local class field load/store is tracked
                     // by the corresponding address instruction instead.
@@ -3872,6 +4292,8 @@ public struct Engine: Verification.ImageVerifying {
                             "make_mutable_cell consumes a non-live value"
                         )
                     }
+                case .borrowMutableCell:
+                    break
                 case let .loadMutableCell(result, _):
                     if function.type(of: result)?.requiresLinearOwnership == true {
                         live.insert(result)
@@ -4336,7 +4758,8 @@ public struct Engine: Verification.ImageVerifying {
     /// ordinary returns and throws must close them explicitly.
     private func verifyAddressLifecycle(
         function: Bytecode.Function,
-        functions: [Bytecode.FunctionID: Bytecode.Function]
+        functions: [Bytecode.FunctionID: Bytecode.Function],
+        borrowedMutableCells: BorrowedMutableCellFacts
     ) throws {
         guard function.registerTypes.contains(where: {
             if case .address = $0 { return true }
@@ -4424,6 +4847,21 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 }
 
+                var borrowedSources = Set<Bytecode.Register>()
+                for operand in instruction.operandRegisters {
+                    if let address = borrowedMutableCells
+                        .sourceAddressByCell[operand] {
+                        borrowedSources.insert(address)
+                    }
+                    borrowedSources.formUnion(
+                        borrowedMutableCells.sourceAddressesByClosure[operand]
+                            ?? []
+                    )
+                }
+                for address in borrowedSources {
+                    _ = try requireScoped(address, modify: true)
+                }
+
                 switch instruction {
                 case let .beginAccess(result, address, kind):
                     let base = try checked(address)
@@ -4460,6 +4898,8 @@ public struct Engine: Verification.ImageVerifying {
                             "load_address.take requires frame-owned stack storage"
                         )
                     }
+                case let .borrowMutableCell(_, address):
+                    _ = try requireScoped(address, modify: true)
                 case let .storeAddress(address, _, mode):
                     let destination = try requireScoped(address, modify: true)
                     if mode == .initialize {
@@ -4744,6 +5184,9 @@ public struct Engine: Verification.ImageVerifying {
                 switch instruction {
                 case let .makeMutableCell(defined, _) where defined == register:
                     result = .init(root: register, path: [])
+                case let .borrowMutableCell(defined, _)
+                    where defined == register:
+                    result = .init(root: register, path: [])
                 case let .copyValue(defined, source) where defined == register:
                     result = try provenance(of: source)
                 case let .moveValue(defined, source) where defined == register:
@@ -4872,6 +5315,12 @@ public struct Engine: Verification.ImageVerifying {
                        cellRegisters.contains(initialValue) {
                         try requireInitialized(initialValue)
                     }
+                case let .borrowMutableCell(result, _):
+                    let target = try targetLeaves(for: result)
+                    initialized[target.root] = .init(
+                        definitelyInitialized: target.leaves,
+                        possiblyInitialized: target.leaves
+                    )
                 case let .copyValue(result, _)
                     where cellRegisters.contains(result):
                     break

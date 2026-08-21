@@ -453,7 +453,17 @@ visibility alone does not create a VM capability: every native operation must
 also resolve through an eligible Entry or exact NativeImport. Supported local
 closures and already indexed same-image helpers may use synchronous `@escaping`
 parameters, internal closure returns, nested closure captures, and synchronous
-throwing paths. Copyable linear captures such as frozen imported references are
+throwing paths. Closure values may also flow through Optional, tuple, Array,
+Dictionary, patch-local struct/enum/class fields, mutable callback variables,
+and higher-order function signatures. This covers capture lists, recursive
+callbacks, local/bound method references, multiple trailing closures,
+autoclosures, and strong `self` captures through one value model. On-stack
+closures and `withoutActuallyEscaping` carry a verified dynamic lifetime; a
+nonescaping closure may borrow caller-owned `inout` storage, but must close
+before that modify access and cannot promote the borrow into an escaping
+context. Direct-only closure and `defer` helpers keep their physical address ABI
+instead of being mistaken for managed closure construction. Copyable linear
+captures such as frozen imported references are
 accepted when their closure-body capture convention is borrowed; fully concrete
 reabstraction thunks are linked into the image rather than treated as
 NativeImports. Mutable captures use the same VM-managed cell for scalar,

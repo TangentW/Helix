@@ -91,6 +91,10 @@ public final class ArrayMutationState: @unchecked Sendable, Hashable,
         }
     }
 
+    func valuesForInspection() -> [VM.Value] {
+        lock.withLock { elements }
+    }
+
     private func validatedIndex(_ index: Int64) throws -> Int {
         guard index >= 0,
               let exact = Int(exactly: index),

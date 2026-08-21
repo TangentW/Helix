@@ -153,6 +153,10 @@ public final class ArraySortState: @unchecked Sendable, Hashable,
         }
     }
 
+    func valuesForInspection() -> [VM.Value] {
+        lock.withLock { elements }
+    }
+
     public static func == (lhs: VM.ArraySortState, rhs: VM.ArraySortState) -> Bool {
         lhs === rhs
     }

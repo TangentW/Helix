@@ -1339,9 +1339,10 @@ public struct TypeEnvironment: Sendable {
             case let .tuple(elements):
                 try (elements.map(typeDepth).max() ?? 0) + 1
             case .closure:
-                throw CanonicalSIL.LoweringError.unsupportedType(
-                    "closure stored in a local nominal type"
-                )
+                // A closure context is reference-like storage. Local values
+                // mentioned by its callable signature do not recursively
+                // expand the containing nominal's inline layout.
+                0
             case .error:
                 // The verifier and VM treat Error as a dynamic graph leaf and
                 // cap its concrete value tree when the existential is built.
@@ -1834,11 +1835,9 @@ public struct TypeEnvironment: Sendable {
               case let .structure(fields) = try definition(for: key).kind
         else { return nil }
         let prefix = String(function.loweredType[..<arrow.lowerBound])
-        guard let open = prefix.lastIndex(of: "("),
-              let close = prefix.lastIndex(of: ")"),
-              open < close
+        guard let parametersRange = outerParameterTuple(in: prefix)
         else { return nil }
-        let parameters = splitTopLevel(String(prefix[prefix.index(after: open)..<close]))
+        let parameters = splitTopLevel(String(prefix[parametersRange]))
 
         var physicalParameterTypes: [Bytecode.ValueType] = []
         func makePlan(_ type: Bytecode.ValueType) -> StructFieldPlan {
@@ -1873,6 +1872,32 @@ public struct TypeEnvironment: Sendable {
             physicalParameterTypes,
             rawResult
         )
+    }
+
+    /// Finds the final balanced parameter tuple in a function-type prefix.
+    /// Looking for the last `(` is incorrect once a parameter is itself a
+    /// tuple or closure, because that delimiter belongs to the nested type.
+    private func outerParameterTuple(
+        in prefix: String
+    ) -> Range<String.Index>? {
+        guard let close = prefix.lastIndex(of: ")") else { return nil }
+        var depth = 0
+        var index = close
+        while true {
+            switch prefix[index] {
+            case ")":
+                depth += 1
+            case "(":
+                depth -= 1
+                if depth == 0 {
+                    return prefix.index(after: index)..<close
+                }
+            default:
+                break
+            }
+            guard index > prefix.startIndex else { return nil }
+            index = prefix.index(before: index)
+        }
     }
 
     private func resultKey(

@@ -23,7 +23,7 @@ struct StaticKeyPath {
         let root = try #require(fixture.image.function(entry: fixture.entry))
         let closures = root.blocks.flatMap(\.instructions).compactMap {
             instruction -> [Bytecode.Register]? in
-            guard case let .makeClosure(_, _, captures) = instruction else {
+            guard case let .makeClosure(_, _, captures, _) = instruction else {
                 return nil
             }
             return captures
@@ -62,7 +62,7 @@ struct StaticKeyPath {
         }
         #expect(extracts.count == 2)
         #expect(projection.blocks.flatMap(\.instructions).allSatisfy {
-            if case let .makeClosure(_, _, captures) = $0 {
+            if case let .makeClosure(_, _, captures, _) = $0 {
                 return captures.isEmpty
             }
             return true
@@ -195,7 +195,7 @@ struct StaticKeyPath {
         #expect(projections.count == 2)
         #expect(projections.allSatisfy { function in
             function.blocks.flatMap(\.instructions).allSatisfy {
-                if case let .makeClosure(_, _, captures) = $0 {
+                if case let .makeClosure(_, _, captures, _) = $0 {
                     return captures.isEmpty
                 }
                 return true

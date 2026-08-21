@@ -7,6 +7,40 @@ import Testing
 extension VMTests {
 @Suite("HLVM address and call-convention execution")
 struct AddressExecution {
+    @Test("Borrowed mutable cells alias only an active modify address")
+    func executesBorrowedMutableCellLifetime() throws {
+        let first = VM.Value.integer(try int(1))
+        let second = VM.Value.integer(try int(2))
+        let replacement = VM.Value.integer(try int(3))
+        let tupleType = Bytecode.ValueType.tuple([.int64, .int64])
+        let cell = VM.MemoryCell(
+            .tuple([first, second]),
+            storageShape: .tuple([.leaf, .leaf])
+        )
+        let base = VM.Address(cell: cell, pointee: tupleType)
+
+        let read = try base.begin(.read)
+        #expect(throws: VM.RuntimeTrap.addressWriteRequiresModifyAccess) {
+            try VM.MutableCell(borrowing: read)
+        }
+        try read.end()
+
+        let modify = try base.begin(.modify)
+        let borrowed = try VM.MutableCell(borrowing: modify)
+            .projected(field: 1, pointee: .int64)
+        #expect(try borrowed.read() == second)
+        try borrowed.store(replacement, mode: .assign)
+        #expect(try modify.read() == .tuple([first, replacement]))
+
+        try modify.end()
+        #expect(throws: VM.RuntimeTrap.inactiveAddressAccess) {
+            try borrowed.read()
+        }
+        #expect(throws: VM.RuntimeTrap.inactiveAddressAccess) {
+            try borrowed.store(second, mode: .assign)
+        }
+    }
+
     @Test("Empty aggregate storage still requires explicit initialization")
     func requiresEmptyAggregateInitialization() throws {
         let cell = VM.MemoryCell(storageShape: .leaf)

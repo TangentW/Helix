@@ -979,7 +979,7 @@ extension ReleaseCompiler {
                     let target: Bytecode.FunctionID? = switch instruction {
                     case let .apply(_, function, _),
                          let .tryApply(function, _, _, _),
-                         let .makeClosure(_, function, _):
+                         let .makeClosure(_, function, _, _):
                         function
                     default:
                         nil

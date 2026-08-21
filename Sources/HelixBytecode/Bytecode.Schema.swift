@@ -43,6 +43,14 @@ public enum AccessKind: String, Codable, Hashable, Sendable {
     case modify
 }
 
+/// Storage lifetime of a constructed closure context. Invocation closures may
+/// move between same-image frames; lexical closures must close on every normal
+/// and throwing path before their creating frame continues.
+public enum ClosureLifetime: String, Codable, Hashable, Sendable {
+    case invocation
+    case lexical
+}
+
 public struct ClosureSignature: Codable, Hashable, Sendable, CustomStringConvertible {
     public var parameters: [Bytecode.ValueType]
     /// Invocation ownership is part of a closure's callable ABI. In
@@ -472,6 +480,12 @@ public enum Instruction: Codable, Hashable, Sendable {
     case makeMutableCell(
         result: Bytecode.Register,
         initialValue: Bytecode.Register?
+    )
+    /// Presents an already active caller-owned address through the same
+    /// closure-cell ABI as a mutable local, without copying its storage.
+    case borrowMutableCell(
+        result: Bytecode.Register,
+        address: Bytecode.Register
     )
     case projectMutableCell(
         result: Bytecode.Register,
@@ -993,8 +1007,19 @@ public enum Instruction: Codable, Hashable, Sendable {
     case makeClosure(
         result: Bytecode.Register,
         function: Bytecode.FunctionID,
-        captures: [Bytecode.Register]
+        captures: [Bytecode.Register],
+        lifetime: Bytecode.ClosureLifetime = .invocation
     )
+    /// Creates a dynamically scoped escaping view of a nonescaping closure.
+    /// The verifier requires every normal and throwing CFG path to close it;
+    /// runtime traps if another live value still reaches the scoped view.
+    case beginClosureScope(
+        result: Bytecode.Register,
+        closure: Bytecode.Register
+    )
+    /// Verifies escape, invalidates the dynamic token, and consumes this exact
+    /// scoped root. Aggregate or register aliases are checked independently.
+    case endClosureScope(closure: Bytecode.Register)
     case closureApply(
         result: Bytecode.Register?,
         closure: Bytecode.Register,
@@ -1056,6 +1081,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .stackAddress(result, _),
              let .projectAggregateAddress(result, _, _),
              let .makeMutableCell(result, _),
+             let .borrowMutableCell(result, _),
              let .projectMutableCell(result, _, _),
              let .loadMutableCell(result, _),
              let .makeArrayBuilder(result),
@@ -1134,7 +1160,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .setAlgebra(result, _, _, _),
              let .setRelation(result, _, _, _),
              let .compare(result, _, _, _),
-             let .makeClosure(result, _, _):
+             let .makeClosure(result, _, _, _),
+             let .beginClosureScope(result, _):
             [result]
         case let .unpackTuple(results, _):
             results
@@ -1179,7 +1206,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              .hostedSuperApply, .endAccess,
              .storeAddress, .destroyAddress,
              .destroyAddressIfInitialized, .switchOptional, .branch,
-             .conditionalBranch, .closureTryApply, .tryApply,
+             .conditionalBranch, .endClosureScope, .closureTryApply, .tryApply,
              .entryTryApply, .nativeTryApply,
              .returnValue, .throwError, .sourceFailure, .trap:
             []
@@ -1227,6 +1254,8 @@ public enum Instruction: Codable, Hashable, Sendable {
             [base]
         case let .makeMutableCell(_, initialValue):
             initialValue.map { [$0] } ?? []
+        case let .borrowMutableCell(_, address):
+            [address]
         case let .projectMutableCell(_, cell, _),
              let .loadMutableCell(_, cell):
             [cell]
@@ -1421,8 +1450,11 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .entryApply(_, _, arguments),
              let .nativeApply(_, _, arguments):
             arguments
-        case let .makeClosure(_, _, captures):
+        case let .makeClosure(_, _, captures, _):
             captures
+        case let .beginClosureScope(_, closure),
+             let .endClosureScope(closure):
+            [closure]
         case let .closureApply(_, closure, arguments):
             [closure] + arguments
         case let .closureTryApply(closure, arguments, _, _):

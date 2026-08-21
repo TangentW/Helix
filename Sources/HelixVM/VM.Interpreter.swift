@@ -1009,6 +1009,25 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
+                case let .borrowMutableCell(result, addressRegister):
+                    guard case let .address(address) = try read(
+                        addressRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: addressRegister)
+                                ?? .never,
+                            actual: try read(
+                                addressRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    try initialize(
+                        .mutableCell(try .init(borrowing: address)),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .projectMutableCell(result, cellRegister, fieldIndex):
                     guard case let .mutableCell(cell) = try read(
                         cellRegister,
@@ -4019,7 +4038,7 @@ public struct Interpreter: Sendable {
                         }
                         throw VM.BusinessError(message: message, requiresBoundaryCharge: true)
                     }
-                case let .makeClosure(result, callee, captures):
+                case let .makeClosure(result, callee, captures, lifetime):
                     guard case let .closure(signature) = function.type(of: result) else {
                         throw VM.RuntimeTrap.typeMismatch(
                             expected: .closure(
@@ -4044,10 +4063,77 @@ public struct Interpreter: Sendable {
                             .init(
                                 functionID: callee,
                                 signature: signature,
-                                captures: capturedValues
+                                captures: capturedValues,
+                                dynamicScope: lifetime == .lexical
+                                    ? .init() : nil
                             )
                         ),
                         register: result,
+                        registers: &registers
+                    )
+                case let .beginClosureScope(result, closureRegister):
+                    guard case let .closure(closure) = try read(
+                        closureRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: closureRegister)
+                                ?? .never,
+                            actual: try read(
+                                closureRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    guard closure.dynamicScope == nil else {
+                        throw VM.RuntimeTrap.explicit(
+                            "a scoped closure cannot be wrapped again"
+                        )
+                    }
+                    try initialize(
+                        .closure(
+                            .init(
+                                functionID: closure.functionID,
+                                signature: closure.signature,
+                                captures: closure.captures,
+                                dynamicScope: .init()
+                            )
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .endClosureScope(closureRegister):
+                    guard case let .closure(closure) = try read(
+                        closureRegister,
+                        registers: registers
+                    ), let scope = closure.dynamicScope else {
+                        throw VM.RuntimeTrap.explicit(
+                            "end_closure_scope requires a scoped closure"
+                        )
+                    }
+                    let escaped = try closureScopeIsReachable(
+                        scope,
+                        excluding: closureRegister,
+                        registers: registers,
+                        stackSlots: stackSlots,
+                        function: function,
+                        blockID: block.id,
+                        instructionIndex: instructionIndex,
+                        budget: budget
+                    )
+                    try scope.end()
+                    guard !escaped else {
+                        throw VM.RuntimeTrap.explicit(
+                            "dynamically scoped closure escaped its lifetime"
+                        )
+                    }
+                    // Scope end is a consuming operation. Clearing this exact
+                    // SSA root also releases any inner lexical closure it
+                    // captured before the inner scope performs its own escape
+                    // scan; aliases and aggregate copies were already checked
+                    // above and still trap.
+                    _ = try take(
+                        closureRegister,
                         registers: &registers
                     )
                 case let .closureApply(result, closureRegister, arguments):
@@ -4060,6 +4146,7 @@ public struct Interpreter: Sendable {
                             actual: try read(closureRegister, registers: registers).type
                         )
                     }
+                    try closure.dynamicScope?.requireActive()
                     guard let calleeFunction = functions[closure.functionID],
                           calleeFunction.parameterConventions.count >= arguments.count
                     else {
@@ -4118,6 +4205,7 @@ public struct Interpreter: Sendable {
                             ).type
                         )
                     }
+                    try closure.dynamicScope?.requireActive()
                     guard let calleeFunction = functions[closure.functionID],
                           calleeFunction.parameterConventions.count
                             >= arguments.count
@@ -4861,7 +4949,8 @@ public struct Interpreter: Sendable {
                 .init(
                     functionID: closure.functionID,
                     signature: closure.signature,
-                    captures: try closure.captures.map(copy)
+                    captures: try closure.captures.map(copy),
+                    dynamicScope: closure.dynamicScope
                 )
             )
         case .mutableCell:
@@ -4876,6 +4965,355 @@ public struct Interpreter: Sendable {
         case .bool, .integer, .float, .string:
             value
         }
+    }
+
+    private func closureScopeIsReachable(
+        _ scope: VM.ClosureScope,
+        excluding closureRegister: Bytecode.Register,
+        registers: [VM.Value?],
+        stackSlots: [VM.MemoryCell],
+        function: Bytecode.Function,
+        blockID: Bytecode.BlockID,
+        instructionIndex: Int,
+        budget: VM.InvocationBudget
+    ) throws -> Bool {
+        func inspectCell(
+            _ cell: VM.MemoryCell,
+            depth: Int,
+            visitedReferences: inout Set<ObjectIdentifier>
+        ) throws -> Bool {
+            guard visitedReferences.insert(ObjectIdentifier(cell)).inserted
+            else { return false }
+            for value in cell.initializedValuesForInspection() {
+                if try inspect(
+                    value,
+                    depth: depth + 1,
+                    visitedReferences: &visitedReferences
+                ) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        func inspect(
+            _ value: VM.Value,
+            depth: Int,
+            visitedReferences: inout Set<ObjectIdentifier>
+        ) throws -> Bool {
+            guard depth <= VM.ValueLimits.maximumNestingDepth else {
+                throw VM.RuntimeTrap.valueNestingDepthExceeded(
+                    maximum: VM.ValueLimits.maximumNestingDepth
+                )
+            }
+            try budget.consumeWork(units: 1)
+            switch value {
+            case let .closure(closure):
+                if let dynamicScope = closure.dynamicScope,
+                   dynamicScope === scope {
+                    return true
+                }
+                for capture in closure.captures {
+                    if try inspect(
+                        capture,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case let .any(erased):
+                return try inspect(
+                    erased.payload,
+                    depth: depth + 1,
+                    visitedReferences: &visitedReferences
+                )
+            case let .tuple(elements):
+                for element in elements {
+                    if try inspect(
+                        element,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case let .array(storage):
+                for element in storage.elements {
+                    if try inspect(
+                        element,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case let .dictionary(entries, _, _):
+                for entry in entries {
+                    if try inspect(
+                        entry.key,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) || inspect(
+                        entry.value,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case let .set(set):
+                for element in set.elements {
+                    if try inspect(
+                        element,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case let .optional(.some(wrapped)):
+                return try inspect(
+                    wrapped,
+                    depth: depth + 1,
+                    visitedReferences: &visitedReferences
+                )
+            case let .structure(_, fields):
+                for field in fields {
+                    if try inspect(
+                        field,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case let .enumeration(_, _, payload):
+                if let payload {
+                    return try inspect(
+                        payload,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    )
+                }
+            case let .object(object):
+                let identity = ObjectIdentifier(object.storage)
+                guard visitedReferences.insert(identity).inserted else {
+                    return false
+                }
+                for field in object.storage.initializedValuesForInspection() {
+                    if try inspect(
+                        field,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case let .error(error):
+                if let payload = error.payload {
+                    return try inspect(
+                        payload,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    )
+                }
+            case let .address(address):
+                return try inspectCell(
+                    address.cell,
+                    depth: depth,
+                    visitedReferences: &visitedReferences
+                )
+            case let .mutableCell(cell):
+                return try inspectCell(
+                    cell.storageForInspection,
+                    depth: depth,
+                    visitedReferences: &visitedReferences
+                )
+            case let .arrayBuilder(builder):
+                for element in builder.valuesForInspection() {
+                    if try inspect(
+                        element,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case let .arrayMutationState(state):
+                for element in state.valuesForInspection() {
+                    if try inspect(
+                        element,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case let .dictionaryBuilder(builder):
+                for value in builder.valuesForInspection() {
+                    if try inspect(
+                        value,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case let .arraySortState(state):
+                for element in state.valuesForInspection() {
+                    if try inspect(
+                        element,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case let .arraySplitState(state):
+                for element in state.valuesForInspection() {
+                    if try inspect(
+                        element,
+                        depth: depth + 1,
+                        visitedReferences: &visitedReferences
+                    ) {
+                        return true
+                    }
+                }
+            case .optional(nil), .native, .bool, .integer, .float, .string:
+                break
+            }
+            return false
+        }
+
+        func containsScope(_ value: VM.Value) throws -> Bool {
+            var visitedReferences = Set<ObjectIdentifier>()
+            return try inspect(
+                value,
+                depth: 0,
+                visitedReferences: &visitedReferences
+            )
+        }
+
+        var candidateRegisters = Set<Bytecode.Register>()
+        for (index, value) in registers.enumerated()
+        where UInt32(index) != closureRegister.rawValue {
+            guard let raw = UInt32(exactly: index), let value else { continue }
+            if try containsScope(value) {
+                candidateRegisters.insert(.init(rawValue: raw))
+            }
+        }
+        for slot in stackSlots {
+            var visitedReferences = Set<ObjectIdentifier>()
+            if try inspectCell(
+                slot,
+                depth: 0,
+                visitedReferences: &visitedReferences
+            ) {
+                return true
+            }
+        }
+        return try registersAreUsedAfter(
+            candidateRegisters,
+            function: function,
+            blockID: blockID,
+            instructionIndex: instructionIndex,
+            budget: budget
+        )
+    }
+
+    /// SSA values remain physically present in the register array after their
+    /// final semantic use. A dynamically scoped closure escapes only when a
+    /// root that still reaches it is used after the scope-end instruction.
+    /// This forward, candidate-only analysis also handles loop redefinitions
+    /// without materializing a dense liveness table for untrusted bytecode.
+    private func registersAreUsedAfter(
+        _ candidates: Set<Bytecode.Register>,
+        function: Bytecode.Function,
+        blockID: Bytecode.BlockID,
+        instructionIndex: Int,
+        budget: VM.InvocationBudget
+    ) throws -> Bool {
+        guard !candidates.isEmpty else { return false }
+        let blocks = Dictionary(
+            uniqueKeysWithValues: function.blocks.map { ($0.id, $0) }
+        )
+
+        func traverse(
+            _ block: Bytecode.Block,
+            from start: Int,
+            surviving: Set<Bytecode.Register>
+        ) throws -> (used: Bool, surviving: Set<Bytecode.Register>) {
+            var surviving = surviving
+            for instruction in block.instructions.dropFirst(start) {
+                try budget.consumeWork(units: 1)
+                if instruction.operandRegisters.contains(
+                    where: surviving.contains
+                ) {
+                    return (true, surviving)
+                }
+                surviving.subtract(instruction.resultRegisters)
+                if surviving.isEmpty { break }
+            }
+            return (false, surviving)
+        }
+
+        guard let current = blocks[blockID] else {
+            throw VM.RuntimeTrap.invalidProgramCounter
+        }
+        let suffix = try traverse(
+            current,
+            from: instructionIndex + 1,
+            surviving: candidates
+        )
+        if suffix.used { return true }
+        guard !suffix.surviving.isEmpty else { return false }
+
+        var incoming: [Bytecode.BlockID: Set<Bytecode.Register>] = [:]
+        var pending: [Bytecode.BlockID] = []
+        var queued = Set<Bytecode.BlockID>()
+
+        func forward(
+            _ surviving: Set<Bytecode.Register>,
+            to targetID: Bytecode.BlockID
+        ) throws {
+            guard let target = blocks[targetID] else {
+                throw VM.RuntimeTrap.invalidProgramCounter
+            }
+            let edge = surviving.subtracting(target.parameters)
+            guard !edge.isEmpty else { return }
+            let prior = incoming[targetID] ?? []
+            let additions = edge.subtracting(prior)
+            guard !additions.isEmpty else { return }
+            incoming[targetID] = prior.union(additions)
+            if queued.insert(targetID).inserted {
+                pending.append(targetID)
+            }
+        }
+
+        for successor in current.instructions.last?.successorBlocks ?? [] {
+            try forward(suffix.surviving, to: successor)
+        }
+
+        while let nextID = pending.popLast() {
+            queued.remove(nextID)
+            guard let block = blocks[nextID],
+                  let state = incoming[nextID]
+            else {
+                throw VM.RuntimeTrap.invalidProgramCounter
+            }
+            let traversed = try traverse(
+                block,
+                from: 0,
+                surviving: state
+            )
+            if traversed.used { return true }
+            guard !traversed.surviving.isEmpty else { continue }
+            for successor in block.instructions.last?.successorBlocks ?? [] {
+                try forward(traversed.surviving, to: successor)
+            }
+        }
+        return false
     }
 
     private func mutableCellFieldType(

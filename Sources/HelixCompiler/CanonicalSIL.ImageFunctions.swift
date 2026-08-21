@@ -303,13 +303,20 @@ enum ImageFunctions {
                     }
                     ?? intrinsicReplacement.map { _ in .closureBody }
                 guard let fallback else { return nil }
-                // Swift routinely materializes a no-capture closure for
-                // lifetime/debug semantics while devirtualizing its actual
-                // invocation to the same function_ref. Closure eligibility is
-                // therefore additive, not an exclusive invocation mode.
-                let kind: Bytecode.FunctionKind = usages.contains(
-                    .closureConstruction
-                ) ? .closureBody : fallback
+                // Only a body that reaches partial_apply/thin_to_thick uses
+                // the managed closure-capture ABI. Swift also emits direct-only
+                // closure and defer helpers; those retain their physical
+                // address parameters and link as concrete specializations.
+                // When both forms occur, closure construction wins because
+                // the same body must remain a valid make_closure target.
+                let kind: Bytecode.FunctionKind
+                if usages.contains(.closureConstruction) {
+                    kind = .closureBody
+                } else if usages.contains(.directCall), fallback == .closureBody {
+                    kind = .concreteSpecialization
+                } else {
+                    kind = fallback
+                }
                 return .init(
                     symbol: symbol,
                     kind: kind,

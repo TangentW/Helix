@@ -4,13 +4,17 @@ import HelixBytecode
 #endif
 
 extension VM {
-/// Heap-promoted mutable storage captured by a closure. Unlike `VM.Address`,
-/// this reference carries no frame-scoped access token and therefore remains
-/// valid when the closure outlives its creating frame.
+/// Mutable storage captured through one closure ABI. Owned backing promotes a
+/// local into context-owned storage; borrowed backing retains an active address
+/// token and is therefore valid only for a lexical nonescaping closure.
 public struct MutableCell: Hashable, @unchecked Sendable,
     CustomStringConvertible {
-    let storage: VM.MemoryCell
-    let path: [UInt32]
+    private enum Backing: Hashable {
+        case owned(storage: VM.MemoryCell, path: [UInt32])
+        case borrowed(VM.Address)
+    }
+
+    private let backing: Backing
     let pointee: Bytecode.ValueType
 
     init(
@@ -18,46 +22,83 @@ public struct MutableCell: Hashable, @unchecked Sendable,
         pointee: Bytecode.ValueType,
         shape: VM.StorageShape
     ) {
-        storage = .init(initialValue, storageShape: shape)
-        path = []
+        backing = .owned(
+            storage: .init(initialValue, storageShape: shape),
+            path: []
+        )
         self.pointee = pointee
     }
 
     private init(
-        storage: VM.MemoryCell,
-        path: [UInt32],
+        backing: Backing,
         pointee: Bytecode.ValueType
     ) {
-        self.storage = storage
-        self.path = path
+        self.backing = backing
         self.pointee = pointee
     }
 
+    init(borrowing address: VM.Address) throws {
+        guard address.isScoped else {
+            throw VM.RuntimeTrap.inactiveAddressAccess
+        }
+        guard address.canModify else {
+            throw VM.RuntimeTrap.addressWriteRequiresModifyAccess
+        }
+        backing = .borrowed(address)
+        pointee = address.pointee
+    }
+
     func projected(field: UInt32, pointee: Bytecode.ValueType) -> Self {
-        .init(
-            storage: storage,
-            path: path + [field],
-            pointee: pointee
-        )
+        switch backing {
+        case let .owned(storage, path):
+            .init(
+                backing: .owned(
+                    storage: storage,
+                    path: path + [field]
+                ),
+                pointee: pointee
+            )
+        case let .borrowed(address):
+            .init(
+                backing: .borrowed(
+                    address.projected(field: field, pointee: pointee)
+                ),
+                pointee: pointee
+            )
+        }
     }
 
     func read() throws -> VM.Value {
-        try storage.unscopedRead(path: path)
+        switch backing {
+        case let .owned(storage, path):
+            try storage.unscopedRead(path: path)
+        case let .borrowed(address):
+            try address.read()
+        }
     }
 
     func store(_ value: VM.Value, mode: Bytecode.StackStoreMode) throws {
-        try storage.unscopedStore(value, path: path, mode: mode)
+        switch backing {
+        case let .owned(storage, path):
+            try storage.unscopedStore(value, path: path, mode: mode)
+        case let .borrowed(address):
+            try address.store(value, mode: mode)
+        }
+    }
+
+    var storageForInspection: VM.MemoryCell {
+        switch backing {
+        case let .owned(storage, _): storage
+        case let .borrowed(address): address.cell
+        }
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.storage === rhs.storage
-            && lhs.path == rhs.path
-            && lhs.pointee == rhs.pointee
+        lhs.backing == rhs.backing && lhs.pointee == rhs.pointee
     }
 
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(ObjectIdentifier(storage))
-        hasher.combine(path)
+        hasher.combine(backing)
         hasher.combine(pointee)
     }
 

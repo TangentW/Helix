@@ -814,9 +814,17 @@ struct Container {
         module.capabilities.formUnion([
             .closureValuesV1,
             .compilerSpecializationsV1,
+            .addressValuesV1,
+            .mutableCapturesV1,
         ])
         module.functions[0].registerTypes.append(.closure(signature))
         module.functions[0].registerTypes.append(.int64)
+        module.functions[0].registerTypes.append(.closure(signature))
+        module.functions[0].registerTypes.append(.closure(signature))
+        module.functions[0].registerTypes.append(.address(.int64))
+        module.functions[0].registerTypes.append(.address(.int64))
+        module.functions[0].registerTypes.append(.mutableCell(.int64))
+        module.functions[0].stackSlotTypes.append(.int64)
         module.functions[0].blocks[0].instructions.insert(
             .makeClosure(
                 result: .init(rawValue: 5),
@@ -826,13 +834,53 @@ struct Container {
             at: 0
         )
         module.functions[0].blocks[0].instructions.insert(
-            .closureApply(
-                result: .init(rawValue: 6),
-                closure: .init(rawValue: 5),
-                arguments: [.init(rawValue: 1)]
+            .beginClosureScope(
+                result: .init(rawValue: 7),
+                closure: .init(rawValue: 5)
             ),
             at: 1
         )
+        module.functions[0].blocks[0].instructions.insert(
+            .closureApply(
+                result: .init(rawValue: 6),
+                closure: .init(rawValue: 7),
+                arguments: [.init(rawValue: 1)]
+            ),
+            at: 2
+        )
+        module.functions[0].blocks[0].instructions.insert(
+            .endClosureScope(closure: .init(rawValue: 7)),
+            at: 3
+        )
+        module.functions[0].blocks[0].instructions.insert(contentsOf: [
+            .makeClosure(
+                result: .init(rawValue: 8),
+                function: .init(rawValue: 1),
+                captures: [.init(rawValue: 0)],
+                lifetime: .lexical
+            ),
+            .endClosureScope(closure: .init(rawValue: 8)),
+            .storeStack(
+                slot: .init(rawValue: 0),
+                source: .init(rawValue: 0),
+                mode: .initialize
+            ),
+            .stackAddress(
+                result: .init(rawValue: 9),
+                slot: .init(rawValue: 0)
+            ),
+            .beginAccess(
+                result: .init(rawValue: 10),
+                address: .init(rawValue: 9),
+                kind: .modify
+            ),
+            .borrowMutableCell(
+                result: .init(rawValue: 11),
+                address: .init(rawValue: 10)
+            ),
+            .endAccess(.init(rawValue: 10)),
+            .destroyStack(.init(rawValue: 0)),
+        ], at: 4)
         module.functions.append(
             .init(
                 id: .init(rawValue: 1),
@@ -872,10 +920,15 @@ struct Container {
 
         let bytes = try Bytecode.Encoder.encode(module)
         let decoded = try Bytecode.Decoder.decode(bytes)
+        let text = Bytecode.Disassembler.disassemble(decoded.module)
 
         #expect(decoded.header.formatMinor == Bytecode.Format.minorVersion)
         #expect(decoded.module == module)
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
+        #expect(text.contains("make_closure.lexical"))
+        #expect(text.contains("borrow_mutable_cell"))
+        #expect(text.contains("begin_closure_scope"))
+        #expect(text.contains("end_closure_scope"))
     }
 
     @Test("Closure descriptions preserve ownership and expose malformed ABI")
@@ -895,6 +948,35 @@ struct Container {
             signature.description
                 == "<invalid closure signature: 3 parameters, 2 conventions>"
         )
+    }
+
+    @Test("Closure storage inspection distinguishes direct and nested values")
+    func closureStorageInspection() {
+        let leaf = Bytecode.ValueType.closure(
+            .init(
+                parameters: [.int64],
+                parameterConventions: [.owned],
+                result: .int64
+            )
+        )
+        let higherOrder = Bytecode.ValueType.closure(
+            .init(
+                parameters: [leaf],
+                parameterConventions: [.owned],
+                result: .optional(leaf)
+            )
+        )
+
+        #expect(leaf.containsClosureValue)
+        #expect(!leaf.containsNestedClosureValue)
+        #expect(higherOrder.containsClosureValue)
+        #expect(higherOrder.containsNestedClosureValue)
+        #expect(Bytecode.ValueType.array(leaf).containsNestedClosureValue)
+        #expect(
+            Bytecode.ValueType.dictionary(key: .string, value: leaf)
+                .containsClosureValue
+        )
+        #expect(!Bytecode.ValueType.array(.int64).containsClosureValue)
     }
 
     @Test("HLBC 1.0 canonically carries the non-suspending async entry ABI")

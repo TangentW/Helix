@@ -180,6 +180,7 @@ public struct Closure: Hashable, Sendable, CustomStringConvertible {
     public var functionID: Bytecode.FunctionID
     public var signature: Bytecode.ClosureSignature
     public var captures: [VM.Value]
+    var dynamicScope: VM.ClosureScope?
 
     public init(
         functionID: Bytecode.FunctionID,
@@ -189,6 +190,19 @@ public struct Closure: Hashable, Sendable, CustomStringConvertible {
         self.functionID = functionID
         self.signature = signature
         self.captures = captures
+        dynamicScope = nil
+    }
+
+    init(
+        functionID: Bytecode.FunctionID,
+        signature: Bytecode.ClosureSignature,
+        captures: [VM.Value],
+        dynamicScope: VM.ClosureScope?
+    ) {
+        self.functionID = functionID
+        self.signature = signature
+        self.captures = captures
+        self.dynamicScope = dynamicScope
     }
 
     public var description: String {

@@ -158,6 +158,8 @@ public enum Disassembler {
         case let .makeMutableCell(result, initialValue):
             initialValue.map { "\(result) = make_mutable_cell \($0)" }
                 ?? "\(result) = make_mutable_cell.uninitialized"
+        case let .borrowMutableCell(result, address):
+            "\(result) = borrow_mutable_cell \(address)"
         case let .projectMutableCell(result, cell, fieldIndex):
             "\(result) = project_mutable_cell \(cell), #\(fieldIndex)"
         case let .loadMutableCell(result, cell):
@@ -408,9 +410,13 @@ public enum Disassembler {
             "\(assignment(result))entry_apply #\(entry)(\(arguments.map(\.description).joined(separator: ", ")))"
         case let .nativeApply(result, importID, arguments):
             "\(assignment(result))native_apply #\(importID)(\(arguments.map(\.description).joined(separator: ", ")))"
-        case let .makeClosure(result, function, captures):
-            "\(result) = make_closure @\(function)"
+        case let .makeClosure(result, function, captures, lifetime):
+            "\(result) = make_closure.\(lifetime.rawValue) @\(function)"
                 + " [\(captures.map(\.description).joined(separator: ", "))]"
+        case let .beginClosureScope(result, closure):
+            "\(result) = begin_closure_scope \(closure)"
+        case let .endClosureScope(closure):
+            "end_closure_scope \(closure)"
         case let .closureApply(result, closure, arguments):
             "\(assignment(result))closure_apply \(closure)"
                 + "(\(arguments.map(\.description).joined(separator: ", ")))"

@@ -159,6 +159,10 @@ public final class ArraySplitState: @unchecked Sendable, Hashable,
         }
     }
 
+    func valuesForInspection() -> [VM.Value] {
+        lock.withLock { elements }
+    }
+
     public static func == (
         lhs: VM.ArraySplitState,
         rhs: VM.ArraySplitState

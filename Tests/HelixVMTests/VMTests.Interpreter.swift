@@ -5494,6 +5494,302 @@ struct Interpreter {
         )
     }
 
+    @Test("Dynamic closure scopes reject aggregate escape")
+    func rejectsDynamicallyScopedClosureEscape() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .int64
+        )
+        let closureType = Bytecode.ValueType.closure(signature)
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "scopedClosureEscape",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .bool,
+            registerTypes: [
+                .int64,
+                closureType,
+                closureType,
+                .optional(closureType),
+                .bool,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeClosure(
+                            result: .init(rawValue: 1),
+                            function: .init(rawValue: 1),
+                            captures: [.init(rawValue: 0)]
+                        ),
+                        .beginClosureScope(
+                            result: .init(rawValue: 2),
+                            closure: .init(rawValue: 1)
+                        ),
+                        .makeOptionalSome(
+                            result: .init(rawValue: 3),
+                            value: .init(rawValue: 2)
+                        ),
+                        .endClosureScope(closure: .init(rawValue: 2)),
+                        .optionalIsSome(
+                            result: .init(rawValue: 4),
+                            optional: .init(rawValue: 3)
+                        ),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ]
+        )
+        let closureBody = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "scopedClosureBody",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [
+                .baselineV1,
+                .closureValuesV1,
+                .escapingClosureValuesV1,
+            ],
+            signature: .init(
+                parameters: ["Swift.Int"],
+                result: "Swift.Bool"
+            ),
+            resultType: .bool,
+            additionalFunctions: [closureBody]
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    .integer(
+                        try .init(signed: 7, bitWidth: 64, isSigned: true)
+                    ),
+                ]
+            ) == .trapped(
+                .explicit(
+                    "dynamically scoped closure escaped its lifetime"
+                )
+            )
+        )
+    }
+
+    @Test("Nested lexical closure cleanup releases captured inner scopes")
+    func executesNestedLexicalClosureCleanup() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .int64
+        )
+        let closureType = Bytecode.ValueType.closure(signature)
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "nestedLexicalClosures",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64,
+                closureType,
+                closureType,
+                .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeClosure(
+                            result: .init(rawValue: 1),
+                            function: .init(rawValue: 1),
+                            captures: [.init(rawValue: 0)],
+                            lifetime: .lexical
+                        ),
+                        .makeClosure(
+                            result: .init(rawValue: 2),
+                            function: .init(rawValue: 2),
+                            captures: [.init(rawValue: 1)],
+                            lifetime: .lexical
+                        ),
+                        .closureApply(
+                            result: .init(rawValue: 3),
+                            closure: .init(rawValue: 2),
+                            arguments: []
+                        ),
+                        .endClosureScope(closure: .init(rawValue: 2)),
+                        .endClosureScope(closure: .init(rawValue: 1)),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+        let inner = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "innerLexicalClosure",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
+        let outer = Bytecode.Function(
+            id: .init(rawValue: 2),
+            name: "outerLexicalClosure",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [closureType, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .closureApply(
+                            result: .init(rawValue: 1),
+                            closure: .init(rawValue: 0),
+                            arguments: []
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [
+                .baselineV1,
+                .closureValuesV1,
+                .escapingClosureValuesV1,
+            ],
+            additionalFunctions: [inner, outer]
+        )
+        let input = VM.Value.integer(
+            try .init(signed: 7, bitWidth: 64, isSigned: true)
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [input]
+            ) == .returned(input)
+        )
+    }
+
+    @Test("Dead block-parameter aliases do not escape lexical closure scope")
+    func executesLexicalClosureBlockParameterAlias() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .int64
+        )
+        let closureType = Bytecode.ValueType.closure(signature)
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "lexicalClosureBlockParameterAlias",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64,
+                closureType,
+                closureType,
+                .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeClosure(
+                            result: .init(rawValue: 1),
+                            function: .init(rawValue: 1),
+                            captures: [.init(rawValue: 0)],
+                            lifetime: .lexical
+                        ),
+                        .branch(
+                            target: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 1)]
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 2)],
+                    instructions: [
+                        .closureApply(
+                            result: .init(rawValue: 3),
+                            closure: .init(rawValue: 2),
+                            arguments: []
+                        ),
+                        .endClosureScope(closure: .init(rawValue: 1)),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+        let closureBody = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "lexicalClosureBlockParameterAliasBody",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [
+                .baselineV1,
+                .closureValuesV1,
+            ],
+            additionalFunctions: [closureBody]
+        )
+        let input = VM.Value.integer(
+            try .init(signed: 7, bitWidth: 64, isSigned: true)
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [input]
+            ) == .returned(input)
+        )
+    }
+
     @Test("Borrowed closure arguments remain live in their caller")
     func preservesBorrowedClosureArguments() throws {
         let signature = Bytecode.ClosureSignature(

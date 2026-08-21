@@ -25,6 +25,10 @@ public final class ObjectStorage: @unchecked Sendable, Hashable {
 
     var fieldCount: Int { fields.count }
 
+    func initializedValuesForInspection() -> [VM.Value] {
+        fields.flatMap { $0.initializedValuesForInspection() }
+    }
+
     func address(
         field index: UInt32,
         pointee: Bytecode.ValueType
