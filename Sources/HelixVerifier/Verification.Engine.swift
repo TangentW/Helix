@@ -350,6 +350,10 @@ public struct Engine: Verification.ImageVerifying {
                 throw Verification.Error.invalidModule(
                     "local type members cannot contain mutable capture cells"
                 )
+            case .nonOwningReference:
+                throw Verification.Error.invalidModule(
+                    "local type members cannot contain non-owning reference storage"
+                )
             case .arrayState:
                 throw Verification.Error.invalidModule(
                     "local type members cannot contain Array operation states"
@@ -380,7 +384,8 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 for parameter in signature.parameters {
                     switch parameter {
-                    case .void, .never, .mutableCell, .arrayState,
+                    case .void, .never, .mutableCell, .nonOwningReference,
+                         .arrayState,
                          .dictionaryState:
                         throw Verification.Error.invalidModule(
                             "local type closure parameter has invalid storage"
@@ -388,6 +393,7 @@ public struct Engine: Verification.ImageVerifying {
                     case let .address(pointee):
                         switch pointee {
                         case .void, .never, .address, .mutableCell,
+                             .nonOwningReference,
                              .arrayState, .dictionaryState:
                             throw Verification.Error.invalidModule(
                                 "local type inout closure parameter has invalid storage"
@@ -410,7 +416,8 @@ public struct Engine: Verification.ImageVerifying {
                 switch signature.result {
                 case .void:
                     break
-                case .never, .address, .mutableCell, .arrayState,
+                case .never, .address, .mutableCell, .nonOwningReference,
+                     .arrayState,
                      .dictionaryState:
                     throw Verification.Error.invalidModule(
                         "local type closure result has invalid storage"
@@ -568,7 +575,7 @@ public struct Engine: Verification.ImageVerifying {
             case let .tuple(elements):
                 try (elements.map(typeDepth).max() ?? 0) + 1
             case .void, .never, .bool, .integer, .float, .string, .any, .native,
-                 .error, .address, .closure:
+                 .error, .address, .closure, .nonOwningReference:
                 0
             }
         }
@@ -604,6 +611,7 @@ public struct Engine: Verification.ImageVerifying {
             case let .array(element), let .optional(element), let .set(element):
                 try visit(element)
             case let .address(pointee), let .mutableCell(pointee),
+                 let .nonOwningReference(_, pointee),
                  let .arrayState(_, pointee):
                 try visit(pointee)
             case let .closure(signature):
@@ -920,6 +928,7 @@ public struct Engine: Verification.ImageVerifying {
         case let .native(id): shell.types[id]?.requiresMainActor == true
         case let .array(element), let .optional(element), let .set(element),
              let .address(element), let .mutableCell(element),
+             let .nonOwningReference(_, element),
              let .arrayState(_, element):
             usesMainActorNativeType(element, shell: shell)
         case let .dictionary(key, value):
@@ -947,7 +956,9 @@ public struct Engine: Verification.ImageVerifying {
         case let .tuple(elements):
             for element in elements { try verifyNativeTypes(element, shell: shell) }
         case let .optional(wrapped), let .address(wrapped),
-             let .mutableCell(wrapped), let .arrayState(_, wrapped):
+             let .mutableCell(wrapped),
+             let .nonOwningReference(_, wrapped),
+             let .arrayState(_, wrapped):
             try verifyNativeTypes(wrapped, shell: shell)
         case let .array(element):
             try verifyNativeTypes(element, shell: shell)
@@ -1004,6 +1015,13 @@ public struct Engine: Verification.ImageVerifying {
             case let .mutableCell(pointee):
                 guard capabilities.contains(.mutableCapturesV1) else {
                     throw Verification.Error.capabilityDenied(.mutableCapturesV1)
+                }
+                try visit(pointee)
+            case let .nonOwningReference(_, pointee):
+                guard capabilities.contains(.nonOwningReferencesV1) else {
+                    throw Verification.Error.capabilityDenied(
+                        .nonOwningReferencesV1
+                    )
                 }
                 try visit(pointee)
             case let .arrayState(_, element):
@@ -1195,7 +1213,11 @@ public struct Engine: Verification.ImageVerifying {
         guard !function.blocks.isEmpty else {
             throw Verification.Error.invalidFunction(function: function.id, reason: "function has no blocks")
         }
-        try verifyTypeShapes(function)
+        try verifyTypeShapes(
+            function,
+            shell: shell,
+            localTypes: localTypes
+        )
 
         var blocks: [Bytecode.BlockID: Bytecode.Block] = [:]
         for block in function.blocks {
@@ -1361,7 +1383,11 @@ public struct Engine: Verification.ImageVerifying {
         )
     }
 
-    private func verifyTypeShapes(_ function: Bytecode.Function) throws {
+    private func verifyTypeShapes(
+        _ function: Bytecode.Function,
+        shell: Verification.ShellInterface,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
+    ) throws {
         func verify(_ type: Bytecode.ValueType, depth: Int, isRegister: Bool) throws {
             guard depth <= 32 else {
                 throw Verification.Error.invalidFunction(
@@ -1417,7 +1443,8 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 }
                 switch pointee {
-                case .void, .never, .address, .mutableCell, .arrayState,
+                case .void, .never, .address, .mutableCell,
+                     .nonOwningReference, .arrayState,
                      .dictionaryState:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
@@ -1434,7 +1461,8 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 }
                 switch pointee {
-                case .void, .never, .address, .mutableCell, .arrayState,
+                case .void, .never, .address, .mutableCell,
+                     .nonOwningReference, .arrayState,
                      .dictionaryState:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
@@ -1442,6 +1470,35 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 default:
                     try verify(pointee, depth: depth + 1, isRegister: false)
+                }
+            case let .nonOwningReference(kind, pointee):
+                guard isRegister, depth == 0 else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "non-owning references must be top-level registers"
+                    )
+                }
+                if case .optional = pointee {
+                    // Both weak and optional unowned storage use an Optional
+                    // strong value at their checked load boundary.
+                } else {
+                    guard kind == .unowned else {
+                        throw Verification.Error.invalidFunction(
+                            function: function.id,
+                            reason: "weak references must load an Optional value"
+                        )
+                    }
+                }
+                guard isValidNonOwningReference(
+                    kind: kind,
+                    pointee: pointee,
+                    shell: shell,
+                    localTypes: localTypes
+                ) else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "non-owning reference pointee must be a local or native class"
+                    )
                 }
             case let .arrayState(_, element):
                 guard isRegister, depth == 0 else {
@@ -1451,7 +1508,8 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 }
                 switch element {
-                case .void, .never, .address, .mutableCell, .arrayState,
+                case .void, .never, .address, .mutableCell,
+                     .nonOwningReference, .arrayState,
                      .dictionaryState:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
@@ -1475,7 +1533,8 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 for component in [key, value] {
                     switch component {
-                    case .void, .never, .address, .mutableCell, .arrayState,
+                    case .void, .never, .address, .mutableCell,
+                         .nonOwningReference, .arrayState,
                          .dictionaryState:
                         throw Verification.Error.invalidFunction(
                             function: function.id,
@@ -1522,7 +1581,8 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 for parameter in signature.parameters {
                     switch parameter {
-                    case .void, .never, .mutableCell, .arrayState,
+                    case .void, .never, .mutableCell, .nonOwningReference,
+                         .arrayState,
                          .dictionaryState:
                         throw Verification.Error.invalidFunction(
                             function: function.id,
@@ -1531,6 +1591,7 @@ public struct Engine: Verification.ImageVerifying {
                     case let .address(pointee):
                         switch pointee {
                         case .void, .never, .address, .mutableCell,
+                             .nonOwningReference,
                              .arrayState, .dictionaryState:
                             throw Verification.Error.invalidFunction(
                                 function: function.id,
@@ -1548,7 +1609,8 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 }
                 switch signature.result {
-                case .never, .address, .mutableCell, .arrayState,
+                case .never, .address, .mutableCell, .nonOwningReference,
+                     .arrayState,
                      .dictionaryState:
                     throw Verification.Error.invalidFunction(
                         function: function.id,
@@ -1584,6 +1646,12 @@ public struct Engine: Verification.ImageVerifying {
                     reason: "mutable cells cannot be stored in stack slots"
                 )
             }
+            if case .nonOwningReference = type {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "non-owning reference storage cannot be stored in stack slots"
+                )
+            }
             if case .arrayState = type {
                 throw Verification.Error.invalidFunction(
                     function: function.id,
@@ -1608,6 +1676,12 @@ public struct Engine: Verification.ImageVerifying {
             throw Verification.Error.invalidFunction(
                 function: function.id,
                 reason: "mutable cells cannot be returned"
+            )
+        }
+        if case .nonOwningReference = function.resultType {
+            throw Verification.Error.invalidFunction(
+                function: function.id,
+                reason: "non-owning reference storage cannot be returned"
             )
         }
         if case .arrayState = function.resultType {
@@ -2348,6 +2422,52 @@ public struct Engine: Verification.ImageVerifying {
             else {
                 throw fail(
                     "store_mutable_cell source must match a copyable pointee"
+                )
+            }
+        case let .makeNonOwningReference(result, initialValue):
+            guard capabilities.contains(.nonOwningReferencesV1),
+                  case let .nonOwningReference(kind, pointee) = type(result),
+                  isValidNonOwningReference(
+                    kind: kind,
+                    pointee: pointee,
+                    shell: shell,
+                    localTypes: localTypes
+                  ),
+                  initialValue.map(type) == nil
+                    || initialValue.map(type) == pointee
+            else {
+                throw fail(
+                    "make_nonowning_reference requires a matching class reference pointee"
+                )
+            }
+        case let .loadNonOwningReference(result, reference, _):
+            guard capabilities.contains(.nonOwningReferencesV1),
+                  case let .nonOwningReference(kind, pointee) = type(reference),
+                  isValidNonOwningReference(
+                    kind: kind,
+                    pointee: pointee,
+                    shell: shell,
+                    localTypes: localTypes
+                  ),
+                  type(result) == pointee
+            else {
+                throw fail(
+                    "load_nonowning_reference result must match its strong pointee"
+                )
+            }
+        case let .storeNonOwningReference(reference, source, _):
+            guard capabilities.contains(.nonOwningReferencesV1),
+                  case let .nonOwningReference(kind, pointee) = type(reference),
+                  isValidNonOwningReference(
+                    kind: kind,
+                    pointee: pointee,
+                    shell: shell,
+                    localTypes: localTypes
+                  ),
+                  type(source) == pointee
+            else {
+                throw fail(
+                    "store_nonowning_reference source must match its strong pointee"
                 )
             }
         case let .allocateObject(result):
@@ -3874,7 +3994,7 @@ public struct Engine: Verification.ImageVerifying {
         switch type {
         case let .native(id):
             shell.types[id]?.isCopyable == true
-        case .closure, .mutableCell:
+        case .closure, .mutableCell, .nonOwningReference:
             true
         case .arrayState, .dictionaryState:
             false
@@ -3892,6 +4012,32 @@ public struct Engine: Verification.ImageVerifying {
             false
         case .bool, .integer, .float, .string, .any, .local, .error:
             true
+        }
+    }
+
+    private func isValidNonOwningReference(
+        kind: Bytecode.NonOwningReferenceKind,
+        pointee: Bytecode.ValueType,
+        shell: Verification.ShellInterface,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
+    ) -> Bool {
+        let strongType: Bytecode.ValueType
+        if case let .optional(wrapped) = pointee {
+            strongType = wrapped
+        } else {
+            guard kind == .unowned else { return false }
+            strongType = pointee
+        }
+        switch strongType {
+        case let .local(key):
+            guard let definition = localTypes[key],
+                  case .class = definition.kind
+            else { return false }
+            return true
+        case let .native(id):
+            return shell.types[id]?.kind == .reference
+        default:
+            return false
         }
     }
 
@@ -4152,7 +4298,9 @@ public struct Engine: Verification.ImageVerifying {
                      .eraseToAny, .checkedCastAny, .forceCastAny, .stackAddress,
                      .projectAggregateAddress, .projectMutableCell, .allocateObject,
                      .projectObjectAddress, .hostedSuperApply, .beginAccess,
-                     .endAccess, .beginClosureScope, .endClosureScope:
+                     .endAccess, .makeNonOwningReference,
+                     .storeNonOwningReference,
+                     .beginClosureScope, .endClosureScope:
                     // Allocation and address projection do not transfer a
                     // native handle. A local class field load/store is tracked
                     // by the corresponding address instruction instead.
@@ -4295,6 +4443,10 @@ public struct Engine: Verification.ImageVerifying {
                 case .borrowMutableCell:
                     break
                 case let .loadMutableCell(result, _):
+                    if function.type(of: result)?.requiresLinearOwnership == true {
+                        live.insert(result)
+                    }
+                case let .loadNonOwningReference(result, _, _):
                     if function.type(of: result)?.requiresLinearOwnership == true {
                         live.insert(result)
                     }

@@ -27,6 +27,8 @@ enum ValueRepresentation {
             .address(storable(pointee))
         case let .mutableCell(pointee):
             .mutableCell(storable(pointee))
+        case let .nonOwningReference(kind, pointee):
+            .nonOwningReference(kind: kind, pointee: storable(pointee))
         case let .arrayState(kind, element):
             .arrayState(kind: kind, element: storable(element))
         case let .dictionaryState(key, value):

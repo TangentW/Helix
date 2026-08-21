@@ -140,7 +140,7 @@ enum ImageFunctions {
                try environment.hostedMethodRequiresMainActor(context) {
                 effects.requiresMainActor = true
             }
-            let normalized = try CanonicalSIL.MutableCaptures.normalize(
+            let normalized = try CanonicalSIL.ManagedCaptureStorage.normalize(
                 body: function.body,
                 role: kind,
                 parameters: parsed.parameters,

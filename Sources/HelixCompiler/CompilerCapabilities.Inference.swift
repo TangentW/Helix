@@ -168,6 +168,9 @@ extension CompilerCapabilities {
         case let .mutableCell(pointee):
             capabilities.insert(.mutableCapturesV1)
             collect(pointee, into: &capabilities)
+        case let .nonOwningReference(_, pointee):
+            capabilities.insert(.nonOwningReferencesV1)
+            collect(pointee, into: &capabilities)
         case let .arrayState(_, element):
             capabilities.insert(.collectionsV1)
             collect(element, into: &capabilities)

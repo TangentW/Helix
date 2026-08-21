@@ -1743,6 +1743,7 @@ public struct Generator: Sendable {
         case let .tuple(elements):
             !elements.isEmpty && elements.allSatisfy(isGeneratedValueType)
         case .void, .never, .local, .error, .address, .mutableCell,
+             .nonOwningReference,
              .arrayState, .dictionaryState, .closure:
             false
         }
@@ -2020,6 +2021,8 @@ public struct Generator: Sendable {
         case .error: ".error"
         case let .address(pointee): ".address(\(render(pointee)))"
         case let .mutableCell(pointee): ".mutableCell(\(render(pointee)))"
+        case let .nonOwningReference(kind, pointee):
+            ".nonOwningReference(kind: .\(kind.rawValue), pointee: \(render(pointee)))"
         case let .arrayState(kind, element):
             ".arrayState(kind: .\(kind.rawValue), element: \(render(element)))"
         case let .dictionaryState(key, value):

@@ -23,6 +23,7 @@ public enum Metadata {
         .closureValuesV1,
         .escapingClosureValuesV1,
         .mutableCapturesV1,
+        .nonOwningReferencesV1,
         .compilerSpecializationsV1,
         .asyncLeafEntriesV1,
         .anyValuesV1,

@@ -2,18 +2,19 @@ import Foundation
 import HelixBytecode
 
 extension CanonicalSIL {
-/// Normalizes frame-relative captures of a constructed Swift closure into a
-/// VM-managed cell ABI. The same `@closureCapture` spelling also appears on
-/// directly called helpers such as `defer`; those retain their address ABI.
-enum MutableCaptures {
+/// Normalizes compiler-owned closure capture storage into VM-managed value
+/// handles. Mutable captures use cells; weak and unowned captures preserve
+/// their shared non-owning storage identity. Ordinary caller-owned `inout`
+/// parameters retain their address ABI.
+enum ManagedCaptureStorage {
     struct Signature: Equatable, Sendable {
         var parameters: [Bytecode.ValueType]
         var parameterConventions: [Bytecode.ParameterConvention]
         var logicalIndices: Set<Int>
     }
 
-    /// Reference-backed scratch state keeps mutable-capture bookkeeping out
-    /// of the already large SIL lowering stack frame.
+    /// Reference-backed scratch state keeps capture bookkeeping out of the
+    /// already large SIL lowering stack frame.
     final class LoweringState {
         struct Address {
             var register: Bytecode.Register
@@ -38,9 +39,15 @@ enum MutableCaptures {
                 "function parameter ownership count is inconsistent"
             )
         }
-        guard role == .closureBody,
-              body.contains("@closureCapture")
-        else {
+        let normalizesMutableCaptures = role == .closureBody
+            && body.contains("@closureCapture")
+        let normalizesNonOwningCaptures = parameters.contains { type in
+            guard case let .address(pointee) = type,
+                  case .nonOwningReference = pointee
+            else { return false }
+            return true
+        }
+        guard normalizesMutableCaptures || normalizesNonOwningCaptures else {
             return .init(
                 parameters: parameters,
                 parameterConventions: parameterConventions,
@@ -49,17 +56,18 @@ enum MutableCaptures {
         }
         guard let components = entryBlockParameters(in: body) else {
             throw CanonicalSIL.LoweringError.malformedSIL(
-                "mutable closure capture has no canonical entry block"
+                "managed closure capture has no canonical entry block"
             )
         }
 
         let leadingAddressCount = (hasIndirectResult ? 1 : 0)
             + (hasIndirectError ? 1 : 0)
         guard components.count
-                == leadingAddressCount + erasedPhysicalIndices.count + parameters.count
+                == leadingAddressCount + erasedPhysicalIndices.count
+                    + parameters.count
         else {
             throw CanonicalSIL.LoweringError.malformedSIL(
-                "mutable closure capture entry parameters differ from its function ABI"
+                "managed closure capture entry parameters differ from its function ABI"
             )
         }
 
@@ -73,12 +81,34 @@ enum MutableCaptures {
             if erasedPhysicalIndices.contains(valuePhysicalIndex) { continue }
             guard normalizedParameters.indices.contains(logicalIndex) else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "mutable closure capture has an invalid logical parameter index"
+                    "managed closure capture has an invalid logical parameter index"
                 )
             }
             defer { logicalIndex += 1 }
-            guard component.contains("@closureCapture") else { continue }
-            guard case let .address(pointee) = normalizedParameters[logicalIndex]
+
+            if case let .address(pointee) = normalizedParameters[logicalIndex],
+               case let .nonOwningReference(kind, _) = pointee {
+                let marker = switch kind {
+                case .weak: "@sil_weak"
+                case .unowned: "@sil_unowned"
+                }
+                guard normalizedConventions[logicalIndex] == .inout,
+                      component.contains("@closureCapture"),
+                      component.contains(marker)
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "non-owning closure capture has an invalid storage convention"
+                    )
+                }
+                normalizedParameters[logicalIndex] = pointee
+                normalizedConventions[logicalIndex] = .owned
+                logicalIndices.insert(logicalIndex)
+                continue
+            }
+
+            guard normalizesMutableCaptures,
+                  component.contains("@closureCapture"),
+                  case let .address(pointee) = normalizedParameters[logicalIndex]
             else {
                 // Immutable captures carry the same entry-block decoration
                 // but already have a regular value ABI.
@@ -95,7 +125,7 @@ enum MutableCaptures {
         }
         guard logicalIndex == parameters.count else {
             throw CanonicalSIL.LoweringError.malformedSIL(
-                "mutable closure capture did not resolve every logical parameter"
+                "managed closure capture did not resolve every logical parameter"
             )
         }
         return .init(

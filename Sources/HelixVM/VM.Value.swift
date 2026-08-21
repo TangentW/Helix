@@ -87,6 +87,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
     case error(VM.ErrorValue)
     case address(VM.Address)
     case mutableCell(VM.MutableCell)
+    case nonOwningReference(VM.NonOwningReference)
     case arrayBuilder(VM.ArrayBuilder)
     case arrayMutationState(VM.ArrayMutationState)
     case dictionaryBuilder(VM.DictionaryBuilder)
@@ -113,6 +114,8 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case .error: .error
         case let .address(address): .address(address.pointee)
         case let .mutableCell(cell): .mutableCell(cell.pointee)
+        case let .nonOwningReference(reference):
+            .nonOwningReference(kind: reference.kind, pointee: reference.pointee)
         case let .arrayBuilder(builder):
             .arrayState(kind: .builder, element: builder.elementType)
         case let .arrayMutationState(state):
@@ -150,6 +153,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .error(error): error.description
         case let .address(address): address.description
         case let .mutableCell(cell): cell.description
+        case let .nonOwningReference(reference): reference.description
         case let .arrayBuilder(builder): builder.description
         case let .arrayMutationState(state): state.description
         case let .dictionaryBuilder(builder): builder.description
@@ -338,6 +342,11 @@ extension VM.Value {
             address.pointee == pointee && address.isScoped
         case let (.mutableCell(cell), .mutableCell(pointee)):
             cell.pointee == pointee
+        case let (
+            .nonOwningReference(reference),
+            .nonOwningReference(kind, pointee)
+        ):
+            reference.kind == kind && reference.pointee == pointee
         case let (.arrayBuilder(builder), .arrayState(kind: .builder, element)):
             builder.elementType == element
         case let (

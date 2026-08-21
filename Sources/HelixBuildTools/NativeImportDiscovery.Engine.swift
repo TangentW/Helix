@@ -332,6 +332,7 @@ extension NativeImportDiscovery {
             case let .tuple(elements):
                 !elements.isEmpty && elements.allSatisfy(isAutomaticallyBridgeable)
             case .void, .never, .local, .error, .address, .mutableCell,
+                 .nonOwningReference,
                  .arrayState, .dictionaryState, .closure:
                 false
             }

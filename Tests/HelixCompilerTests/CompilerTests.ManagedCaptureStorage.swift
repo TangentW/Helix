@@ -3,11 +3,11 @@ import Testing
 @testable import HelixCompiler
 
 extension CompilerTests {
-@Suite("Canonical SIL mutable-capture ABI normalization")
-struct MutableCaptures {
+@Suite("Canonical SIL managed-capture storage ABI normalization")
+struct ManagedCaptureStorage {
     @Test("Only mutable address captures become VM-managed cells")
     func normalizesPhysicalCaptureABI() throws {
-        let normalized = try CanonicalSIL.MutableCaptures.normalize(
+        let normalized = try CanonicalSIL.ManagedCaptureStorage.normalize(
             body: """
             bb0(%0 : $*String, %1 : $*any Error, %2 : $*Int, \
             %3 : $@thin String.Type, %4 : @closureCapture $*String):
@@ -27,7 +27,7 @@ struct MutableCaptures {
 
     @Test("Immutable captures and ordinary inout parameters keep their ABI")
     func preservesNonmutableCaptureABI() throws {
-        let immutable = try CanonicalSIL.MutableCaptures.normalize(
+        let immutable = try CanonicalSIL.ManagedCaptureStorage.normalize(
             body: "bb0(%0 : @closureCapture $Int):",
             role: .closureBody,
             parameters: [.int64],
@@ -40,7 +40,7 @@ struct MutableCaptures {
         #expect(immutable.parameterConventions == [.owned])
         #expect(immutable.logicalIndices.isEmpty)
 
-        let inoutParameter = try CanonicalSIL.MutableCaptures.normalize(
+        let inoutParameter = try CanonicalSIL.ManagedCaptureStorage.normalize(
             body: "bb0(%0 : $*Int):",
             role: .closureBody,
             parameters: [.address(.int64)],
@@ -53,7 +53,7 @@ struct MutableCaptures {
         #expect(inoutParameter.parameterConventions == [.inout])
         #expect(inoutParameter.logicalIndices.isEmpty)
 
-        let directHelper = try CanonicalSIL.MutableCaptures.normalize(
+        let directHelper = try CanonicalSIL.ManagedCaptureStorage.normalize(
             body: "bb0(%0 : @closureCapture $*Int):",
             role: .ordinary,
             parameters: [.address(.int64)],
@@ -70,7 +70,7 @@ struct MutableCaptures {
     @Test("An inconsistent mutable-capture convention fails closed")
     func rejectsMalformedCaptureABI() {
         #expect(throws: CanonicalSIL.LoweringError.self) {
-            _ = try CanonicalSIL.MutableCaptures.normalize(
+            _ = try CanonicalSIL.ManagedCaptureStorage.normalize(
                 body: "bb0(%0 : @closureCapture $*Int):",
                 role: .closureBody,
                 parameters: [.address(.int64)],
@@ -81,7 +81,7 @@ struct MutableCaptures {
             )
         }
         #expect(throws: CanonicalSIL.LoweringError.self) {
-            _ = try CanonicalSIL.MutableCaptures.normalize(
+            _ = try CanonicalSIL.ManagedCaptureStorage.normalize(
                 body: "bb0(%0 : @closureCapture $*Int)):",
                 role: .closureBody,
                 parameters: [.address(.int64)],
@@ -100,7 +100,7 @@ struct MutableCaptures {
             parameterConventions: [.owned, .owned],
             result: .bool
         )
-        let normalized = try CanonicalSIL.MutableCaptures.normalize(
+        let normalized = try CanonicalSIL.ManagedCaptureStorage.normalize(
             body: """
             bb0(%0 : @guaranteed $@callee_guaranteed (Int, String) -> Bool, \
             %1 : @closureCapture $*Int):
@@ -128,7 +128,7 @@ struct MutableCaptures {
         #expect(signature.parameters == [.mutableCell(.string)])
         #expect(signature.parameterConventions == [.owned])
 
-        let normalized = try CanonicalSIL.MutableCaptures.normalize(
+        let normalized = try CanonicalSIL.ManagedCaptureStorage.normalize(
             body: "bb0(%0 : @closureCapture ${ var String }):",
             role: .closureBody,
             parameters: signature.parameters,
@@ -143,6 +143,64 @@ struct MutableCaptures {
         #expect(throws: CanonicalSIL.LoweringError.self) {
             _ = try CanonicalSIL.Lowerer().parseFunctionType(
                 "$@convention(thin) (@guaranteed { let String }) -> Int"
+            )
+        }
+    }
+
+    @Test("Weak and unowned address captures become shared VM handles")
+    func normalizesNonOwningCaptureABI() throws {
+        let owner = Bytecode.LocalTypeKey(rawValue: "Fixture.Owner")
+        let weakType = Bytecode.ValueType.nonOwningReference(
+            kind: .weak,
+            pointee: .optional(.local(owner))
+        )
+        let weak = try CanonicalSIL.ManagedCaptureStorage.normalize(
+            body: "bb0(%0 : @closureCapture $*@sil_weak Optional<Fixture.Owner>):",
+            role: .ordinary,
+            parameters: [.address(weakType)],
+            parameterConventions: [.inout],
+            erasedPhysicalIndices: [],
+            hasIndirectResult: false,
+            hasIndirectError: false
+        )
+        #expect(weak.parameters == [weakType])
+        #expect(weak.parameterConventions == [.owned])
+        #expect(weak.logicalIndices == [0])
+
+        let unownedType = Bytecode.ValueType.nonOwningReference(
+            kind: .unowned,
+            pointee: .local(owner)
+        )
+        let unowned = try CanonicalSIL.ManagedCaptureStorage.normalize(
+            body: "bb0(%0 : @closureCapture $*@sil_unowned Fixture.Owner):",
+            role: .closureBody,
+            parameters: [.address(unownedType)],
+            parameterConventions: [.inout],
+            erasedPhysicalIndices: [],
+            hasIndirectResult: false,
+            hasIndirectError: false
+        )
+        #expect(unowned.parameters == [unownedType])
+        #expect(unowned.parameterConventions == [.owned])
+        #expect(unowned.logicalIndices == [0])
+    }
+
+    @Test("Non-owning capture ABI rejects mismatched ownership markers")
+    func rejectsMalformedNonOwningCaptureABI() {
+        let owner = Bytecode.LocalTypeKey(rawValue: "Fixture.Owner")
+        let weakType = Bytecode.ValueType.nonOwningReference(
+            kind: .weak,
+            pointee: .optional(.local(owner))
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.ManagedCaptureStorage.normalize(
+                body: "bb0(%0 : @closureCapture $*@sil_unowned Fixture.Owner):",
+                role: .ordinary,
+                parameters: [.address(weakType)],
+                parameterConventions: [.inout],
+                erasedPhysicalIndices: [],
+                hasIndirectResult: false,
+                hasIndirectError: false
             )
         }
     }

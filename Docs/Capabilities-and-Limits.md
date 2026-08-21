@@ -436,6 +436,12 @@ does not by itself certify a physical device or distribution channel.
   invocation;
   `escaping-closure-values-1` gates return and
   nested-capture semantics, while `mutable-captures-1` gates managed cells.
+  Safe `weak` and checked `unowned` capture lists, plus captured weak local
+  variables, use the same managed-capture ABI. The shared non-retaining handle
+  accepts patch-local classes and frozen native reference identities: weak
+  loads become `nil` after deallocation, while a dead checked-unowned load is a
+  controlled VM trap. `non-owning-references-1` gates this storage and every
+  instruction that creates or accesses it.
   Compiler-emitted fully concrete specializations are also supported when no
   archetype, metadata, or witness dependency remains.
 - Top-level non-suspending `async`, `async throws`, and `@MainActor async`
@@ -505,9 +511,11 @@ does not by itself certify a physical device or distribution channel.
 - A closure crossing a Shell Entry or NativeImport boundary, being persisted in
   native/global/native-property state, or outliving its pinned HLVM invocation
   or generation. Async and `@Sendable` closure semantics remain unsupported.
-  Weak and unowned capture ownership is not yet represented. A caller-owned
-  `inout` value may be captured only by the verified lexical nonescaping path
-  above; an escaping capture remains fail-closed.
+  `unowned(unsafe)` is rejected because its dangling reference cannot be made
+  safe, and weak/unowned stored properties are not yet a patch-local nominal
+  layout feature. A caller-owned `inout` value may be captured only by the
+  verified lexical nonescaping path above; an escaping capture remains
+  fail-closed.
 - `String.Index`, index-based String subscripting or mutation, UTF-8/UTF-16/
   Unicode-scalar views, locale-sensitive or Foundation text APIs, and
   Character properties not listed above. These remain fail-closed rather than

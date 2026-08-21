@@ -51,6 +51,9 @@ public final class NativeValue: @unchecked Sendable, Hashable, CustomStringConve
     public let estimatedByteCount: UInt64
 
     fileprivate let storage: Any
+    /// Kept alongside reference storage so weak handles observe the concrete
+    /// object identity rather than the lifetime of a copied NativeValue box.
+    fileprivate let referencedObject: AnyObject?
     private let equalsStorage: @Sendable (Any, Any) -> Bool
     private let hashStorage: @Sendable (Any, inout Hasher) -> Void
     private let describeStorage: @Sendable (Any) -> String
@@ -61,6 +64,7 @@ public final class NativeValue: @unchecked Sendable, Hashable, CustomStringConve
         layoutFingerprint: Core.Digest,
         estimatedByteCount: UInt64,
         storage: Any,
+        referencedObject: AnyObject? = nil,
         equals: @escaping @Sendable (Any, Any) -> Bool,
         hash: @escaping @Sendable (Any, inout Hasher) -> Void,
         describe: @escaping @Sendable (Any) -> String
@@ -70,6 +74,7 @@ public final class NativeValue: @unchecked Sendable, Hashable, CustomStringConve
         self.layoutFingerprint = layoutFingerprint
         self.estimatedByteCount = estimatedByteCount
         self.storage = storage
+        self.referencedObject = referencedObject
         equalsStorage = equals
         hashStorage = hash
         describeStorage = describe
@@ -96,6 +101,22 @@ public final class NativeValue: @unchecked Sendable, Hashable, CustomStringConve
 
     public var description: String {
         "\(canonicalTypeName)(\(describeStorage(storage)))"
+    }
+
+    fileprivate func attachingReferencedObject(
+        _ object: AnyObject
+    ) -> VM.NativeValue {
+        .init(
+            typeID: typeID,
+            canonicalTypeName: canonicalTypeName,
+            layoutFingerprint: layoutFingerprint,
+            estimatedByteCount: estimatedByteCount,
+            storage: storage,
+            referencedObject: object,
+            equals: equalsStorage,
+            hash: hashStorage,
+            describe: describeStorage
+        )
     }
 }
 
@@ -218,7 +239,7 @@ public struct NativeTypeOperations: Sendable {
         },
         describe: @escaping @Sendable (Value) -> String = { String(describing: $0) }
     ) -> Self {
-        Self(
+        return Self(
             id: id,
             canonicalName: canonicalName,
             kind: .reference,
@@ -313,8 +334,21 @@ public struct NativeTypeOperations: Sendable {
         self.copyStorage = copyStorage
     }
 
-    private func attachingReferenceClass(_ metatype: AnyClass) -> Self {
-        Self(
+    private func attachingReferenceClass<Value: AnyObject>(
+        _ metatype: Value.Type
+    ) -> Self {
+        let boxStorage = boxStorage
+        let copyStorage = copyStorage
+
+        @Sendable func attachReference(
+            _ value: VM.NativeValue
+        ) throws -> VM.NativeValue {
+            guard let object = value.value(as: Value.self) else {
+                throw VM.RuntimeTrap.nativeTypeMismatch(expected: id)
+            }
+            return value.attachingReferencedObject(object)
+        }
+        return Self(
             id: id,
             canonicalName: canonicalName,
             kind: kind,
@@ -323,8 +357,8 @@ public struct NativeTypeOperations: Sendable {
             requiresMainActor: requiresMainActor,
             estimatedSize: estimatedSize,
             referenceClass: .init(metatype),
-            boxStorage: boxStorage,
-            copyStorage: copyStorage
+            boxStorage: { try attachReference(boxStorage($0)) },
+            copyStorage: { try attachReference(copyStorage($0)) }
         )
     }
 
@@ -396,6 +430,16 @@ public struct NativeTypeCatalog: Sendable {
             throw VM.RuntimeTrap.unknownNativeType(value.typeID)
         }
         return try operations.copy(value)
+    }
+
+    func referencedObject(in value: VM.NativeValue) throws -> AnyObject {
+        guard let operations = operations[value.typeID],
+              operations.kind == .reference,
+              let object = value.referencedObject
+        else {
+            throw VM.RuntimeTrap.nativeTypeMismatch(expected: value.typeID)
+        }
+        return object
     }
 }
 }

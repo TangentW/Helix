@@ -1,4 +1,6 @@
+import Foundation
 import HelixBytecode
+import HelixCore
 import HelixVM
 import Testing
 @testable import HelixCompiler
@@ -516,6 +518,640 @@ struct ClosureValueSemanticsMatrix {
 
         #expect(try invoke(fixture, [integer(4), .bool(false)]) == integer(5))
         #expect(try invoke(fixture, [integer(4), .bool(true)]) == integer(12))
+    }
+
+    @Test("Weak capture lists preserve live references and zero dead references")
+    func lowersWeakReferenceCaptures() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+
+                func callback() -> () -> Int {
+                    { [weak self] in self?.value ?? -1 }
+                }
+            }
+
+            @inline(never)
+            private func makeExpiredCallback(_ value: Int) -> () -> Int {
+                let owner = Owner(value)
+                return owner.callback()
+            }
+
+            public func weakReferenceCapture(
+                _ value: Int,
+                _ keepAlive: Bool
+            ) -> Int {
+                if keepAlive {
+                    let owner = Owner(value)
+                    let callback = owner.callback()
+                    return callback()
+                }
+                return makeExpiredCallback(value)()
+            }
+            """,
+            functionName: "weakReferenceCapture",
+            moduleName: "HelixWeakReferenceCaptureFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(9), .bool(true)]) == integer(9))
+        #expect(try invoke(fixture, [integer(9), .bool(false)]) == integer(-1))
+    }
+
+    @Test("Weak captures zero when the final strong value dies in the same frame")
+    func releasesWeakCaptureReferentsWithinFrame() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            public func weakReferenceClearsInFrame(_ value: Int) -> Int {
+                var owner: Owner? = Owner(value)
+                let callback = { [weak owner] in owner?.value ?? -1 }
+                owner = nil
+                return callback()
+            }
+            """,
+            functionName: "weakReferenceClearsInFrame",
+            moduleName: "HelixWeakReferenceLifetimeFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(13)]) == integer(-1))
+    }
+
+    @Test("Weak captures observe release through patch-local value aggregates")
+    func releasesWeakCaptureReferentsFromStructStorage() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            private struct Holder {
+                var owner: Owner?
+            }
+
+            public func weakReferenceInStruct(_ value: Int) -> Int {
+                var holder = Holder(owner: Owner(value))
+                let callback = { [weak captured = holder.owner] in
+                    captured?.value ?? -1
+                }
+                holder.owner = nil
+                return callback()
+            }
+            """,
+            functionName: "weakReferenceInStruct",
+            moduleName: "HelixWeakReferenceStructLifetimeFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(29)]) == integer(-1))
+    }
+
+    @Test("Aggregate snapshots keep weak capture referents alive independently")
+    func preservesIndependentStructOwners() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            private struct Holder {
+                var owner: Owner?
+            }
+
+            public func weakReferenceWithSnapshot(_ value: Int) -> Int {
+                var holder = Holder(owner: Owner(value))
+                let snapshot = holder
+                let callback = { [weak captured = holder.owner] in
+                    captured?.value ?? -100
+                }
+                holder.owner = nil
+                return callback() + (snapshot.owner?.value ?? -1)
+            }
+            """,
+            functionName: "weakReferenceWithSnapshot",
+            moduleName: "HelixWeakReferenceStructSnapshotFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(37)]) == integer(74))
+    }
+
+    @Test("Tuple snapshots keep weak capture referents alive independently")
+    func preservesIndependentTupleOwners() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            public func weakReferenceWithTupleSnapshot(_ value: Int) -> Int {
+                var holder: (Owner?, Int) = (Owner(value), 1)
+                let snapshot = holder
+                let callback = { [weak captured = holder.0] in
+                    captured?.value ?? -100
+                }
+                holder.0 = nil
+                return callback() + (snapshot.0?.value ?? -1) + snapshot.1
+            }
+            """,
+            functionName: "weakReferenceWithTupleSnapshot",
+            moduleName: "HelixWeakReferenceTupleSnapshotFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(43)]) == integer(87))
+    }
+
+    @Test("Weak captures observe release through patch-local enum payloads")
+    func releasesWeakCaptureReferentsFromEnumStorage() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            private enum Holder {
+                case owner(Owner)
+                case empty
+            }
+
+            @inline(never)
+            private func observe(_ holder: Holder) -> () -> Int {
+                switch holder {
+                case .owner(let owner):
+                    return { [weak owner] in owner?.value ?? -1 }
+                case .empty:
+                    return { -2 }
+                }
+            }
+
+            public func weakReferenceInEnum(_ value: Int) -> Int {
+                var holder = Holder.owner(Owner(value))
+                let callback = observe(holder)
+                holder = .empty
+                return callback()
+            }
+            """,
+            functionName: "weakReferenceInEnum",
+            moduleName: "HelixWeakReferenceEnumLifetimeFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(41)]) == integer(-1))
+    }
+
+    @Test("Weak captures observe release through represented Array storage")
+    func releasesWeakCaptureReferentsFromArrayStorage() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            public func weakReferenceInArray(_ value: Int) -> Int {
+                var owners = [Owner(value)]
+                let callback = { [weak captured = owners[0]] in
+                    captured?.value ?? -1
+                }
+                owners.removeAll()
+                return callback()
+            }
+            """,
+            functionName: "weakReferenceInArray",
+            moduleName: "HelixWeakReferenceArrayLifetimeFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(31)]) == integer(-1))
+    }
+
+    @Test("Weak captures observe release through represented Dictionary values")
+    func releasesWeakCaptureReferentsFromDictionaryStorage() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            public func weakReferenceInDictionary(_ value: Int) -> Int {
+                var owners = ["owner": Owner(value)]
+                let callback = { [weak captured = owners["owner"]] in
+                    captured?.value ?? -1
+                }
+                owners.removeAll()
+                return callback()
+            }
+            """,
+            functionName: "weakReferenceInDictionary",
+            moduleName: "HelixWeakReferenceDictionaryLifetimeFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(47)]) == integer(-1))
+    }
+
+    @Test("Weak captures observe release through VM-owned Any storage")
+    func releasesWeakCaptureReferentsFromAnyStorage() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            public func weakReferenceInAny(_ value: Int) -> Int {
+                var erased: Any = Owner(value)
+                let callback = { [weak captured = erased as? Owner] in
+                    captured?.value ?? -1
+                }
+                erased = value
+                return callback()
+            }
+            """,
+            functionName: "weakReferenceInAny",
+            moduleName: "HelixWeakReferenceAnyLifetimeFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(53)]) == integer(-1))
+    }
+
+    @Test("Weak captures observe release through structured Error storage")
+    func releasesWeakCaptureReferentsFromErrorStorage() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            private struct Failure: Error {
+                let owner: Owner
+            }
+
+            private enum EmptyFailure: Error {
+                case empty
+            }
+
+            public func weakReferenceInError(_ value: Int) -> Int {
+                var failure: any Error = Failure(owner: Owner(value))
+                let callback = {
+                    [weak captured = (failure as? Failure)?.owner] in
+                    captured?.value ?? -1
+                }
+                failure = EmptyFailure.empty
+                return callback()
+            }
+            """,
+            functionName: "weakReferenceInError",
+            moduleName: "HelixWeakReferenceErrorLifetimeFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(59)]) == integer(-1))
+    }
+
+    @Test("Unowned captures load live references and trap safely after death")
+    func lowersUnownedReferenceCaptures() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+
+                func callback() -> () -> Int {
+                    { [unowned self] in self.value }
+                }
+            }
+
+            @inline(never)
+            private func makeExpiredCallback(_ value: Int) -> () -> Int {
+                let owner = Owner(value)
+                return owner.callback()
+            }
+
+            public func unownedReferenceCapture(
+                _ value: Int,
+                _ keepAlive: Bool
+            ) -> Int {
+                if keepAlive {
+                    let owner = Owner(value)
+                    let callback = owner.callback()
+                    return callback()
+                }
+                return makeExpiredCallback(value)()
+            }
+            """,
+            functionName: "unownedReferenceCapture",
+            moduleName: "HelixUnownedReferenceCaptureFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(11), .bool(true)]) == integer(11))
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [try integer(11), .bool(false)]
+            ) == .trapped(.danglingUnownedReference)
+        )
+    }
+
+    @Test("Unowned captures trap when the final strong value dies in the same frame")
+    func trapsUnownedCaptureAfterInFrameRelease() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            public func unownedReferenceDiesInFrame(_ value: Int) -> Int {
+                var owner: Owner? = Owner(value)
+                let callback = { [unowned captured = owner!] in
+                    captured.value
+                }
+                owner = nil
+                return callback()
+            }
+            """,
+            functionName: "unownedReferenceDiesInFrame",
+            moduleName: "HelixUnownedReferenceLifetimeFixture"
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [try integer(17)]
+            ) == .trapped(.danglingUnownedReference)
+        )
+    }
+
+    @Test("Optional unowned captures distinguish explicit nil from a dead referent")
+    func lowersOptionalUnownedCaptures() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            public func optionalUnownedCapture(
+                _ value: Int,
+                _ createOwner: Bool
+            ) -> Int {
+                var owner: Owner? = createOwner ? Owner(value) : nil
+                let callback = { [unowned captured = owner] in
+                    captured?.value ?? -1
+                }
+                if createOwner {
+                    owner = nil
+                }
+                return callback()
+            }
+            """,
+            functionName: "optionalUnownedCapture",
+            moduleName: "HelixOptionalUnownedCaptureFixture"
+        )
+
+        #expect(
+            try invoke(fixture, [integer(23), .bool(false)]) == integer(-1)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [try integer(23), .bool(true)]
+            ) == .trapped(.danglingUnownedReference)
+        )
+    }
+
+    @Test("Unsafe unowned captures fail closed instead of exposing raw references")
+    func rejectsUnsafeUnownedCaptures() {
+        do {
+            _ = try FrontendExecutionHarness.compile(
+                source: """
+                private final class Owner {
+                    let value: Int
+
+                    init(_ value: Int) {
+                        self.value = value
+                    }
+                }
+
+                public func unsafeUnownedCapture(_ value: Int) -> Int {
+                    let owner = Owner(value)
+                    return { [unowned(unsafe) owner] in owner.value }()
+                }
+                """,
+                functionName: "unsafeUnownedCapture",
+                moduleName: "HelixUnsafeUnownedCaptureFixture"
+            )
+            Issue.record("unsafe unowned capture unexpectedly compiled")
+        } catch let error as PatchCompiler.CompilationError {
+            guard case let .generatedFunctionUnsupported(_, reason) = error else {
+                Issue.record("unexpected unsafe-unowned diagnostic: \(error)")
+                return
+            }
+            #expect(reason.contains("unmanaged reference storage"))
+        } catch {
+            Issue.record("unexpected unsafe-unowned error: \(error)")
+        }
+    }
+
+    @Test("Capture lists compose weak and unowned storage generically")
+    func lowersMixedNonOwningCaptureLists() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            public func mixedNonOwningCaptures(_ value: Int) -> Int {
+                let first = Owner(value)
+                let second = Owner(value + 1)
+                let callback = { [weak first, unowned second] in
+                    (first?.value ?? -100) + second.value
+                }
+                return callback()
+            }
+            """,
+            functionName: "mixedNonOwningCaptures",
+            moduleName: "HelixMixedNonOwningCapturesFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(8)]) == integer(17))
+    }
+
+    @Test("Weak local variables remain zeroing when captured by a closure")
+    func lowersCapturedWeakLocalVariables() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            public func capturedWeakLocal(_ value: Int) -> Int {
+                var strong: Owner? = Owner(value)
+                weak var observed = strong
+                let callback = { observed?.value ?? -1 }
+                strong = nil
+                return callback()
+            }
+            """,
+            functionName: "capturedWeakLocal",
+            moduleName: "HelixCapturedWeakLocalFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(19)]) == integer(-1))
+    }
+
+    @Test("Captured weak local variables share reassignment with their closure")
+    func reassignsCapturedWeakLocalVariables() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            public func reassignCapturedWeakLocal(
+                _ firstValue: Int,
+                _ secondValue: Int,
+                _ clear: Bool
+            ) -> Int {
+                let first = Owner(firstValue)
+                let second = Owner(secondValue)
+                weak var observed = first
+                let callback = {
+                    if clear {
+                        observed = nil
+                    } else {
+                        observed = second
+                    }
+                }
+                callback()
+                return observed?.value ?? -1
+            }
+            """,
+            functionName: "reassignCapturedWeakLocal",
+            moduleName: "HelixReassignedWeakLocalFixture"
+        )
+
+        #expect(
+            try invoke(fixture, [integer(5), integer(27), .bool(false)])
+                == integer(27)
+        )
+        #expect(
+            try invoke(fixture, [integer(5), integer(27), .bool(true)])
+                == integer(-1)
+        )
+    }
+
+    @Test("Weak captures preserve frozen native reference identity end to end")
+    func lowersWeakNativeReferenceCaptures() throws {
+        let typeID = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let layout = Core.Digest.sha256("Foundation.NSObject.layout.v1")
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            import Foundation
+
+            public func weakNativeReferenceCapture(_ object: NSObject) -> Bool {
+                let callback = { [weak object] in
+                    switch object {
+                    case .some: true
+                    case .none: false
+                    }
+                }
+                return callback()
+            }
+            """,
+            functionName: "weakNativeReferenceCapture",
+            moduleName: "HelixWeakNativeReferenceCaptureFixture",
+            nativeTypes: [
+                .init(
+                    id: typeID,
+                    canonicalName: "Foundation.NSObject",
+                    kind: .reference,
+                    layoutFingerprint: layout,
+                    isCopyable: true,
+                    isEmittedToDevice: true,
+                    estimatedSize: 8
+                ),
+            ]
+        )
+        let operations = VM.NativeTypeOperations.reference(
+            id: typeID,
+            canonicalName: "Foundation.NSObject",
+            layoutFingerprint: layout,
+            estimatedSize: 8,
+            estimatedByteCount: { (_: NSObject) in 8 }
+        )
+        let object = NSObject()
+        let boxed = try operations.box(object)
+
+        #expect(
+            VM.Interpreter(
+                nativeTypeCatalog: try VM.NativeTypeCatalog([operations])
+            ).invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [.native(boxed)]
+            ) == .returned(.bool(true))
+        )
     }
 
     @Test("Nonescaping closures may capture caller-scoped inout storage")

@@ -211,6 +211,35 @@ public struct Lowerer: Sendable {
         var index: Int
     }
 
+    private enum StrongReferenceOperation: Equatable {
+        case retain
+        case release
+    }
+
+    /// Swift may publish an existential box into strong storage before its
+    /// projected payload is initialized. HLBC represents the completed Error
+    /// value rather than that physical box, so these ownership-only uses are
+    /// replayed once the semantic value exists.
+    private enum DeferredErrorExistentialOperation {
+        case strong(
+            StrongReferenceOperation,
+            block: Bytecode.BlockID
+        )
+        case store(
+            destination: String,
+            mode: Bytecode.StackStoreMode,
+            sourceLine: Int,
+            block: Bytecode.BlockID
+        )
+
+        var block: Bytecode.BlockID {
+            switch self {
+            case let .strong(_, block): block
+            case let .store(_, _, _, block): block
+            }
+        }
+    }
+
     private struct OptionalAddressInitialization {
         var wrappedType: Bytecode.ValueType
         var payload: Bytecode.Register?
@@ -507,7 +536,7 @@ public struct Lowerer: Sendable {
         expectedEffects: Core.Effects?
     ) throws -> PreparedLowering {
         var signature = try parseFunctionType(function.loweredType)
-        let mutableCaptures = try CanonicalSIL.MutableCaptures.normalize(
+        let managedCaptures = try CanonicalSIL.ManagedCaptureStorage.normalize(
             body: function.body,
             role: kind,
             parameters: signature.parameters,
@@ -518,8 +547,8 @@ public struct Lowerer: Sendable {
             hasIndirectResult: signature.hasIndirectResult,
             hasIndirectError: signature.indirectErrorType != nil
         )
-        signature.parameters = mutableCaptures.parameters
-        signature.parameterConventions = mutableCaptures.parameterConventions
+        signature.parameters = managedCaptures.parameters
+        signature.parameterConventions = managedCaptures.parameterConventions
         let hostedMethodContext = try typeEnvironment.hostedMethodContext(
             for: function
         )
@@ -740,7 +769,8 @@ public struct Lowerer: Sendable {
         var runtimeStackSlots: [String: Bytecode.StackSlot] = [:]
         var runtimeAddressValues: [String: Bytecode.Register] = [:]
         var runtimeAddressPointees: [String: Bytecode.ValueType] = [:]
-        let mutableCaptureState = CanonicalSIL.MutableCaptures.LoweringState()
+        let mutableCaptureState = CanonicalSIL.ManagedCaptureStorage
+            .LoweringState()
         var pendingMutableBoxes: [String: Bytecode.ValueType] = [:]
         var mutableBoxProjectionRoots: [String: String] = [:]
         var scopedRuntimeAddresses = Set<String>()
@@ -850,6 +880,9 @@ public struct Lowerer: Sendable {
         var typedErrorBoxTypes: [String: Bytecode.LocalTypeKey] = [:]
         var projectedBoxByAddress: [String: String] = [:]
         var errorMessageByBox: [String: String] = [:]
+        var deferredErrorExistentialOperations: [
+            String: [DeferredErrorExistentialOperation]
+        ] = [:]
         var catchScratchAddresses = Set<String>()
         var implicitStackValues: [
             Bytecode.BlockID: [ImplicitStackValue]
@@ -936,6 +969,11 @@ public struct Lowerer: Sendable {
             let copy = try allocate(type: type)
             appendInstruction(.copyValue(result: copy, source: source))
             return copy
+        }
+
+        func requiresManagedOwnership(_ type: Bytecode.ValueType) -> Bool {
+            type.requiresLinearOwnership
+                || typeEnvironment.containsOwningReference(type)
         }
 
         func retainedValueAliasRoot(for token: String) -> String {
@@ -1071,7 +1109,7 @@ public struct Lowerer: Sendable {
                 }
                 return retained
             }
-            guard type.requiresLinearOwnership else { return value }
+            guard requiresManagedOwnership(type) else { return value }
             if let temporary = borrowedTemporaryValue(for: token) {
                 guard temporary == value else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -1126,7 +1164,7 @@ public struct Lowerer: Sendable {
             value: Bytecode.Register
         ) throws {
             let type = registerTypes[Int(value.rawValue)]
-            guard type.requiresLinearOwnership else { return }
+            guard requiresManagedOwnership(type) else { return }
             let retained = try copyOwnedValue(value)
             if let temporary = borrowedTemporaryValue(for: token) {
                 guard temporary == value else {
@@ -1305,6 +1343,20 @@ public struct Lowerer: Sendable {
         func mutableCellPointee(at token: String) -> Bytecode.ValueType? {
             (mutableCaptureState.addresses[token]
                 ?? mutableCaptureState.addresses[addressBase(token)])?.pointee
+        }
+
+        func nonOwningReference(
+            at token: String
+        ) -> Bytecode.Register? {
+            for candidate in [token, addressBase(token)] {
+                guard let register = values[candidate],
+                      case .nonOwningReference = registerTypes[
+                        Int(register.rawValue)
+                      ]
+                else { continue }
+                return register
+            }
+            return nil
         }
 
         func isKnownSomeOptionalAddress(
@@ -1750,6 +1802,9 @@ public struct Lowerer: Sendable {
             if let value = stackValue(at: token) {
                 return value
             }
+            if let reference = nonOwningReference(at: token) {
+                return reference
+            }
             guard runtimeAddress(at: token) == nil,
                   mutableCell(at: token) == nil
             else { return nil }
@@ -1839,7 +1894,7 @@ public struct Lowerer: Sendable {
                 }
                 return .init(
                     register: copy,
-                    temporaryOwner: type.requiresLinearOwnership ? copy : nil
+                    temporaryOwner: requiresManagedOwnership(type) ? copy : nil
                 )
             }
             guard let stored = try resolvedStackValue(at: token, line: line),
@@ -1917,12 +1972,29 @@ public struct Lowerer: Sendable {
                 return result
             }
             guard let stored = try resolvedStackValue(at: token, line: line),
-                  !type.requiresLinearOwnership
+                  !requiresManagedOwnership(type)
                     || !isBorrowedValue(token: token, register: stored)
             else { return nil }
             removeCompilerAddressValue(at: token)
             invalidateOptionalStorageFacts(at: token)
             return stored
+        }
+
+        func transferAddressCastSource(
+            mode: String,
+            at token: String,
+            line: Int
+        ) throws -> Bytecode.Register? {
+            switch mode {
+            case "take_always":
+                return try takeStoredValue(at: token, line: line)
+            case "copy_on_success":
+                return try copyStoredValue(at: token, line: line)
+            default:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "checked address cast has unknown ownership mode \(mode)"
+                )
+            }
         }
 
         func destroyRuntimeStoredValue(
@@ -2129,11 +2201,21 @@ public struct Lowerer: Sendable {
                 line: currentSILLineIndex + 1
                ),
                previous != value,
-               registerTypes[Int(previous.rawValue)].requiresLinearOwnership {
+               requiresManagedOwnership(
+                   registerTypes[Int(previous.rawValue)]
+               ),
+               !values.contains(where: { candidate, registered in
+                   registered == previous
+                       && addressBase(candidate) != addressBase(token)
+                       && hasFutureSemanticUse(
+                           of: candidate,
+                           after: currentSILLineIndex
+                       )
+               }) {
                 // Compiler-only addresses elide VM storage instructions, but
-                // assignment still ends the previous stored ownership. Keep
-                // that release in the shared storage sink so every synthesized
-                // mutating operation follows the same rule.
+                // assignment still ends the previous stored ownership unless
+                // SIL first moved it into an SSA value whose later release is
+                // the ownership endpoint.
                 appendInstruction(.destroyValue(previous))
             }
             recordCompilerAddressValue(value, at: token)
@@ -2373,13 +2455,13 @@ public struct Lowerer: Sendable {
                     if consumes {
                         stored = try takeStoredValue(at: token, line: line)
                     } else if convention == .borrowed,
-                              logicalType.requiresLinearOwnership,
+                              requiresManagedOwnership(logicalType),
                               runtimeAddress(at: token) == nil {
                         stored = try resolvedStackValue(at: token, line: line)
                     } else {
                         stored = try copyStoredValue(at: token, line: line)
                         if convention == .borrowed,
-                           logicalType.requiresLinearOwnership,
+                           requiresManagedOwnership(logicalType),
                            let stored {
                             temporaryOwners.append(stored)
                         }
@@ -3293,20 +3375,23 @@ public struct Lowerer: Sendable {
             path: ArraySlice<Int>,
             prefix: [Int] = [],
             with replacement: Bytecode.Register,
+            preservingCurrentValue: Bool = false,
             updatedValues: inout [[Int]: Bytecode.Register]
         ) throws -> Bytecode.Register {
             guard registerTypes[Int(currentValue.rawValue)] == type else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "projected Optional writeback has a mismatched aggregate value"
+                    "projected aggregate writeback has a mismatched value"
                 )
             }
             guard let fieldIndex = path.first else {
                 guard registerTypes[Int(replacement.rawValue)] == type else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "projected Optional writeback has a mismatched replacement"
+                        "projected aggregate writeback has a mismatched replacement"
                     )
                 }
-                if currentValue != replacement, type.requiresLinearOwnership {
+                if currentValue != replacement,
+                   !preservingCurrentValue,
+                   !type.isTrivial {
                     appendInstruction(.destroyValue(currentValue))
                 }
                 updatedValues[prefix] = replacement
@@ -3323,10 +3408,14 @@ public struct Lowerer: Sendable {
                         "projected Optional tuple writeback is out of bounds"
                     )
                 }
+                let projectionSource = preservingCurrentValue
+                    && requiresManagedOwnership(type)
+                    ? try copyOwnedValue(currentValue)
+                    : currentValue
                 childTypes = types
                 children = try types.map { try allocate(type: $0) }
                 appendInstruction(
-                    .unpackTuple(results: children, tuple: currentValue)
+                    .unpackTuple(results: children, tuple: projectionSource)
                 )
                 rebuild = { fields in
                     let result = try allocate(type: type)
@@ -3366,9 +3455,16 @@ public struct Lowerer: Sendable {
                     )
                     return result
                 }
+                if !preservingCurrentValue {
+                    // `struct_extract` copies each field. The compiler-storage
+                    // owner being replaced must end after those copies are
+                    // materialized; otherwise an obsolete aggregate can keep
+                    // a class referent alive past a weak/unowned observation.
+                    appendInstruction(.destroyValue(currentValue))
+                }
             default:
                 throw CanonicalSIL.LoweringError.unsupportedType(
-                    "projected Optional writeback requires a represented aggregate"
+                    "projected writeback requires a represented aggregate"
                 )
             }
 
@@ -3387,6 +3483,59 @@ public struct Lowerer: Sendable {
             let rebuilt = try rebuild(rebuiltChildren)
             updatedValues[prefix] = rebuilt
             return rebuilt
+        }
+
+        /// Applies a field write to compiler-elided aggregate storage. Runtime
+        /// addresses perform this reconstruction in `MemoryCell`; compiler-only
+        /// storage must publish the rebuilt root and every already-formed field
+        /// projection explicitly so no projection can retain a stale owner.
+        func storeCompilerAggregateProjection(
+            _ value: Bytecode.Register,
+            at token: String
+        ) throws -> Bool {
+            guard runtimeAddress(at: token) == nil,
+                  mutableCell(at: token) == nil
+            else { return false }
+            let identity = compilerStorageIdentity(for: token)
+            guard !identity.path.isEmpty,
+                  let rootType = compilerAddressType(identity.root),
+                  let currentValue = stackValue(at: identity.root),
+                  registerTypes[Int(currentValue.rawValue)] == rootType
+            else { return false }
+
+            let preservesRoot = values.contains { candidate, registered in
+                registered == currentValue
+                    && compilerStorageIdentity(for: candidate).root
+                        != identity.root
+                    && hasFutureSemanticUse(
+                        of: candidate,
+                        after: currentSILLineIndex
+                    )
+            }
+            var updatedValues: [[Int]: Bytecode.Register] = [:]
+            let rebuilt = try replacingAggregateProjection(
+                in: currentValue,
+                type: rootType,
+                path: identity.path[...],
+                with: value,
+                preservingCurrentValue: preservesRoot,
+                updatedValues: &updatedValues
+            )
+            recordCompilerAddressValue(rebuilt, at: identity.root)
+            values[identity.root] = rebuilt
+
+            for candidate in aggregateComponentAddresses.keys {
+                let candidateIdentity = compilerStorageIdentity(for: candidate)
+                guard candidateIdentity.root == identity.root,
+                      let updated = updatedValues[candidateIdentity.path]
+                else { continue }
+                if let key = tupleComponentStorageKey(for: candidate) {
+                    tupleComponentValues[key] = updated
+                } else {
+                    stackAddressValues[addressBase(candidate)] = updated
+                }
+            }
+            return true
         }
 
         func storeConstructedValue(
@@ -3517,6 +3666,9 @@ public struct Lowerer: Sendable {
                 optionalAddressInitializations[root] = initialization
                 return
             }
+            if try storeCompilerAggregateProjection(value, at: token) {
+                return
+            }
             try storeVMValue(value, at: token, requestedMode: mode)
         }
 
@@ -3534,7 +3686,105 @@ public struct Lowerer: Sendable {
             appendInstruction(
                 .constantString(result: value, value: message)
             )
+            values[token] = value
             return value
+        }
+
+        func applyStrongReferenceOperation(
+            _ operation: StrongReferenceOperation,
+            to token: String,
+            value: Bytecode.Register
+        ) throws {
+            if operation == .release,
+               let retained = takePendingRetainedValue(for: token) {
+                appendInstruction(.destroyValue(retained))
+                return
+            }
+            let type = registerTypes[Int(value.rawValue)]
+            if case .closure = type { return }
+            if case .mutableCell = type { return }
+            if case .nonOwningReference = type { return }
+            guard type == .string || type == .error
+                    || requiresManagedOwnership(type)
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "strong ownership operation references an unmanaged value"
+                )
+            }
+            if operation == .retain {
+                try materializeRetain(of: token, value: value)
+            } else if borrowedTemporaryValue(for: token) != nil
+                || !isBorrowedValue(token: token, register: value) {
+                try closeBorrowedTemporaryLifetime(
+                    for: token,
+                    resolved: value
+                )
+                appendInstruction(.destroyValue(value))
+            }
+        }
+
+        func storeErrorExistential(
+            _ box: String,
+            at destination: String,
+            mode: Bytecode.StackStoreMode,
+            sourceLine: Int
+        ) throws {
+            guard let destinationType = compilerAddressType(destination),
+                  [.string, .error].contains(destinationType),
+                  let materialized = try materializeErrorValue(from: box),
+                  registerTypes[Int(materialized.rawValue)] == destinationType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Error existential box does not match its destination"
+                )
+            }
+            let value = try prepareStoredValue(
+                box,
+                expectedType: destinationType,
+                line: sourceLine
+            )
+            try storeConstructedValue(value, at: destination, mode: mode)
+        }
+
+        func finishErrorExistentialInitialization(
+            _ box: String
+        ) throws {
+            guard values[box] != nil,
+                  let block = current?.id
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Error existential payload did not materialize its box"
+                )
+            }
+            let deferred = deferredErrorExistentialOperations
+                .removeValue(forKey: box) ?? []
+            guard deferred.allSatisfy({ $0.block == block }) else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Error existential initialization crosses a basic block"
+                )
+            }
+            for operation in deferred {
+                switch operation {
+                case let .strong(ownership, _):
+                    guard let value = values[box] else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Error existential ownership lost its materialized value"
+                        )
+                    }
+                    try applyStrongReferenceOperation(
+                        ownership,
+                        to: box,
+                        value: value
+                    )
+                case let .store(destination, mode, sourceLine, _):
+                    try storeErrorExistential(
+                        box,
+                        at: destination,
+                        mode: mode,
+                        sourceLine: sourceLine
+                    )
+                }
+            }
         }
 
         func lowerMutatingValueReceiverApply(
@@ -3815,7 +4065,7 @@ public struct Lowerer: Sendable {
             )
             return (
                 result,
-                arrayType.requiresLinearOwnership ? result : nil
+                requiresManagedOwnership(arrayType) ? result : nil
             )
         }
 
@@ -4160,7 +4410,7 @@ public struct Lowerer: Sendable {
                 [right, left],
                 closureSignature.parameterConventions
             ).compactMap { register, convention in
-                plan.elementType.requiresLinearOwnership
+                requiresManagedOwnership(plan.elementType)
                     && convention == .borrowed
                     ? IntermediateRepresentation.Instruction
                         .destroyValue(register)
@@ -4350,7 +4600,7 @@ public struct Lowerer: Sendable {
                 errorTarget: errorTarget,
                 line: line
             )
-            let elementNeedsCleanup = plan.elementType.requiresLinearOwnership
+            let elementNeedsCleanup = requiresManagedOwnership(plan.elementType)
                 && context.closureSignature.parameterConventions[0] != .owned
 
             let lowSlot = try allocateStackSlot(type: .int64)
@@ -4695,7 +4945,7 @@ public struct Lowerer: Sendable {
                     "half-stable removal omitted its traversal snapshot"
                 )
             }
-            let elementNeedsCleanup = plan.elementType.requiresLinearOwnership
+            let elementNeedsCleanup = requiresManagedOwnership(plan.elementType)
                 && context.closureSignature.parameterConventions[0] != .owned
 
             let indexSlot = try allocateStackSlot(type: .int64)
@@ -5234,7 +5484,7 @@ public struct Lowerer: Sendable {
                 ]
             )
             let borrowedElementCleanup: [IntermediateRepresentation.Instruction]
-            if plan.elementType.requiresLinearOwnership,
+            if requiresManagedOwnership(plan.elementType),
                signature.parameterConventions[0] == .borrowed {
                 borrowedElementCleanup = [.destroyValue(element)]
             } else {
@@ -5412,7 +5662,7 @@ public struct Lowerer: Sendable {
                 )
             )
             if let initialDictionary,
-               plan.dictionaryType.requiresLinearOwnership {
+               requiresManagedOwnership(plan.dictionaryType) {
                 appendInstruction(.destroyValue(initialDictionary))
             }
 
@@ -5442,7 +5692,7 @@ public struct Lowerer: Sendable {
             let next = try allocate(type: .optional(plan.elementType))
             let element = try allocate(type: plan.elementType)
             let sourceCleanup: [IntermediateRepresentation.Instruction] =
-                plan.sourceType.requiresLinearOwnership
+                requiresManagedOwnership(plan.sourceType)
                     ? [.destroyValue(source)] : []
 
             appendInstruction(.branch(target: loop, arguments: []))
@@ -5477,16 +5727,16 @@ public struct Lowerer: Sendable {
                 let missing = try allocateSyntheticBlockID()
                 let combinedValue = try allocateSyntheticBlockID()
                 let keyCleanup: [IntermediateRepresentation.Instruction] =
-                    plan.keyType.requiresLinearOwnership
+                    requiresManagedOwnership(plan.keyType)
                         ? [.destroyValue(key)] : []
                 let incomingCleanup: [IntermediateRepresentation.Instruction] =
-                    plan.valueType.requiresLinearOwnership
+                    requiresManagedOwnership(plan.valueType)
                         ? [.destroyValue(incoming)] : []
                 let existingCleanup: [IntermediateRepresentation.Instruction] =
-                    plan.valueType.requiresLinearOwnership
+                    requiresManagedOwnership(plan.valueType)
                         ? [.destroyValue(existing)] : []
                 let combinedCleanup: [IntermediateRepresentation.Instruction] =
-                    plan.valueType.requiresLinearOwnership
+                    requiresManagedOwnership(plan.valueType)
                         ? [.destroyValue(combined)] : []
 
                 appendSyntheticBlock(
@@ -5587,10 +5837,10 @@ public struct Lowerer: Sendable {
                 let key = try allocate(type: plan.keyType)
                 let classified = try allocateSyntheticBlockID()
                 let elementCleanup: [IntermediateRepresentation.Instruction] =
-                    plan.elementType.requiresLinearOwnership
+                    requiresManagedOwnership(plan.elementType)
                         ? [.destroyValue(element)] : []
                 let keyCleanup: [IntermediateRepresentation.Instruction] =
-                    plan.keyType.requiresLinearOwnership
+                    requiresManagedOwnership(plan.keyType)
                         ? [.destroyValue(key)] : []
                 appendSyntheticBlock(
                     id: some,
@@ -5794,7 +6044,7 @@ public struct Lowerer: Sendable {
             )
             let finalAccumulator = try allocate(type: plan.callResultType)
             let elementCleanup: [IntermediateRepresentation.Instruction] =
-                plan.inputType.requiresLinearOwnership
+                requiresManagedOwnership(plan.inputType)
                     ? [.destroyValue(element)] : []
 
             appendInstruction(.branch(target: loop, arguments: []))
@@ -6182,7 +6432,7 @@ public struct Lowerer: Sendable {
                         .finishArrayBuilder(result: buffered, builder: builder),
                         .makeDictionary(result: result, pairs: buffered),
                     ]
-                    if bufferedType.requiresLinearOwnership {
+                    if requiresManagedOwnership(bufferedType) {
                         instructions.append(.destroyValue(buffered))
                     }
                     return (result, instructions)
@@ -6193,7 +6443,7 @@ public struct Lowerer: Sendable {
                         .finishArrayBuilder(result: buffered, builder: builder),
                         .makeSet(result: result, source: buffered),
                     ]
-                    if bufferedType.requiresLinearOwnership {
+                    if requiresManagedOwnership(bufferedType) {
                         instructions.append(.destroyValue(buffered))
                     }
                     return (result, instructions)
@@ -6283,7 +6533,7 @@ public struct Lowerer: Sendable {
                     .makeTuple(result: pair, elements: [key, value]),
                     .arrayBuilderAppend(builder: builder, value: pair),
                 ]
-                if pairType.requiresLinearOwnership {
+                if requiresManagedOwnership(pairType) {
                     instructions.append(.destroyValue(pair))
                 }
                 return instructions
@@ -6369,7 +6619,7 @@ public struct Lowerer: Sendable {
                 let inputConvention = closureSignature.parameterConventions[
                     plan.operation == .reduce ? 1 : 0
                 ]
-                if plan.inputType.requiresLinearOwnership,
+                if requiresManagedOwnership(plan.inputType),
                    inputConvention == .owned,
                    plan.operation.retainsInputAfterCall {
                     let copy = try allocate(type: plan.inputType)
@@ -6380,7 +6630,7 @@ public struct Lowerer: Sendable {
                 } else {
                     closureInput = element
                 }
-                inputNeedsCleanup = plan.inputType.requiresLinearOwnership
+                inputNeedsCleanup = requiresManagedOwnership(plan.inputType)
                     && (inputConvention == .borrowed
                         || plan.operation.retainsInputAfterCall)
             } else {
@@ -6401,10 +6651,10 @@ public struct Lowerer: Sendable {
                 dictionaryProjectionInstructions = [
                     .unpackTuple(results: [key, value], tuple: element),
                 ]
-                if dictionaryTypes.key.requiresLinearOwnership {
+                if requiresManagedOwnership(dictionaryTypes.key) {
                     projectedFieldCleanup.append(.destroyValue(key))
                 }
-                if dictionaryTypes.value.requiresLinearOwnership {
+                if requiresManagedOwnership(dictionaryTypes.value) {
                     projectedFieldCleanup.append(.destroyValue(value))
                 }
                 func retainedClosureArgument(
@@ -6412,7 +6662,7 @@ public struct Lowerer: Sendable {
                     type: Bytecode.ValueType,
                     convention: Bytecode.ParameterConvention
                 ) throws -> Bytecode.Register {
-                    guard type.requiresLinearOwnership,
+                    guard requiresManagedOwnership(type),
                           convention == .owned
                     else { return register }
                     let copy = try allocate(type: type)
@@ -6451,8 +6701,9 @@ public struct Lowerer: Sendable {
                 closureInput = nil
                 inputNeedsCleanup = false
             }
-            let accumulatorNeedsCleanup = accumulatorType?
-                .requiresLinearOwnership == true
+            let accumulatorNeedsCleanup = accumulatorType.map(
+                requiresManagedOwnership
+            ) == true
                 && (plan.operation.isComparatorSelection
                     || closureSignature.parameterConventions[0] == .borrowed)
             let sourceCleanup = traversal.cleanup
@@ -6646,7 +6897,7 @@ public struct Lowerer: Sendable {
                         value: result
                     ),
                 ]
-                if plan.callResultType.requiresLinearOwnership {
+                if requiresManagedOwnership(plan.callResultType) {
                     instructions.append(.destroyValue(result))
                 }
                 instructions.append(contentsOf: closureArgumentCleanup)
@@ -6670,7 +6921,7 @@ public struct Lowerer: Sendable {
                         array: result
                     ),
                 ]
-                if plan.closureResultType.requiresLinearOwnership {
+                if requiresManagedOwnership(plan.closureResultType) {
                     instructions.append(.destroyValue(result))
                 }
                 instructions.append(contentsOf: closureArgumentCleanup)
@@ -6800,7 +7051,7 @@ public struct Lowerer: Sendable {
                             builder: builder,
                             value: mapped
                         ),
-                    ] + (mappedType.requiresLinearOwnership
+                    ] + (requiresManagedOwnership(mappedType)
                         ? [.destroyValue(mapped)] : [])
                         + [.branch(target: loop, arguments: [])]
                 )
@@ -6837,7 +7088,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 var instructions = resultMaterialization
-                if dictionaryTypes.value.requiresLinearOwnership {
+                if requiresManagedOwnership(dictionaryTypes.value) {
                     instructions.append(.destroyValue(originalValue))
                 }
                 instructions.append(
@@ -6881,7 +7132,7 @@ public struct Lowerer: Sendable {
                 var continuationInstructions: [
                     IntermediateRepresentation.Instruction
                 ] = []
-                if dictionaryTypes.value.requiresLinearOwnership {
+                if requiresManagedOwnership(dictionaryTypes.value) {
                     continuationInstructions.append(
                         .destroyValue(originalValue)
                     )
@@ -6909,7 +7160,7 @@ public struct Lowerer: Sendable {
                 )
                 appendSyntheticBlock(
                     id: skip,
-                    instructions: (dictionaryTypes.key.requiresLinearOwnership
+                    instructions: (requiresManagedOwnership(dictionaryTypes.key)
                         ? [.destroyValue(key)] : []) + [
                         .branch(target: loop, arguments: []),
                     ]
@@ -7039,7 +7290,7 @@ public struct Lowerer: Sendable {
                             builder: builder,
                             value: remainderElement
                         ),
-                    ] + (plan.inputType.requiresLinearOwnership
+                    ] + (requiresManagedOwnership(plan.inputType)
                         ? [.destroyValue(remainderElement)] : []) + [
                         .branch(target: remainderLoop, arguments: []),
                     ]
@@ -7335,14 +7586,14 @@ public struct Lowerer: Sendable {
                 )
                 appendSyntheticBlock(
                     id: challengerWins,
-                    instructions: (plan.inputType.requiresLinearOwnership
+                    instructions: (requiresManagedOwnership(plan.inputType)
                         ? [.destroyValue(candidate)] : []) + [
                         .branch(target: loop, arguments: [element]),
                     ]
                 )
                 appendSyntheticBlock(
                     id: candidateWins,
-                    instructions: (plan.inputType.requiresLinearOwnership
+                    instructions: (requiresManagedOwnership(plan.inputType)
                         ? [.destroyValue(element)] : []) + [
                         .branch(target: loop, arguments: [candidate]),
                     ]
@@ -8306,8 +8557,9 @@ public struct Lowerer: Sendable {
                 transformedValue = continuationResult
                 continuationInstructions = []
             }
-            let payloadNeedsCleanup = closureParameterType
-                .requiresLinearOwnership
+            let payloadNeedsCleanup = requiresManagedOwnership(
+                closureParameterType
+            )
                 && signature.parameterConventions[0] == .borrowed
             if payloadNeedsCleanup {
                 continuationInstructions.append(.destroyValue(payload))
@@ -8347,7 +8599,7 @@ public struct Lowerer: Sendable {
                 if isThrowing && payloadNeedsCleanup {
                     instructions.append(.destroyValue(payload))
                 } else if !isThrowing,
-                          plan.input.type.requiresLinearOwnership {
+                          requiresManagedOwnership(plan.input.type) {
                     // The impossible edge precedes the consuming Optional
                     // switch, so it still owns the materialized source.
                     instructions.append(.destroyValue(source))
@@ -8751,7 +9003,7 @@ public struct Lowerer: Sendable {
                         ?? resolve(token, line: line)
                 }
                 let cleanup: [IntermediateRepresentation.Instruction]
-                if consumesSource, sourceType.requiresLinearOwnership {
+                if consumesSource, requiresManagedOwnership(sourceType) {
                     cleanup = [.destroyValue(source)]
                 } else {
                     cleanup = borrowedSource?.temporaryOwner.map {
@@ -9593,7 +9845,7 @@ public struct Lowerer: Sendable {
                 let arrayType = Bytecode.ValueType.array(type.element)
                 return (
                     array,
-                    arrayType.requiresLinearOwnership
+                    requiresManagedOwnership(arrayType)
                         ? [.destroyValue(array)] : []
                 )
             }
@@ -9775,7 +10027,7 @@ public struct Lowerer: Sendable {
             let absentValue = try allocate(type: .bool)
             let result = try allocate(type: .bool)
             let elementCleanup: [IntermediateRepresentation.Instruction] =
-                elementType.requiresLinearOwnership
+                requiresManagedOwnership(elementType)
                     ? [.destroyValue(element)] : []
             let terminalCleanup = traversalCleanup(traversal)
                 + (needle.temporaryOwner.map { [.destroyValue($0)] } ?? [])
@@ -9893,10 +10145,10 @@ public struct Lowerer: Sendable {
             let noSelection = try allocate(type: .optional(elementType))
             let result = try allocate(type: .optional(elementType))
             let candidateCleanup: [IntermediateRepresentation.Instruction] =
-                elementType.requiresLinearOwnership
+                requiresManagedOwnership(elementType)
                     ? [.destroyValue(candidate)] : []
             let elementCleanup: [IntermediateRepresentation.Instruction] =
-                elementType.requiresLinearOwnership
+                requiresManagedOwnership(elementType)
                     ? [.destroyValue(element)] : []
             let terminalCleanup = traversalCleanup(traversal)
 
@@ -10085,13 +10337,13 @@ public struct Lowerer: Sendable {
                 let trailingElement = try allocate(type: elementType)
                 let equal = try allocate(type: .bool)
                 let lhsCleanup: [IntermediateRepresentation.Instruction] =
-                    elementType.requiresLinearOwnership
+                    requiresManagedOwnership(elementType)
                         ? [.destroyValue(lhsElement)] : []
                 let rhsCleanup: [IntermediateRepresentation.Instruction] =
-                    elementType.requiresLinearOwnership
+                    requiresManagedOwnership(elementType)
                         ? [.destroyValue(rhsElement)] : []
                 let trailingCleanup: [IntermediateRepresentation.Instruction] =
-                    elementType.requiresLinearOwnership
+                    requiresManagedOwnership(elementType)
                         ? [.destroyValue(trailingElement)] : []
 
                 appendInstruction(.branch(target: loop, arguments: []))
@@ -10200,10 +10452,10 @@ public struct Lowerer: Sendable {
                 let lhsElement = try allocate(type: elementType)
                 let equal = try allocate(type: .bool)
                 let rhsCleanup: [IntermediateRepresentation.Instruction] =
-                    elementType.requiresLinearOwnership
+                    requiresManagedOwnership(elementType)
                         ? [.destroyValue(rhsElement)] : []
                 let lhsCleanup: [IntermediateRepresentation.Instruction] =
-                    elementType.requiresLinearOwnership
+                    requiresManagedOwnership(elementType)
                         ? [.destroyValue(lhsElement)] : []
 
                 appendInstruction(.branch(target: loop, arguments: []))
@@ -10297,13 +10549,13 @@ public struct Lowerer: Sendable {
                 let lhsBefore = try allocate(type: .bool)
                 let rhsBefore = try allocate(type: .bool)
                 let lhsCleanup: [IntermediateRepresentation.Instruction] =
-                    elementType.requiresLinearOwnership
+                    requiresManagedOwnership(elementType)
                         ? [.destroyValue(lhsElement)] : []
                 let rhsCleanup: [IntermediateRepresentation.Instruction] =
-                    elementType.requiresLinearOwnership
+                    requiresManagedOwnership(elementType)
                         ? [.destroyValue(rhsElement)] : []
                 let trailingCleanup: [IntermediateRepresentation.Instruction] =
-                    elementType.requiresLinearOwnership
+                    requiresManagedOwnership(elementType)
                         ? [.destroyValue(trailingElement)] : []
 
                 appendInstruction(.branch(target: loop, arguments: []))
@@ -12304,7 +12556,7 @@ public struct Lowerer: Sendable {
                             indexBase: zero
                         )
                     )
-                    if sourceType.requiresLinearOwnership,
+                    if requiresManagedOwnership(sourceType),
                        source != materialized.array {
                         appendInstruction(.destroyValue(source))
                     }
@@ -13323,9 +13575,10 @@ public struct Lowerer: Sendable {
                     return result
                 }
 
-                func destroyLinearTemporary(_ value: Bytecode.Register) {
-                    if registerTypes[Int(value.rawValue)]
-                        .requiresLinearOwnership {
+                func destroyManagedTemporary(_ value: Bytecode.Register) {
+                    if requiresManagedOwnership(
+                        registerTypes[Int(value.rawValue)]
+                    ) {
                         appendInstruction(.destroyValue(value))
                     }
                 }
@@ -13397,7 +13650,7 @@ public struct Lowerer: Sendable {
                         to: upperBound,
                         with: empty
                     )
-                    destroyLinearTemporary(empty)
+                    destroyManagedTemporary(empty)
                     if edit.operation == .removeFirst,
                        destinationPlan.indexModel == .preservedBaseInteger {
                         let rebased = try allocate(type: elementsType)
@@ -13473,7 +13726,7 @@ public struct Lowerer: Sendable {
                         to: upperBound,
                         with: empty
                     )
-                    destroyLinearTemporary(empty)
+                    destroyManagedTemporary(empty)
                     if edit.operation == .removeFirstCount,
                        destinationPlan.indexModel == .preservedBaseInteger {
                         let rebased = try allocate(type: elementsType)
@@ -13588,8 +13841,8 @@ public struct Lowerer: Sendable {
                                 falseValue: reset
                             )
                         )
-                        destroyLinearTemporary(preserved)
-                        destroyLinearTemporary(reset)
+                        destroyManagedTemporary(preserved)
+                        destroyManagedTemporary(reset)
                     } else {
                         result = try makeEmptyRangeReplaceableStorage(
                             representation
@@ -13875,9 +14128,10 @@ public struct Lowerer: Sendable {
                     return result
                 }
 
-                func destroyLinearTemporary(_ value: Bytecode.Register) {
-                    if registerTypes[Int(value.rawValue)]
-                        .requiresLinearOwnership {
+                func destroyManagedTemporary(_ value: Bytecode.Register) {
+                    if requiresManagedOwnership(
+                        registerTypes[Int(value.rawValue)]
+                    ) {
                         appendInstruction(.destroyValue(value))
                     }
                 }
@@ -13958,7 +14212,7 @@ public struct Lowerer: Sendable {
                         to: index,
                         with: singleton
                     )
-                    destroyLinearTemporary(singleton)
+                    destroyManagedTemporary(singleton)
                     destroyTemporaryOwners([destination])
                     try storeConstructedValue(
                         result,
@@ -14055,7 +14309,7 @@ public struct Lowerer: Sendable {
                         to: upperBound,
                         with: empty
                     )
-                    destroyLinearTemporary(empty)
+                    destroyManagedTemporary(empty)
                     destroyTemporaryOwners([destination])
                     try storeConstructedValue(
                         removed,
@@ -14086,7 +14340,7 @@ public struct Lowerer: Sendable {
                         to: bounds.end,
                         with: empty
                     )
-                    destroyLinearTemporary(empty)
+                    destroyManagedTemporary(empty)
                     destroyTemporaryOwners([destination])
                     try storeConstructedValue(
                         result,
@@ -14302,8 +14556,9 @@ public struct Lowerer: Sendable {
                     )
                 )
                 for temporary in [array, element]
-                where registerTypes[Int(temporary.rawValue)]
-                    .requiresLinearOwnership {
+                where requiresManagedOwnership(
+                    registerTypes[Int(temporary.rawValue)]
+                ) {
                     appendInstruction(.destroyValue(temporary))
                 }
                 try storeConstructedValue(
@@ -14336,8 +14591,9 @@ public struct Lowerer: Sendable {
                     )
                 )
                 for temporary in [dictionary, key, update, previous]
-                where registerTypes[Int(temporary.rawValue)]
-                    .requiresLinearOwnership {
+                where requiresManagedOwnership(
+                    registerTypes[Int(temporary.rawValue)]
+                ) {
                     appendInstruction(.destroyValue(temporary))
                 }
                 try storeConstructedValue(
@@ -14469,7 +14725,9 @@ public struct Lowerer: Sendable {
                 appendInstruction(.makeArray(result: pairs, elements: []))
                 let result = try allocate(type: .dictionary(key: key, value: value))
                 appendInstruction(.makeDictionary(result: result, pairs: pairs))
-                if registerTypes[Int(pairs.rawValue)].requiresLinearOwnership {
+                if requiresManagedOwnership(
+                    registerTypes[Int(pairs.rawValue)]
+                ) {
                     appendInstruction(.destroyValue(pairs))
                 }
                 return result
@@ -14511,8 +14769,10 @@ public struct Lowerer: Sendable {
                 return (previous, updated)
             }
 
-            func destroyLinearTemporary(_ register: Bytecode.Register) {
-                if registerTypes[Int(register.rawValue)].requiresLinearOwnership {
+            func destroyManagedTemporary(_ register: Bytecode.Register) {
+                if requiresManagedOwnership(
+                    registerTypes[Int(register.rawValue)]
+                ) {
                     appendInstruction(.destroyValue(register))
                 }
             }
@@ -16492,8 +16752,9 @@ public struct Lowerer: Sendable {
                     )
                 )
                 for temporary in [array, value]
-                where registerTypes[Int(temporary.rawValue)]
-                    .requiresLinearOwnership {
+                where requiresManagedOwnership(
+                    registerTypes[Int(temporary.rawValue)]
+                ) {
                     appendInstruction(.destroyValue(temporary))
                 }
                 try storeConstructedValue(
@@ -16763,9 +17024,9 @@ public struct Lowerer: Sendable {
                     keyType: types.key,
                     valueType: types.value
                 )
-                destroyLinearTemporary(update)
-                destroyLinearTemporary(dictionary)
-                destroyLinearTemporary(mutation.previous)
+                destroyManagedTemporary(update)
+                destroyManagedTemporary(dictionary)
+                destroyManagedTemporary(mutation.previous)
                 try storeConstructedValue(
                     mutation.updated,
                     at: arguments[2],
@@ -16882,8 +17143,8 @@ public struct Lowerer: Sendable {
                     keyType: types.key,
                     valueType: types.value
                 )
-                destroyLinearTemporary(update)
-                destroyLinearTemporary(dictionary)
+                destroyManagedTemporary(update)
+                destroyManagedTemporary(dictionary)
                 try storeConstructedValue(
                     mutation.previous,
                     at: arguments[0],
@@ -16941,8 +17202,8 @@ public struct Lowerer: Sendable {
                     keyType: types.key,
                     valueType: types.value
                 )
-                destroyLinearTemporary(update)
-                destroyLinearTemporary(dictionary)
+                destroyManagedTemporary(update)
+                destroyManagedTemporary(dictionary)
                 try storeConstructedValue(
                     mutation.previous,
                     at: arguments[0],
@@ -17061,7 +17322,7 @@ public struct Lowerer: Sendable {
                 appendInstruction(
                     .makeDictionary(result: result, pairs: pairs)
                 )
-                destroyLinearTemporary(pairs)
+                destroyManagedTemporary(pairs)
 
             case .dictionaryUniqueKeysWithValues:
                 guard arguments.count == 2 else {
@@ -17094,7 +17355,7 @@ public struct Lowerer: Sendable {
                     type: .dictionary(key: types.key, value: types.value)
                 )
                 appendInstruction(.makeDictionary(result: result, pairs: pairs))
-                destroyLinearTemporary(pairs)
+                destroyManagedTemporary(pairs)
                 values[resultToken] = result
 
             case .dictionaryMakeIterator:
@@ -17781,7 +18042,7 @@ public struct Lowerer: Sendable {
             borrowedValueTokens.remove(token)
             if let value = mutableCaptureState.temporaryBorrowOwners.removeValue(
                 forKey: token
-            ), registerTypes[Int(value.rawValue)].requiresLinearOwnership,
+            ), requiresManagedOwnership(registerTypes[Int(value.rawValue)]),
                emitsRuntimeCleanup {
                 appendInstruction(.destroyValue(value))
             }
@@ -18000,7 +18261,7 @@ public struct Lowerer: Sendable {
                 storedValues.append(aggregate)
             }
             for value in Set(storedValues)
-            where registerTypes[Int(value.rawValue)].requiresLinearOwnership {
+            where requiresManagedOwnership(registerTypes[Int(value.rawValue)]) {
                 emitCleanup(.destroyValue(value))
             }
         }
@@ -18332,7 +18593,7 @@ public struct Lowerer: Sendable {
                     resolved
                 ).map { token, value -> Bytecode.ParameterConvention in
                     let type = registerTypes[Int(value.rawValue)]
-                    return type.requiresLinearOwnership
+                    return requiresManagedOwnership(type)
                         && isBorrowedValue(token: token, register: value)
                         ? .borrowed : .owned
                 }
@@ -18722,6 +18983,22 @@ public struct Lowerer: Sendable {
                 }
                 let type = try parseStoredType(stack[1])
                 stackAddressTypes[stack[0]] = type
+                if case let .nonOwningReference(.weak, pointee) = type {
+                    let reference = try allocate(
+                        type: .nonOwningReference(
+                            kind: .weak,
+                            pointee: pointee
+                        )
+                    )
+                    appendInstruction(
+                        .makeNonOwningReference(
+                            result: reference,
+                            initialValue: nil
+                        )
+                    )
+                    values[stack[0]] = reference
+                    continue
+                }
                 if type == .never {
                     guard mutableCapturePointees[stack[0]] == nil,
                           !storageInitializationPlan.runtimeStorageRoots.contains(
@@ -18806,6 +19083,19 @@ public struct Lowerer: Sendable {
                     stackAddressTypes[projection[0]] = pointee
                     continue
                 }
+                if let reference = values[projection[1]],
+                   case let .nonOwningReference(kind, pointee) = registerTypes[
+                    Int(reference.rawValue)
+                   ] {
+                    let type = Bytecode.ValueType.nonOwningReference(
+                        kind: kind,
+                        pointee: pointee
+                    )
+                    stackAddressTypes[projection[0]] = type
+                    addressAliases[projection[0]] = projection[1]
+                    values[projection[0]] = reference
+                    continue
+                }
                 guard let cell = values[projection[1]],
                       case let .mutableCell(pointee) = registerTypes[
                         Int(cell.rawValue)
@@ -18825,6 +19115,143 @@ public struct Lowerer: Sendable {
                 )
                 addressAliases[projection[0]] = projection[1]
                 values[projection[0]] = cell
+                continue
+            }
+
+            if let store = match(
+                line,
+                pattern: #"^store_weak (%[0-9]+) to(?: \[(init|assign)\])? (%[0-9]+)$"#
+            ) {
+                let source = try resolve(store[0], line: sourceLine)
+                let mode: Bytecode.StackStoreMode = store[1] == "init"
+                    ? .initialize : .assign
+                if let box = mutableBoxProjectionRoots.removeValue(
+                    forKey: store[2]
+                ), let type = pendingMutableBoxes.removeValue(forKey: box) {
+                    guard case let .nonOwningReference(.weak, pointee) = type,
+                          registerTypes[Int(source.rawValue)] == pointee,
+                          mode == .initialize,
+                          values[box] == nil
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "weak box initializer does not match its reference type"
+                        )
+                    }
+                    let reference = try allocate(type: type)
+                    appendInstruction(
+                        .makeNonOwningReference(
+                            result: reference,
+                            initialValue: source
+                        )
+                    )
+                    for token in [box, store[2]] {
+                        values[token] = reference
+                    }
+                    continue
+                }
+                guard let reference = nonOwningReference(at: store[2]),
+                      case let .nonOwningReference(.weak, pointee) =
+                        registerTypes[Int(reference.rawValue)],
+                      registerTypes[Int(source.rawValue)] == pointee
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "store_weak requires matching weak reference storage"
+                    )
+                }
+                appendInstruction(
+                    .storeNonOwningReference(
+                        reference: reference,
+                        source: source,
+                        mode: mode
+                    )
+                )
+                continue
+            }
+
+            if let load = match(
+                line,
+                pattern: #"^(%[0-9]+) = load_weak(?: \[(take)\])? (%[0-9]+)$"#
+            ) {
+                guard let reference = nonOwningReference(at: load[2]),
+                      case let .nonOwningReference(.weak, pointee) =
+                        registerTypes[Int(reference.rawValue)]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "load_weak requires weak reference storage"
+                    )
+                }
+                let result = try allocate(type: pointee)
+                values[load[0]] = result
+                appendInstruction(
+                    .loadNonOwningReference(
+                        result: result,
+                        reference: reference,
+                        mode: load[1] == "take" ? .take : .copy
+                    )
+                )
+                continue
+            }
+
+            if let conversion = match(
+                line,
+                pattern: #"^(%[0-9]+) = ref_to_unowned (%[0-9]+) to \$@sil_unowned (.+)$"#
+            ) {
+                let source = try resolve(conversion[1], line: sourceLine)
+                let type = try parseType("@sil_unowned \(conversion[2])")
+                guard case let .nonOwningReference(.unowned, pointee) = type,
+                      registerTypes[Int(source.rawValue)] == pointee
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "ref_to_unowned source does not match its reference type"
+                    )
+                }
+                let result = try allocate(type: type)
+                values[conversion[0]] = result
+                appendInstruction(
+                    .makeNonOwningReference(
+                        result: result,
+                        initialValue: source
+                    )
+                )
+                continue
+            }
+
+            if let conversion = match(
+                line,
+                pattern: #"^(%[0-9]+) = (?:strong_copy_unowned_value|unowned_to_ref) (%[0-9]+)$"#
+            ) {
+                let reference = try resolve(conversion[1], line: sourceLine)
+                guard case let .nonOwningReference(.unowned, pointee) =
+                    registerTypes[Int(reference.rawValue)]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "unowned-to-strong conversion requires an unowned reference"
+                    )
+                }
+                let result = try allocate(type: pointee)
+                values[conversion[0]] = result
+                appendInstruction(
+                    .loadNonOwningReference(
+                        result: result,
+                        reference: reference,
+                        mode: .copy
+                    )
+                )
+                continue
+            }
+
+            if let ownership = match(
+                line,
+                pattern: #"^unowned_(?:retain|release) (%[0-9]+)$"#
+            ) {
+                let reference = try resolve(ownership[0], line: sourceLine)
+                guard case .nonOwningReference(.unowned, _) =
+                    registerTypes[Int(reference.rawValue)]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "unowned ownership operation requires an unowned reference"
+                    )
+                }
                 continue
             }
 
@@ -19015,7 +19442,7 @@ public struct Lowerer: Sendable {
                     }
                     values[borrow[0]] = value
                     borrowedValueTokens.insert(borrow[0])
-                    if pointee.requiresLinearOwnership {
+                    if requiresManagedOwnership(pointee) {
                         mutableCaptureState.temporaryBorrowOwners[borrow[0]] = value
                     }
                     continue
@@ -19038,6 +19465,11 @@ public struct Lowerer: Sendable {
             ) {
                 let source = access[3]
                 let base = addressBase(source)
+                if let reference = nonOwningReference(at: source) {
+                    addressAliases[access[0]] = base
+                    values[access[0]] = reference
+                    continue
+                }
                 if let cell = mutableCell(at: source),
                    let pointee = mutableCellPointee(at: source) {
                     addressAliases[access[0]] = base
@@ -20219,6 +20651,14 @@ public struct Lowerer: Sendable {
                     == targetType {
                     let result = try allocate(type: .native(targetType))
                     values[cast[0]] = result
+                    if let retained = takePendingRetainedValue(for: cast[1]) {
+                        // `project_hosted_object` creates an independently
+                        // owned native superclass value. It replaces the
+                        // source-level retain that Swift carries through the
+                        // representation-only upcast; the matching release of
+                        // the cast result will close the native owner.
+                        appendInstruction(.destroyValue(retained))
+                    }
                     appendInstruction(
                         .projectHostedObject(result: result, object: source)
                     )
@@ -20325,7 +20765,7 @@ public struct Lowerer: Sendable {
                 }
                 let registers = try zip(operands, fields).map {
                     operand, field in
-                    try resolveStorableValue(
+                    try prepareOwnedValue(
                         operand,
                         expectedType: field.type,
                         line: sourceLine
@@ -20366,8 +20806,12 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = struct_extract (%[0-9]+), #(.+)\.([^.]+)$"#
             ), let key = typeEnvironment.localKey(for: extraction[2]) {
-                let structure = try resolve(extraction[1], line: sourceLine)
-                guard registerTypes[Int(structure.rawValue)] == .local(key) else {
+                let source = try resolve(extraction[1], line: sourceLine)
+                let structure = takePendingRetainedValue(for: extraction[1])
+                    ?? source
+                guard registerTypes[Int(source.rawValue)] == .local(key),
+                      registerTypes[Int(structure.rawValue)] == .local(key)
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "local struct_extract operand does not match \(key)"
                     )
@@ -20391,6 +20835,28 @@ public struct Lowerer: Sendable {
                         fieldIndex: fieldIndex
                     )
                 )
+                if structure != source {
+                    // A canonical `retain_value` immediately before
+                    // `struct_extract` owns the projected field, not a hidden
+                    // aggregate that may outlive it. Copy through that owner,
+                    // then close the aggregate ticket once projection has
+                    // materialized the field value.
+                    appendInstruction(.destroyValue(structure))
+                } else if requiresManagedOwnership(.local(key)),
+                          !isBorrowedValue(
+                            token: extraction[1],
+                            register: source
+                          ),
+                          !hasFutureSemanticUse(
+                            of: extraction[1],
+                            after: currentSILLineIndex
+                          ) {
+                    // The VM projection copies the selected field. End an
+                    // otherwise ownerless aggregate SSA value at its final
+                    // projection so nested class references do not gain an
+                    // implicit lifetime extension.
+                    appendInstruction(.destroyValue(source))
+                }
                 continue
             }
 
@@ -20398,8 +20864,12 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^\((%[0-9]+(?:, %[0-9]+)*)\) = destructure_struct (%[0-9]+)$"#
             ) {
-                let structure = try resolve(destructure[1], line: sourceLine)
-                guard case let .local(key) = registerTypes[Int(structure.rawValue)] else {
+                let source = try resolve(destructure[1], line: sourceLine)
+                let structure = takePendingRetainedValue(for: destructure[1])
+                    ?? source
+                guard case let .local(key) = registerTypes[Int(source.rawValue)],
+                      registerTypes[Int(structure.rawValue)] == .local(key)
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "destructure_struct operand is not a local struct"
                     )
@@ -20430,6 +20900,20 @@ public struct Lowerer: Sendable {
                             fieldIndex: fieldIndex
                         )
                     )
+                }
+                if structure != source
+                    || (requiresManagedOwnership(.local(key))
+                        && !isBorrowedValue(
+                            token: destructure[1],
+                            register: source
+                        )
+                        && !hasFutureSemanticUse(
+                            of: destructure[1],
+                            after: currentSILLineIndex
+                        )) {
+                    // Each field projection owns its copied value; retire the
+                    // aggregate ticket once all fields have been materialized.
+                    appendInstruction(.destroyValue(structure))
                 }
                 continue
             }
@@ -20837,8 +21321,9 @@ public struct Lowerer: Sendable {
                     )
                 )
                 for owner in captureTemporaryOwners
-                where registerTypes[Int(owner.rawValue)]
-                    .requiresLinearOwnership {
+                where requiresManagedOwnership(
+                    registerTypes[Int(owner.rawValue)]
+                ) {
                     // make_closure copies captures into its managed context;
                     // this owner represents Swift's explicit context retain.
                     appendInstruction(.destroyValue(owner))
@@ -21726,7 +22211,7 @@ public struct Lowerer: Sendable {
                         physicalTokens,
                         factory.physicalParameterTypes
                     ).map { token, expectedType in
-                        try resolveStorableValue(
+                        try prepareOwnedValue(
                             token,
                             expectedType: expectedType,
                             line: sourceLine
@@ -22670,7 +23155,7 @@ public struct Lowerer: Sendable {
                 if enumeration[3].isEmpty {
                     payload = nil
                 } else if let expectedPayload {
-                    payload = try resolveStorableValue(
+                    payload = try prepareOwnedValue(
                         enumeration[3],
                         expectedType: expectedPayload,
                         line: sourceLine
@@ -22866,7 +23351,16 @@ public struct Lowerer: Sendable {
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
             ), existentialProjections[store[1]] != nil
                 || existentialComponentAddresses[store[1]] != nil {
-                let payload = try resolve(store[0], line: sourceLine)
+                guard let payloadType = compilerAddressType(store[1]) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Any payload has no concrete projected type"
+                    )
+                }
+                let payload = try prepareOwnedValue(
+                    store[0],
+                    expectedType: payloadType,
+                    line: sourceLine
+                )
                 guard try storeExistentialPayload(payload, at: store[1]) else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Any payload lost its existential projection"
@@ -23046,7 +23540,11 @@ public struct Lowerer: Sendable {
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
             ), let box = projectedBoxByAddress[store[1]],
                let key = typedErrorBoxTypes[box] {
-                let payload = try resolve(store[0], line: sourceLine)
+                let payload = try prepareOwnedValue(
+                    store[0],
+                    expectedType: .local(key),
+                    line: sourceLine
+                )
                 guard registerTypes[Int(payload.rawValue)] == .local(key),
                       values[box] == nil
                 else {
@@ -23059,6 +23557,7 @@ public struct Lowerer: Sendable {
                 appendInstruction(
                     .makeError(result: error, payload: payload)
                 )
+                try finishErrorExistentialInitialization(box)
                 continue
             }
 
@@ -23069,6 +23568,12 @@ public struct Lowerer: Sendable {
                let message = errorEnumMessages[store[0]],
                let box = projectedBoxByAddress[store[1]] {
                 errorMessageByBox[box] = message
+                guard try materializeErrorValue(from: box) != nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Error existential message did not materialize its box"
+                    )
+                }
+                try finishErrorExistentialInitialization(box)
                 continue
             }
 
@@ -23119,14 +23624,35 @@ public struct Lowerer: Sendable {
             ), existentialBoxes.contains(store[0]),
                let destinationType = compilerAddressType(store[1]),
                [.string, .error].contains(destinationType) {
-                guard let value = try materializeErrorValue(from: store[0]),
-                      registerTypes[Int(value.rawValue)] == destinationType
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Error existential box does not match its destination"
+                let mode = storageInitializationPlan.storeMode(
+                    at: currentSILLineIndex,
+                    address: store[1]
+                )
+                if values[store[0]] == nil,
+                   errorMessageByBox[store[0]] == nil {
+                    guard let block = current?.id else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Error existential store is outside a basic block"
+                        )
+                    }
+                    deferredErrorExistentialOperations[
+                        store[0], default: []
+                    ].append(
+                        .store(
+                            destination: store[1],
+                            mode: mode,
+                            sourceLine: sourceLine,
+                            block: block
+                        )
+                    )
+                } else {
+                    try storeErrorExistential(
+                        store[0],
+                        at: store[1],
+                        mode: mode,
+                        sourceLine: sourceLine
                     )
                 }
-                try storeConstructedValue(value, at: store[1])
                 continue
             }
 
@@ -23134,6 +23660,11 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
             ), let addressType = compilerAddressType(store[1]) {
+                let copiedLocalOwnerSource: Bytecode.Register? =
+                    !addressType.requiresLinearOwnership
+                        && typeEnvironment.containsOwningReference(addressType)
+                    ? try resolve(store[0], line: sourceLine)
+                    : nil
                 let value = try prepareStoredValue(
                     store[0],
                     expectedType: addressType,
@@ -23145,6 +23676,15 @@ public struct Lowerer: Sendable {
                     )
                 }
                 try storeConstructedValue(value, at: store[1])
+                if let source = copiedLocalOwnerSource,
+                   value != source,
+                   !hasFutureSemanticUse(of: store[0], after: currentSILLineIndex) {
+                    // Linear values already have an explicit SIL/HLBC owner
+                    // endpoint. This closes only the compiler-elided source
+                    // register of a copied local-class graph; closing a native
+                    // value here would duplicate its later release_value.
+                    appendInstruction(.destroyValue(source))
+                }
                 if case .optional = addressType {
                     recordOptionalValueSource(store[0], at: store[1])
                     if let blockID = current?.id {
@@ -23567,10 +24107,14 @@ public struct Lowerer: Sendable {
                     line: sourceLine
                 ) {
                     removeCompilerAddressValue(at: destroy[0])
-                    if registerTypes[Int(value.rawValue)].requiresLinearOwnership {
+                    if requiresManagedOwnership(
+                        registerTypes[Int(value.rawValue)]
+                    ) {
                         appendInstruction(.destroyValue(value))
                     }
-                } else if stackType(at: destroy[0])?.requiresLinearOwnership == true {
+                } else if stackType(at: destroy[0]).map(
+                    requiresManagedOwnership
+                ) == true {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "destroy_addr references uninitialized compiler storage"
                     )
@@ -23580,26 +24124,27 @@ public struct Lowerer: Sendable {
 
             if let cast = match(
                 line,
-                pattern: #"^checked_cast_addr_br (?:take_always|copy_on_success) Any in (%[0-9]+) to (.+) in (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
+                pattern: #"^checked_cast_addr_br (take_always|copy_on_success) Any in (%[0-9]+) to (.+) in (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
             ) {
-                let targetDynamicType = try parseDynamicAnyType(cast[1])
+                let targetDynamicType = try parseDynamicAnyType(cast[2])
                 let targetType = targetDynamicType.storageType
-                guard stackType(at: cast[0]) == .any,
-                      let source = try copyStoredValue(
-                        at: cast[0],
+                guard stackType(at: cast[1]) == .any,
+                      let source = try transferAddressCastSource(
+                        mode: cast[0],
+                        at: cast[1],
                         line: sourceLine
                       ),
                       registerTypes[Int(source.rawValue)] == .any,
-                      compilerAddressType(cast[2]) == targetType,
+                      compilerAddressType(cast[3]) == targetType,
                       targetDynamicType.isAnyCastTargetV1,
-                      runtimeAddress(at: cast[2]) == nil
+                      runtimeAddress(at: cast[3]) == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "checked Any cast source or destination type does not match"
                     )
                 }
-                let successTarget = try parseBlockID(cast[3])
-                let failureTarget = try parseBlockID(cast[4])
+                let successTarget = try parseBlockID(cast[4])
+                let failureTarget = try parseBlockID(cast[5])
                 guard implicitStackValues[successTarget] == nil else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "multiple checked Any casts share a success block"
@@ -23621,7 +24166,7 @@ public struct Lowerer: Sendable {
                         noneTarget: failureTarget
                     )
                 )
-                implicitStackValues[successTarget] = [.init(cast[2], projected)]
+                implicitStackValues[successTarget] = [.init(cast[3], projected)]
                 continue
             }
 
@@ -23658,26 +24203,27 @@ public struct Lowerer: Sendable {
 
             if let cast = match(
                 line,
-                pattern: #"^checked_cast_addr_br copy_on_success any Error in (%[0-9]+) to (.+) in (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
+                pattern: #"^checked_cast_addr_br (take_always|copy_on_success) any Error in (%[0-9]+) to (.+) in (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
             ) {
-                let sourceAddress = addressBase(cast[0])
-                let destinationAddress = addressBase(cast[2])
-                guard stackType(at: cast[0]) == .error,
-                      let error = try copyStoredValue(
-                        at: cast[0],
+                let sourceAddress = addressBase(cast[1])
+                let destinationAddress = addressBase(cast[3])
+                guard stackType(at: cast[1]) == .error,
+                      let error = try transferAddressCastSource(
+                        mode: cast[0],
+                        at: cast[1],
                         line: sourceLine
                       ),
                       registerTypes[Int(error.rawValue)] == .error,
-                      let key = typeEnvironment.localKey(for: cast[1]),
+                      let key = typeEnvironment.localKey(for: cast[2]),
                       try typeEnvironment.definition(for: key).conformsToError,
-                      stackType(at: cast[2]) == .local(key)
+                      stackType(at: cast[3]) == .local(key)
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "checked Error cast source or destination type does not match"
                     )
                 }
-                let successTarget = try parseBlockID(cast[3])
-                let failureTarget = try parseBlockID(cast[4])
+                let successTarget = try parseBlockID(cast[4])
+                let failureTarget = try parseBlockID(cast[5])
                 guard implicitStackValues[successTarget] == nil else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "multiple checked Error casts share a success block"
@@ -23695,7 +24241,7 @@ public struct Lowerer: Sendable {
                         noneTarget: failureTarget
                     )
                 )
-                implicitStackValues[successTarget] = [.init(cast[2], projected)]
+                implicitStackValues[successTarget] = [.init(cast[3], projected)]
                 catchScratchAddresses.insert(sourceAddress)
                 catchScratchAddresses.insert(destinationAddress)
                 continue
@@ -24099,7 +24645,9 @@ public struct Lowerer: Sendable {
                     continue
                 }
                 let value = try resolve(ownership[1], line: sourceLine)
-                if registerTypes[Int(value.rawValue)].requiresLinearOwnership {
+                if requiresManagedOwnership(
+                    registerTypes[Int(value.rawValue)]
+                ) {
                     if ownership[0] == "retain_value" {
                         try materializeRetain(of: ownership[1], value: value)
                     } else if borrowedTemporaryValue(for: ownership[1]) != nil
@@ -24123,43 +24671,27 @@ public struct Lowerer: Sendable {
                 if staticKeyPathValues[ownership[1]] != nil {
                     continue
                 }
-                if ownership[0] == "release",
-                   let retained = takePendingRetainedValue(
-                    for: ownership[1]
-                   ) {
-                    appendInstruction(.destroyValue(retained))
+                let operation: StrongReferenceOperation = ownership[0]
+                    == "retain" ? .retain : .release
+                if existentialBoxes.contains(ownership[1]),
+                   values[ownership[1]] == nil,
+                   errorMessageByBox[ownership[1]] == nil {
+                    guard let block = current?.id else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Error existential ownership is outside a basic block"
+                        )
+                    }
+                    deferredErrorExistentialOperations[
+                        ownership[1], default: []
+                    ].append(.strong(operation, block: block))
                     continue
                 }
                 let value = try resolve(ownership[1], line: sourceLine)
-                let type = registerTypes[Int(value.rawValue)]
-                if case .closure = type { continue }
-                if case .mutableCell = type { continue }
-                if case let .local(key) = type, typeEnvironment.isClass(key) {
-                    // VM.Value retains one shared object identity; Swift ARC
-                    // traffic does not become explicit HLBC instructions.
-                    continue
-                }
-                guard type == .string || type == .error
-                        || type.requiresLinearOwnership
-                else {
-                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
-                        line: sourceLine,
-                        text: line
-                    )
-                }
-                if ownership[0] == "retain" {
-                    try materializeRetain(of: ownership[1], value: value)
-                } else if borrowedTemporaryValue(for: ownership[1]) != nil
-                    || !isBorrowedValue(
-                        token: ownership[1],
-                        register: value
-                    ) {
-                    try closeBorrowedTemporaryLifetime(
-                        for: ownership[1],
-                        resolved: value
-                    )
-                    appendInstruction(.destroyValue(value))
-                }
+                try applyStrongReferenceOperation(
+                    operation,
+                    to: ownership[1],
+                    value: value
+                )
                 continue
             }
 
@@ -24427,8 +24959,9 @@ public struct Lowerer: Sendable {
                             "an explicit Optional.some case cannot share its payload block with none"
                         )
                     }
-                    if registerTypes[Int(optional.rawValue)]
-                        .requiresLinearOwnership {
+                    if requiresManagedOwnership(
+                        registerTypes[Int(optional.rawValue)]
+                    ) {
                         appendInstruction(.destroyValue(optional))
                     }
                     appendInstruction(
@@ -24460,8 +24993,9 @@ public struct Lowerer: Sendable {
                     appendInstruction(
                         .optionalIsSome(result: isSome, optional: optional)
                     )
-                    if registerTypes[Int(optional.rawValue)]
-                        .requiresLinearOwnership {
+                    if requiresManagedOwnership(
+                        registerTypes[Int(optional.rawValue)]
+                    ) {
                         appendInstruction(.destroyValue(optional))
                     }
                     appendInstruction(
@@ -24522,8 +25056,8 @@ public struct Lowerer: Sendable {
                 let body = String(line.dropFirst("switch_enum ".count))
                 let components = splitTopLevel(body)
                 if let operandToken = components.first,
-                   let enumeration = values[operandToken],
-                   case let .local(key) = registerTypes[Int(enumeration.rawValue)] {
+                   let source = values[operandToken],
+                   case let .local(key) = registerTypes[Int(source.rawValue)] {
                     var caseTargets: [Bytecode.EnumCaseTarget] = []
                     var seenCases = Set<UInt32>()
                     var defaultTarget: Bytecode.BlockID?
@@ -24567,6 +25101,11 @@ public struct Lowerer: Sendable {
                             "local enum switch contains no case targets"
                         )
                     }
+                    let enumeration = try prepareOwnedValue(
+                        operandToken,
+                        expectedType: .local(key),
+                        line: sourceLine
+                    )
                     appendInstruction(
                         .switchEnum(
                             enumeration: enumeration,
@@ -24805,10 +25344,11 @@ public struct Lowerer: Sendable {
         }
         guard existentialProjections.isEmpty,
               branchMergedExistentialProjections.isEmpty,
-              existentialComponentAddresses.isEmpty
+              existentialComponentAddresses.isEmpty,
+              deferredErrorExistentialOperations.isEmpty
         else {
             throw CanonicalSIL.LoweringError.malformedSIL(
-                "Any existential projection is not initialized"
+                "existential projection or Error box is not initialized"
             )
         }
         guard optionalAddressInitializations.isEmpty,
@@ -25279,7 +25819,8 @@ public struct Lowerer: Sendable {
 
     private func supportsIndirectResult(_ type: Bytecode.ValueType) -> Bool {
         switch type {
-        case .void, .never, .address, .mutableCell, .arrayState,
+        case .void, .never, .address, .mutableCell, .nonOwningReference,
+             .arrayState,
              .dictionaryState:
             false
         case .bool, .integer, .float, .string, .any, .array, .dictionary, .set,
@@ -25319,6 +25860,10 @@ public struct Lowerer: Sendable {
                 : ValueRepresentation.storable(parsed)
             if case let .mutableCell(pointee) = expected,
                actual == .address(pointee) {
+                return expected
+            }
+            if case .nonOwningReference = expected,
+               actual == .address(expected) {
                 return expected
             }
             guard actual == expected else {
@@ -25407,6 +25952,14 @@ public struct Lowerer: Sendable {
             if value.hasPrefix("@inout ")
                 || value.hasPrefix("@inout_aliasable ")
                 || value.hasPrefix("*") {
+                switch type {
+                case .mutableCell, .nonOwningReference:
+                    // Physical capture addresses are normalized to shared VM
+                    // handles before they enter an internal function ABI.
+                    return .owned
+                default:
+                    break
+                }
                 return .inout
             }
             // Copyable VM values do not need SIL's borrow distinction. Linear
@@ -25418,7 +25971,8 @@ public struct Lowerer: Sendable {
                 || value.hasPrefix("@unowned ")
                 || value.hasPrefix("@in_guaranteed ")
             let explicitlyOwned = value.hasPrefix("@owned ")
-            if type.requiresLinearOwnership,
+            if (type.requiresLinearOwnership
+                || typeEnvironment.containsOwningReference(type)),
                explicitlyBorrowed
                 || (implicitlyBorrowsLinearValues
                     && !explicitlyOwned

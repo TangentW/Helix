@@ -311,6 +311,7 @@ concrete `Result` values,
 payload-carrying local errors, scoped patch-local `inout`/`mutating` helpers,
 synchronous nonthrowing or throwing patch-local closures, type-independent
 managed mutable captures, copyable linear captures with a borrowed capture ABI,
+safe weak and checked-unowned capture storage,
 same-image `@escaping` return/capture flows, recursively stored and higher-order
 closure values, dynamically checked `withoutActuallyEscaping`, lexical
 nonescaping capture of caller-owned `inout`, fully concrete compiler
@@ -327,7 +328,8 @@ It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch, a
 patch concrete Swift type identity visible to native code, function-local
 nominal declarations, hosted stored properties/custom initializers/arbitrary
 callback ABIs, changes to existing native stored layout, closure persistence or native/Shell boundary crossing,
-async closures, weak/unowned capture ownership, escaping caller-owned `inout`
+async closures, `unowned(unsafe)`, weak/unowned stored-property layouts,
+escaping caller-owned `inout`
 capture, true `await`/continuations, actor-isolated `self`,
 custom global actors, unrestricted pointers, reflection-based field access, and
 unregistered native APIs are rejected. See

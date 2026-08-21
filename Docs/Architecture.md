@@ -65,12 +65,16 @@ Both workflows depend on stable, build-specific identities:
 - An immutable `Runtime.Generation` makes all routes in one activation visible
   atomically. A call chain pins one generation so it cannot observe a mixture
   during concurrent activation or rollback.
-- Mutable closure captures and collection transforms use verifier-private
-  storage values rather than Swift runtime layout: managed cells may be shared
-  only by same-image closures, while Array builders and Dictionary accumulators
-  are linear and must be finished or destroyed on every control-flow path.
-  None can enter a Shell/Native boundary, local value layout, stack slot, or
-  function result.
+- Closure captures and collection transforms use verifier-private storage
+  values rather than Swift runtime layout. Mutable captures share managed cells;
+  `weak` and checked `unowned` captures share non-retaining handles whose
+  referent is a patch-local class or frozen native reference identity. Weak
+  loads produce Optional and zero after deallocation. Unowned loads use the
+  same safe zeroing primitive internally but turn a dead referent into a
+  controlled VM trap instead of a process-level Swift abort. Array builders and
+  Dictionary accumulators remain linear and must be finished or destroyed on
+  every control-flow path. These internal storage values cannot enter a stack
+  slot, Shell/Native boundary, local value layout, or function result.
   Immutable closure contexts may also copy a represented linear capture when
   its frozen TypeOps are copyable and the closure body receives that capture
   with a borrowed ABI. `make_closure` charges and performs the copy; owned or
@@ -376,8 +380,17 @@ Both workflows depend on stable, build-specific identities:
   not a list of API- or framework-specific exceptions. Synchronous closures are
   recursively valid value shapes: higher-order signatures and Optional, tuple,
   Array, Dictionary, or patch-local nominal storage use the same signature and
-  ownership verifier. `withoutActuallyEscaping` creates a separate dynamically
-  scoped view; CFG verification covers split normal/error exits, while a
+  ownership verifier. Capture-list and local-variable `weak`/`unowned` storage
+  is normalized with mutable capture boxes into one managed-capture ABI; direct
+  and specialized closure bodies therefore share the same storage identity.
+  Compiler and VM ownership transfer follows the verified static type graph, so
+  replacing Optional, Array, Dictionary, Set, enum, tuple, or struct storage
+  releases obsolete class owners without scanning aggregate contents at
+  runtime. `Any` and `Error` conservatively use managed transfers because their
+  concrete payload is dynamic. `unowned(unsafe)` remains fail-closed because a
+  raw dangling reference cannot be made safe at a downloaded-code boundary.
+  `withoutActuallyEscaping` creates a separate
+  dynamically scoped view; CFG verification covers split normal/error exits, while a
   budgeted, cycle-safe VM graph scan plus candidate-only CFG liveness rejects
   explicit-storage and semantically live aggregate escape without treating dead
   SSA aliases as roots. Direct-only closure and `defer` helpers retain

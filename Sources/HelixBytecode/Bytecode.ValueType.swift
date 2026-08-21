@@ -51,7 +51,8 @@ extension Bytecode.ValueType {
                 pending.append((key, item.depth + 1))
                 pending.append((value, item.depth + 1))
             case .void, .never, .any, .native, .local, .error, .address,
-                 .mutableCell, .arrayState, .dictionaryState, .closure, .tuple:
+                 .mutableCell, .nonOwningReference, .arrayState,
+                 .dictionaryState, .closure, .tuple:
                 return false
             }
         }

@@ -243,7 +243,8 @@ enum DynamicType {
         switch type {
         case .closure:
             return .containsClosure
-        case let .optional(wrapped), let .array(wrapped), let .set(wrapped):
+        case let .optional(wrapped), let .array(wrapped), let .set(wrapped),
+             let .nonOwningReference(_, wrapped):
             return inspectStorage(wrapped, depth: depth + 1)
         case let .dictionary(key, value):
             return StorageInspection.combining(

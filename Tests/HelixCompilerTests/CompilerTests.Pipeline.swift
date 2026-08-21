@@ -3591,6 +3591,7 @@ struct Pipeline {
             .init(
                 mangledName: echoAny.mangledName,
                 parameterTypes: [.any],
+                parameterConventions: [.borrowed],
                 resultType: .any,
                 target: .function(.init(rawValue: 2))
             ),

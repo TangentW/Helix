@@ -9,6 +9,7 @@ extension Bytecode.ValueType {
                 return true
             case let .optional(wrapped), let .array(wrapped), let .set(wrapped),
                  let .address(wrapped), let .mutableCell(wrapped),
+                 let .nonOwningReference(_, wrapped),
                  let .arrayState(_, wrapped):
                 pending.append(wrapped)
             case let .dictionary(key, value),
@@ -36,6 +37,7 @@ extension Bytecode.ValueType {
             )
         case let .optional(wrapped), let .array(wrapped), let .set(wrapped),
              let .address(wrapped), let .mutableCell(wrapped),
+             let .nonOwningReference(_, wrapped),
              let .arrayState(_, wrapped):
             wrapped.containsClosureValue
         case let .dictionary(key, value),

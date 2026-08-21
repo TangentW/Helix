@@ -468,7 +468,11 @@ accepted when their closure-body capture convention is borrowed; fully concrete
 reabstraction thunks are linked into the image rather than treated as
 NativeImports. Mutable captures use the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
-boxes. Fully concrete Array, Dictionary, and Set values share verified closure
+boxes. Safe `weak` and checked `unowned` capture lists and captured weak locals
+use a second managed storage kind shared by patch-local and frozen native
+reference identities. Weak loads become `nil` after release; dead checked
+unowned loads produce a controlled VM trap. `unowned(unsafe)` and weak/unowned
+stored-property layouts remain rejected. Fully concrete Array, Dictionary, and Set values share verified closure
 traversal for common `map`/`flatMap`/`compactMap`, reduction, visit, predicate,
 `count(where:)`, and comparator-selection operations. Container-preserving
 `filter` uses the same traversal for all three; Dictionary `mapValues` and `compactMapValues`

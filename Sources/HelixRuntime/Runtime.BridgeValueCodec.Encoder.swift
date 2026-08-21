@@ -543,7 +543,8 @@ public final class Encoder {
                 try addAggregate(elements.count, to: &result, limits: limits)
                 try append(elements, below: depth, to: &pending, limits: limits)
             case .structure, .enumeration, .object, .error, .address,
-                 .mutableCell, .arrayBuilder, .arrayMutationState,
+                 .mutableCell, .nonOwningReference,
+                 .arrayBuilder, .arrayMutationState,
                  .dictionaryBuilder, .arraySortState, .arraySplitState,
                  .closure:
                 throw Runtime.BridgeInputError.encodedTypeMismatch(

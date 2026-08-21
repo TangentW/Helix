@@ -391,6 +391,8 @@ public struct TypeEnvironment: Sendable {
             containsReferenceNativeValue(wrapped)
         case let .mutableCell(pointee):
             containsReferenceNativeValue(pointee)
+        case let .nonOwningReference(_, pointee):
+            containsReferenceNativeValue(pointee)
         case let .arrayState(_, element):
             containsReferenceNativeValue(element)
         case let .dictionaryState(key, value):
@@ -406,6 +408,58 @@ public struct TypeEnvironment: Sendable {
              .error, .address, .closure:
             false
         }
+    }
+
+    /// Whether a represented value can keep a strong class identity alive.
+    /// This is separate from native-handle linearity: Swift-managed local and
+    /// aggregate values are copyable, but their SIL ownership endpoints remain
+    /// observable through weak and unowned references.
+    func containsOwningReference(_ type: Bytecode.ValueType) -> Bool {
+        var visiting = Set<Bytecode.LocalTypeKey>()
+
+        func visit(_ type: Bytecode.ValueType) -> Bool {
+            switch type {
+            case let .native(id):
+                return nativeTypeKinds[id] == .reference
+            case let .local(key):
+                if isClass(key) { return true }
+                guard visiting.insert(key).inserted,
+                      let definition = try? definition(for: key)
+                else { return false }
+                defer { visiting.remove(key) }
+                switch definition.kind {
+                case let .structure(fields):
+                    return fields.contains { visit($0.type) }
+                case let .enumeration(cases):
+                    return cases.contains { item in
+                        item.payloadType.map(visit) == true
+                    }
+                case .class:
+                    return true
+                }
+            case let .optional(wrapped), let .array(wrapped),
+                 let .set(wrapped), let .arrayState(_, wrapped):
+                return visit(wrapped)
+            case let .dictionary(key, value),
+                 let .dictionaryState(key, value):
+                return visit(key) || visit(value)
+            case let .tuple(elements):
+                return elements.contains(where: visit)
+            case .any, .error:
+                // Their concrete payload is dynamic, so conservatively keep
+                // every ownership transfer explicit even when one invocation
+                // happens to contain no class reference.
+                return true
+            case .void, .never, .bool, .integer, .float, .string, .address,
+                 .nonOwningReference, .mutableCell, .closure:
+                // Capture cells and closures have dedicated lifetime
+                // protocols; this predicate covers ordinary value ownership
+                // and dynamically typed payload containers.
+                return false
+            }
+        }
+
+        return visit(type)
     }
 
     func matchesPseudogenericNativeType(
@@ -502,6 +556,24 @@ public struct TypeEnvironment: Sendable {
             }
         }
 
+        for (prefix, kind): (String, Bytecode.NonOwningReferenceKind) in [
+            ("@sil_weak ", .weak),
+            ("@sil_unowned ", .unowned),
+        ] where type.hasPrefix(prefix) {
+            let pointee = ValueRepresentation.storable(
+                try resolve(
+                    String(type.dropFirst(prefix.count)),
+                    relativeTo: parentScope
+                )
+            )
+            return .nonOwningReference(kind: kind, pointee: pointee)
+        }
+        if type.hasPrefix("@sil_unmanaged ") {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "unmanaged reference storage"
+            )
+        }
+
         // Captured mutable locals are printed as `@closureCapture $*T`.
         // Ownership decoration is orthogonal to the pointee identity, so
         // recognize the address again after removing those decorations.
@@ -519,14 +591,14 @@ public struct TypeEnvironment: Sendable {
             guard contents.hasPrefix("var ") else {
                 throw CanonicalSIL.LoweringError.unsupportedType(raw)
             }
-            return .mutableCell(
-                ValueRepresentation.storable(
-                    try resolve(
-                        String(contents.dropFirst("var ".count)),
-                        relativeTo: parentScope
-                    )
+            let pointee = ValueRepresentation.storable(
+                try resolve(
+                    String(contents.dropFirst("var ".count)),
+                    relativeTo: parentScope
                 )
             )
+            if case .nonOwningReference = pointee { return pointee }
+            return .mutableCell(pointee)
         }
 
         if type.contains(" -> "), outerClosureArrow(in: type) != nil {
@@ -994,9 +1066,10 @@ public struct TypeEnvironment: Sendable {
         let explicitlyBorrowed = spelling.hasPrefix("@guaranteed ")
             || spelling.hasPrefix("@unowned ")
             || spelling.hasPrefix("@in_guaranteed ")
-        return parameter.requiresLinearOwnership && explicitlyBorrowed
-            ? .borrowed
-            : .owned
+        return (parameter.requiresLinearOwnership
+            || containsOwningReference(parameter)) && explicitlyBorrowed
+                ? .borrowed
+                : .owned
     }
 
     private func closureErrorChannel(
@@ -1231,6 +1304,7 @@ public struct TypeEnvironment: Sendable {
                 if seen.insert(key).inserted { pending.append(key) }
             case let .array(element), let .optional(element), let .set(element),
                  let .address(element), let .mutableCell(element),
+                 let .nonOwningReference(_, element),
                  let .arrayState(_, element):
                 collect(element)
             case let .dictionary(key, value):
@@ -1338,7 +1412,7 @@ public struct TypeEnvironment: Sendable {
                 try max(typeDepth(key), typeDepth(value)) + 1
             case let .tuple(elements):
                 try (elements.map(typeDepth).max() ?? 0) + 1
-            case .closure:
+            case .closure, .nonOwningReference:
                 // A closure context is reference-like storage. Local values
                 // mentioned by its callable signature do not recursively
                 // expand the containing nominal's inline layout.

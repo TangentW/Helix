@@ -1413,6 +1413,7 @@ enum StorageInitialization {
 
     private static func writtenAddress(in line: String) -> String? {
         let writesAddress = line.hasPrefix("store ")
+            || line.hasPrefix("store_weak ")
             || line.hasPrefix("assign ")
             || line.hasPrefix("copy_addr")
         if writesAddress { return silValues(in: line).last }
@@ -1760,7 +1761,8 @@ enum StorageInitialization {
         if line.hasPrefix("copy_addr [take]") {
             return silValues(in: line).first
         }
-        if line.contains(" = load [take] ") {
+        if line.contains(" = load [take] ")
+            || line.contains(" = load_weak [take] ") {
             return silValues(in: line).last
         }
         return nil

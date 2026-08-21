@@ -224,7 +224,8 @@ public struct Document: Codable, Hashable, Sendable {
         switch type {
         case .void: allowVoid
         case .never: false
-        case .address, .mutableCell, .arrayState, .dictionaryState,
+        case .address, .mutableCell, .nonOwningReference, .arrayState,
+             .dictionaryState,
              .closure: false
         case .bool, .integer, .float, .string, .any, .native: true
         case .local, .error: false
@@ -249,6 +250,7 @@ public struct Document: Codable, Hashable, Sendable {
         case let .native(id): ids.contains(id)
         case let .array(element), let .optional(element), let .set(element),
              let .address(element), let .mutableCell(element),
+             let .nonOwningReference(_, element),
              let .arrayState(_, element):
             containsNativeType(element, ids: ids)
         case let .dictionary(key, value):

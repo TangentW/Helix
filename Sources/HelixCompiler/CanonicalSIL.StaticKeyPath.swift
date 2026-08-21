@@ -1107,7 +1107,8 @@ enum StaticKeyPath {
         role: String
     ) throws {
         switch type {
-        case .void, .never, .address, .mutableCell, .arrayState,
+        case .void, .never, .address, .mutableCell, .nonOwningReference,
+             .arrayState,
              .dictionaryState, .closure:
             throw CanonicalSIL.LoweringError.unsupportedType(
                 "static KeyPath \(role) \(type)"

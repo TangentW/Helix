@@ -584,6 +584,7 @@ public final class Engine: @unchecked Sendable {
              .exclusivityViolation:
             true
         case .integerOverflow, .divisionByZero, .optionalUnwrapOfNil,
+             .danglingUnownedReference,
              .dynamicCastFailure, .dynamicCastProducedDuplicateDictionaryKey,
              .dynamicCastProducedDuplicateSetElement, .valueNestingDepthExceeded,
              .arrayIndexOutOfBounds, .collectionCursorOutOfBounds, .unknownEntry,

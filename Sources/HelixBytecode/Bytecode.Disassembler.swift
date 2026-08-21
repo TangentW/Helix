@@ -166,6 +166,13 @@ public enum Disassembler {
             "\(result) = load_mutable_cell \(cell)"
         case let .storeMutableCell(cell, source, mode):
             "store_mutable_cell.\(mode.rawValue) \(source) to \(cell)"
+        case let .makeNonOwningReference(result, initialValue):
+            initialValue.map { "\(result) = make_nonowning_reference \($0)" }
+                ?? "\(result) = make_nonowning_reference.uninitialized"
+        case let .loadNonOwningReference(result, reference, mode):
+            "\(result) = load_nonowning_reference.\(mode.rawValue) \(reference)"
+        case let .storeNonOwningReference(reference, source, mode):
+            "store_nonowning_reference.\(mode.rawValue) \(source) to \(reference)"
         case let .allocateObject(result):
             "\(result) = allocate_object"
         case let .projectObjectAddress(result, object, fieldIndex):

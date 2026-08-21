@@ -112,6 +112,7 @@ struct HostedClasses {
         #expect(methods.first?.abi == .voidNoArguments)
         #expect(result.module.capabilities.contains(.localClassesV1))
         #expect(result.module.capabilities.contains(.hostedObjectiveCClassesV1))
+        #expect(result.module.capabilities.contains(.borrowCallsV1))
         #expect(result.disassembly.contains("allocate_object"))
         #expect(result.disassembly.contains("project_hosted_object"))
         #expect(result.disassembly.contains("hosted_super_apply"))
@@ -126,6 +127,7 @@ struct HostedClasses {
                 .localClassesV1,
                 .hostedObjectiveCClassesV1,
                 .mainActorSyncV1,
+                .borrowCallsV1,
             ],
             entries: [
                 .init(

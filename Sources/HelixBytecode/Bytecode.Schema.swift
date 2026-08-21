@@ -113,6 +113,12 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
     case error
     case address(Bytecode.ValueType)
     case mutableCell(Bytecode.ValueType)
+    /// Shared, non-retaining reference storage. `pointee` is the strong value
+    /// produced by a load, including Optional for zeroing weak references.
+    case nonOwningReference(
+        kind: Bytecode.NonOwningReferenceKind,
+        pointee: Bytecode.ValueType
+    )
     case arrayState(
         kind: Bytecode.ArrayStateKind,
         element: Bytecode.ValueType
@@ -138,7 +144,8 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case let .optional(wrapped):
             wrapped.isTrivial
         case .string, .any, .array, .dictionary, .set, .native, .local, .error,
-             .address, .mutableCell, .arrayState, .dictionaryState, .closure:
+             .address, .mutableCell, .nonOwningReference, .arrayState,
+             .dictionaryState, .closure:
             false
         }
     }
@@ -163,7 +170,7 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case .arrayState, .dictionaryState:
             true
         case .void, .never, .bool, .integer, .float, .string, .any, .local,
-             .error, .address, .mutableCell, .closure:
+             .error, .address, .mutableCell, .nonOwningReference, .closure:
             false
         }
     }
@@ -185,6 +192,8 @@ public indirect enum ValueType: Codable, Hashable, Sendable, CustomStringConvert
         case .error: "any Error"
         case let .address(pointee): "@address<\(pointee)>"
         case let .mutableCell(pointee): "@mutableCell<\(pointee)>"
+        case let .nonOwningReference(kind, pointee):
+            "@\(kind.rawValue)<\(pointee)>"
         case let .arrayState(kind, element):
             "@arrayState.\(kind)<\(element)>"
         case let .dictionaryState(key, value):
@@ -498,6 +507,20 @@ public enum Instruction: Codable, Hashable, Sendable {
     )
     case storeMutableCell(
         cell: Bytecode.Register,
+        source: Bytecode.Register,
+        mode: Bytecode.StackStoreMode
+    )
+    case makeNonOwningReference(
+        result: Bytecode.Register,
+        initialValue: Bytecode.Register?
+    )
+    case loadNonOwningReference(
+        result: Bytecode.Register,
+        reference: Bytecode.Register,
+        mode: Bytecode.StackLoadMode
+    )
+    case storeNonOwningReference(
+        reference: Bytecode.Register,
         source: Bytecode.Register,
         mode: Bytecode.StackStoreMode
     )
@@ -1084,6 +1107,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .borrowMutableCell(result, _),
              let .projectMutableCell(result, _, _),
              let .loadMutableCell(result, _),
+             let .makeNonOwningReference(result, _),
+             let .loadNonOwningReference(result, _, _),
              let .makeArrayBuilder(result),
              let .finishArrayBuilder(result, _),
              let .makeArrayMutationState(result, _),
@@ -1196,7 +1221,8 @@ public enum Instruction: Codable, Hashable, Sendable {
             result.map { [$0] } ?? []
         case .destroyValue, .switchEnum, .storeStack, .destroyStack,
              .destroyStackIfInitialized,
-             .storeMutableCell, .arrayBuilderAppend,
+             .storeMutableCell, .storeNonOwningReference,
+             .arrayBuilderAppend,
              .arrayBuilderAppendContents,
              .arrayMutationSwap,
              .dictionaryBuilderSet,
@@ -1261,6 +1287,12 @@ public enum Instruction: Codable, Hashable, Sendable {
             [cell]
         case let .storeMutableCell(cell, source, _):
             [cell, source]
+        case let .makeNonOwningReference(_, initialValue):
+            initialValue.map { [$0] } ?? []
+        case let .loadNonOwningReference(_, reference, _):
+            [reference]
+        case let .storeNonOwningReference(reference, source, _):
+            [reference, source]
         case let .projectObjectAddress(_, object, _):
             [object]
         case let .projectHostedObject(_, object):

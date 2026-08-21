@@ -134,7 +134,8 @@ public struct Interpreter: Sendable {
                   !rootFunction.parameterRegisters.contains(where: {
                       guard let type = rootFunction.type(of: $0) else { return false }
                       return switch type {
-                      case .address, .mutableCell, .arrayState,
+                      case .address, .mutableCell, .nonOwningReference,
+                           .arrayState,
                            .dictionaryState: true
                       default: false
                       }
@@ -243,7 +244,9 @@ public struct Interpreter: Sendable {
             case let .tuple(elements):
                 elements.forEach(visit)
             case let .optional(wrapped), let .address(wrapped),
-                 let .mutableCell(wrapped), let .arrayState(_, wrapped):
+                 let .mutableCell(wrapped),
+                 let .nonOwningReference(_, wrapped),
+                 let .arrayState(_, wrapped):
                 visit(wrapped)
             case let .array(element), let .set(element):
                 visit(element)
@@ -522,13 +525,16 @@ public struct Interpreter: Sendable {
                     let value = try consume(
                         source,
                         type: function.type(of: source)!,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     try initialize(value, register: result, registers: &registers)
                 case let .destroyValue(register):
-                    if function.type(of: register)?.requiresLinearOwnership == true {
-                        _ = try take(register, registers: &registers)
-                    }
+                    // SIL lifetime-ending operations must release the value in
+                    // the register even when the verifier does not model it as
+                    // linear. This is observable for weak references to local
+                    // class objects that die before their invocation frame.
+                    _ = try take(register, registers: &registers)
                 case let .makeTuple(result, elements):
                     try budget.consumeLinearWork(elementCount: elements.count)
                     try chargeAggregate(elementCount: elements.count, budget: budget)
@@ -536,6 +542,7 @@ public struct Interpreter: Sendable {
                         try consume(
                             $0,
                             type: function.type(of: $0)!,
+                            localTypes: localTypes,
                             registers: &registers
                         )
                     }
@@ -545,6 +552,7 @@ public struct Interpreter: Sendable {
                     let tupleValue = try consume(
                         tuple,
                         type: function.type(of: tuple)!,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     guard case let .tuple(values) = tupleValue, values.count == results.count else {
@@ -573,6 +581,7 @@ public struct Interpreter: Sendable {
                         try consume(
                             $0,
                             type: function.type(of: $0)!,
+                            localTypes: localTypes,
                             registers: &registers
                         )
                     }
@@ -708,6 +717,7 @@ public struct Interpreter: Sendable {
                         try consume(
                             $0,
                             type: function.type(of: $0)!,
+                            localTypes: localTypes,
                             registers: &registers
                         )
                     }
@@ -718,7 +728,12 @@ public struct Interpreter: Sendable {
                         registers: &registers
                     )
                 case let .switchEnum(enumeration, cases, defaultTarget):
-                    let value = try read(enumeration, registers: registers)
+                    let value = try consume(
+                        enumeration,
+                        type: function.type(of: enumeration)!,
+                        localTypes: localTypes,
+                        registers: &registers
+                    )
                     guard case let .enumeration(_, caseIndex, payload) = value else {
                         throw VM.RuntimeTrap.typeMismatch(
                             expected: function.type(of: enumeration)!,
@@ -736,7 +751,12 @@ public struct Interpreter: Sendable {
                     currentBlock = target
                     advancedToNextBlock = true
                 case let .makeError(result, payload):
-                    let value = try read(payload, registers: registers)
+                    let value = try consume(
+                        payload,
+                        type: function.type(of: payload)!,
+                        localTypes: localTypes,
+                        registers: &registers
+                    )
                     guard case let .local(key) = function.type(of: payload),
                           let definition = localTypes[key],
                           definition.conformsToError
@@ -767,7 +787,12 @@ public struct Interpreter: Sendable {
                         registers: &registers
                     )
                 case let .castError(result, error, expectedType):
-                    let value = try read(error, registers: registers)
+                    let value = try consume(
+                        error,
+                        type: .error,
+                        localTypes: localTypes,
+                        registers: &registers
+                    )
                     guard case let .error(errorValue) = value else {
                         throw VM.RuntimeTrap.typeMismatch(expected: .error, actual: value.type)
                     }
@@ -778,7 +803,12 @@ public struct Interpreter: Sendable {
                     try initialize(.optional(projected), register: result, registers: &registers)
                 case let .eraseToAny(result, source, dynamicType):
                     let sourceType = function.type(of: source)!
-                    let value = try read(source, registers: registers)
+                    let value = try consume(
+                        source,
+                        type: sourceType,
+                        localTypes: localTypes,
+                        registers: &registers
+                    )
                     let erased: VM.Value
                     if sourceType == .any {
                         guard dynamicType == .any, case .any = value else {
@@ -809,7 +839,12 @@ public struct Interpreter: Sendable {
                     }
                     try initialize(erased, register: result, registers: &registers)
                 case let .checkedCastAny(result, source, targetType):
-                    let value = try read(source, registers: registers)
+                    let value = try consume(
+                        source,
+                        type: .any,
+                        localTypes: localTypes,
+                        registers: &registers
+                    )
                     guard case let .any(erased) = value,
                           case let .optional(resultType) = function.type(of: result),
                           resultType == targetType.storageType
@@ -834,7 +869,12 @@ public struct Interpreter: Sendable {
                         registers: &registers
                     )
                 case let .forceCastAny(result, source, targetType):
-                    let value = try read(source, registers: registers)
+                    let value = try consume(
+                        source,
+                        type: .any,
+                        localTypes: localTypes,
+                        registers: &registers
+                    )
                     guard case let .any(erased) = value,
                           function.type(of: result) == targetType.storageType
                     else {
@@ -859,6 +899,7 @@ public struct Interpreter: Sendable {
                     let payload = try consume(
                         value,
                         type: function.type(of: value)!,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     try initialize(.optional(payload), register: result, registers: &registers)
@@ -877,6 +918,7 @@ public struct Interpreter: Sendable {
                     let optionalValue = try consume(
                         optional,
                         type: function.type(of: optional)!,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     guard case let .optional(value) = optionalValue else {
@@ -891,6 +933,7 @@ public struct Interpreter: Sendable {
                     let optionalValue = try consume(
                         optional,
                         type: function.type(of: optional)!,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     guard case let .optional(value) = optionalValue else {
@@ -912,6 +955,7 @@ public struct Interpreter: Sendable {
                     let value = try consume(
                         source,
                         type: function.type(of: source)!,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     try store(
@@ -983,6 +1027,7 @@ public struct Interpreter: Sendable {
                         try consume(
                             $0,
                             type: pointee,
+                            localTypes: localTypes,
                             registers: &registers
                         )
                     }
@@ -1091,9 +1136,83 @@ public struct Interpreter: Sendable {
                     let value = try consume(
                         source,
                         type: cell.pointee,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     try cell.store(value, mode: mode)
+                case let .makeNonOwningReference(result, initialValue):
+                    guard case let .nonOwningReference(kind, pointee) = function.type(
+                        of: result
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .nonOwningReference(
+                                kind: .weak,
+                                pointee: .never
+                            ),
+                            actual: function.type(of: result)
+                        )
+                    }
+                    let target = try nonOwningReferenceTarget(
+                        kind: kind,
+                        pointee: pointee,
+                        localTypes: localTypes
+                    )
+                    let reference = VM.NonOwningReference(
+                        kind: kind,
+                        pointee: pointee,
+                        target: target
+                    )
+                    if let initialValue {
+                        try store(
+                            try read(initialValue, registers: registers),
+                            in: reference,
+                            mode: .initialize
+                        )
+                    }
+                    try chargeAggregate(elementCount: 1, budget: budget)
+                    try initialize(
+                        .nonOwningReference(reference),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .loadNonOwningReference(result, referenceRegister, mode):
+                    guard case let .nonOwningReference(reference) = try read(
+                        referenceRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: referenceRegister)
+                                ?? .never,
+                            actual: try read(
+                                referenceRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    try initialize(
+                        try load(from: reference, mode: mode, budget: budget),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .storeNonOwningReference(referenceRegister, source, mode):
+                    guard case let .nonOwningReference(reference) = try read(
+                        referenceRegister,
+                        registers: registers
+                    ) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: referenceRegister)
+                                ?? .never,
+                            actual: try read(
+                                referenceRegister,
+                                registers: registers
+                            ).type
+                        )
+                    }
+                    try store(
+                        try read(source, registers: registers),
+                        in: reference,
+                        mode: mode
+                    )
                 case let .beginAccess(result, base, kind):
                     guard case let .address(address) = try read(base, registers: registers) else {
                         throw VM.RuntimeTrap.typeMismatch(
@@ -1149,6 +1268,7 @@ public struct Interpreter: Sendable {
                     let value = try consume(
                         source,
                         type: function.type(of: source)!,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     try address.store(value, mode: mode)
@@ -1938,6 +2058,7 @@ public struct Interpreter: Sendable {
                         try consume(
                             $0,
                             type: function.type(of: $0)!,
+                            localTypes: localTypes,
                             registers: &registers
                         )
                     }
@@ -1982,6 +2103,7 @@ public struct Interpreter: Sendable {
                           case let .array(storage) = try consume(
                             operand,
                             type: arrayType,
+                            localTypes: localTypes,
                             registers: &registers
                           )
                     else {
@@ -2455,6 +2577,7 @@ public struct Interpreter: Sendable {
                        case let .arrayBuilder(builder) = try consume(
                         builderRegister,
                         type: .arrayState(kind: .builder, element: element),
+                        localTypes: localTypes,
                         registers: &registers
                        )
                     else {
@@ -2561,6 +2684,7 @@ public struct Interpreter: Sendable {
                        case let .arrayMutationState(state) = try consume(
                         stateRegister,
                         type: .arrayState(kind: .mutation, element: element),
+                        localTypes: localTypes,
                         registers: &registers
                        )
                     else {
@@ -2813,6 +2937,7 @@ public struct Interpreter: Sendable {
                                 key: keyType,
                                 value: valueType
                             ),
+                            localTypes: localTypes,
                             registers: &registers
                           )
                     else {
@@ -2961,6 +3086,7 @@ public struct Interpreter: Sendable {
                             kind: .stableSort,
                             element: element
                         ),
+                        localTypes: localTypes,
                         registers: &registers
                        )
                     else {
@@ -3118,6 +3244,7 @@ public struct Interpreter: Sendable {
                        case let .arraySplitState(state) = try consume(
                         stateRegister,
                         type: .arrayState(kind: .split, element: element),
+                        localTypes: localTypes,
                         registers: &registers
                        )
                     else {
@@ -3919,6 +4046,7 @@ public struct Interpreter: Sendable {
                         arguments,
                         to: frame.blocks[target]!,
                         function: function,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     currentBlock = target
@@ -3933,6 +4061,7 @@ public struct Interpreter: Sendable {
                         arguments,
                         to: frame.blocks[target]!,
                         function: function,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     currentBlock = target
@@ -3947,6 +4076,7 @@ public struct Interpreter: Sendable {
                         arguments,
                         conventions: calleeFunction.parameterConventions,
                         function: function,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     persist(
@@ -3975,6 +4105,7 @@ public struct Interpreter: Sendable {
                         arguments,
                         conventions: Array(repeating: .owned, count: arguments.count),
                         function: function,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     switch entryInvocation(entry, values, budget) {
@@ -4004,6 +4135,7 @@ public struct Interpreter: Sendable {
                         arguments,
                         conventions: Array(repeating: .owned, count: arguments.count),
                         function: function,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     switch try invokeNative(
@@ -4161,6 +4293,7 @@ public struct Interpreter: Sendable {
                             calleeFunction.parameterConventions.prefix(arguments.count)
                         ),
                         function: function,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     persist(
@@ -4225,6 +4358,7 @@ public struct Interpreter: Sendable {
                             )
                         ),
                         function: function,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     persist(
@@ -4256,6 +4390,7 @@ public struct Interpreter: Sendable {
                         arguments,
                         conventions: calleeFunction.parameterConventions,
                         function: function,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     persist(
@@ -4285,6 +4420,7 @@ public struct Interpreter: Sendable {
                         arguments,
                         conventions: Array(repeating: .owned, count: arguments.count),
                         function: function,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     switch entryInvocation(entry, values, budget) {
@@ -4328,6 +4464,7 @@ public struct Interpreter: Sendable {
                         arguments,
                         conventions: Array(repeating: .owned, count: arguments.count),
                         function: function,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     switch try invokeNative(
@@ -4380,6 +4517,7 @@ public struct Interpreter: Sendable {
                     let value = try consume(
                         error,
                         type: function.type(of: error)!,
+                        localTypes: localTypes,
                         registers: &registers
                     )
                     switch value {
@@ -4457,12 +4595,15 @@ public struct Interpreter: Sendable {
         _ arguments: [Bytecode.Register],
         conventions: [Bytecode.ParameterConvention],
         function: Bytecode.Function,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
         registers: inout [VM.Value?]
     ) throws {
         for (argument, convention) in zip(arguments, conventions)
-        where convention == .owned
-            && function.type(of: argument)?.requiresLinearOwnership == true {
-            _ = try take(argument, registers: &registers)
+        where convention == .owned {
+            if let type = function.type(of: argument),
+               requiresManagedOwnership(type, localTypes: localTypes) {
+                _ = try take(argument, registers: &registers)
+            }
         }
     }
 
@@ -4504,6 +4645,16 @@ public struct Interpreter: Sendable {
             }
         case let (.mutableCell(cell), .mutableCell(pointee)):
             guard cell.pointee == pointee else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: expected,
+                    actual: value.type
+                )
+            }
+        case let (
+            .nonOwningReference(reference),
+            .nonOwningReference(kind, pointee)
+        ):
+            guard reference.kind == kind, reference.pointee == pointee else {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: expected,
                     actual: value.type
@@ -4795,10 +4946,61 @@ public struct Interpreter: Sendable {
     private func consume(
         _ register: Bytecode.Register,
         type: Bytecode.ValueType,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
         registers: inout [VM.Value?]
     ) throws -> VM.Value {
-        if !type.requiresLinearOwnership { return try read(register, registers: registers) }
+        guard requiresManagedOwnership(type, localTypes: localTypes) else {
+            return try read(register, registers: registers)
+        }
         return try take(register, registers: &registers)
+    }
+
+    /// Managed ownership is a property of the verified type graph, not of the
+    /// aggregate's current element count. Keeping this check structural avoids
+    /// unmetered value traversal on every move, call, or block transfer while
+    /// still ending owners for local/native class references nested in values.
+    private func requiresManagedOwnership(
+        _ type: Bytecode.ValueType,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
+    ) -> Bool {
+        if type.requiresLinearOwnership { return true }
+        var visiting = Set<Bytecode.LocalTypeKey>()
+
+        func visit(_ type: Bytecode.ValueType) -> Bool {
+            switch type {
+            case let .local(key):
+                guard visiting.insert(key).inserted,
+                      let definition = localTypes[key]
+                else { return false }
+                defer { visiting.remove(key) }
+                switch definition.kind {
+                case .class:
+                    return true
+                case let .structure(fields):
+                    return fields.contains { visit($0.type) }
+                case let .enumeration(cases):
+                    return cases.contains { item in
+                        item.payloadType.map(visit) == true
+                    }
+                }
+            case let .optional(wrapped), let .array(wrapped),
+                 let .set(wrapped):
+                return visit(wrapped)
+            case let .dictionary(key, value):
+                return visit(key) || visit(value)
+            case let .tuple(elements):
+                return elements.contains(where: visit)
+            case .any, .error:
+                return true
+            case .void, .never, .bool, .integer, .float, .string,
+                 .native, .address, .mutableCell,
+                 .nonOwningReference, .arrayState, .dictionaryState,
+                 .closure:
+                return false
+            }
+        }
+
+        return visit(type)
     }
 
     private func read(
@@ -4885,6 +5087,137 @@ public struct Interpreter: Sendable {
         return exact
     }
 
+    private func nonOwningReferenceTarget(
+        kind: Bytecode.NonOwningReferenceKind,
+        pointee: Bytecode.ValueType,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
+    ) throws -> VM.NonOwningReference.Target {
+        let strongType: Bytecode.ValueType
+        if case let .optional(wrapped) = pointee {
+            strongType = wrapped
+        } else {
+            guard kind == .unowned else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: .optional(pointee),
+                    actual: pointee
+                )
+            }
+            strongType = pointee
+        }
+
+        switch strongType {
+        case let .local(key):
+            guard let definition = localTypes[key],
+                  case .class = definition.kind
+            else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: strongType,
+                    actual: strongType
+                )
+            }
+            return .local(key)
+        case let .native(id):
+            guard nativeTypeCatalog[id]?.kind == .reference else {
+                throw VM.RuntimeTrap.nativeTypeMismatch(expected: id)
+            }
+            return .native(id)
+        default:
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: strongType,
+                actual: strongType
+            )
+        }
+    }
+
+    private func store(
+        _ value: VM.Value,
+        in reference: VM.NonOwningReference,
+        mode: Bytecode.StackStoreMode
+    ) throws {
+        guard value.hasRuntimeType(reference.pointee) else {
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: reference.pointee,
+                actual: value.type
+            )
+        }
+
+        let payload: VM.Value?
+        if case .optional = reference.pointee {
+            guard case let .optional(wrapped) = value else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: reference.pointee,
+                    actual: value.type
+                )
+            }
+            payload = wrapped
+        } else {
+            payload = value
+        }
+
+        let object: AnyObject?
+        switch (reference.target, payload) {
+        case (_, nil):
+            object = nil
+        case let (.local(expected), .some(.object(value))):
+            guard value.typeKey == expected else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: .local(expected),
+                    actual: .local(value.typeKey)
+                )
+            }
+            object = value
+        case let (.native(expected), .some(.native(value))):
+            guard value.typeID == expected else {
+                throw VM.RuntimeTrap.nativeTypeMismatch(expected: expected)
+            }
+            object = try nativeTypeCatalog.referencedObject(in: value)
+        default:
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: reference.pointee,
+                actual: value.type
+            )
+        }
+        try reference.store(object: object, mode: mode)
+    }
+
+    private func load(
+        from reference: VM.NonOwningReference,
+        mode: Bytecode.StackLoadMode,
+        budget: VM.InvocationBudget
+    ) throws -> VM.Value {
+        guard let object = try reference.loadObject(mode: mode) else {
+            guard case .optional = reference.pointee else {
+                throw VM.RuntimeTrap.danglingUnownedReference
+            }
+            return .optional(nil)
+        }
+
+        let strong: VM.Value
+        switch reference.target {
+        case let .local(expected):
+            guard let value = object as? VM.ObjectReference,
+                  value.typeKey == expected
+            else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: .local(expected),
+                    actual: nil
+                )
+            }
+            strong = .object(value)
+        case let .native(expected):
+            let value = try nativeTypeCatalog.boxReference(
+                object,
+                as: expected
+            )
+            try budget.consumeNativeOwned(bytes: value.estimatedByteCount)
+            strong = .native(value)
+        }
+        if case .optional = reference.pointee {
+            return .optional(strong)
+        }
+        return strong
+    }
+
     private func copy(_ value: VM.Value) throws -> VM.Value {
         if value.type.isVMHashable {
             // This closed family contains no native handles or mutable cells.
@@ -4954,6 +5287,8 @@ public struct Interpreter: Sendable {
                 )
             )
         case .mutableCell:
+            value
+        case .nonOwningReference:
             value
         case .arrayBuilder, .arrayMutationState, .dictionaryBuilder,
              .arraySortState, .arraySplitState:
@@ -5180,7 +5515,8 @@ public struct Interpreter: Sendable {
                         return true
                     }
                 }
-            case .optional(nil), .native, .bool, .integer, .float, .string:
+            case .optional(nil), .native, .nonOwningReference, .bool,
+                 .integer, .float, .string:
                 break
             }
             return false
@@ -5481,6 +5817,7 @@ public struct Interpreter: Sendable {
                 try chargeCopiedValue(capture, budget: budget, depth: depth + 1)
             }
         case .bool, .integer, .float, .string, .address, .mutableCell,
+             .nonOwningReference,
              .arrayBuilder, .arrayMutationState, .dictionaryBuilder,
              .arraySortState, .arraySplitState:
             break
@@ -5529,14 +5866,17 @@ public struct Interpreter: Sendable {
         _ arguments: [Bytecode.Register],
         to target: Bytecode.Block,
         function: Bytecode.Function,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
         registers: inout [VM.Value?]
     ) throws {
         var values: [VM.Value] = []
         for (argument, parameter) in zip(arguments, target.parameters) {
-            if function.type(of: parameter)?.requiresLinearOwnership == true {
+            let value = try read(argument, registers: registers)
+            if let type = function.type(of: parameter),
+               requiresManagedOwnership(type, localTypes: localTypes) {
                 values.append(try take(argument, registers: &registers))
             } else {
-                values.append(try read(argument, registers: registers))
+                values.append(value)
             }
         }
         try transferValues(values, to: target, registers: &registers)

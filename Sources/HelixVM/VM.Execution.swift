@@ -25,6 +25,7 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
     case addressWriteRequiresModifyAccess
     case exclusivityViolation
     case optionalUnwrapOfNil
+    case danglingUnownedReference
     case dynamicCastFailure(
         actual: Bytecode.DynamicType,
         expected: Bytecode.DynamicType
@@ -80,6 +81,8 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
         case .addressWriteRequiresModifyAccess: "address write requires modify access"
         case .exclusivityViolation: "overlapping address access violates exclusivity"
         case .optionalUnwrapOfNil: "attempted to unwrap a nil Optional"
+        case .danglingUnownedReference:
+            "attempted to load an unowned reference after deallocation"
         case let .dynamicCastFailure(actual, expected):
             "could not cast value of type \(actual) to \(expected)"
         case .dynamicCastProducedDuplicateDictionaryKey:
@@ -369,7 +372,8 @@ public final class InvocationBudget: @unchecked Sendable {
                 try consumeValueTraversal(capture, depth: depth + 1)
             }
         case .object, .optional(nil), .native, .bool, .integer, .float,
-             .address, .mutableCell, .arrayBuilder, .arrayMutationState,
+             .address, .mutableCell, .nonOwningReference,
+             .arrayBuilder, .arrayMutationState,
              .dictionaryBuilder, .arraySortState, .arraySplitState:
             break
         }
@@ -623,6 +627,10 @@ public final class InvocationBudget: @unchecked Sendable {
         case .mutableCell:
             throw VM.RuntimeTrap.explicit(
                 "mutable capture cells cannot cross a VM boundary"
+            )
+        case .nonOwningReference:
+            throw VM.RuntimeTrap.explicit(
+                "non-owning reference storage cannot cross a VM boundary"
             )
         case .arrayBuilder, .arrayMutationState, .dictionaryBuilder,
              .arraySortState, .arraySplitState:
