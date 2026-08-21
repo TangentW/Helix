@@ -152,6 +152,18 @@ or a stable native C/Objective-C-shaped operation, while supported Swift
 Sequence APIs are recognized at the frontend and lowered onto a small set of
 typed cursors, builders, mutations, and ordinary closure calls.
 
+Scalar/text conversion uses the same boundary. The frontend's concrete and
+generic ABI entry points for `Bool`, every represented signed or unsigned
+fixed-width integer, `Float`, and `Double` parsing converge on one
+type-directed `scalar_from_string` operation; integer radix formatting
+converges on `integer_to_string`. StringProtocol inputs are accepted only when
+their concrete representation is String or Substring. The verifier checks the
+Optional target and every operand type, and the VM validates radix `2...36`,
+charges input work, and reserves the maximum formatted output before calling
+Swift's native parser or formatter as a private implementation leaf. This
+reuses native standard-library behavior without exposing its generic ABI as a
+NativeImport or multiplying operations by API, scalar type, or bit width.
+
 Text follows that same split rather than receiving an API-shaped import table.
 The compiler keeps String and the one-grapheme Character contract logically
 distinct even though both use the compact HLBC String value, and normalizes

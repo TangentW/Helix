@@ -630,6 +630,21 @@ public enum Instruction: Codable, Hashable, Sendable {
         separator: Bytecode.Register?,
         elementKind: Bytecode.StringJoinElementKind
     )
+    /// Parses a represented String into the scalar carried by the Optional
+    /// result type. Only integer targets may provide an explicit radix.
+    case scalarFromString(
+        result: Bytecode.Register,
+        string: Bytecode.Register,
+        radix: Bytecode.Register?
+    )
+    /// Formats every represented fixed-width integer through one type-driven
+    /// radix operation. The radix and case remain runtime values.
+    case integerToString(
+        result: Bytecode.Register,
+        value: Bytecode.Register,
+        radix: Bytecode.Register,
+        uppercase: Bytecode.Register
+    )
     case stringify(result: Bytecode.Register, value: Bytecode.Register)
     case makeArray(result: Bytecode.Register, elements: [Bytecode.Register])
     case arrayCount(result: Bytecode.Register, array: Bytecode.Register)
@@ -1060,6 +1075,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .stringTransform(result, _, _),
              let .stringCharacters(result, _),
              let .stringJoin(result, _, _, _),
+             let .scalarFromString(result, _, _),
+             let .integerToString(result, _, _, _),
              let .stringify(result, _),
              let .makeArray(result, _),
              let .arrayCount(result, _),
@@ -1241,6 +1258,10 @@ public enum Instruction: Codable, Hashable, Sendable {
             [string]
         case let .stringJoin(_, elements, separator, _):
             [elements] + (separator.map { [$0] } ?? [])
+        case let .scalarFromString(_, string, radix):
+            [string] + (radix.map { [$0] } ?? [])
+        case let .integerToString(_, value, radix, uppercase):
+            [value, radix, uppercase]
         case let .stringify(_, value):
             [value]
         case let .makeArray(_, elements):

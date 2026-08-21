@@ -233,6 +233,12 @@ public enum Disassembler {
         case let .stringJoin(result, elements, separator, elementKind):
             "\(result) = string_join.\(elementKind.rawValue) \(elements)"
                 + (separator.map { ", separator: \($0)" } ?? "")
+        case let .scalarFromString(result, string, radix):
+            "\(result) = scalar_from_string \(string)"
+                + (radix.map { ", radix: \($0)" } ?? "")
+        case let .integerToString(result, value, radix, uppercase):
+            "\(result) = integer_to_string \(value), radix: \(radix), "
+                + "uppercase: \(uppercase)"
         case let .stringify(result, value):
             "\(result) = stringify \(value)"
         case let .makeArray(result, elements):

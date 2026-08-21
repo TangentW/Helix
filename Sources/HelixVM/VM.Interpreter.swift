@@ -1818,6 +1818,65 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
+                case let .scalarFromString(result, stringRegister, radixRegister):
+                    let source = try string(stringRegister, registers: registers)
+                    let radix = try radixRegister.map {
+                        try VM.ScalarText.radix(
+                            from: integer($0, registers: registers)
+                        )
+                    }
+                    // Preserve Swift's radix precondition before charging work
+                    // proportional to an input that parsing will never inspect.
+                    try budget.consumeUTF8Work(byteCount: source.utf8.count)
+                    guard case let .optional(target) = function.type(of: result) else {
+                        throw VM.RuntimeTrap.invalidProgramCounter
+                    }
+                    let parsed = try VM.ScalarText.parse(
+                        source,
+                        as: target,
+                        radix: radix
+                    )
+                    try budget.checkDeadline()
+                    try initialize(
+                        .optional(parsed),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .integerToString(
+                    result,
+                    valueRegister,
+                    radixRegister,
+                    uppercaseRegister
+                ):
+                    let value = try integer(valueRegister, registers: registers)
+                    let radix = try VM.ScalarText.radix(
+                        from: integer(radixRegister, registers: registers)
+                    )
+                    let uppercase = try boolean(
+                        uppercaseRegister,
+                        registers: registers
+                    )
+                    let maximumBytes = VM.ScalarText
+                        .maximumFormattedUTF8ByteCount(for: value)
+                    try budget.consumeUTF8Work(
+                        byteCount: Int(maximumBytes)
+                    )
+                    let formatted = try budget.withReservedVMHeap(
+                        maximumBytes: maximumBytes
+                    ) {
+                        let string = try VM.ScalarText.format(
+                            value,
+                            radix: radix,
+                            uppercase: uppercase
+                        )
+                        return (string, UInt64(string.utf8.count))
+                    }
+                    try budget.checkDeadline()
+                    try initialize(
+                        .string(formatted),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .stringify(result, operand):
                     let source = try read(operand, registers: registers)
                     let maximumBytes = try VM.StringAllocation

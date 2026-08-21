@@ -181,6 +181,68 @@ struct Container {
         #expect(disassembly.contains("string_join.string"))
     }
 
+    @Test("Scalar text primitives share the current HLBC 1.0 wire format")
+    func scalarTextRoundTrip() throws {
+        let optionalInteger = Bytecode.ValueType.optional(.int64)
+        let resultType = Bytecode.ValueType.tuple([
+            optionalInteger, .string,
+        ])
+        var module = try makeAddModule()
+        module.capabilities.insert(.stringsV1)
+        module.functions[0] = .init(
+            id: .init(rawValue: 0),
+            name: "scalarText",
+            parameterRegisters: [
+                .init(rawValue: 0), .init(rawValue: 1),
+                .init(rawValue: 2), .init(rawValue: 3),
+            ],
+            resultType: resultType,
+            registerTypes: [
+                .string, .int64, .int64, .bool,
+                optionalInteger, .string, resultType,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                        .init(rawValue: 2), .init(rawValue: 3),
+                    ],
+                    instructions: [
+                        .scalarFromString(
+                            result: .init(rawValue: 4),
+                            string: .init(rawValue: 0),
+                            radix: .init(rawValue: 2)
+                        ),
+                        .integerToString(
+                            result: .init(rawValue: 5),
+                            value: .init(rawValue: 1),
+                            radix: .init(rawValue: 2),
+                            uppercase: .init(rawValue: 3)
+                        ),
+                        .makeTuple(
+                            result: .init(rawValue: 6),
+                            elements: [
+                                .init(rawValue: 4), .init(rawValue: 5),
+                            ]
+                        ),
+                        .returnValue(.init(rawValue: 6)),
+                    ]
+                ),
+            ]
+        )
+
+        let bytes = try Bytecode.Encoder.encode(module)
+        let decoded = try Bytecode.Decoder.decode(bytes).module
+        let disassembly = Bytecode.Disassembler.disassemble(decoded)
+
+        #expect(decoded == module)
+        #expect(try Bytecode.Encoder.encode(decoded) == bytes)
+        #expect(disassembly.contains("scalar_from_string"))
+        #expect(disassembly.contains("integer_to_string"))
+    }
+
     @Test("Encoding is deterministic")
     func deterministicEncoding() throws {
         let module = try makeAddModule()

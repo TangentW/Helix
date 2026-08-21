@@ -205,6 +205,15 @@ String, Substring, Array, and normalized Array-backed views. Contents sources
 reuse the existing represented managed-Collection/progression materialization
 boundary after canonical source-level Element identity and physical shape are
 checked; direct String/Character suffixes avoid segmenting the destination.
+Scalar parsing also remains type-driven: one verified operation covers `Bool`
+from String and all represented signed/unsigned fixed-width integers,
+`Float`, and `Double` across their supported String/Substring entry points,
+while one more covers radix formatting for the entire integer family. The VM
+may use Swift's native
+parser/formatter internally only after type, radix, fuel, and allocation checks;
+the generic standard-library ABI is neither serialized nor registered as a
+NativeImport. Invalid radix outside `2...36` is a controlled Swift-compatible
+trap. Both operations remain part of the current HLBC 1.0 contract.
 Private
 String indices, UTF views, index-sensitive mutation, and Foundation text
 semantics remain fail-closed.

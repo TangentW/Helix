@@ -2283,6 +2283,46 @@ public struct Engine: Verification.ImageVerifying {
             if elementKind == .character, separator != nil {
                 throw fail("character string_join cannot carry a separator")
             }
+        case let .scalarFromString(result, string, radix):
+            guard capabilities.contains(.stringsV1) else {
+                throw fail("Scalar text parsing requires \(Core.Capability.stringsV1)")
+            }
+            guard type(string) == .string,
+                  case let .optional(target) = type(result)
+            else {
+                throw fail(
+                    "scalar_from_string requires a String and an Optional scalar result"
+                )
+            }
+            switch target {
+            case .integer:
+                guard radix.map({ type($0) == .int64 }) ?? true else {
+                    throw fail("integer scalar_from_string radix must be Int64")
+                }
+            case .bool, .float:
+                guard radix == nil else {
+                    throw fail(
+                        "Bool and floating scalar_from_string cannot carry a radix"
+                    )
+                }
+            default:
+                throw fail(
+                    "scalar_from_string supports only Bool, integer, and floating-point targets"
+                )
+            }
+        case let .integerToString(result, value, radix, uppercase):
+            guard capabilities.contains(.stringsV1) else {
+                throw fail("Integer formatting requires \(Core.Capability.stringsV1)")
+            }
+            guard type(result) == .string,
+                  case .integer = type(value),
+                  type(radix) == .int64,
+                  type(uppercase) == .bool
+            else {
+                throw fail(
+                    "integer_to_string requires an integer, Int64 radix, Bool case, and String result"
+                )
+            }
         case let .stringify(result, value):
             guard capabilities.contains(.stringsV1) else {
                 throw fail("String interpolation requires \(Core.Capability.stringsV1)")
@@ -4036,7 +4076,8 @@ public struct Engine: Verification.ImageVerifying {
                      .floatingConvert,
                      .booleanBinary, .stringConcat, .stringCount, .stringIsEmpty,
                      .stringPredicate, .stringTransform, .stringCharacters,
-                     .stringJoin, .stringify,
+                     .stringJoin, .scalarFromString, .integerToString,
+                     .stringify,
                      .arrayCount, .arrayIsEmpty, .arraySearch,
                      .dictionaryCount, .dictionaryIsEmpty,
                      .setCount, .setIsEmpty, .setContains, .setRelation,

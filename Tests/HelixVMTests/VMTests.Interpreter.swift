@@ -2173,6 +2173,163 @@ struct Interpreter {
         }
     }
 
+    @Test("Scalar text conversion is bounded before native parsing and formatting")
+    func scalarTextConversionRespectsResourceBudgets() throws {
+        let integer = Bytecode.ValueType.int64
+        let formatting = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "integerToString",
+            parameterRegisters: [
+                .init(rawValue: 0), .init(rawValue: 1), .init(rawValue: 2),
+            ],
+            resultType: .string,
+            registerTypes: [integer, integer, .bool, .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                        .init(rawValue: 2),
+                    ],
+                    instructions: [
+                        .integerToString(
+                            result: .init(rawValue: 3),
+                            value: .init(rawValue: 0),
+                            radix: .init(rawValue: 1),
+                            uppercase: .init(rawValue: 2)
+                        ),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+        let minimum = try VM.Integer(
+            signed: .min,
+            bitWidth: 64,
+            isSigned: true
+        )
+        let radixTwo = try VM.Integer(
+            signed: 2,
+            bitWidth: 64,
+            isSigned: true
+        )
+        let output = String(Int64.min, radix: 2)
+        let frameBytes = UInt64(
+            formatting.registerTypes.count * MemoryLayout<VM.Value?>.stride
+        )
+        let outputBytes = UInt64(output.utf8.count)
+        #expect(
+            outputBytes
+                == VM.ScalarText.maximumFormattedUTF8ByteCount(for: minimum)
+        )
+
+        func formattingImage(
+            maximumHeapBytes: UInt64
+        ) throws -> Verification.Image {
+            try makeVerified(
+                function: formatting,
+                limits: .init(
+                    maxVMHeapBytes: maximumHeapBytes,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                capabilities: [.baselineV1, .stringsV1],
+                signature: .init(
+                    parameters: ["Swift.Int", "Swift.Int", "Swift.Bool"],
+                    result: "Swift.String"
+                ),
+                parameterTypes: [integer, integer, .bool],
+                resultType: .string
+            )
+        }
+
+        let arguments: [VM.Value] = [
+            .integer(minimum), .integer(radixTwo), .bool(false),
+        ]
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try formattingImage(
+                    maximumHeapBytes: frameBytes + outputBytes - 1
+                ),
+                arguments: arguments
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try formattingImage(
+                    maximumHeapBytes: frameBytes + outputBytes
+                ),
+                arguments: arguments
+            ) == .returned(.string(output))
+        )
+
+        let optionalInteger = Bytecode.ValueType.optional(integer)
+        let parsing = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "scalarFromString",
+            parameterRegisters: [
+                .init(rawValue: 0), .init(rawValue: 1),
+            ],
+            resultType: optionalInteger,
+            registerTypes: [.string, integer, optionalInteger],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                    ],
+                    instructions: [
+                        .scalarFromString(
+                            result: .init(rawValue: 2),
+                            string: .init(rawValue: 0),
+                            radix: .init(rawValue: 1)
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let longInput = String(repeating: "1", count: 4_096)
+        let parsingImage = try makeVerified(
+            function: parsing,
+            limits: .init(
+                instructionFuelPerEntry: 300,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            ),
+            capabilities: [.baselineV1, .stringsV1],
+            signature: .init(
+                parameters: ["Swift.String", "Swift.Int"],
+                result: "Swift.Optional<Swift.Int>"
+            ),
+            parameterTypes: [.string, integer],
+            resultType: optionalInteger
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: parsingImage,
+                arguments: [.string(longInput), .integer(radixTwo)]
+            ) == .trapped(.instructionFuelExhausted)
+        )
+        let invalidRadix = try VM.Integer(
+            signed: 1,
+            bitWidth: 64,
+            isSigned: true
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: parsingImage,
+                arguments: [.string(longInput), .integer(invalidRadix)]
+            ) == .trapped(
+                .explicit(VM.ScalarText.invalidRadixMessage)
+            )
+        )
+    }
+
     @Test("Array boundary storage is typed and charged before execution")
     func arrayBoundaryConsumesHeapBudget() throws {
         let arrayType = Bytecode.ValueType.array(.int64)

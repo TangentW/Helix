@@ -17,6 +17,7 @@ enum SwiftCoreIntrinsic: Equatable {
     case managedCollectionCast(
         CanonicalSIL.ManagedCollectionCastIntrinsic
     )
+    case scalarText(CanonicalSIL.ScalarTextIntrinsic)
     case text(CanonicalSIL.TextIntrinsic)
     case minimum
     case maximum
@@ -75,6 +76,12 @@ enum SwiftCoreIntrinsic: Equatable {
             mangledName: mangledName
         ) {
             self = .collection(collection)
+            return
+        }
+        if let scalarText = CanonicalSIL.ScalarTextIntrinsic(
+            mangledName: mangledName
+        ) {
+            self = .scalarText(scalarText)
             return
         }
         if let text = CanonicalSIL.TextIntrinsic(mangledName: mangledName) {

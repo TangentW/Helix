@@ -70,8 +70,16 @@ does not by itself certify a physical device or distribution channel.
   `RangeReplaceableCollection` plan with Array-backed values rather than text-
   specific bytecode. Direct Character/String suffixes avoid segmenting the
   existing String; other represented Character sequences are materialized and
-  joined once. Variable-size text operations precharge deterministic UTF-8
-  work and output storage.
+  joined once. Failable scalar construction additionally covers `Bool` from
+  String, every represented signed and unsigned fixed-width integer from String
+  or Substring with decimal or runtime radix, and `Float`/`Double` from String
+  or Substring. Integer `String(_:radix:uppercase:)` supports the same complete
+  integer family. Two target-type-driven HLBC operations cover those families;
+  verifier checks reject mismatched scalar/radix shapes, radix outside `2...36`
+  preserves Swift's precondition as a controlled trap, and no generic
+  standard-library NativeImport or per-width operation is introduced.
+  Variable-size text operations precharge deterministic UTF-8 work and output
+  storage.
 - Tuple, `Void`, and `Optional`, including the ordinary control flow produced by
   `if let`, `guard let`, `??`, and `try?`, including address-based Optional
   projection emitted by semantic Dictionary lookup SIL. Explicit

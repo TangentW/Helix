@@ -655,6 +655,103 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Scalar text instructions reject forged targets and format operands")
+    func rejectsInvalidScalarTextInstructions() throws {
+        func enableStrings(_ fixture: inout Fixture) {
+            fixture.module.capabilities.insert(.stringsV1)
+            fixture.shell.capabilities.insert(.stringsV1)
+            fixture.policy.acceptedCapabilities.insert(.stringsV1)
+        }
+
+        var invalidTarget = try makeFixture { function in
+            function.registerTypes.append(contentsOf: [
+                .string, .optional(.string),
+            ])
+            function.blocks[0].instructions = [
+                .constantString(result: .init(rawValue: 1), value: "1"),
+                .scalarFromString(
+                    result: .init(rawValue: 2),
+                    string: .init(rawValue: 1),
+                    radix: nil
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        enableStrings(&invalidTarget)
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "scalar_from_string supports only Bool, integer, and floating-point targets"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(invalidTarget.module),
+                shell: invalidTarget.shell,
+                policy: invalidTarget.policy
+            )
+        }
+
+        var invalidFloatingRadix = try makeFixture { function in
+            function.registerTypes.append(contentsOf: [
+                .string, .optional(.float(bitWidth: 32)),
+            ])
+            function.blocks[0].instructions = [
+                .constantString(result: .init(rawValue: 1), value: "1"),
+                .scalarFromString(
+                    result: .init(rawValue: 2),
+                    string: .init(rawValue: 1),
+                    radix: .init(rawValue: 0)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        enableStrings(&invalidFloatingRadix)
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "Bool and floating scalar_from_string cannot carry a radix"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(invalidFloatingRadix.module),
+                shell: invalidFloatingRadix.shell,
+                policy: invalidFloatingRadix.policy
+            )
+        }
+
+        var invalidFormatting = try makeFixture { function in
+            function.registerTypes.append(.string)
+            function.blocks[0].instructions = [
+                .integerToString(
+                    result: .init(rawValue: 1),
+                    value: .init(rawValue: 0),
+                    radix: .init(rawValue: 0),
+                    uppercase: .init(rawValue: 0)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        enableStrings(&invalidFormatting)
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "integer_to_string requires an integer, Int64 radix, Bool case, and String result"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(invalidFormatting.module),
+                shell: invalidFormatting.shell,
+                policy: invalidFormatting.policy
+            )
+        }
+    }
+
     @Test("Text representation primitives enforce types and logical Character shape")
     func rejectsInvalidTextRepresentationInstructions() throws {
         var invalidCharacters = try makeFixture { function in

@@ -12954,6 +12954,276 @@ public struct Lowerer: Sendable {
                 values[resultToken] = result
             }
 
+            func lowerDefaultIntegerParsingRadix() throws {
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard arguments.isEmpty,
+                      specializations.count == 2,
+                      case .integer = try parseStoredType(specializations[0]),
+                      let sourceKind = CanonicalSIL.TextRepresentation.kind(
+                          of: specializations[1]
+                      ),
+                      sourceKind != .character
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "integer parsing default radix has unsupported specializations"
+                    )
+                }
+                let result = try allocate(type: .int64)
+                appendInstruction(
+                    .constantInteger(result: result, bitPattern: 10)
+                )
+                values[resultToken] = result
+            }
+
+            func lowerDefaultIntegerFormattingCase() throws {
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard arguments.isEmpty,
+                      specializations.count == 1,
+                      case .integer = try parseStoredType(specializations[0])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "integer formatting default case has unsupported specializations"
+                    )
+                }
+                let result = try allocate(type: .bool)
+                appendInstruction(.constantBool(result: result, value: false))
+                values[resultToken] = result
+            }
+
+            func lowerIntegerTextFormatting() throws {
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard specializations.count == 1,
+                      arguments.count == 4,
+                      metatypeValues.contains(arguments[3]),
+                      let value = try copyStoredValue(
+                          at: arguments[0],
+                          line: line
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "integer text formatting has unsupported arguments"
+                    )
+                }
+                let type = try parseStoredType(specializations[0])
+                guard case .integer = type else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "integer text formatting payload \(specializations[0])"
+                    )
+                }
+                let radix = try resolve(arguments[1], line: line)
+                let uppercase = try resolve(arguments[2], line: line)
+                guard registerTypes[Int(value.rawValue)] == type,
+                      registerTypes[Int(radix.rawValue)] == .int64,
+                      registerTypes[Int(uppercase.rawValue)] == .bool
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "integer text formatting operands do not match its specialization"
+                    )
+                }
+                let result = try allocate(type: .string)
+                appendInstruction(
+                    .integerToString(
+                        result: result,
+                        value: value,
+                        radix: radix,
+                        uppercase: uppercase
+                    )
+                )
+                values[resultToken] = result
+            }
+
+            func lowerScalarTextParsing(
+                _ parsing: CanonicalSIL.ScalarTextIntrinsic.Parsing
+            ) throws {
+                var specializations = ArraySlice(
+                    splitTopLevel(genericArguments).filter { !$0.isEmpty }
+                )
+                let target: Bytecode.ValueType
+                switch parsing.target {
+                case .genericInteger:
+                    guard let spelling = specializations.popFirst() else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "integer text parsing is missing its target specialization"
+                        )
+                    }
+                    target = try parseStoredType(spelling)
+                    guard case .integer = target else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "text parsing target \(spelling) is not a represented integer"
+                        )
+                    }
+                case let .fixed(type):
+                    target = type
+                }
+
+                let sourceKind: CanonicalSIL.TextRepresentation.Kind
+                switch parsing.source {
+                case .ownedString:
+                    sourceKind = .string
+                case .ownedSubstring:
+                    sourceKind = .substring
+                case .stringProtocolAddress:
+                    guard let spelling = specializations.popFirst(),
+                          let kind = CanonicalSIL.TextRepresentation.kind(
+                              of: spelling
+                          ),
+                          kind != .character
+                    else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "scalar text parsing requires represented String or Substring"
+                        )
+                    }
+                    sourceKind = kind
+                }
+                guard specializations.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "scalar text parsing has unexpected specializations"
+                    )
+                }
+
+                switch (target, parsing.radix) {
+                case (.integer, .decimal), (.integer, .argument),
+                     (.bool, .none), (.float, .none):
+                    break
+                default:
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "scalar text parsing target and radix shape disagree"
+                    )
+                }
+
+                let expectedArgumentCount = (parsing.hasIndirectResult ? 1 : 0)
+                    + 1 + (parsing.radix == .argument ? 1 : 0) + 1
+                guard arguments.count == expectedArgumentCount else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "scalar text parsing has unsupported arguments"
+                    )
+                }
+                var argumentIndex = 0
+                let destination: String?
+                if parsing.hasIndirectResult {
+                    destination = arguments[argumentIndex]
+                    argumentIndex += 1
+                } else {
+                    destination = nil
+                }
+                if let destination,
+                   compilerAddressType(destination) != .optional(target) {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "scalar text parsing result address has the wrong type"
+                    )
+                }
+
+                let sourceToken = arguments[argumentIndex]
+                argumentIndex += 1
+                let representedSource: Bytecode.Register
+                switch parsing.source {
+                case .ownedString, .ownedSubstring:
+                    representedSource = try materializeOwnedValue(
+                        at: sourceToken,
+                        line: line
+                    )
+                case .stringProtocolAddress:
+                    guard let copied = try copyStoredValue(
+                        at: sourceToken,
+                        line: line
+                    ) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "scalar text parsing source address is uninitialized"
+                        )
+                    }
+                    representedSource = copied
+                }
+
+                let source: Bytecode.Register
+                switch sourceKind {
+                case .string:
+                    guard registerTypes[Int(representedSource.rawValue)] == .string else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "scalar text parsing String source has the wrong representation"
+                        )
+                    }
+                    source = representedSource
+                case .substring:
+                    guard registerTypes[Int(representedSource.rawValue)]
+                            == .array(.string)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "scalar text parsing Substring source has the wrong representation"
+                        )
+                    }
+                    source = try lowerStringJoin(
+                        elements: representedSource,
+                        separator: nil,
+                        elementKind: .character,
+                        context: "scalar text parsing"
+                    )
+                case .character:
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Character does not conform to StringProtocol"
+                    )
+                }
+
+                let radix: Bytecode.Register?
+                if parsing.radix == .argument {
+                    radix = try resolve(arguments[argumentIndex], line: line)
+                    argumentIndex += 1
+                } else {
+                    radix = nil
+                }
+                if let radix,
+                   registerTypes[Int(radix.rawValue)] != .int64 {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "scalar text parsing radix must be Int"
+                    )
+                }
+                let metatype = arguments[argumentIndex]
+                argumentIndex += 1
+                guard argumentIndex == arguments.count,
+                      scalarMetatypeValues[metatype] == target
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "scalar text parsing metatype does not match its target"
+                    )
+                }
+
+                let result = try allocate(type: .optional(target))
+                appendInstruction(
+                    .scalarFromString(
+                        result: result,
+                        string: source,
+                        radix: radix
+                    )
+                )
+                if let destination {
+                    try storeConstructedValue(
+                        result,
+                        at: destination,
+                        mode: .initialize
+                    )
+                    voidValues.insert(resultToken)
+                } else {
+                    values[resultToken] = result
+                }
+            }
+
+            func lowerScalarTextIntrinsic(
+                _ intrinsic: CanonicalSIL.ScalarTextIntrinsic
+            ) throws {
+                switch intrinsic {
+                case .defaultIntegerRadix:
+                    try lowerDefaultIntegerParsingRadix()
+                case .defaultUppercase:
+                    try lowerDefaultIntegerFormattingCase()
+                case .integerToString:
+                    try lowerIntegerTextFormatting()
+                case let .parse(parsing):
+                    try lowerScalarTextParsing(parsing)
+                }
+            }
+
             switch intrinsic {
             case let .scalar(scalar):
                 try lowerScalarIntrinsic(
@@ -13342,6 +13612,9 @@ public struct Lowerer: Sendable {
                 // `unreachable` terminator.
                 unreachableTrapReasons[blockID] = trapReason(for: message)
                 voidValues.insert(resultToken)
+
+            case let .scalarText(scalarText):
+                try lowerScalarTextIntrinsic(scalarText)
 
             case let .text(.literal(kind)):
                 guard genericArguments.isEmpty else {
@@ -15595,7 +15868,7 @@ public struct Lowerer: Sendable {
                 }
                 if let type = try? parseStoredType(metatype[2]) {
                     switch type {
-                    case .integer, .float:
+                    case .bool, .integer, .float:
                         scalarMetatypeValues[metatype[0]] = type
                         continue
                     default:
