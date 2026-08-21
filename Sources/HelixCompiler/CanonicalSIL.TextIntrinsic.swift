@@ -24,9 +24,36 @@ enum TextIntrinsic: Equatable {
         case repeating
         case losslessDescription
         case customDescription
+        case nativeDescription(NativeDescription)
         case fromCharacter
         case fromSubstring
         case fromCharacterSequence
+    }
+
+    enum NativeDescription: Equatable {
+        case describing
+        case reflecting
+
+        var descriptor: Bytecode.StandardLibraryImports.Descriptor {
+            switch self {
+            case .describing:
+                Bytecode.StandardLibraryImports.swiftStringDescribing
+            case .reflecting:
+                Bytecode.StandardLibraryImports.swiftStringReflecting
+            }
+        }
+
+        init?(mangledName: String) {
+            if Bytecode.StandardLibraryImports.swiftStringDescribing
+                .silMangledNames.contains(mangledName) {
+                self = .describing
+            } else if Bytecode.StandardLibraryImports.swiftStringReflecting
+                .silMangledNames.contains(mangledName) {
+                self = .reflecting
+            } else {
+                return nil
+            }
+        }
     }
 
     enum Interpolation: Equatable {
@@ -47,6 +74,12 @@ enum TextIntrinsic: Equatable {
     case interpolation(Interpolation)
 
     init?(mangledName: String) {
+        if let nativeDescription = NativeDescription(
+            mangledName: mangledName
+        ) {
+            self = .construction(.nativeDescription(nativeDescription))
+            return
+        }
         switch mangledName {
         case "$sSS21_builtinStringLiteral17utf8CodeUnitCount7isASCIISSBp_BwBi1_tcfC":
             self = .literal(.string)

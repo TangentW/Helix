@@ -278,6 +278,20 @@ witnesses outside the downloaded execution surface. If recursive conversion
 would collapse distinct Dictionary keys or Set elements, HLVM raises a
 controlled trap matching Swift's terminating collection-invariant check.
 
+Native text rendering is a deliberately narrow exception to keeping generic
+standard-library APIs inside HLVM. The compiler recognizes the generic
+`String(describing:)` and `String(reflecting:)` SIL entries, proves a recursive
+scalar/text/Optional/Array/Dictionary/Set value can cross the Swift codec, and
+converts it to the fixed `Any -> String` Shell ABI; generic metadata and witness
+tables never cross. `Swift.print` and `Swift.debugPrint` use their concrete
+`[Any], String, String -> Void` ABI. All four imports are frozen into current
+Shells and enforce a 64 KiB rendering bound. Branch-local existential writes
+are merged through typed HLBC block parameters before an Array literal is
+finalized. ArraySlice, tuple, patch-local, native-object, and closure values
+remain valid only inside the verified image and are rejected by compiler proof
+or the boundary codec before the Swift formatter or I/O executes. HLBC, HLXI,
+ABI, schema, and product versions remain 1/1.0.
+
 Reading VM storage as `Array.capacity` and
 unrepresented randomness through `randomElement()` remain rejected. The
 subset also includes
@@ -288,8 +302,9 @@ payload-carrying local errors, scoped patch-local `inout`/`mutating` helpers,
 synchronous nonthrowing or throwing patch-local closures, type-independent
 managed mutable captures, copyable linear captures with a borrowed capture ABI,
 and same-image `@escaping` return/capture flows, fully concrete compiler
-specializations, reabstraction thunks, and default-argument generators, an
-automatically frozen `Swift.print` NativeImport, and top-level non-suspending
+specializations, reabstraction thunks, and default-argument generators,
+automatically frozen `Swift.print`, `Swift.debugPrint`, and fixed
+String-description NativeImports, and top-level non-suspending
 `async`, `async throws`, and `@MainActor async` entries. A new `final` class may
 also inherit an HLXI-frozen, `NSObject`-compatible project or system type under
 the closed hosted profile and cross into native code as that superclass. The

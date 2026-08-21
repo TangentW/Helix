@@ -1,4 +1,5 @@
 import Foundation
+import HelixBytecode
 import HelixCore
 import HelixInterface
 import HelixVerifier
@@ -17,6 +18,9 @@ struct FrontendExecutionHarness {
         functionName: String,
         moduleName: String = "HelixFrontendExecutionFixture",
         nativeTypes: [InterfaceArchive.TypeRecord] = [],
+        standardLibraryImports: [
+            Bytecode.StandardLibraryImports.Descriptor
+        ] = [],
         optimization: String = "-Onone"
     ) throws -> Fixture {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -100,6 +104,60 @@ struct FrontendExecutionHarness {
             buildNumber: "1",
             seed: "fixture"
         )
+        var resolvedImports: [(
+            descriptor: Bytecode.StandardLibraryImports.Descriptor,
+            requirement: Bytecode.ImportRequirement
+        )] = []
+        var directBindings: [CanonicalSIL.DirectCallBinding] = []
+        for (index, descriptor) in standardLibraryImports.enumerated() {
+            try descriptor.contract.validate(effects: descriptor.effects)
+            guard let rawID = UInt32(exactly: index) else {
+                throw CanonicalSIL.LoweringError.invalidCallTable(
+                    "frontend fixture has too many standard-library imports"
+                )
+            }
+            let id = Core.NativeImportID(rawValue: rawID)
+            let key = try Core.NativeImportKey.derive(
+                namespace: namespace,
+                canonicalCallee: descriptor.canonicalCallee,
+                signature: descriptor.signature,
+                effects: descriptor.effects,
+                contract: descriptor.contract
+            )
+            let requirement = Bytecode.ImportRequirement(
+                id: id,
+                key: key,
+                signature: descriptor.signature,
+                effects: descriptor.effects,
+                contract: descriptor.contract,
+                requiredCapability: descriptor.capability
+            )
+            resolvedImports.append((descriptor, requirement))
+            directBindings.append(contentsOf: descriptor.silMangledNames.map {
+                .init(
+                    mangledName: $0,
+                    parameterTypes: descriptor.parameterTypes,
+                    resultType: descriptor.resultType,
+                    effects: descriptor.effects,
+                    target: .nativeImport(requirement)
+                )
+            })
+        }
+        let directCalls = try CanonicalSIL.DirectCallTable(directBindings)
+        var rootEffects = signature.effects
+        for descriptor in standardLibraryImports {
+            rootEffects.mayThrow = rootEffects.mayThrow
+                || descriptor.effects.mayThrow
+            rootEffects.mayAllocate = rootEffects.mayAllocate
+                || descriptor.effects.mayAllocate
+            rootEffects.hasExternalSideEffects = rootEffects
+                .hasExternalSideEffects
+                || descriptor.effects.hasExternalSideEffects
+            rootEffects.requiresMainActor = rootEffects.requiresMainActor
+                || descriptor.effects.requiresMainActor
+            rootEffects.isAsync = rootEffects.isAsync
+                || descriptor.effects.isAsync
+        }
         let key = try Core.FunctionKey.derive(
             namespace: namespace,
             module: moduleName,
@@ -127,9 +185,11 @@ struct FrontendExecutionHarness {
                 entryIndex: entry,
                 shellInterfaceHash: shellHash,
                 compatibility: compatibility,
+                directCalls: directCalls,
                 nativeTypes: nativeTypeIDs,
                 nativeTypeKinds: nativeTypeKinds,
-                mainActorNativeTypes: mainActorNativeTypes
+                mainActorNativeTypes: mainActorNativeTypes,
+                effects: rootEffects
             )
         )
         let shell = try Verification.ShellInterface(
@@ -142,9 +202,21 @@ struct FrontendExecutionHarness {
                     key: key,
                     parameterTypes: signature.parameters,
                     resultType: signature.result,
-                    effects: signature.effects
+                    effects: rootEffects
                 ),
             ],
+            imports: resolvedImports.map { item in
+                .init(
+                    id: item.requirement.id,
+                    key: item.requirement.key,
+                    parameterTypes: item.descriptor.parameterTypes,
+                    resultType: item.descriptor.resultType,
+                    signature: item.descriptor.signature,
+                    effects: item.descriptor.effects,
+                    contract: item.descriptor.contract,
+                    capability: item.descriptor.capability
+                )
+            },
             types: nativeTypes.map { record in
                 let kind: Verification.NativeTypeKind = switch record.kind {
                 case .value: .value
@@ -165,7 +237,12 @@ struct FrontendExecutionHarness {
         let image = try Verification.Engine().verify(
             bytes: compiled.bytecode,
             shell: shell,
-            policy: .init(acceptedCapabilities: compiled.module.capabilities)
+            policy: .init(
+                acceptedCapabilities: compiled.module.capabilities,
+                allowedNativeImports: Set(
+                    resolvedImports.map { $0.requirement.id }
+                )
+            )
         )
         return .init(image: image, entry: entry)
     }

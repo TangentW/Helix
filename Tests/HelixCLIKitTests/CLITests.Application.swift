@@ -527,7 +527,10 @@ struct Application {
             Data(contentsOf: shell.appendingPathComponent("ShellBuildReceipt.json"))
         )
         #expect(patchReceipt.configuration.schema == 1)
-        #expect(patchReceipt.nativeImportCandidates.map(\.canonicalCallee) == [
+        #expect(patchReceipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
+            "Swift.String.init(describing:)",
+            "Swift.String.init(reflecting:)",
+            "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
 
@@ -577,8 +580,11 @@ struct Application {
         )
         #expect(liveReceipt.configuration.schema == 1)
         #expect(featureConfiguration.nativeImports.sourceScope?.visibility == .all)
-        #expect(liveReceipt.nativeImportCandidates.map(\.canonicalCallee) == [
+        #expect(liveReceipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
             "Feature.hidden(_:)",
+            "Swift.String.init(describing:)",
+            "Swift.String.init(reflecting:)",
+            "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
         let entrySymbols = Set(liveReceipt.roots.compactMap { root in

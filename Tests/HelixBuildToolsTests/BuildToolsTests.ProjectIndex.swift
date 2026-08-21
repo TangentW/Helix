@@ -127,7 +127,7 @@ struct ProjectIndexTests {
         )
         #expect(output.report.modules.map(\.moduleName) == moduleNames)
         #expect(output.report.modules.allSatisfy {
-            $0.generatedNativeImportCount == 1 && $0.emittedNativeImportCount == 2
+            $0.generatedNativeImportCount == 1 && $0.emittedNativeImportCount == 5
         })
         #expect(output.modules.count == 2)
         let accountTransform = try #require(
@@ -144,11 +144,14 @@ struct ProjectIndexTests {
         #expect(checkoutTransform.effects.hasExternalSideEffects)
         for module in output.report.modules {
             let receipt = try #require(output.modules[module.moduleName]?.receipt)
-            #expect(receipt.nativeImportBindings.count == 2)
+            #expect(receipt.nativeImportBindings.count == 5)
             #expect(receipt.nativeImportBindings.filter { $0.generated != nil }.count == 1)
             #expect(receipt.nativeImportBindings.contains {
                 $0.generated == nil && $0.importedModules == ["HelixRuntime"]
             })
+            #expect(receipt.nativeImportBindings.filter {
+                $0.generated == nil && $0.importedModules == ["HelixRuntime"]
+            }.count == 4)
             #expect(
                 Core.Digest.sha256(try ShellBuildReceipt.Codec.encode(receipt))
                     == module.receiptHash

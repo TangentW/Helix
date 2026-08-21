@@ -72,5 +72,70 @@ public enum StandardLibraryImports {
             allowsMainThread: true
         )
     )
+
+    /// Swift's variadic debug-print ABI after SIL has materialized `[Any]`.
+    public static let swiftDebugPrint = Descriptor(
+        canonicalCallee: "Swift.debugPrint(_:separator:terminator:)",
+        silMangledNames: ["$ss10debugPrint_9separator10terminatoryypd_S2StF"],
+        parameterTypes: [.array(.any), .string, .string],
+        resultType: .void,
+        signature: .init(
+            parameters: [
+                "Swift.Array<Swift.Any>",
+                "Swift.String",
+                "Swift.String",
+            ],
+            result: "Swift.Void"
+        ),
+        effects: .init(
+            mayAllocate: true,
+            hasExternalSideEffects: true
+        ),
+        contract: .cooperative(
+            kind: .globalFunction,
+            domain: .swift,
+            access: .io,
+            maximumDurationMicroseconds: 16_000,
+            allowsMainThread: true
+        )
+    )
+
+    /// A fixed `Any -> String` bridge for Swift's generic describing entry.
+    /// Compiler lowering proves and records the concrete source identity before
+    /// this NativeImport is invoked; Swift generic metadata never enters HLBC.
+    public static let swiftStringDescribing = textRendering(
+        canonicalCallee: "Swift.String.init(describing:)",
+        silMangledName: "$sSS10describingSSx_tclufC"
+    )
+
+    /// A fixed `Any -> String` bridge for Swift's generic reflecting entry.
+    public static let swiftStringReflecting = textRendering(
+        canonicalCallee: "Swift.String.init(reflecting:)",
+        silMangledName: "$sSS10reflectingSSx_tclufC"
+    )
+
+    private static func textRendering(
+        canonicalCallee: String,
+        silMangledName: String
+    ) -> Descriptor {
+        Descriptor(
+            canonicalCallee: canonicalCallee,
+            silMangledNames: [silMangledName],
+            parameterTypes: [.any],
+            resultType: .string,
+            signature: .init(
+                parameters: ["Swift.Any"],
+                result: "Swift.String"
+            ),
+            effects: .init(mayAllocate: true),
+            contract: .cooperative(
+                kind: .initializer,
+                domain: .swift,
+                access: .pure,
+                maximumDurationMicroseconds: 16_000,
+                allowsMainThread: true
+            )
+        )
+    }
 }
 }

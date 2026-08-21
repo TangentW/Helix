@@ -53,6 +53,29 @@ struct AnyWireContract {
             Bytecode.DynamicType.floatingPoint(.cgFloat).storageType
                 == .float(bitWidth: 64)
         )
+        #expect(Bytecode.DynamicType.any.isSwiftBridgeMaterializableV1)
+        #expect(
+            Bytecode.DynamicType.optional(
+                .dictionary(
+                    key: .string,
+                    value: .array(.integer(.int))
+                )
+            ).isSwiftBridgeMaterializableV1
+        )
+        #expect(
+            !Bytecode.DynamicType.arraySlice(.integer(.int))
+                .isSwiftBridgeMaterializableV1
+        )
+        #expect(
+            !Bytecode.DynamicType.tuple([
+                .init(type: .integer(.int)),
+                .init(type: .string),
+            ]).isSwiftBridgeMaterializableV1
+        )
+        #expect(
+            !Bytecode.DynamicType.array(.local(.init(rawValue: "Payload")))
+                .isSwiftBridgeMaterializableV1
+        )
 
         var deepest = Bytecode.DynamicType.integer(.int)
         for _ in 0..<Bytecode.DynamicType.maximumNestingDepthV1 {

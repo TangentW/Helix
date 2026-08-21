@@ -62,6 +62,7 @@ enum DynamicAny {
         let reflectedType = String(reflecting: Swift.type(of: value))
         guard let dynamicType = parseStandardType(reflectedType),
               dynamicType.isAnyPayloadV1,
+              dynamicType.isSwiftBridgeMaterializableV1,
               let codec = codec(for: dynamicType)
         else {
             throw Runtime.BridgeInputError.unsupportedAnyType(reflectedType)

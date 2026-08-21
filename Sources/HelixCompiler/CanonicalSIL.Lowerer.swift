@@ -460,6 +460,7 @@ public struct Lowerer: Sendable {
         var usesRuntimeAddresses: Bool
         var normalizedBody: String
         var storageInitializationPlan: CanonicalSIL.StorageInitialization.Plan
+        var existentialInitializationPlan: CanonicalSIL.ExistentialInitialization.Plan
         var nsErrorBridges: CanonicalSIL.NSErrorBridgePlan
     }
 
@@ -537,6 +538,8 @@ public struct Lowerer: Sendable {
                     ? signature.result : nil,
                 indirectErrorType: signature.indirectErrorType
             )
+        let existentialInitializationPlan = try CanonicalSIL
+            .ExistentialInitialization.analyze(body: normalizedBody)
         let nsErrorBridges = try CanonicalSIL.NSErrorBridgePlan.analyze(
             body: normalizedBody,
             directCalls: directCalls
@@ -548,6 +551,7 @@ public struct Lowerer: Sendable {
             usesRuntimeAddresses: usesRuntimeAddresses,
             normalizedBody: normalizedBody,
             storageInitializationPlan: storageInitializationPlan,
+            existentialInitializationPlan: existentialInitializationPlan,
             nsErrorBridges: nsErrorBridges
         )
     }
@@ -570,6 +574,8 @@ public struct Lowerer: Sendable {
         let usesRuntimeAddresses = preparation.usesRuntimeAddresses
         let normalizedBody = preparation.normalizedBody
         let storageInitializationPlan = preparation.storageInitializationPlan
+        let existentialInitializationPlan =
+            preparation.existentialInitializationPlan
         let mutableCapturePointees =
             storageInitializationPlan.mutableCapturePointees
         let nsErrorBridges = preparation.nsErrorBridges
@@ -816,6 +822,9 @@ public struct Lowerer: Sendable {
         var existentialBoxes = Set<String>()
         var existentialProjections: [String: ExistentialProjection] = [:]
         var existentialComponentAddresses: [String: ExistentialComponentAddress] = [:]
+        // A projection with alternate textual writes stays live until the last
+        // write; each runtime path carries only its own erased SSA value.
+        var branchMergedExistentialProjections = Set<String>()
         var optionalAddressInitializations: [String: OptionalAddressInitialization] = [:]
         var optionalPayloadAddressRoots: [String: String] = [:]
         var takenOptionalPayloads: [String: TakenOptionalPayload] = [:]
@@ -1993,6 +2002,31 @@ public struct Lowerer: Sendable {
                 return true
             }
             return false
+        }
+
+        // Hidden block parameters make alternate element initializers one SSA
+        // value; commit it only in the block that finalizes this allocation.
+        func applyMergedArrayLiteralWrites(
+            to allocation: String
+        ) throws {
+            guard let blockID = current?.id,
+                  let writes = compilerAddressWrites[blockID]
+            else { return }
+            let matching = writes.keys.filter { token in
+                arrayLiteralAddresses[token]?.allocation == allocation
+                    || arrayLiteralComponentAddresses[token]?.allocation
+                        == allocation
+            }.sorted()
+            for token in matching {
+                guard let value = writes[token],
+                      try storePendingArrayLiteralValue(value, at: token)
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "merged Array literal write lost its element address"
+                    )
+                }
+                compilerAddressWrites[blockID]?.removeValue(forKey: token)
+            }
         }
 
         // Materialized values must cross this single sink so compiler-only
@@ -3338,6 +3372,13 @@ public struct Lowerer: Sendable {
                     "constructed value does not match its SIL address"
                 )
             }
+            if try storeExistentialPayload(
+                value,
+                at: token,
+                mode: mode
+            ) {
+                return
+            }
             if let cell = mutableCell(at: token) {
                 let storeMode = mode
                     ?? storageInitializationPlan.storeMode(
@@ -3603,19 +3644,98 @@ public struct Lowerer: Sendable {
             try storeConstructedValue(value, at: token, mode: mode)
         }
 
+        func storeExistentialPayload(
+            _ payload: Bytecode.Register,
+            at token: String,
+            mode: Bytecode.StackStoreMode? = nil
+        ) throws -> Bool {
+            if var projection = existentialProjections[token] {
+                guard projection.components.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Any payload mixes direct and component writes"
+                    )
+                }
+                if projection.componentStoreMode == nil {
+                    projection.componentStoreMode = mode
+                    existentialProjections[token] = projection
+                }
+                try finishExistentialProjection(token, payload: payload)
+                return true
+            }
+            guard let component = existentialComponentAddresses[token]
+            else { return false }
+            guard var projection = existentialProjections[
+                    component.projection
+                  ],
+                  case let .tuple(types) = projection.storageType,
+                  types.indices.contains(component.index),
+                  registerTypes[Int(payload.rawValue)]
+                    == types[component.index],
+                  projection.components.updateValue(
+                    payload,
+                    forKey: component.index
+                  ) == nil
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Any tuple payload component is invalid or duplicated"
+                )
+            }
+            if projection.componentStoreMode == nil {
+                projection.componentStoreMode = mode
+                    ?? storageInitializationPlan.storeMode(
+                        at: currentSILLineIndex,
+                        address: token
+                    )
+            }
+            existentialProjections[component.projection] = projection
+            if projection.components.count == types.count {
+                let elements = try types.indices.map { index in
+                    guard let element = projection.components[index] else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Any tuple payload is incomplete"
+                        )
+                    }
+                    return element
+                }
+                let tuple = try allocate(type: projection.storageType)
+                appendInstruction(.makeTuple(result: tuple, elements: elements))
+                try finishExistentialProjection(
+                    component.projection,
+                    payload: tuple
+                )
+            }
+            return true
+        }
+
         func finishExistentialProjection(
             _ token: String,
             payload: Bytecode.Register
         ) throws {
-            guard let projection = existentialProjections.removeValue(forKey: token),
+            guard let projection = existentialProjections[token],
                   registerTypes[Int(payload.rawValue)] == projection.storageType
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "Any payload does not match its concrete SIL type"
                 )
             }
-            existentialComponentAddresses = existentialComponentAddresses.filter {
-                $0.value.projection != token
+            let hasFutureWrite = existentialInitializationPlan.hasWrite(
+                to: token,
+                after: currentSILLineIndex
+            )
+            let requiresMerge = hasFutureWrite
+                || branchMergedExistentialProjections.contains(token)
+            if hasFutureWrite {
+                var reset = projection
+                reset.components.removeAll(keepingCapacity: true)
+                reset.componentStoreMode = nil
+                existentialProjections[token] = reset
+                branchMergedExistentialProjections.insert(token)
+            } else {
+                existentialProjections.removeValue(forKey: token)
+                existentialComponentAddresses = existentialComponentAddresses.filter {
+                    $0.value.projection != token
+                }
+                branchMergedExistentialProjections.remove(token)
             }
             let erased = try allocate(type: .any)
             appendInstruction(
@@ -3625,6 +3745,19 @@ public struct Lowerer: Sendable {
                     dynamicType: projection.dynamicType
                 )
             )
+            if requiresMerge {
+                guard let blockID = current?.id,
+                      compilerAddressWrites[blockID, default: [:]].updateValue(
+                        erased,
+                        forKey: projection.destination
+                      ) == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Any projection has multiple writes on one control-flow path"
+                    )
+                }
+                return
+            }
             try storeExistential(
                 erased,
                 at: projection.destination,
@@ -15480,6 +15613,97 @@ public struct Lowerer: Sendable {
                     }
                 }
 
+            case let .text(.construction(.nativeDescription(operation))):
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard specializations.count == 1,
+                      arguments.count == 2,
+                      metatypeValues.contains(arguments[1])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift native text rendering has unsupported arguments"
+                    )
+                }
+                let dynamicType = try parseDynamicAnyType(specializations[0])
+                guard dynamicType.isSwiftBridgeMaterializableV1,
+                      dynamicType == .any || dynamicType.isAnyPayloadV1
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Swift native text rendering payload \(specializations[0])"
+                    )
+                }
+                let payload = try materializeOwnedValue(
+                    at: arguments[0],
+                    line: line
+                )
+                guard registerTypes[Int(payload.rawValue)]
+                        == dynamicType.storageType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift native text rendering payload does not match its specialization"
+                    )
+                }
+                let erased: Bytecode.Register
+                if dynamicType == .any {
+                    erased = payload
+                } else {
+                    erased = try allocate(type: .any)
+                    appendInstruction(
+                        .eraseToAny(
+                            result: erased,
+                            value: payload,
+                            dynamicType: dynamicType
+                        )
+                    )
+                }
+
+                let descriptor = operation.descriptor
+                guard descriptor.silMangledNames.count == 1,
+                      let symbol = descriptor.silMangledNames.first
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "Swift native text rendering descriptor has no unique SIL symbol"
+                    )
+                }
+                guard let binding = directCalls.binding(for: symbol) else {
+                    if let unavailable = directCalls.unavailableCall(for: symbol) {
+                        throw CanonicalSIL.LoweringError.unavailableNativeImport(
+                            line: line,
+                            mangledName: symbol,
+                            canonicalCallee: unavailable.canonicalCallee,
+                            reason: unavailable.reason
+                        )
+                    }
+                    throw CanonicalSIL.LoweringError.unboundCallee(
+                        line: line,
+                        mangledName: symbol
+                    )
+                }
+                guard binding.parameterTypes == descriptor.parameterTypes,
+                      binding.parameterConventions == [.owned],
+                      binding.resultType == descriptor.resultType,
+                      binding.effects == descriptor.effects,
+                      binding.abiAdapter == .direct,
+                      case let .nativeImport(requirement) = binding.target,
+                      requirement.signature == descriptor.signature,
+                      requirement.effects == descriptor.effects,
+                      requirement.contract == descriptor.contract,
+                      requirement.requiredCapability == descriptor.capability
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "Swift native text rendering has an invalid frozen binding"
+                    )
+                }
+                let result = try allocate(type: .string)
+                appendInstruction(
+                    .nativeApply(
+                        result: result,
+                        importID: requirement.id,
+                        arguments: [erased]
+                    )
+                )
+                values[resultToken] = result
+
             case .text(.construction(.fromCharacter)):
                 guard genericArguments.isEmpty,
                       arguments.count == 2,
@@ -17035,11 +17259,16 @@ public struct Lowerer: Sendable {
             case .finalizeUninitializedArray:
                 guard arguments.count == 1,
                       !genericArguments.isEmpty,
-                      let allocation = arrayLiteralAllocationByValue[arguments[0]],
-                      let pending = pendingArrayLiterals[allocation]
+                      let allocation = arrayLiteralAllocationByValue[arguments[0]]
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Array literal finalization has unsupported arguments"
+                    )
+                }
+                try applyMergedArrayLiteralWrites(to: allocation)
+                guard let pending = pendingArrayLiterals[allocation] else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array literal finalization lost its allocation"
                     )
                 }
                 let element = try parseStoredType(genericArguments)
@@ -17567,6 +17796,21 @@ public struct Lowerer: Sendable {
                 }
                 if let implicit = implicitStackValues[block.block.id] {
                     for item in implicit {
+                        if compilerAddressMergeRegisters[block.block.id]?[
+                            item.address
+                        ] == item.register {
+                            guard compilerAddressWrites[
+                                block.block.id,
+                                default: [:]
+                            ].updateValue(
+                                item.register,
+                                forKey: item.address
+                            ) == nil else {
+                                throw CanonicalSIL.LoweringError.malformedSIL(
+                                    "compiler address merge initializes one path twice"
+                                )
+                            }
+                        }
                         if runtimeAddress(at: item.address) != nil
                             || item.address == indirectResultAddress {
                             // Continuation-carried values may initialize an
@@ -22188,59 +22432,14 @@ public struct Lowerer: Sendable {
             if let store = match(
                 line,
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
-            ), let component = existentialComponentAddresses[store[1]],
-               var projection = existentialProjections[component.projection],
-               case let .tuple(types) = projection.storageType {
+            ), existentialProjections[store[1]] != nil
+                || existentialComponentAddresses[store[1]] != nil {
                 let payload = try resolve(store[0], line: sourceLine)
-                guard types.indices.contains(component.index),
-                      registerTypes[Int(payload.rawValue)] == types[component.index],
-                      projection.components.updateValue(
-                          payload,
-                          forKey: component.index
-                      ) == nil
-                else {
+                guard try storeExistentialPayload(payload, at: store[1]) else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Any tuple payload component is invalid or duplicated"
+                        "Any payload lost its existential projection"
                     )
                 }
-                if projection.componentStoreMode == nil {
-                    projection.componentStoreMode = storageInitializationPlan
-                        .storeMode(
-                            at: currentSILLineIndex,
-                            address: store[1]
-                        )
-                }
-                existentialProjections[component.projection] = projection
-                if projection.components.count == types.count {
-                    let elements = try types.indices.map { index in
-                        guard let element = projection.components[index] else {
-                            throw CanonicalSIL.LoweringError.malformedSIL(
-                                "Any tuple payload is incomplete"
-                            )
-                        }
-                        return element
-                    }
-                    let tuple = try allocate(type: projection.storageType)
-                    appendInstruction(.makeTuple(result: tuple, elements: elements))
-                    try finishExistentialProjection(
-                        component.projection,
-                        payload: tuple
-                    )
-                }
-                continue
-            }
-
-            if let store = match(
-                line,
-                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
-            ), let projection = existentialProjections[store[1]] {
-                let payload = try resolve(store[0], line: sourceLine)
-                guard projection.components.isEmpty else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Any payload mixes direct and component stores"
-                    )
-                }
-                try finishExistentialProjection(store[1], payload: payload)
                 continue
             }
 
@@ -23755,13 +23954,23 @@ public struct Lowerer: Sendable {
                 if let temporaryOwner = borrowed.temporaryOwner {
                     appendInstruction(.destroyValue(temporaryOwner))
                 }
+                var someArguments: [Bytecode.Register] = []
+                var noneArguments: [Bytecode.Register] = []
+                try appendCompilerAddressMergeArguments(
+                    target: branch.someTarget,
+                    arguments: &someArguments
+                )
+                try appendCompilerAddressMergeArguments(
+                    target: branch.noneTarget,
+                    arguments: &noneArguments
+                )
                 appendInstruction(
                     .conditionalBranch(
                         condition: isSome,
                         trueTarget: branch.someTarget,
-                        trueArguments: [],
+                        trueArguments: someArguments,
                         falseTarget: branch.noneTarget,
-                        falseArguments: []
+                        falseArguments: noneArguments
                     )
                 )
                 continue
@@ -24118,8 +24327,15 @@ public struct Lowerer: Sendable {
                         )
                     }
                     appendInstruction(.returnValue(nil))
-                } else if let allocation = arrayLiteralAllocationByValue[returned[0]],
-                          let pending = pendingArrayLiterals[allocation] {
+                } else if let allocation = arrayLiteralAllocationByValue[
+                    returned[0]
+                ] {
+                    try applyMergedArrayLiteralWrites(to: allocation)
+                    guard let pending = pendingArrayLiterals[allocation] else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "returned Array literal lost its allocation"
+                        )
+                    }
                     let elements = try materializeArrayLiteralElements(pending)
                     let result = try allocate(type: .array(pending.elementType))
                     appendInstruction(
@@ -24156,6 +24372,7 @@ public struct Lowerer: Sendable {
             )
         }
         guard existentialProjections.isEmpty,
+              branchMergedExistentialProjections.isEmpty,
               existentialComponentAddresses.isEmpty
         else {
             throw CanonicalSIL.LoweringError.malformedSIL(

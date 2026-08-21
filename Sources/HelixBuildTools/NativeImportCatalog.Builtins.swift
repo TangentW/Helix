@@ -17,6 +17,21 @@ enum Builtins {
             invokerFactory: "Runtime.StandardLibraryImports.makePrint",
             importedModules: ["HelixRuntime"]
         ),
+        Definition(
+            descriptor: Bytecode.StandardLibraryImports.swiftDebugPrint,
+            invokerFactory: "Runtime.StandardLibraryImports.makeDebugPrint",
+            importedModules: ["HelixRuntime"]
+        ),
+        Definition(
+            descriptor: Bytecode.StandardLibraryImports.swiftStringDescribing,
+            invokerFactory: "Runtime.StandardLibraryImports.makeStringDescribing",
+            importedModules: ["HelixRuntime"]
+        ),
+        Definition(
+            descriptor: Bytecode.StandardLibraryImports.swiftStringReflecting,
+            invokerFactory: "Runtime.StandardLibraryImports.makeStringReflecting",
+            importedModules: ["HelixRuntime"]
+        ),
     ]
 
     static let automaticCallees = Set(

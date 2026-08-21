@@ -428,10 +428,15 @@ does not by itself certify a physical device or distribution channel.
   implementation fingerprints. This covers eligible callers in one complete
   module source set; cross-module public/package defaults, an ineligible caller,
   or a remaining generic ABI require a full build.
-- Ordinary `Swift.print` through a synchronous NativeImport frozen into every
-  new Shell. It supports common Bridge-compatible `Any` values,
-  separator/terminator semantics, and a 64 KiB output bound without App catalog
-  configuration.
+- Native Swift text rendering frozen into every new Shell: ordinary
+  `Swift.print`, `Swift.debugPrint`, `String(describing:)`, and
+  `String(reflecting:)`. Print operations preserve variadic
+  separator/terminator semantics; the generic String initializers are lowered
+  through a fixed `Any -> String` adapter after the compiler proves the source
+  dynamic type is reconstructible. The shared codec supports recursive scalar,
+  text, Optional, Array, Dictionary, and Set values, and every operation has a
+  64 KiB output bound. No App catalog setup, generic metadata, witness table,
+  new opcode, or contract version is required.
 - Managed Debug measurement of public members for every module contributing an
   already-frozen imported native type. The captured toolchain's symbol graph
   nominates minimum-OS-valid APIs, and the same typed AST/canonical SIL pipeline

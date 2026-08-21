@@ -75,6 +75,30 @@ public indirect enum DynamicType: Codable, Hashable, Sendable,
         isWellFormedV1
     }
 
+    /// Whether Runtime can reconstruct this logical Swift type without
+    /// private metadata or an application-defined codec. This is narrower
+    /// than the image-local `Any` grammar: ArraySlice bases, tuples, and local
+    /// nominal values deliberately remain inside HLVM.
+    public var isSwiftBridgeMaterializableV1: Bool {
+        isSwiftBridgeMaterializableV1(depth: 0)
+    }
+
+    private func isSwiftBridgeMaterializableV1(depth: Int) -> Bool {
+        guard depth <= Self.maximumNestingDepthV1 else { return false }
+        return switch self {
+        case .any, .bool, .integer, .floatingPoint, .string, .character,
+             .substring:
+            true
+        case let .optional(wrapped), let .array(wrapped), let .set(wrapped):
+            wrapped.isSwiftBridgeMaterializableV1(depth: depth + 1)
+        case let .dictionary(key, value):
+            key.isSwiftBridgeMaterializableV1(depth: depth + 1)
+                && value.isSwiftBridgeMaterializableV1(depth: depth + 1)
+        case .arraySlice, .local, .tuple:
+            false
+        }
+    }
+
     /// Swift `Hashable` semantics that can be reproduced without user code.
     public var hasVMDefinedHashableSemantics: Bool {
         hasVMDefinedHashableSemantics(depth: 0)

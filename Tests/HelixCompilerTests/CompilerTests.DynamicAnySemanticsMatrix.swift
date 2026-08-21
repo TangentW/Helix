@@ -6,6 +6,24 @@ import Testing
 extension CompilerTests {
 @Suite("Recursive Swift Any semantics")
 struct DynamicAnySemanticsMatrix {
+    @Test("Existential initialization inventory follows component and out writes")
+    func inventoriesExistentialWrites() throws {
+        let plan = try CanonicalSIL.ExistentialInitialization.analyze(
+            body: """
+            bb0:
+              %0 = init_existential_addr %1, $(Int, Int)
+              %2 = tuple_element_addr %0, 0
+              store %3 to %2
+              br bb1
+            bb1:
+              %4 = apply %5(%0) : $@convention(thin) () -> @out (Int, Int)
+            """
+        )
+
+        #expect(plan.hasWrite(to: "%0", after: 3))
+        #expect(!plan.hasWrite(to: "%0", after: 6))
+    }
+
     @Test("Dynamic type parsing is bounded before descriptor construction")
     func rejectsOverdeepDynamicType() {
         var spelling = "Int"
@@ -310,6 +328,39 @@ struct DynamicAnySemanticsMatrix {
         )
         #expect(
             invoke(fixture, arguments: [.bool(false)])
+                == .returned(try integer(7))
+        )
+        #expect(fixture.image.module.imports.isEmpty)
+    }
+
+    @Test("Existential Array elements merge Optional tuple coalescing paths")
+    func mergesCoalescedTupleExistentialArrayElements() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            public func mergesCoalescedTupleExistentialArrayElements(
+                _ value: (Int, Int)?
+            ) -> Int {
+                let values: [Any] = [value ?? (3, 4)]
+                let tuple = values[0] as! (Int, Int)
+                return tuple.0 + tuple.1
+            }
+            """,
+            functionName: "mergesCoalescedTupleExistentialArrayElements",
+            moduleName: "HelixDynamicAnyTupleArrayMerge"
+        )
+
+        #expect(
+            invoke(
+                fixture,
+                arguments: [
+                    .optional(
+                        .tuple([try integer(1), try integer(2)])
+                    ),
+                ]
+            ) == .returned(try integer(3))
+        )
+        #expect(
+            invoke(fixture, arguments: [.optional(nil)])
                 == .returned(try integer(7))
         )
         #expect(fixture.image.module.imports.isEmpty)

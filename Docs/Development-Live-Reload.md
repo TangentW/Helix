@@ -147,10 +147,13 @@ physical ABI may carry concrete-type metadata, protocol witness tables,
 specialization-dependent ownership, indirect results, and private reabstraction
 details; its closure and collection values also do not share HLVM's runtime
 representation. Those details are toolchain contracts rather than stable Shell
-capabilities. NativeImport is therefore reserved for an exact generated bridge
-or a stable native C/Objective-C-shaped operation, while supported Swift
-Sequence APIs are recognized at the frontend and lowered onto a small set of
-typed cursors, builders, mutations, and ordinary closure calls.
+capabilities. NativeImport is therefore reserved for an exact generated bridge,
+a stable native C/Objective-C-shaped operation, or a fixed represented adapter
+around a native semantic leaf. The last category must erase every generic
+parameter before dispatch and must be independently type-, effect-, and
+resource-checked. Supported Swift Sequence APIs are instead recognized at the
+frontend and lowered onto a small set of typed cursors, builders, mutations,
+and ordinary closure calls.
 
 VM-owned `Any` follows the same split. Erasure and dynamic-cast instructions
 carry a closed recursive logical type descriptor separately from the physical
@@ -163,6 +166,18 @@ metadata or calling a generic cast through NativeImport. At a Swift Shell
 boundary, recursively composed concrete codecs materialize the supported
 scalar, text, Optional, Array, Dictionary, and Set family; shapes that cannot
 be reconstructed exactly remain fail-closed.
+
+`String(describing:)` and `String(reflecting:)` are the concrete native-leaf
+case. The frontend recognizes their generic SIL entry but never dispatches that
+physical ABI. It proves the represented source type is Shell-materializable,
+erases it to VM-owned `Any`, and calls a fixed `Any -> String` NativeImport.
+`debugPrint` uses the already-concrete `[Any], String, String -> Void` ABI.
+Mutually exclusive writes into one existential Array-literal element are
+merged as typed HLBC block arguments before finalization, so Optional
+coalescing and equivalent control flow do not depend on textual block order.
+All four rendering operations share a 64 KiB bound; ArraySlice, tuple,
+patch-local, native-object, and closure payloads are rejected by compiler proof
+or the boundary codec before the Swift formatter or I/O executes.
 
 Scalar/text conversion uses the same boundary. The frontend's concrete and
 generic ABI entry points for `Bool`, every represented signed or unsigned
@@ -251,16 +266,17 @@ no-argument/Bool `Void` overrides; native code cannot identify the patch's
 concrete Swift type. This is a verified selector/ABI surface, not arbitrary IMP
 or native-ABI injection.
 
-Every new Dev Shell automatically includes the exact NativeImport for
-`Swift.print(_:separator:terminator:)`, so adding
-`print("value: \(value)", value)` to a supported body needs no App catalog setup. The
-compiler lowers the variadic arguments into a VM-owned `Array<Any>` and links
-the omitted separator/terminator as ordinary default-argument generators in
-the same image. Fully concrete defaults on other functions use the same
-mechanism; an ineligible affected caller or remaining generic metadata fails
-the save transaction with a full-build diagnostic. Cross-module public/package
-default changes also require a normal build because one module receipt cannot
-prove that every precompiled caller was replaced.
+Every new Dev Shell automatically includes the exact NativeImports for
+`Swift.print`, `Swift.debugPrint`, `String(describing:)`, and
+`String(reflecting:)`, so adding those operations to a supported body needs no
+App catalog setup. The compiler lowers variadic arguments into VM-owned
+`Array<Any>`, links omitted separator/terminator values as ordinary
+default-argument generators, and applies the fixed `Any` adapter for the two
+generic String initializers. Fully concrete defaults on other functions use the
+same mechanism; an ineligible affected caller or remaining generic metadata
+fails the save transaction with a full-build diagnostic. Cross-module
+public/package default changes also require a normal build because one module
+receipt cannot prove that every precompiled caller was replaced.
 
 A managed Debug Shell also audits public members for every module that
 contributes an already-frozen imported native type. Helix reads the symbol graph

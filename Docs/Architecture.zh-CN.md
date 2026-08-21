@@ -4,7 +4,7 @@
 
 Helix 的核心思路只有一套：工程师修改普通 Swift 源码；但生产热补丁与开发期热重载必须使用不同的产物、信任边界和生命周期。它们共享编译器事实与身份合同，不共享下发通道。
 
-本文描述截至 2026 年 8 月 21 日仓库中已经存在的实现，不把尚未完成的资格验证写成产品承诺。
+本文描述截至 2026 年 8 月 22 日仓库中已经存在的实现，不把尚未完成的资格验证写成产品承诺。
 
 ## 两条工作流
 
@@ -47,6 +47,7 @@ flowchart TB
 - 可变 closure 捕获与集合转换不依赖 Swift runtime layout，而是使用 Verifier 私有的 storage value：managed cell 只能由同 image closure 共享；Array builder 与 Dictionary accumulator 都是线性值，每条控制流路径都必须完成或销毁。它们都不能进入 Shell/Native 边界、局部值布局、stack slot 或函数返回值。不可变 closure context 还可以复制可表示的线性捕获，但冻结 TypeOps 必须声明可复制，且 closure body 必须以 borrowed ABI 接收该捕获；`make_closure` 会计费并执行复制，owned 或 inout 线性捕获仍会被 Verifier 拒绝。
 - Array、Dictionary 与 Set 是有明确类型的 VM value，不投影 Swift runtime 的私有布局。一套有深度上限的递归值语义模型为受支持标量与容器统一提供 VM-defined Equatable/Hashable；严格排序是独立且仅限标量的能力。Set 使用不可变 COW storage，在同一值内保持稳定迭代；Dictionary/Set 的相等与哈希不依赖顺序。Verifier、边界校验、比较工作量计费和分配前资源计费会端到端执行同一模型。
 - 运行时 `nil` 不会伪造 wrapped type。边界校验仍是深度、可计费的 shape 验证；VM 内部 collection state 则从已验证的 bytecode 上下文，以有深度上限的 runtime-type 检查恢复无 payload Optional 的类型。泛型间接调用结果与普通 store 也共用同一个 compiler-address sink，包括尚未完成的 Array 字面量整个 element 与 Tuple component。
+- 原生文本渲染使用固定的表示适配层，而不是暴露 Swift 泛型 ABI。Compiler 会识别 `String(describing:)` 与 `String(reflecting:)`，证明递归动态类型能够由 Shell codec 精确重建，把该身份保存在 VM-owned `Any` 中，再调用精确的 `Any -> String` NativeImport。`debugPrint` 复用 variadic `print` 已有的 `[Any], String, String -> Void` 形状；具体 metadata 与 witness table 都不会跨边界。若 canonical SIL 在互斥路径上初始化同一个 existential Array 字面量 element，擦除后的值会通过强类型隐藏 block parameter 合流，只在字面量 finalize 的位置提交。该适配层只接纳标量、文本、Optional、Array、Dictionary、Set codec 家族，拒绝 ArraySlice、Tuple、补丁内 nominal、native object 与 closure payload，并统一执行 64 KiB 渲染上限；当前 v1 合同不增加 opcode、schema 或版本。
 - Array 结构变更表示为不可变、强类型的值转换。拼接、插入、删除与 `replaceSubrange` 复用同一个半开区间替换指令，`swapAt` 使用一个 swap 指令。Verifier 证明 element 类型一致且可复制；VM 在任何修改前验证全部边界并预扣输出工作量与存储；compiler-only assignment 则在共享存储出口释放被替换的线性所有者。
 - Dictionary 的插入、替换与删除会降低为同一个不可变强类型转换：Optional update 决定设置或擦除，两个结果分别携带旧值与更新后的 Dictionary。`keys` 和 `values` 则共用一个按所选 element 类型参数化的投影操作。Verifier 会证明完整的操作数/结果关系；VM 只查找一次 key，并在构造任一结果前预扣遍历、输出存储和所有复制成本。
 - Dictionary 默认下标是建立在同一套强类型查找/更新表面上的编译器控制流：getter 对 `dictionary_get` 分支，只在缺键边调用 autoclosure。Array element 修改与 Dictionary 默认值修改共用一种 `_modify` 借出模型：frame slot 与 scoped address 暂存 element，`end_apply` 和 `abort_apply` 再执行强类型值语义回写。因此嵌套或可抛错的 inout 调用无需新增某个集合 API 的 opcode，可复制的 imported reference value 也复用同一 ownership 路径。

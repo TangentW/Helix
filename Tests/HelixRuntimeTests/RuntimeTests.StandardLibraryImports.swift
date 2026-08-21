@@ -43,6 +43,49 @@ struct StandardLibraryImports {
         #expect(output == "Helix | 3 | true!")
     }
 
+    @Test("Native text rendering preserves Swift describing and debug styles")
+    func formatsNativeTextRendering() throws {
+        let optional: Int? = 7
+        let absent: Int? = nil
+        let strings = ["Helix", "Runtime"]
+        let described = try Runtime.StandardLibraryImports
+            .formatStringDescribing(
+                arguments: [
+                    Runtime.BridgeValueCodec.encodeAny(optional as Any),
+                ]
+            )
+        let reflected = try Runtime.StandardLibraryImports
+            .formatStringReflecting(
+                arguments: [
+                    Runtime.BridgeValueCodec.encodeAny(strings),
+                ]
+            )
+        let absentDescription = try Runtime.StandardLibraryImports
+            .formatStringDescribing(
+                arguments: [
+                    Runtime.BridgeValueCodec.encodeAny(absent as Any),
+                ]
+            )
+        let debugOutput = try Runtime.StandardLibraryImports.formatDebugPrint(
+            arguments: [
+                .array(
+                    try [
+                        Runtime.BridgeValueCodec.encodeAny("Helix"),
+                        Runtime.BridgeValueCodec.encodeAny(3),
+                    ],
+                    elementType: .any
+                ),
+                .string(" | "),
+                .string("!"),
+            ]
+        )
+
+        #expect(described == String(describing: optional))
+        #expect(absentDescription == String(describing: absent))
+        #expect(reflected == String(reflecting: strings))
+        #expect(debugOutput == "\"Helix\" | 3!")
+    }
+
     @Test("The print NativeImport emits one bounded synchronous write")
     func invokesPrintThroughVerifiedNativeImport() throws {
         let descriptor = Bytecode.StandardLibraryImports.swiftPrint
@@ -90,17 +133,56 @@ struct StandardLibraryImports {
         #expect(output.values == ["count:4\n"])
     }
 
+    @Test("String describing executes through its verified fixed Any ABI")
+    func invokesStringDescribingThroughNativeImport() throws {
+        let descriptor = Bytecode.StandardLibraryImports.swiftStringDescribing
+        let namespace = Core.ShellNamespaceID.derive(
+            bundleID: "dev.helix.runtime-description",
+            buildNumber: "1",
+            seed: "fixture"
+        )
+        let importID = Core.NativeImportID(rawValue: 0)
+        let importKey = try Core.NativeImportKey.derive(
+            namespace: namespace,
+            canonicalCallee: descriptor.canonicalCallee,
+            signature: descriptor.signature,
+            effects: descriptor.effects,
+            contract: descriptor.contract
+        )
+        let invoker = Runtime.StandardLibraryImports.makeStringDescribing(
+            id: importID,
+            key: importKey
+        )
+        let fixture = try makeFixture(
+            namespace: namespace,
+            importID: importID,
+            importKey: importKey,
+            descriptor: descriptor
+        )
+        let catalog = try VM.NativeCatalog([invoker])
+        let optional: Int? = 5
+        let argument = try Runtime.BridgeValueCodec.encodeAny(optional as Any)
+
+        #expect(
+            VM.Interpreter(nativeCatalog: catalog).invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [argument]
+            ) == .returned(.string(String(describing: optional)))
+        )
+    }
+
     @Test("Print rejects output beyond its frozen bound before performing I/O")
     func rejectsOversizedOutput() throws {
         let oversized = String(
             repeating: "x",
-            count: Runtime.StandardLibraryImports.maximumPrintUTF8Bytes + 1
+            count: Runtime.StandardLibraryImports.maximumRenderedUTF8Bytes + 1
         )
         let value = try Runtime.BridgeValueCodec.encodeAny(oversized)
         #expect(
             throws: VM.RuntimeTrap.nativeFailure(
                 "Swift.print output exceeds "
-                    + "\(Runtime.StandardLibraryImports.maximumPrintUTF8Bytes) UTF-8 bytes"
+                    + "\(Runtime.StandardLibraryImports.maximumRenderedUTF8Bytes) UTF-8 bytes"
             )
         ) {
             _ = try Runtime.StandardLibraryImports.formatPrint(
@@ -109,6 +191,16 @@ struct StandardLibraryImports {
                     .string(" "),
                     .string("\n"),
                 ]
+            )
+        }
+        #expect(
+            throws: VM.RuntimeTrap.nativeFailure(
+                "Swift.String.init(describing:) output exceeds "
+                    + "\(Runtime.StandardLibraryImports.maximumRenderedUTF8Bytes) UTF-8 bytes"
+            )
+        ) {
+            _ = try Runtime.StandardLibraryImports.formatStringDescribing(
+                arguments: [value]
             )
         }
     }
@@ -121,52 +213,50 @@ struct StandardLibraryImports {
     private func makeFixture(
         namespace: Core.ShellNamespaceID,
         importID: Core.NativeImportID,
-        importKey: Core.NativeImportKey
+        importKey: Core.NativeImportKey,
+        descriptor: Bytecode.StandardLibraryImports.Descriptor =
+            Bytecode.StandardLibraryImports.swiftPrint
     ) throws -> Fixture {
-        let descriptor = Bytecode.StandardLibraryImports.swiftPrint
         let functionID = Bytecode.FunctionID(rawValue: 0)
         let entry = Core.EntryIndex(rawValue: 0)
         let functionKey = try Core.FunctionKey.derive(
             namespace: namespace,
-            module: "RuntimePrintFixture",
+            module: "RuntimeStandardLibraryImportFixture",
             sourceFileLogicalID: "Fixture.swift",
-            canonicalDeclaration: "func printFixture(_: [Any], _: String, _: String)",
+            canonicalDeclaration: "func standardLibraryImportFixture",
             loweredSignature: .init(
                 parameters: descriptor.signature.parameters,
                 result: descriptor.signature.result
             ),
             role: .function
         )
+        let parameterRegisters = descriptor.parameterTypes.indices.map {
+            Bytecode.Register(rawValue: UInt32($0))
+        }
+        let resultRegister = descriptor.resultType == .void
+            ? nil : Bytecode.Register(
+                rawValue: UInt32(descriptor.parameterTypes.count)
+            )
         let function = Bytecode.Function(
             id: functionID,
-            name: "printFixture",
-            parameterRegisters: [
-                .init(rawValue: 0),
-                .init(rawValue: 1),
-                .init(rawValue: 2),
-            ],
-            resultType: .void,
-            registerTypes: descriptor.parameterTypes,
+            name: "standardLibraryImportFixture",
+            parameterRegisters: parameterRegisters,
+            resultType: descriptor.resultType,
+            registerTypes: descriptor.parameterTypes
+                + (descriptor.resultType == .void
+                    ? [] : [descriptor.resultType]),
             entryBlock: .init(rawValue: 0),
             blocks: [
                 .init(
                     id: .init(rawValue: 0),
-                    parameters: [
-                        .init(rawValue: 0),
-                        .init(rawValue: 1),
-                        .init(rawValue: 2),
-                    ],
+                    parameters: parameterRegisters,
                     instructions: [
                         .nativeApply(
-                            result: nil,
+                            result: resultRegister,
                             importID: importID,
-                            arguments: [
-                                .init(rawValue: 0),
-                                .init(rawValue: 1),
-                                .init(rawValue: 2),
-                            ]
+                            arguments: parameterRegisters
                         ),
-                        .returnValue(nil),
+                        .returnValue(resultRegister),
                     ]
                 ),
             ],
@@ -218,7 +308,7 @@ struct StandardLibraryImports {
                     index: entry,
                     key: functionKey,
                     parameterTypes: descriptor.parameterTypes,
-                    resultType: .void,
+                    resultType: descriptor.resultType,
                     effects: descriptor.effects
                 ),
             ],
@@ -227,7 +317,7 @@ struct StandardLibraryImports {
                     id: importID,
                     key: importKey,
                     parameterTypes: descriptor.parameterTypes,
-                    resultType: .void,
+                    resultType: descriptor.resultType,
                     signature: descriptor.signature,
                     effects: descriptor.effects,
                     contract: descriptor.contract,

@@ -9,6 +9,104 @@ import Testing
 extension CompilerTests {
 @Suite("Swift standard-library NativeImports")
 struct StandardLibraryImports {
+    private enum NativeTextOperation: Sendable {
+        case describing(expected: Int64?)
+        case reflecting
+        case debugPrint(expected: Int64)
+    }
+
+    private struct NativeTextProbe: VM.NativeInvoker {
+        let id: Core.NativeImportID
+        let key: Core.NativeImportKey
+        let parameterTypes: [Bytecode.ValueType]
+        let resultType: Bytecode.ValueType
+        let effects: Core.Effects
+        let contract: Core.NativeImportContract
+        let operation: NativeTextOperation
+
+        init(
+            requirement: Bytecode.ImportRequirement,
+            descriptor: Bytecode.StandardLibraryImports.Descriptor,
+            operation: NativeTextOperation
+        ) {
+            id = requirement.id
+            key = requirement.key
+            parameterTypes = descriptor.parameterTypes
+            resultType = descriptor.resultType
+            effects = descriptor.effects
+            contract = descriptor.contract
+            self.operation = operation
+        }
+
+        func invoke(
+            arguments: [VM.Value],
+            context: VM.NativeInvocationContext
+        ) throws -> VM.NativeInvocationResult {
+            try context.checkpoint()
+            switch operation {
+            case let .describing(expected):
+                guard arguments.count == 1,
+                      case let .any(erased) = arguments[0],
+                      erased.dynamicType == .optional(.integer(.int)),
+                      case let .optional(payload) = erased.payload
+                else {
+                    return .businessError(
+                        "describing adapter lost Optional<Int> identity"
+                    )
+                }
+                if let expected {
+                    guard case let .integer(value)? = payload,
+                          value.signedValue == expected
+                    else {
+                        return .businessError(
+                            "describing adapter lost Optional.some payload"
+                        )
+                    }
+                } else if payload != nil {
+                    return .businessError(
+                        "describing adapter lost Optional.none identity"
+                    )
+                }
+                return .returned(.string("described"))
+
+            case .reflecting:
+                guard arguments.count == 1,
+                      case let .any(erased) = arguments[0],
+                      erased.dynamicType == .array(.string),
+                      case let .array(storage) = erased.payload,
+                      storage.elementType == .string,
+                      storage.elements == [.string("x"), .string("y")]
+                else {
+                    return .businessError(
+                        "reflecting adapter lost Array<String> identity"
+                    )
+                }
+                return .returned(.string("reflected"))
+
+            case let .debugPrint(expected):
+                guard arguments.count == 3,
+                      case let .array(storage) = arguments[0],
+                      storage.elementType == .any,
+                      storage.elements.count == 2,
+                      case let .any(label) = storage.elements[0],
+                      label.dynamicType == .string,
+                      label.payload == .string("value"),
+                      case let .any(value) = storage.elements[1],
+                      value.dynamicType == .integer(.int),
+                      case let .integer(number) = value.payload,
+                      number.signedValue == expected,
+                      arguments[1] == .string(":"),
+                      arguments[2] == .string("!")
+                else {
+                    return .businessError(
+                        "debugPrint arguments lost their represented values"
+                    )
+                }
+                return .returned(nil)
+            }
+        }
+    }
+
     private struct PrintProbe: VM.NativeInvoker {
         let id: Core.NativeImportID
         let key: Core.NativeImportKey
@@ -195,6 +293,124 @@ struct StandardLibraryImports {
                 .integer(try VM.Integer(signed: 5, bitWidth: 64, isSigned: true))
             )
         )
+    }
+
+    @Test("Generic text rendering adapts represented values to fixed NativeImports")
+    func compilesNativeTextRenderingAdapters() throws {
+        let descriptors = [
+            Bytecode.StandardLibraryImports.swiftStringDescribing,
+            Bytecode.StandardLibraryImports.swiftStringReflecting,
+            Bytecode.StandardLibraryImports.swiftDebugPrint,
+        ]
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            public func nativeTextRendering(_ value: Int?) -> String {
+                debugPrint(
+                    "value",
+                    value ?? -1,
+                    separator: ":",
+                    terminator: "!"
+                )
+                return String(describing: value)
+                    + "|" + String(reflecting: ["x", "y"])
+            }
+            """,
+            functionName: "nativeTextRendering",
+            moduleName: "HelixNativeTextRendering",
+            standardLibraryImports: descriptors
+        )
+        #expect(fixture.image.module.imports.count == descriptors.count)
+        let requirements = Dictionary<
+            Core.NativeImportID,
+            Bytecode.ImportRequirement
+        >(
+            uniqueKeysWithValues: fixture.image.module.imports.map {
+                ($0.id, $0)
+            }
+        )
+        func invoke(
+            argument: VM.Value,
+            expectedDescription: Int64?,
+            expectedDebugValue: Int64
+        ) throws -> VM.ExecutionResult {
+            let probes: [any VM.NativeInvoker] = [
+                NativeTextProbe(
+                    requirement: try #require(
+                        requirements[Core.NativeImportID(rawValue: 0)]
+                    ),
+                    descriptor: descriptors[0],
+                    operation: .describing(expected: expectedDescription)
+                ),
+                NativeTextProbe(
+                    requirement: try #require(
+                        requirements[Core.NativeImportID(rawValue: 1)]
+                    ),
+                    descriptor: descriptors[1],
+                    operation: .reflecting
+                ),
+                NativeTextProbe(
+                    requirement: try #require(
+                        requirements[Core.NativeImportID(rawValue: 2)]
+                    ),
+                    descriptor: descriptors[2],
+                    operation: .debugPrint(expected: expectedDebugValue)
+                ),
+            ]
+            return VM.Interpreter(
+                nativeCatalog: try VM.NativeCatalog(probes)
+            ).invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [argument]
+            )
+        }
+        let expected = VM.ExecutionResult.returned(
+            VM.Value.string("described|reflected")
+        )
+        #expect(
+            try invoke(
+                argument: .optional(try integer(7)),
+                expectedDescription: 7,
+                expectedDebugValue: 7
+            ) == expected
+        )
+        #expect(
+            try invoke(
+                argument: .optional(nil),
+                expectedDescription: nil,
+                expectedDebugValue: -1
+            ) == expected
+        )
+    }
+
+    @Test("Native text rendering rejects image-local values before dispatch")
+    func rejectsUnbridgeableNativeTextPayload() {
+        do {
+            _ = try FrontendExecutionHarness.compile(
+                source: """
+                private struct LocalPayload { var value: Int }
+                public func unsupportedDescription(_ value: Int) -> String {
+                    String(describing: LocalPayload(value: value))
+                }
+                """,
+                functionName: "unsupportedDescription",
+                moduleName: "HelixUnsupportedNativeTextRendering",
+                standardLibraryImports: [
+                    Bytecode.StandardLibraryImports.swiftStringDescribing,
+                ]
+            )
+            Issue.record("image-local payload unexpectedly crossed NativeImport")
+        } catch {
+            #expect(
+                String(describing: error).contains(
+                    "Swift native text rendering payload LocalPayload"
+                )
+            )
+        }
+    }
+
+    private func integer(_ value: Int64) throws -> VM.Value {
+        .integer(try .init(signed: value, bitWidth: 64, isSigned: true))
     }
 }
 }

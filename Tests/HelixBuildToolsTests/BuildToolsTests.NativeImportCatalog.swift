@@ -268,15 +268,15 @@ struct NativeImportCatalogPipeline {
             )
         )
         let receipt = output.receipt
-        #expect(receipt.nativeImportCandidates.count == 3)
-        #expect(receipt.nativeImportCandidates.filter(\.isEmittedToDevice).count == 2)
+        #expect(receipt.nativeImportCandidates.count == 6)
+        #expect(receipt.nativeImportCandidates.filter(\.isEmittedToDevice).count == 5)
         #expect(receipt.nativeImportCandidates.first {
             $0.canonicalCallee == incrementCallee
         }?.id == .init(rawValue: 0))
         #expect(receipt.nativeImportCandidates.first {
             $0.canonicalCallee == dormantCallee
         }?.id == nil)
-        #expect(receipt.nativeImportBindings.count == 2)
+        #expect(receipt.nativeImportBindings.count == 5)
         #expect(receipt.nativeImportBindings.contains {
             $0.importedModules == ["NativeSupport"]
         })
@@ -289,8 +289,8 @@ struct NativeImportCatalogPipeline {
             receipt: receipt,
             sourceRoot: directory
         )
-        #expect(shell.archive.nativeImports.count == 3)
-        #expect(shell.report.emittedNativeImportCount == 2)
+        #expect(shell.archive.nativeImports.count == 6)
+        #expect(shell.report.emittedNativeImportCount == 5)
         let bridge = try #require(shell.bridge.sourceFiles[
             "Generated/\(moduleName)Bridge.swift"
         ])
@@ -299,6 +299,9 @@ struct NativeImportCatalogPipeline {
         #expect(!bridge.contains("import DormantSupport"))
         #expect(bridge.contains("NativeSupport.IncrementFactory.make("))
         #expect(bridge.contains("Runtime.StandardLibraryImports.makePrint("))
+        #expect(bridge.contains("Runtime.StandardLibraryImports.makeDebugPrint("))
+        #expect(bridge.contains("Runtime.StandardLibraryImports.makeStringDescribing("))
+        #expect(bridge.contains("Runtime.StandardLibraryImports.makeStringReflecting("))
         #expect(!bridge.contains("DormantSupport.DormantFactory.make("))
 
         let metadataURL = directory.appendingPathComponent("ReleaseMetadata.json")

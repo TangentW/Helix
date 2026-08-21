@@ -9,7 +9,7 @@ share compiler facts and identity contracts; they do not share a delivery
 channel.
 
 This document describes the implementation available in the repository as of
-August 21, 2026. It does not turn unfinished qualification work into a product
+August 22, 2026. It does not turn unfinished qualification work into a product
 claim.
 
 ## The two workflows
@@ -89,6 +89,20 @@ Both workflows depend on stable, build-specific identities:
   depth-bounded runtime-type check. Generic indirect call results and ordinary
   stores likewise share one compiler-address sink, including pending whole
   Array-literal elements and tuple components.
+- Native text rendering uses a fixed representation adapter rather than
+  exposing Swift's generic ABI. The compiler recognizes
+  `String(describing:)` and `String(reflecting:)`, proves that the recursive
+  dynamic type can be reconstructed by the Shell codec, preserves that type in
+  VM-owned `Any`, and then calls an exact `Any -> String` NativeImport.
+  `debugPrint` reuses the exact `[Any], String, String -> Void` shape already
+  used by variadic `print`. Concrete metadata and witness tables never cross
+  the boundary. If canonical SIL initializes one existential Array-literal
+  element on mutually exclusive paths, the erased values travel through typed
+  hidden block parameters and are committed only where the literal is
+  finalized. The adapter admits the scalar/text/Optional/Array/Dictionary/Set
+  codec family, rejects ArraySlice, tuple, local nominal, native-object, and
+  closure payloads, and enforces the shared 64 KiB rendering bound. This adds
+  no opcode, schema, or version beyond the current v1 contracts.
 - Array structural mutation is represented by immutable, typed value
   transforms. Concatenation, insertion, removal, and `replaceSubrange` share
   one half-open range-replacement instruction; `swapAt` uses one swap

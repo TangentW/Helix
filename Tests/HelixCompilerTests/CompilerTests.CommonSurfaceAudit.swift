@@ -535,15 +535,6 @@ struct CommonSurfaceAudit {
             diagnostic: "lowered signature is not fully concrete"
         )
         expectUnsupported(
-            name: "describedValue",
-            source: """
-            public func describedValue(_ value: Int?) -> String {
-                String(describing: value)
-            }
-            """,
-            diagnostic: "explicit NativeImport Catalog"
-        )
-        expectUnsupported(
             name: "appliedDifference",
             source: """
             public func appliedDifference(

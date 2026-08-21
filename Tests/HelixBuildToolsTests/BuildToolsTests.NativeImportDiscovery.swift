@@ -358,12 +358,15 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).echo(_:)",
             "\(moduleName).keyword(_:repeat:)",
             "\(moduleName).mainValue(_:)",
+            "Swift.String.init(describing:)",
+            "Swift.String.init(reflecting:)",
+            "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
-        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...10).map {
+        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...13).map {
             Core.NativeImportID(rawValue: UInt32($0))
         })
-        #expect(output.receipt.nativeImportBindings.count == 11)
+        #expect(output.receipt.nativeImportBindings.count == 14)
         #expect(output.receipt.nativeImportBindings.filter {
             $0.generated != nil
         }.allSatisfy {
@@ -375,6 +378,9 @@ struct NativeImportDiscoveryTests {
         #expect(output.receipt.nativeImportBindings.contains {
             $0.generated == nil && $0.importedModules == ["HelixRuntime"]
         })
+        #expect(output.receipt.nativeImportBindings.filter {
+            $0.generated == nil && $0.importedModules == ["HelixRuntime"]
+        }.count == 4)
         #expect(output.receipt.configuration.modules[moduleName]?.nativeImports.allow.sorted() == [
             "\(moduleName).Counter.increment(_:)",
             "\(moduleName).Counter.value.get",
@@ -386,6 +392,9 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).echo(_:)",
             "\(moduleName).keyword(_:repeat:)",
             "\(moduleName).mainValue(_:)",
+            "Swift.String.init(describing:)",
+            "Swift.String.init(reflecting:)",
+            "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
 
@@ -650,6 +659,9 @@ struct NativeImportDiscoveryTests {
         #expect(output.receipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
             "\(moduleName).Counter.value.get",
             "\(moduleName).Counter.value.set",
+            "Swift.String.init(describing:)",
+            "Swift.String.init(reflecting:)",
+            "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
         #expect(output.receipt.roots.compactMap(\.bridge).count == 1)
@@ -852,6 +864,9 @@ struct NativeImportDiscoveryTests {
         )
         #expect(candidateNames.contains("\(moduleName).Screen.label.get"))
         #expect(candidateNames.contains("\(moduleName).Screen.label.set"))
+        #expect(candidateNames.contains("Swift.String.init(describing:)"))
+        #expect(candidateNames.contains("Swift.String.init(reflecting:)"))
+        #expect(candidateNames.contains("Swift.debugPrint(_:separator:terminator:)"))
         #expect(candidateNames.contains("Swift.print(_:separator:terminator:)"))
         let generatedSymbols = Set(
             output.receipt.nativeImportCandidates.flatMap(\.silMangledNames)
