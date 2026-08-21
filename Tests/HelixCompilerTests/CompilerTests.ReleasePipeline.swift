@@ -561,6 +561,10 @@ struct ReleasePipeline {
         public func unique(_ values: Set<Int>) -> Set<Int> { values }
 
         public func echo(_ value: Any) -> Any { value }
+
+        public func echoCharacter(_ value: Character) -> Character { value }
+
+        public func echoSubstring(_ value: Substring) -> Substring { value }
         """
         try Data(source.utf8).write(to: sourceURL, options: .atomic)
 
@@ -622,6 +626,16 @@ struct ReleasePipeline {
         anyInterface.baseName = "echo"
         anyInterface.canonicalFormalType = "(Swift.Any) -> Swift.Any"
         anyInterface.loweredSILType = "@convention(thin) (@in_guaranteed Any) -> @out Any"
+        var characterInterface = commonInterface
+        characterInterface.baseName = "echoCharacter"
+        characterInterface.canonicalFormalType = "(Swift.Character) -> Swift.Character"
+        characterInterface.loweredSILType =
+            "@convention(thin) (Character) -> Character"
+        var substringInterface = commonInterface
+        substringInterface.baseName = "echoSubstring"
+        substringInterface.canonicalFormalType = "(Swift.Substring) -> Swift.Substring"
+        substringInterface.loweredSILType =
+            "@convention(thin) (@guaranteed Substring) -> @owned Substring"
         let report = try ReleaseCompiler.Indexer().index(
             .init(
                 metadata: metadata,
@@ -730,10 +744,42 @@ struct ReleasePipeline {
                         interface: anyInterface,
                         canonicalSILBody: "return %0"
                     ),
+                    .init(
+                        moduleName: "Fixture",
+                        sourceFileLogicalID: "Sources/BridgeFeatures.swift",
+                        canonicalDeclaration:
+                            "func echoCharacter(_: Character) -> Character",
+                        mangledName: "$s7Fixture13echoCharacteryS2JF",
+                        role: .function,
+                        loweredSignature: .init(
+                            parameters: ["Swift.Character"],
+                            result: "Swift.Character"
+                        ),
+                        parameterTypes: [.string],
+                        resultType: .string,
+                        interface: characterInterface,
+                        canonicalSILBody: "return %0"
+                    ),
+                    .init(
+                        moduleName: "Fixture",
+                        sourceFileLogicalID: "Sources/BridgeFeatures.swift",
+                        canonicalDeclaration:
+                            "func echoSubstring(_: Substring) -> Substring",
+                        mangledName: "$s7Fixture13echoSubstringyS2sF",
+                        role: .function,
+                        loweredSignature: .init(
+                            parameters: ["Swift.Substring"],
+                            result: "Swift.Substring"
+                        ),
+                        parameterTypes: [.array(.string)],
+                        resultType: .array(.string),
+                        interface: substringInterface,
+                        canonicalSILBody: "return %0"
+                    ),
                 ]
             )
         )
-        #expect(report.eligibleCount == 6)
+        #expect(report.eligibleCount == 8)
         #expect(report.archive.capabilities.contains(.untypedThrowsV1))
         #expect(report.archive.capabilities.contains(.mainActorSyncV1))
         #expect(report.archive.capabilities.contains(.collectionsV1))
@@ -743,6 +789,38 @@ struct ReleasePipeline {
 
         let roots = try report.archive.functions.map { record -> BridgeGeneration.Root in
             let entry = try #require(record.entryIndex)
+            if record.canonicalDeclaration.contains("echoCharacter") {
+                return .init(
+                    functionKey: record.key,
+                    entryIndex: entry,
+                    sourceFileLogicalID: record.sourceFileLogicalID,
+                    privateImportSourceFile: "BridgeFeatures.swift",
+                    originalReference: "echoCharacter(_:)",
+                    replacementDeclaration:
+                        "public func helixBridge_echoCharacter(_ value: Character) -> Character",
+                    parameterExpressions: ["value"],
+                    parameterSwiftTypes: ["Swift.Character"],
+                    resultSwiftType: "Swift.Character",
+                    originalInvocation: "echoCharacter(value)",
+                    bridgeInvocation: "helixBridge_echoCharacter(argument0)"
+                )
+            }
+            if record.canonicalDeclaration.contains("echoSubstring") {
+                return .init(
+                    functionKey: record.key,
+                    entryIndex: entry,
+                    sourceFileLogicalID: record.sourceFileLogicalID,
+                    privateImportSourceFile: "BridgeFeatures.swift",
+                    originalReference: "echoSubstring(_:)",
+                    replacementDeclaration:
+                        "public func helixBridge_echoSubstring(_ value: Substring) -> Substring",
+                    parameterExpressions: ["value"],
+                    parameterSwiftTypes: ["Swift.Substring"],
+                    resultSwiftType: "Swift.Substring",
+                    originalInvocation: "echoSubstring(value)",
+                    bridgeInvocation: "helixBridge_echoSubstring(argument0)"
+                )
+            }
             if record.canonicalDeclaration.contains("echo") {
                 return .init(
                     functionKey: record.key,
@@ -856,6 +934,16 @@ struct ReleasePipeline {
         #expect(entrySource.contains("encoder.encodeAny"))
         #expect(entrySource.contains("BridgeValueCodec.encodeAny"))
         #expect(entrySource.contains("BridgeValueCodec.decodeAny"))
+        #expect(
+            entrySource.contains(
+                "BridgeValueCodec.decode(value, as: Swift.Character.self)"
+            )
+        )
+        #expect(
+            entrySource.contains(
+                "BridgeValueCodec.decode(value, as: Swift.Substring.self)"
+            )
+        )
         try typeCheckGeneratedBridge(
             bridge,
             baseSourceURL: sourceURL,

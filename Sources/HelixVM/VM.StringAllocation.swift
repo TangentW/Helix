@@ -29,6 +29,8 @@ enum StringAllocation {
             20
         case let .float(number) where number.bitWidth == 32 || number.bitWidth == 64:
             64
+        case let .string(string):
+            UInt64(string.utf8.count)
         default:
             throw VM.RuntimeTrap.nativeFailure(
                 "stringify is unsupported for \(value.type)"
@@ -46,6 +48,8 @@ enum StringAllocation {
             String(number.floatValue)
         case let .float(number) where number.bitWidth == 64:
             String(number.doubleValue)
+        case let .string(string):
+            string
         default:
             throw VM.RuntimeTrap.nativeFailure(
                 "stringify is unsupported for \(value.type)"

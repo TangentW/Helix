@@ -450,7 +450,7 @@ struct FiniteSequenceConsumerSemanticsMatrix {
                 Values(value: 0).sorted()
             }
             """,
-            diagnostic: "represented managed Collection or supported finite progression"
+            diagnostic: "represented String/Collection storage"
         )
         expectUnsupported(
             name: "unboundedSequenceSet",

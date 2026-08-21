@@ -116,6 +116,71 @@ struct Container {
         #expect(try Bytecode.Encoder.encode(decoded) == bytes)
     }
 
+    @Test("Text representation primitives share the current HLBC 1.0 wire format")
+    func textRepresentationRoundTrip() throws {
+        let strings = Bytecode.ValueType.array(.string)
+        let resultType = Bytecode.ValueType.tuple([.string, .string])
+        var module = try makeAddModule()
+        module.capabilities.formUnion([.collectionsV1, .stringsV1])
+        module.functions[0] = .init(
+            id: .init(rawValue: 0),
+            name: "textRepresentation",
+            parameterRegisters: [
+                .init(rawValue: 0), .init(rawValue: 1), .init(rawValue: 2),
+            ],
+            resultType: resultType,
+            registerTypes: [
+                .string, strings, .string, strings, .string, .string,
+                resultType,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                        .init(rawValue: 2),
+                    ],
+                    instructions: [
+                        .stringCharacters(
+                            result: .init(rawValue: 3),
+                            string: .init(rawValue: 0)
+                        ),
+                        .stringJoin(
+                            result: .init(rawValue: 4),
+                            elements: .init(rawValue: 3),
+                            separator: nil,
+                            elementKind: .character
+                        ),
+                        .stringJoin(
+                            result: .init(rawValue: 5),
+                            elements: .init(rawValue: 1),
+                            separator: .init(rawValue: 2),
+                            elementKind: .string
+                        ),
+                        .makeTuple(
+                            result: .init(rawValue: 6),
+                            elements: [
+                                .init(rawValue: 4), .init(rawValue: 5),
+                            ]
+                        ),
+                        .returnValue(.init(rawValue: 6)),
+                    ]
+                ),
+            ]
+        )
+
+        let bytes = try Bytecode.Encoder.encode(module)
+        let decoded = try Bytecode.Decoder.decode(bytes).module
+        let disassembly = Bytecode.Disassembler.disassemble(decoded)
+
+        #expect(decoded == module)
+        #expect(try Bytecode.Encoder.encode(decoded) == bytes)
+        #expect(disassembly.contains("string_characters"))
+        #expect(disassembly.contains("string_join.character"))
+        #expect(disassembly.contains("string_join.string"))
+    }
+
     @Test("Encoding is deterministic")
     func deterministicEncoding() throws {
         let module = try makeAddModule()

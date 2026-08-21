@@ -746,7 +746,12 @@ public struct Generator: Sendable {
         case let (.named(name), .bool):
             return ["Bool", "Swift.Bool"].contains(name)
         case let (.named(name), .string):
-            return ["String", "Swift.String"].contains(name)
+            return [
+                "String", "Swift.String", "Character", "Swift.Character",
+            ].contains(name)
+        case let (.named(name), .array(element)):
+            return element == .string
+                && ["Substring", "Swift.Substring"].contains(name)
         case let (.named(name), .any):
             return ["Any", "Swift.Any"].contains(name)
         case let (.named(name), .void):
@@ -1263,6 +1268,13 @@ public struct Generator: Sendable {
                 return "try \(inputEncoder).encode(\(expression))"
             }
             return "try Runtime.BridgeValueCodec.encode(\(expression))"
+        case let (.named(name), .array(element))
+        where element == .string
+                && ["Substring", "Swift.Substring"].contains(name):
+            if let inputEncoder {
+                return "try \(inputEncoder).encode(\(expression))"
+            }
+            return "try Runtime.BridgeValueCodec.encode(\(expression))"
         case let (.named, .native(typeID)):
             if let inputEncoder {
                 return "try \(inputEncoder).encodeNative(\(expression), as: \(render(typeID)), "
@@ -1369,6 +1381,10 @@ public struct Generator: Sendable {
             return "try Runtime.BridgeValueCodec.decodeAny(\(expression))"
         case let (.named(name), .bool), let (.named(name), .integer),
              let (.named(name), .float), let (.named(name), .string):
+            return "try Runtime.BridgeValueCodec.decode(\(expression), as: \(name).self)"
+        case let (.named(name), .array(element))
+        where element == .string
+                && ["Substring", "Swift.Substring"].contains(name):
             return "try Runtime.BridgeValueCodec.decode(\(expression), as: \(name).self)"
         case let (.named(name), .native(typeID)):
             return "try Runtime.BridgeValueCodec.decodeNative(\(expression), as: \(name).self, "

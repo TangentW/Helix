@@ -127,6 +127,37 @@ struct ReleaseDriver {
                 == .returned(.integer(try VM.Integer(signed: 30, bitWidth: 64, isSigned: true)))
         )
 
+        #expect(archive.capabilities.contains(.stringsV1))
+        #expect(archive.capabilities.contains(.collectionsV1))
+        let localVMValues = """
+        public func transform(_ x: Int) -> Int {
+            let text = String(repeating: "🧬", count: 2)
+            let values = [x, text.count]
+            return values[0] + values[1]
+        }
+        public func locked(_ x: Int) -> Int { x + 2 }
+        """
+        try Data(localVMValues.utf8).write(to: sourceURL)
+        let localVMResult = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+        #expect(localVMResult.module.capabilities.contains(.stringsV1))
+        #expect(localVMResult.module.capabilities.contains(.collectionsV1))
+        let localVMImage = try Verification.Engine().verify(
+            bytes: localVMResult.bytecode,
+            shell: shell,
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: entry,
+                image: localVMImage,
+                arguments: [.integer(input)]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 5, bitWidth: 64, isSigned: true))
+            )
+        )
+
         let changedRejectedOnly = """
         public func transform(_ x: Int) -> Int { x + 1 }
         public func locked(_ x: Int) -> Int { x + 99 }
@@ -1153,6 +1184,34 @@ struct ReleaseDriver {
                 image: predicateImage,
                 arguments: [.string("Helix")]
             ) == .returned(.string("matched"))
+        )
+
+        #expect(archive.capabilities.contains(.collectionsV1))
+        try Data(
+            """
+            @inline(never)
+            public func transform(_ value: String) -> String {
+                String(value.reversed())
+            }
+            """.utf8
+        ).write(to: sourceURL)
+        let sequenceResult = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+        #expect(sequenceResult.module.capabilities.contains(.collectionsV1))
+        #expect(sequenceResult.disassembly.contains("string_characters"))
+        #expect(sequenceResult.disassembly.contains("string_join.character"))
+        let sequenceImage = try Verification.Engine().verify(
+            bytes: sequenceResult.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: entry,
+                image: sequenceImage,
+                arguments: [.string("A🧬é")]
+            ) == .returned(.string("é🧬A"))
         )
     }
 

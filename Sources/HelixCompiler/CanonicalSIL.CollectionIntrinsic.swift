@@ -19,6 +19,7 @@ enum CollectionIntrinsic: Equatable {
         /// behavior; every shape resolves to the same Sequence specialization.
         enum Source: Equatable {
             case collection
+            case stringCharacters
             case arrayBackedElement
             case dictionaryKeyValue
             case setElement
@@ -181,6 +182,10 @@ enum CollectionIntrinsic: Equatable {
 
     init?(mangledName: String) {
         switch mangledName {
+        case "$sSS5countSivg":
+            self = .query(.init(operation: .count, source: .stringCharacters))
+        case "$sSS7isEmptySbvg":
+            self = .query(.init(operation: .isEmpty, source: .stringCharacters))
         case "$sSa5countSivg":
             self = .query(.init(operation: .count, source: .arrayBackedElement))
         case "$ss10ArraySliceV5countSivg":
@@ -263,7 +268,8 @@ enum CollectionIntrinsic: Equatable {
             self = .adapter(.arrayRepeat(hasMetatype: false))
         case "$sSlsE9dropFirsty11SubSequenceQzSiF":
             self = .adapter(.subsequence(.dropFirst))
-        case "$sSKsE8dropLasty11SubSequenceQzSiF":
+        case "$sSlsE8dropLasty11SubSequenceQzSiF",
+             "$sSKsE8dropLasty11SubSequenceQzSiF":
             self = .adapter(.subsequence(.dropLast))
         case "$sSlsE6prefixy11SubSequenceQzSiF":
             self = .adapter(.subsequence(.prefix))

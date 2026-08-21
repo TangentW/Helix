@@ -17,25 +17,10 @@ enum SwiftCoreIntrinsic: Equatable {
     case managedCollectionCast(
         CanonicalSIL.ManagedCollectionCastIntrinsic
     )
+    case text(CanonicalSIL.TextIntrinsic)
     case minimum
     case maximum
     case absoluteValue
-    case stringLiteral
-    case characterLiteral
-    case stringEqual
-    case stringLess
-    case stringConcat
-    case stringAppend
-    case stringCount
-    case stringIsEmpty
-    case stringTransform(Bytecode.StringTransformOperation)
-    case stringHasPrefix
-    case stringHasSuffix
-    case stringContains
-    case stringInterpolationInit
-    case stringInterpolationAppendLiteral
-    case stringInterpolationAppendValue
-    case stringFromInterpolation
     case arrayEmpty
     case arraySubscript
     case arraySubscriptModify
@@ -94,6 +79,10 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .collection(collection)
             return
         }
+        if let text = CanonicalSIL.TextIntrinsic(mangledName: mangledName) {
+            self = .text(text)
+            return
+        }
         if let accumulation = CanonicalSIL.DictionaryAccumulationIntrinsic(
             mangledName: mangledName
         ) {
@@ -116,6 +105,8 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .higherOrder(.filter(.array))
         case "$sSTsE6filterySay7ElementQzGSbACKXEKF":
             self = .higherOrder(.filter(.array))
+        case "$sSmsE6filteryxSb7ElementQzKXEKF":
+            self = .higherOrder(.filter(.rangeReplaceableCollection))
         case "$sSD6filterySDyxq_GSbx3key_q_5valuet_tKXEKF":
             self = .higherOrder(.filter(.dictionary))
         case "$sSh6filteryShyxGSbxKXEKF":
@@ -196,31 +187,6 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$ss3minyxx_xtSLRzlF": self = .minimum
         case "$ss3maxyxx_xtSLRzlF": self = .maximum
         case "$ss3absyxxSLRzs13SignedNumericRzlF": self = .absoluteValue
-        case "$sSS21_builtinStringLiteral17utf8CodeUnitCount7isASCIISSBp_BwBi1_tcfC":
-            self = .stringLiteral
-        case "$sSJ38_builtinExtendedGraphemeClusterLiteral17utf8CodeUnitCount7isASCIISJBp_BwBi1_tcfC":
-            self = .characterLiteral
-        case "$sSS2eeoiySbSS_SStFZ": self = .stringEqual
-        case "$sSS1loiySbSS_SStFZ": self = .stringLess
-        case "$sSS1poiyS2S_SStFZ": self = .stringConcat
-        case "$sSS2peoiyySSz_SStFZ": self = .stringAppend
-        case "$sSS5countSivg": self = .stringCount
-        case "$sSS7isEmptySbvg": self = .stringIsEmpty
-        case "$sSS10uppercasedSSyF": self = .stringTransform(.uppercase)
-        case "$sSS10lowercasedSSyF": self = .stringTransform(.lowercase)
-        case "$sSS9hasPrefixySbSSF": self = .stringHasPrefix
-        case "$sSS9hasSuffixySbSSF": self = .stringHasSuffix
-        case "$sSy17_StringProcessingE8containsySbSSF": self = .stringContains
-        case "$ss26DefaultStringInterpolationV15literalCapacity18interpolationCountABSi_SitcfC":
-            self = .stringInterpolationInit
-        case "$ss26DefaultStringInterpolationV13appendLiteralyySSF":
-            self = .stringInterpolationAppendLiteral
-        case "$ss26DefaultStringInterpolationV06appendC0yyxs06CustomB11ConvertibleRzlF":
-            self = .stringInterpolationAppendValue
-        case "$ss26DefaultStringInterpolationV06appendC0yyxs06CustomB11ConvertibleRzs20TextOutputStreamableRzlF":
-            self = .stringInterpolationAppendValue
-        case "$sSS19stringInterpolationSSs013DefaultStringB0V_tcfC":
-            self = .stringFromInterpolation
         case "$sS2ayxGycfC": self = .arrayEmpty
         case "$sSayxSicig": self = .arraySubscript
         case "$sSayxSiciM": self = .arraySubscriptModify

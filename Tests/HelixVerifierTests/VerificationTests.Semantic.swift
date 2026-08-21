@@ -655,6 +655,88 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Text representation primitives enforce types and logical Character shape")
+    func rejectsInvalidTextRepresentationInstructions() throws {
+        var invalidCharacters = try makeFixture { function in
+            function.registerTypes.append(contentsOf: [
+                .string, .array(.int64),
+            ])
+            function.blocks[0].instructions = [
+                .constantString(result: .init(rawValue: 1), value: "Helix"),
+                .stringCharacters(
+                    result: .init(rawValue: 2),
+                    string: .init(rawValue: 1)
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        invalidCharacters.module.capabilities.formUnion([
+            .collectionsV1, .stringsV1,
+        ])
+        invalidCharacters.shell.capabilities.formUnion([
+            .collectionsV1, .stringsV1,
+        ])
+        invalidCharacters.policy.acceptedCapabilities.formUnion([
+            .collectionsV1, .stringsV1,
+        ])
+
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "string_characters requires a String and produces Array<String>"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(invalidCharacters.module),
+                shell: invalidCharacters.shell,
+                policy: invalidCharacters.policy
+            )
+        }
+
+        var invalidCharacterJoin = try makeFixture { function in
+            function.registerTypes.append(contentsOf: [
+                .array(.string), .string, .string,
+            ])
+            function.blocks[0].instructions = [
+                .makeArray(result: .init(rawValue: 1), elements: []),
+                .constantString(result: .init(rawValue: 2), value: "|"),
+                .stringJoin(
+                    result: .init(rawValue: 3),
+                    elements: .init(rawValue: 1),
+                    separator: .init(rawValue: 2),
+                    elementKind: .character
+                ),
+                .returnValue(.init(rawValue: 0)),
+            ]
+        }
+        invalidCharacterJoin.module.capabilities.formUnion([
+            .collectionsV1, .stringsV1,
+        ])
+        invalidCharacterJoin.shell.capabilities.formUnion([
+            .collectionsV1, .stringsV1,
+        ])
+        invalidCharacterJoin.policy.acceptedCapabilities.formUnion([
+            .collectionsV1, .stringsV1,
+        ])
+
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "character string_join cannot carry a separator"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(invalidCharacterJoin.module),
+                shell: invalidCharacterJoin.shell,
+                policy: invalidCharacterJoin.policy
+            )
+        }
+    }
+
     @Test("String value types cannot be smuggled in without the String capability")
     func rejectsUndeclaredStringCapability() throws {
         let fixture = try makeFixture { function in

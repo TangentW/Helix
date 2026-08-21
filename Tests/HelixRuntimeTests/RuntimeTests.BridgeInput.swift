@@ -300,6 +300,112 @@ struct BridgeInput {
         }
     }
 
+    @Test("Character and Substring use validated normalized text representations")
+    func textRepresentationsRoundTrip() throws {
+        for character: Character in ["e\u{301}", "👨‍👩‍👧‍👦", "🇨🇳"] {
+            let encoded = try Runtime.BridgeValueCodec.encode(character)
+            #expect(
+                try Runtime.BridgeValueCodec.decode(
+                    encoded,
+                    as: Character.self
+                ) == character
+            )
+        }
+
+        for malformed in ["", "ab"] {
+            #expect(
+                throws: VM.RuntimeTrap.explicit(
+                    "represented Character must contain exactly one extended grapheme cluster"
+                )
+            ) {
+                _ = try Runtime.BridgeValueCodec.decode(
+                    .string(malformed),
+                    as: Character.self
+                )
+            }
+        }
+        #expect(
+            throws: VM.RuntimeTrap.typeMismatch(
+                expected: .string,
+                actual: .bool
+            )
+        ) {
+            _ = try Runtime.BridgeValueCodec.decode(
+                .bool(false),
+                as: Character.self
+            )
+        }
+
+        let source = "A👩🏽‍💻e\u{301}Z"
+        let substring = source.dropFirst().dropLast()
+        let encoded = try Runtime.BridgeValueCodec.encode(substring)
+        #expect(
+            encoded == .array(
+                [.string("👩🏽‍💻"), .string("e\u{301}")],
+                elementType: .string
+            )
+        )
+        #expect(
+            try Runtime.BridgeValueCodec.decode(
+                encoded,
+                as: Substring.self
+            ) == substring
+        )
+
+        let encoder = makeEncoder()
+        let streamed = try encoder.encode(substring)
+        try encoder.finalize(arguments: [streamed])
+        #expect(
+            try Runtime.BridgeValueCodec.decode(
+                streamed,
+                as: Substring.self
+            ) == substring
+        )
+        #expect(
+            throws: VM.RuntimeTrap.explicit(
+                "represented Character must contain exactly one extended grapheme cluster"
+            )
+        ) {
+            _ = try Runtime.BridgeValueCodec.decode(
+                .array([.string("ab")], elementType: .string),
+                as: Substring.self
+            )
+        }
+
+        let boundedEncoder = makeEncoder(
+            .init(
+                maximumEstimatedVMBytes: 1_024,
+                maximumValueNodes: 16,
+                maximumNestingDepth: 8,
+                maximumContainerElements: 1
+            )
+        )
+        #expect(
+            throws: Runtime.BridgeInputError.containerElementLimitExceeded(
+                actual: 2,
+                maximum: 1
+            )
+        ) {
+            _ = try boundedEncoder.encode(Substring("ab"))
+        }
+
+        let byteBoundedEncoder = makeEncoder(
+            .init(
+                maximumEstimatedVMBytes: 49,
+                maximumValueNodes: 16,
+                maximumNestingDepth: 8,
+                maximumContainerElements: 16
+            )
+        )
+        #expect(
+            throws: Runtime.BridgeInputError.estimatedVMByteLimitExceeded(
+                maximum: 49
+            )
+        ) {
+            _ = try byteBoundedEncoder.encode(Substring("ab"))
+        }
+    }
+
     private func makeEncoder(
         _ limits: Runtime.BridgeInputLimits = .init()
     ) -> Runtime.BridgeValueCodec.Encoder {

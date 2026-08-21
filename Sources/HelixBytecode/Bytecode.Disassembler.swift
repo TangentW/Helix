@@ -228,6 +228,11 @@ public enum Disassembler {
             "\(result) = string_\(operation.rawValue) \(string), \(pattern)"
         case let .stringTransform(result, operation, string):
             "\(result) = string_\(operation.rawValue) \(string)"
+        case let .stringCharacters(result, string):
+            "\(result) = string_characters \(string)"
+        case let .stringJoin(result, elements, separator, elementKind):
+            "\(result) = string_join.\(elementKind.rawValue) \(elements)"
+                + (separator.map { ", separator: \($0)" } ?? "")
         case let .stringify(result, value):
             "\(result) = stringify \(value)"
         case let .makeArray(result, elements):

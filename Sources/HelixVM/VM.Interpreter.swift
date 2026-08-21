@@ -1690,6 +1690,134 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
+                case let .stringCharacters(result, string):
+                    let source = try self.string(string, registers: registers)
+                    let byteCount = source.utf8.count
+                    try budget.consumeUTF8Work(byteCount: byteCount)
+                    let characterCount = source.count
+                    try budget.consumeAggregateStorage(
+                        elementCount: characterCount
+                    )
+                    try budget.consumeVMHeap(bytes: UInt64(byteCount))
+                    // `count` and materialization each traverse the grapheme
+                    // view. Reserve both deterministic passes before the
+                    // output Array allocates storage.
+                    try budget.consumeUTF8Work(byteCount: byteCount)
+                    var characters: [VM.Value] = []
+                    characters.reserveCapacity(characterCount)
+                    for (offset, character) in source.enumerated() {
+                        if offset.isMultiple(of: 64) {
+                            try budget.checkDeadline()
+                        }
+                        characters.append(.string(String(character)))
+                    }
+                    try budget.checkDeadline()
+                    try initialize(
+                        .array(characters, elementType: .string),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .stringJoin(
+                    result,
+                    elementsRegister,
+                    separatorRegister,
+                    elementKind
+                ):
+                    let elementsValue = try read(
+                        elementsRegister,
+                        registers: registers
+                    )
+                    guard case let .array(elements, elementType) = elementsValue,
+                          elementType == .string
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .array(.string),
+                            actual: elementsValue.type
+                        )
+                    }
+                    let separator = try separatorRegister.map {
+                        try self.string($0, registers: registers)
+                    }
+                    if elementKind == .character, separator != nil {
+                        throw VM.RuntimeTrap.invalidProgramCounter
+                    }
+                    try budget.consumeLinearWork(elementCount: elements.count)
+                    var totalBytes: UInt64 = 0
+                    for element in elements {
+                        guard case let .string(component) = element else {
+                            throw VM.RuntimeTrap.typeMismatch(
+                                expected: .string,
+                                actual: element.type
+                            )
+                        }
+                        let componentByteCount = component.utf8.count
+                        try budget.consumeUTF8Work(
+                            byteCount: componentByteCount
+                        )
+                        if elementKind == .character, component.count != 1 {
+                            throw VM.RuntimeTrap.explicit(
+                                "Character sequence contains a value that is not one extended grapheme cluster"
+                            )
+                        }
+                        let next = totalBytes.addingReportingOverflow(
+                            UInt64(componentByteCount)
+                        )
+                        guard !next.overflow else {
+                            throw VM.RuntimeTrap.vmHeapLimitExceeded
+                        }
+                        totalBytes = next.partialValue
+                    }
+                    if let separator, elements.count > 1 {
+                        let separatorByteCount = separator.utf8.count
+                        try budget.consumeUTF8Work(
+                            byteCount: separatorByteCount
+                        )
+                        let repetitions = UInt64(elements.count - 1)
+                        let separatorBytes = UInt64(separatorByteCount)
+                            .multipliedReportingOverflow(by: repetitions)
+                        let combined = totalBytes.addingReportingOverflow(
+                            separatorBytes.partialValue
+                        )
+                        guard !separatorBytes.overflow, !combined.overflow else {
+                            throw VM.RuntimeTrap.vmHeapLimitExceeded
+                        }
+                        totalBytes = combined.partialValue
+                    }
+                    guard let capacity = Int(exactly: totalBytes) else {
+                        throw VM.RuntimeTrap.vmHeapLimitExceeded
+                    }
+                    // Joining traverses the element array once to prove the
+                    // output bound and once to construct it. Charge both passes
+                    // and the exact output before allocating any String storage.
+                    try budget.consumeLinearWork(elementCount: elements.count)
+                    try budget.consumeUTF8Work(byteCount: capacity)
+                    let joined = try budget.withReservedVMHeap(
+                        maximumBytes: totalBytes
+                    ) {
+                        var value = String()
+                        value.reserveCapacity(capacity)
+                        for (offset, element) in elements.enumerated() {
+                            if offset.isMultiple(of: 64) {
+                                try budget.checkDeadline()
+                            }
+                            if offset > 0, let separator {
+                                value.append(contentsOf: separator)
+                            }
+                            guard case let .string(component) = element else {
+                                throw VM.RuntimeTrap.invalidProgramCounter
+                            }
+                            value.append(contentsOf: component)
+                        }
+                        // String concatenation preserves the input UTF-8 code
+                        // units, so the proven bound is also the exact payload.
+                        return (value, totalBytes)
+                    }
+                    try budget.checkDeadline()
+                    try initialize(
+                        .string(joined),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .stringify(result, operand):
                     let source = try read(operand, registers: registers)
                     let maximumBytes = try VM.StringAllocation

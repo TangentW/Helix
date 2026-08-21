@@ -152,6 +152,16 @@ or a stable native C/Objective-C-shaped operation, while supported Swift
 Sequence APIs are recognized at the frontend and lowered onto a small set of
 typed cursors, builders, mutations, and ordinary closure calls.
 
+Text follows that same split rather than receiving an API-shaped import table.
+The compiler keeps String and the one-grapheme Character contract logically
+distinct even though both use the compact HLBC String value, and normalizes
+Substring to a Character Array. `string_characters` and the two verified
+`string_join` modes are the only representation boundaries; count, traversal,
+transforms, split, subsequences, relations, and joining then reuse existing
+finite-Sequence plans. Character and Substring Shell codecs revalidate the
+erased invariants. `String.Index`, UTF views, and Foundation text behavior stay
+fail-closed until their own semantics are represented explicitly.
+
 Payload-free `nil` values recover their wrapped type from verified bytecode
 context, so the same Array/Dictionary builders, mutation/sort/split states, and
 VM equality path work for every represented `Optional<T>` without a
@@ -407,8 +417,10 @@ require an intermediate Array. `enumerated`, `Array(sequence)`, heterogeneous
 `zip`, natural/comparator `sorted`, and `Set(sequence)` use the same typed
 builder only when their result needs complete storage. Stable comparator
 `sorted(by:)` accepts Array, Set, Dictionary, and supported finite-progression
-elements through the same verified sort CFG; short-circuiting prefix/drop
-predicates, reverse `last` searches, and mutating `sort(by:)` remain Array-only.
+elements through the same verified sort CFG. String and Array-backed sources
+share short-circuiting Collection prefix/drop predicates and reverse `last`
+searches; direct Sequence prefix also accepts supported finite progressions.
+Mutating `sort(by:)` remains Array-only.
 Finite integer ranges and supported numeric strides enter that same forward
 closure traversal for Array-producing transforms, reductions, visits,
 short-circuit predicates, and comparator selection. Equality membership,

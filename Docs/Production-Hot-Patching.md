@@ -166,8 +166,8 @@ device performance qualification.
 
 The current wire versions are HLBC 1.0 and HLXI 1.0. The implemented subset
 includes common integer and floating-point operations and conversions,
-`min`/`max`/`abs`, Bool, Unicode String transforms and interpolation,
-one-grapheme Character literals for the bounded String predicate path,
+`min`/`max`/`abs`, Bool, logical String/Character/Substring values, Unicode
+String transforms and interpolation, validated grapheme literals and bridges,
 tuple/Optional including address projection and verified force-unwrap traps,
 recursive Array/Dictionary equality,
 common Array index/search plus streaming natural extrema, equality membership,
@@ -191,6 +191,15 @@ reductions, visits, predicate queries including `count(where:)`, and comparator
 selection share one closure traversal across Array, Dictionary, and Set; all
 three preserve their container through `filter`, while Dictionary also supports
 `mapValues` and `compactMapValues`.
+String has allocation-free `count`/`isEmpty`; element-oriented traversal,
+transforms, relations, count-based subsequences, split, `Array(sequence)`, and
+reversal normalize once to a verified Character Array and reuse the same finite
+Sequence plans. String/Substring conversion, Character-sequence construction,
+nested Character flattening, String-sequence joining, append/repetition,
+String/Character comparison, and text interpolation use two verifier-visible representation
+primitives rather than Swift generic NativeImports or per-source-API opcodes.
+Private String indices, UTF views, index-sensitive mutation, and Foundation text
+semantics remain fail-closed.
 Frontend Array/Dictionary cast helpers may erase tuple labels only when the
 original types differ solely by those labels and both complete VM types match;
 real element, key, value, and reference conversions remain rejected.

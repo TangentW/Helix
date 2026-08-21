@@ -2251,6 +2251,38 @@ public struct Engine: Verification.ImageVerifying {
             guard type(result) == .string, type(string) == .string else {
                 throw fail("string transform operand and result must both be String")
             }
+        case let .stringCharacters(result, string):
+            guard capabilities.contains(.stringsV1),
+                  capabilities.contains(.collectionsV1)
+            else {
+                throw fail(
+                    "String character materialization requires String and Collection capabilities"
+                )
+            }
+            guard type(result) == .array(.string), type(string) == .string else {
+                throw fail(
+                    "string_characters requires a String and produces Array<String>"
+                )
+            }
+        case let .stringJoin(result, elements, separator, elementKind):
+            guard capabilities.contains(.stringsV1),
+                  capabilities.contains(.collectionsV1)
+            else {
+                throw fail(
+                    "String joining requires String and Collection capabilities"
+                )
+            }
+            guard type(result) == .string,
+                  type(elements) == .array(.string),
+                  separator.map({ type($0) == .string }) ?? true
+            else {
+                throw fail(
+                    "string_join requires Array<String>, an optional String separator, and a String result"
+                )
+            }
+            if elementKind == .character, separator != nil {
+                throw fail("character string_join cannot carry a separator")
+            }
         case let .stringify(result, value):
             guard capabilities.contains(.stringsV1) else {
                 throw fail("String interpolation requires \(Core.Capability.stringsV1)")
@@ -2259,10 +2291,12 @@ public struct Engine: Verification.ImageVerifying {
                 throw fail("stringify result must be String")
             }
             switch type(value) {
-            case .bool, .integer, .float:
+            case .bool, .integer, .float, .string:
                 break
             default:
-                throw fail("stringify supports only Bool, integer, and floating-point scalars")
+                throw fail(
+                    "stringify supports only Bool, integer, floating-point, and String values"
+                )
             }
         case let .makeArray(result, elements):
             guard capabilities.contains(.collectionsV1) else {
@@ -4001,7 +4035,8 @@ public struct Engine: Verification.ImageVerifying {
                      .scalarBitCast, .integerConvert,
                      .floatingConvert,
                      .booleanBinary, .stringConcat, .stringCount, .stringIsEmpty,
-                     .stringPredicate, .stringTransform, .stringify,
+                     .stringPredicate, .stringTransform, .stringCharacters,
+                     .stringJoin, .stringify,
                      .arrayCount, .arrayIsEmpty, .arraySearch,
                      .dictionaryCount, .dictionaryIsEmpty,
                      .setCount, .setIsEmpty, .setContains, .setRelation,

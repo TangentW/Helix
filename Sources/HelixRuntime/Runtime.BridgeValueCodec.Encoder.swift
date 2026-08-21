@@ -74,6 +74,32 @@ public final class Encoder {
         return .string(value)
     }
 
+    /// Encodes one logical Character as its validated one-grapheme String
+    /// representation and charges the exact UTF-8 payload.
+    public func encode(_ value: Character) throws -> VM.Value {
+        try requireActive()
+        try pollDeadline(force: true)
+        let byteCount = try count(value.utf8.count)
+        try reserveLeaf(estimatedVMBytes: byteCount)
+        try pollDeadline(force: true)
+        return .string(String(value))
+    }
+
+    /// Encodes a Substring as the normalized Character Array used by HLBC.
+    public func encode(_ value: Substring) throws -> VM.Value {
+        let preflight = try preflightSubstring(value)
+        return try withContainer(childValueCount: preflight.characterCount) {
+            try reserveVMBytes(preflight.utf8Bytes)
+            var elements: [VM.Value] = []
+            elements.reserveCapacity(preflight.characterCount)
+            for character in value {
+                try reserveLeaf()
+                elements.append(.string(String(character)))
+            }
+            return .array(elements, elementType: .string)
+        }
+    }
+
     func encodeDynamicLeaf(_ value: VM.Value) throws -> VM.Value {
         switch value {
         case let .string(string):
@@ -271,6 +297,43 @@ public final class Encoder {
         try reserveNode(at: try nextDepth())
         try reserveVMBytes(estimatedVMBytes)
         try reserveNativeBytes(estimatedNativeBytes)
+    }
+
+    /// Counts graphemes without allocating their Array representation. The
+    /// container limit and deadline are enforced while traversing, before the
+    /// output buffer exists.
+    private func preflightSubstring(
+        _ value: Substring
+    ) throws -> (characterCount: Int, utf8Bytes: UInt64) {
+        try requireActive()
+        try pollDeadline(force: true)
+        var characterCount: UInt64 = 0
+        var utf8Bytes: UInt64 = 0
+        for character in value {
+            let nextCount = characterCount.addingReportingOverflow(1)
+            let nextBytes = utf8Bytes.addingReportingOverflow(
+                UInt64(character.utf8.count)
+            )
+            guard !nextCount.overflow, !nextBytes.overflow else {
+                throw Runtime.BridgeInputError.invalidContainerCount
+            }
+            characterCount = nextCount.partialValue
+            utf8Bytes = nextBytes.partialValue
+            guard characterCount <= limits.maximumContainerElements else {
+                throw Runtime.BridgeInputError.containerElementLimitExceeded(
+                    actual: characterCount,
+                    maximum: limits.maximumContainerElements
+                )
+            }
+            if characterCount.isMultiple(of: 64) {
+                try pollDeadline(force: true)
+            }
+        }
+        try pollDeadline(force: true)
+        guard let count = Int(exactly: characterCount) else {
+            throw Runtime.BridgeInputError.invalidContainerCount
+        }
+        return (count, utf8Bytes)
     }
 
     private func withContainer<Result>(

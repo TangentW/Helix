@@ -821,6 +821,8 @@ public struct TypeEnvironment: Sendable {
         case "CGFloat", "CoreFoundation.CGFloat", "CoreGraphics.CGFloat":
             return .float(bitWidth: 64)
         case "String", "Swift.String": return .string
+        case "Character", "Swift.Character": return .string
+        case "Substring", "Swift.Substring": return .array(.string)
         case "Any", "Swift.Any": return .any
         case "any Error", "Swift.Error": return preservesTypedErrors ? .error : .string
         case "Void", "Swift.Void": return .void
@@ -838,6 +840,10 @@ public struct TypeEnvironment: Sendable {
         _ raw: String,
         relativeTo parentScope: String?
     ) throws -> Bytecode.ValueType {
+        if let element = CanonicalSIL.TextRepresentation.kind(of: raw)?
+            .sequenceElement {
+            return element
+        }
         if let progression = try CanonicalSIL.Progression.sequenceType(
             raw,
             resolve: {

@@ -52,13 +52,18 @@ does not by itself certify a physical device or distribution channel.
   full-width quotient, signed minimum divided by minus one, signed zero,
   subnormal values, and signaling NaNs retain Swift behavior; undefined
   zero-count builtin forms are rejected rather than guessed.
-- `String` literals, concatenation, interpolation for supported scalar values,
-  Unicode `uppercased`/`lowercased` transforms, count/empty checks, comparisons,
-  and common prefix/suffix/contains predicates. Variable-size transforms reserve
-  a proven output bound before allocation and charge only their measured UTF-8
-  result. A one-grapheme `Character` literal is supported for the common
-  `String.contains(Character)` form without exposing Swift's private Character
-  layout.
+- `String`, `Character`, and `Substring` use explicit logical text contracts
+  without importing their private standard-library layouts. A represented
+  `Character` is validated as exactly one extended grapheme cluster at every
+  producer or Shell boundary; `Substring` is normalized to its Character
+  sequence and does not preserve private slice storage or index identity.
+  Supported operations include String/Character literals and equality/
+  ordering, String concatenation, `+=`, String/Character append, scalar and
+  text interpolation, repeating and
+  common String construction, Unicode `uppercased`/`lowercased`, count/empty,
+  prefix/suffix/contains predicates, String/Substring conversion, Character-
+  sequence construction, and String-sequence joining. Variable-size text
+  operations precharge deterministic UTF-8 work and output storage.
 - Tuple, `Void`, and `Optional`, including the ordinary control flow produced by
   `if let`, `guard let`, `??`, and `try?`, including address-based Optional
   projection emitted by semantic Dictionary lookup SIL. Explicit
@@ -167,28 +172,36 @@ does not by itself certify a physical device or distribution channel.
   represented element/key/value types. Array, Dictionary, and Set share direct
   `count`, `isEmpty`, and `first` queries; Array additionally supports `last`
   through its represented bidirectional storage, and normalized Array-backed
-  views use the same queries. Fully concrete `map`, `flatMap`,
+  views use the same queries. String has direct `count`/`isEmpty` and enters the
+  same finite Sequence cursor as a verified Character Array for element-based
+  traversal, including `first`/`last`, transforms, relations, and adapters.
+  Fully concrete `map`, `flatMap`,
   `compactMap`, `reduce`, `reduce(into:_:)`, `forEach`, `first(where:)`,
   `contains(where:)`, `allSatisfy`, `count(where:)`, and comparator-driven
   `min(by:)`/`max(by:)` share verified closure traversal across represented
-  Array, Dictionary, and Set values. Dictionary elements use their native
+  String, Array, Dictionary, and Set values. Dictionary elements use their native
   `(key: Key, value: Value)` tuple shape. Container-preserving `filter` is
-  supported for all three containers, and Dictionary additionally supports
-  `mapValues` and `compactMapValues`; their specialized key/value callback ABI
-  is projected from the same tuple traversal. Natural `min()`/`max()`, equality
+  supported for String and all three stored containers, and Dictionary
+  additionally supports `mapValues` and `compactMapValues`; their specialized
+  key/value callback ABI is projected from the same tuple traversal. Natural
+  `min()`/`max()`, equality
   `contains(_:)`, and `elementsEqual`/`starts(with:)`/
   `lexicographicallyPrecedes` also accept represented managed Collections and
   supported finite progressions when the required VM-defined Comparable or
   Equatable semantics exist; the two relation operands may use different
-  source kinds when their element shapes match. These element-only consumers
-  stream the shared cursor and do not materialize an intermediate Array.
-  Array-only reverse
-  `last(where:)`, zero-based `firstIndex(where:)`/`lastIndex(where:)`,
-  `prefix(while:)`, Collection `drop(while:)`, mutating `sort(by:)`,
+  source kinds when their element shapes match. Managed Collection and
+  progression consumers stream the shared cursor without an intermediate
+  Array; String performs one validated Character-Array materialization before
+  entering that same cursor.
+  Reverse `last(where:)` accepts String and Array-backed sources. String and
+  Array-backed sources support Collection `prefix(while:)`/`drop(while:)`;
+  direct Sequence `prefix(while:)` also accepts represented finite
+  specializations, including supported progressions. Zero-based
+  `firstIndex(where:)`/`lastIndex(where:)`, mutating `sort(by:)`,
   zero-based `reverse()`, `removeAll(where:)`, and zero-based `partition(by:)`
   retain their existing constraints. Producing
   variants use one linear invocation-local element buffer followed by a typed
-  Array, Dictionary, or Set finalizer instead of repeated copy-on-write edits.
+  String, Array, Dictionary, or Set finalizer instead of repeated copy-on-write edits.
   The `last` searches invoke their predicates from the end; comparator selection
   preserves Swift's argument order and first-element tie behavior. Comparator
   sorting uses a bounded stable merge-state machine. Partition uses Swift's
@@ -217,23 +230,25 @@ does not by itself certify a physical device or distribution channel.
   Collection boundaries/subsequences, and unbounded partial ranges remain
   rejected until their direction, index identity, complexity, or termination
   can be represented exactly.
-  Array-backed Collection `split` supports both the
+  Array-backed Collection and String `split` support both the
   `separator:maxSplits:omittingEmptySubsequences:` overload for recursively
   VM-defined Equatable elements and the throwing `whereSeparator:` overload
   for any represented copyable element. Both use one kind-checked linear range
   state: omitted empty segments do not consume `maxSplits`, predicate calls
   stop as soon as the limit is reached, a negative limit traps before any
   callback, and throwing edges destroy all transient ownership. Returned
-  subsequences preserve element order but are normalized to Arrays; their
-  original collection index identity is not retained.
-  Sequence `prefix(while:)` is also supported when its concrete source has an
-  Array-backed normalization. The lazy Sequence `drop(while:)` overload remains
-  rejected: eagerly materializing it would change predicate side-effect timing.
+  subsequences preserve element order but are normalized to Arrays; String
+  subsequences use the represented `Substring` Character Array. Original
+  collection and String index identity is not retained.
+  The lazy Sequence `drop(while:)` overload remains rejected: eagerly
+  materializing it would change predicate side-effect timing.
   `enumerated()`, `Array(sequence)`, heterogeneous `zip`, and `reversed()`
   accept finite progression sources through the same typed builder used by the
   verified managed-Collection materialization path. Managed Array, Set, and
-  Dictionary sources remain supported, and Array-backed adapters additionally
-  support
+  Dictionary sources remain supported. String uses the same materialization
+  boundary for `Array(sequence)`, `reversed`, count-based subsequences, split,
+  transforms, and relations; nested represented Character sequences can be
+  flattened and reconstructed as String. Array-backed adapters additionally support
   `reversed()`, `repeatElement`, `Array(repeating:count:)`, count-based
   `dropFirst`/`dropLast`/`prefix`/`suffix`, concrete Array index
   prefixes/suffixes, `Range<Int>` slicing, `joined()`,
@@ -372,16 +387,22 @@ does not by itself certify a physical device or distribution channel.
   `inout` parameter also remains fail-closed because it requires explicit
   writeback to the caller; ordinary mutable locals and Swift escape boxes use
   the managed-cell path above.
-- General `Character` values/APIs beyond the bounded literal predicate above;
-  progression element types beyond the fixed-width integer and floating
+- `String.Index`, index-based String subscripting or mutation, UTF-8/UTF-16/
+  Unicode-scalar views, locale-sensitive or Foundation text APIs, and
+  Character properties not listed above. These remain fail-closed rather than
+  being approximated through integer offsets or generic NativeImport. Also
+  rejected are progression element types beyond the fixed-width integer and floating
   iteration surface above, exporting a Range/stride value across a Shell or
   NativeImport boundary, and function-local nominal type declarations. Move a
   non-exported patch-local struct or enum to file/module scope in an existing
   watched source file; no Shell rebuild is needed when the resulting
   declaration remains private to the HLBC image.
-- User-defined `Hashable` semantics for Dictionary keys or Set elements, and
-  dynamic Set payloads inside VM-owned `Any`. Typed Set Shell bridges are
-  supported, but the bounded dynamic-Any codec does not guess an element type.
+- User-defined `Hashable` semantics for Dictionary keys or Set elements,
+  dynamic Set payloads inside VM-owned `Any`, and Character/Substring dynamic
+  identities (including nested aggregate occurrences). Character and Substring
+  deliberately share compact physical storage with String and Array<String>;
+  they remain fail-closed in `Any` until it carries a recursive logical type
+  discriminator. Typed Set and text Shell bridges remain supported.
 - Arbitrary new Swift metadata, a patch concrete class identity visible to
   native code, retroactive conformances, or changes to a Shell type's layout,
   superclass, or enum cases. The hosted Objective-C subclass above is a frozen
@@ -418,7 +439,7 @@ machine code.
 | Use a supported local closure or an already indexed same-image helper with an `@escaping` closure parameter | Lowered into the same image; closure return/capture is allowed only inside the pinned VM invocation |
 | Use a fully static read-only KeyPath literal as a transform or direct projection | Stored patch-local struct/class fields, concrete getter chains—including an imported Objective-C property whose generated accessor resolves to an exact NativeImport—and static Optional chain/force/wrap components may compose into a typed zero-capture function; dynamic KeyPath values, captured components such as subscript indices, unproven components, and writable/reference-writable mutation are rejected because KeyPath objects are not HLBC runtime values |
 | Use integer `Range`/`ClosedRange` iteration, numeric `stride`, or scalar `contains` | Supported for the concrete local families above; bounds, direction, inclusive/exclusive endpoints, zero-stride traps, and integer extrema retain their verified Swift semantics. Progression values remain image-local and cannot cross Shell/NativeImport boundaries |
-| Use a one-grapheme Character literal in supported `String.contains` | Supported as a compiler-only String representation; general Character storage/API is not implied |
+| Use `String`, `Character`, or `Substring` in supported text/Sequence APIs | Supported through validated grapheme and normalized Character-sequence representations, including Shell bridge round trips; `String.Index`, index-sensitive mutation, UTF views, and unlisted Character/Foundation APIs remain rejected |
 | Declare a patch-local struct or enum | A newly introduced non-exported type is supported at file/module scope, including namespace nesting and supported computed accessors; a function-local nominal is rejected with an exact type diagnostic |
 | Declare a pure patch-local class | A final, nongeneric type used only inside one image supports reference identity, stored properties, private/ordinary methods, and computed accessors; it cannot cross into native code |
 | Declare a hosted class inheriting a project or system type | The superclass must be frozen as `NSObject`-compatible reference TypeOps; the current profile supports inherited no-argument initialization, no new stored properties, and no-argument/Bool `Void` overrides, and projects the instance to native code as its superclass |

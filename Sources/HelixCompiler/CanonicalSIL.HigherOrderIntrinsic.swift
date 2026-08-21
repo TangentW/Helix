@@ -6,6 +6,9 @@ enum HigherOrderIntrinsic: Equatable {
         case array
         case set
         case dictionary
+        /// RangeReplaceableCollection.filter returns Self. The concrete
+        /// representation decides how the shared element builder is finalized.
+        case rangeReplaceableCollection
     }
 
     case map

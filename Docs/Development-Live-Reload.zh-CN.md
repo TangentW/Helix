@@ -76,6 +76,8 @@ iOS 进程不会接收或执行 Swift 编译器、linker、JIT、dylib 或源文
 
 Swift 泛型集合方法并不是安全的 NativeImport 捷径。它的物理 ABI 可能携带具体类型 metadata、protocol witness table、随 specialization 改变的 ownership、间接结果和私有 reabstraction 细节；closure 与集合值也不使用 HLVM 的 Runtime 表示。这些属于具体 toolchain 合同，并非稳定 Shell capability。因此 NativeImport 只承载精确生成的 Bridge 或稳定的 C/Objective-C 形状原生操作；受支持 Swift Sequence API 则由 frontend 识别，再降低到少量强类型 cursor、builder、mutation 与普通 closure 调用。
 
+文本遵循同一分层，不会得到按 API 罗列的 import 表。Compiler 在逻辑上区分 String 与“恰好一个扩展字素簇”的 Character 合同，即使两者都使用紧凑 HLBC String value；Substring 则归一为 Character Array。`string_characters` 与两种经过验证的 `string_join` 是仅有的表示边界，count、遍历、变换、split、subsequence、关系与 joining 随后复用现有有限 Sequence plan。Character/Substring Shell codec 会重新验证被擦除的 invariant。`String.Index`、UTF view 与 Foundation 文本行为会继续 fail closed，直到各自语义被显式表示。
+
 一次保存可以在现有源码文件中新增可达的普通顶层 helper、class private 实例方法或计算 accessor，也可以新增只被该调用图使用、且不导出原生 ABI 的文件/module scope struct/enum/pure class。编译器会沿当前 module 的直接调用图递归收集，为函数和完整限定 nominal 分配 image-local ID，逐一验证具体签名、ownership convention 与值形状，再与变化的 Shell root 一起下发闭合图。pure class 的引用 identity 与字段 storage 由 HLVM 持有，并不是动态注册的 Swift metadata。
 
 作为函数值使用的完全静态只读 `KeyPath` 字面量属于编译期 descriptor，不会成为新的 HLBC Runtime value。Helix 会验证编译器生成的 `swift_getAtKeyPath` thunk 及其 ownership skeleton，证明精确的 stored-property/getter 链，再把它替换为强类型、零捕获的投影函数。该路径覆盖可组合的 patch-local struct/class 字段，以及已经能通过普通同 image/NativeImport 调用表解析的具体计算属性或 SDK getter；同一投影 CFG 还会表达静态 Optional chain、force 与末尾 wrap，并保留 payload ownership 和 nil trap。动态 KeyPath 参数、带 subscript index 等 capture 或无法证明的 component，以及 writable/reference-writable mutation 都会 fail closed；artifact 中不会出现 KeyPath metadata 对象。
@@ -154,9 +156,11 @@ struct ProfileScreen: View {
 
 `count(where:)` 复用上述来源无关的 cursor 与普通 throwing closure CFG，并以 checked `Int` accumulator 计数，不需要结果 builder。容量变更提示可用，但读取物理 `Array.capacity` 与调用 `randomElement()` 会明确拒绝，因为对应的存储和随机性 policy 尚未进入表示层。
 
+String 在一次受验证的 Character Array 物化后也复用这套 closure CFG；保留容器的 `filter` 会通过通用 builder 收尾为 String。String 与 Array-backed 来源支持 Collection `prefix/drop(while:)` 和反向 `last(where:)`，而 Sequence `prefix(while:)` 的直接 Array 结果形式还接受受支持有限 progression；可变排序仍只属于 Array。
+
 可表示的 managed Collection 与有限具体 progression 共用一种强类型 Sequence 策略。等值 `contains(_:)`、自然极值与跨来源关系直接驱动 cursor，因此短路与首个 tie 不需要中间 Array；`enumerated`、`Array(sequence)`、异构 `zip`、自然/comparator `sorted` 与 `Set(sequence)` 只有在结果需要完整存储时才复用统一 builder。稳定的 comparator `sorted(by:)` 可接受 Array、Set、Dictionary 与受支持有限 progression element；自然 `sorted()` 可接受 element 为 VM-comparable 标量的这些来源。可变 `sort()`/`sort(by:)` 仍只支持 Array，并继续只在 normal continuation 写回。
 
-managed Array、Dictionary、Set 共用直接的 `count`、`isEmpty`、`first` 查询；具有已表示双向存储的 Array 另支持 `last`，已经归一的 Array-backed view 使用同一套查询语义。
+managed Array、Dictionary、Set 共用直接的 `count`、`isEmpty`、`first` 查询；具有已表示双向存储的 Array 另支持 `last`，已经归一的 Array-backed view 使用同一套查询语义。String 的 `count`/`isEmpty` 直接执行，`first`/`last` 则通过其经过验证的 Character Array 进入相同边界语义。
 
 有限整数 Range 与受支持数值 stride 也会进入同一套正向 closure 遍历，用于产生 Array 的变换、归约、访问、短路 predicate 与 comparator selection。等值 membership、自然极值与混合来源 Sequence 关系同样直接流式驱动这些仅存在于 Compiler 的强类型 bounds/stride 值；排序、Set 构造/代数、`Array(sequence)`、`enumerated`、`reversed` 与 `zip` 只有在结果需要完整存储或随机访问表示时才复用强类型 Array builder。无界 partial range、progression index 结果、index-sensitive Collection 操作和反向 predicate 遍历会明确 fail closed，不会猜测语义。
 

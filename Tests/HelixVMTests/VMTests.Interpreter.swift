@@ -511,6 +511,277 @@ struct Interpreter {
         )
     }
 
+    @Test("Text representation primitives preserve graphemes and validate Character arrays")
+    func textRepresentationSemantics() throws {
+        let strings = Bytecode.ValueType.array(.string)
+        let resultType = Bytecode.ValueType.tuple([.string, .string])
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "textRepresentation",
+            parameterRegisters: [
+                .init(rawValue: 0), .init(rawValue: 1), .init(rawValue: 2),
+            ],
+            resultType: resultType,
+            registerTypes: [
+                .string, strings, .string, strings, .string, .string,
+                resultType,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                        .init(rawValue: 2),
+                    ],
+                    instructions: [
+                        .stringCharacters(
+                            result: .init(rawValue: 3),
+                            string: .init(rawValue: 0)
+                        ),
+                        .stringJoin(
+                            result: .init(rawValue: 4),
+                            elements: .init(rawValue: 3),
+                            separator: nil,
+                            elementKind: .character
+                        ),
+                        .stringJoin(
+                            result: .init(rawValue: 5),
+                            elements: .init(rawValue: 1),
+                            separator: .init(rawValue: 2),
+                            elementKind: .string
+                        ),
+                        .makeTuple(
+                            result: .init(rawValue: 6),
+                            elements: [
+                                .init(rawValue: 4), .init(rawValue: 5),
+                            ]
+                        ),
+                        .returnValue(.init(rawValue: 6)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .collectionsV1, .stringsV1],
+            signature: .init(
+                parameters: [
+                    "Swift.String", "Swift.Array<Swift.String>",
+                    "Swift.String",
+                ],
+                result: "(Swift.String, Swift.String)"
+            ),
+            parameterTypes: [.string, strings, .string],
+            resultType: resultType
+        )
+        let value = "e\u{301}👨‍👩‍👧‍👦🇨🇳"
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    .string(value),
+                    .array(
+                        [.string("alpha"), .string("β"), .string("🧬")],
+                        elementType: .string
+                    ),
+                    .string("|"),
+                ]
+            ) == .returned(.tuple([
+                .string(value), .string("alpha|β|🧬"),
+            ]))
+        )
+
+        let invalidCharacterFunction = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "joinCharacters",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .string,
+            registerTypes: [strings, .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .stringJoin(
+                            result: .init(rawValue: 1),
+                            elements: .init(rawValue: 0),
+                            separator: nil,
+                            elementKind: .character
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let invalidCharacterImage = try makeVerified(
+            function: invalidCharacterFunction,
+            capabilities: [.baselineV1, .collectionsV1, .stringsV1],
+            signature: .init(
+                parameters: ["Swift.Array<Swift.String>"],
+                result: "Swift.String"
+            ),
+            parameterTypes: [strings],
+            resultType: .string
+        )
+        for malformed in ["", "not a Character"] {
+            #expect(
+                VM.Interpreter().invoke(
+                    entry: .init(rawValue: 0),
+                    image: invalidCharacterImage,
+                    arguments: [
+                        .array([.string(malformed)], elementType: .string),
+                    ]
+                ) == .trapped(.explicit(
+                    "Character sequence contains a value that is not one extended grapheme cluster"
+                ))
+            )
+        }
+    }
+
+    @Test("String Character materialization is fuel-bounded inside one instruction")
+    func stringCharacterMaterializationConsumesFuel() throws {
+        let resultType = Bytecode.ValueType.array(.string)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "stringCharacters",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: resultType,
+            registerTypes: [.string, resultType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .stringCharacters(
+                            result: .init(rawValue: 1),
+                            string: .init(rawValue: 0)
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            limits: .init(
+                instructionFuelPerEntry: 400,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            ),
+            capabilities: [.baselineV1, .collectionsV1, .stringsV1],
+            signature: .init(
+                parameters: ["Swift.String"],
+                result: "Swift.Array<Swift.String>"
+            ),
+            parameterTypes: [.string],
+            resultType: resultType
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.string(String(repeating: "a", count: 4_096))]
+            ) == .trapped(.instructionFuelExhausted)
+        )
+    }
+
+    @Test("String joining reserves its exact output before allocation")
+    func stringJoiningConsumesHeapBudget() throws {
+        let strings = Bytecode.ValueType.array(.string)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "stringJoin",
+            parameterRegisters: [.init(rawValue: 0), .init(rawValue: 1)],
+            resultType: .string,
+            registerTypes: [strings, .string, .string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0), .init(rawValue: 1)],
+                    instructions: [
+                        .stringJoin(
+                            result: .init(rawValue: 2),
+                            elements: .init(rawValue: 0),
+                            separator: .init(rawValue: 1),
+                            elementKind: .string
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let components = ["a", "β", "🧬"]
+        let separator = "|"
+        let joined = components.joined(separator: separator)
+        let input = VM.Value.array(
+            components.map(VM.Value.string),
+            elementType: .string
+        )
+        let frameBytes = UInt64(
+            function.registerTypes.count * MemoryLayout<VM.Value?>.stride
+        )
+        let aggregateBytes = UInt64((components.count + 1) * 16)
+        let inputBytes = UInt64(
+            components.reduce(0) { $0 + $1.utf8.count }
+                + separator.utf8.count
+        )
+        let outputBytes = UInt64(joined.utf8.count)
+        let exactBudget = frameBytes + aggregateBytes + inputBytes + outputBytes
+
+        func image(
+            maximumHeapBytes: UInt64,
+            fuel: UInt64 = 1_000_000
+        ) throws -> Verification.Image {
+            try makeVerified(
+                function: function,
+                limits: .init(
+                    instructionFuelPerEntry: fuel,
+                    maxVMHeapBytes: maximumHeapBytes,
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                capabilities: [.baselineV1, .collectionsV1, .stringsV1],
+                signature: .init(
+                    parameters: ["Swift.Array<Swift.String>", "Swift.String"],
+                    result: "Swift.String"
+                ),
+                parameterTypes: [strings, .string],
+                resultType: .string
+            )
+        }
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: exactBudget - 1),
+                arguments: [input, .string(separator)]
+            ) == .trapped(.vmHeapLimitExceeded)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: exactBudget),
+                arguments: [input, .string(separator)]
+            ) == .returned(.string(joined))
+        )
+
+        let emptyComponents = VM.Value.array(
+            Array(repeating: .string(""), count: 128),
+            elementType: .string
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: try image(maximumHeapBytes: 100_000, fuel: 64),
+                arguments: [emptyComponents, .string("")]
+            ) == .trapped(.instructionFuelExhausted)
+        )
+    }
+
     @Test("Substring work arithmetic is total at Int limits")
     func substringWorkArithmeticDoesNotOverflow() throws {
         let budget = VM.InvocationBudget(

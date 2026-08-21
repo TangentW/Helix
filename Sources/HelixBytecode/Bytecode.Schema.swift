@@ -295,6 +295,14 @@ public enum StringTransformOperation: String, Codable, Hashable, Sendable {
     case lowercase
 }
 
+/// Selects the logical element contract when a represented Array of VM strings
+/// is folded back into a Swift String. `character` validates the one-grapheme
+/// invariant that is erased by the compact HLBC representation.
+public enum StringJoinElementKind: String, Codable, Hashable, Sendable {
+    case character
+    case string
+}
+
 public enum ArrayBoundaryOperation: String, Codable, Hashable, Sendable {
     case first
     case last
@@ -607,6 +615,20 @@ public enum Instruction: Codable, Hashable, Sendable {
         result: Bytecode.Register,
         operation: Bytecode.StringTransformOperation,
         string: Bytecode.Register
+    )
+    /// Materializes a String's extended-grapheme Collection view as the common
+    /// represented Array form used by finite Sequence lowering.
+    case stringCharacters(
+        result: Bytecode.Register,
+        string: Bytecode.Register
+    )
+    /// Folds represented String or Character elements without depending on the
+    /// Swift standard library's generic Collection ABI.
+    case stringJoin(
+        result: Bytecode.Register,
+        elements: Bytecode.Register,
+        separator: Bytecode.Register?,
+        elementKind: Bytecode.StringJoinElementKind
     )
     case stringify(result: Bytecode.Register, value: Bytecode.Register)
     case makeArray(result: Bytecode.Register, elements: [Bytecode.Register])
@@ -1036,6 +1058,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .stringIsEmpty(result, _),
              let .stringPredicate(result, _, _, _),
              let .stringTransform(result, _, _),
+             let .stringCharacters(result, _),
+             let .stringJoin(result, _, _, _),
              let .stringify(result, _),
              let .makeArray(result, _),
              let .arrayCount(result, _),
@@ -1213,6 +1237,10 @@ public enum Instruction: Codable, Hashable, Sendable {
             [string, pattern]
         case let .stringTransform(_, _, string):
             [string]
+        case let .stringCharacters(_, string):
+            [string]
+        case let .stringJoin(_, elements, separator, _):
+            [elements] + (separator.map { [$0] } ?? [])
         case let .stringify(_, value):
             [value]
         case let .makeArray(_, elements):

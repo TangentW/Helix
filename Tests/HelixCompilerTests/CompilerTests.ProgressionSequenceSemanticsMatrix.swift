@@ -229,6 +229,16 @@ struct ProgressionSequenceSemanticsMatrix {
                 )
             ),
             Probe(
+                name: "stridePrefixWhile",
+                source: """
+                public func stridePrefixWhile(_ end: Int) -> [Int] {
+                    stride(from: 0, to: end, by: 2).prefix { $0 < 5 }
+                }
+                """,
+                arguments: [try integer(10)],
+                expected: try integers([0, 2, 4])
+            ),
+            Probe(
                 name: "throwingRangeMap",
                 source: """
                 private enum RangeStop: Error { case stop }
@@ -390,7 +400,7 @@ struct ProgressionSequenceSemanticsMatrix {
                 (0..<upper).last { $0.isMultiple(of: 2) }
             }
             """,
-            diagnostic: "reverse higher-order traversal requires a represented Array"
+            diagnostic: "reverse higher-order traversal requires Array-backed normalization"
         )
         expectUnsupported(
             name: "unboundedRangeArray",

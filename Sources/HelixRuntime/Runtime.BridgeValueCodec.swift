@@ -109,6 +109,61 @@ public enum BridgeValueCodec {
         return result
     }
 
+    /// Encodes a Character through the compact one-grapheme String
+    /// representation used by HLBC text algorithms.
+    public static func encode(_ value: Character) throws -> VM.Value {
+        .string(String(value))
+    }
+
+    /// Decodes a represented Character and revalidates its erased grapheme
+    /// invariant at the Shell boundary.
+    public static func decode(
+        _ value: VM.Value,
+        as type: Character.Type
+    ) throws -> Character {
+        guard case let .string(result) = value else {
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: .string,
+                actual: value.type
+            )
+        }
+        guard result.count == 1, let character = result.first else {
+            throw VM.RuntimeTrap.explicit(
+                "represented Character must contain exactly one extended grapheme cluster"
+            )
+        }
+        return character
+    }
+
+    /// Substring crosses a Shell boundary as its normalized Character sequence;
+    /// private slice storage and index identity never enter HLBC.
+    public static func encode(_ value: Substring) throws -> VM.Value {
+        .array(
+            value.map { .string(String($0)) },
+            elementType: .string
+        )
+    }
+
+    public static func decode(
+        _ value: VM.Value,
+        as type: Substring.Type
+    ) throws -> Substring {
+        guard case let .array(elements, elementType) = value,
+              elementType == .string
+        else {
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: .array(.string),
+                actual: value.type
+            )
+        }
+        var result = String()
+        for element in elements {
+            let character = try decode(element, as: Character.self)
+            result.append(character)
+        }
+        return Substring(result)
+    }
+
     /// Encodes an array with a compiler-supplied element codec and VM element type.
     public static func encodeArray<Element>(
         _ value: [Element],

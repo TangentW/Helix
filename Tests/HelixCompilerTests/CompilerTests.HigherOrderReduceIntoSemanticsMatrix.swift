@@ -1,3 +1,4 @@
+import HelixBytecode
 import HelixVM
 import Testing
 @testable import HelixCompiler
@@ -200,6 +201,48 @@ struct HigherOrderReduceIntoSemanticsMatrix {
                 ]
             ),
         ])
+    }
+
+    @Test("Never-specialized rethrows storage stays compiler-only beside inout")
+    func keepsUninhabitedErrorDestinationsVirtual() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            public func mixedInoutAndRethrows(
+                _ values: [Int]
+            ) -> (Int, Int?) {
+                let total = values.reduce(into: 0) { $0 += $1 }
+                let positive = values.count { $0 > 0 }
+                let successor = values.min().map { $0 + 1 }
+                return (total + positive, successor)
+            }
+            """,
+            functionName: "mixedInoutAndRethrows",
+            moduleName: "HelixReduceIntoNeverStorage"
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [try integers([-2, 3, 4])]
+            ) == .returned(.tuple([
+                try integer(7), .optional(try integer(-1)),
+            ]))
+        )
+        let disassembly = Bytecode.Disassembler.disassemble(
+            fixture.image.module
+        )
+        #expect(
+            !fixture.image.module.functions.flatMap(\.registerTypes).contains {
+                $0 == .address(.never)
+            }
+        )
+        #expect(
+            !fixture.image.module.functions.flatMap(\.stackSlotTypes).contains(
+                .never
+            )
+        )
+        #expect(!disassembly.contains("@address<Never>"))
     }
 
     private func run(_ probes: [Probe]) throws {

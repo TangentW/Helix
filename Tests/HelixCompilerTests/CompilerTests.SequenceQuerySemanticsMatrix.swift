@@ -621,7 +621,7 @@ struct SequenceQuerySemanticsMatrix {
                 Values(value: 0).count { $0 > 1 }
             }
             """,
-            diagnostic: "represented managed Collection or supported finite progression"
+            diagnostic: "represented String/Collection storage"
         )
         expectUnsupported(
             name: "arrayCapacity",
@@ -630,7 +630,7 @@ struct SequenceQuerySemanticsMatrix {
                 values.capacity
             }
             """,
-            diagnostic: "unsupported SIL type"
+            diagnostic: "is not frozen in the target HLXI"
         )
         expectUnsupported(
             name: "randomElement",
@@ -639,7 +639,7 @@ struct SequenceQuerySemanticsMatrix {
                 values.randomElement()
             }
             """,
-            diagnostic: "unsupported SIL type"
+            diagnostic: "is not frozen in the target HLXI"
         )
     }
 

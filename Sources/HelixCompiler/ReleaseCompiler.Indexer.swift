@@ -244,6 +244,8 @@ public struct Indexer: Sendable {
         // Advertising VM-only capabilities up front does not widen native ABI.
         capabilities.formUnion([
             .baselineV1,
+            .stringsV1,
+            .collectionsV1,
             .localNominalsV1,
             .structuredErrorsV1,
             .addressValuesV1,
@@ -263,30 +265,6 @@ public struct Indexer: Sendable {
         }
         if imports.contains(where: \.isEmittedToDevice) { capabilities.insert(.nativeImportsV1) }
         if request.nativeTypes.contains(where: \.isEmittedToDevice) { capabilities.insert(.nativeTypesV1) }
-        if records.contains(where: { record in
-            record.parameterTypes.contains(where: containsString)
-                || containsString(record.resultType)
-                || record.effects.mayThrow
-        }) || imports.contains(where: { item in
-            item.isEmittedToDevice && (
-                item.parameterTypes.contains(where: containsString)
-                    || containsString(item.resultType)
-                    || item.effects.mayThrow
-            )
-        }) {
-            capabilities.insert(.stringsV1)
-        }
-        if records.contains(where: { record in
-            record.parameterTypes.contains(where: containsCollection)
-                || containsCollection(record.resultType)
-        }) || imports.contains(where: { item in
-            item.isEmittedToDevice && (
-                item.parameterTypes.contains(where: containsCollection)
-                    || containsCollection(item.resultType)
-            )
-        }) {
-            capabilities.insert(.collectionsV1)
-        }
         if records.contains(where: { $0.effects.mayThrow })
             || imports.contains(where: { $0.isEmittedToDevice && $0.effects.mayThrow }) {
             capabilities.insert(.untypedThrowsV1)
@@ -447,20 +425,6 @@ public struct Indexer: Sendable {
         }
     }
 
-    private func containsString(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .string: true
-        case let .tuple(elements): elements.contains(where: containsString)
-        case let .optional(wrapped): containsString(wrapped)
-        case let .array(element): containsString(element)
-        case let .set(element): containsString(element)
-        case let .dictionary(key, value): containsString(key) || containsString(value)
-        case let .closure(signature):
-            (signature.parameters + [signature.result]).contains(where: containsString)
-        default: false
-        }
-    }
-
     private func containsClosure(_ type: Bytecode.ValueType) -> Bool {
         switch type {
         case .closure:
@@ -477,14 +441,6 @@ public struct Indexer: Sendable {
         }
     }
 
-    private func containsCollection(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .array, .dictionary, .set: true
-        case let .tuple(elements): elements.contains(where: containsCollection)
-        case let .optional(wrapped): containsCollection(wrapped)
-        default: false
-        }
-    }
 }
 
 public enum IndexError: Error, Equatable, Sendable, CustomStringConvertible {

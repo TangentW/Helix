@@ -9,7 +9,7 @@ share compiler facts and identity contracts; they do not share a delivery
 channel.
 
 This document describes the implementation available in the repository as of
-August 20, 2026. It does not turn unfinished qualification work into a product
+August 21, 2026. It does not turn unfinished qualification work into a product
 claim.
 
 ## The two workflows
@@ -54,6 +54,11 @@ Both workflows depend on stable, build-specific identities:
   edit from an ABI, layout, source-membership, or dependency change.
 - Toolchain, SDK, target triple, compiler arguments, module source set, and
   binary identity bind every artifact to the Shell for which it was built.
+- Version 1 Shells advertise pure-VM String and Collection capabilities even
+  when an eligible entry's frozen native signature does not mention those
+  types, so a later body-only patch can use represented local text and
+  collections. Native types and imports remain limited to the exact generated
+  Shell surface.
 - Verified debug metadata maps HLBC function/block/instruction coordinates to
   logical Swift file, line, and column. Production artifacts redact build-host
   absolute paths; traps add the exact VM program counter and pinned generation.
@@ -164,6 +169,20 @@ Both workflows depend on stable, build-specific identities:
   sequence semantics are normalized; an ArraySlice's non-zero-based index
   identity is not erased into an Array index, so unsupported slice-index APIs
   still fail closed.
+- Swift text has a logical contract separate from its compact HLBC storage.
+  String and Character both occupy the verifier's String value type, but every
+  Character producer and Shell codec proves exactly one extended grapheme
+  cluster. Substring occupies `Array<String>` whose elements carry that
+  Character invariant; private slice storage and String indices never enter an
+  artifact. Two representation primitives form the boundary:
+  `string_characters` segments a String into the normalized Character Array,
+  while `string_join.character` revalidates and reconstructs text and
+  `string_join.string` joins logical String elements with an optional separator.
+  String's direct `count`/`isEmpty` remain allocation-free; element-oriented
+  finite Sequence operations materialize once and then reuse the same cursor,
+  builder, split, subsequence, relation, and closure control flow as other
+  represented Collections. UTF views, `String.Index`, and index-sensitive
+  mutation remain outside this representation and fail closed.
 - Finite integer `Range`/`ClosedRange` and supported numeric `StrideTo`/
   `StrideThrough` values form a second, compiler-only concrete Sequence
   specialization. They retain typed bounds and stride registers rather than a
@@ -231,8 +250,9 @@ Both workflows depend on stable, build-specific identities:
   type-checked collection cursor: forward cursors hold the next element offset,
   Dictionary produces its `(Key, Value)` element tuple, and Set produces its
   element directly. Array additionally supports a reverse cursor whose value is
-  an exclusive upper bound. Its finite-progression arm drives the existing
-  Optional-valued progression cursor from typed start/end/stride registers.
+  an exclusive upper bound. The String specialization first enters this arm
+  through its verified Character Array. The finite-progression arm drives the
+  existing Optional-valued progression cursor from typed start/end/stride registers.
   Both arms therefore feed the same closure CFG without importing a Swift
   iterator or witness-table ABI. The Verifier rejects unsupported reverse or
   unordered traversal, and the VM rejects corrupt cursor state instead of
@@ -246,8 +266,8 @@ Both workflows depend on stable, build-specific identities:
   candidate and challenger are closed on a throwing edge.
 - Common fully concrete Sequence transformations compose that source-neutral
   cursor with the ordinary closure ABI instead of importing Swift generic
-  collection methods. Represented Array/Dictionary/Set and finite progression
-  sources therefore share the same map/filter/reduction/predicate/comparator
+  collection methods. Represented String/Array/Dictionary/Set and finite
+  progression sources therefore share the same map/filter/reduction/predicate/comparator
   control flow, short-circuiting, throwing edges, and ownership cleanup.
   `count(where:)` is another source-neutral cursor consumer: its predicate is
   an ordinary closure CFG edge and its `Int` accumulator uses checked
@@ -265,6 +285,9 @@ Both workflows depend on stable, build-specific identities:
   frame-owned slot, opens a narrow modify scope for each callback, and closes
   that scope on both normal and throwing edges before returning or destroying
   the accumulator. No accumulator type receives a special lowering path.
+  Indirect `$Never` destinations retained by nonthrowing typed-rethrows SIL
+  remain compiler-only control-flow metadata; they never become VM slots or
+  addresses when the surrounding function also needs runtime `inout` storage.
 - A closure signature carries an ownership convention for every invocation
   parameter, including an address type paired with `inout`. The compiler
   preserves concrete Swift `@in_guaranteed` inputs as borrowed VM values,

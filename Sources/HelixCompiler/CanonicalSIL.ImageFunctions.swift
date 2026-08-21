@@ -243,6 +243,14 @@ enum ImageFunctions {
         return ReleaseCompiler.ImplementationFingerprint
             .referencedSymbols(in: executableBody).sorted().compactMap { symbol in
                 let usages = usageBySymbol[symbol, default: []]
+                // A directly applied semantic intrinsic is a terminal compiler
+                // edge. A reference converted into a closure still needs a
+                // callable body and must never be silently discarded.
+                if CanonicalSIL.SwiftCoreIntrinsic(mangledName: symbol) != nil,
+                   usages.contains(.directCall),
+                   !usages.contains(.closureConstruction) {
+                    return nil
+                }
                 let fallback = kindForSymbol(symbol)
                     ?? file.function(mangledName: symbol).flatMap {
                         !usages.isEmpty

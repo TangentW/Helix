@@ -231,6 +231,11 @@ public struct Lowerer: Sendable {
         var someCaseIsExplicit: Bool
     }
 
+    private enum SequenceBuilderOutput {
+        case representedCollection
+        case stringCharacters
+    }
+
     private struct SequenceHigherOrderPlan {
         var operation: CanonicalSIL.HigherOrderIntrinsic
         var sourceToken: String
@@ -244,6 +249,7 @@ public struct Lowerer: Sendable {
         var callResultType: Bytecode.ValueType
         var callbackShape: SequenceCallbackShape = .element
         var consumesSource = false
+        var builderOutput: SequenceBuilderOutput = .representedCollection
     }
 
     private enum SequenceCursor {
@@ -309,6 +315,7 @@ public struct Lowerer: Sendable {
 
     private struct ArraySplitPlan {
         var sourceToken: String
+        var source: CanonicalSIL.SequenceSpecialization
         var decisionToken: String
         var maximumSplitsToken: String
         var omittingEmptySubsequencesToken: String
@@ -555,7 +562,7 @@ public struct Lowerer: Sendable {
                 instruction,
                 pattern: #"^%[0-9]+ = init_existential_addr %[0-9]+, \$(.+)$"#
             ) else { continue }
-            let concreteType = try parseType(projection[0])
+            let concreteType = try parseDynamicAnyType(projection[0])
             guard concreteType.isAnyPayloadOrExistentialV1 else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
                     "Any payload \(concreteType)"
@@ -3677,12 +3684,12 @@ public struct Lowerer: Sendable {
                 )
             }
             let arrayType = Bytecode.ValueType.array(plan.elementType)
-            let borrowedSource = try borrowStoredValue(
-                at: plan.sourceToken,
+            let materialized = try materializeSequenceOperand(
+                plan.source,
+                token: plan.sourceToken,
+                context: "split(separator:) source",
                 line: line
             )
-            let source = try borrowedSource?.register
-                ?? resolve(plan.sourceToken, line: line)
             let borrowedSeparator = try borrowStoredValue(
                 at: plan.decisionToken,
                 line: line
@@ -3697,7 +3704,7 @@ public struct Lowerer: Sendable {
                 plan.omittingEmptySubsequencesToken,
                 line: line
             )
-            guard registerTypes[Int(source.rawValue)] == arrayType,
+            guard registerTypes[Int(materialized.array.rawValue)] == arrayType,
                   registerTypes[Int(separator.rawValue)] == plan.elementType,
                   registerTypes[Int(maximumSplits.rawValue)] == .int64,
                   registerTypes[Int(omittingEmptySubsequences.rawValue)] == .bool
@@ -3710,16 +3717,16 @@ public struct Lowerer: Sendable {
             appendInstruction(
                 .arraySplitSeparator(
                     result: result,
-                    array: source,
+                    array: materialized.array,
                     separator: separator,
                     maxSplits: maximumSplits,
                     omittingEmptySubsequences: omittingEmptySubsequences
                 )
             )
-            for owner in [
-                borrowedSeparator?.temporaryOwner,
-                borrowedSource?.temporaryOwner,
-            ].compactMap({ $0 }) {
+            for instruction in materialized.cleanup {
+                appendInstruction(instruction)
+            }
+            if let owner = borrowedSeparator?.temporaryOwner {
                 appendInstruction(.destroyValue(owner))
             }
             values[resultToken] = result
@@ -4769,12 +4776,12 @@ public struct Lowerer: Sendable {
                 line: line
             )
             let arrayType = Bytecode.ValueType.array(plan.elementType)
-            let borrowedSource = try borrowStoredValue(
-                at: plan.sourceToken,
+            let materialized = try materializeSequenceOperand(
+                plan.source,
+                token: plan.sourceToken,
+                context: "split(whereSeparator:) source",
                 line: line
             )
-            let source = try borrowedSource?.register
-                ?? resolve(plan.sourceToken, line: line)
             let maximumSplits = try resolve(
                 plan.maximumSplitsToken,
                 line: line
@@ -4784,7 +4791,7 @@ public struct Lowerer: Sendable {
                 line: line
             )
             let closure = try resolve(plan.decisionToken, line: line)
-            guard registerTypes[Int(source.rawValue)] == arrayType,
+            guard registerTypes[Int(materialized.array.rawValue)] == arrayType,
                   registerTypes[Int(maximumSplits.rawValue)] == .int64,
                   registerTypes[Int(omittingEmptySubsequences.rawValue)] == .bool,
                   case let .closure(signature) = registerTypes[
@@ -4821,13 +4828,13 @@ public struct Lowerer: Sendable {
             appendInstruction(
                 .makeArraySplitState(
                     result: state,
-                    array: source,
+                    array: materialized.array,
                     maxSplits: maximumSplits,
                     omittingEmptySubsequences: omittingEmptySubsequences
                 )
             )
-            if let owner = borrowedSource?.temporaryOwner {
-                appendInstruction(.destroyValue(owner))
+            for instruction in materialized.cleanup {
+                appendInstruction(instruction)
             }
             appendInstruction(.branch(target: loop, arguments: []))
             finishCurrent()
@@ -5689,15 +5696,27 @@ public struct Lowerer: Sendable {
 
             let builder: Bytecode.Register?
             if plan.operation.usesElementBuilder {
-                let element: Bytecode.ValueType = switch plan.callResultType {
-                case let .array(element), let .set(element):
-                    element
-                case let .dictionary(key, value):
-                    .tuple([key, value])
-                default:
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "higher-order builder has an unsupported result container"
-                    )
+                let element: Bytecode.ValueType
+                switch plan.builderOutput {
+                case .representedCollection:
+                    switch plan.callResultType {
+                    case let .array(resultElement),
+                         let .set(resultElement):
+                        element = resultElement
+                    case let .dictionary(key, value):
+                        element = .tuple([key, value])
+                    default:
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "higher-order builder has an unsupported result container"
+                        )
+                    }
+                case .stringCharacters:
+                    guard plan.callResultType == .string else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "text builder result must use represented String storage"
+                        )
+                    }
+                    element = .string
                 }
                 let register = try allocate(
                     type: .arrayState(kind: .builder, element: element)
@@ -5713,6 +5732,30 @@ public struct Lowerer: Sendable {
                 result: Bytecode.Register,
                 instructions: [IntermediateRepresentation.Instruction]
             ) {
+                switch plan.builderOutput {
+                case .stringCharacters:
+                    let characters = try allocate(type: .array(.string))
+                    let result = try allocate(type: .string)
+                    return (
+                        result,
+                        [
+                            .finishArrayBuilder(
+                                result: characters,
+                                builder: builder
+                            ),
+                            .stringJoin(
+                                result: result,
+                                elements: characters,
+                                separator: nil,
+                                elementKind: .character
+                            ),
+                        ]
+                    )
+
+                case .representedCollection:
+                    break
+                }
+
                 let result = try allocate(type: plan.callResultType)
                 switch plan.callResultType {
                 case .array:
@@ -7920,34 +7963,22 @@ public struct Lowerer: Sendable {
             direction: Bytecode.CollectionTraversalDirection,
             line: Int
         ) throws -> PreparedSequenceTraversal {
-            switch specialization {
-            case let .managedCollection(sourceType, element):
-                guard sourceType.managedCollectionElement == element else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "managed Sequence specialization has inconsistent Element"
-                    )
-                }
-                let borrowedSource: BorrowedStoredValue?
-                let source: Bytecode.Register
-                if consumesSource {
-                    borrowedSource = nil
-                    source = try materializeOwnedValue(at: token, line: line)
-                } else {
-                    borrowedSource = try borrowStoredValue(at: token, line: line)
-                    source = try borrowedSource?.register
-                        ?? resolve(token, line: line)
-                }
+            func makeCollectionCursor(
+                source: Bytecode.Register,
+                sourceType: Bytecode.ValueType,
+                cleanup: [IntermediateRepresentation.Instruction]
+            ) throws -> PreparedSequenceTraversal {
                 guard registerTypes[Int(source.rawValue)] == sourceType else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Sequence source does not match its specialization"
                     )
                 }
-                if direction == .reverse {
-                    guard case .array = sourceType else {
-                        throw CanonicalSIL.LoweringError.unsupportedType(
-                            "reverse traversal requires a represented Array"
-                        )
-                    }
+                if direction == .reverse, case .array = sourceType {
+                    // Array-backed normalization preserves bidirectional order.
+                } else if direction == .reverse {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "reverse traversal requires represented bidirectional storage"
+                    )
                 }
                 let initialIndex = try allocate(type: .int64)
                 if direction == .reverse {
@@ -7967,6 +7998,50 @@ public struct Lowerer: Sendable {
                         mode: .initialize
                     )
                 )
+                return .init(
+                    cursor: .managedCollection(
+                        collection: source,
+                        indexSlot: indexSlot
+                    ),
+                    cleanup: cleanup
+                )
+            }
+
+            switch specialization {
+            case .stringCharacters:
+                guard !consumesSource else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "consuming String traversal is not required by the current frontend ABI"
+                    )
+                }
+                let materialized = try materializeSequenceOperand(
+                    specialization,
+                    token: token,
+                    context: "String traversal",
+                    line: line
+                )
+                return try makeCollectionCursor(
+                    source: materialized.array,
+                    sourceType: .array(.string),
+                    cleanup: materialized.cleanup
+                )
+
+            case let .managedCollection(sourceType, element):
+                guard sourceType.managedCollectionElement == element else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "managed Sequence specialization has inconsistent Element"
+                    )
+                }
+                let borrowedSource: BorrowedStoredValue?
+                let source: Bytecode.Register
+                if consumesSource {
+                    borrowedSource = nil
+                    source = try materializeOwnedValue(at: token, line: line)
+                } else {
+                    borrowedSource = try borrowStoredValue(at: token, line: line)
+                    source = try borrowedSource?.register
+                        ?? resolve(token, line: line)
+                }
                 let cleanup: [IntermediateRepresentation.Instruction]
                 if consumesSource, sourceType.requiresLinearOwnership {
                     cleanup = [.destroyValue(source)]
@@ -7975,11 +8050,9 @@ public struct Lowerer: Sendable {
                         [.destroyValue($0)]
                     } ?? []
                 }
-                return .init(
-                    cursor: .managedCollection(
-                        collection: source,
-                        indexSlot: indexSlot
-                    ),
+                return try makeCollectionCursor(
+                    source: source,
+                    sourceType: sourceType,
                     cleanup: cleanup
                 )
 
@@ -8221,7 +8294,7 @@ public struct Lowerer: Sendable {
             return result
         }
 
-        func borrowManagedCollectionSource(
+        func borrowRepresentedSequenceSource(
             type: Bytecode.ValueType,
             token: String,
             operation: String,
@@ -8248,8 +8321,24 @@ public struct Lowerer: Sendable {
             line: Int
         ) throws -> Bytecode.Register {
             switch specialization {
+            case .stringCharacters:
+                let borrowed = try borrowRepresentedSequenceSource(
+                    type: .string,
+                    token: sourceToken,
+                    operation: "String.count",
+                    line: line
+                )
+                let result = try allocate(type: .int64)
+                appendInstruction(
+                    .stringCount(result: result, string: borrowed.register)
+                )
+                if let owner = borrowed.temporaryOwner {
+                    appendInstruction(.destroyValue(owner))
+                }
+                return result
+
             case let .managedCollection(type, _):
-                let borrowed = try borrowManagedCollectionSource(
+                let borrowed = try borrowRepresentedSequenceSource(
                     type: type,
                     token: sourceToken,
                     operation: "Collection.count",
@@ -8298,8 +8387,24 @@ public struct Lowerer: Sendable {
             line: Int
         ) throws -> Bytecode.Register {
             switch specialization {
+            case .stringCharacters:
+                let borrowed = try borrowRepresentedSequenceSource(
+                    type: .string,
+                    token: sourceToken,
+                    operation: "String.isEmpty",
+                    line: line
+                )
+                let result = try allocate(type: .bool)
+                appendInstruction(
+                    .stringIsEmpty(result: result, string: borrowed.register)
+                )
+                if let owner = borrowed.temporaryOwner {
+                    appendInstruction(.destroyValue(owner))
+                }
+                return result
+
             case let .managedCollection(type, _):
-                let borrowed = try borrowManagedCollectionSource(
+                let borrowed = try borrowRepresentedSequenceSource(
                     type: type,
                     token: sourceToken,
                     operation: "Collection.isEmpty",
@@ -8395,13 +8500,34 @@ public struct Lowerer: Sendable {
             line: Int
         ) throws -> Bytecode.Register {
             switch specialization {
+            case .stringCharacters:
+                let traversal = try prepareSequenceTraversal(
+                    specialization,
+                    token: sourceToken,
+                    consumesSource: false,
+                    direction: .reverse,
+                    line: line
+                )
+                let result = try allocate(type: .optional(.string))
+                appendInstruction(
+                    try sequenceNextInstruction(
+                        cursor: traversal.cursor,
+                        result: result,
+                        direction: .reverse
+                    )
+                )
+                for instruction in traversalCleanup(traversal) {
+                    appendInstruction(instruction)
+                }
+                return result
+
             case let .managedCollection(type, element):
                 guard case .array = type else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
                         "Collection.last requires represented bidirectional storage"
                     )
                 }
-                let borrowed = try borrowManagedCollectionSource(
+                let borrowed = try borrowRepresentedSequenceSource(
                     type: type,
                     token: sourceToken,
                     operation: "Collection.last",
@@ -8598,6 +8724,29 @@ public struct Lowerer: Sendable {
             cleanup: [IntermediateRepresentation.Instruction]
         ) {
             switch specialization {
+            case .stringCharacters:
+                if let storageType = stackType(at: token),
+                   storageType != .string {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "\(context) String storage does not match its Sequence specialization"
+                    )
+                }
+                let borrowed = try borrowStoredValue(at: token, line: line)
+                let source = try borrowed?.register ?? resolve(token, line: line)
+                guard registerTypes[Int(source.rawValue)] == .string else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "\(context) String value does not match its Sequence specialization"
+                    )
+                }
+                let characters = try allocate(type: .array(.string))
+                appendInstruction(
+                    .stringCharacters(result: characters, string: source)
+                )
+                return (
+                    characters,
+                    borrowed?.temporaryOwner.map { [.destroyValue($0)] } ?? []
+                )
+
             case let .managedCollection(sourceType, element):
                 guard sourceType.managedCollectionElement == element else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -8648,6 +8797,34 @@ public struct Lowerer: Sendable {
                         ? [.destroyValue(array)] : []
                 )
             }
+        }
+
+        func lowerStringJoin(
+            elements: Bytecode.Register,
+            separator: Bytecode.Register?,
+            elementKind: Bytecode.StringJoinElementKind,
+            context: String
+        ) throws -> Bytecode.Register {
+            guard registerTypes[Int(elements.rawValue)] == .array(.string),
+                  separator.map({
+                      registerTypes[Int($0.rawValue)] == .string
+                  }) ?? true,
+                  elementKind != .character || separator == nil
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) does not match its represented text elements"
+                )
+            }
+            let result = try allocate(type: .string)
+            appendInstruction(
+                .stringJoin(
+                    result: result,
+                    elements: elements,
+                    separator: separator,
+                    elementKind: elementKind
+                )
+            )
+            return result
         }
 
         /// Executes equality membership through the shared cursor so a finite
@@ -10837,6 +11014,23 @@ public struct Lowerer: Sendable {
                     )
                 }
                 switch sourceSpecialization {
+                case .stringCharacters:
+                    guard stackType(at: arguments[0]) == .string else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array sequence initializer String storage does not match"
+                        )
+                    }
+                    let materialized = try materializeSequenceOperand(
+                        sourceSpecialization,
+                        token: arguments[0],
+                        context: "Array sequence initializer",
+                        line: line
+                    )
+                    values[resultToken] = materialized.array
+                    for instruction in materialized.cleanup {
+                        appendInstruction(instruction)
+                    }
+
                 case let .managedCollection(sourceType, _):
                     guard stackType(at: arguments[0]) == sourceType else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -10929,7 +11123,11 @@ public struct Lowerer: Sendable {
                         "collection subsequence has unsupported arguments"
                     )
                 }
-                let collection = try parseType(genericArguments)
+                let source = try parseSequenceSpecialization(
+                    genericArguments,
+                    context: "collection subsequence"
+                )
+                let resultType = Bytecode.ValueType.array(source.element)
                 let normalizedSpelling = genericArguments
                     .trimmingCharacters(in: .whitespaces)
                     .trimmingPrefix("$")
@@ -10939,31 +11137,36 @@ public struct Lowerer: Sendable {
                 case .prefixUpTo, .prefixThrough, .suffixFrom: true
                 case .dropFirst, .dropLast, .prefix, .suffix: false
                 }
-                guard case .array = collection,
-                      !usesConcreteIndex || isConcreteArray,
-                      compilerAddressType(arguments[0]) == collection,
-                      stackType(at: arguments[2]) == collection
+                guard source.normalizedCollectionType == resultType,
+                      !usesConcreteIndex || (
+                          isConcreteArray
+                            && source.managedCollectionType == resultType
+                      ),
+                      compilerAddressType(arguments[0]) == resultType
                 else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
                         "collection subsequence specialization \(genericArguments)"
                     )
                 }
                 let bound = try trivialOperand(arguments[1], as: .int64)
-                let source = try borrowOperand(
-                    arguments[2],
-                    as: collection,
-                    context: "collection subsequence"
+                let materialized = try materializeSequenceOperand(
+                    source,
+                    token: arguments[2],
+                    context: "collection subsequence",
+                    line: line
                 )
-                let result = try allocate(type: collection)
+                let result = try allocate(type: resultType)
                 appendInstruction(
                     .arraySubsequence(
                         result: result,
                         operation: operation,
-                        array: source.register,
+                        array: materialized.array,
                         bound: bound
                     )
                 )
-                destroyBorrowedOwners([source])
+                for instruction in materialized.cleanup {
+                    appendInstruction(instruction)
+                }
                 try storeConstructedValue(
                     result,
                     at: arguments[0],
@@ -12720,13 +12923,13 @@ public struct Lowerer: Sendable {
                 unreachableTrapReasons[blockID] = trapReason(for: message)
                 voidValues.insert(resultToken)
 
-            case .stringLiteral, .characterLiteral:
+            case let .text(.literal(kind)):
                 guard genericArguments.isEmpty else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "String or Character literal initializer unexpectedly has generic arguments"
                     )
                 }
-                let expectedMetatypes = intrinsic == .stringLiteral
+                let expectedMetatypes = kind == .string
                     ? metatypeValues
                     : characterMetatypeValues
                 guard arguments.count == 4,
@@ -12743,7 +12946,7 @@ public struct Lowerer: Sendable {
                 let actualASCII = literal.utf8.allSatisfy { $0 < 0x80 }
                 guard actualByteCount == expectedByteCount,
                       actualASCII == expectedASCII,
-                      intrinsic != .characterLiteral || literal.count == 1
+                      kind != .character || literal.count == 1
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "String or Character literal metadata does not match its payload"
@@ -12753,13 +12956,17 @@ public struct Lowerer: Sendable {
                 values[resultToken] = result
                 appendInstruction(.constantString(result: result, value: literal))
 
-            case .stringEqual, .stringLess:
+            case let .text(.comparison(comparison)):
                 guard genericArguments.isEmpty else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "String comparison unexpectedly has generic arguments"
                     )
                 }
-                guard arguments.count == 3, metatypeValues.contains(arguments[2]) else {
+                let expectedMetatypes = comparison.operandKind == .character
+                    ? characterMetatypeValues : metatypeValues
+                guard arguments.count == 3,
+                      expectedMetatypes.contains(arguments[2])
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "String comparison has unsupported arguments"
                     )
@@ -12778,13 +12985,14 @@ public struct Lowerer: Sendable {
                 appendInstruction(
                     .compare(
                         result: result,
-                        predicate: intrinsic == .stringEqual ? .equal : .lessThan,
+                        predicate: comparison.operation == .equal
+                            ? .equal : .lessThan,
                         lhs: lhs,
                         rhs: rhs
                     )
                 )
 
-            case .stringConcat:
+            case .text(.concatenation):
                 guard genericArguments.isEmpty else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "String concatenation unexpectedly has generic arguments"
@@ -12808,7 +13016,7 @@ public struct Lowerer: Sendable {
                 values[resultToken] = result
                 appendInstruction(.stringConcat(result: result, lhs: lhs, rhs: rhs))
 
-            case .stringAppend:
+            case .text(.mutation(.addAssign)):
                 guard genericArguments.isEmpty,
                       arguments.count == 3,
                       metatypeValues.contains(arguments[2]),
@@ -12841,33 +13049,280 @@ public struct Lowerer: Sendable {
                 )
                 voidValues.insert(resultToken)
 
-            case .stringCount, .stringIsEmpty:
-                guard genericArguments.isEmpty else {
+            case .text(.mutation(.append)):
+                guard genericArguments.isEmpty,
+                      arguments.count == 2,
+                      compilerAddressType(arguments[1]) == .string,
+                      let lhs = try copyStoredValue(
+                          at: arguments[1],
+                          line: line
+                      )
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "String property getter unexpectedly has generic arguments"
+                        "String.append has unsupported arguments"
                     )
                 }
-                guard arguments.count == 1 else {
+                let borrowedRHS = try borrowStoredValue(
+                    at: arguments[0],
+                    line: line
+                )
+                let rhs = try borrowedRHS?.register
+                    ?? resolve(arguments[0], line: line)
+                guard registerTypes[Int(lhs.rawValue)] == .string,
+                      registerTypes[Int(rhs.rawValue)] == .string
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "String property getter has unsupported arguments"
+                        "String.append operands must use represented text values"
                     )
                 }
-                let operand = try resolve(arguments[0], line: line)
-                guard registerTypes[Int(operand.rawValue)] == .string else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "String property getter operand must be String"
-                    )
-                }
-                let resultType: Bytecode.ValueType = intrinsic == .stringCount ? .int64 : .bool
-                let result = try allocate(type: resultType)
-                values[resultToken] = result
+                let result = try allocate(type: .string)
                 appendInstruction(
-                    intrinsic == .stringCount
-                        ? .stringCount(result: result, string: operand)
-                        : .stringIsEmpty(result: result, string: operand)
+                    .stringConcat(result: result, lhs: lhs, rhs: rhs)
+                )
+                if let owner = borrowedRHS?.temporaryOwner {
+                    appendInstruction(.destroyValue(owner))
+                }
+                try storeConstructedValue(
+                    result,
+                    at: arguments[1],
+                    mode: .assign
+                )
+                voidValues.insert(resultToken)
+
+            case .text(.construction(.repeating)):
+                guard genericArguments.isEmpty,
+                      arguments.count == 3,
+                      metatypeValues.contains(arguments[2])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String(repeating:count:) has unsupported arguments"
+                    )
+                }
+                let value = try materializeOwnedValue(
+                    at: arguments[0],
+                    line: line
+                )
+                let count = try copyStoredValue(
+                    at: arguments[1],
+                    line: line
+                ) ?? resolve(arguments[1], line: line)
+                guard registerTypes[Int(value.rawValue)] == .string,
+                      registerTypes[Int(count.rawValue)] == .int64
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String repetition operands do not match String and Int"
+                    )
+                }
+                let repeated = try allocate(type: .array(.string))
+                appendInstruction(
+                    .arrayRepeat(
+                        result: repeated,
+                        value: value,
+                        count: count
+                    )
+                )
+                values[resultToken] = try lowerStringJoin(
+                    elements: repeated,
+                    separator: nil,
+                    elementKind: .string,
+                    context: "String repetition"
                 )
 
-            case let .stringTransform(operation):
+            case .text(.construction(.losslessDescription)),
+                 .text(.construction(.customDescription)):
+                let usesCustomDescription = intrinsic
+                    == .text(.construction(.customDescription))
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard specializations.count == 1,
+                      arguments.count == 2,
+                      metatypeValues.contains(arguments[1])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String scalar description has unsupported arguments"
+                    )
+                }
+                let logicalKind = CanonicalSIL.TextRepresentation.kind(
+                    of: specializations[0]
+                )
+                let type = try parseStoredType(specializations[0])
+                let value = try materializeOwnedValue(
+                    at: arguments[0],
+                    line: line
+                )
+                guard registerTypes[Int(value.rawValue)] == type else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String scalar description does not match its specialization"
+                    )
+                }
+                if usesCustomDescription,
+                   logicalKind == .substring {
+                    values[resultToken] = try lowerStringJoin(
+                        elements: value,
+                        separator: nil,
+                        elementKind: .character,
+                        context: "Substring description"
+                    )
+                } else {
+                    switch type {
+                    case .bool, .integer, .float, .string:
+                        let result = try allocate(type: .string)
+                        appendInstruction(
+                            .stringify(result: result, value: value)
+                        )
+                        values[resultToken] = result
+                    default:
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "String description payload \(specializations[0])"
+                        )
+                    }
+                }
+
+            case .text(.construction(.fromCharacter)):
+                guard genericArguments.isEmpty,
+                      arguments.count == 2,
+                      metatypeValues.contains(arguments[1])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String(Character) has unsupported arguments"
+                    )
+                }
+                let character = try materializeOwnedValue(
+                    at: arguments[0],
+                    line: line
+                )
+                guard registerTypes[Int(character.rawValue)] == .string else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String(Character) source is not a represented Character"
+                    )
+                }
+                let result = try allocate(type: .string)
+                appendInstruction(
+                    .copyValue(result: result, source: character)
+                )
+                values[resultToken] = result
+
+            case .text(.construction(.fromSubstring)):
+                guard genericArguments.isEmpty,
+                      arguments.count == 2,
+                      metatypeValues.contains(arguments[1])
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String(Substring) has unsupported arguments"
+                    )
+                }
+                let borrowed = try borrowStoredValue(
+                    at: arguments[0],
+                    line: line
+                )
+                let substring = try borrowed?.register
+                    ?? resolve(arguments[0], line: line)
+                values[resultToken] = try lowerStringJoin(
+                    elements: substring,
+                    separator: nil,
+                    elementKind: .character,
+                    context: "String(Substring)"
+                )
+                if let owner = borrowed?.temporaryOwner {
+                    appendInstruction(.destroyValue(owner))
+                }
+
+            case .text(.construction(.fromCharacterSequence)):
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard specializations.count == 1,
+                      arguments.count == 2,
+                      metatypeValues.contains(arguments[1]),
+                      CanonicalSIL.TextRepresentation.sequenceElementKind(
+                          of: specializations[0]
+                      ) == .character
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String Character-sequence initializer has unsupported specializations"
+                    )
+                }
+                let source = try parseSequenceSpecialization(
+                    specializations[0],
+                    context: "String Character-sequence initializer"
+                )
+                let materialized = try materializeSequenceOperand(
+                    source,
+                    token: arguments[0],
+                    context: "String Character-sequence initializer",
+                    line: line
+                )
+                values[resultToken] = try lowerStringJoin(
+                    elements: materialized.array,
+                    separator: nil,
+                    elementKind: .character,
+                    context: "String Character-sequence initializer"
+                )
+                for instruction in materialized.cleanup {
+                    appendInstruction(instruction)
+                }
+
+            case .text(.joinStringCollection):
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard specializations.count == 1,
+                      arguments.count == 2,
+                      CanonicalSIL.TextRepresentation.sequenceElementKind(
+                          of: specializations[0]
+                      ) == .string
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String collection joining has unsupported specializations"
+                    )
+                }
+                let source = try parseSequenceSpecialization(
+                    specializations[0],
+                    context: "String collection joining"
+                )
+                let materialized = try materializeSequenceOperand(
+                    source,
+                    token: arguments[1],
+                    context: "String collection joining",
+                    line: line
+                )
+                let borrowedSeparator = try borrowStoredValue(
+                    at: arguments[0],
+                    line: line
+                )
+                let separator = try borrowedSeparator?.register
+                    ?? resolve(arguments[0], line: line)
+                values[resultToken] = try lowerStringJoin(
+                    elements: materialized.array,
+                    separator: separator,
+                    elementKind: .string,
+                    context: "String collection joining"
+                )
+                for instruction in materialized.cleanup {
+                    appendInstruction(instruction)
+                }
+                if let owner = borrowedSeparator?.temporaryOwner {
+                    appendInstruction(.destroyValue(owner))
+                }
+
+            case .text(.joinDefaultSeparator):
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard arguments.isEmpty,
+                      specializations.count == 1,
+                      CanonicalSIL.TextRepresentation.sequenceElementKind(
+                          of: specializations[0]
+                      ) == .string
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String collection joining default has unsupported specializations"
+                    )
+                }
+                let result = try allocate(type: .string)
+                appendInstruction(
+                    .constantString(result: result, value: "")
+                )
+                values[resultToken] = result
+
+            case let .text(.transform(operation)):
                 guard genericArguments.isEmpty, arguments.count == 1 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "String transform has unsupported arguments"
@@ -12889,7 +13344,10 @@ public struct Lowerer: Sendable {
                     )
                 )
 
-            case .stringHasPrefix, .stringHasSuffix:
+            case .text(.predicate(.hasPrefix)),
+                 .text(.predicate(.hasSuffix)):
+                let operation: Bytecode.StringPredicateOperation = intrinsic
+                    == .text(.predicate(.hasPrefix)) ? .hasPrefix : .hasSuffix
                 guard genericArguments.isEmpty, arguments.count == 2 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "String prefix/suffix predicate has unsupported arguments"
@@ -12909,13 +13367,13 @@ public struct Lowerer: Sendable {
                 appendInstruction(
                     .stringPredicate(
                         result: result,
-                        operation: intrinsic == .stringHasPrefix ? .hasPrefix : .hasSuffix,
+                        operation: operation,
                         string: string,
                         pattern: pattern
                     )
                 )
 
-            case .stringContains:
+            case .text(.predicate(.contains)):
                 guard arguments.count == 2,
                       try parseType(genericArguments) == .string
                 else {
@@ -12946,7 +13404,7 @@ public struct Lowerer: Sendable {
                     )
                 )
 
-            case .stringInterpolationInit:
+            case .text(.interpolation(.initialize)):
                 guard genericArguments.isEmpty,
                       arguments.count == 3,
                       stringInterpolationMetatypes.contains(arguments[2])
@@ -12970,7 +13428,7 @@ public struct Lowerer: Sendable {
                 )
                 stringInterpolationValues[resultToken] = accumulator
 
-            case .stringInterpolationAppendLiteral:
+            case .text(.interpolation(.appendLiteral)):
                 guard genericArguments.isEmpty,
                       arguments.count == 2,
                       let accumulator = stringInterpolationAddressValues[
@@ -12994,7 +13452,7 @@ public struct Lowerer: Sendable {
                 stringInterpolationAddressValues[addressBase(arguments[1])] = result
                 voidValues.insert(resultToken)
 
-            case .stringInterpolationAppendValue:
+            case .text(.interpolation(.appendValue)):
                 guard arguments.count == 2,
                       !genericArguments.isEmpty,
                       let accumulator = stringInterpolationAddressValues[
@@ -13023,18 +13481,29 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let rendered: Bytecode.Register
-                switch valueType {
-                case .string:
-                    rendered = value
-                case .bool, .integer, .float:
-                    rendered = try allocate(type: .string)
-                    appendInstruction(
-                        .stringify(result: rendered, value: value)
+                if CanonicalSIL.TextRepresentation.kind(
+                    of: genericArguments
+                ) == .substring {
+                    rendered = try lowerStringJoin(
+                        elements: value,
+                        separator: nil,
+                        elementKind: .character,
+                        context: "Substring interpolation"
                     )
-                default:
-                    throw CanonicalSIL.LoweringError.unsupportedType(
-                        "String interpolation payload \(valueType)"
-                    )
+                } else {
+                    switch valueType {
+                    case .string:
+                        rendered = value
+                    case .bool, .integer, .float:
+                        rendered = try allocate(type: .string)
+                        appendInstruction(
+                            .stringify(result: rendered, value: value)
+                        )
+                    default:
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "String interpolation payload \(valueType)"
+                        )
+                    }
                 }
                 let result = try allocate(type: .string)
                 appendInstruction(
@@ -13043,7 +13512,7 @@ public struct Lowerer: Sendable {
                 stringInterpolationAddressValues[addressBase(arguments[1])] = result
                 voidValues.insert(resultToken)
 
-            case .stringFromInterpolation:
+            case .text(.interpolation(.finalize)):
                 guard genericArguments.isEmpty,
                       arguments.count == 2,
                       metatypeValues.contains(arguments[1]),
@@ -15058,6 +15527,22 @@ public struct Lowerer: Sendable {
                 }
                 let type = try parseStoredType(stack[1])
                 stackAddressTypes[stack[0]] = type
+                if type == .never {
+                    guard mutableCapturePointees[stack[0]] == nil,
+                          !storageInitializationPlan.runtimeStorageRoots.contains(
+                            stack[0]
+                          )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Never storage cannot have a runtime lifetime"
+                        )
+                    }
+                    // Typed-rethrows calls retain an indirect `$Never` error
+                    // destination even when their error edge is statically
+                    // impossible. It is compiler-only control-flow metadata:
+                    // no Never value or address may enter HLBC.
+                    continue
+                }
                 if let capturedType = mutableCapturePointees[stack[0]] {
                     guard capturedType == type else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -16942,7 +17427,7 @@ public struct Lowerer: Sendable {
                     hostedAllocatorReferences[reference[0]] = superclass.typeID
                     continue
                 }
-                if let allocatorType = try hostedAllocatorType(
+                if let allocatorType = hostedAllocatorType(
                     loweredType: reference[2]
                 ) {
                     hostedAllocatorReferences[reference[0]] = allocatorType
@@ -19091,7 +19576,7 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = init_existential_addr (%[0-9]+), \$(.+)$"#
             ) {
-                let concreteType = try parseType(projection[2])
+                let concreteType = try parseDynamicAnyType(projection[2])
                 guard compilerAddressType(projection[1]) == .any,
                       concreteType.isAnyPayloadOrExistentialV1,
                       existentialProjections[projection[0]] == nil
@@ -19818,7 +20303,7 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^checked_cast_addr_br (?:take_always|copy_on_success) Any in (%[0-9]+) to (.+) in (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
             ) {
-                let targetType = try parseType(cast[1])
+                let targetType = try parseDynamicAnyType(cast[1])
                 guard stackType(at: cast[0]) == .any,
                       let source = try copyStoredValue(
                         at: cast[0],
@@ -19860,7 +20345,7 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^unconditional_checked_cast_addr Any in (%[0-9]+) to (.+) in (%[0-9]+)$"#
             ) {
-                let targetType = try parseType(cast[1])
+                let targetType = try parseDynamicAnyType(cast[1])
                 guard stackType(at: cast[0]) == .any,
                       let source = try copyStoredValue(
                         at: cast[0],
@@ -21304,9 +21789,10 @@ public struct Lowerer: Sendable {
 
     private func hostedAllocatorType(
         loweredType: String
-    ) throws -> Core.TypeID? {
-        guard loweredType.contains("@convention(method)") else { return nil }
-        let signature = try parseFunctionType(loweredType)
+    ) -> Core.TypeID? {
+        guard loweredType.contains("@convention(method)"),
+              let signature = try? parseFunctionType(loweredType)
+        else { return nil }
         guard signature.parameters.isEmpty,
               signature.result != .void,
               !signature.effects.mayThrow,
@@ -21536,6 +22022,19 @@ public struct Lowerer: Sendable {
 
     private func parseType(_ raw: String) throws -> Bytecode.ValueType {
         try typeEnvironment.resolve(raw)
+    }
+
+    private func parseDynamicAnyType(
+        _ raw: String
+    ) throws -> Bytecode.ValueType {
+        guard !CanonicalSIL.TextRepresentation
+            .containsAnyErasedIdentity(in: raw)
+        else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "VM-owned Any cannot preserve Character/Substring identity in \(raw)"
+            )
+        }
+        return try parseType(raw)
     }
 
     private func parseStoredType(
@@ -22011,22 +22510,30 @@ public struct Lowerer: Sendable {
         argumentText: String,
         line: Int
     ) throws -> ArraySplitPlan {
-        let genericTypes = try splitTopLevel(genericArguments)
+        let genericSpellings = splitTopLevel(genericArguments)
             .filter { !$0.isEmpty }
-            .map(parseType)
         let arguments = try parseApplyValueTokens(argumentText, line: line)
-        guard genericTypes.count == 1,
-              case let .array(element) = genericTypes[0],
-              arguments.count == 4
+        guard genericSpellings.count == 1, arguments.count == 4
         else {
             throw CanonicalSIL.LoweringError.unsupportedType(
-                "split requires a represented Array-backed Collection"
+                "split requires one concrete Collection specialization"
+            )
+        }
+        let source = try parseSequenceSpecialization(
+            genericSpellings[0],
+            context: "Collection.split"
+        )
+        let element = source.element
+        guard source.normalizedCollectionType == .array(element) else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "split requires represented text or Array-backed Collection storage"
             )
         }
         switch operation {
         case .separator:
             return .init(
                 sourceToken: arguments[3],
+                source: source,
                 decisionToken: arguments[0],
                 maximumSplitsToken: arguments[1],
                 omittingEmptySubsequencesToken: arguments[2],
@@ -22035,6 +22542,7 @@ public struct Lowerer: Sendable {
         case .predicate:
             return .init(
                 sourceToken: arguments[3],
+                source: source,
                 decisionToken: arguments[2],
                 maximumSplitsToken: arguments[0],
                 omittingEmptySubsequencesToken: arguments[1],
@@ -22117,6 +22625,9 @@ public struct Lowerer: Sendable {
         _ raw: String,
         context: String
     ) throws -> CanonicalSIL.SequenceSpecialization {
+        if CanonicalSIL.TextRepresentation.kind(of: raw) == .string {
+            return .stringCharacters
+        }
         if let progression = try CanonicalSIL.Progression.sequenceType(
             raw,
             resolve: { try parseStoredType($0) }
@@ -22129,8 +22640,8 @@ public struct Lowerer: Sendable {
             return .progression(progression)
         }
         let unsupportedSource = CanonicalSIL.LoweringError.unsupportedType(
-            "\(context) requires a represented managed Collection or "
-                + "supported finite progression, got \(raw)"
+            "\(context) requires represented String/Collection storage or "
+                + "a supported finite progression, got \(raw)"
         )
         let type: Bytecode.ValueType
         do {
@@ -22163,6 +22674,14 @@ public struct Lowerer: Sendable {
                 spellings[0],
                 context: context
             )
+
+        case .stringCharacters:
+            guard spellings.isEmpty else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "String query unexpectedly has generic specializations"
+                )
+            }
+            return .stringCharacters
 
         case .arrayBackedElement:
             guard spellings.count == 1 else {
@@ -22412,14 +22931,11 @@ public struct Lowerer: Sendable {
                 callResultType: .array(mapped)
             )
         case let .filter(result):
-            guard arguments.count == 2 else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "Collection.filter has an unsupported specialization"
-                )
-            }
             switch result {
             case .array:
-                guard genericSpellings.count == 1 else {
+                guard genericSpellings.count == 1,
+                      arguments.count == 2
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Sequence.filter has an unsupported specialization"
                     )
@@ -22439,7 +22955,9 @@ public struct Lowerer: Sendable {
                 )
 
             case .set:
-                guard genericSpellings.count == 1 else {
+                guard genericSpellings.count == 1,
+                      arguments.count == 2
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Set.filter has an unsupported specialization"
                     )
@@ -22464,7 +22982,9 @@ public struct Lowerer: Sendable {
                 )
 
             case .dictionary:
-                guard genericSpellings.count == 2 else {
+                guard genericSpellings.count == 2,
+                      arguments.count == 2
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Dictionary.filter has an unsupported specialization"
                     )
@@ -22491,6 +23011,52 @@ public struct Lowerer: Sendable {
                     callResultType: sourceType,
                     callbackShape: .dictionaryKeyValue,
                     consumesSource: true
+                )
+
+            case .rangeReplaceableCollection:
+                guard genericSpellings.count == 1,
+                      arguments.count == 3
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "RangeReplaceableCollection.filter has an unsupported specialization"
+                    )
+                }
+                let source = try sequence(0)
+                let resultType = try genericType(0)
+                let builderOutput: SequenceBuilderOutput
+                if CanonicalSIL.TextRepresentation.kind(
+                    of: genericSpellings[0]
+                ) == .string {
+                    guard source == .stringCharacters,
+                          resultType == .string
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "String.filter specialization has inconsistent storage"
+                        )
+                    }
+                    builderOutput = .stringCharacters
+                } else {
+                    guard source.normalizedCollectionType == resultType,
+                          case .array = resultType
+                    else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "RangeReplaceableCollection.filter result \(genericSpellings[0])"
+                        )
+                    }
+                    builderOutput = .representedCollection
+                }
+                return .init(
+                    operation: operation,
+                    sourceToken: arguments[2],
+                    source: source,
+                    closureToken: arguments[1],
+                    initialToken: nil,
+                    resultDestination: arguments[0],
+                    errorDestination: nil,
+                    inputType: source.element,
+                    closureResultType: .bool,
+                    callResultType: resultType,
+                    builderOutput: builderOutput
                 )
             }
         case .compactMap:
@@ -22553,16 +23119,19 @@ public struct Lowerer: Sendable {
                     "prefix/drop(while:) has an unsupported specialization"
                 )
             }
-            let sourceType = try genericType(0)
-            let input = try arrayElement(sourceType)
+            let source = try sequence(0)
+            let input = source.element
             let hasIndirectResult = arguments.count == 3
+            if hasIndirectResult,
+               source.normalizedCollectionType != .array(input) {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "Collection prefix/drop(while:) requires Array-backed normalization"
+                )
+            }
             return .init(
                 operation: operation,
                 sourceToken: arguments[arguments.count - 1],
-                source: .managedCollection(
-                    type: sourceType,
-                    element: input
-                ),
+                source: source,
                 closureToken: arguments[arguments.count - 2],
                 initialToken: nil,
                 resultDestination: hasIndirectResult ? arguments[0] : nil,
@@ -22652,11 +23221,10 @@ public struct Lowerer: Sendable {
             let source = try sequence(0)
             let input = source.element
             if operation.traversalDirection == .reverse {
-                guard let managed = source.managedCollectionType,
-                      case .array = managed
+                guard source.normalizedCollectionType == .array(input)
                 else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
-                        "reverse higher-order traversal requires a represented Array"
+                        "reverse higher-order traversal requires Array-backed normalization"
                     )
                 }
             }
