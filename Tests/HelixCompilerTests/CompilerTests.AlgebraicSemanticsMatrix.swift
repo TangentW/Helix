@@ -1,3 +1,4 @@
+import HelixBytecode
 import HelixVM
 import Testing
 @testable import HelixCompiler
@@ -14,6 +15,8 @@ struct AlgebraicSemanticsMatrix {
         var name: String
         var source: String
         var scenarios: [Scenario]
+        var requiredDisassembly: [String] = []
+        var forbiddenDisassembly: [String] = []
     }
 
     @Test("Optional map and flatMap share selected-case transformation")
@@ -253,6 +256,247 @@ struct AlgebraicSemanticsMatrix {
         ])
     }
 
+    @Test("Result(catching:) builds cases from verified closure continuations")
+    func lowersResultCatching() throws {
+        #expect(
+            CanonicalSIL.SwiftCoreIntrinsic(
+                mangledName:
+                    "$ss6ResultOsRi_zrlE8catchingAByxq_Gxyq_YKXE_tcfC"
+            ) == .algebraic(.resultCatching)
+        )
+        try run([
+            Probe(
+                name: "caughtIntegerResult",
+                source: """
+                enum IntegerCatchingFailure: Error { case rejected(Int) }
+
+                func integerCatchingLeaf(_ value: Int) throws -> Int {
+                    guard value >= 0 else {
+                        throw IntegerCatchingFailure.rejected(value)
+                    }
+                    return value + 10
+                }
+
+                public func caughtIntegerResult(_ value: Int) -> (Int, Bool) {
+                    var calls = 0
+                    let result = Result {
+                        calls += 1
+                        return try integerCatchingLeaf(value)
+                    }
+                    return switch result {
+                    case let .success(output): (output + calls, true)
+                    case .failure: (calls, false)
+                    }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integer(2)],
+                        expected: .returned(
+                            .tuple([try integer(13), .bool(true)])
+                        )
+                    ),
+                    .init(
+                        arguments: [try integer(-2)],
+                        expected: .returned(
+                            .tuple([try integer(1), .bool(false)])
+                        )
+                    ),
+                ],
+                requiredDisassembly: ["closure_try_apply", "make_enum"],
+                forbiddenDisassembly: ["native_apply"]
+            ),
+            Probe(
+                name: "caughtStringResult",
+                source: """
+                enum StringCatchingFailure: Error { case rejected }
+
+                func stringCatchingLeaf(
+                    _ value: String,
+                    _ fails: Bool
+                ) throws -> String {
+                    guard !fails else { throw StringCatchingFailure.rejected }
+                    return value + "!"
+                }
+
+                public func caughtStringResult(
+                    _ value: String,
+                    _ fails: Bool
+                ) -> String {
+                    let result = Result {
+                        try stringCatchingLeaf(value, fails)
+                    }
+                    return switch result {
+                    case let .success(output): output
+                    case .failure: "failed"
+                    }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [.string("ok"), .bool(false)],
+                        expected: .returned(.string("ok!"))
+                    ),
+                    .init(
+                        arguments: [.string("ok"), .bool(true)],
+                        expected: .returned(.string("failed"))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "caughtVoidResult",
+                source: """
+                enum VoidCatchingFailure: Error { case rejected }
+
+                func voidCatchingLeaf(_ fails: Bool) throws {
+                    guard !fails else { throw VoidCatchingFailure.rejected }
+                }
+
+                public func caughtVoidResult(_ fails: Bool) -> Bool {
+                    let result = Result { try voidCatchingLeaf(fails) }
+                    return switch result {
+                    case .success: true
+                    case .failure: false
+                    }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [.bool(false)],
+                        expected: .returned(.bool(true))
+                    ),
+                    .init(
+                        arguments: [.bool(true)],
+                        expected: .returned(.bool(false))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "caughtTupleResult",
+                source: """
+                enum TupleCatchingFailure: Error { case rejected }
+
+                func tupleCatchingLeaf(
+                    _ value: Int,
+                    _ fails: Bool
+                ) throws -> (Int, Bool) {
+                    guard !fails else { throw TupleCatchingFailure.rejected }
+                    return (value + 1, true)
+                }
+
+                public func caughtTupleResult(
+                    _ value: Int,
+                    _ fails: Bool
+                ) -> Int {
+                    let result = Result {
+                        try tupleCatchingLeaf(value, fails)
+                    }
+                    return switch result {
+                    case let .success((output, accepted)):
+                        accepted ? output : -2
+                    case .failure: -1
+                    }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integer(4), .bool(false)],
+                        expected: .returned(try integer(5))
+                    ),
+                    .init(
+                        arguments: [try integer(4), .bool(true)],
+                        expected: .returned(try integer(-1))
+                    ),
+                ]
+            ),
+            Probe(
+                name: "caughtErrorPayload",
+                source: """
+                enum PayloadCatchingFailure: Error { case rejected(Int) }
+
+                func payloadCatchingLeaf(_ value: Int) throws -> Int {
+                    guard value >= 0 else {
+                        throw PayloadCatchingFailure.rejected(-value)
+                    }
+                    return value
+                }
+
+                public func caughtErrorPayload(_ value: Int) -> Int {
+                    let result = Result { try payloadCatchingLeaf(value) }
+                    return switch result {
+                    case let .success(output): output
+                    case let .failure(error as PayloadCatchingFailure):
+                        switch error {
+                        case let .rejected(code): -code
+                        }
+                    case .failure: -999
+                    }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integer(3)],
+                        expected: .returned(try integer(3))
+                    ),
+                    .init(
+                        arguments: [try integer(-4)],
+                        expected: .returned(try integer(-4))
+                    ),
+                ]
+            ),
+        ])
+    }
+
+    @Test("Patch-local aggregates store managed Error existentials generically")
+    func storesErrorExistentialsInLocalAggregates() throws {
+        try run([
+            Probe(
+                name: "localErrorAggregate",
+                source: """
+                enum AggregateFailure: Error { case rejected(Int) }
+
+                struct ErrorEnvelope {
+                    var failure: any Error
+                }
+
+                enum ErrorSlot {
+                    case empty
+                    case wrapped(any Error)
+                }
+
+                public func localErrorAggregate(_ value: Int) -> Int {
+                    let envelope = ErrorEnvelope(
+                        failure: AggregateFailure.rejected(value)
+                    )
+                    let slot: ErrorSlot = value == 0
+                        ? .empty
+                        : .wrapped(envelope.failure)
+                    return switch slot {
+                    case .empty: 0
+                    case let .wrapped(error as AggregateFailure):
+                        switch error {
+                        case let .rejected(code): code + 1
+                        }
+                    case .wrapped: -1
+                    }
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integer(0)],
+                        expected: .returned(try integer(0))
+                    ),
+                    .init(
+                        arguments: [try integer(4)],
+                        expected: .returned(try integer(5))
+                    ),
+                ],
+                requiredDisassembly: ["local_struct", "local_enum", "make_error"],
+                forbiddenDisassembly: ["native_apply"]
+            ),
+        ])
+    }
+
     @Test("Result.get projects success and failure to their exact CFG edges")
     func lowersResultGet() throws {
         try run([
@@ -346,6 +590,21 @@ struct AlgebraicSemanticsMatrix {
                     functionName: probe.name,
                     moduleName: "HelixAlgebraic_\(probe.name)"
                 )
+                let disassembly = Bytecode.Disassembler.disassemble(
+                    fixture.image.module
+                )
+                for required in probe.requiredDisassembly
+                    where !disassembly.contains(required) {
+                    failures.append(
+                        "\(probe.name): missing HLBC instruction \(required)"
+                    )
+                }
+                for forbidden in probe.forbiddenDisassembly
+                    where disassembly.contains(forbidden) {
+                    failures.append(
+                        "\(probe.name): unexpected HLBC instruction \(forbidden)"
+                    )
+                }
                 for (index, scenario) in probe.scenarios.enumerated() {
                     let result = VM.Interpreter().invoke(
                         entry: fixture.entry,

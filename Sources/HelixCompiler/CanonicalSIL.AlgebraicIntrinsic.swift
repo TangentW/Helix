@@ -26,6 +26,9 @@ enum AlgebraicIntrinsic: Equatable {
     /// Result transformations select one payload case and pass the other through.
     case result(case: ResultCase, transformation: Transformation)
 
+    /// Converts a throwing closure's normal/error continuations into Result.
+    case resultCatching
+
     /// Projects `.success` to the normal edge and `.failure` to the error edge.
     case resultGet
 }

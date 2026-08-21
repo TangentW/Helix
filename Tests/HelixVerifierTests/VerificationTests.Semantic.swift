@@ -2236,24 +2236,33 @@ struct SemanticVerifier {
             )
         }
 
-        var existentialMember = fixture.module
-        existentialMember.localTypes[0].kind = .enumeration(
-            cases: [.init(name: "wrapped", payloadType: .error)]
+        let existentialKey = Bytecode.LocalTypeKey(
+            rawValue: "Fixture.ErrorContainer"
         )
-        existentialMember.capabilities.insert(.structuredErrorsV1)
-        fixture.shell.capabilities.insert(.structuredErrorsV1)
-        fixture.policy.acceptedCapabilities.insert(.structuredErrorsV1)
-        #expect(
-            throws: Verification.Error.invalidModule(
-                "HLBC local types cannot contain Error existential values"
+        var existentialMember = fixture.module
+        existentialMember.localTypes.append(
+            .init(
+                key: existentialKey,
+                kind: .enumeration(
+                    cases: [.init(name: "wrapped", payloadType: .error)]
+                )
             )
-        ) {
+        )
+        #expect(throws: Verification.Error.capabilityDenied(.structuredErrorsV1)) {
             try Verification.Engine().verify(
                 bytes: Bytecode.Encoder.encode(existentialMember),
                 shell: fixture.shell,
                 policy: fixture.policy
             )
         }
+        existentialMember.capabilities.insert(.structuredErrorsV1)
+        fixture.shell.capabilities.insert(.structuredErrorsV1)
+        fixture.policy.acceptedCapabilities.insert(.structuredErrorsV1)
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(existentialMember),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
     }
 
     @Test("A nonescaping closure body with copyable captures is accepted")

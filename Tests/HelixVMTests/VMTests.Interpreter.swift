@@ -149,6 +149,231 @@ struct Interpreter {
         )
     }
 
+    @Test("Local enums preserve structured Error existential payloads")
+    func roundTripsErrorStoredInLocalEnum() throws {
+        let errorKey = Bytecode.LocalTypeKey(rawValue: "Fixture.StoredError")
+        let boxKey = Bytecode.LocalTypeKey(rawValue: "Fixture.ErrorBox")
+        let localTypes = [
+            Bytecode.LocalTypeDefinition(
+                key: errorKey,
+                kind: .enumeration(
+                    cases: [.init(name: "rejected", payloadType: .int64)]
+                ),
+                conformsToError: true
+            ),
+            Bytecode.LocalTypeDefinition(
+                key: boxKey,
+                kind: .enumeration(
+                    cases: [.init(name: "wrapped", payloadType: .error)]
+                )
+            ),
+        ]
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "roundTripStoredError",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64,
+                .local(errorKey),
+                .error,
+                .local(boxKey),
+                .error,
+                .optional(.local(errorKey)),
+                .local(errorKey),
+                .int64,
+                .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeEnum(
+                            result: .init(rawValue: 1),
+                            caseIndex: 0,
+                            payload: .init(rawValue: 0)
+                        ),
+                        .makeError(
+                            result: .init(rawValue: 2),
+                            payload: .init(rawValue: 1)
+                        ),
+                        .makeEnum(
+                            result: .init(rawValue: 3),
+                            caseIndex: 0,
+                            payload: .init(rawValue: 2)
+                        ),
+                        .switchEnum(
+                            enumeration: .init(rawValue: 3),
+                            cases: [
+                                .init(caseIndex: 0, target: .init(rawValue: 1)),
+                            ],
+                            defaultTarget: nil
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 4)],
+                    instructions: [
+                        .castError(
+                            result: .init(rawValue: 5),
+                            error: .init(rawValue: 4),
+                            expectedType: errorKey
+                        ),
+                        .switchOptional(
+                            optional: .init(rawValue: 5),
+                            someTarget: .init(rawValue: 2),
+                            noneTarget: .init(rawValue: 3)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 6)],
+                    instructions: [
+                        .switchEnum(
+                            enumeration: .init(rawValue: 6),
+                            cases: [
+                                .init(caseIndex: 0, target: .init(rawValue: 4)),
+                            ],
+                            defaultTarget: nil
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 3),
+                    instructions: [
+                        .constantInteger(
+                            result: .init(rawValue: 8),
+                            bitPattern: UInt64.max
+                        ),
+                        .returnValue(.init(rawValue: 8)),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 4),
+                    parameters: [.init(rawValue: 7)],
+                    instructions: [.returnValue(.init(rawValue: 7))]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [
+                .baselineV1,
+                .localNominalsV1,
+                .structuredErrorsV1,
+            ],
+            localTypes: localTypes
+        )
+        let input = VM.Value.integer(
+            try VM.Integer(signed: 7, bitWidth: 64, isSigned: true)
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [input]
+            ) == .returned(input)
+        )
+    }
+
+    @Test("Dynamic Error recursion remains bounded during VM construction")
+    func rejectsOverdeepRecursiveErrorPayload() throws {
+        let errorKey = Bytecode.LocalTypeKey(rawValue: "Fixture.NestedError")
+        let localTypes = [
+            Bytecode.LocalTypeDefinition(
+                key: errorKey,
+                kind: .enumeration(
+                    cases: [
+                        .init(name: "wrapped", payloadType: .error),
+                        .init(name: "leaf"),
+                    ]
+                ),
+                conformsToError: true
+            ),
+        ]
+        var registerTypes: [Bytecode.ValueType] = [
+            .int64,
+            .local(errorKey),
+            .error,
+        ]
+        var instructions: [Bytecode.Instruction] = [
+            .makeEnum(
+                result: .init(rawValue: 1),
+                caseIndex: 1,
+                payload: nil
+            ),
+            .makeError(
+                result: .init(rawValue: 2),
+                payload: .init(rawValue: 1)
+            ),
+        ]
+        var currentError = Bytecode.Register(rawValue: 2)
+        for _ in 0...VM.ValueLimits.maximumNestingDepth {
+            let payload = Bytecode.Register(
+                rawValue: UInt32(registerTypes.count)
+            )
+            registerTypes.append(.local(errorKey))
+            let error = Bytecode.Register(
+                rawValue: UInt32(registerTypes.count)
+            )
+            registerTypes.append(.error)
+            instructions.append(
+                .makeEnum(
+                    result: payload,
+                    caseIndex: 0,
+                    payload: currentError
+                )
+            )
+            instructions.append(.makeError(result: error, payload: payload))
+            currentError = error
+        }
+        instructions.append(.returnValue(.init(rawValue: 0)))
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "constructNestedError",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: registerTypes,
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: instructions
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [
+                .baselineV1,
+                .localNominalsV1,
+                .structuredErrorsV1,
+            ],
+            localTypes: localTypes
+        )
+        let input = VM.Value.integer(
+            try VM.Integer(signed: 1, bitWidth: 64, isSigned: true)
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [input]
+            ) == .trapped(
+                .valueNestingDepthExceeded(
+                    maximum: VM.ValueLimits.maximumNestingDepth
+                )
+            )
+        )
+    }
+
     @Test("Checked arithmetic and CFG branching produce the patched result")
     func executesCheckedAdd() throws {
         let fixture = try makeVerified(function: addFunction())

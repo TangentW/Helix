@@ -753,8 +753,16 @@ public struct Interpreter: Sendable {
                         message = key.rawValue
                     }
                     try chargeAggregate(elementCount: 1, budget: budget)
+                    let error = VM.Value.error(
+                        .init(concreteType: key, payload: value, message: message)
+                    )
+                    // Error is a dynamic leaf in a local type's static graph.
+                    // Charge and cap the concrete value tree here so internal
+                    // code cannot build an overdeep existential before the
+                    // next Shell boundary.
+                    try chargeShapeValidation(error, budget: budget)
                     try initialize(
-                        .error(.init(concreteType: key, payload: value, message: message)),
+                        error,
                         register: result,
                         registers: &registers
                     )

@@ -201,6 +201,8 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .algebraic(
                 .result(case: .failure, transformation: .flatMap)
             )
+        case "$ss6ResultOsRi_zrlE8catchingAByxq_Gxyq_YKXE_tcfC":
+            self = .algebraic(.resultCatching)
         case "$ss6ResultOsRi_zRi0_zrlE3getxyq_YKF":
             self = .algebraic(.resultGet)
         case "$ss3minyxx_xtSLRzlF": self = .minimum

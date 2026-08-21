@@ -369,11 +369,11 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 }
             case .error:
-                // A dynamic Error payload could recursively contain its owning
-                // local value and evade the statically bounded nominal graph.
-                throw Verification.Error.invalidModule(
-                    "HLBC local types cannot contain Error existential values"
-                )
+                // Error is a dynamic leaf in the static nominal graph. Its
+                // concrete local payload is checked when the existential is
+                // constructed and at every VM boundary, with runtime depth
+                // and fuel limits on both paths.
+                break
             case let .integer(bitWidth, _):
                 guard [8, 16, 32, 64].contains(bitWidth) else {
                     throw Verification.Error.invalidModule(

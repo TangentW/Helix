@@ -1354,9 +1354,9 @@ public struct TypeEnvironment: Sendable {
                     "closure stored in a local nominal type"
                 )
             case .error:
-                throw CanonicalSIL.LoweringError.unsupportedType(
-                    "Error existential stored in a local nominal type"
-                )
+                // The verifier and VM treat Error as a dynamic graph leaf and
+                // cap its concrete value tree when the existential is built.
+                0
             case .void, .never, .bool, .integer, .float, .string, .any, .native:
                 0
             }

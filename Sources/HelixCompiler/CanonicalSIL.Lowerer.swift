@@ -7218,7 +7218,80 @@ public struct Lowerer: Sendable {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "Result.get entered closure-transform planning"
                 )
+
+            case .resultCatching:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Result(catching:) entered closure-transform planning"
+                )
             }
+        }
+
+        func parseResultCatchingPlan(
+            genericArguments: String,
+            argumentText: String,
+            line: Int
+        ) throws -> CanonicalSIL.AlgebraicConstruction.CatchingPlan {
+            let genericSpellings = splitTopLevel(genericArguments)
+                .filter { !$0.isEmpty }
+            let arguments = try parseApplyValueTokens(
+                argumentText,
+                line: line
+            )
+            guard genericSpellings.count == 2,
+                  arguments.count == 3
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Result(catching:) has an unsupported specialization"
+                )
+            }
+
+            let logicalSuccess = try parseType(genericSpellings[0])
+            let logicalFailure = try parseType(genericSpellings[1])
+            let storedSuccess = ValueRepresentation.storable(logicalSuccess)
+            let storedFailure = ValueRepresentation.storable(logicalFailure)
+            let runtimeErrorType: Bytecode.ValueType = typeEnvironment
+                .preservesTypedErrors ? .error : .string
+            guard try isSupportedErrorType(
+                logicalFailure,
+                spelling: genericSpellings[1]
+            ), storedFailure == runtimeErrorType
+            else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "Result(catching:) Failure \(logicalFailure)"
+                )
+            }
+
+            let output = try resultContainer(
+                success: genericSpellings[0],
+                failure: genericSpellings[1]
+            )
+            guard case let .enumeration(outputKey) = output,
+                  localMetatypeValues[arguments[2]] == outputKey
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Result(catching:) metatype does not match its output"
+                )
+            }
+            return .init(
+                closureToken: arguments[1],
+                resultDestination: arguments[0],
+                output: output,
+                successCase: try algebraicEnumerationCase(
+                    named: CanonicalSIL.AlgebraicIntrinsic.ResultCase
+                        .success.rawValue,
+                    payloadType: storedSuccess,
+                    in: output
+                ),
+                failureCase: try algebraicEnumerationCase(
+                    named: CanonicalSIL.AlgebraicIntrinsic.ResultCase
+                        .failure.rawValue,
+                    payloadType: runtimeErrorType,
+                    in: output
+                ),
+                logicalSuccessType: logicalSuccess,
+                storedSuccessType: storedSuccess,
+                errorType: runtimeErrorType
+            )
         }
 
         func appendAlgebraicSwitch(
@@ -7355,6 +7428,120 @@ public struct Lowerer: Sendable {
                     "algebraic case does not belong to its output container"
                 )
             }
+        }
+
+        func lowerResultCatching(
+            _ plan: CanonicalSIL.AlgebraicConstruction.CatchingPlan,
+            resultToken: String,
+            line: Int
+        ) throws {
+            guard compilerAddressType(plan.resultDestination)
+                    == plan.output.type,
+                  try algebraicCaseIsValid(
+                    plan.successCase,
+                    in: plan.output
+                  ),
+                  try algebraicCaseIsValid(
+                    plan.failureCase,
+                    in: plan.output
+                  ),
+                  plan.successCase.payloadType == plan.storedSuccessType,
+                  plan.failureCase.payloadType == plan.errorType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Result(catching:) plan does not match its physical ABI"
+                )
+            }
+
+            let closure = try resolve(plan.closureToken, line: line)
+            guard case let .closure(signature) = registerTypes[
+                Int(closure.rawValue)
+            ], signature.parameters.isEmpty,
+               signature.parameterConventions.isEmpty,
+               signature.result == plan.logicalSuccessType,
+               signature.effects.mayThrow,
+               !signature.effects.isAsync
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "Result(catching:)"
+                )
+            }
+
+            let successTarget = try allocateSyntheticBlockID()
+            let failureTarget = try allocateSyntheticBlockID()
+            let completionTarget = try allocateSyntheticBlockID()
+            appendInstruction(
+                .closureTryApply(
+                    closure: closure,
+                    arguments: [],
+                    normalTarget: successTarget,
+                    errorTarget: failureTarget
+                )
+            )
+            finishCurrent()
+
+            let successParameter: Bytecode.Register? =
+                plan.logicalSuccessType == .void
+                    ? nil : try allocate(type: plan.storedSuccessType)
+            let successPayload: Bytecode.Register
+            var successInstructions: [IntermediateRepresentation.Instruction]
+            if let successParameter {
+                successPayload = successParameter
+                successInstructions = []
+            } else {
+                successPayload = try allocate(type: ValueRepresentation.unit)
+                successInstructions = [
+                    .makeTuple(result: successPayload, elements: []),
+                ]
+            }
+            let success = try makeAlgebraicCase(
+                plan.successCase,
+                in: plan.output,
+                payload: successPayload
+            )
+            successInstructions.append(contentsOf: success.instructions)
+            successInstructions.append(
+                .branch(
+                    target: completionTarget,
+                    arguments: [success.value]
+                )
+            )
+            appendSyntheticBlock(
+                id: successTarget,
+                parameters: successParameter.map { [$0] } ?? [],
+                instructions: successInstructions
+            )
+
+            let failureParameter = try allocate(type: plan.errorType)
+            let failure = try makeAlgebraicCase(
+                plan.failureCase,
+                in: plan.output,
+                payload: failureParameter
+            )
+            appendSyntheticBlock(
+                id: failureTarget,
+                parameters: [failureParameter],
+                instructions: failure.instructions + [
+                    .branch(
+                        target: completionTarget,
+                        arguments: [failure.value]
+                    ),
+                ]
+            )
+
+            let result = try allocate(type: plan.output.type)
+            current = .init(
+                id: completionTarget,
+                parameters: [result],
+                instructions: []
+            )
+            try storeConstructedValue(
+                result,
+                at: plan.resultDestination,
+                mode: .initialize
+            )
+            voidValues.insert(resultToken)
         }
 
         func lowerAlgebraicTransform(
@@ -16389,6 +16576,18 @@ public struct Lowerer: Sendable {
 
             if let metatype = match(
                 line,
+                pattern: #"^(%[0-9]+) = metatype \$@(?:thin|thick) (.+)\.Type$"#
+            ), let type = try? parseType(metatype[1]),
+               case let .local(key) = type {
+                // Standard-library algebraic containers are represented as
+                // image-local enum shapes even though they are not source
+                // declarations in the patch module.
+                localMetatypeValues[metatype[0]] = key
+                continue
+            }
+
+            if let metatype = match(
+                line,
                 pattern: #"^(%[0-9]+) = metatype \$@(?:thin|thick|objc_metatype) (.+)\.Type$"#
             ), let type = try? parseType(metatype[1]),
                case let .native(typeID) = type {
@@ -18928,6 +19127,11 @@ public struct Lowerer: Sendable {
                             errorTarget: errorTarget,
                             line: sourceLine
                         )
+                    case .resultCatching:
+                        throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                            line: sourceLine,
+                            text: "Result(catching:) requires nonthrowing apply"
+                        )
                     }
                     continue
                 }
@@ -19377,6 +19581,17 @@ public struct Lowerer: Sendable {
                         throw CanonicalSIL.LoweringError.unsupportedInstruction(
                             line: sourceLine,
                             text: "Result.get requires try_apply"
+                        )
+                    case .resultCatching:
+                        let plan = try parseResultCatchingPlan(
+                            genericArguments: call[2],
+                            argumentText: call[3],
+                            line: sourceLine
+                        )
+                        try lowerResultCatching(
+                            plan,
+                            resultToken: call[0],
+                            line: sourceLine
                         )
                     }
                     continue
@@ -22571,10 +22786,18 @@ public struct Lowerer: Sendable {
             parsedResult = (.void, false)
             mayThrow = error.isPossible
             indirectErrorType = error.isIndirect ? error.type : nil
-        } else if resultComponents.count == 2,
-                  let error = try supportedErrorResult(resultComponents[1]) {
+        } else if resultComponents.count >= 2,
+                  let errorComponent = resultComponents.last,
+                  let error = try supportedErrorResult(errorComponent) {
+            // A direct tuple normal result is flattened beside the trailing
+            // SIL error result. Reassemble every normal component before
+            // applying logical bridging or stored-type normalization.
+            let normalComponents = resultComponents.dropLast()
+            let normalResult = normalComponents.count == 1
+                ? normalComponents[normalComponents.startIndex]
+                : "(" + normalComponents.joined(separator: ", ") + ")"
             parsedResult = try parseFunctionResult(
-                resultComponents[0],
+                normalResult,
                 bridgedTo: physicalResultExpectation
             )
             mayThrow = error.isPossible

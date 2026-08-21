@@ -231,7 +231,8 @@ The subset additionally includes typed `enumerated`, `Array(sequence)`, and
 heterogeneous `zip` over represented managed Collections, plus
 reversed/repeated/sliced/joined Array-backed adapters,
 `Optional.map`/`flatMap`, concrete `Result` payload transforms and
-`Result.get()` for patch-local value payloads, VM-owned `Any`, and common
+`Result.get()` for patch-local value payloads, `Result(catching:)` over verified
+throwing-closure continuations, VM-owned `Any`, and common
 dynamic casts, fixed-width integer `Range`/`ClosedRange` iteration,
 integer and floating-point `stride`, scalar Range containment, and common
 forward Sequence transforms, reductions, visits, predicates, comparator

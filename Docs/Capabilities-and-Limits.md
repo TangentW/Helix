@@ -299,8 +299,13 @@ does not by itself certify a physical device or distribution channel.
   and concrete `Result.map`/`mapError`/`flatMap`/`flatMapError` whose payloads
   are valid patch-local values use one selected-case transform with explicit
   payload ownership; `Result.get()` projects success and failure onto verified
-  normal and error edges. A local `Result` cannot currently embed a native
-  handle.
+  normal and error edges. `Result(catching:)` invokes its synchronous throwing
+  closure exactly once and constructs the same local enum from the verified
+  normal/error continuations; it does not call the generic Swift implementation
+  through NativeImport. Local nominal aggregates may contain managed `Error`
+  existentials. Their concrete local payloads remain capability-gated and are
+  depth- and fuel-checked when the existential is constructed and at VM
+  boundaries. A local `Result` still cannot embed a native handle.
 - Structured branches, loops, switches, calls, recursion, checked business
   error edges, and local payload-carrying Error values. Real-frontend coverage
   includes ternary, `if`, and `switch` expressions; multiple Optional bindings;

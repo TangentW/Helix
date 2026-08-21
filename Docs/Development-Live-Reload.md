@@ -474,7 +474,10 @@ linear range state with exact `maxSplits`, empty-segment, and throwing-edge
 semantics. Split subsequences are normalized by element sequence and therefore
 do not preserve a source view's public index identity. Meanwhile,
 supported Optional and Result payload transforms use the same selected-case
-plan. Common Array structural edits—including nonmutating concatenation,
+plan. `Result(catching:)` uses a construction plan over the throwing closure's
+ordinary verified normal/error CFG edges, so it needs neither an API-specific
+opcode nor a generic standard-library NativeImport.
+Common Array structural edits—including nonmutating concatenation,
 contents insertion, range replacement/removal, reversal, and swapping—are
 supported for matching Array-backed sources and represented copyable elements.
 Element append, `append(contentsOf:)`, `+=`, edge/count removal, `popLast`,

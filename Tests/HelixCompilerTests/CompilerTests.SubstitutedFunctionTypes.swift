@@ -60,6 +60,49 @@ struct SubstitutedFunctionTypes {
         #expect(closureSignature.effects.mayThrow)
     }
 
+    @Test("A throwing SIL tuple result keeps every normal component")
+    func resolvesThrowingTupleResult() throws {
+        let signature = try CanonicalSIL.Lowerer().parseFunctionType(
+            "$@convention(thin) (Int, Bool) "
+                + "-> (Int, Bool, @error any Error)"
+        )
+
+        #expect(signature.parameters == [.int64, .bool])
+        #expect(signature.result == .tuple([.int64, .bool]))
+        #expect(!signature.hasIndirectResult)
+        #expect(signature.indirectErrorType == nil)
+        #expect(signature.effects.mayThrow)
+    }
+
+    @Test("Indirect tuple and Error results retain both address conventions")
+    func resolvesIndirectThrowingTupleResult() throws {
+        let signature = try CanonicalSIL.Lowerer().parseFunctionType(
+            "$@convention(thin) () "
+                + "-> (@out (Int, Bool), @error_indirect any Error)"
+        )
+
+        #expect(signature.result == .tuple([.int64, .bool]))
+        #expect(signature.hasIndirectResult)
+        #expect(signature.indirectErrorType == .string)
+        #expect(signature.effects.mayThrow)
+    }
+
+    @Test("The SIL error result must be the sole trailing component")
+    func rejectsMalformedTupleErrorResults() {
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer().parseFunctionType(
+                "$@convention(thin) () "
+                    + "-> (Int, @error any Error, Bool)"
+            )
+        }
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer().parseFunctionType(
+                "$@convention(thin) () "
+                    + "-> (Int, @error any Error, @error any Error)"
+            )
+        }
+    }
+
     @Test("Partial or mismatched substitutions fail closed")
     func rejectsIncompleteSubstitutions() {
         #expect(throws: CanonicalSIL.LoweringError.self) {
