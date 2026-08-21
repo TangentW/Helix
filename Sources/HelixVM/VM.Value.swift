@@ -285,8 +285,11 @@ extension VM.Value {
         return switch (self, expected) {
         case (.bool, .bool), (.string, .string): true
         case let (.any(value), .any):
-            value.concreteType.isAnyPayloadV1
-                && value.payload.matches(value.concreteType, depth: depth + 1)
+            value.dynamicType.isAnyPayloadV1
+                && value.payload.matchesDynamicType(
+                    value.dynamicType,
+                    depth: depth + 1
+                )
         case let (.array(storage), .array(expectedElement)):
             storage.elementType == expectedElement
                 && storage.elements.allSatisfy {

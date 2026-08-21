@@ -399,9 +399,17 @@ does not by itself certify a physical device or distribution channel.
 - Top-level non-suspending `async`, `async throws`, and `@MainActor async`
   entries. Exact generated Swift wrappers preserve their ABI while HLVM runs a
   body proven not to suspend.
-- VM-owned `Any`, `is`, `as?`, and `as!`, including recursive conversions of
-  supported Optional, Array, and Dictionary values. Swift existential metadata,
-  native objects, and linear lifetimes never enter downloaded bytecode.
+- VM-owned `Any`, `is`, `as?`, and `as!`. A closed recursive logical descriptor
+  distinguishes source types that deliberately share HLBC storage, including
+  `Int`/`Int64`, `UInt`/`UInt64`, `Double`/`CGFloat`, String/Character,
+  Substring/Array, and Array/ArraySlice. Recursive Optional, Array, Dictionary,
+  Set, and tuple casts preserve those identities; ArraySlice and patch-local
+  nominal values support exact dynamic identity. Key/element collisions created
+  by recursive Dictionary or Set conversion retain Swift's terminating behavior
+  as a controlled VM trap. The v1 descriptor admits at most 32 nested wrappers,
+  64 tuple elements, and 256 UTF-8 bytes per tuple label. Swift existential
+  metadata, native objects, and linear lifetimes never enter downloaded
+  bytecode.
 - Fully concrete default-argument generators. Production and development
   compilers link reachable `fA...` thunks and include them in transitive
   implementation fingerprints. This covers eligible callers in one complete
@@ -464,12 +472,16 @@ does not by itself certify a physical device or distribution channel.
   non-exported patch-local struct or enum to file/module scope in an existing
   watched source file; no Shell rebuild is needed when the resulting
   declaration remains private to the HLBC image.
-- User-defined `Hashable` semantics for Dictionary keys or Set elements,
-  dynamic Set payloads inside VM-owned `Any`, and Character/Substring dynamic
-  identities (including nested aggregate occurrences). Character and Substring
-  deliberately share compact physical storage with String and Array<String>;
-  they remain fail-closed in `Any` until it carries a recursive logical type
-  discriminator. Typed Set and text Shell bridges remain supported.
+- User-defined `Hashable` semantics for Dictionary keys or Set elements. The
+  VM-owned `Any` grammar admits only recursively VM-defined Hashable keys and
+  elements, so no user witness executes implicitly. Its Swift Shell codec
+  recursively materializes the supported scalar, text, Optional, Array,
+  Dictionary, and Set family, but still rejects ArraySlice (whose nonzero
+  public index base cannot be reconstructed through the type-erased boundary),
+  tuple values, patch-local values, native objects, and closures. `Void` is
+  likewise not erasable because HLVM represents it as absence of a value. Those
+  failures do not weaken internal exact identity for ArraySlice, tuple, or
+  patch-local values inside one verified image.
 - Arbitrary new Swift metadata, a patch concrete class identity visible to
   native code, retroactive conformances, or changes to a Shell type's layout,
   superclass, or enum cases. The hosted Objective-C subclass above is a frozen

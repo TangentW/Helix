@@ -39,7 +39,8 @@ struct AnyVerifier {
             .makeTuple(result: .init(rawValue: 1), elements: []),
             .eraseToAny(
                 result: .init(rawValue: 2),
-                value: .init(rawValue: 1)
+                value: .init(rawValue: 1),
+                dynamicType: .tuple([])
             ),
             .returnValue(.init(rawValue: 0)),
         ]
@@ -48,7 +49,7 @@ struct AnyVerifier {
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
                 offset: 1,
-                reason: "erase_to_any requires a supported VM value and Any result"
+                reason: "erase_to_any dynamic type must match a supported VM value and Any result"
             )
         ) {
             try verify(
@@ -64,11 +65,74 @@ struct AnyVerifier {
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
                 offset: 1,
-                reason: "checked_cast_any requires Any and Optional<supported target>"
+                reason: "checked_cast_any requires Any and a matching Optional<dynamic target>"
             )
         ) {
             try verify(
                 function: invalidTarget,
+                capabilities: [.baselineV1, .anyValuesV1]
+            )
+        }
+    }
+
+    @Test("Any descriptors must match their physical register storage")
+    func rejectsDescriptorStorageMismatch() throws {
+        var invalidErasure = validFunction()
+        invalidErasure.blocks[0].instructions[0] = .eraseToAny(
+            result: .init(rawValue: 1),
+            value: .init(rawValue: 0),
+            dynamicType: .string
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "erase_to_any dynamic type must match a supported VM value and Any result"
+            )
+        ) {
+            try verify(
+                function: invalidErasure,
+                capabilities: [.baselineV1, .anyValuesV1]
+            )
+        }
+
+        var invalidCheckedCast = validFunction()
+        invalidCheckedCast.blocks[0].instructions[1] = .checkedCastAny(
+            result: .init(rawValue: 2),
+            value: .init(rawValue: 1),
+            targetType: .character
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "checked_cast_any requires Any and a matching Optional<dynamic target>"
+            )
+        ) {
+            try verify(
+                function: invalidCheckedCast,
+                capabilities: [.baselineV1, .anyValuesV1]
+            )
+        }
+
+        var invalidForceCast = validFunction()
+        invalidForceCast.blocks[0].instructions[2] = .forceCastAny(
+            result: .init(rawValue: 3),
+            value: .init(rawValue: 1),
+            targetType: .character
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "force_cast_any requires Any and a matching dynamic target"
+            )
+        ) {
+            try verify(
+                function: invalidForceCast,
                 capabilities: [.baselineV1, .anyValuesV1]
             )
         }
@@ -123,15 +187,18 @@ struct AnyVerifier {
                     instructions: [
                         .eraseToAny(
                             result: .init(rawValue: 1),
-                            value: .init(rawValue: 0)
+                            value: .init(rawValue: 0),
+                            dynamicType: .integer(.int)
                         ),
                         .checkedCastAny(
                             result: .init(rawValue: 2),
-                            value: .init(rawValue: 1)
+                            value: .init(rawValue: 1),
+                            targetType: .integer(.int)
                         ),
                         .forceCastAny(
                             result: .init(rawValue: 3),
-                            value: .init(rawValue: 1)
+                            value: .init(rawValue: 1),
+                            targetType: .integer(.int)
                         ),
                         .returnValue(.init(rawValue: 3)),
                     ]

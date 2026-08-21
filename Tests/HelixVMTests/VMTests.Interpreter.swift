@@ -2772,11 +2772,13 @@ struct Interpreter {
             valueType: .int64
         )
         let frameBytes = UInt64(MemoryLayout<VM.Value?>.stride)
-        // 80 bytes for Dictionary storage plus 48 bytes for the transient
-        // duplicate-key validation set.
-        let aggregateBytes: UInt64 = 128
+        let dictionaryBytes: UInt64 = 80
+        let validationScratchBytes: UInt64 = 48
         let stringBytes: UInt64 = 5
-        let exactBudget = frameBytes + aggregateBytes + stringBytes
+        // Validation scratch is released before the frame is allocated, so
+        // only the larger transient phase contributes to the peak.
+        let exactBudget = dictionaryBytes + stringBytes
+            + max(frameBytes, validationScratchBytes)
 
         func image(maximumHeapBytes: UInt64) throws -> Verification.Image {
             try makeVerified(
@@ -4835,10 +4837,10 @@ struct Interpreter {
             ) == .returned(.array([], elementType: .int64))
         )
         let frameBytes = UInt64(2 * MemoryLayout<VM.Value?>.stride)
-        // Boundary storage, duplicate-element validation scratch, and the
-        // materialized result each hold the same two-element aggregate.
-        let setBoundaryScratchAndResultBytes = UInt64(3 * (2 + 1) * 16)
-        let exactSetHeap = frameBytes + setBoundaryScratchAndResultBytes
+        // Boundary storage and the materialized result remain live together;
+        // duplicate validation scratch is released before result allocation.
+        let setBoundaryAndResultBytes = UInt64(2 * (2 + 1) * 16)
+        let exactSetHeap = frameBytes + setBoundaryAndResultBytes
         let setSource = VM.Value.set(
             .init(elements: [five, three], elementType: .int64)
         )
@@ -4919,9 +4921,9 @@ struct Interpreter {
             keyType: .int64,
             valueType: .int64
         )
-        // Boundary Dictionary storage, duplicate-key scratch, and the output
-        // Array of two-field tuples consume 5, 3, and 9 aggregate slots.
-        let exactDictionaryHeap = frameBytes + UInt64((5 + 3 + 9) * 16)
+        // Boundary Dictionary storage and the output Array of two-field tuples
+        // retain 5 + 9 slots. The 3-slot validation index is released first.
+        let exactDictionaryHeap = frameBytes + UInt64((5 + 9) * 16)
         #expect(
             try invoke(
                 collectionType: integerDictionaryType,

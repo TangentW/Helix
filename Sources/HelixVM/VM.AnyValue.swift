@@ -3,20 +3,21 @@ import HelixBytecode
 #endif
 
 extension VM {
-/// A VM-owned existential. It deliberately stores a stable HLBC type rather
-/// than Swift metadata or an ABI existential container.
+/// A VM-owned existential. It stores a verified, recursive source-level
+/// identity rather than Swift metadata or an ABI existential container.
 public struct AnyValue: Hashable, Sendable {
-    /// Verified HLBC identity of the erased payload.
-    public let concreteType: Bytecode.ValueType
-    /// VM-owned value whose shape must match `concreteType`.
+    /// Verified Swift identity and its deterministic HLBC storage mapping.
+    public let dynamicType: Bytecode.DynamicType
+    /// VM-owned value whose shape must match `dynamicType.storageType` and all
+    /// logical invariants carried by `dynamicType`.
     public let payload: VM.Value
 
     /// Creates an existential value, flattening a redundant Any-in-Any box.
-    public init(concreteType: Bytecode.ValueType, payload: VM.Value) {
-        if concreteType == .any, case let .any(erased) = payload {
+    public init(dynamicType: Bytecode.DynamicType, payload: VM.Value) {
+        if dynamicType == .any, case let .any(erased) = payload {
             self = erased
         } else {
-            self.concreteType = concreteType
+            self.dynamicType = dynamicType
             self.payload = payload
         }
     }

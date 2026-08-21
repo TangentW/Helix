@@ -25,7 +25,12 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
     case addressWriteRequiresModifyAccess
     case exclusivityViolation
     case optionalUnwrapOfNil
-    case dynamicCastFailure(actual: Bytecode.ValueType, expected: Bytecode.ValueType)
+    case dynamicCastFailure(
+        actual: Bytecode.DynamicType,
+        expected: Bytecode.DynamicType
+    )
+    case dynamicCastProducedDuplicateDictionaryKey
+    case dynamicCastProducedDuplicateSetElement
     case valueNestingDepthExceeded(maximum: Int)
     case arrayIndexOutOfBounds(index: Int64, count: Int)
     case collectionCursorOutOfBounds(index: Int64, count: Int)
@@ -77,6 +82,10 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
         case .optionalUnwrapOfNil: "attempted to unwrap a nil Optional"
         case let .dynamicCastFailure(actual, expected):
             "could not cast value of type \(actual) to \(expected)"
+        case .dynamicCastProducedDuplicateDictionaryKey:
+            "Dictionary dynamic cast produced duplicate keys"
+        case .dynamicCastProducedDuplicateSetElement:
+            "Set dynamic cast produced duplicate elements"
         case let .valueNestingDepthExceeded(maximum):
             "VM value nesting exceeds \(maximum) levels"
         case let .arrayIndexOutOfBounds(index, count):
@@ -305,6 +314,81 @@ public final class InvocationBudget: @unchecked Sendable {
         try consumeWork(units: units)
     }
 
+    /// Charges one complete immutable VM value traversal. Hashing, equality,
+    /// logical type validation, and similar helpers must use this instead of
+    /// hiding aggregate or Unicode work inside a single HLBC instruction.
+    func consumeValueTraversal(
+        _ value: VM.Value,
+        depth: Int = 0
+    ) throws {
+        guard depth <= VM.ValueLimits.maximumNestingDepth else {
+            throw VM.RuntimeTrap.valueNestingDepthExceeded(
+                maximum: VM.ValueLimits.maximumNestingDepth
+            )
+        }
+        try consumeWork(units: 1)
+        switch value {
+        case let .string(string):
+            try consumeUTF8Work(byteCount: string.utf8.count)
+        case let .any(erased):
+            try consumeValueTraversal(erased.payload, depth: depth + 1)
+        case let .tuple(elements):
+            for element in elements {
+                try consumeValueTraversal(element, depth: depth + 1)
+            }
+        case let .array(storage):
+            for element in storage.elements {
+                try consumeValueTraversal(element, depth: depth + 1)
+            }
+        case let .dictionary(entries, _, _):
+            for entry in entries {
+                try consumeValueTraversal(entry.key, depth: depth + 1)
+                try consumeValueTraversal(entry.value, depth: depth + 1)
+            }
+        case let .set(set):
+            for element in set.elements {
+                try consumeValueTraversal(element, depth: depth + 1)
+            }
+        case let .optional(.some(wrapped)):
+            try consumeValueTraversal(wrapped, depth: depth + 1)
+        case let .structure(_, fields):
+            for field in fields {
+                try consumeValueTraversal(field, depth: depth + 1)
+            }
+        case let .enumeration(_, _, payload):
+            if let payload {
+                try consumeValueTraversal(payload, depth: depth + 1)
+            }
+        case let .error(error):
+            try consumeUTF8Work(byteCount: error.message.utf8.count)
+            if let payload = error.payload {
+                try consumeValueTraversal(payload, depth: depth + 1)
+            }
+        case let .closure(closure):
+            for capture in closure.captures {
+                try consumeValueTraversal(capture, depth: depth + 1)
+            }
+        case .object, .optional(nil), .native, .bool, .integer, .float,
+             .address, .mutableCell, .arrayBuilder, .arrayMutationState,
+             .dictionaryBuilder, .arraySortState, .arraySplitState:
+            break
+        }
+    }
+
+    /// Evaluates recursive VM-defined equality with traversal fuel and the
+    /// peak scratch needed by unordered nested collections.
+    func valuesEqual(_ lhs: VM.Value, _ rhs: VM.Value) throws -> Bool {
+        try consumeValueTraversal(lhs)
+        try consumeValueTraversal(rhs)
+        let scratchBytes = try VM.HashableValue.equalityScratchBytes(for: rhs)
+        guard scratchBytes > 0 else {
+            return VM.HashableValue.equal(lhs, rhs)
+        }
+        return try withReservedVMHeap(maximumBytes: scratchBytes) {
+            (value: VM.HashableValue.equal(lhs, rhs), actualBytes: 0)
+        }
+    }
+
     public func checkDeadline() throws {
         try lock.withLock { try ensureWithinDeadline() }
     }
@@ -431,13 +515,30 @@ public final class InvocationBudget: @unchecked Sendable {
     }
 
     func consumeAggregateStorage(elementCount: Int) throws {
+        try consumeVMHeap(bytes: aggregateStorageBytes(elementCount: elementCount))
+    }
+
+    /// Reserves scratch storage with the same conservative aggregate model as
+    /// retained VM collections, then returns the complete reservation after
+    /// the synchronous operation finishes.
+    func withTemporaryAggregateStorage<Result>(
+        elementCount: Int,
+        _ operation: () throws -> Result
+    ) throws -> Result {
+        let bytes = try aggregateStorageBytes(elementCount: elementCount)
+        return try withReservedVMHeap(maximumBytes: bytes) {
+            (value: try operation(), actualBytes: 0)
+        }
+    }
+
+    private func aggregateStorageBytes(elementCount: Int) throws -> UInt64 {
         guard elementCount >= 0 else { throw VM.RuntimeTrap.vmHeapLimitExceeded }
         let count = UInt64(elementCount).addingReportingOverflow(1)
         let bytes = count.partialValue.multipliedReportingOverflow(by: 16)
         guard !count.overflow, !bytes.overflow else {
             throw VM.RuntimeTrap.vmHeapLimitExceeded
         }
-        try consumeVMHeap(bytes: bytes.partialValue)
+        return bytes.partialValue
     }
 
     func consumeAggregateElementStorage(elementCount: Int) throws {

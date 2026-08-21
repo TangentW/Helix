@@ -1,3 +1,4 @@
+import Foundation
 import HelixBytecode
 import HelixVM
 import Testing
@@ -21,7 +22,7 @@ struct AnyBridge {
             return
         }
         #expect(
-            erased.concreteType == .dictionary(key: .string, value: .any)
+            erased.dynamicType == .dictionary(key: .string, value: .any)
         )
 
         let decoded = try #require(
@@ -87,15 +88,68 @@ struct AnyBridge {
         )
         #expect(decodedDouble.bitPattern == doublePayload.bitPattern)
 
-        // HLBC deliberately gives Int and Int64 one 64-bit signed identity.
-        let canonicalInt = try Runtime.BridgeValueCodec.decodeAny(
+        let exactInt64 = try Runtime.BridgeValueCodec.decodeAny(
             Runtime.BridgeValueCodec.encodeAny(Int64(64))
         )
-        #expect(canonicalInt as? Int == 64)
-        let canonicalUInt = try Runtime.BridgeValueCodec.decodeAny(
+        #expect(exactInt64 as? Int64 == 64)
+        #expect(exactInt64 is Int == false)
+        let exactUInt64 = try Runtime.BridgeValueCodec.decodeAny(
             Runtime.BridgeValueCodec.encodeAny(UInt64(64))
         )
-        #expect(canonicalUInt as? UInt == 64)
+        #expect(exactUInt64 as? UInt64 == 64)
+        #expect(exactUInt64 is UInt == false)
+    }
+
+    @Test("Recursive codecs preserve text and collection identities")
+    func preservesRecursiveConcreteShapes() throws {
+        let first: Set<Character> = ["e\u{301}", "👨‍👩‍👧‍👦"]
+        let second: Set<Character> = ["🇨🇳"]
+        let input: [String: [Set<Character>?]] = [
+            "values": [first, nil, second],
+        ]
+
+        let encoded = try Runtime.BridgeValueCodec.encodeAny(input)
+        guard case let .any(erased) = encoded else {
+            Issue.record("expected an Any VM value")
+            return
+        }
+        #expect(
+            erased.dynamicType == .dictionary(
+                key: .string,
+                value: .array(.optional(.set(.character)))
+            )
+        )
+        let decoded = try #require(
+            Runtime.BridgeValueCodec.decodeAny(encoded)
+                as? [String: [Set<Character>?]]
+        )
+        #expect(decoded == input)
+
+        let substrings: Set<Substring> = ["alpha", "beta"]
+        let decodedSubstrings = try #require(
+            Runtime.BridgeValueCodec.decodeAny(
+                Runtime.BridgeValueCodec.encodeAny(substrings)
+            ) as? Set<Substring>
+        )
+        #expect(decodedSubstrings == substrings)
+
+        let compositeKeys: [[Int?]: Set<Substring>] = [
+            [1, nil]: ["first", "second"],
+            [2]: ["third"],
+        ]
+        let decodedCompositeKeys = try #require(
+            Runtime.BridgeValueCodec.decodeAny(
+                Runtime.BridgeValueCodec.encodeAny(compositeKeys)
+            ) as? [[Int?]: Set<Substring>]
+        )
+        #expect(decodedCompositeKeys == compositeKeys)
+
+        let cgFloat = CGFloat(12.5)
+        let decodedCGFloat = try Runtime.BridgeValueCodec.decodeAny(
+            Runtime.BridgeValueCodec.encodeAny(cgFloat)
+        )
+        #expect(decodedCGFloat as? CGFloat == cgFloat)
+        #expect(decodedCGFloat is Double == false)
     }
 
     @Test("The Any wrapper participates in node and depth accounting")
@@ -155,18 +209,54 @@ struct AnyBridge {
             #expect(type.contains("LocalValue"))
         }
 
+        do {
+            _ = try Runtime.BridgeValueCodec.encodeAny([1, 2, 3][1...])
+            Issue.record("expected ArraySlice to be rejected at the Shell boundary")
+        } catch let error as Runtime.BridgeInputError {
+            guard case let .unsupportedAnyType(type) = error else {
+                Issue.record("unexpected bridge error: \(error)")
+                return
+            }
+            #expect(type.contains("ArraySlice<Swift.Int>"))
+        }
+
         let unsupported = VM.Value.any(
             .init(
-                concreteType: .tuple([.bool]),
-                payload: .tuple([.bool(true)])
+                dynamicType: .tuple([
+                    .init(type: .bool),
+                    .init(type: .bool),
+                ]),
+                payload: .tuple([.bool(true), .bool(false)])
             )
         )
         #expect(
             throws: VM.RuntimeTrap.nativeFailure(
-                "Swift Any boundary cannot materialize (Bool)"
+                "Swift Any boundary cannot materialize (Bool, Bool)"
             )
         ) {
             _ = try Runtime.BridgeValueCodec.decodeAny(unsupported)
+        }
+
+        let malformedNested = VM.Value.any(
+            .init(
+                dynamicType: .array(.any),
+                payload: .array(
+                    [
+                        .any(
+                            .init(
+                                dynamicType: .character,
+                                payload: .string("multiple characters")
+                            )
+                        ),
+                    ],
+                    elementType: .any
+                )
+            )
+        )
+        #expect(
+            throws: VM.RuntimeTrap.typeMismatch(expected: .any, actual: .any)
+        ) {
+            _ = try Runtime.BridgeValueCodec.decodeAny(malformedNested)
         }
     }
 }

@@ -184,13 +184,19 @@ public struct Lowerer: Sendable {
 
     private struct ExistentialProjection {
         var destination: String
-        var concreteType: Bytecode.ValueType
+        var dynamicType: Bytecode.DynamicType
         var components: [Int: Bytecode.Register]
+        var componentStoreMode: Bytecode.StackStoreMode?
 
-        init(destination: String, concreteType: Bytecode.ValueType) {
+        var storageType: Bytecode.ValueType {
+            dynamicType.storageType
+        }
+
+        init(destination: String, dynamicType: Bytecode.DynamicType) {
             self.destination = destination
-            self.concreteType = concreteType
+            self.dynamicType = dynamicType
             components = [:]
+            componentStoreMode = nil
         }
     }
 
@@ -595,10 +601,10 @@ public struct Lowerer: Sendable {
                 instruction,
                 pattern: #"^%[0-9]+ = init_existential_addr %[0-9]+, \$(.+)$"#
             ) else { continue }
-            let concreteType = try parseDynamicAnyType(projection[0])
-            guard concreteType.isAnyPayloadOrExistentialV1 else {
+            let dynamicType = try parseDynamicAnyType(projection[0])
+            guard dynamicType.isAnyPayloadOrExistentialV1 else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
-                    "Any payload \(concreteType)"
+                    "Any payload \(dynamicType)"
                 )
             }
         }
@@ -3004,11 +3010,11 @@ public struct Lowerer: Sendable {
                 return initialization.wrappedType
             }
             if let projection = existentialProjections[token] {
-                return projection.concreteType
+                return projection.storageType
             }
             if let component = existentialComponentAddresses[token],
                let projection = existentialProjections[component.projection],
-               case let .tuple(types) = projection.concreteType,
+               case let .tuple(types) = projection.storageType,
                types.indices.contains(component.index) {
                 return types[component.index]
             }
@@ -3580,7 +3586,8 @@ public struct Lowerer: Sendable {
 
         func storeExistential(
             _ value: Bytecode.Register,
-            at token: String
+            at token: String,
+            mode: Bytecode.StackStoreMode? = nil
         ) throws {
             guard registerTypes[Int(value.rawValue)] == .any else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
@@ -3590,7 +3597,7 @@ public struct Lowerer: Sendable {
             if try storePendingArrayLiteralValue(value, at: token) {
                 return
             }
-            try storeConstructedValue(value, at: token)
+            try storeConstructedValue(value, at: token, mode: mode)
         }
 
         func finishExistentialProjection(
@@ -3598,7 +3605,7 @@ public struct Lowerer: Sendable {
             payload: Bytecode.Register
         ) throws {
             guard let projection = existentialProjections.removeValue(forKey: token),
-                  registerTypes[Int(payload.rawValue)] == projection.concreteType
+                  registerTypes[Int(payload.rawValue)] == projection.storageType
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "Any payload does not match its concrete SIL type"
@@ -3608,8 +3615,18 @@ public struct Lowerer: Sendable {
                 $0.value.projection != token
             }
             let erased = try allocate(type: .any)
-            appendInstruction(.eraseToAny(result: erased, value: payload))
-            try storeExistential(erased, at: projection.destination)
+            appendInstruction(
+                .eraseToAny(
+                    result: erased,
+                    value: payload,
+                    dynamicType: projection.dynamicType
+                )
+            )
+            try storeExistential(
+                erased,
+                at: projection.destination,
+                mode: projection.componentStoreMode
+            )
         }
 
         func materializeManagedCollectionElements(
@@ -21301,7 +21318,7 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = tuple_element_addr (%[0-9]+), ([0-9]+)$"#
             ), let projection = existentialProjections[component[1]],
-               case let .tuple(types) = projection.concreteType,
+               case let .tuple(types) = projection.storageType,
                let index = Int(component[2]),
                types.indices.contains(index) {
                 existentialComponentAddresses[component[0]] = .init(
@@ -21788,18 +21805,18 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = init_existential_addr (%[0-9]+), \$(.+)$"#
             ) {
-                let concreteType = try parseDynamicAnyType(projection[2])
+                let dynamicType = try parseDynamicAnyType(projection[2])
                 guard compilerAddressType(projection[1]) == .any,
-                      concreteType.isAnyPayloadOrExistentialV1,
+                      dynamicType.isAnyPayloadOrExistentialV1,
                       existentialProjections[projection[0]] == nil
                 else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
-                        "Any payload \(concreteType)"
+                        "Any payload \(dynamicType)"
                     )
                 }
                 existentialProjections[projection[0]] = .init(
                     destination: projection[1],
-                    concreteType: concreteType
+                    dynamicType: dynamicType
                 )
                 continue
             }
@@ -21839,7 +21856,7 @@ public struct Lowerer: Sendable {
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
             ), let component = existentialComponentAddresses[store[1]],
                var projection = existentialProjections[component.projection],
-               case let .tuple(types) = projection.concreteType {
+               case let .tuple(types) = projection.storageType {
                 let payload = try resolve(store[0], line: sourceLine)
                 guard types.indices.contains(component.index),
                       registerTypes[Int(payload.rawValue)] == types[component.index],
@@ -21852,6 +21869,13 @@ public struct Lowerer: Sendable {
                         "Any tuple payload component is invalid or duplicated"
                     )
                 }
+                if projection.componentStoreMode == nil {
+                    projection.componentStoreMode = storageInitializationPlan
+                        .storeMode(
+                            at: currentSILLineIndex,
+                            address: store[1]
+                        )
+                }
                 existentialProjections[component.projection] = projection
                 if projection.components.count == types.count {
                     let elements = try types.indices.map { index in
@@ -21862,7 +21886,7 @@ public struct Lowerer: Sendable {
                         }
                         return element
                     }
-                    let tuple = try allocate(type: projection.concreteType)
+                    let tuple = try allocate(type: projection.storageType)
                     appendInstruction(.makeTuple(result: tuple, elements: elements))
                     try finishExistentialProjection(
                         component.projection,
@@ -22578,7 +22602,8 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^checked_cast_addr_br (?:take_always|copy_on_success) Any in (%[0-9]+) to (.+) in (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
             ) {
-                let targetType = try parseDynamicAnyType(cast[1])
+                let targetDynamicType = try parseDynamicAnyType(cast[1])
+                let targetType = targetDynamicType.storageType
                 guard stackType(at: cast[0]) == .any,
                       let source = try copyStoredValue(
                         at: cast[0],
@@ -22586,7 +22611,7 @@ public struct Lowerer: Sendable {
                       ),
                       registerTypes[Int(source.rawValue)] == .any,
                       compilerAddressType(cast[2]) == targetType,
-                      targetType.isAnyCastTargetV1,
+                      targetDynamicType.isAnyCastTargetV1,
                       runtimeAddress(at: cast[2]) == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -22603,7 +22628,11 @@ public struct Lowerer: Sendable {
                 let optional = try allocate(type: .optional(targetType))
                 let projected = try allocate(type: targetType)
                 appendInstruction(
-                    .checkedCastAny(result: optional, value: source)
+                    .checkedCastAny(
+                        result: optional,
+                        value: source,
+                        targetType: targetDynamicType
+                    )
                 )
                 appendInstruction(
                     .switchOptional(
@@ -22620,7 +22649,8 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^unconditional_checked_cast_addr Any in (%[0-9]+) to (.+) in (%[0-9]+)$"#
             ) {
-                let targetType = try parseDynamicAnyType(cast[1])
+                let targetDynamicType = try parseDynamicAnyType(cast[1])
+                let targetType = targetDynamicType.storageType
                 guard stackType(at: cast[0]) == .any,
                       let source = try copyStoredValue(
                         at: cast[0],
@@ -22628,14 +22658,20 @@ public struct Lowerer: Sendable {
                       ),
                       registerTypes[Int(source.rawValue)] == .any,
                       compilerAddressType(cast[2]) == targetType,
-                      targetType.isAnyCastTargetV1
+                      targetDynamicType.isAnyCastTargetV1
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "forced Any cast source or destination type does not match"
                     )
                 }
                 let result = try allocate(type: targetType)
-                appendInstruction(.forceCastAny(result: result, value: source))
+                appendInstruction(
+                    .forceCastAny(
+                        result: result,
+                        value: source,
+                        targetType: targetDynamicType
+                    )
+                )
                 try storeVMValue(result, at: cast[2])
                 continue
             }
@@ -24454,15 +24490,11 @@ public struct Lowerer: Sendable {
 
     private func parseDynamicAnyType(
         _ raw: String
-    ) throws -> Bytecode.ValueType {
-        guard !CanonicalSIL.TextRepresentation
-            .containsAnyErasedIdentity(in: raw)
-        else {
-            throw CanonicalSIL.LoweringError.unsupportedType(
-                "VM-owned Any cannot preserve Character/Substring identity in \(raw)"
-            )
-        }
-        return try parseType(raw)
+    ) throws -> Bytecode.DynamicType {
+        try CanonicalSIL.DynamicType.parse(
+            raw,
+            resolveStorage: parseType
+        )
     }
 
     private func parseStoredType(

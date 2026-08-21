@@ -8,16 +8,29 @@ struct DynamicCaster {
 
     func cast(
         _ value: VM.Value,
-        from sourceType: Bytecode.ValueType,
-        to targetType: Bytecode.ValueType
+        from sourceType: Bytecode.DynamicType,
+        to targetType: Bytecode.DynamicType
     ) throws -> VM.Value? {
-        try cast(value, from: sourceType, to: targetType, depth: 0)
+        guard sourceType.isAnyPayloadOrExistentialV1,
+              targetType.isAnyCastTargetV1
+        else {
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: .never,
+                actual: value.type
+            )
+        }
+        return try cast(
+            value,
+            from: sourceType,
+            to: targetType,
+            depth: 0
+        )
     }
 
     private func cast(
         _ value: VM.Value,
-        from sourceType: Bytecode.ValueType,
-        to targetType: Bytecode.ValueType,
+        from sourceType: Bytecode.DynamicType,
+        to targetType: Bytecode.DynamicType,
         depth: Int
     ) throws -> VM.Value? {
         guard depth <= VM.ValueLimits.maximumNestingDepth else {
@@ -27,19 +40,24 @@ struct DynamicCaster {
         }
         try budget.consumeWork(units: 1)
 
-        if sourceType == targetType {
-            return value
-        }
+        // Existential payloads are validated when they enter the VM or are
+        // created by erase_to_any. Dynamic descriptors are immutable, so an
+        // exact identity test is O(1), like Swift metadata identity, and does
+        // not rescan a potentially large collection on every `is`/cast.
+        if sourceType == targetType { return value }
 
         if sourceType == .any {
             guard case let .any(erased) = value,
-                  erased.concreteType.isAnyPayloadV1
+                  erased.dynamicType.isAnyPayloadV1
             else {
-                throw VM.RuntimeTrap.typeMismatch(expected: .any, actual: value.type)
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: .any,
+                    actual: value.type
+                )
             }
             return try cast(
                 erased.payload,
-                from: erased.concreteType,
+                from: erased.dynamicType,
                 to: targetType,
                 depth: depth + 1
             )
@@ -48,11 +66,11 @@ struct DynamicCaster {
         if targetType == .any {
             guard sourceType.isAnyPayloadV1 else { return nil }
             try budget.consumeAggregateStorage(elementCount: 1)
-            return .any(.init(concreteType: sourceType, payload: value))
+            return .any(.init(dynamicType: sourceType, payload: value))
         }
 
-        // Swift first attempts Optional injection. This preserves one level for
-        // casts such as Int? -> Int?? instead of prematurely unwrapping source.
+        // Swift attempts Optional injection before source unwrapping. This
+        // preserves one level for casts such as Int? -> Int??.
         if case let .optional(targetWrapped) = targetType,
            let converted = try cast(
                value,
@@ -66,7 +84,10 @@ struct DynamicCaster {
 
         if case let .optional(sourceWrapped) = sourceType {
             guard case let .optional(payload) = value else {
-                throw VM.RuntimeTrap.typeMismatch(expected: sourceType, actual: value.type)
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: sourceType.storageType,
+                    actual: value.type
+                )
             }
             if let payload {
                 return try cast(
@@ -77,7 +98,7 @@ struct DynamicCaster {
                 )
             }
             if case .optional = targetType {
-                // A dynamically typed nil can cast to any Optional target.
+                // A dynamically typed nil casts to every Optional target.
                 try budget.consumeAggregateStorage(elementCount: 0)
                 return .optional(nil)
             }
@@ -85,24 +106,32 @@ struct DynamicCaster {
         }
 
         switch (sourceType, targetType) {
-        case let (.tuple(sourceTypes), .tuple(targetTypes)):
+        case let (.tuple(sourceElements), .tuple(targetElements)):
             guard case let .tuple(values) = value,
-                  values.count == sourceTypes.count,
-                  sourceTypes.count == targetTypes.count
+                  values.count == sourceElements.count,
+                  sourceElements.count == targetElements.count
             else {
-                throw VM.RuntimeTrap.typeMismatch(expected: sourceType, actual: value.type)
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: sourceType.storageType,
+                    actual: value.type
+                )
+            }
+            guard zip(sourceElements, targetElements).allSatisfy({
+                labelsAreCastCompatible($0.label, $1.label)
+            }) else {
+                return nil
             }
             try budget.consumeAggregateStorage(elementCount: values.count)
             var converted: [VM.Value] = []
             converted.reserveCapacity(values.count)
             for ((element, source), target) in zip(
-                zip(values, sourceTypes),
-                targetTypes
+                zip(values, sourceElements),
+                targetElements
             ) {
                 guard let result = try cast(
                     element,
-                    from: source,
-                    to: target,
+                    from: source.type,
+                    to: target.type,
                     depth: depth + 1
                 ) else {
                     return nil
@@ -113,9 +142,13 @@ struct DynamicCaster {
 
         case let (.array(sourceElement), .array(targetElement)):
             guard case let .array(storage) = value,
-                  storage.elementType == sourceElement
+                  storage.indexBase == 0,
+                  storage.elementType == sourceElement.storageType
             else {
-                throw VM.RuntimeTrap.typeMismatch(expected: sourceType, actual: value.type)
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: sourceType.storageType,
+                    actual: value.type
+                )
             }
             try budget.consumeAggregateStorage(
                 elementCount: storage.elements.count
@@ -135,8 +168,7 @@ struct DynamicCaster {
             }
             return .array(
                 converted,
-                elementType: targetElement,
-                indexBase: storage.indexBase
+                elementType: targetElement.storageType
             )
 
         case let (
@@ -144,47 +176,140 @@ struct DynamicCaster {
             .dictionary(targetKey, targetValue)
         ):
             guard case let .dictionary(entries, actualKey, actualValue) = value,
-                  actualKey == sourceKey,
-                  actualValue == sourceValue
+                  actualKey == sourceKey.storageType,
+                  actualValue == sourceValue.storageType
             else {
-                throw VM.RuntimeTrap.typeMismatch(expected: sourceType, actual: value.type)
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: sourceType.storageType,
+                    actual: value.type
+                )
             }
             let storedElements = entries.count.multipliedReportingOverflow(by: 2)
             guard !storedElements.overflow else {
                 throw VM.RuntimeTrap.vmHeapLimitExceeded
             }
-            try budget.consumeAggregateStorage(elementCount: storedElements.partialValue)
-            var converted: [VM.DictionaryEntry] = []
-            converted.reserveCapacity(entries.count)
-            var keys = Set<VM.HashableValue>()
-            keys.reserveCapacity(entries.count)
-            for entry in entries {
-                guard let key = try cast(
-                    entry.key,
-                    from: sourceKey,
-                    to: targetKey,
-                    depth: depth + 1
-                ), let item = try cast(
-                    entry.value,
-                    from: sourceValue,
-                    to: targetValue,
-                    depth: depth + 1
-                ) else {
-                    return nil
-                }
-                guard keys.insert(.init(value: key)).inserted else {
-                    return nil
-                }
-                converted.append(.init(key: key, value: item))
-            }
-            return .dictionary(
-                converted,
-                keyType: targetKey,
-                valueType: targetValue
+            try budget.consumeAggregateStorage(
+                elementCount: storedElements.partialValue
             )
+            // Duplicate detection builds a transient hash index in addition
+            // to the retained converted Dictionary storage.
+            return try budget.withTemporaryAggregateStorage(
+                elementCount: entries.count
+            ) { () throws -> VM.Value? in
+                var converted: [VM.DictionaryEntry] = []
+                converted.reserveCapacity(entries.count)
+                var keys = UniquenessIndex(
+                    capacity: entries.count,
+                    budget: budget
+                )
+                for entry in entries {
+                    guard let key = try cast(
+                        entry.key,
+                        from: sourceKey,
+                        to: targetKey,
+                        depth: depth + 1
+                    ), let item = try cast(
+                        entry.value,
+                        from: sourceValue,
+                        to: targetValue,
+                        depth: depth + 1
+                    ) else {
+                        return nil
+                    }
+                    guard try keys.insert(key) else {
+                        throw VM.RuntimeTrap.dynamicCastProducedDuplicateDictionaryKey
+                    }
+                    converted.append(.init(key: key, value: item))
+                }
+                return .dictionary(
+                    converted,
+                    keyType: targetKey.storageType,
+                    valueType: targetValue.storageType
+                )
+            }
+
+        case let (.set(sourceElement), .set(targetElement)):
+            guard case let .set(storage) = value,
+                  storage.elementType == sourceElement.storageType,
+                  targetElement.hasVMDefinedHashableSemantics
+            else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: sourceType.storageType,
+                    actual: value.type
+                )
+            }
+            try budget.consumeAggregateStorage(
+                elementCount: storage.elements.count
+            )
+            // Account for the transient uniqueness index separately from the
+            // retained Set element storage.
+            return try budget.withTemporaryAggregateStorage(
+                elementCount: storage.elements.count
+            ) { () throws -> VM.Value? in
+                var converted: [VM.Value] = []
+                converted.reserveCapacity(storage.elements.count)
+                var elements = UniquenessIndex(
+                    capacity: storage.elements.count,
+                    budget: budget
+                )
+                for element in storage.elements {
+                    guard let result = try cast(
+                        element,
+                        from: sourceElement,
+                        to: targetElement,
+                        depth: depth + 1
+                    ) else {
+                        return nil
+                    }
+                    guard try elements.insert(result) else {
+                        throw VM.RuntimeTrap.dynamicCastProducedDuplicateSetElement
+                    }
+                    converted.append(result)
+                }
+                return .set(
+                    .init(
+                        uncheckedElements: converted,
+                        elementType: targetElement.storageType
+                    )
+                )
+            }
 
         default:
             return nil
+        }
+    }
+
+    private func labelsAreCastCompatible(
+        _ source: String?,
+        _ target: String?
+    ) -> Bool {
+        source == nil || target == nil || source == target
+    }
+
+    /// Hash buckets keep the common path linear while making every recursive
+    /// collision comparison visible to the invocation budget.
+    private struct UniquenessIndex {
+        let budget: VM.InvocationBudget
+        var buckets: [UInt64: [VM.Value]]
+
+        init(capacity: Int, budget: VM.InvocationBudget) {
+            self.budget = budget
+            buckets = [:]
+            buckets.reserveCapacity(capacity)
+        }
+
+        mutating func insert(_ value: VM.Value) throws -> Bool {
+            try budget.consumeValueTraversal(value)
+            let fingerprint = VM.HashableValue.deterministicFingerprint(value)
+            if let candidates = buckets[fingerprint] {
+                for candidate in candidates {
+                    if try budget.valuesEqual(candidate, value) {
+                        return false
+                    }
+                }
+            }
+            buckets[fingerprint, default: []].append(value)
+            return true
         }
     }
 }

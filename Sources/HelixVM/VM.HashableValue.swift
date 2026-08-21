@@ -1,3 +1,4 @@
+import Foundation
 #if canImport(HelixCore)
 import HelixBytecode
 #endif
@@ -128,6 +129,78 @@ struct HashableValue: Hashable, Sendable {
         var hasher = Hasher()
         hash(value, into: &hasher)
         return hasher.finalize()
+    }
+
+    /// Process-independent structural fingerprint for budget-aware VM indexes.
+    /// It is only a bucket selector; equality always resolves collisions.
+    static func deterministicFingerprint(_ value: VM.Value) -> UInt64 {
+        switch value {
+        case let .bool(value):
+            return mix(0, value ? 1 : 0)
+        case let .integer(value):
+            return mix(
+                mix(mix(1, UInt64(value.bitWidth)), value.isSigned ? 1 : 0),
+                value.rawBits
+            )
+        case let .float(value):
+            let bits: UInt64
+            if value.bitWidth == 32 {
+                bits = value.floatValue == 0 ? 0 : value.bitPattern
+            } else {
+                bits = value.doubleValue == 0 ? 0 : value.bitPattern
+            }
+            return mix(mix(2, UInt64(value.bitWidth)), bits)
+        case let .string(value):
+            var fingerprint = mix(3, 0)
+            for byte in value.precomposedStringWithCanonicalMapping.utf8 {
+                fingerprint = mix(fingerprint, UInt64(byte))
+            }
+            return fingerprint
+        case let .optional(value):
+            guard let value else { return mix(4, 0) }
+            return mix(4, deterministicFingerprint(value))
+        case let .array(storage):
+            var fingerprint = mix(5, UInt64(storage.elements.count))
+            for value in storage.elements {
+                fingerprint = mix(
+                    fingerprint,
+                    deterministicFingerprint(value)
+                )
+            }
+            return fingerprint
+        case let .dictionary(entries, _, _):
+            var xor: UInt64 = 0
+            var sum: UInt64 = 0
+            for entry in entries {
+                let fingerprint = mix(
+                    deterministicFingerprint(entry.key),
+                    deterministicFingerprint(entry.value)
+                )
+                xor ^= fingerprint
+                sum &+= fingerprint
+            }
+            return mix(mix(mix(6, UInt64(entries.count)), xor), sum)
+        case let .set(set):
+            var xor: UInt64 = 0
+            var sum: UInt64 = 0
+            for element in set.elements {
+                let fingerprint = deterministicFingerprint(element)
+                xor ^= fingerprint
+                sum &+= fingerprint
+            }
+            return mix(mix(mix(7, UInt64(set.elements.count)), xor), sum)
+        default:
+            // Unsupported values cannot enter a verified Hashable domain.
+            // A shared bucket keeps malformed diagnostics total and safe.
+            return UInt64.max
+        }
+    }
+
+    private static func mix(_ seed: UInt64, _ value: UInt64) -> UInt64 {
+        var mixed = seed ^ (value &+ 0x9E37_79B9_7F4A_7C15)
+        mixed = (mixed ^ (mixed >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        mixed = (mixed ^ (mixed >> 27)) &* 0x94D0_49BB_1331_11EB
+        return mixed ^ (mixed >> 31)
     }
 
     private static func entryDigest(_ entry: VM.DictionaryEntry) -> Int {

@@ -551,24 +551,32 @@ enum StorageInitialization {
 
             if line.contains(" = tuple_element_addr "),
                let source = silValue(
-                after: " = tuple_element_addr ",
-                in: line
+                    after: " = tuple_element_addr ",
+                    in: line
                ), let parent = result[source],
                let index = fieldIndex(
-                after: " = tuple_element_addr ",
-                in: line
+                    after: " = tuple_element_addr ",
+                    in: line
                ),
-               let aggregate = pointees[parent.root],
-               try childType(
-                of: aggregate,
-                at: parent.path + [index],
-                typeEnvironment: typeEnvironment
-               ) != nil {
-                result[destination] = .init(
-                    root: parent.root,
-                    path: parent.path + [index]
-                )
-                continue
+               let aggregate = pointees[parent.root] {
+                if aggregate == .any {
+                    // Any is one physical storage leaf. The Lowerer separately
+                    // proves that every concrete tuple component is written
+                    // exactly once before materializing the existential.
+                    result[destination] = parent
+                    continue
+                }
+                if try childType(
+                    of: aggregate,
+                    at: parent.path + [index],
+                    typeEnvironment: typeEnvironment
+                ) != nil {
+                    result[destination] = .init(
+                        root: parent.root,
+                        path: parent.path + [index]
+                    )
+                    continue
+                }
             }
 
             if line.contains(" = struct_element_addr "),

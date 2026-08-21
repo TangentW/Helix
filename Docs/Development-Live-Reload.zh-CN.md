@@ -76,6 +76,8 @@ iOS 进程不会接收或执行 Swift 编译器、linker、JIT、dylib 或源文
 
 Swift 泛型集合方法并不是安全的 NativeImport 捷径。它的物理 ABI 可能携带具体类型 metadata、protocol witness table、随 specialization 改变的 ownership、间接结果和私有 reabstraction 细节；closure 与集合值也不使用 HLVM 的 Runtime 表示。这些属于具体 toolchain 合同，并非稳定 Shell capability。因此 NativeImport 只承载精确生成的 Bridge 或稳定的 C/Objective-C 形状原生操作；受支持 Swift Sequence API 则由 frontend 识别，再降低到少量强类型 cursor、builder、mutation 与普通 closure 调用。
 
+VM-owned `Any` 也遵循这条分界。擦除与动态转换指令把闭合的递归逻辑类型描述符和物理 HLBC register shape 分开携带；Verifier 证明描述符与 storage 一致，VM 则校验递归 payload invariant、深度、分配和遍历 fuel。这样无需序列化 Swift metadata，也无需通过 NativeImport 调用泛型 cast，就能保留 `Int`/`Int64`、Character/String、Substring/Array、ArraySlice/Array 及其嵌套 Optional/Array/Dictionary/Set/Tuple 的区别。穿过 Swift Shell 边界时，递归组合的具体 codec 会物化受支持的标量、文本、Optional、Array、Dictionary 与 Set；无法精确重建的形状继续 fail closed。
+
 标量与文本转换也使用同一边界。frontend 为 `Bool`、全部可表示有/无符号定宽整数、`Float` 与 `Double` 解析产生的具体或泛型 ABI 入口，统一归一为一条按目标类型驱动的 `scalar_from_string`；整数进制格式化统一归一为 `integer_to_string`。StringProtocol 输入只在具体表示为 String 或 Substring 时接纳。Verifier 会检查 Optional target 与全部 operand 类型；VM 则在调用 Swift 原生 parser/formatter 这一私有实现 leaf 前验证 radix `2...36`、计入输入工作量，并预留格式化结果的最大存储。这样既复用了原生标准库行为，也没有把泛型 ABI 暴露成 NativeImport，更不会按 API、标量类型或位宽扩增操作。
 
 Swift 失败 helper 也在同一边界归一化。当前 frontend 为 `precondition`、`fatalError`、生效中的 assertion 与 `try!` 产生的形态，会成为受验证的终止控制流，而不是对 Swift 私有 runtime symbol 的调用。静态诊断使用普通 trap，动态 String 或可表示 Error detail 共用一条 `source_failure` terminator；直接 `assertionFailure` 只在失败路径求值 autoclosure，`Optional.unsafelyUnwrapped` 则复用通用 Optional projection 与 nil trap。文件和行信息来自逻辑 source map，不会把构建机路径序列化进指令。

@@ -1787,31 +1787,42 @@ public struct Engine: Verification.ImageVerifying {
             else {
                 throw fail("cast_error requires Error and Optional<local Error> types")
             }
-        case let .eraseToAny(result, value):
+        case let .eraseToAny(result, value, dynamicType):
             guard capabilities.contains(.anyValuesV1) else {
                 throw fail("erase_to_any requires \(Core.Capability.anyValuesV1)")
             }
             guard type(result) == .any,
-                  type(value).isAnyPayloadOrExistentialV1
+                  dynamicType.isAnyPayloadOrExistentialV1,
+                  dynamicType.storageType == type(value)
             else {
-                throw fail("erase_to_any requires a supported VM value and Any result")
+                throw fail(
+                    "erase_to_any dynamic type must match a supported VM value and Any result"
+                )
             }
-        case let .checkedCastAny(result, value):
+        case let .checkedCastAny(result, value, targetType):
             guard capabilities.contains(.anyValuesV1) else {
                 throw fail("checked_cast_any requires \(Core.Capability.anyValuesV1)")
             }
             guard type(value) == .any,
                   case let .optional(target) = type(result),
-                  target.isAnyCastTargetV1
+                  targetType.isAnyCastTargetV1,
+                  targetType.storageType == target
             else {
-                throw fail("checked_cast_any requires Any and Optional<supported target>")
+                throw fail(
+                    "checked_cast_any requires Any and a matching Optional<dynamic target>"
+                )
             }
-        case let .forceCastAny(result, value):
+        case let .forceCastAny(result, value, targetType):
             guard capabilities.contains(.anyValuesV1) else {
                 throw fail("force_cast_any requires \(Core.Capability.anyValuesV1)")
             }
-            guard type(value) == .any, type(result).isAnyCastTargetV1 else {
-                throw fail("force_cast_any requires Any and a supported target")
+            guard type(value) == .any,
+                  targetType.isAnyCastTargetV1,
+                  targetType.storageType == type(result)
+            else {
+                throw fail(
+                    "force_cast_any requires Any and a matching dynamic target"
+                )
             }
         case let .makeOptionalSome(result, value):
             guard case let .optional(wrapped) = type(result), wrapped == type(value) else {

@@ -2898,10 +2898,10 @@ struct Pipeline {
             try VM.Integer(signed: 7, bitWidth: 64, isSigned: true)
         )
         let boxedInt = VM.Value.any(
-            .init(concreteType: .int64, payload: int)
+            .init(dynamicType: .integer(.int), payload: int)
         )
         let boxedString = VM.Value.any(
-            .init(concreteType: .string, payload: .string("seven"))
+            .init(dynamicType: .string, payload: .string("seven"))
         )
 
         let erasure = try compileFixture(
@@ -2935,7 +2935,10 @@ struct Pipeline {
             additionalFrontendArguments: arguments
         )
         let boxedNilInt = VM.Value.any(
-            .init(concreteType: optionalIntType, payload: nilInt)
+            .init(
+                dynamicType: .optional(.integer(.int)),
+                payload: nilInt
+            )
         )
         #expect(
             VM.Interpreter().invoke(
@@ -3140,7 +3143,10 @@ struct Pipeline {
                 image: forced.image,
                 arguments: [boxedString]
             ) == .trapped(
-                .dynamicCastFailure(actual: .string, expected: .int64)
+                .dynamicCastFailure(
+                    actual: .string,
+                    expected: .integer(.int)
+                )
             )
         )
 
@@ -3224,7 +3230,7 @@ struct Pipeline {
         )
         let boxedArray = VM.Value.any(
             .init(
-                concreteType: .array(.any),
+                dynamicType: .array(.any),
                 payload: .array([boxedInt], elementType: .any)
             )
         )
@@ -3241,7 +3247,13 @@ struct Pipeline {
         let tupleType = Bytecode.ValueType.tuple([.int64, .string])
         let tuple = VM.Value.tuple([int, .string("seven")])
         let boxedTuple = VM.Value.any(
-            .init(concreteType: tupleType, payload: tuple)
+            .init(
+                dynamicType: .tuple([
+                    .init(type: .integer(.int)),
+                    .init(type: .string),
+                ]),
+                payload: tuple
+            )
         )
         let tupleErasure = try compileFixture(
             source: source,
@@ -3500,7 +3512,7 @@ struct Pipeline {
                 Issue.record("unexpected Any rejection: \(error)")
                 return
             }
-            #expect(detail.contains("Any payload"))
+            #expect(detail.contains("VM-owned Any"))
             #expect(detail.contains("closure"))
         }
     }

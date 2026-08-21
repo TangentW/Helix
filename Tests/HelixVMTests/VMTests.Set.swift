@@ -109,6 +109,49 @@ struct SetSemantics {
         #expect(!VM.HashableValue.equal(ordered, reversed))
     }
 
+    @Test("Deterministic fingerprints agree for every exercised equal shape")
+    func deterministicFingerprintsRespectEquality() throws {
+        let composed = VM.Value.string("é")
+        let decomposed = VM.Value.string("e\u{301}")
+        #expect(VM.HashableValue.equal(composed, decomposed))
+        #expect(
+            VM.HashableValue.deterministicFingerprint(composed)
+                == VM.HashableValue.deterministicFingerprint(decomposed)
+        )
+
+        let positiveZero = VM.Value.float64(0.0)
+        let negativeZero = VM.Value.float64(-0.0)
+        #expect(VM.HashableValue.equal(positiveZero, negativeZero))
+        #expect(
+            VM.HashableValue.deterministicFingerprint(positiveZero)
+                == VM.HashableValue.deterministicFingerprint(negativeZero)
+        )
+
+        let one = try integer(1)
+        let two = try integer(2)
+        let lhs = VM.Value.dictionary(
+            [
+                .init(key: .string("one"), value: one),
+                .init(key: .string("two"), value: two),
+            ],
+            keyType: .string,
+            valueType: .int64
+        )
+        let rhs = VM.Value.dictionary(
+            [
+                .init(key: .string("two"), value: two),
+                .init(key: .string("one"), value: one),
+            ],
+            keyType: .string,
+            valueType: .int64
+        )
+        #expect(VM.HashableValue.equal(lhs, rhs))
+        #expect(
+            VM.HashableValue.deterministicFingerprint(lhs)
+                == VM.HashableValue.deterministicFingerprint(rhs)
+        )
+    }
+
     @Test("Nested unordered equality reports its temporary VM storage")
     func accountsForEqualityScratchStorage() throws {
         let one = try integer(1)

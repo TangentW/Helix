@@ -74,26 +74,6 @@ struct TextSequenceSemanticsMatrix {
                 of: "Application.CharacterCollection"
             ) == nil
         )
-        #expect(
-            CanonicalSIL.TextRepresentation.containsAnyErasedIdentity(
-                in: "Array<Optional<Swift.Substring>>"
-            )
-        )
-        #expect(
-            CanonicalSIL.TextRepresentation.containsAnyErasedIdentity(
-                in: "(name: String, marker: Character)"
-            )
-        )
-        #expect(
-            !CanonicalSIL.TextRepresentation.containsAnyErasedIdentity(
-                in: "Array<String>"
-            )
-        )
-        #expect(
-            !CanonicalSIL.TextRepresentation.containsAnyErasedIdentity(
-                in: "(Character: Int, value: Application.Character)"
-            )
-        )
     }
 
     @Test("Only direct semantic intrinsic references terminate discovery")
@@ -574,35 +554,6 @@ struct TextSequenceSemanticsMatrix {
             }
             """,
             diagnostic: "is not frozen in the target HLXI"
-        )
-        expectUnsupported(
-            name: "boxCharacterAsAny",
-            source: """
-            public func boxCharacterAsAny(_ value: Character) -> Any {
-                value
-            }
-            """,
-            diagnostic: "VM-owned Any cannot preserve Character/Substring identity"
-        )
-        expectUnsupported(
-            name: "castAnyToCharacter",
-            source: """
-            public func castAnyToCharacter(_ value: Any) -> Character? {
-                value as? Character
-            }
-            """,
-            diagnostic: "VM-owned Any cannot preserve Character/Substring identity"
-        )
-        expectUnsupported(
-            name: "boxCharacterArrayAsAny",
-            source: """
-            public func boxCharacterArrayAsAny(
-                _ value: [Character]
-            ) -> Any {
-                value
-            }
-            """,
-            diagnostic: "VM-owned Any cannot preserve Character/Substring identity"
         )
     }
 

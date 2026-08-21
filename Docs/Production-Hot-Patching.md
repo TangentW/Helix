@@ -258,6 +258,18 @@ a NativeImport or opcode for each collection API. Potentially infinite
 partial-range Sequence sources, custom `Comparable` witnesses, private
 `String.Index`, `ReversedCollection.Index`, and other opaque index identities
 remain rejected.
+
+`Any` does not serialize Swift existential metadata or delegate generic casts
+to NativeImport. HLBC 1.0 records a closed recursive logical descriptor next to
+each erasure/cast, independently of the compact physical storage. Verification
+checks descriptor/storage agreement and the VM recursively validates payload
+shape, Hashable eligibility, depth, fuel, and conversion collisions. This
+preserves shared-storage identities and nested Optional/Array/Dictionary/Set/
+tuple casts while keeping native objects, closures, and user-defined Hashable
+witnesses outside the downloaded execution surface. If recursive conversion
+would collapse distinct Dictionary keys or Set elements, HLVM raises a
+controlled trap matching Swift's terminating collection-invariant check.
+
 Reading VM storage as `Array.capacity` and
 unrepresented randomness through `randomElement()` remain rejected. The
 subset also includes

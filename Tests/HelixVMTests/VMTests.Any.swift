@@ -10,7 +10,7 @@ struct AnyExecution {
     @Test("Erasure records the static concrete type and preserves its value")
     func erasesScalarValue() throws {
         let int = try integer(42)
-        let function = erasureFunction(sourceType: .int64)
+        let function = erasureFunction(sourceType: .integer(.int))
         let image = try makeVerified(
             function: function,
             parameterTypes: [.int64],
@@ -23,7 +23,7 @@ struct AnyExecution {
                 image: image,
                 arguments: [int]
             ) == .returned(
-                .any(.init(concreteType: .int64, payload: int))
+                .any(.init(dynamicType: .integer(.int), payload: int))
             )
         )
     }
@@ -31,7 +31,7 @@ struct AnyExecution {
     @Test("Checked casts and force casts preserve scalar values")
     func scalarCasts() throws {
         let int = try integer(42)
-        let checked = castFunction(target: .int64, checked: true)
+        let checked = castFunction(target: .integer(.int), checked: true)
         let checkedImage = try makeVerified(
             function: checked,
             parameterTypes: [.any],
@@ -43,7 +43,7 @@ struct AnyExecution {
             interpreter.invoke(
                 function: checked.id,
                 image: checkedImage,
-                arguments: [.any(.init(concreteType: .int64, payload: int))]
+                arguments: [.any(.init(dynamicType: .integer(.int), payload: int))]
             ) == .returned(.optional(int))
         )
         #expect(
@@ -51,12 +51,12 @@ struct AnyExecution {
                 function: checked.id,
                 image: checkedImage,
                 arguments: [
-                    .any(.init(concreteType: .string, payload: .string("42"))),
+                    .any(.init(dynamicType: .string, payload: .string("42"))),
                 ]
             ) == .returned(.optional(nil))
         )
 
-        let forced = castFunction(target: .int64, checked: false)
+        let forced = castFunction(target: .integer(.int), checked: false)
         let forcedImage = try makeVerified(
             function: forced,
             parameterTypes: [.any],
@@ -66,7 +66,7 @@ struct AnyExecution {
             interpreter.invoke(
                 function: forced.id,
                 image: forcedImage,
-                arguments: [.any(.init(concreteType: .int64, payload: int))]
+                arguments: [.any(.init(dynamicType: .integer(.int), payload: int))]
             ) == .returned(int)
         )
         #expect(
@@ -74,26 +74,29 @@ struct AnyExecution {
                 function: forced.id,
                 image: forcedImage,
                 arguments: [
-                    .any(.init(concreteType: .string, payload: .string("42"))),
+                    .any(.init(dynamicType: .string, payload: .string("42"))),
                 ]
             ) == .trapped(
-                .dynamicCastFailure(actual: .string, expected: .int64)
+                .dynamicCastFailure(
+                    actual: .string,
+                    expected: .integer(.int)
+                )
             )
         )
     }
 
     @Test("Dynamic Optional casts distinguish failure from a successful nil")
     func optionalNilCasts() throws {
-        let target = Bytecode.ValueType.optional(.string)
+        let target = Bytecode.DynamicType.optional(.string)
         let function = castFunction(target: target, checked: true)
         let image = try makeVerified(
             function: function,
             parameterTypes: [.any],
-            resultType: .optional(target)
+            resultType: .optional(target.storageType)
         )
         let boxedNil = VM.Value.any(
             .init(
-                concreteType: .optional(.int64),
+                dynamicType: .optional(.integer(.int)),
                 payload: .optional(nil)
             )
         )
@@ -107,7 +110,7 @@ struct AnyExecution {
         )
 
         let int = try integer(7)
-        let injectedTarget = Bytecode.ValueType.optional(.int64)
+        let injectedTarget = Bytecode.DynamicType.optional(.integer(.int))
         let injectedFunction = castFunction(
             target: injectedTarget,
             checked: true
@@ -115,19 +118,21 @@ struct AnyExecution {
         let injectedImage = try makeVerified(
             function: injectedFunction,
             parameterTypes: [.any],
-            resultType: .optional(injectedTarget)
+            resultType: .optional(injectedTarget.storageType)
         )
         #expect(
             VM.Interpreter().invoke(
                 function: injectedFunction.id,
                 image: injectedImage,
                 arguments: [
-                    .any(.init(concreteType: .int64, payload: int)),
+                    .any(.init(dynamicType: .integer(.int), payload: int)),
                 ]
             ) == .returned(.optional(.optional(int)))
         )
 
-        let doublyOptional = Bytecode.ValueType.optional(.optional(.int64))
+        let doublyOptional = Bytecode.DynamicType.optional(
+            .optional(.integer(.int))
+        )
         let nestedFunction = castFunction(
             target: doublyOptional,
             checked: true
@@ -135,7 +140,7 @@ struct AnyExecution {
         let nestedImage = try makeVerified(
             function: nestedFunction,
             parameterTypes: [.any],
-            resultType: .optional(doublyOptional)
+            resultType: .optional(doublyOptional.storageType)
         )
         #expect(
             VM.Interpreter().invoke(
@@ -144,7 +149,7 @@ struct AnyExecution {
                 arguments: [
                     .any(
                         .init(
-                            concreteType: .optional(.int64),
+                            dynamicType: .optional(.integer(.int)),
                             payload: .optional(int)
                         )
                     ),
@@ -159,20 +164,24 @@ struct AnyExecution {
     func collectionCasts() throws {
         let one = try integer(1)
         let two = try integer(2)
-        let boxedOne = VM.Value.any(.init(concreteType: .int64, payload: one))
-        let boxedTwo = VM.Value.any(.init(concreteType: .int64, payload: two))
+        let boxedOne = VM.Value.any(
+            .init(dynamicType: .integer(.int), payload: one)
+        )
+        let boxedTwo = VM.Value.any(
+            .init(dynamicType: .integer(.int), payload: two)
+        )
         let arraySource = VM.Value.any(
             .init(
-                concreteType: .array(.any),
+                dynamicType: .array(.any),
                 payload: .array([boxedOne, boxedTwo], elementType: .any)
             )
         )
-        let arrayTarget = Bytecode.ValueType.array(.int64)
+        let arrayTarget = Bytecode.DynamicType.array(.integer(.int))
         let arrayFunction = castFunction(target: arrayTarget, checked: true)
         let arrayImage = try makeVerified(
             function: arrayFunction,
             parameterTypes: [.any],
-            resultType: .optional(arrayTarget)
+            resultType: .optional(arrayTarget.storageType)
         )
         #expect(
             VM.Interpreter().invoke(
@@ -186,11 +195,11 @@ struct AnyExecution {
 
         let reverseSource = VM.Value.any(
             .init(
-                concreteType: .array(.int64),
+                dynamicType: .array(.integer(.int)),
                 payload: .array([one, two], elementType: .int64)
             )
         )
-        let reverseTarget = Bytecode.ValueType.array(.any)
+        let reverseTarget = Bytecode.DynamicType.array(.any)
         let reverseFunction = castFunction(
             target: reverseTarget,
             checked: true
@@ -198,7 +207,7 @@ struct AnyExecution {
         let reverseImage = try makeVerified(
             function: reverseFunction,
             parameterTypes: [.any],
-            resultType: .optional(reverseTarget)
+            resultType: .optional(reverseTarget.storageType)
         )
         #expect(
             VM.Interpreter().invoke(
@@ -214,7 +223,7 @@ struct AnyExecution {
 
         let dictionarySource = VM.Value.any(
             .init(
-                concreteType: .dictionary(key: .string, value: .any),
+                dynamicType: .dictionary(key: .string, value: .any),
                 payload: .dictionary(
                     [
                         .init(key: .string("one"), value: boxedOne),
@@ -225,9 +234,9 @@ struct AnyExecution {
                 )
             )
         )
-        let dictionaryTarget = Bytecode.ValueType.dictionary(
+        let dictionaryTarget = Bytecode.DynamicType.dictionary(
             key: .string,
-            value: .int64
+            value: .integer(.int)
         )
         let dictionaryFunction = castFunction(
             target: dictionaryTarget,
@@ -236,7 +245,7 @@ struct AnyExecution {
         let dictionaryImage = try makeVerified(
             function: dictionaryFunction,
             parameterTypes: [.any],
-            resultType: .optional(dictionaryTarget)
+            resultType: .optional(dictionaryTarget.storageType)
         )
         #expect(
             VM.Interpreter().invoke(
@@ -258,19 +267,17 @@ struct AnyExecution {
         )
     }
 
-    @Test("Dictionary casts reject keys that collide after index-base erasure")
-    func dictionaryCastRejectsSemanticArrayKeyCollisions() throws {
+    @Test("Dictionary casts trap when keys collide after recursive conversion")
+    func dictionaryCastTrapsOnConvertedKeyCollisions() throws {
         let sourceElement = Bytecode.ValueType.optional(.optional(.int64))
-        let targetElement = Bytecode.ValueType.optional(.int64)
         let sourceKey = Bytecode.ValueType.array(sourceElement)
-        let targetKey = Bytecode.ValueType.array(targetElement)
-        let sourceType = Bytecode.ValueType.dictionary(
-            key: sourceKey,
-            value: .int64
+        let sourceDynamicType = Bytecode.DynamicType.dictionary(
+            key: .array(.optional(.optional(.integer(.int)))),
+            value: .integer(.int)
         )
-        let targetType = Bytecode.ValueType.dictionary(
-            key: targetKey,
-            value: .int64
+        let targetDynamicType = Bytecode.DynamicType.dictionary(
+            key: .array(.optional(.integer(.int))),
+            value: .integer(.int)
         )
         let source = VM.Value.dictionary(
             [
@@ -284,8 +291,7 @@ struct AnyExecution {
                 .init(
                     key: .array(
                         [.optional(.optional(nil))],
-                        elementType: sourceElement,
-                        indexBase: 1
+                        elementType: sourceElement
                     ),
                     value: try integer(2)
                 ),
@@ -300,34 +306,102 @@ struct AnyExecution {
         )
 
         #expect(
+            throws: VM.RuntimeTrap.dynamicCastProducedDuplicateDictionaryKey
+        ) {
+            _ = try caster.cast(
+                source,
+                from: sourceDynamicType,
+                to: targetDynamicType
+            )
+        }
+    }
+
+    @Test("Set casts trap when elements collide after recursive conversion")
+    func setCastTrapsOnConvertedElementCollisions() throws {
+        let sourceElement = Bytecode.DynamicType.optional(
+            .optional(.integer(.int))
+        )
+        let targetElement = Bytecode.DynamicType.optional(.integer(.int))
+        let source = VM.Value.set(
+            .init(
+                elements: [
+                    .optional(nil),
+                    .optional(.optional(nil)),
+                ],
+                elementType: sourceElement.storageType
+            )
+        )
+        let caster = VM.DynamicCaster(
+            budget: .init(
+                limits: .init(maxWallTimeMainThreadMilliseconds: 1_000)
+            )
+        )
+
+        #expect(
+            throws: VM.RuntimeTrap.dynamicCastProducedDuplicateSetElement
+        ) {
+            _ = try caster.cast(
+                source,
+                from: .set(sourceElement),
+                to: .set(targetElement)
+            )
+        }
+    }
+
+    @Test("Dynamic collection casts refund transient uniqueness storage")
+    func collectionCastRefundsUniquenessStorage() throws {
+        let budget = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: 96,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        let caster = VM.DynamicCaster(budget: budget)
+        let source = VM.Value.set(
+            .init(
+                elements: [try integer(1)],
+                elementType: .int64
+            )
+        )
+
+        #expect(
             try caster.cast(
                 source,
-                from: sourceType,
-                to: targetType
-            ) == nil
+                from: .set(.integer(.int)),
+                to: .set(.optional(.integer(.int)))
+            ) == .set(
+                .init(
+                    elements: [.optional(try integer(1))],
+                    elementType: .optional(.int64)
+                )
+            )
         )
+        try budget.consumeVMHeap(bytes: 32)
+        #expect(throws: VM.RuntimeTrap.vmHeapLimitExceeded) {
+            try budget.consumeVMHeap(bytes: 1)
+        }
     }
 
     @Test("A failed element cast rejects the complete collection")
     func collectionCastIsAtomic() throws {
         let boxedInt = VM.Value.any(
-            .init(concreteType: .int64, payload: try integer(1))
+            .init(dynamicType: .integer(.int), payload: try integer(1))
         )
         let boxedString = VM.Value.any(
-            .init(concreteType: .string, payload: .string("two"))
+            .init(dynamicType: .string, payload: .string("two"))
         )
         let source = VM.Value.any(
             .init(
-                concreteType: .array(.any),
+                dynamicType: .array(.any),
                 payload: .array([boxedInt, boxedString], elementType: .any)
             )
         )
-        let target = Bytecode.ValueType.array(.int64)
+        let target = Bytecode.DynamicType.array(.integer(.int))
         let function = castFunction(target: target, checked: true)
         let image = try makeVerified(
             function: function,
             parameterTypes: [.any],
-            resultType: .optional(target)
+            resultType: .optional(target.storageType)
         )
 
         #expect(
@@ -341,7 +415,7 @@ struct AnyExecution {
 
     @Test("Forged existential metadata is rejected before a cast executes")
     func rejectsMalformedExistentials() throws {
-        let function = castFunction(target: .int64, checked: true)
+        let function = castFunction(target: .integer(.int), checked: true)
         let image = try makeVerified(
             function: function,
             parameterTypes: [.any],
@@ -349,7 +423,7 @@ struct AnyExecution {
         )
         let malformed = VM.Value.any(
             .init(
-                concreteType: .string,
+                dynamicType: .string,
                 payload: try integer(1)
             )
         )
@@ -364,18 +438,15 @@ struct AnyExecution {
             )
         )
 
-        let nativeType = Core.TypeID(
-            rawValue: .sha256("Any.UnsupportedNative.fixture")
-        )
         let unsupported = VM.Value.any(
-            .init(concreteType: .native(nativeType), payload: .bool(true))
+            .init(dynamicType: .character, payload: .string("not one character"))
         )
         #expect(
             VM.Interpreter().invoke(
                 function: function.id,
                 image: image,
                 arguments: [unsupported]
-            ) == .trapped(.typeMismatch(expected: .any, actual: .any))
+            ) == .trapped(.typeMismatch(expected: .string, actual: .string))
         )
     }
 
@@ -383,24 +454,84 @@ struct AnyExecution {
     func castTraversalConsumesFuel() throws {
         let elements = try (0..<32).map { try integer(Int64($0)) }
         let boxedElements = elements.map {
-            VM.Value.any(.init(concreteType: .int64, payload: $0))
+            VM.Value.any(.init(dynamicType: .integer(.int), payload: $0))
         }
         let source = VM.Value.any(
             .init(
-                concreteType: .array(.any),
+                dynamicType: .array(.any),
                 payload: .array(boxedElements, elementType: .any)
             )
         )
-        let target = Bytecode.ValueType.array(.int64)
+        let target = Bytecode.DynamicType.array(.integer(.int))
         let function = castFunction(target: target, checked: true)
         let limits = Core.ResourceLimits(
-            instructionFuelPerEntry: 40,
+            // Boundary ownership consumes 66 units; recursive conversion
+            // consumes another 65 and must be the operation that exhausts.
+            instructionFuelPerEntry: 100,
             maxWallTimeMainThreadMilliseconds: 1_000
+        )
+        let passthrough = identityFunction(type: .any)
+        let passthroughImage = try makeVerified(
+            function: passthrough,
+            parameterTypes: [.any],
+            resultType: .any,
+            limits: limits
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                function: passthrough.id,
+                image: passthroughImage,
+                arguments: [source]
+            ) == .returned(source)
         )
         let image = try makeVerified(
             function: function,
             parameterTypes: [.any],
-            resultType: .optional(target),
+            resultType: .optional(target.storageType),
+            limits: limits
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                function: function.id,
+                image: image,
+                arguments: [source]
+            ) == .trapped(.instructionFuelExhausted)
+        )
+    }
+
+    @Test("Existential erasure charges recursive logical validation")
+    func erasureValidationConsumesFuel() throws {
+        let source = VM.Value.array(
+            Array(repeating: .string("a"), count: 32),
+            elementType: .string
+        )
+        let dynamicType = Bytecode.DynamicType.array(.character)
+        let function = erasureFunction(sourceType: dynamicType)
+        let limits = Core.ResourceLimits(
+            // Boundary ownership consumes 65 units; logical Character-array
+            // validation consumes another 65 before the Any box is created.
+            instructionFuelPerEntry: 100,
+            maxWallTimeMainThreadMilliseconds: 1_000
+        )
+        let passthrough = identityFunction(type: dynamicType.storageType)
+        let passthroughImage = try makeVerified(
+            function: passthrough,
+            parameterTypes: [dynamicType.storageType],
+            resultType: dynamicType.storageType,
+            limits: limits
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                function: passthrough.id,
+                image: passthroughImage,
+                arguments: [source]
+            ) == .returned(source)
+        )
+        let image = try makeVerified(
+            function: function,
+            parameterTypes: [dynamicType.storageType],
+            resultType: .any,
             limits: limits
         )
 
@@ -416,12 +547,12 @@ struct AnyExecution {
     @Test("Boundary validation rejects existential nesting beyond the VM limit")
     func nestingLimit() throws {
         var value = VM.Value.any(
-            .init(concreteType: .int64, payload: try integer(1))
+            .init(dynamicType: .integer(.int), payload: try integer(1))
         )
         for _ in 0..<VM.ValueLimits.maximumNestingDepth {
             value = .any(
                 .init(
-                    concreteType: .optional(.any),
+                    dynamicType: .optional(.any),
                     payload: .optional(value)
                 )
             )
@@ -444,22 +575,26 @@ struct AnyExecution {
                 )
             )
         )
-        #expect(!value.matches(.any))
+        #expect(!value.matches(Bytecode.ValueType.any))
     }
 
     private func castFunction(
-        target: Bytecode.ValueType,
+        target: Bytecode.DynamicType,
         checked: Bool
     ) -> Bytecode.Function {
-        let resultType = checked ? .optional(target) : target
+        let resultType: Bytecode.ValueType = checked
+            ? .optional(target.storageType)
+            : target.storageType
         let instruction: Bytecode.Instruction = checked
             ? .checkedCastAny(
                 result: .init(rawValue: 1),
-                value: .init(rawValue: 0)
+                value: .init(rawValue: 0),
+                targetType: target
             )
             : .forceCastAny(
                 result: .init(rawValue: 1),
-                value: .init(rawValue: 0)
+                value: .init(rawValue: 0),
+                targetType: target
             )
         return .init(
             id: .init(rawValue: 0),
@@ -481,15 +616,35 @@ struct AnyExecution {
         )
     }
 
+    private func identityFunction(
+        type: Bytecode.ValueType
+    ) -> Bytecode.Function {
+        .init(
+            id: .init(rawValue: 0),
+            name: "identity",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: type,
+            registerTypes: [type],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
+    }
+
     private func erasureFunction(
-        sourceType: Bytecode.ValueType
+        sourceType: Bytecode.DynamicType
     ) -> Bytecode.Function {
         .init(
             id: .init(rawValue: 0),
             name: "erase",
             parameterRegisters: [.init(rawValue: 0)],
             resultType: .any,
-            registerTypes: [sourceType, .any],
+            registerTypes: [sourceType.storageType, .any],
             entryBlock: .init(rawValue: 0),
             blocks: [
                 .init(
@@ -498,7 +653,8 @@ struct AnyExecution {
                     instructions: [
                         .eraseToAny(
                             result: .init(rawValue: 1),
-                            value: .init(rawValue: 0)
+                            value: .init(rawValue: 0),
+                            dynamicType: sourceType
                         ),
                         .returnValue(.init(rawValue: 1)),
                     ]

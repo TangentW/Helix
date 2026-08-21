@@ -18,34 +18,93 @@ struct AnyWireContract {
 
     @Test("Any v1 exposes a closed, VM-managed payload set")
     func payloadPolicy() {
-        #expect(Bytecode.ValueType.int64.isAnyPayloadV1)
-        #expect(Bytecode.ValueType.optional(.any).isAnyPayloadV1)
-        #expect(Bytecode.ValueType.array(.any).isAnyPayloadV1)
+        #expect(Bytecode.DynamicType.integer(.int).isAnyPayloadV1)
+        #expect(Bytecode.DynamicType.optional(.any).isAnyPayloadV1)
+        #expect(Bytecode.DynamicType.array(.any).isAnyPayloadV1)
         #expect(
-            Bytecode.ValueType.dictionary(key: .string, value: .any)
-                .isAnyPayloadV1
-        )
-        #expect(!Bytecode.ValueType.any.isAnyPayloadV1)
-        #expect(!Bytecode.ValueType.tuple([]).isAnyPayloadV1)
-        #expect(
-            !Bytecode.ValueType.dictionary(key: .any, value: .string)
+            Bytecode.DynamicType.dictionary(key: .string, value: .any)
                 .isAnyPayloadV1
         )
         #expect(
-            !Bytecode.ValueType.native(
-                .init(rawValue: .sha256("Any.Native.fixture"))
+            Bytecode.DynamicType.dictionary(
+                key: .array(.optional(.integer(.int))),
+                value: .set(.substring)
             ).isAnyPayloadV1
         )
-        #expect(!Bytecode.ValueType.error.isAnyPayloadV1)
-        #expect(!Bytecode.ValueType.address(.int64).isAnyPayloadV1)
+        #expect(Bytecode.DynamicType.set(.character).isAnyPayloadV1)
+        #expect(Bytecode.DynamicType.substring.isAnyPayloadV1)
+        #expect(Bytecode.DynamicType.arraySlice(.integer(.int)).isAnyPayloadV1)
+        #expect(!Bytecode.DynamicType.any.isAnyPayloadV1)
+        #expect(!Bytecode.DynamicType.tuple([]).isAnyPayloadV1)
         #expect(
-            !Bytecode.ValueType.closure(
-                .init(
-                    parameters: [],
-                    parameterConventions: [],
-                    result: .void
+            !Bytecode.DynamicType.tuple([.init(type: .bool)]).isAnyPayloadV1
+        )
+        #expect(
+            !Bytecode.DynamicType.dictionary(key: .any, value: .string)
+                .isAnyPayloadV1
+        )
+        #expect(
+            Bytecode.DynamicType.integer(.int).storageType == .int64
+        )
+        #expect(
+            Bytecode.DynamicType.integer(.int64).storageType == .int64
+        )
+        #expect(
+            Bytecode.DynamicType.floatingPoint(.cgFloat).storageType
+                == .float(bitWidth: 64)
+        )
+
+        var deepest = Bytecode.DynamicType.integer(.int)
+        for _ in 0..<Bytecode.DynamicType.maximumNestingDepthV1 {
+            deepest = .optional(deepest)
+        }
+        #expect(deepest.isAnyPayloadV1)
+        let overdeep = Bytecode.DynamicType.optional(deepest)
+        #expect(!overdeep.isAnyPayloadV1)
+
+        let maximumTuple = Bytecode.DynamicType.tuple(
+            Array(
+                repeating: .init(type: .bool),
+                count: Bytecode.DynamicType.maximumTupleElementCountV1
+            )
+        )
+        #expect(maximumTuple.isAnyPayloadV1)
+        #expect(
+            !Bytecode.DynamicType.tuple(
+                Array(
+                    repeating: .init(type: .bool),
+                    count: Bytecode.DynamicType.maximumTupleElementCountV1 + 1
                 )
             ).isAnyPayloadV1
+        )
+
+        let maximumLabel = String(
+            repeating: "a",
+            count: Bytecode.DynamicType.maximumTupleLabelUTF8LengthV1
+        )
+        #expect(
+            Bytecode.DynamicType.tuple([
+                .init(label: maximumLabel, type: .bool),
+                .init(type: .string),
+            ]).isAnyPayloadV1
+        )
+        #expect(
+            !Bytecode.DynamicType.tuple([
+                .init(label: maximumLabel + "a", type: .bool),
+                .init(type: .string),
+            ]).isAnyPayloadV1
+        )
+        #expect(
+            !Bytecode.DynamicType.tuple([
+                .init(label: "invalid\nlabel", type: .bool),
+                .init(label: "valid", type: .string),
+            ]).isAnyPayloadV1
+        )
+        #expect(
+            !Bytecode.DynamicType.tuple([
+                .init(label: "value", type: .bool),
+                .init(label: "value", type: .string),
+            ]).isAnyPayloadV1
         )
     }
 
@@ -56,14 +115,14 @@ struct AnyWireContract {
             seed: "fixture"
         )
         let signature = Core.LoweredSignature(
-            parameters: ["Swift.Int"],
-            result: "Swift.Int"
+            parameters: ["Swift.Array<Swift.Optional<Swift.Character>>"],
+            result: "Swift.Array<Swift.Optional<Swift.Character>>"
         )
         let key = try Core.FunctionKey.derive(
             namespace: namespace,
             module: "Fixture",
             sourceFileLogicalID: "Sources/Fixture.swift",
-            canonicalDeclaration: "func identity(_ value: Int) -> Int",
+            canonicalDeclaration: "func identity(_ value: [Character?]) -> [Character?]",
             loweredSignature: signature,
             role: .function
         )
@@ -71,8 +130,13 @@ struct AnyWireContract {
             id: .init(rawValue: 0),
             name: "identity",
             parameterRegisters: [.init(rawValue: 0)],
-            resultType: .int64,
-            registerTypes: [.int64, .any, .optional(.int64), .int64],
+            resultType: .array(.optional(.string)),
+            registerTypes: [
+                .array(.optional(.string)),
+                .any,
+                .optional(.array(.optional(.string))),
+                .array(.optional(.string)),
+            ],
             entryBlock: .init(rawValue: 0),
             blocks: [
                 .init(
@@ -81,15 +145,18 @@ struct AnyWireContract {
                     instructions: [
                         .eraseToAny(
                             result: .init(rawValue: 1),
-                            value: .init(rawValue: 0)
+                            value: .init(rawValue: 0),
+                            dynamicType: .array(.optional(.character))
                         ),
                         .checkedCastAny(
                             result: .init(rawValue: 2),
-                            value: .init(rawValue: 1)
+                            value: .init(rawValue: 1),
+                            targetType: .array(.optional(.character))
                         ),
                         .forceCastAny(
                             result: .init(rawValue: 3),
-                            value: .init(rawValue: 1)
+                            value: .init(rawValue: 1),
+                            targetType: .array(.optional(.character))
                         ),
                         .returnValue(.init(rawValue: 3)),
                     ]

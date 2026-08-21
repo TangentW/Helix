@@ -152,6 +152,18 @@ or a stable native C/Objective-C-shaped operation, while supported Swift
 Sequence APIs are recognized at the frontend and lowered onto a small set of
 typed cursors, builders, mutations, and ordinary closure calls.
 
+VM-owned `Any` follows the same split. Erasure and dynamic-cast instructions
+carry a closed recursive logical type descriptor separately from the physical
+HLBC register shape. The verifier proves descriptor/storage agreement, and the
+VM validates recursive payload invariants, depth, allocation, and traversal
+fuel. This preserves distinctions such as `Int` versus `Int64`, Character
+versus String, Substring versus Array, ArraySlice versus Array, and their nested
+Optional/Array/Dictionary/Set/tuple occurrences without serializing Swift
+metadata or calling a generic cast through NativeImport. At a Swift Shell
+boundary, recursively composed concrete codecs materialize the supported
+scalar, text, Optional, Array, Dictionary, and Set family; shapes that cannot
+be reconstructed exactly remain fail-closed.
+
 Scalar/text conversion uses the same boundary. The frontend's concrete and
 generic ABI entry points for `Bool`, every represented signed or unsigned
 fixed-width integer, `Float`, and `Double` parsing converge on one

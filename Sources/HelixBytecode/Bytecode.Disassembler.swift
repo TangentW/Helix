@@ -127,12 +127,12 @@ public enum Disassembler {
             "\(result) = make_error \(payload)"
         case let .castError(result, error, expectedType):
             "\(result) = cast_error \(error) to \(expectedType)"
-        case let .eraseToAny(result, value):
-            "\(result) = erase_to_any \(value)"
-        case let .checkedCastAny(result, value):
-            "\(result) = checked_cast_any \(value)"
-        case let .forceCastAny(result, value):
-            "\(result) = force_cast_any \(value)"
+        case let .eraseToAny(result, value, dynamicType):
+            "\(result) = erase_to_any \(value) as \(dynamicType)"
+        case let .checkedCastAny(result, value, targetType):
+            "\(result) = checked_cast_any \(value) to \(targetType)"
+        case let .forceCastAny(result, value, targetType):
+            "\(result) = force_cast_any \(value) to \(targetType)"
         case let .makeOptionalSome(result, value):
             "\(result) = optional_some \(value)"
         case let .makeOptionalNone(result):
