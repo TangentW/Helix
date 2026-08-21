@@ -17,7 +17,9 @@ enum SwiftCoreIntrinsic: Equatable {
     case managedCollectionCast(
         CanonicalSIL.ManagedCollectionCastIntrinsic
     )
+    case defaultValue(CanonicalSIL.DefaultValueIntrinsic)
     case scalarText(CanonicalSIL.ScalarTextIntrinsic)
+    case sourceFailure(CanonicalSIL.SourceFailureIntrinsic)
     case text(CanonicalSIL.TextIntrinsic)
     case minimum
     case maximum
@@ -65,9 +67,21 @@ enum SwiftCoreIntrinsic: Equatable {
     case allocateUninitializedArray
     case finalizeUninitializedArray
     case unexpectedNilOptional
-    case assertionFailure
+    case unsafeOptionalUnwrap
 
     init?(mangledName: String) {
+        if let defaultValue = CanonicalSIL.DefaultValueIntrinsic(
+            mangledName: mangledName
+        ) {
+            self = .defaultValue(defaultValue)
+            return
+        }
+        if let failure = CanonicalSIL.SourceFailureIntrinsic(
+            mangledName: mangledName
+        ) {
+            self = .sourceFailure(failure)
+            return
+        }
         if let scalar = CanonicalSIL.ScalarIntrinsic(mangledName: mangledName) {
             self = .scalar(scalar)
             return
@@ -292,10 +306,21 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .finalizeUninitializedArray
         case "$ss30_diagnoseUnexpectedNilOptional14_filenameStart01_E6Length01_E7IsASCII5_line17_isImplicitUnwrapyBp_BwBi1_BwBi1_tF":
             self = .unexpectedNilOptional
-        case "$ss17_assertionFailure__4file4line5flagss5NeverOs12StaticStringV_A2HSus6UInt32VtF":
-            self = .assertionFailure
+        case "$sSq17unsafelyUnwrappedxvg":
+            self = .unsafeOptionalUnwrap
         default:
             return nil
+        }
+    }
+
+    func closureReplacement(
+        for function: CanonicalSIL.Function
+    ) -> CanonicalSIL.Function? {
+        switch self {
+        case let .defaultValue(value):
+            value.closureReplacement(for: function)
+        default:
+            nil
         }
     }
 }

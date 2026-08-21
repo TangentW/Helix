@@ -2330,6 +2330,58 @@ struct Interpreter {
         )
     }
 
+    @Test("Source failures retain represented diagnostics and terminate execution")
+    func sourceFailureTerminatesExecution() throws {
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "sourceFailure",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .void,
+            registerTypes: [.string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .sourceFailure(
+                            prefix: "Precondition failed",
+                            detail: .init(rawValue: 0)
+                        ),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .stringsV1],
+            signature: .init(
+                parameters: ["Swift.String"],
+                result: "Swift.Void"
+            ),
+            parameterTypes: [.string],
+            resultType: .void
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.string("negative")]
+            ) == .trapped(
+                .sourceFailure(
+                    prefix: "Precondition failed",
+                    detail: "negative"
+                )
+            )
+        )
+        let empty = VM.RuntimeTrap.sourceFailure(
+            prefix: "Fatal error",
+            detail: ""
+        )
+        #expect(empty.description == "Fatal error")
+    }
+
     @Test("Array boundary storage is typed and charged before execution")
     func arrayBoundaryConsumesHeapBudget() throws {
         let arrayType = Bytecode.ValueType.array(.int64)

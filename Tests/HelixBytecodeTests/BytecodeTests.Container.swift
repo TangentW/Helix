@@ -243,6 +243,128 @@ struct Container {
         #expect(disassembly.contains("integer_to_string"))
     }
 
+    @Test("Dynamic source failures share the current HLBC 1.0 wire format")
+    func sourceFailureRoundTrip() throws {
+        var module = try makeAddModule()
+        module.capabilities.insert(.stringsV1)
+        module.functions[0] = .init(
+            id: .init(rawValue: 0),
+            name: "sourceFailure",
+            parameterRegisters: [],
+            resultType: .void,
+            registerTypes: [.string],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [],
+                    instructions: [
+                        .constantString(
+                            result: .init(rawValue: 0),
+                            value: "negative"
+                        ),
+                        .sourceFailure(
+                            prefix: "Precondition failed",
+                            detail: .init(rawValue: 0)
+                        ),
+                    ]
+                ),
+            ]
+        )
+
+        let bytes = try Bytecode.Encoder.encode(module)
+        let decoded = try Bytecode.Decoder.decode(bytes).module
+        let disassembly = Bytecode.Disassembler.disassemble(decoded)
+
+        #expect(decoded == module)
+        #expect(try Bytecode.Encoder.encode(decoded) == bytes)
+        #expect(
+            disassembly.contains(
+                "source_failure \"Precondition failed\", %0"
+            )
+        )
+    }
+
+    @Test("Instruction CFG successors are schema-defined")
+    func instructionSuccessors() {
+        let first = Bytecode.BlockID(rawValue: 1)
+        let second = Bytecode.BlockID(rawValue: 2)
+        let register = Bytecode.Register(rawValue: 0)
+        let cases: [(Bytecode.Instruction, [Bytecode.BlockID])] = [
+            (.branch(target: first, arguments: []), [first]),
+            (
+                .conditionalBranch(
+                    condition: register,
+                    trueTarget: first,
+                    trueArguments: [],
+                    falseTarget: second,
+                    falseArguments: []
+                ),
+                [first, second]
+            ),
+            (
+                .switchOptional(
+                    optional: register,
+                    someTarget: first,
+                    noneTarget: second
+                ),
+                [first, second]
+            ),
+            (
+                .switchEnum(
+                    enumeration: register,
+                    cases: [.init(caseIndex: 0, target: first)],
+                    defaultTarget: second
+                ),
+                [first, second]
+            ),
+            (
+                .tryApply(
+                    function: .init(rawValue: 0),
+                    arguments: [],
+                    normalTarget: first,
+                    errorTarget: second
+                ),
+                [first, second]
+            ),
+            (
+                .entryTryApply(
+                    entry: .init(rawValue: 0),
+                    arguments: [],
+                    normalTarget: first,
+                    errorTarget: second
+                ),
+                [first, second]
+            ),
+            (
+                .nativeTryApply(
+                    importID: .init(rawValue: 0),
+                    arguments: [],
+                    normalTarget: first,
+                    errorTarget: second
+                ),
+                [first, second]
+            ),
+            (
+                .closureTryApply(
+                    closure: register,
+                    arguments: [],
+                    normalTarget: first,
+                    errorTarget: second
+                ),
+                [first, second]
+            ),
+            (
+                .sourceFailure(prefix: "Failure", detail: register),
+                []
+            ),
+        ]
+
+        for (instruction, expected) in cases {
+            #expect(instruction.successorBlocks == expected)
+        }
+    }
+
     @Test("Encoding is deterministic")
     func deterministicEncoding() throws {
         let module = try makeAddModule()

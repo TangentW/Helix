@@ -752,6 +752,57 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Source failures require a bounded prefix and represented diagnostic")
+    func rejectsInvalidSourceFailures() throws {
+        let invalidDetail = try makeFixture { function in
+            function.blocks[0].instructions = [
+                .sourceFailure(
+                    prefix: "Failure",
+                    detail: .init(rawValue: 0)
+                ),
+            ]
+        }
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "source_failure detail must be String or Error"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(invalidDetail.module),
+                shell: invalidDetail.shell,
+                policy: invalidDetail.policy
+            )
+        }
+
+        var emptyPrefix = try makeFixture { function in
+            function.registerTypes.append(.string)
+            function.blocks[0].instructions = [
+                .constantString(result: .init(rawValue: 1), value: "detail"),
+                .sourceFailure(prefix: "", detail: .init(rawValue: 1)),
+            ]
+        }
+        emptyPrefix.module.capabilities.insert(.stringsV1)
+        emptyPrefix.shell.capabilities.insert(.stringsV1)
+        emptyPrefix.policy.acceptedCapabilities.insert(.stringsV1)
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "source_failure requires a nonempty prefix"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(emptyPrefix.module),
+                shell: emptyPrefix.shell,
+                policy: emptyPrefix.policy
+            )
+        }
+    }
+
     @Test("Text representation primitives enforce types and logical Character shape")
     func rejectsInvalidTextRepresentationInstructions() throws {
         var invalidCharacters = try makeFixture { function in

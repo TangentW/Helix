@@ -425,6 +425,8 @@ public enum Disassembler {
                 + "normal: \(normalTarget), error: \(errorTarget)"
         case let .returnValue(value): value.map { "return \($0)" } ?? "return"
         case let .throwError(error): "throw_error \(error)"
+        case let .sourceFailure(prefix, detail):
+            "source_failure \(quoted(prefix)), \(detail)"
         case let .trap(reason): "trap \(quoted(reason.description))"
         }
     }

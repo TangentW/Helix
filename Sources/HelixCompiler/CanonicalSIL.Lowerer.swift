@@ -805,6 +805,8 @@ public struct Lowerer: Sendable {
         var blocks: [IntermediateRepresentation.Block] = []
         var current: IntermediateRepresentation.Block?
         var unreachableTrapReasons: [Bytecode.BlockID: Bytecode.TrapReason] = [:]
+        var discardsRemainingCurrentSILBlock = false
+        var discardedSourceFailureTargets = Set<Bytecode.BlockID>()
         var currentSourceLocation: Core.SourceLocation?
         var currentSILLineIndex = 0
         var sourceMap: [IntermediateRepresentation.SourceMapEntry] = []
@@ -13224,7 +13226,236 @@ public struct Lowerer: Sendable {
                 }
             }
 
+            func emitSourceFailure(
+                prefix: String,
+                detail: Bytecode.Register
+            ) throws {
+                guard !prefix.isEmpty,
+                      [.string, .error].contains(
+                        registerTypes[Int(detail.rawValue)]
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift source failure has an invalid diagnostic value"
+                    )
+                }
+                // The frontend may route a compiler-inserted semantic trap
+                // through the same runtime helper as source-level fatalError.
+                // A preceding diagnostic intrinsic is authoritative when it
+                // has already classified that trap (for example, force unwrap).
+                if let blockID = current?.id,
+                   let reason = unreachableTrapReasons.removeValue(
+                       forKey: blockID
+                   ) {
+                    appendInstruction(.trap(reason))
+                } else {
+                    appendInstruction(
+                        .sourceFailure(prefix: prefix, detail: detail)
+                    )
+                }
+                voidValues.insert(resultToken)
+                discardsRemainingCurrentSILBlock = true
+            }
+
+            func emitStaticSourceFailure(
+                prefix: String,
+                detail: String
+            ) throws {
+                guard !prefix.isEmpty, !detail.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift static source failure has empty diagnostic metadata"
+                    )
+                }
+                // StaticString forms are emitted by compiler and standard-
+                // library checks rather than the public String-autoclosure
+                // APIs. Preserve their established semantic trap category.
+                appendInstruction(.trap(trapReason(for: detail)))
+                voidValues.insert(resultToken)
+                discardsRemainingCurrentSILBlock = true
+            }
+
+            func lowerSourceFailure(
+                _ failure: CanonicalSIL.SourceFailureIntrinsic
+            ) throws {
+                let uint = Bytecode.ValueType.integer(
+                    bitWidth: 64,
+                    signed: false
+                )
+                guard genericArguments.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift source failure unexpectedly has generic arguments"
+                    )
+                }
+
+                switch failure {
+                case .runtimeAssertion:
+                    guard arguments.count == 5,
+                          let prefix = staticStringValues[arguments[0]],
+                          !prefix.isEmpty,
+                          let detail = values[arguments[1]],
+                          registerTypes[Int(detail.rawValue)] == .string,
+                          let file = staticStringValues[arguments[2]],
+                          !file.isEmpty,
+                          let sourceLine = values[arguments[3]],
+                          registerTypes[Int(sourceLine.rawValue)] == uint,
+                          let flags = values[arguments[4]],
+                          registerTypes[Int(flags.rawValue)]
+                            == .integer(bitWidth: 32, signed: false)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Swift runtime assertion has unsupported metadata"
+                        )
+                    }
+                    try emitSourceFailure(prefix: prefix, detail: detail)
+
+                case .runtimeAssertionWithoutLocation:
+                    guard arguments.count == 3,
+                          let prefix = staticStringValues[arguments[0]],
+                          !prefix.isEmpty,
+                          let detail = values[arguments[1]],
+                          registerTypes[Int(detail.rawValue)] == .string,
+                          let flags = values[arguments[2]],
+                          registerTypes[Int(flags.rawValue)]
+                            == .integer(bitWidth: 32, signed: false)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Swift runtime assertion has unsupported metadata"
+                        )
+                    }
+                    try emitSourceFailure(prefix: prefix, detail: detail)
+
+                case .runtimeStaticAssertion:
+                    guard arguments.count == 5,
+                          let prefix = staticStringValues[arguments[0]],
+                          let detail = staticStringValues[arguments[1]],
+                          let file = staticStringValues[arguments[2]],
+                          !file.isEmpty,
+                          let sourceLine = values[arguments[3]],
+                          registerTypes[Int(sourceLine.rawValue)] == uint,
+                          let flags = values[arguments[4]],
+                          registerTypes[Int(flags.rawValue)]
+                            == .integer(bitWidth: 32, signed: false)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Swift static runtime assertion has unsupported metadata"
+                        )
+                    }
+                    try emitStaticSourceFailure(
+                        prefix: prefix,
+                        detail: detail
+                    )
+
+                case .debugAssertion:
+                    guard arguments.count == 3,
+                          let file = staticStringValues[arguments[1]],
+                          !file.isEmpty,
+                          let sourceLine = values[arguments[2]],
+                          registerTypes[Int(sourceLine.rawValue)] == uint
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Swift debug assertion has unsupported metadata"
+                        )
+                    }
+                    let closure = try resolve(arguments[0], line: line)
+                    guard case let .closure(signature) = registerTypes[
+                        Int(closure.rawValue)
+                    ], signature.parameters.isEmpty,
+                       signature.parameterConventions.isEmpty,
+                       signature.result == .string,
+                       !signature.effects.mayThrow,
+                       !signature.effects.isAsync
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Swift debug assertion message is not a String autoclosure"
+                        )
+                    }
+                    let detail = try allocate(type: .string)
+                    appendInstruction(
+                        .closureApply(
+                            result: detail,
+                            closure: closure,
+                            arguments: []
+                        )
+                    )
+                    try emitSourceFailure(
+                        prefix: "Assertion failed",
+                        detail: detail
+                    )
+
+                case .unexpectedError:
+                    guard arguments.count == 5,
+                          let filename = stringLiterals[arguments[1]],
+                          let filenameLength = wordLiterals[arguments[2]],
+                          let filenameIsASCII = boolLiterals[arguments[3]],
+                          let sourceLine = wordLiterals[arguments[4]],
+                          UInt64(filename.utf8.count) == filenameLength,
+                          filename.utf8.allSatisfy({ $0 < 0x80 })
+                            == filenameIsASCII,
+                          sourceLine > 0,
+                          let detail = try materializeErrorValue(
+                            from: arguments[0]
+                          )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Swift unexpected-error trap has unsupported metadata"
+                        )
+                    }
+                    try emitSourceFailure(
+                        prefix: "try! expression unexpectedly raised an error",
+                        detail: detail
+                    )
+                }
+            }
+
+            func lowerUnsafeOptionalUnwrap() throws {
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard specializations.count == 1,
+                      arguments.count == 2
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional.unsafelyUnwrapped has unsupported arguments"
+                    )
+                }
+                let wrapped = try parseStoredType(specializations[0])
+                guard compilerAddressType(arguments[0]) == wrapped,
+                      compilerAddressType(arguments[1]) == .optional(wrapped),
+                      let optional = try copyStoredValue(
+                        at: arguments[1],
+                        line: line
+                      ),
+                      registerTypes[Int(optional.rawValue)]
+                        == .optional(wrapped)
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Optional.unsafelyUnwrapped storage does not match its specialization"
+                    )
+                }
+                let result = try allocate(type: wrapped)
+                appendInstruction(
+                    .unwrapOptional(result: result, optional: optional)
+                )
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+            }
+
             switch intrinsic {
+            case .defaultValue(.emptyString):
+                guard genericArguments.isEmpty, arguments.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift empty-String default helper has unexpected arguments"
+                    )
+                }
+                let result = try allocate(type: .string)
+                values[resultToken] = result
+                appendInstruction(
+                    .constantString(result: result, value: "")
+                )
+
             case let .scalar(scalar):
                 try lowerScalarIntrinsic(
                     scalar,
@@ -13590,28 +13821,11 @@ public struct Lowerer: Sendable {
                 unreachableTrapReasons[blockID] = .optionalUnwrapOfNil
                 voidValues.insert(resultToken)
 
-            case .assertionFailure:
-                guard genericArguments.isEmpty,
-                      arguments.count == 5,
-                      let prefix = staticStringValues[arguments[0]],
-                      let message = staticStringValues[arguments[1]],
-                      staticStringValues[arguments[2]] != nil,
-                      values[arguments[3]] != nil,
-                      values[arguments[4]] != nil,
-                      !prefix.isEmpty,
-                      !message.isEmpty,
-                      let blockID = current?.id,
-                      unreachableTrapReasons[blockID] == nil
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Swift assertion failure has unsupported metadata"
-                    )
-                }
-                // Assertion metadata stays compiler-only, but retain its
-                // diagnostic in the trap emitted by the following canonical
-                // `unreachable` terminator.
-                unreachableTrapReasons[blockID] = trapReason(for: message)
-                voidValues.insert(resultToken)
+            case let .sourceFailure(failure):
+                try lowerSourceFailure(failure)
+
+            case .unsafeOptionalUnwrap:
+                try lowerUnsafeOptionalUnwrap()
 
             case let .scalarText(scalarText):
                 try lowerScalarTextIntrinsic(scalarText)
@@ -15430,6 +15644,237 @@ public struct Lowerer: Sendable {
             appendInstruction(.copyValue(result: result, source: source))
         }
 
+        func lowerBorrowEnd(
+            _ token: String,
+            emitsRuntimeCleanup: Bool
+        ) {
+            if staticKeyPathValues[token] != nil { return }
+            borrowedValueTokens.remove(token)
+            if let value = mutableCaptureState.temporaryBorrowOwners.removeValue(
+                forKey: token
+            ), registerTypes[Int(value.rawValue)].requiresLinearOwnership,
+               emitsRuntimeCleanup {
+                appendInstruction(.destroyValue(value))
+            }
+            if let value = removeBorrowedTemporaryValue(for: token) {
+                clearBorrowedTemporaryClassification(for: token)
+                if emitsRuntimeCleanup {
+                    appendInstruction(.destroyValue(value))
+                }
+            }
+        }
+
+        /// A source failure terminates the HLBC edge before canonical SIL's
+        /// lexical tail. Still validate and retire its compiler storage facts;
+        /// frame unwinding owns runtime cleanup on the terminated edge.
+        func lowerStackDeallocation(
+            _ token: String,
+            emitsRuntimeCleanup: Bool
+        ) throws {
+            func emitCleanup(
+                _ instruction: IntermediateRepresentation.Instruction
+            ) {
+                guard emitsRuntimeCleanup else { return }
+                appendInstruction(instruction)
+            }
+
+            let address = addressBase(token)
+            guard let remainingUses = remainingDeallocStackUses[token],
+                  remainingUses > 0
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "dealloc_stack is absent from the lexical cleanup inventory"
+                )
+            }
+            let isFinalLexicalUse = remainingUses == 1
+            if isFinalLexicalUse {
+                remainingDeallocStackUses.removeValue(forKey: token)
+            } else {
+                remainingDeallocStackUses[token] = remainingUses - 1
+            }
+            if compilerEnumAddressTypes[address] != nil {
+                if isFinalLexicalUse {
+                    compilerEnumAddressTypes.removeValue(forKey: address)
+                    compilerEnumAddressCases.removeValue(forKey: address)
+                }
+                return
+            }
+            if onStackClosureValues.contains(address) {
+                // SIL models an on-stack partial_apply as storage. The VM owns
+                // the corresponding closure value for its frame lifetime.
+                if isFinalLexicalUse { onStackClosureValues.remove(address) }
+                return
+            }
+            if catchScratchAddresses.contains(address),
+               runtimeStackSlots[address] == nil {
+                return
+            }
+            if progressionAddresses[address] != nil {
+                guard progressionAddressValues[address] != nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "progression storage is deallocated before initialization"
+                    )
+                }
+                if isFinalLexicalUse {
+                    progressionAddresses.removeValue(forKey: address)
+                    progressionAddressValues.removeValue(forKey: address)
+                }
+                return
+            }
+            if progressionIteratorAddresses[address] != nil {
+                guard let state = progressionIteratorStates[address] else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "progression iterator storage is deallocated before initialization"
+                    )
+                }
+                emitCleanup(.destroyStack(state.cursorSlot))
+                if isFinalLexicalUse {
+                    progressionIteratorAddresses.removeValue(forKey: address)
+                    progressionIteratorStates.removeValue(forKey: address)
+                }
+                return
+            }
+            if pendingStringInterpolationAddresses.contains(address) {
+                guard stringInterpolationAddressValues[address] == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "String interpolation storage is deallocated before take"
+                    )
+                }
+                if isFinalLexicalUse {
+                    pendingStringInterpolationAddresses.remove(address)
+                }
+                return
+            }
+            if pendingArrayIteratorTypes[address] != nil {
+                guard let block = current?.id,
+                      let iterator = arrayIteratorStates[address]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Array iterator is deallocated before initialization"
+                    )
+                }
+                let hasExplicitDestroy = explicitlyDestroyedAddresses
+                    .contains(token)
+                if hasExplicitDestroy {
+                    guard destroyedArrayIterators[address]?
+                        .contains(block) == true
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Array iterator is deallocated before destroy_addr"
+                        )
+                    }
+                } else {
+                    guard destroyedArrayIterators[address, default: []]
+                        .insert(block).inserted
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "trivial Array iterator is deallocated twice"
+                        )
+                    }
+                    emitCleanup(.destroyStack(iterator.indexSlot))
+                }
+                if isFinalLexicalUse {
+                    pendingArrayIteratorTypes.removeValue(forKey: address)
+                    arrayIteratorStates.removeValue(forKey: address)
+                    destroyedArrayIterators.removeValue(forKey: address)
+                }
+                return
+            }
+            if pendingDictionaryIteratorTypes[address] != nil {
+                guard let block = current?.id,
+                      dictionaryIteratorStates[address] != nil,
+                      destroyedDictionaryIterators[address]?
+                        .contains(block) == true
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Dictionary iterator is deallocated before destroy_addr"
+                    )
+                }
+                if isFinalLexicalUse {
+                    pendingDictionaryIteratorTypes.removeValue(forKey: address)
+                    dictionaryIteratorStates.removeValue(forKey: address)
+                    destroyedDictionaryIterators.removeValue(forKey: address)
+                }
+                return
+            }
+            if pendingSetIteratorTypes[address] != nil {
+                guard let block = current?.id,
+                      setIteratorStates[address] != nil,
+                      destroyedSetIterators[address]?.contains(block) == true
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Set iterator is deallocated before destroy_addr"
+                    )
+                }
+                if isFinalLexicalUse {
+                    pendingSetIteratorTypes.removeValue(forKey: address)
+                    setIteratorStates.removeValue(forKey: address)
+                    destroyedSetIterators.removeValue(forKey: address)
+                }
+                return
+            }
+            if let slot = runtimeStackSlots[address] {
+                switch storageInitializationPlan.deallocationMode(
+                    at: currentSILLineIndex
+                ) {
+                case .none:
+                    break
+                case .destroy:
+                    emitCleanup(.destroyStack(slot))
+                case .destroyIfInitialized:
+                    emitCleanup(.destroyStackIfInitialized(slot))
+                }
+                guard stackAddressTypes[address] != nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "runtime stack address lost its declared type"
+                    )
+                }
+                // SIL prints mutually exclusive successor blocks in one
+                // linear stream. Keep declarations and initialization facts
+                // so each successor can retire its own lexical storage.
+                return
+            }
+            guard stackAddressTypes[address] != nil else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "dealloc_stack references an unsupported address"
+                )
+            }
+            takenOptionalPayloads = takenOptionalPayloads.filter {
+                addressBase($0.value.address) != address
+            }
+            // Some imported C values are trivial in SIL but owned in HLBC.
+            // A terminating edge relies on frame unwind instead of emitting
+            // cleanup after its terminator.
+            var storedValues = removeTupleComponentValues(rootedAt: address)
+            if let aggregate = stackAddressValues.removeValue(forKey: address) {
+                storedValues.append(aggregate)
+            }
+            for value in Set(storedValues)
+            where registerTypes[Int(value.rawValue)].requiresLinearOwnership {
+                emitCleanup(.destroyValue(value))
+            }
+        }
+
+        func recordDiscardedSourceFailureTargets(in line: String) {
+            let branchPrefixes = [
+                "br ", "cond_br ", "switch_", "try_apply ",
+                "checked_cast_", "dynamic_method_br ", "yield ",
+            ]
+            guard branchPrefixes.contains(where: line.hasPrefix) else {
+                return
+            }
+            for token in line.split(whereSeparator: {
+                !$0.isLetter && !$0.isNumber
+            }) where token.hasPrefix("bb") {
+                guard let rawValue = UInt32(token.dropFirst(2)) else {
+                    continue
+                }
+                discardedSourceFailureTargets.insert(
+                    .init(rawValue: rawValue)
+                )
+            }
+        }
+
         for (lineIndex, originalRawLine) in rawLines.enumerated() {
             currentSILLineIndex = lineIndex
             let rawLine = nsErrorBridges.replacementLines[lineIndex]
@@ -15448,23 +15893,30 @@ public struct Lowerer: Sendable {
                 ?? debugLineLocations[sourceLine]
             let line = parsedLine.instruction
             if nsErrorBridges.skippedLines.contains(lineIndex) { continue }
+            let startsBlock = parseBlockNumber(line) != nil
+            if startsBlock { discardsRemainingCurrentSILBlock = false }
             if let borrowEnd = match(
                 line,
                 pattern: #"^end_borrow (%[0-9]+)$"#
             ) {
-                if staticKeyPathValues[borrowEnd[0]] != nil {
-                    continue
-                }
-                borrowedValueTokens.remove(borrowEnd[0])
-                if let value = mutableCaptureState.temporaryBorrowOwners.removeValue(
-                    forKey: borrowEnd[0]
-                ), registerTypes[Int(value.rawValue)].requiresLinearOwnership {
-                    appendInstruction(.destroyValue(value))
-                }
-                if let value = removeBorrowedTemporaryValue(for: borrowEnd[0]) {
-                    clearBorrowedTemporaryClassification(for: borrowEnd[0])
-                    appendInstruction(.destroyValue(value))
-                }
+                lowerBorrowEnd(
+                    borrowEnd[0],
+                    emitsRuntimeCleanup: !discardsRemainingCurrentSILBlock
+                )
+                continue
+            }
+            if let deallocation = match(
+                line,
+                pattern: #"^dealloc_stack (%[0-9]+)$"#
+            ) {
+                try lowerStackDeallocation(
+                    deallocation[0],
+                    emitsRuntimeCleanup: !discardsRemainingCurrentSILBlock
+                )
+                continue
+            }
+            if discardsRemainingCurrentSILBlock, !startsBlock {
+                recordDiscardedSourceFailureTargets(in: line)
                 continue
             }
             guard !line.isEmpty,
@@ -16455,191 +16907,6 @@ public struct Lowerer: Sendable {
                     deferredAccessMetadataCleanup.insert(token)
                 } else {
                     removeAccessMetadata(token)
-                }
-                continue
-            }
-
-            if let deallocation = match(line, pattern: #"^dealloc_stack (%[0-9]+)$"#) {
-                let token = deallocation[0]
-                let address = addressBase(token)
-                guard let remainingUses = remainingDeallocStackUses[token],
-                      remainingUses > 0
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "dealloc_stack is absent from the lexical cleanup inventory"
-                    )
-                }
-                let isFinalLexicalUse = remainingUses == 1
-                if isFinalLexicalUse {
-                    remainingDeallocStackUses.removeValue(forKey: token)
-                } else {
-                    remainingDeallocStackUses[token] = remainingUses - 1
-                }
-                if compilerEnumAddressTypes[address] != nil {
-                    if isFinalLexicalUse {
-                        compilerEnumAddressTypes.removeValue(forKey: address)
-                        compilerEnumAddressCases.removeValue(forKey: address)
-                    }
-                    continue
-                }
-                if onStackClosureValues.contains(address) {
-                    // SIL models an on-stack partial_apply as storage. The VM owns the
-                    // corresponding closure value for the lifetime of its frame.
-                    if isFinalLexicalUse { onStackClosureValues.remove(address) }
-                    continue
-                }
-                if catchScratchAddresses.contains(address),
-                   runtimeStackSlots[address] == nil {
-                    continue
-                }
-                if progressionAddresses[address] != nil {
-                    guard progressionAddressValues[address] != nil else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "progression storage is deallocated before initialization"
-                        )
-                    }
-                    if isFinalLexicalUse {
-                        progressionAddresses.removeValue(forKey: address)
-                        progressionAddressValues.removeValue(forKey: address)
-                    }
-                    continue
-                }
-                if progressionIteratorAddresses[address] != nil {
-                    guard let state = progressionIteratorStates[address]
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "progression iterator storage is deallocated before initialization"
-                        )
-                    }
-                    appendInstruction(.destroyStack(state.cursorSlot))
-                    if isFinalLexicalUse {
-                        progressionIteratorAddresses.removeValue(forKey: address)
-                        progressionIteratorStates.removeValue(forKey: address)
-                    }
-                    continue
-                }
-                if pendingStringInterpolationAddresses.contains(address) {
-                    guard stringInterpolationAddressValues[address] == nil else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "String interpolation storage is deallocated before take"
-                        )
-                    }
-                    if isFinalLexicalUse {
-                        pendingStringInterpolationAddresses.remove(address)
-                    }
-                    continue
-                }
-                if pendingArrayIteratorTypes[address] != nil {
-                    guard let block = current?.id,
-                          let iterator = arrayIteratorStates[address]
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Array iterator is deallocated before initialization"
-                        )
-                    }
-                    let hasExplicitDestroy = explicitlyDestroyedAddresses
-                        .contains(token)
-                    if hasExplicitDestroy {
-                        guard destroyedArrayIterators[address]?
-                            .contains(block) == true
-                        else {
-                            throw CanonicalSIL.LoweringError.malformedSIL(
-                                "Array iterator is deallocated before destroy_addr"
-                            )
-                        }
-                    } else {
-                        guard destroyedArrayIterators[address, default: []]
-                            .insert(block).inserted
-                        else {
-                            throw CanonicalSIL.LoweringError.malformedSIL(
-                                "trivial Array iterator is deallocated twice"
-                            )
-                        }
-                        appendInstruction(.destroyStack(iterator.indexSlot))
-                    }
-                    if isFinalLexicalUse {
-                        pendingArrayIteratorTypes.removeValue(forKey: address)
-                        arrayIteratorStates.removeValue(forKey: address)
-                        destroyedArrayIterators.removeValue(forKey: address)
-                    }
-                    continue
-                }
-                if pendingDictionaryIteratorTypes[address] != nil {
-                    guard let block = current?.id,
-                          dictionaryIteratorStates[address] != nil,
-                          destroyedDictionaryIterators[address]?.contains(block) == true
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Dictionary iterator is deallocated before destroy_addr"
-                        )
-                    }
-                    if isFinalLexicalUse {
-                        pendingDictionaryIteratorTypes.removeValue(forKey: address)
-                        dictionaryIteratorStates.removeValue(forKey: address)
-                        destroyedDictionaryIterators.removeValue(forKey: address)
-                    }
-                    continue
-                }
-                if pendingSetIteratorTypes[address] != nil {
-                    guard let block = current?.id,
-                          setIteratorStates[address] != nil,
-                          destroyedSetIterators[address]?.contains(block) == true
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Set iterator is deallocated before destroy_addr"
-                        )
-                    }
-                    if isFinalLexicalUse {
-                        pendingSetIteratorTypes.removeValue(forKey: address)
-                        setIteratorStates.removeValue(forKey: address)
-                        destroyedSetIterators.removeValue(forKey: address)
-                    }
-                    continue
-                }
-                if let slot = runtimeStackSlots[address] {
-                    switch storageInitializationPlan.deallocationMode(
-                        at: currentSILLineIndex
-                    ) {
-                    case .none:
-                        break
-                    case .destroy:
-                        appendInstruction(.destroyStack(slot))
-                    case .destroyIfInitialized:
-                        appendInstruction(
-                            .destroyStackIfInitialized(slot)
-                        )
-                    }
-                    guard stackAddressTypes[address] != nil else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "runtime stack address lost its declared type"
-                        )
-                    }
-                    // SIL prints mutually exclusive successor blocks in one
-                    // linear stream. Keep the compile-time slot declaration
-                    // and initialization evidence so each successor can emit
-                    // its own destroy_stack; HLBC verification then proves
-                    // exactly one destroy occurs on every runtime path.
-                    continue
-                }
-                guard stackAddressTypes[address] != nil else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "dealloc_stack references an unsupported address"
-                    )
-                }
-                takenOptionalPayloads = takenOptionalPayloads.filter {
-                    addressBase($0.value.address) != address
-                }
-                // Swift treats some imported C values as trivial even though
-                // HLBC represents them with an owned native box. Release any
-                // compiler-only storage that SIL legitimately deallocates
-                // without a preceding destroy_addr.
-                var storedValues = removeTupleComponentValues(rootedAt: address)
-                if let aggregate = stackAddressValues.removeValue(forKey: address) {
-                    storedValues.append(aggregate)
-                }
-                for value in Set(storedValues)
-                where registerTypes[Int(value.rawValue)].requiresLinearOwnership {
-                    appendInstruction(.destroyValue(value))
                 }
                 continue
             }
@@ -17941,7 +18208,14 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = (?:dynamic_)?function_ref @([^\s:]+) : \$(.+)$"#
             ) {
-                if let intrinsic = SwiftCoreIntrinsic(mangledName: reference[1]) {
+                let boundCall = directCalls.binding(for: reference[1])
+                let hasImageBody = boundCall.map { binding in
+                    if case .function = binding.target { true } else { false }
+                } ?? false
+                if !hasImageBody,
+                   let intrinsic = SwiftCoreIntrinsic(
+                       mangledName: reference[1]
+                   ) {
                     swiftCoreReferences[reference[0]] = intrinsic
                     continue
                 }
@@ -17974,7 +18248,7 @@ public struct Lowerer: Sendable {
                         continue
                     }
                 }
-                guard let binding = directCalls.binding(for: reference[1]) else {
+                guard let binding = boundCall else {
                     if let unavailable = directCalls.unavailableCall(for: reference[1]) {
                         throw CanonicalSIL.LoweringError.unavailableNativeImport(
                             line: sourceLine,
@@ -22067,6 +22341,57 @@ public struct Lowerer: Sendable {
                 "compiler-only lifetime is incomplete in \(displayName): "
                     + incompleteCompilerLifetimes.joined(separator: ", ")
             )
+        }
+
+        var blocksByID: [
+            Bytecode.BlockID: IntermediateRepresentation.Block
+        ] = [:]
+        for block in blocks {
+            guard blocksByID.updateValue(block, forKey: block.id) == nil else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "lowered function contains duplicate block \(block.id)"
+                )
+            }
+        }
+        var reachableBlocks: Set<Bytecode.BlockID> = [entryBlock]
+        var reachabilityWorklist = [entryBlock]
+        while let blockID = reachabilityWorklist.popLast(),
+              let block = blocksByID[blockID],
+              let terminator = block.instructions.last {
+            for successor in terminator.successorBlocks
+            where blocksByID[successor] != nil
+                && reachableBlocks.insert(successor).inserted {
+                reachabilityWorklist.append(successor)
+            }
+        }
+        if reachableBlocks.count != blocks.count {
+            var sourceFailurePrunableBlocks = Set<Bytecode.BlockID>()
+            var pruningWorklist = Array(
+                discardedSourceFailureTargets.filter {
+                    blocksByID[$0] != nil
+                }
+            )
+            while let blockID = pruningWorklist.popLast(),
+                  sourceFailurePrunableBlocks.insert(blockID).inserted,
+                  let block = blocksByID[blockID],
+                  let terminator = block.instructions.last {
+                pruningWorklist.append(
+                    contentsOf: terminator.successorBlocks.filter {
+                        blocksByID[$0] != nil
+                    }
+                )
+            }
+            let unreachableBlocks = Set(blocksByID.keys)
+                .subtracting(reachableBlocks)
+            guard unreachableBlocks.isSubset(
+                of: sourceFailurePrunableBlocks
+            ) else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "lowered function contains unrelated unreachable blocks"
+                )
+            }
+            blocks.removeAll { !reachableBlocks.contains($0.id) }
+            sourceMap.removeAll { !reachableBlocks.contains($0.blockID) }
         }
 
         return IntermediateRepresentation.Function(

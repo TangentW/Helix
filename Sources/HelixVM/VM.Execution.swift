@@ -49,6 +49,7 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
     case nativeOwnedMemoryLimitExceeded
     case wallTimeExceeded
     case nativeFailure(String)
+    case sourceFailure(prefix: String, detail: String)
     case explicit(String)
 
     public var description: String {
@@ -107,6 +108,8 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
         case .nativeOwnedMemoryLimitExceeded: "maximum native-owned memory budget exceeded"
         case .wallTimeExceeded: "HLBC wall-time budget exceeded"
         case let .nativeFailure(message): "native invocation failed: \(message)"
+        case let .sourceFailure(prefix, detail):
+            detail.isEmpty ? prefix : "\(prefix): \(detail)"
         case let .explicit(message): message
         }
     }

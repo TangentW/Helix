@@ -1570,19 +1570,7 @@ public struct Engine: Verification.ImageVerifying {
     }
 
     private func successors(of instruction: Bytecode.Instruction) -> [Bytecode.BlockID] {
-        switch instruction {
-        case let .branch(target, _): [target]
-        case let .conditionalBranch(_, trueTarget, _, falseTarget, _): [trueTarget, falseTarget]
-        case let .switchOptional(_, someTarget, noneTarget): [someTarget, noneTarget]
-        case let .switchEnum(_, cases, defaultTarget):
-            cases.map(\.target) + (defaultTarget.map { [$0] } ?? [])
-        case let .tryApply(_, _, normalTarget, errorTarget),
-             let .entryTryApply(_, _, normalTarget, errorTarget),
-             let .nativeTryApply(_, _, normalTarget, errorTarget),
-             let .closureTryApply(_, _, normalTarget, errorTarget):
-            [normalTarget, errorTarget]
-        default: []
-        }
+        instruction.successorBlocks
     }
 
     private func computeReachable(
@@ -3411,6 +3399,13 @@ public struct Engine: Verification.ImageVerifying {
             default:
                 throw fail("throw_error payload does not match its declared Error capability")
             }
+        case let .sourceFailure(prefix, detail):
+            guard !prefix.isEmpty else {
+                throw fail("source_failure requires a nonempty prefix")
+            }
+            guard [.string, .error].contains(type(detail)) else {
+                throw fail("source_failure detail must be String or Error")
+            }
         case .trap:
             break
         }
@@ -4065,7 +4060,7 @@ public struct Engine: Verification.ImageVerifying {
                     guard live.isEmpty else {
                         throw fail("owned values remain live at throw")
                     }
-                case .trap:
+                case .sourceFailure, .trap:
                     live.removeAll()
                 case .constantInteger, .constantBool, .constantFloat, .checkedBinary,
                      .floatingBinary, .floatingUnary, .floatingPredicate,
@@ -4507,10 +4502,9 @@ public struct Engine: Verification.ImageVerifying {
 
             let targets = block.instructions.last.map(successors) ?? []
             if targets.isEmpty {
-                let abandonsScopes: Bool = if case .trap? = block.instructions.last {
-                    true
-                } else {
-                    false
+                let abandonsScopes: Bool = switch block.instructions.last {
+                case .sourceFailure?, .trap?: true
+                default: false
                 }
                 guard active.isEmpty || abandonsScopes else {
                     throw Verification.Error.invalidBlock(
@@ -5131,7 +5125,7 @@ public struct Engine: Verification.ImageVerifying {
                     }) else {
                         throw fail("initialized stack slots remain at function exit")
                     }
-                case .trap:
+                case .sourceFailure, .trap:
                     // Runtime unwinding releases the entire verified frame.
                     initialized = emptyState
                 default:

@@ -4213,6 +4213,25 @@ public struct Interpreter: Sendable {
                     default:
                         throw VM.RuntimeTrap.typeMismatch(expected: .error, actual: value.type)
                     }
+                case let .sourceFailure(prefix, detailRegister):
+                    let detail = try read(detailRegister, registers: registers)
+                    switch detail {
+                    case let .string(message):
+                        throw VM.RuntimeTrap.sourceFailure(
+                            prefix: prefix,
+                            detail: message
+                        )
+                    case let .error(error):
+                        throw VM.RuntimeTrap.sourceFailure(
+                            prefix: prefix,
+                            detail: error.message
+                        )
+                    default:
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .string,
+                            actual: detail.type
+                        )
+                    }
                 case let .trap(reason):
                     throw runtimeTrap(for: reason)
                 }

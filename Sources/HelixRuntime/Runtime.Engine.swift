@@ -590,7 +590,7 @@ public final class Engine: @unchecked Sendable {
              .vmHeapLimitExceeded, .nativeOwnedMemoryLimitExceeded,
              .wallTimeExceeded, .mainActorViolation, .nativeImportThreadViolation,
              .nativeImportDeadlineExceeded, .nativeImportCooperationViolation,
-             .nativeFailure, .explicit:
+             .nativeFailure, .sourceFailure, .explicit:
             false
         }
     }

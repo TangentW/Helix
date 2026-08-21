@@ -217,6 +217,13 @@ trap. Both operations remain part of the current HLBC 1.0 contract.
 Private
 String indices, UTF views, index-sensitive mutation, and Foundation text
 semantics remain fail-closed.
+Current source-level irrecoverable failures are also verifier-visible:
+`precondition`, fatal-error families, active assertions, and failed `try!`
+edges lower to terminal traps, with one `source_failure` form for represented
+String/Error details. `Optional.unsafelyUnwrapped` shares the ordinary typed
+Optional projection and nil trap. These paths do not add Swift runtime failure
+symbols to the NativeImport Catalog, and source locations remain in the
+sanitized HLBC source map.
 Frontend Array/Dictionary cast helpers may erase tuple labels only when the
 original types differ solely by those labels and both complete VM types match;
 real element, key, value, and reference conversions remain rejected.

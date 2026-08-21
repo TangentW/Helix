@@ -1006,6 +1006,9 @@ public enum Instruction: Codable, Hashable, Sendable {
     )
     case returnValue(Bytecode.Register?)
     case throwError(Bytecode.Register)
+    /// Terminates source execution with a represented String or Error detail.
+    /// Prefix metadata is compiler-validated and bounded by the HLBC decoder.
+    case sourceFailure(prefix: String, detail: Bytecode.Register)
     case trap(Bytecode.TrapReason)
 
     public var resultRegisters: [Bytecode.Register] {
@@ -1156,7 +1159,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              .destroyAddressIfInitialized, .switchOptional, .branch,
              .conditionalBranch, .closureTryApply, .tryApply,
              .entryTryApply, .nativeTryApply,
-             .returnValue, .throwError, .trap:
+             .returnValue, .throwError, .sourceFailure, .trap:
             []
         }
     }
@@ -1405,7 +1408,7 @@ public enum Instruction: Codable, Hashable, Sendable {
             arguments
         case let .returnValue(value):
             value.map { [$0] } ?? []
-        case let .throwError(error):
+        case let .throwError(error), let .sourceFailure(_, error):
             [error]
         }
     }
@@ -1414,9 +1417,34 @@ public enum Instruction: Codable, Hashable, Sendable {
         switch self {
         case .switchOptional, .switchEnum, .branch, .conditionalBranch,
              .closureTryApply, .tryApply, .entryTryApply, .nativeTryApply,
-             .returnValue, .throwError, .trap:
+             .returnValue, .throwError, .sourceFailure, .trap:
             true
         default: false
+        }
+    }
+
+    /// Static CFG successors carried by a terminator. Keeping this beside the
+    /// instruction schema prevents compiler and verifier reachability rules
+    /// from drifting as new branch forms are added.
+    public var successorBlocks: [Bytecode.BlockID] {
+        switch self {
+        case let .branch(target, _):
+            [target]
+        case let .conditionalBranch(
+            _, trueTarget, _, falseTarget, _
+        ):
+            [trueTarget, falseTarget]
+        case let .switchOptional(_, someTarget, noneTarget):
+            [someTarget, noneTarget]
+        case let .switchEnum(_, cases, defaultTarget):
+            cases.map(\.target) + (defaultTarget.map { [$0] } ?? [])
+        case let .tryApply(_, _, normalTarget, errorTarget),
+             let .entryTryApply(_, _, normalTarget, errorTarget),
+             let .nativeTryApply(_, _, normalTarget, errorTarget),
+             let .closureTryApply(_, _, normalTarget, errorTarget):
+            [normalTarget, errorTarget]
+        default:
+            []
         }
     }
 }

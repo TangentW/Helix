@@ -164,6 +164,16 @@ Swift's native parser or formatter as a private implementation leaf. This
 reuses native standard-library behavior without exposing its generic ABI as a
 NativeImport or multiplying operations by API, scalar type, or bit width.
 
+Swift failure helpers are normalized at that boundary as well. The current
+frontend forms behind `precondition`, `fatalError`, active assertions, and
+`try!` become verified terminal control flow rather than calls to private Swift
+runtime symbols. Static diagnostics use an ordinary trap; dynamic String or
+represented Error details use one `source_failure` terminator. Direct
+`assertionFailure` evaluates its autoclosure on the failing path, while
+`Optional.unsafelyUnwrapped` reuses the generic Optional projection and nil
+trap. Logical source-map coordinates supply the file and line without
+serializing build-machine paths into the instruction.
+
 Text follows that same split rather than receiving an API-shaped import table.
 The compiler keeps String and the one-grapheme Character contract logically
 distinct even though both use the compact HLBC String value, and normalizes

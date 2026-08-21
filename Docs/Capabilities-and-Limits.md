@@ -104,11 +104,20 @@ does not by itself certify a physical device or distribution channel.
   such as `T?`, `T!`, `[T]`, `[K: V]`, and redundant grouping parentheses
   normalize recursively to the same typed representation, including in
   patch-local stored fields.
-- Direct Optional force unwrap is supported for represented payloads and a nil
-  unwrap retains its dedicated verified trap reason. A payload-free runtime
+- Direct Optional force unwrap and `unsafelyUnwrapped` are supported for
+  represented payloads and a nil unwrap retains its dedicated verified trap
+  reason. A payload-free runtime
   `nil` obtains `T` from its verified static context, including nested tuples,
   collection builders, mutation/sort/split states, Dictionary keys and values,
   and VM equality.
+- Source-level irrecoverable failures emitted by the captured frontend are
+  explicit verified control flow. This covers `precondition`,
+  `preconditionFailure`, `fatalError`, active `assert`/`assertionFailure`, and
+  the error edge of `try!`. Current frontend variants with static diagnostics
+  use the existing trap terminator; dynamic String and represented Error
+  details share one `source_failure` terminator. Message autoclosures retain
+  their source evaluation timing, source locations come from the HLBC source
+  map, and no Swift runtime failure symbol is exposed as a NativeImport.
 - Array value semantics and equality, single-element append, `+`, `+=`,
   `append(contentsOf:)`, element and contents insertion, `replaceSubrange`,
   positional/first/last/range removal (including counted edge removal),

@@ -251,12 +251,20 @@ enum ImageFunctions {
                    !usages.contains(.closureConstruction) {
                     return nil
                 }
+                let intrinsicReplacement = file.function(
+                    mangledName: symbol
+                ).flatMap { function in
+                    CanonicalSIL.SwiftCoreIntrinsic(
+                        mangledName: symbol
+                    )?.closureReplacement(for: function)
+                }
                 let fallback = kindForSymbol(symbol)
                     ?? file.function(mangledName: symbol).flatMap {
                         !usages.isEmpty
                             && CanonicalSIL.StaticKeyPath.isAccessorThunk($0)
                             ? .concreteSpecialization : nil
                     }
+                    ?? intrinsicReplacement.map { _ in .closureBody }
                 guard let fallback else { return nil }
                 // Swift routinely materializes a no-capture closure for
                 // lifetime/debug semantics while devirtualizing its actual
@@ -268,7 +276,8 @@ enum ImageFunctions {
                 return .init(
                     symbol: symbol,
                     kind: kind,
-                    replacement: rewrites[symbol]?.function,
+                    replacement: rewrites[symbol]?.function
+                        ?? intrinsicReplacement,
                     abiAdapter: rewrites[symbol]?.adapter ?? .direct
                 )
             }
