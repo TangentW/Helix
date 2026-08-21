@@ -576,17 +576,6 @@ struct TextSequenceSemanticsMatrix {
             diagnostic: "is not frozen in the target HLXI"
         )
         expectUnsupported(
-            name: "removeFirstCharacter",
-            source: """
-            public func removeFirstCharacter(_ input: String) -> String {
-                var value = input
-                value.removeFirst()
-                return value
-            }
-            """,
-            diagnostic: "Array-backed specialization"
-        )
-        expectUnsupported(
             name: "boxCharacterAsAny",
             source: """
             public func boxCharacterAsAny(_ value: Character) -> Any {

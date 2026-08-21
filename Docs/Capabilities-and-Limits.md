@@ -62,8 +62,12 @@ does not by itself certify a physical device or distribution channel.
   text interpolation, repeating and
   common String construction, Unicode `uppercased`/`lowercased`, count/empty,
   prefix/suffix/contains predicates, String/Substring conversion, Character-
-  sequence construction, and String-sequence joining. Variable-size text
-  operations precharge deterministic UTF-8 work and output storage.
+  sequence construction, String-sequence joining, grapheme-correct
+  `removeFirst`/`removeLast` (including counted forms), `popLast`, clearing, and
+  capacity hints. These mutations share one represented
+  `RangeReplaceableCollection` plan with Array-backed values rather than text-
+  specific bytecode. Variable-size text operations precharge deterministic
+  UTF-8 work and output storage.
 - Tuple, `Void`, and `Optional`, including the ordinary control flow produced by
   `if let`, `guard let`, `??`, and `try?`, including address-based Optional
   projection emitted by semantic Dictionary lookup SIL. Explicit
@@ -175,6 +179,10 @@ does not by itself certify a physical device or distribution channel.
   views use the same queries. String has direct `count`/`isEmpty` and enters the
   same finite Sequence cursor as a verified Character Array for element-based
   traversal, including `first`/`last`, transforms, relations, and adapters.
+  String, Substring, Array, and normalized Array-backed views also share typed
+  edge/count removal, `popLast`, and clearing; capacity hints are retained only
+  to the extent observable through supported APIs. String finalizes the edited
+  Character sequence back to text, while Array-backed storage remains direct.
   Fully concrete `map`, `flatMap`,
   `compactMap`, `reduce`, `reduce(into:_:)`, `forEach`, `first(where:)`,
   `contains(where:)`, `allSatisfy`, `count(where:)`, and comparator-driven

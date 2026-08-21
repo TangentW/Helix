@@ -156,7 +156,7 @@ struct ArrayStructuralEditSemanticsMatrix {
                 image: fixture.image,
                 arguments: [try integers([1]), try integer(-1), .bool(true)]
             ) == .trapped(
-                .explicit("Array capacity must not be negative")
+                .explicit("Collection capacity must not be negative")
             )
         )
     }
@@ -280,7 +280,7 @@ struct ArrayStructuralEditSemanticsMatrix {
                 image: countFixture.image,
                 arguments: [try integers([1, 2]), try integer(-1)]
             ) == .trapped(
-                .explicit("Array removal count must not be negative")
+                .explicit("Collection removal count must not be negative")
             )
         )
     }

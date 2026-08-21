@@ -196,10 +196,13 @@ transforms, relations, count-based subsequences, split, `Array(sequence)`, and
 reversal normalize once to a verified Character Array and reuse the same finite
 Sequence plans. String/Substring conversion, Character-sequence construction,
 nested Character flattening, String-sequence joining, append/repetition,
-String/Character comparison, and text interpolation use two verifier-visible representation
-primitives rather than Swift generic NativeImports or per-source-API opcodes.
-Private String indices, UTF views, index-sensitive mutation, and Foundation text
-semantics remain fail-closed.
+String/Character comparison, and text interpolation use two verifier-visible
+representation primitives rather than Swift generic NativeImports or per-
+source-API opcodes. Edge/count removal, `popLast`, clearing, and capacity hints
+reuse one represented `RangeReplaceableCollection` mutation plan across String,
+Substring, Array, and normalized Array-backed views. Private String indices,
+UTF views, index-sensitive mutation, and Foundation text semantics remain fail-
+closed.
 Frontend Array/Dictionary cast helpers may erase tuple labels only when the
 original types differ solely by those labels and both complete VM types match;
 real element, key, value, and reference conversions remain rejected.

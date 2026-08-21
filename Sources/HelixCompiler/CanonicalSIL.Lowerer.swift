@@ -11628,6 +11628,323 @@ public struct Lowerer: Sendable {
                     values[resultToken] = result
                 }
 
+            case let .rangeReplaceableEdit(edit):
+                let context = "RangeReplaceableCollection edit"
+                let representation = try
+                    parseRangeReplaceableCollectionRepresentation(
+                        source: edit.source,
+                        genericArguments: genericArguments,
+                        context: context
+                    )
+                let storageType = representation.storageType
+                let element = representation.element
+                let elementsType = representation.elementsType
+
+                func integerConstant(
+                    _ bitPattern: UInt64
+                ) throws -> Bytecode.Register {
+                    let result = try allocate(type: .int64)
+                    appendInstruction(
+                        .constantInteger(
+                            result: result,
+                            bitPattern: bitPattern
+                        )
+                    )
+                    return result
+                }
+
+                func materializeDestination(
+                    at token: String
+                ) throws -> (
+                    elements: Bytecode.Register,
+                    cleanup: [IntermediateRepresentation.Instruction]
+                ) {
+                    guard compilerAddressType(token) == storageType else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "\(context) destination does not match its specialization"
+                        )
+                    }
+                    let materialized = try materializeSequenceOperand(
+                        representation.sequence,
+                        token: token,
+                        context: context,
+                        line: line
+                    )
+                    guard registerTypes[Int(materialized.array.rawValue)]
+                            == elementsType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "\(context) produced mismatched element storage"
+                        )
+                    }
+                    return (
+                        elements: materialized.array,
+                        cleanup: materialized.cleanup
+                    )
+                }
+
+                func appendCleanup(
+                    _ cleanup: [IntermediateRepresentation.Instruction]
+                ) {
+                    for instruction in cleanup {
+                        appendInstruction(instruction)
+                    }
+                }
+
+                func emptyElements() throws -> Bytecode.Register {
+                    let result = try allocate(type: elementsType)
+                    appendInstruction(
+                        .makeArray(result: result, elements: [])
+                    )
+                    return result
+                }
+
+                func destroyLinearTemporary(_ value: Bytecode.Register) {
+                    if registerTypes[Int(value.rawValue)]
+                        .requiresLinearOwnership {
+                        appendInstruction(.destroyValue(value))
+                    }
+                }
+
+                func replace(
+                    _ elements: Bytecode.Register,
+                    from lowerBound: Bytecode.Register,
+                    to upperBound: Bytecode.Register,
+                    with replacement: Bytecode.Register
+                ) throws -> Bytecode.Register {
+                    let result = try allocate(type: elementsType)
+                    appendInstruction(
+                        .arrayReplaceSubrange(
+                            result: result,
+                            array: elements,
+                            lowerBound: lowerBound,
+                            upperBound: upperBound,
+                            replacement: replacement
+                        )
+                    )
+                    return result
+                }
+
+                func finalizeElements(
+                    _ elements: Bytecode.Register
+                ) throws -> Bytecode.Register {
+                    guard registerTypes[Int(elements.rawValue)] == elementsType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "\(context) finalizer received mismatched elements"
+                        )
+                    }
+                    switch representation {
+                    case .representedArray:
+                        return elements
+                    case .stringCharacters:
+                        return try lowerStringJoin(
+                            elements: elements,
+                            separator: nil,
+                            elementKind: .character,
+                            context: context
+                        )
+                    }
+                }
+
+                func emptyStorage() throws -> Bytecode.Register {
+                    switch representation {
+                    case .representedArray:
+                        return try emptyElements()
+                    case .stringCharacters:
+                        let result = try allocate(type: .string)
+                        appendInstruction(
+                            .constantString(result: result, value: "")
+                        )
+                        return result
+                    }
+                }
+
+                switch edit.operation {
+                case .removeFirst, .removeLast:
+                    guard arguments.count == 2,
+                          compilerAddressType(arguments[0]) == element
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "RangeReplaceableCollection element removal has unsupported arguments"
+                        )
+                    }
+                    let destination = try materializeDestination(
+                        at: arguments[1]
+                    )
+                    let index: Bytecode.Register
+                    if edit.operation == .removeFirst {
+                        index = try integerConstant(0)
+                    } else {
+                        let end = try emitArrayCount(destination.elements)
+                        index = try emitCheckedIndexArithmetic(
+                            .subtract,
+                            end,
+                            integerConstant(1)
+                        )
+                    }
+                    let removed = try allocate(type: element)
+                    appendInstruction(
+                        .arrayGet(
+                            result: removed,
+                            array: destination.elements,
+                            index: index
+                        )
+                    )
+                    let upperBound = try emitCheckedIndexArithmetic(
+                        .add,
+                        index,
+                        integerConstant(1)
+                    )
+                    let empty = try emptyElements()
+                    let updatedElements = try replace(
+                        destination.elements,
+                        from: index,
+                        to: upperBound,
+                        with: empty
+                    )
+                    destroyLinearTemporary(empty)
+                    let updated = try finalizeElements(updatedElements)
+                    appendCleanup(destination.cleanup)
+                    try storeConstructedValue(
+                        removed,
+                        at: arguments[0],
+                        mode: .initialize
+                    )
+                    try storeConstructedValue(
+                        updated,
+                        at: arguments[1],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .removeFirstCount, .removeLastCount:
+                    guard arguments.count == 2 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "RangeReplaceableCollection counted removal has unsupported arguments"
+                        )
+                    }
+                    let count = try trivialOperand(arguments[0], as: .int64)
+                    try appendNonnegativePrecondition(
+                        count,
+                        reason: "Collection removal count must not be negative"
+                    )
+                    let destination = try materializeDestination(
+                        at: arguments[1]
+                    )
+                    let zero = try integerConstant(0)
+                    let end = try emitArrayCount(destination.elements)
+                    let lowerBound: Bytecode.Register
+                    let upperBound: Bytecode.Register
+                    if edit.operation == .removeFirstCount {
+                        lowerBound = zero
+                        upperBound = count
+                    } else {
+                        lowerBound = try emitCheckedIndexArithmetic(
+                            .subtract,
+                            end,
+                            count
+                        )
+                        upperBound = end
+                    }
+                    let empty = try emptyElements()
+                    let updatedElements = try replace(
+                        destination.elements,
+                        from: lowerBound,
+                        to: upperBound,
+                        with: empty
+                    )
+                    destroyLinearTemporary(empty)
+                    let updated = try finalizeElements(updatedElements)
+                    appendCleanup(destination.cleanup)
+                    try storeConstructedValue(
+                        updated,
+                        at: arguments[1],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .popLast:
+                    guard arguments.count == 2,
+                          compilerAddressType(arguments[0])
+                            == .optional(element)
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "RangeReplaceableCollection.popLast has unsupported arguments"
+                        )
+                    }
+                    let destination = try materializeDestination(
+                        at: arguments[1]
+                    )
+                    let removed = try allocate(type: .optional(element))
+                    let updatedElements = try allocate(type: elementsType)
+                    appendInstruction(
+                        .arrayPopLast(
+                            elementResult: removed,
+                            arrayResult: updatedElements,
+                            array: destination.elements
+                        )
+                    )
+                    let updated = try finalizeElements(updatedElements)
+                    appendCleanup(destination.cleanup)
+                    try storeConstructedValue(
+                        removed,
+                        at: arguments[0],
+                        mode: .initialize
+                    )
+                    try storeConstructedValue(
+                        updated,
+                        at: arguments[1],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .removeAll:
+                    guard arguments.count == 2,
+                          compilerAddressType(arguments[1]) == storageType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "RangeReplaceableCollection.removeAll has unsupported arguments"
+                        )
+                    }
+                    _ = try trivialOperand(arguments[0], as: .bool)
+                    guard let destination = try borrowStoredValue(
+                        at: arguments[1],
+                        line: line
+                    ), registerTypes[Int(destination.register.rawValue)]
+                        == storageType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "RangeReplaceableCollection.removeAll references uninitialized storage"
+                        )
+                    }
+                    let result = try emptyStorage()
+                    if let owner = destination.temporaryOwner {
+                        appendInstruction(.destroyValue(owner))
+                    }
+                    try storeConstructedValue(
+                        result,
+                        at: arguments[1],
+                        mode: .assign
+                    )
+                    voidValues.insert(resultToken)
+
+                case .reserveCapacity:
+                    guard arguments.count == 2 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "RangeReplaceableCollection.reserveCapacity has unsupported arguments"
+                        )
+                    }
+                    try lowerCapacityHint(
+                        capacityToken: arguments[0],
+                        storageToken: arguments[1],
+                        expectedType: storageType,
+                        displayName: "Collection capacity",
+                        resultToken: resultToken,
+                        line: line
+                    )
+                }
+
             case let .arrayEdit(operation):
                 let specializations = try splitTopLevel(genericArguments)
                     .filter { !$0.isEmpty }
@@ -11894,15 +12211,14 @@ public struct Lowerer: Sendable {
                     )
                     voidValues.insert(resultToken)
 
-                case .removeAt, .removeFirst, .removeLast:
-                    let expectedCount = operation == .removeAt ? 3 : 2
-                    guard arguments.count == expectedCount else {
+                case .removeAt:
+                    guard arguments.count == 3 else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Array element removal has unsupported arguments"
                         )
                     }
                     let outputToken = arguments[0]
-                    let destinationToken = arguments[expectedCount - 1]
+                    let destinationToken = arguments[2]
                     guard compilerAddressType(outputToken) == element,
                           compilerAddressType(destinationToken) == arrayType
                     else {
@@ -11911,24 +12227,7 @@ public struct Lowerer: Sendable {
                         )
                     }
                     let destination = try borrowArray(at: destinationToken)
-                    let index: Bytecode.Register
-                    switch operation {
-                    case .removeAt:
-                        index = try trivialOperand(arguments[1], as: .int64)
-                    case .removeFirst:
-                        index = try integerConstant(0)
-                    case .removeLast:
-                        let end = try emitArrayCount(destination.register)
-                        index = try emitCheckedIndexArithmetic(
-                            .subtract,
-                            end,
-                            integerConstant(1)
-                        )
-                    default:
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Array removal dispatch is inconsistent"
-                        )
-                    }
+                    let index = try trivialOperand(arguments[1], as: .int64)
                     let removed = try allocate(type: element)
                     appendInstruction(
                         .arrayGet(
@@ -11982,70 +12281,6 @@ public struct Lowerer: Sendable {
                         with: empty
                     )
                     destroyLinearTemporary(empty)
-                    destroyTemporaryOwners([destination])
-                    try storeConstructedValue(
-                        result,
-                        at: arguments[1],
-                        mode: .assign
-                    )
-                    voidValues.insert(resultToken)
-
-                case .removeFirstCount, .removeLastCount:
-                    guard arguments.count == 2,
-                          compilerAddressType(arguments[1]) == arrayType
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Array counted removal has unsupported arguments"
-                        )
-                    }
-                    let count = try trivialOperand(arguments[0], as: .int64)
-                    try appendNonnegativePrecondition(
-                        count,
-                        reason: "Array removal count must not be negative"
-                    )
-                    let destination = try borrowArray(at: arguments[1])
-                    let zero = try integerConstant(0)
-                    let end = try emitArrayCount(destination.register)
-                    let lowerBound: Bytecode.Register
-                    let upperBound: Bytecode.Register
-                    if operation == .removeFirstCount {
-                        lowerBound = zero
-                        upperBound = count
-                    } else {
-                        lowerBound = try emitCheckedIndexArithmetic(
-                            .subtract,
-                            end,
-                            count
-                        )
-                        upperBound = end
-                    }
-                    let empty = try emptyArray()
-                    let result = try replace(
-                        destination.register,
-                        from: lowerBound,
-                        to: upperBound,
-                        with: empty
-                    )
-                    destroyLinearTemporary(empty)
-                    destroyTemporaryOwners([destination])
-                    try storeConstructedValue(
-                        result,
-                        at: arguments[1],
-                        mode: .assign
-                    )
-                    voidValues.insert(resultToken)
-
-                case .removeAll:
-                    guard arguments.count == 2,
-                          compilerAddressType(arguments[1]) == arrayType
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Array.removeAll has unsupported arguments"
-                        )
-                    }
-                    _ = try trivialOperand(arguments[0], as: .bool)
-                    let destination = try borrowArray(at: arguments[1])
-                    let result = try emptyArray()
                     destroyTemporaryOwners([destination])
                     try storeConstructedValue(
                         result,
@@ -12125,22 +12360,6 @@ public struct Lowerer: Sendable {
                     )
                     voidValues.insert(resultToken)
 
-                case .reserveCapacity:
-                    guard arguments.count == 2,
-                          compilerAddressType(arguments[1]) == arrayType
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Array.reserveCapacity has unsupported arguments"
-                        )
-                    }
-                    try lowerCapacityHint(
-                        capacityToken: arguments[0],
-                        storageToken: arguments[1],
-                        expectedType: arrayType,
-                        displayName: "Array capacity",
-                        resultToken: resultToken,
-                        line: line
-                    )
                 }
             }
         }
@@ -13666,55 +13885,6 @@ public struct Lowerer: Sendable {
                     appendInstruction(.destroyValue(owner))
                 }
                 try storeConstructedValue(result, at: arguments[1], mode: .assign)
-                voidValues.insert(resultToken)
-
-            case .arrayPopLast:
-                guard arguments.count == 2,
-                      !genericArguments.isEmpty,
-                      let outputType = compilerAddressType(arguments[0]),
-                      let arrayType = compilerAddressType(arguments[1])
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array.popLast has unsupported inout arguments"
-                    )
-                }
-                guard let array = try copyStoredValue(
-                    at: arguments[1],
-                    line: line
-                ) else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array.popLast references uninitialized storage"
-                    )
-                }
-                let collectionType = try parseType(genericArguments)
-                guard case let .array(element) = collectionType,
-                      arrayType == collectionType,
-                      outputType == .optional(element),
-                      registerTypes[Int(array.rawValue)] == collectionType
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array.popLast types do not match Array.Element"
-                    )
-                }
-                let removed = try allocate(type: outputType)
-                let updated = try allocate(type: collectionType)
-                appendInstruction(
-                    .arrayPopLast(
-                        elementResult: removed,
-                        arrayResult: updated,
-                        array: array
-                    )
-                )
-                try storeConstructedValue(
-                    removed,
-                    at: arguments[0],
-                    mode: .initialize
-                )
-                try storeConstructedValue(
-                    updated,
-                    at: arguments[1],
-                    mode: .assign
-                )
                 voidValues.insert(resultToken)
 
             case let .collectionMakeIterator(shape):
@@ -22654,6 +22824,59 @@ public struct Lowerer: Sendable {
             throw unsupportedSource
         }
         return .managedCollection(type: type, element: element)
+    }
+
+    private func parseRangeReplaceableCollectionRepresentation(
+        source: CanonicalSIL.CollectionIntrinsic.RangeReplaceableEdit.Source,
+        genericArguments: String,
+        context: String
+    ) throws -> CanonicalSIL.RangeReplaceableCollectionRepresentation {
+        let spellings = splitTopLevel(genericArguments)
+            .filter { !$0.isEmpty }
+        let sequence: CanonicalSIL.SequenceSpecialization
+        switch source {
+        case .genericSelf:
+            guard spellings.count == 1 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) has an incomplete Self specialization"
+                )
+            }
+            sequence = try parseSequenceSpecialization(
+                spellings[0],
+                context: context
+            )
+
+        case .arrayBackedElement:
+            guard spellings.count == 1 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) has an incomplete Array-backed Element specialization"
+                )
+            }
+            let element = CanonicalSIL.ValueRepresentation.storable(
+                try parseType(spellings[0])
+            )
+            sequence = .managedCollection(
+                type: .array(element),
+                element: element
+            )
+
+        case .stringCharacters:
+            guard spellings.isEmpty else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) String entry point unexpectedly has generic specializations"
+                )
+            }
+            sequence = .stringCharacters
+        }
+
+        guard let representation = CanonicalSIL
+            .RangeReplaceableCollectionRepresentation(sequence: sequence)
+        else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "\(context) requires represented Array-backed or String storage"
+            )
+        }
+        return representation
     }
 
     private func parseCollectionQuerySpecialization(

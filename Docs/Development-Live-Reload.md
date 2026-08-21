@@ -159,8 +159,12 @@ Substring to a Character Array. `string_characters` and the two verified
 `string_join` modes are the only representation boundaries; count, traversal,
 transforms, split, subsequences, relations, and joining then reuse existing
 finite-Sequence plans. Character and Substring Shell codecs revalidate the
-erased invariants. `String.Index`, UTF views, and Foundation text behavior stay
-fail-closed until their own semantics are represented explicitly.
+erased invariants. Edge/count removal, `popLast`, clearing, and capacity hints
+reuse one represented `RangeReplaceableCollection` plan across String,
+Substring, Array, and normalized Array-backed views; no Swift generic
+NativeImport or API-specific opcode is introduced. `String.Index`, UTF views,
+and Foundation text behavior stay fail-closed until their own semantics are
+represented explicitly.
 
 Payload-free `nil` values recover their wrapped type from verified bytecode
 context, so the same Array/Dictionary builders, mutation/sort/split states, and
@@ -446,14 +450,16 @@ semantics. Split subsequences are normalized by element sequence and therefore
 do not preserve a source view's public index identity. Meanwhile,
 supported Optional and Result payload transforms use the same selected-case
 plan. Common Array structural edits—including concatenation, contents append
-and insertion, range replacement/removal, counted edge removal, clearing,
-reversal, swapping, and capacity hints—are also supported for matching Array-backed
-sources and represented copyable elements; they are type-driven rather than
-special-cased for a framework class. Reading physical `Array.capacity` and
-requesting `randomElement()` remain rejected because those storage and
-randomness policies are not represented. Dictionary default lookup invokes its
-autoclosure only for a missing key. Its scoped `_modify` and Array element
-`_modify` share frame-backed lending and write back on normal `end_apply` and
+and insertion, range replacement/removal, reversal, and swapping—are
+supported for matching Array-backed sources and represented copyable
+elements. Edge/count removal, `popLast`, clearing, and capacity hints use the
+broader represented `RangeReplaceableCollection` plan shared by String,
+Substring, Array, and normalized Array-backed views. Both paths are type-driven
+rather than special-cased for a framework class. Reading physical
+`Array.capacity` and requesting `randomElement()` remain rejected because those
+storage and randomness policies are not represented. Dictionary default lookup
+invokes its autoclosure only for a missing key. Its scoped `_modify` and Array
+element `_modify` share frame-backed lending and write back on normal `end_apply` and
 throwing `abort_apply`, including nested collections and imported references.
 Dictionary merging, mutating merge, uniquing construction, and grouping share
 one typed linear accumulator and the ordinary closure CFG. These operations

@@ -207,8 +207,8 @@ struct ArrayPredicateMutationSemanticsMatrix {
         )
     }
 
-    @Test("Index-erased ArraySlice mutation fails closed")
-    func rejectsArraySliceMutation() {
+    @Test("ArraySlice reverse remains fail-closed without index identity")
+    func rejectsArraySliceReverse() {
         do {
             _ = try FrontendExecutionHarness.compile(
                 source: """

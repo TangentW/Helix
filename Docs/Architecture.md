@@ -181,8 +181,13 @@ Both workflows depend on stable, build-specific identities:
   String's direct `count`/`isEmpty` remain allocation-free; element-oriented
   finite Sequence operations materialize once and then reuse the same cursor,
   builder, split, subsequence, relation, and closure control flow as other
-  represented Collections. UTF views, `String.Index`, and index-sensitive
-  mutation remain outside this representation and fail closed.
+  represented Collections. A separate represented
+  `RangeReplaceableCollection` plan covers edge and counted-edge removal,
+  `popLast`, clearing, and capacity hints across String, Substring, Array, and
+  normalized Array-backed views. String enters that plan through its Character
+  Array and is finalized with `string_join.character`; Array-backed storage
+  executes the same typed edits directly. UTF views, `String.Index`, and
+  index-sensitive mutation remain outside this representation and fail closed.
 - Finite integer `Range`/`ClosedRange` and supported numeric `StrideTo`/
   `StrideThrough` values form a second, compiler-only concrete Sequence
   specialization. They retain typed bounds and stride registers rather than a

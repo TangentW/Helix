@@ -91,6 +91,33 @@ enum CollectionIntrinsic: Equatable {
         case joined(hasSeparator: Bool)
     }
 
+    /// Variable-length mutations classified by the frontend specialization
+    /// that identifies `Self`. Their implementation is shared by every
+    /// collection with a complete represented storage model.
+    struct RangeReplaceableEdit: Equatable {
+        enum Operation: Equatable {
+            case removeFirst
+            case removeLast
+            case removeFirstCount
+            case removeLastCount
+            case popLast
+            case removeAll
+            case reserveCapacity
+        }
+
+        enum Source: Equatable {
+            /// The generic substitution is the concrete collection `Self`.
+            case genericSelf
+            /// A concrete Array-backed entry point substitutes only `Element`.
+            case arrayBackedElement
+            /// A concrete String entry point has no generic substitution.
+            case stringCharacters
+        }
+
+        var operation: Operation
+        var source: Source
+    }
+
     /// Array-backed structural edits share value-semantic VM primitives. The
     /// cases describe frontend call shapes only; lowering does not specialize
     /// behavior by element type.
@@ -102,15 +129,9 @@ enum CollectionIntrinsic: Equatable {
         case insertContents
         case replaceSubrange
         case removeAt
-        case removeFirst
-        case removeLast
-        case removeFirstCount
-        case removeLastCount
         case removeSubrange
-        case removeAll
         case reverse
         case swapAt
-        case reserveCapacity
 
         func resolveSpecialization(
             _ specializations: [Bytecode.ValueType]
@@ -118,7 +139,7 @@ enum CollectionIntrinsic: Equatable {
             let array: Bytecode.ValueType
             switch self {
             case .concatenating, .concatenateInPlace, .insertElement,
-                 .removeAt, .removeAll, .reserveCapacity:
+                 .removeAt:
                 guard specializations.count == 1 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Array edit has unsupported specializations"
@@ -151,8 +172,7 @@ enum CollectionIntrinsic: Equatable {
                     )
                 }
                 array = .array(element)
-            case .removeFirst, .removeLast, .removeFirstCount,
-                 .removeLastCount, .removeSubrange, .reverse, .swapAt:
+            case .removeSubrange, .reverse, .swapAt:
                 guard specializations.count == 1,
                       case .array = specializations[0]
                 else {
@@ -178,6 +198,7 @@ enum CollectionIntrinsic: Equatable {
     case relation(RelationOperation)
     case arrayIndex(ArrayIndexOperation)
     case adapter(Adapter)
+    case rangeReplaceableEdit(RangeReplaceableEdit)
     case arrayEdit(ArrayEdit)
 
     init?(mangledName: String) {
@@ -303,24 +324,69 @@ enum CollectionIntrinsic: Equatable {
             self = .arrayEdit(.replaceSubrange)
         case "$sSa6remove2atxSi_tF":
             self = .arrayEdit(.removeAt)
-        case "$sSmsE11removeFirst7ElementQzyF":
-            self = .arrayEdit(.removeFirst)
-        case "$sSmsSKRzrlE10removeLast7ElementSTQzyF":
-            self = .arrayEdit(.removeLast)
-        case "$sSmsE11removeFirstyySiF":
-            self = .arrayEdit(.removeFirstCount)
-        case "$sSmsSKRzrlE10removeLastyySiF":
-            self = .arrayEdit(.removeLastCount)
+        case "$sSmsE11removeFirst7ElementQzyF",
+             "$sSms11SubSequenceQzRszrlE11removeFirst7ElementQzyF":
+            self = .rangeReplaceableEdit(
+                .init(operation: .removeFirst, source: .genericSelf)
+            )
+        case "$sSmsSKRzrlE10removeLast7ElementSTQzyF",
+             "$sSmsSKRz11SubSequenceSlQzRszrlE10removeLast7ElementSTQzyF":
+            self = .rangeReplaceableEdit(
+                .init(operation: .removeLast, source: .genericSelf)
+            )
+        case "$sSmsE11removeFirstyySiF",
+             "$sSms11SubSequenceQzRszrlE11removeFirstyySiF":
+            self = .rangeReplaceableEdit(
+                .init(operation: .removeFirstCount, source: .genericSelf)
+            )
+        case "$sSmsSKRzrlE10removeLastyySiF",
+             "$sSmsSKRz11SubSequenceSlQzRszrlE10removeLastyySiF":
+            self = .rangeReplaceableEdit(
+                .init(operation: .removeLastCount, source: .genericSelf)
+            )
+        case "$sSmsSKRzrlE7popLast7ElementSTQzSgyF",
+             "$sSmsSKRz11SubSequenceSlQzRszrlE7popLast7ElementSTQzSgyF":
+            self = .rangeReplaceableEdit(
+                .init(operation: .popLast, source: .genericSelf)
+            )
         case "$sSmsE14removeSubrangeyySny5IndexQzGF":
             self = .arrayEdit(.removeSubrange)
         case "$sSa9removeAll15keepingCapacityySb_tF":
-            self = .arrayEdit(.removeAll)
+            self = .rangeReplaceableEdit(
+                .init(operation: .removeAll, source: .arrayBackedElement)
+            )
+        case "$ss10ArraySliceV9removeAll15keepingCapacityySb_tF":
+            self = .rangeReplaceableEdit(
+                .init(operation: .removeAll, source: .arrayBackedElement)
+            )
+        case "$sSS9removeAll15keepingCapacityySb_tF":
+            self = .rangeReplaceableEdit(
+                .init(operation: .removeAll, source: .stringCharacters)
+            )
+        case "$sSmsE9removeAll15keepingCapacityySb_tF":
+            self = .rangeReplaceableEdit(
+                .init(operation: .removeAll, source: .genericSelf)
+            )
         case "$sSMsSKRzrlE7reverseyyF":
             self = .arrayEdit(.reverse)
         case "$sSMsE6swapAtyy5IndexQz_ACtF":
             self = .arrayEdit(.swapAt)
         case "$sSa15reserveCapacityyySiF":
-            self = .arrayEdit(.reserveCapacity)
+            self = .rangeReplaceableEdit(
+                .init(operation: .reserveCapacity, source: .arrayBackedElement)
+            )
+        case "$ss10ArraySliceV15reserveCapacityyySiF":
+            self = .rangeReplaceableEdit(
+                .init(operation: .reserveCapacity, source: .arrayBackedElement)
+            )
+        case "$sSS15reserveCapacityyySiF":
+            self = .rangeReplaceableEdit(
+                .init(operation: .reserveCapacity, source: .stringCharacters)
+            )
+        case "$sSmsE15reserveCapacityyySiF":
+            self = .rangeReplaceableEdit(
+                .init(operation: .reserveCapacity, source: .genericSelf)
+            )
         default:
             return nil
         }
