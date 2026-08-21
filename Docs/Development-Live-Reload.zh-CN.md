@@ -174,7 +174,9 @@ managed Array、Dictionary、Set 共用直接的 `count`、`isEmpty`、`first` �
 
 可表示整数、浮点、String 与 Character bounds 的单侧 `RangeExpression` containment 和 switch pattern 共用标量比较计划。Array-backed 来源的整数 `Range`、`ClosedRange`、单侧与全范围下标统一复用强类型 slice 边界并保留逻辑基址；String/Substring 的全范围物化仍保留独立 Character 表示。Compiler 会消除这些范围 wrapper，不把 Swift 泛型 Collection ABI 绑定为 NativeImport，也不为每个源码 API 增加 opcode。把单侧范围当作可能无限的 Sequence、progression index 结果、私有 `String.Index`、`ReversedCollection.Index` 与其他不透明 index identity 仍会明确 fail closed，不会猜测语义。
 
-整数 Range/ClosedRange 的 `count`、`isEmpty`、`first`、`last` 是直接读取 bounds 的常数时间操作；count 精确覆盖完整 element 位宽，并在基数超过 `Int.max` 时 trap。具有可表示 Comparable bounds 的 Range 也可执行 `isEmpty`，但不会因此获得迭代能力。
+整数 Range/ClosedRange 的 `count`、`isEmpty`、`first`、`last` 是直接读取 bounds 的常数时间操作；count 精确覆盖完整 element 位宽，并在基数超过 `Int.max` 时 trap。具有可表示 Comparable bounds 的 Range 还支持 `isEmpty`、`overlaps`、`clamped(to:)` 与上下界直接投影，但不会因此获得迭代能力；共享的强类型 compare/select 计划会保留空区间 overlap 和浮点相等/signed-zero 语义，不引入泛型 NativeImport。
+
+`Bool.toggle()` 与全局 `swap` 同样通过共享 compiler-address sink 上的值修改计划执行。swap 会验证 storage 不重叠，并在写入任一 destination 前读取两个可表示值，因此普通局部变量、aggregate projection、frame storage 与可变 closure capture 无需各自的 API adapter。
 
 冻结 imported reference 等可复制线性值也可以被 closure 捕获，但 closure body 的 capture convention 必须是 borrowed；完全具体的 reabstraction thunk 会直接链接进 image，不会被误判成 NativeImport。Dictionary 默认查找只在缺键时调用 autoclosure；其 scoped `_modify` 与 Array element `_modify` 共用 frame-backed 借出，并在正常 `end_apply` 与抛错 `abort_apply` 两条出口都通过普通强类型集合原语回写，覆盖嵌套集合和 imported-reference element。
 

@@ -52,6 +52,12 @@ does not by itself certify a physical device or distribution channel.
   full-width quotient, signed minimum divided by minus one, signed zero,
   subnormal values, and signaling NaNs retain Swift behavior; undefined
   zero-count builtin forms are rejected rather than guessed.
+- `Bool.toggle()` and global `swap` use one type-directed value-mutation path.
+  Swap supports represented copyable scalar, text, Optional, tuple, and
+  patch-local aggregate values in ordinary, projected, frame, or mutable
+  closure-cell storage; overlapping storage is rejected and both reads precede
+  either assignment. Neither operation adds an API-specific opcode or
+  NativeImport.
 - `String`, `Character`, and `Substring` use explicit logical text contracts
   without importing their private standard-library layouts. A represented
   `Character` is validated as exactly one extended grapheme cluster at every
@@ -267,7 +273,10 @@ does not by itself certify a physical device or distribution channel.
   Collections. Integer Range/ClosedRange `count`, `isEmpty`, `first`, and
   `last` are constant-time bound queries; count is exact across the full
   element width and traps when its cardinality exceeds `Int.max`. Represented
-  Comparable Range bounds also support `isEmpty` without implying iteration.
+  Comparable Range bounds also support `isEmpty`, `overlaps`,
+  `clamped(to:)`, and direct lower/upper-bound access without implying
+  iteration. Empty ranges never overlap; clamping preserves the selected
+  original bound on equality, including floating signed zero.
   Progression index results, opaque-index collection operations, and using a
   one-sided partial range as a potentially infinite Sequence source remain
   rejected until their direction, index identity, complexity, or termination
@@ -329,7 +338,9 @@ does not by itself certify a physical device or distribution channel.
   `stride(from:through:by:)` over those integers, `Float`, `Double`, and
   64-bit `CGFloat`.
   `Range.contains` and `ClosedRange.contains` also accept supported integer,
-  floating, and String bounds. Lowering uses one typed, Optional-cursor HLBC
+  floating, and String bounds. `Range.overlaps`, `clamped(to:)`, and direct
+  bound projection accept the same represented Comparable bound family.
+  Lowering uses one typed, Optional-cursor HLBC
   progression operation rather than standard-library iterator ABI objects;
   the finite concrete Sequence operations listed above reuse that cursor
   instead of adding API-specific opcodes. Zero strides and invalid range bounds
@@ -352,7 +363,9 @@ does not by itself certify a physical device or distribution channel.
 - Newly introduced, non-exported file- or module-scope patch-local nonrecursive
   stored struct and enum values, concrete `Result`, field extraction, enum
   switch, instance/static computed getters and setters, and supported mutating
-  helpers. Nested declarations keep their namespace-qualified identity. These
+  helpers. Comma-separated enum cases, including mixed labeled and unlabeled
+  associated values, are parsed at top level; duplicate or malformed case
+  summaries fail closed. Nested declarations keep their namespace-qualified identity. These
   are generation-local VM values, not newly loaded Swift metadata.
 - Newly introduced ordinary functions, private methods, and computed accessors
   are transitively linked as same-image functions, getters, or setters without
@@ -517,7 +530,7 @@ machine code.
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |
 | Use a supported local closure or an already indexed same-image helper with an `@escaping` closure parameter | Lowered into the same image; closure return/capture is allowed only inside the pinned VM invocation |
 | Use a fully static read-only KeyPath literal as a transform or direct projection | Stored patch-local struct/class fields, concrete getter chains—including an imported Objective-C property whose generated accessor resolves to an exact NativeImport—and static Optional chain/force/wrap components may compose into a typed zero-capture function; dynamic KeyPath values, captured components such as subscript indices, unproven components, and writable/reference-writable mutation are rejected because KeyPath objects are not HLBC runtime values |
-| Use integer `Range`/`ClosedRange` iteration, numeric `stride`, or scalar `contains` | Supported for the concrete local families above; bounds, direction, inclusive/exclusive endpoints, zero-stride traps, and integer extrema retain their verified Swift semantics. Progression values remain image-local and cannot cross Shell/NativeImport boundaries |
+| Use integer `Range`/`ClosedRange` iteration, numeric `stride`, or represented Range queries | `contains`, `overlaps`, `clamped(to:)`, bound projection, and the concrete iteration families above preserve verified Swift boundary, empty-range, signed-zero, direction, endpoint, zero-stride, and integer-extrema semantics. Progression values remain image-local and cannot cross Shell/NativeImport boundaries |
 | Use `String`, `Character`, or `Substring` in supported text/Sequence APIs | Supported through validated grapheme and normalized Character-sequence representations, including Shell bridge round trips; `String.Index`, index-sensitive mutation, UTF views, and unlisted Character/Foundation APIs remain rejected |
 | Declare a patch-local struct or enum | A newly introduced non-exported type is supported at file/module scope, including namespace nesting and supported computed accessors; a function-local nominal is rejected with an exact type diagnostic |
 | Declare a pure patch-local class | A final, nongeneric type used only inside one image supports reference identity, stored properties, private/ordinary methods, and computed accessors; it cannot cross into native code |

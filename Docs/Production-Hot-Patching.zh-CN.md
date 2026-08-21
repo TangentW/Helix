@@ -109,7 +109,9 @@ sequenceDiagram
 
 managed Array、Dictionary、Set 共用直接的 `count`、`isEmpty`、`first` 查询，Array 另支持 `last`，已经归一的 Array-backed view 使用同一套查询语义；`count(where:)` 在这些容器与受支持有限 progression 上复用同一 streaming cursor 和普通 throwing closure CFG。容量变更提示可用，但读取 `Array.capacity` 与调用 `randomElement()` 会在相应存储或随机性 policy 被表示前明确拒绝。
 
-有限整数 Range/ClosedRange 与受支持数值 stride 还会复用现有强类型 cursor/builder/closure 语义，覆盖常见正向 Sequence 变换、归约、访问、predicate、comparator selection、自然极值/排序、关系、Set 构造/代数与 Array-backed adapter。整数 Range/ClosedRange 的 `count`、`isEmpty`、`first`、`last` 是常数时间 bounds 查询，count 精确覆盖完整 element 位宽并在超过 `Int.max` 时 trap；具有可表示 Comparable bounds 的 Range 也支持 `isEmpty`。只消费 element 的操作直接流式执行，只有结果需要完整存储时才使用 builder；不会把 Swift 泛型方法绑定成 NativeImport，也不会为每个源码 API 增加 opcode。
+有限整数 Range/ClosedRange 与受支持数值 stride 还会复用现有强类型 cursor/builder/closure 语义，覆盖常见正向 Sequence 变换、归约、访问、predicate、comparator selection、自然极值/排序、关系、Set 构造/代数与 Array-backed adapter。整数 Range/ClosedRange 的 `count`、`isEmpty`、`first`、`last` 是常数时间 bounds 查询，count 精确覆盖完整 element 位宽并在超过 `Int.max` 时 trap；具有可表示 Comparable bounds 的 Range 还支持 `isEmpty`、`overlaps`、`clamped(to:)` 与上下界投影，并通过同一强类型 compare/select 计划保留空区间 overlap 与浮点 signed-zero 语义。只消费 element 的操作直接流式执行，只有结果需要完整存储时才使用 builder；不会把 Swift 泛型方法绑定成 NativeImport，也不会为每个源码 API 增加 opcode。
+
+`Bool.toggle()` 与全局 `swap` 归一为共享 compiler-address sink 上的值修改语义族。swap 要求两个 storage 不重叠，并在任一写入前完成两次读取，因此局部值、aggregate projection、frame address 与可变 closure cell 共用同一路径，不增加逐 API opcode 或 NativeImport。
 
 可表示整数、浮点、String 与 Character bounds 的单侧 `RangeExpression` containment 和 switch 匹配复用同一套强类型比较。Array-backed 来源的整数 `Range`、`ClosedRange`、单侧与全范围下标统一复用强类型 slice 边界并保留逻辑基址；String/Substring 的全范围物化仍保留独立 Character 表示。这些只存在于 Compiler 的计划不会序列化 Swift 泛型 metadata 或 witness table，也不会为每个集合 API 新增 NativeImport 或 opcode。可能无限的 partial-range Sequence 来源、自定义 `Comparable` witness、私有 `String.Index`、`ReversedCollection.Index` 与其他不透明 index identity 仍会被拒绝。
 

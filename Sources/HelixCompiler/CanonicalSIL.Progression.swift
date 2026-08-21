@@ -2,6 +2,11 @@ import HelixBytecode
 
 extension CanonicalSIL {
 enum Progression {
+    enum BoundedRangeBound: Equatable, Sendable {
+        case lower
+        case upper
+    }
+
     enum Family: Equatable, Sendable {
         case range
         case closedRange
@@ -62,6 +67,30 @@ enum Progression {
         var end: Bytecode.Register
         var stride: Bytecode.Register
         var cursorSlot: Bytecode.StackSlot
+    }
+
+    static func boundedRangeBound(
+        owner rawOwner: String,
+        field: String,
+        type: SequenceType
+    ) -> BoundedRangeBound? {
+        let expectedOwner: String
+        switch type.family {
+        case .range:
+            expectedOwner = "Range"
+        case .closedRange:
+            expectedOwner = "ClosedRange"
+        case .strideTo, .strideThrough:
+            return nil
+        }
+        guard CanonicalSIL.SwiftTypeIdentity.normalized(rawOwner)
+                == expectedOwner
+        else { return nil }
+        switch field {
+        case "lowerBound": return .lower
+        case "upperBound": return .upper
+        default: return nil
+        }
     }
 
     static func sequenceType(

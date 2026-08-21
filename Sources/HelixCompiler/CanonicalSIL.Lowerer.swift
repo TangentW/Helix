@@ -139,6 +139,12 @@ public struct Lowerer: Sendable {
     private struct CompilerStorageIdentity: Hashable {
         var root: String
         var path: [Int]
+
+        func overlaps(_ other: Self) -> Bool {
+            root == other.root
+                && (path.starts(with: other.path)
+                    || other.path.starts(with: path))
+        }
     }
 
     private struct NativePropertyAddress {
@@ -740,6 +746,8 @@ public struct Lowerer: Sendable {
         var progressionAddressValues: [
             String: CanonicalSIL.Progression.Value
         ] = [:]
+        var progressionBoundProjectionRoots: [String: String] = [:]
+        var retiredProgressionAddresses = Set<String>()
         var partialRangeValues: [
             String: CanonicalSIL.RangeExpression.PartialValue
         ] = [:]
@@ -1622,19 +1630,14 @@ public struct Lowerer: Sendable {
         func invalidateOptionalStorageFacts(at token: String) {
             guard let blockID = current?.id else { return }
             let changed = compilerStorageIdentity(for: token)
-            func overlaps(_ candidate: CompilerStorageIdentity) -> Bool {
-                guard candidate.root == changed.root else { return false }
-                return candidate.path.starts(with: changed.path)
-                    || changed.path.starts(with: candidate.path)
-            }
             if let known = knownSomeOptionalAddresses[blockID] {
                 knownSomeOptionalAddresses[blockID] = Set(
-                    known.filter { !overlaps($0) }
+                    known.filter { !changed.overlaps($0) }
                 )
             }
             if let sources = optionalValueSourcesByBlock[blockID] {
                 optionalValueSourcesByBlock[blockID] = sources.filter {
-                    !overlaps($0.key)
+                    !changed.overlaps($0.key)
                 }
             }
         }
@@ -11248,6 +11251,20 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func clearProgressionBoundProjections(root: String) {
+            let projections = progressionBoundProjectionRoots.compactMap {
+                projection, candidate in
+                candidate == root ? projection : nil
+            }
+            for projection in projections {
+                progressionBoundProjectionRoots.removeValue(
+                    forKey: projection
+                )
+                stackAddressTypes.removeValue(forKey: projection)
+                stackAddressValues.removeValue(forKey: projection)
+            }
+        }
+
         func emitBoundedRangeContainment(
             _ range: CanonicalSIL.Progression.Value,
             candidate: Bytecode.Register
@@ -12593,6 +12610,7 @@ public struct Lowerer: Sendable {
                         end: try emitArrayEndIndex(array.register),
                         stride: nil
                     )
+                    retiredProgressionAddresses.remove(output)
                     destroyBorrowedOwners([array])
                     voidValues.insert(resultToken)
 
@@ -14558,7 +14576,276 @@ public struct Lowerer: Sendable {
                 voidValues.insert(resultToken)
             }
 
+            func lowerValueMutation(
+                _ mutation: CanonicalSIL.ValueMutationIntrinsic
+            ) throws {
+                switch mutation {
+                case .logicalToggle:
+                    guard genericArguments.isEmpty,
+                          arguments.count == 1,
+                          compilerAddressType(arguments[0]) == .bool,
+                          let currentValue = try copyStoredValue(
+                            at: arguments[0],
+                            line: line
+                          ),
+                          registerTypes[Int(currentValue.rawValue)] == .bool
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Bool.toggle has unsupported storage"
+                        )
+                    }
+                    let trueValue = try allocate(type: .bool)
+                    appendInstruction(
+                        .constantBool(result: trueValue, value: true)
+                    )
+                    let toggled = try allocate(type: .bool)
+                    appendInstruction(
+                        .booleanBinary(
+                            result: toggled,
+                            operation: .xor,
+                            lhs: currentValue,
+                            rhs: trueValue
+                        )
+                    )
+                    try storeConstructedValue(
+                        toggled,
+                        at: arguments[0],
+                        mode: .assign
+                    )
+
+                case .exchange:
+                    guard !genericArguments.isEmpty, arguments.count == 2 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "swap has unsupported arguments"
+                        )
+                    }
+                    let type = try parseStoredType(genericArguments)
+                    guard compilerAddressType(arguments[0]) == type,
+                          compilerAddressType(arguments[1]) == type
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "swap storage does not match its specialization"
+                        )
+                    }
+                    let firstIdentity = compilerStorageIdentity(
+                        for: arguments[0]
+                    )
+                    let secondIdentity = compilerStorageIdentity(
+                        for: arguments[1]
+                    )
+                    guard !firstIdentity.overlaps(secondIdentity) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "swap requires non-overlapping storage"
+                        )
+                    }
+                    guard let first = try copyStoredValue(
+                        at: arguments[0],
+                        line: line
+                    ), let second = try copyStoredValue(
+                        at: arguments[1],
+                        line: line
+                    ), registerTypes[Int(first.rawValue)] == type,
+                       registerTypes[Int(second.rawValue)] == type
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "swap references uninitialized storage"
+                        )
+                    }
+                    // Both reads precede either write, preserving exchange
+                    // semantics for compiler, frame, projected, and cell storage.
+                    try storeConstructedValue(
+                        second,
+                        at: arguments[0],
+                        mode: .assign
+                    )
+                    try storeConstructedValue(
+                        first,
+                        at: arguments[1],
+                        mode: .assign
+                    )
+                }
+                voidValues.insert(resultToken)
+            }
+
+            func lowerRange(
+                _ operation: CanonicalSIL.RangeIntrinsic
+            ) throws {
+                guard !genericArguments.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Range operation has no bound specialization"
+                    )
+                }
+                let element = try parseStoredType(genericArguments)
+                let type = CanonicalSIL.Progression.SequenceType(
+                    family: .range,
+                    element: element
+                )
+                guard element.isVMComparable else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Range operation bound \(element)"
+                    )
+                }
+
+                func compare(
+                    _ predicate: Bytecode.ComparisonPredicate,
+                    _ lhs: Bytecode.Register,
+                    _ rhs: Bytecode.Register
+                ) throws -> Bytecode.Register {
+                    guard registerTypes[Int(lhs.rawValue)] == element,
+                          registerTypes[Int(rhs.rawValue)] == element
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Range operation has mismatched bounds"
+                        )
+                    }
+                    let result = try allocate(type: .bool)
+                    appendInstruction(
+                        .compare(
+                            result: result,
+                            predicate: predicate,
+                            lhs: lhs,
+                            rhs: rhs
+                        )
+                    )
+                    return result
+                }
+
+                func clamp(
+                    _ bound: Bytecode.Register,
+                    to limits: CanonicalSIL.Progression.Value
+                ) throws -> Bytecode.Register {
+                    let below = try compare(.lessThan, bound, limits.start)
+                    let lowerBounded = try allocate(type: element)
+                    appendInstruction(
+                        .select(
+                            result: lowerBounded,
+                            condition: below,
+                            trueValue: limits.start,
+                            falseValue: bound
+                        )
+                    )
+                    let above = try compare(.lessThan, limits.end, bound)
+                    let result = try allocate(type: element)
+                    appendInstruction(
+                        .select(
+                            result: result,
+                            condition: above,
+                            trueValue: limits.end,
+                            falseValue: lowerBounded
+                        )
+                    )
+                    return result
+                }
+
+                switch operation {
+                case .overlaps:
+                    guard arguments.count == 2 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Range.overlaps has unsupported arguments"
+                        )
+                    }
+                    let other = try progressionValue(
+                        at: arguments[0],
+                        line: line
+                    )
+                    let receiver = try progressionValue(
+                        at: arguments[1],
+                        line: line
+                    )
+                    guard other.type == type, receiver.type == type else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Range.overlaps operands do not match its specialization"
+                        )
+                    }
+                    let receiverIsNonempty = try compare(
+                        .lessThan,
+                        receiver.start,
+                        receiver.end
+                    )
+                    let otherIsNonempty = try compare(
+                        .lessThan,
+                        other.start,
+                        other.end
+                    )
+                    let receiverStartsBeforeOtherEnds = try compare(
+                        .lessThan,
+                        receiver.start,
+                        other.end
+                    )
+                    let otherStartsBeforeReceiverEnds = try compare(
+                        .lessThan,
+                        other.start,
+                        receiver.end
+                    )
+                    let bothNonempty = try allocate(type: .bool)
+                    appendInstruction(
+                        .booleanBinary(
+                            result: bothNonempty,
+                            operation: .and,
+                            lhs: receiverIsNonempty,
+                            rhs: otherIsNonempty
+                        )
+                    )
+                    let boundsIntersect = try allocate(type: .bool)
+                    appendInstruction(
+                        .booleanBinary(
+                            result: boundsIntersect,
+                            operation: .and,
+                            lhs: receiverStartsBeforeOtherEnds,
+                            rhs: otherStartsBeforeReceiverEnds
+                        )
+                    )
+                    let result = try allocate(type: .bool)
+                    appendInstruction(
+                        .booleanBinary(
+                            result: result,
+                            operation: .and,
+                            lhs: bothNonempty,
+                            rhs: boundsIntersect
+                        )
+                    )
+                    values[resultToken] = result
+
+                case .clamped:
+                    guard arguments.count == 3 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Range.clamped(to:) has unsupported arguments"
+                        )
+                    }
+                    let output = addressBase(arguments[0])
+                    let limits = try progressionValue(
+                        at: arguments[1],
+                        line: line
+                    )
+                    let receiver = try progressionValue(
+                        at: arguments[2],
+                        line: line
+                    )
+                    guard progressionAddresses[output] == type,
+                          progressionAddressValues[output] == nil,
+                          limits.type == type,
+                          receiver.type == type
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Range.clamped(to:) storage does not match its specialization"
+                        )
+                    }
+                    progressionAddressValues[output] = .init(
+                        type: type,
+                        start: try clamp(receiver.start, to: limits),
+                        end: try clamp(receiver.end, to: limits),
+                        stride: nil
+                    )
+                    retiredProgressionAddresses.remove(output)
+                    voidValues.insert(resultToken)
+                }
+            }
+
             switch intrinsic {
+            case let .valueMutation(mutation):
+                try lowerValueMutation(mutation)
+            case let .range(operation):
+                try lowerRange(operation)
             case .defaultValue(.emptyString):
                 guard genericArguments.isEmpty, arguments.isEmpty else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -14714,12 +15001,14 @@ public struct Lowerer: Sendable {
                     condition: isZero,
                     reason: .explicit("Stride size must not be zero")
                 )
-                progressionAddressValues[addressBase(arguments[0])] = .init(
+                let output = addressBase(arguments[0])
+                progressionAddressValues[output] = .init(
                     type: type,
                     start: start,
                     end: end,
                     stride: stride
                 )
+                retiredProgressionAddresses.remove(output)
                 voidValues.insert(resultToken)
 
             case let .progressionMakeIterator(family):
@@ -16948,14 +17237,17 @@ public struct Lowerer: Sendable {
                 return
             }
             if progressionAddresses[address] != nil {
-                guard progressionAddressValues[address] != nil else {
+                if progressionAddressValues[address] == nil,
+                   !retiredProgressionAddresses.contains(address) {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "progression storage is deallocated before initialization"
                     )
                 }
                 if isFinalLexicalUse {
+                    clearProgressionBoundProjections(root: address)
                     progressionAddresses.removeValue(forKey: address)
                     progressionAddressValues.removeValue(forKey: address)
+                    retiredProgressionAddresses.remove(address)
                 }
                 return
             }
@@ -17943,16 +18235,21 @@ public struct Lowerer: Sendable {
                     continue
                 }
                 if let progression = progressionAddressValues[source] {
-                    guard progressionAddresses[source] == progression.type,
+                    guard source != destination,
+                          progressionAddresses[source] == progression.type,
                           progressionAddresses[destination] == progression.type
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "progression copy_addr requires matching storage"
                         )
                     }
+                    clearProgressionBoundProjections(root: destination)
                     progressionAddressValues[destination] = progression
+                    retiredProgressionAddresses.remove(destination)
                     if copy[0] == "take" {
                         progressionAddressValues.removeValue(forKey: source)
+                        clearProgressionBoundProjections(root: source)
+                        retiredProgressionAddresses.insert(source)
                     }
                     continue
                 }
@@ -18824,9 +19121,30 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = struct_element_addr (%[0-9]+), #(.+)\.([^.]+)$"#
             ) {
-                let partialRangeRoot = addressBase(projection[1])
-                if let range = partialRangeAddressValues[partialRangeRoot] {
-                    guard partialRangeAddresses[partialRangeRoot]
+                let rangeRoot = addressBase(projection[1])
+                if let range = progressionAddressValues[rangeRoot],
+                   let bound = CanonicalSIL.Progression.boundedRangeBound(
+                    owner: projection[2],
+                    field: projection[3],
+                    type: range.type
+                   ) {
+                    guard progressionAddresses[rangeRoot] == range.type
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "bounded range projection has mismatched storage"
+                        )
+                    }
+                    stackAddressTypes[projection[0]] = range.type.element
+                    stackAddressValues[projection[0]] = switch bound {
+                    case .lower: range.start
+                    case .upper: range.end
+                    }
+                    progressionBoundProjectionRoots[projection[0]] =
+                        rangeRoot
+                    continue
+                }
+                if let range = partialRangeAddressValues[rangeRoot] {
+                    guard partialRangeAddresses[rangeRoot]
                             == range.shape,
                           CanonicalSIL.RangeExpression
                             .matchesPartialStoredField(
@@ -18842,7 +19160,7 @@ public struct Lowerer: Sendable {
                     stackAddressTypes[projection[0]] = range.shape.boundType
                     stackAddressValues[projection[0]] = range.bound
                     partialRangeBoundProjectionRoots[projection[0]] =
-                        partialRangeRoot
+                        rangeRoot
                     continue
                 }
                 let scalarWrappers: Set<String> = [
@@ -19405,6 +19723,22 @@ public struct Lowerer: Sendable {
                 appendInstruction(
                     .makeStruct(result: result, fields: registers)
                 )
+                continue
+            }
+
+            if let extraction = match(
+                line,
+                pattern: #"^(%[0-9]+) = struct_extract (%[0-9]+), #(.+)\.([^.]+)$"#
+            ), let range = progressionValues[extraction[1]],
+               let bound = CanonicalSIL.Progression.boundedRangeBound(
+                owner: extraction[2],
+                field: extraction[3],
+                type: range.type
+               ) {
+                values[extraction[0]] = switch bound {
+                case .lower: range.start
+                case .upper: range.end
+                }
                 continue
             }
 
@@ -21994,7 +22328,9 @@ public struct Lowerer: Sendable {
                         "progression value does not match its destination storage"
                     )
                 }
+                clearProgressionBoundProjections(root: address)
                 progressionAddressValues[address] = progression
+                retiredProgressionAddresses.remove(address)
                 if !hasFutureSemanticUse(
                     of: store[0],
                     after: currentSILLineIndex
@@ -22305,6 +22641,8 @@ public struct Lowerer: Sendable {
                     }
                     if isTakingLoad {
                         progressionAddressValues.removeValue(forKey: address)
+                        clearProgressionBoundProjections(root: address)
+                        retiredProgressionAddresses.insert(address)
                     }
                     progressionValues[load[0]] = progression
                     continue
@@ -22510,6 +22848,17 @@ public struct Lowerer: Sendable {
                     partialRangeAddressValues.removeValue(forKey: address)
                     clearPartialRangeBoundProjections(root: address)
                     retiredPartialRangeAddresses.insert(address)
+                    continue
+                }
+                if let progression = progressionAddressValues[address] {
+                    guard progressionAddresses[address] == progression.type else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "destroy_addr references mismatched progression storage"
+                        )
+                    }
+                    progressionAddressValues.removeValue(forKey: address)
+                    clearProgressionBoundProjections(root: address)
+                    retiredProgressionAddresses.insert(address)
                     continue
                 }
                 if runtimeAddress(at: destroy[0]) != nil,
@@ -23842,6 +24191,8 @@ public struct Lowerer: Sendable {
             count: progressionValues.count
                 + progressionAddresses.count
                 + progressionAddressValues.count
+                + retiredProgressionAddresses.count
+                + progressionBoundProjectionRoots.count
                 + progressionIteratorAddresses.count
                 + progressionIteratorStates.count
         )

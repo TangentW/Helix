@@ -471,7 +471,10 @@ natural extrema, and mixed-source Sequence relations also stream those
 compiler-only typed bounds/stride values. Integer Range/ClosedRange `count`,
 `isEmpty`, `first`, and `last` are constant-time bound operations with exact
 full-width cardinality and checked `Int` overflow; represented Comparable Range
-bounds also support `isEmpty`. Sorting, Set construction/algebra,
+bounds also support `isEmpty`, `overlaps`, `clamped(to:)`, and direct bound
+projection. Their typed compare/select plan preserves empty-range overlap and
+floating-point equality/signed-zero behavior without a generic NativeImport.
+Sorting, Set construction/algebra,
 `Array(sequence)`, `enumerated`, `reversed`, and `zip` reuse the typed Array
 builder when a complete stored or random-access representation is required.
 One-sided `RangeExpression` containment and switch patterns over represented
@@ -485,6 +488,11 @@ one opcode per source API. Using a one-sided range as a potentially infinite
 Sequence, progression index results, private `String.Index`,
 `ReversedCollection.Index`, and other opaque index identities remain
 fail-closed rather than acquiring guessed semantics.
+`Bool.toggle()` and global `swap` likewise use a value-mutation plan over the
+shared compiler-address sink. Swap validates nonoverlapping storage and reads
+both represented values before either assignment, so ordinary locals,
+aggregate projections, frame storage, and mutable closure captures do not need
+separate API adapters.
 Array `partition(by:)` and `removeAll(where:)` share a typed linear mutable
 snapshot while their predicate calls remain ordinary verified CFG edges;
 partition preserves Swift's low/high scan, removal preserves forward visits,

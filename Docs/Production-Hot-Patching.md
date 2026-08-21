@@ -246,7 +246,9 @@ Array-backed adapters over those finite progression sources. Element-only
 consumers stream the existing typed cursor; only stored results reuse the typed
 builder. Integer Range/ClosedRange boundary queries are constant-time, and their
 exact full-width count traps if it cannot fit `Int`; represented Comparable
-Range bounds also support `isEmpty`. Neither path uses Swift generic
+Range bounds also support `isEmpty`, `overlaps`, `clamped(to:)`, and direct
+bound projection through the same typed compare/select plan. Empty-range
+overlap and floating signed-zero selection match native Swift. Neither path uses Swift generic
 NativeImports or per-API opcodes. One-sided `RangeExpression` containment and
 switch matching over represented integer, floating, String, and Character
 bounds reuse the same typed comparisons. Integer `Range`, `ClosedRange`,
@@ -258,6 +260,12 @@ a NativeImport or opcode for each collection API. Potentially infinite
 partial-range Sequence sources, custom `Comparable` witnesses, private
 `String.Index`, `ReversedCollection.Index`, and other opaque index identities
 remain rejected.
+
+`Bool.toggle()` and global `swap` are lowered as one value-mutation family over
+the existing compiler-address sink. Swap requires nonoverlapping represented
+storage and reads both values before assignment, so the same path covers local
+values, aggregate projections, frame addresses, and mutable closure cells
+without an API-specific opcode or NativeImport.
 
 `Any` does not serialize Swift existential metadata or delegate generic casts
 to NativeImport. HLBC 1.0 records a closed recursive logical descriptor next to

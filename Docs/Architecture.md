@@ -215,10 +215,20 @@ Both workflows depend on stable, build-specific identities:
   `Range`/`ClosedRange` queries compute `count`, `isEmpty`, `first`, and `last`
   directly from their bounds; full-width cardinality uses an unsigned order key
   and traps if the exact value cannot fit `Int`, without walking the range.
-  Comparable represented `Range` bounds also support `isEmpty` without gaining
-  iteration semantics. Natural and
+  Comparable represented `Range` bounds also support `isEmpty`, `overlaps`,
+  `clamped(to:)`, and direct lower/upper-bound projection without gaining
+  iteration semantics. These operations reuse typed compare/select control
+  flow, including Swift's empty-range overlap rule and equality-preserving
+  floating-point selection, rather than importing the generic Range ABI.
+  Natural and
   comparator sorting, Set construction/algebra, and other APIs whose result
   requires complete storage materialize through the same typed Array builder.
+- Nonthrowing value mutation is expressed through the shared compiler-address
+  sink rather than API-shaped bytecode. `Bool.toggle()` is one typed Boolean
+  transform, while global `swap` reads both nonoverlapping represented values
+  before assigning either destination; compiler storage, tuple/local-struct
+  projections, frame addresses, and mutable closure cells therefore share the
+  same ownership and alias checks.
 - Canonical SIL may spell tuple-label erasure through generic Array and
   Dictionary cast helpers. The compiler removes such a helper only when the
   original types differ only by tuple labels and their recursively normalized
@@ -233,6 +243,11 @@ Both workflows depend on stable, build-specific identities:
   removes frozen declarations and rebuilds the tables strictly. Imported field
   types are never guessed to be patch-local merely because Swift emitted their
   storage attributes in the declaration summary.
+- Enum declaration parsing treats comma-separated cases as independent
+  declarations, preserves nested associated-value commas, and models Swift's
+  labeled single associated value as its canonical one-element payload tuple.
+  Duplicate, empty, and malformed cases fail closed before local-type metadata
+  is built.
 - Array algorithms expose one invocation-local linear state type whose verifier
   kind distinguishes builder, random-access mutation, stable-sort, and split
   machines. This keeps the

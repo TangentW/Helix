@@ -136,6 +136,7 @@ public struct TypeEnvironment: Sendable {
             let key = Bytecode.LocalTypeKey(rawValue: name)
             var fields: [RawField] = []
             var cases: [RawEnumCase] = []
+            var caseNames = Set<String>()
             var hostedMethods: [RawHostedMethod] = []
             index += 1
 
@@ -205,18 +206,16 @@ public struct TypeEnvironment: Sendable {
                           ) {
                     hostedMethods.append(method)
                 } else if header[1] == "enum",
-                          let item = TypeEnvironment.captures(
-                    member,
-                    pattern: TypeEnvironment.enumCasePattern
-                          ) {
-                    cases.append(
-                        .init(
-                            name: item[0],
-                            associatedTypes: item[1].isEmpty
-                                ? []
-                                : TypeEnvironment.splitTopLevel(item[1])
-                        )
-                    )
+                          let declarations = try TypeEnvironment
+                            .enumCaseDeclarations(in: member) {
+                    for declaration in declarations {
+                        guard caseNames.insert(declaration.name).inserted else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "duplicate enum case \(name).\(declaration.name)"
+                            )
+                        }
+                        cases.append(declaration)
+                    }
                 }
                 if TypeEnvironment.braceDelta(in: member) > 0 {
                     try skipBracedDeclaration()
@@ -749,6 +748,18 @@ public struct TypeEnvironment: Sendable {
             let elements = splitTopLevelTuple(type)
             if elements.count == 1 {
                 if elements[0].isEmpty { return .void }
+                if let labeled = splitTopLevelKeyValue(elements[0]) {
+                    // A single labeled enum associated value is the one place
+                    // canonical SIL carries a physical one-element tuple.
+                    return .tuple([
+                        ValueRepresentation.storable(
+                            try resolve(
+                                labeled.value,
+                                relativeTo: parentScope
+                            )
+                        ),
+                    ])
+                }
                 // Swift has no single-element tuple type. Parentheses around
                 // one type are grouping, which is common around Optional
                 // closure spellings such as `((Int) -> String)?`.
@@ -1102,12 +1113,18 @@ public struct TypeEnvironment: Sendable {
                         case 0:
                             payload = nil
                         case 1:
-                            payload = ValueRepresentation.storable(
+                            let value = ValueRepresentation.storable(
                                 try resolve(
                                     removeTupleLabel(item.associatedTypes[0]),
                                     relativeTo: raw.parentScope
                                 )
                             )
+                            // Swift represents a single labeled associated
+                            // value as a one-element tuple in canonical SIL;
+                            // an unlabeled single value remains scalar.
+                            payload = splitTopLevelKeyValue(
+                                item.associatedTypes[0]
+                            ) == nil ? value : .tuple([value])
                         default:
                             payload = .tuple(
                                 try item.associatedTypes.map {
@@ -1879,8 +1896,8 @@ public struct TypeEnvironment: Sendable {
         #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate)\s+)*extension\s+([^\s:{]+)(?:\s*:\s*[^\{]+)?(?:\s+where\s+[^\{]+)?\s*\{$"#
     private static let storedFieldPattern =
         #"^(?:@[^\s]+\s+)*@_hasStorage\s+(?:@[^\s]+\s+)*(?:(?:public|internal|package|private|fileprivate)\s+)?(?:final\s+)?(?:var|let)\s+([^:]+):\s*(.+?)(?:\s*\{.*)?$"#
-    private static let enumCasePattern =
-        #"^(?:indirect )?case\s+([^\s(]+)(?:\((.*)\))?$"#
+    private static let enumCaseDeclarationPattern =
+        #"^([^\s(,]+)(?:\((.*)\))?$"#
 
     private static let hostedMethodPattern =
         #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate|override|final|dynamic|class|nonisolated)\s+)*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)(?:\s+(?:async|throws|rethrows))*\s*$"#
@@ -1953,6 +1970,57 @@ public struct TypeEnvironment: Sendable {
         return value.unicodeScalars.dropFirst().allSatisfy {
             $0 == "_" || CharacterSet.alphanumerics.contains($0)
         }
+    }
+
+    private static func enumCaseDeclarations(
+        in line: String
+    ) throws -> [RawEnumCase]? {
+        let body: Substring
+        if line.hasPrefix("case ") {
+            body = line.dropFirst("case ".count)
+        } else if line.hasPrefix("indirect case ") {
+            body = line.dropFirst("indirect case ".count)
+        } else {
+            return nil
+        }
+
+        let declarations = splitTopLevel(String(body))
+        guard !declarations.isEmpty else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "enum case declaration is empty"
+            )
+        }
+        return try declarations.map { declaration in
+            guard !declaration.isEmpty,
+                  let captures = captures(
+                    declaration,
+                    pattern: enumCaseDeclarationPattern
+                  ),
+                  isSwiftDeclarationIdentifier(captures[0])
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "invalid enum case declaration \(line)"
+                )
+            }
+            let associatedTypes = captures[1].isEmpty
+                ? [] : splitTopLevel(captures[1])
+            guard associatedTypes.allSatisfy({ !$0.isEmpty }) else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "enum case declaration has an empty associated value"
+                )
+            }
+            return .init(
+                name: captures[0],
+                associatedTypes: associatedTypes
+            )
+        }
+    }
+
+    private static func isSwiftDeclarationIdentifier(_ value: String) -> Bool {
+        if value.hasPrefix("`"), value.hasSuffix("`"), value.count > 2 {
+            return isSwiftIdentifier(String(value.dropFirst().dropLast()))
+        }
+        return isSwiftIdentifier(value)
     }
 
     private static func qualified(

@@ -2,6 +2,8 @@ import HelixBytecode
 
 extension CanonicalSIL {
 enum SwiftCoreIntrinsic: Equatable {
+    case valueMutation(CanonicalSIL.ValueMutationIntrinsic)
+    case range(CanonicalSIL.RangeIntrinsic)
     case scalar(CanonicalSIL.ScalarIntrinsic)
     case collection(CanonicalSIL.CollectionIntrinsic)
     case higherOrder(CanonicalSIL.HigherOrderIntrinsic)
@@ -75,6 +77,16 @@ enum SwiftCoreIntrinsic: Equatable {
     case unsafeOptionalUnwrap
 
     init?(mangledName: String) {
+        if let mutation = CanonicalSIL.ValueMutationIntrinsic(
+            mangledName: mangledName
+        ) {
+            self = .valueMutation(mutation)
+            return
+        }
+        if let range = CanonicalSIL.RangeIntrinsic(mangledName: mangledName) {
+            self = .range(range)
+            return
+        }
         if let defaultValue = CanonicalSIL.DefaultValueIntrinsic(
             mangledName: mangledName
         ) {
