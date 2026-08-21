@@ -16,7 +16,8 @@ struct FrontendExecutionHarness {
         source: String,
         functionName: String,
         moduleName: String = "HelixFrontendExecutionFixture",
-        nativeTypes: [InterfaceArchive.TypeRecord] = []
+        nativeTypes: [InterfaceArchive.TypeRecord] = [],
+        optimization: String = "-Onone"
     ) throws -> Fixture {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-frontend-execution-\(UUID().uuidString)",
@@ -32,7 +33,7 @@ struct FrontendExecutionHarness {
         let sil = try SwiftFrontend.Driver().emitCanonicalSIL(
             sourceFiles: [sourceURL],
             moduleName: moduleName,
-            optimization: "-Onone",
+            optimization: optimization,
             additionalArguments: ["-Xfrontend", "-disable-sil-perf-optzns"],
             purpose: .semanticLowering
         )

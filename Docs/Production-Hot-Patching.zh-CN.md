@@ -109,6 +109,8 @@ managed Array、Dictionary、Set 共用直接的 `count`、`isEmpty`、`first` �
 
 有限整数 Range/ClosedRange 与受支持数值 stride 还会复用现有强类型 cursor/builder/closure 语义，覆盖常见正向 Sequence 变换、归约、访问、predicate、comparator selection、自然极值/排序、关系、Set 构造/代数与 Array-backed adapter。整数 Range/ClosedRange 的 `count`、`isEmpty`、`first`、`last` 是常数时间 bounds 查询，count 精确覆盖完整 element 位宽并在超过 `Int.max` 时 trap；具有可表示 Comparable bounds 的 Range 也支持 `isEmpty`。只消费 element 的操作直接流式执行，只有结果需要完整存储时才使用 builder；不会把 Swift 泛型方法绑定成 NativeImport，也不会为每个源码 API 增加 opcode。
 
+可表示整数、浮点、String 与 Character bounds 的单侧 `RangeExpression` containment 和 switch 匹配复用同一套强类型比较。具体 Array 的单侧范围下标复用既有 suffix/prefix subsequence 操作；可表示 Array-backed 与 String/Substring 来源的全范围下标会消除 marker 并复用普通物化边界。这些只存在于 Compiler 的计划不会序列化 Swift 泛型 metadata 或 witness table，也不会为每个集合 API 新增 NativeImport 或 opcode。可能无限的 partial-range Sequence 来源、自定义 `Comparable` witness、私有 String index 与派生 ArraySlice index identity 仍会被拒绝。
+
 Optional 强制解包与 `unsafelyUnwrapped` 会复用同一强类型 projection，并保留专用且经过验证的 nil trap。`precondition`、fatal-error 家族、生效中的 assertion 与失败的 `try!` 错误边会降低为终止 trap；动态 String/Error detail 统一使用一条 `source_failure`。这些路径不会把 Swift runtime failure symbol 加入 NativeImport Catalog，源码位置仍来自脱敏的 HLBC source map。没有 payload 的 nil element/key/value 会从静态上下文恢复 wrapped type；泛型间接结果也可经统一 compiler-address sink 写入 Array 字面量构造 storage，当前 wire 仍为 HLBC 1.0 与 HLXI 1.0。
 
 可表示的 managed Array、Set 与 Dictionary 还会通过通用 cursor 直接执行极值、等值 membership 与跨容器 Sequence 关系；非可变排序、`enumerated`、`Array(sequence)` 与异构 `zip` 只在结果需要完整存储时进入统一物化边界。Dictionary element 保持 `(Key, Value)` Tuple，Set/Dictionary 顺序使用确定的 VM 迭代顺序。可变排序仍只支持 Array。

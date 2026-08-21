@@ -168,7 +168,9 @@ String 在一次受验证的 Character Array 物化后也复用这套 closure CF
 
 managed Array、Dictionary、Set 共用直接的 `count`、`isEmpty`、`first` 查询；具有已表示双向存储的 Array 另支持 `last`，已经归一的 Array-backed view 使用同一套查询语义。String 的 `count`/`isEmpty` 直接执行，`first`/`last` 则通过其经过验证的 Character Array 进入相同边界语义。
 
-有限整数 Range 与受支持数值 stride 也会进入同一套正向 closure 遍历，用于产生 Array 的变换、归约、访问、短路 predicate 与 comparator selection。等值 membership、自然极值与混合来源 Sequence 关系同样直接流式驱动这些仅存在于 Compiler 的强类型 bounds/stride 值；排序、Set 构造/代数、`Array(sequence)`、`enumerated`、`reversed` 与 `zip` 只有在结果需要完整存储或随机访问表示时才复用强类型 Array builder。无界 partial range、progression index 结果、index-sensitive Collection 操作和反向 predicate 遍历会明确 fail closed，不会猜测语义。
+有限整数 Range 与受支持数值 stride 也会进入同一套正向 closure 遍历，用于产生 Array 的变换、归约、访问、短路 predicate 与 comparator selection。等值 membership、自然极值与混合来源 Sequence 关系同样直接流式驱动这些仅存在于 Compiler 的强类型 bounds/stride 值；排序、Set 构造/代数、`Array(sequence)`、`enumerated`、`reversed` 与 `zip` 只有在结果需要完整存储或随机访问表示时才复用强类型 Array builder。
+
+可表示整数、浮点、String 与 Character bounds 的单侧 `RangeExpression` containment 和 switch pattern 共用标量比较计划。具体 Array 的单侧范围下标复用既有强类型 suffix/prefix 操作；可表示 Array-backed 或 String/Substring 来源的全范围下标复用普通 Sequence 物化边界。Compiler 会消除这些范围 wrapper，不把 Swift 泛型 Collection ABI 绑定为 NativeImport，也不为每个源码 API 增加 opcode。把单侧范围当作可能无限的 Sequence、progression index 结果、私有 String 或派生 ArraySlice index、其他 index-sensitive Collection 操作及反向 predicate 遍历仍会明确 fail closed，不会猜测语义。
 
 整数 Range/ClosedRange 的 `count`、`isEmpty`、`first`、`last` 是直接读取 bounds 的常数时间操作；count 精确覆盖完整 element 位宽，并在基数超过 `Int.max` 时 trap。具有可表示 Comparable bounds 的 Range 也可执行 `isEmpty`，但不会因此获得迭代能力。
 

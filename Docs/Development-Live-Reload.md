@@ -460,9 +460,17 @@ full-width cardinality and checked `Int` overflow; represented Comparable Range
 bounds also support `isEmpty`. Sorting, Set construction/algebra,
 `Array(sequence)`, `enumerated`, `reversed`, and `zip` reuse the typed Array
 builder when a complete stored or random-access representation is required.
-Unbounded partial ranges, progression index results, other index-sensitive
-Collection operations, and reverse predicate traversal fail closed rather than
-acquiring guessed semantics.
+One-sided `RangeExpression` containment and switch patterns over represented
+integer, floating, String, and Character bounds reuse the scalar comparison
+plan. Concrete Array partial-range subscripts reuse existing typed
+suffix/prefix operations, and full-range subscripts over represented
+Array-backed or String/Substring sources reuse the ordinary sequence
+materialization boundary. The compiler erases these range wrappers instead of
+binding Swift's generic Collection ABI as NativeImports or adding one opcode
+per source API. Using a one-sided range as a potentially infinite Sequence,
+progression index results, private String or derived ArraySlice indices, other
+index-sensitive Collection operations, and reverse predicate traversal remain
+fail-closed rather than acquiring guessed semantics.
 Array `partition(by:)` and `removeAll(where:)` share a typed linear mutable
 snapshot while their predicate calls remain ordinary verified CFG edges;
 partition preserves Swift's low/high scan, removal preserves forward visits,

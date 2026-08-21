@@ -242,7 +242,17 @@ consumers stream the existing typed cursor; only stored results reuse the typed
 builder. Integer Range/ClosedRange boundary queries are constant-time, and their
 exact full-width count traps if it cannot fit `Int`; represented Comparable
 Range bounds also support `isEmpty`. Neither path uses Swift generic
-NativeImports or per-API opcodes. Reading VM storage as `Array.capacity` and
+NativeImports or per-API opcodes. One-sided `RangeExpression` containment and
+switch matching over represented integer, floating, String, and Character
+bounds reuse the same typed comparisons. Concrete Array partial-range
+subscripts reuse existing suffix/prefix subsequence operations; full-range
+subscripts over represented Array-backed and String/Substring sources erase
+the marker and reuse the ordinary materialization boundary. These compiler-only
+plans do not serialize Swift generic metadata or witness tables and do not add
+a NativeImport or opcode for each collection API. Potentially infinite
+partial-range Sequence sources, custom `Comparable` witnesses, private String
+indices, and derived ArraySlice index identity remain rejected.
+Reading VM storage as `Array.capacity` and
 unrepresented randomness through `randomElement()` remain rejected. The
 subset also includes
 structured control flow, newly introduced non-exported ordinary/private helpers,

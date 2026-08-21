@@ -1,3 +1,4 @@
+import HelixBytecode
 import HelixCore
 import HelixInterface
 import HelixVM
@@ -16,6 +17,9 @@ struct CollectionAdapterSemanticsMatrix {
         var name: String
         var source: String
         var scenarios: [Scenario]
+        var requiredDisassembly: [String] = []
+        var forbiddenDisassembly: [String] = []
+        var optimization = "-Onone"
     }
 
     @Test("Enumerated, reversed, and repeated adapters are type-driven")
@@ -536,6 +540,371 @@ struct CollectionAdapterSemanticsMatrix {
         ])
     }
 
+    @Test("Partial and full ranges reuse represented collection semantics")
+    func lowersPartialAndFullRanges() throws {
+        try run([
+            .init(
+                name: "partialStringSlices",
+                source: """
+                public func partialStringSlices(
+                    _ values: [String],
+                    _ lower: Int,
+                    _ upper: Int
+                ) -> [[String]] {
+                    [
+                        Array(values[lower...]),
+                        Array(values[..<upper]),
+                        Array(values[...upper])
+                    ]
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            strings(["a", "b", "c", "d"]),
+                            try integer(1),
+                            try integer(2),
+                        ],
+                        expected: .returned(
+                            .array(
+                                [
+                                    strings(["b", "c", "d"]),
+                                    strings(["a", "b"]),
+                                    strings(["a", "b", "c"]),
+                                ],
+                                elementType: .array(.string)
+                            )
+                        )
+                    ),
+                ],
+                requiredDisassembly: [
+                    "array_suffixFrom",
+                    "array_prefixUpTo",
+                    "array_prefixThrough",
+                ],
+                forbiddenDisassembly: ["native_apply"]
+            ),
+            .init(
+                name: "partialSuffix",
+                source: """
+                public func partialSuffix(
+                    _ values: [Int],
+                    _ lower: Int
+                ) -> [Int] {
+                    Array(values[lower...])
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integers([1, 2, 3]), try integer(3)],
+                        expected: .returned(try integers([]))
+                    ),
+                    .init(
+                        arguments: [try integers([1, 2, 3]), try integer(-1)],
+                        expected: .trapped(
+                            .arrayIndexOutOfBounds(index: -1, count: 3)
+                        )
+                    ),
+                    .init(
+                        arguments: [try integers([1, 2, 3]), try integer(4)],
+                        expected: .trapped(
+                            .arrayIndexOutOfBounds(index: 4, count: 3)
+                        )
+                    ),
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]), try integer(.min),
+                        ],
+                        expected: .trapped(
+                            .arrayIndexOutOfBounds(index: .min, count: 3)
+                        )
+                    ),
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]), try integer(.max),
+                        ],
+                        expected: .trapped(
+                            .arrayIndexOutOfBounds(index: .max, count: 3)
+                        )
+                    ),
+                ]
+            ),
+            .init(
+                name: "partialPrefix",
+                source: """
+                public func partialPrefix(
+                    _ values: [Int],
+                    _ upper: Int
+                ) -> [Int] {
+                    Array(values[..<upper])
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integers([1, 2, 3]), try integer(0)],
+                        expected: .returned(try integers([]))
+                    ),
+                    .init(
+                        arguments: [try integers([1, 2, 3]), try integer(3)],
+                        expected: .returned(try integers([1, 2, 3]))
+                    ),
+                    .init(
+                        arguments: [try integers([1, 2, 3]), try integer(4)],
+                        expected: .trapped(
+                            .arrayIndexOutOfBounds(index: 4, count: 3)
+                        )
+                    ),
+                    .init(
+                        arguments: [try integers([1, 2, 3]), try integer(-1)],
+                        expected: .trapped(
+                            .arrayIndexOutOfBounds(index: -1, count: 3)
+                        )
+                    ),
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]), try integer(.max),
+                        ],
+                        expected: .trapped(
+                            .arrayIndexOutOfBounds(index: .max, count: 3)
+                        )
+                    ),
+                ]
+            ),
+            .init(
+                name: "partialThrough",
+                source: """
+                public func partialThrough(
+                    _ values: [Int],
+                    _ upper: Int
+                ) -> [Int] {
+                    Array(values[...upper])
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integers([1, 2, 3]), try integer(0)],
+                        expected: .returned(try integers([1]))
+                    ),
+                    .init(
+                        arguments: [try integers([1, 2, 3]), try integer(2)],
+                        expected: .returned(try integers([1, 2, 3]))
+                    ),
+                    .init(
+                        arguments: [try integers([1, 2, 3]), try integer(3)],
+                        expected: .trapped(
+                            .arrayIndexOutOfBounds(index: 3, count: 3)
+                        )
+                    ),
+                    .init(
+                        arguments: [try integers([1, 2, 3]), try integer(-1)],
+                        expected: .trapped(
+                            .arrayIndexOutOfBounds(index: -1, count: 3)
+                        )
+                    ),
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]), try integer(.max),
+                        ],
+                        expected: .trapped(
+                            .arrayIndexOutOfBounds(index: .max, count: 3)
+                        )
+                    ),
+                ]
+            ),
+            .init(
+                name: "optimizedPartialSlices",
+                source: """
+                public func optimizedPartialSlices(
+                    _ values: [Int],
+                    _ lower: Int,
+                    _ upper: Int
+                ) -> [[Int]] {
+                    [
+                        Array(values[lower...]),
+                        Array(values[..<upper]),
+                        Array(values[...upper])
+                    ]
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3, 4]),
+                            try integer(2),
+                            try integer(1),
+                        ],
+                        expected: .returned(
+                            try integerArrays([[3, 4], [1], [1, 2]])
+                        )
+                    ),
+                ],
+                optimization: "-O"
+            ),
+            .init(
+                name: "storedPartialSlices",
+                source: """
+                public func storedPartialSlices(
+                    _ values: [Int],
+                    _ lower: Int,
+                    _ upper: Int
+                ) -> [[Int]] {
+                    let suffix = lower...
+                    let prefix = ..<upper
+                    let inclusivePrefix = ...upper
+                    return [
+                        Array(values[suffix]),
+                        Array(values[prefix]),
+                        Array(values[inclusivePrefix])
+                    ]
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3, 4]),
+                            try integer(2),
+                            try integer(1),
+                        ],
+                        expected: .returned(
+                            try integerArrays([[3, 4], [1], [1, 2]])
+                        )
+                    ),
+                ],
+                forbiddenDisassembly: ["native_apply"]
+            ),
+            .init(
+                name: "fullStringArraySlice",
+                source: """
+                public func fullStringArraySlice(
+                    _ values: [String]
+                ) -> [String] {
+                    Array(values[...])
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [strings(["a", "👩🏽‍💻", "c"])],
+                        expected: .returned(strings(["a", "👩🏽‍💻", "c"]))
+                    ),
+                    .init(
+                        arguments: [strings([])],
+                        expected: .returned(strings([]))
+                    ),
+                ],
+                forbiddenDisassembly: ["make_closure", "native_apply"]
+            ),
+            .init(
+                name: "fullTextSlice",
+                source: """
+                public func fullTextSlice(_ value: String) -> String {
+                    String(value[...])
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [.string("a👩🏽‍💻c")],
+                        expected: .returned(.string("a👩🏽‍💻c"))
+                    ),
+                    .init(
+                        arguments: [.string("")],
+                        expected: .returned(.string(""))
+                    ),
+                ],
+                forbiddenDisassembly: ["make_closure", "native_apply"]
+            ),
+            .init(
+                name: "fullArraySliceValue",
+                source: """
+                public func fullArraySliceValue(
+                    _ values: [Int]
+                ) -> ArraySlice<Int> {
+                    values[...]
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integers([1, 2, 3])],
+                        expected: .returned(try integers([1, 2, 3]))
+                    ),
+                ],
+                forbiddenDisassembly: ["make_closure", "native_apply"]
+            ),
+            .init(
+                name: "fullDerivedArraySlice",
+                source: """
+                public func fullDerivedArraySlice(_ values: [Int]) -> [Int] {
+                    let tail = values[1...]
+                    return Array(tail[...])
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integers([1, 2, 3])],
+                        expected: .returned(try integers([2, 3]))
+                    ),
+                ],
+                forbiddenDisassembly: ["make_closure", "native_apply"]
+            ),
+            .init(
+                name: "fullSubstringSlice",
+                source: """
+                public func fullSubstringSlice(_ value: String) -> String {
+                    let tail = value.dropFirst()
+                    return String(tail[...])
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [.string("a👩🏽‍💻c")],
+                        expected: .returned(.string("👩🏽‍💻c"))
+                    ),
+                ],
+                forbiddenDisassembly: ["make_closure", "native_apply"]
+            ),
+            .init(
+                name: "fullOptionalSlice",
+                source: """
+                public func fullOptionalSlice(_ values: [Int?]) -> [Int?] {
+                    Array(values[...])
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            .array(
+                                [.optional(nil), .optional(try integer(2))],
+                                elementType: .optional(.int64)
+                            ),
+                        ],
+                        expected: .returned(
+                            .array(
+                                [.optional(nil), .optional(try integer(2))],
+                                elementType: .optional(.int64)
+                            )
+                        )
+                    ),
+                ],
+                forbiddenDisassembly: ["make_closure", "native_apply"]
+            ),
+            .init(
+                name: "optimizedFullSlice",
+                source: """
+                public func optimizedFullSlice(_ values: [Int]) -> [Int] {
+                    Array(values[...])
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integers([1, 2, 3])],
+                        expected: .returned(try integers([1, 2, 3]))
+                    ),
+                ],
+                forbiddenDisassembly: ["make_closure", "native_apply"],
+                optimization: "-O"
+            ),
+        ])
+    }
+
     @Test("zip and joined normalize heterogeneous and nested sequences")
     func lowersZipAndJoined() throws {
         try run([
@@ -763,8 +1132,24 @@ struct CollectionAdapterSemanticsMatrix {
                 let fixture = try FrontendExecutionHarness.compile(
                     source: probe.source,
                     functionName: probe.name,
-                    moduleName: "HelixAdapters_\(probe.name)"
+                    moduleName: "HelixAdapters_\(probe.name)",
+                    optimization: probe.optimization
                 )
+                let disassembly = Bytecode.Disassembler.disassemble(
+                    fixture.image.module
+                )
+                for required in probe.requiredDisassembly
+                    where !disassembly.contains(required) {
+                    failures.append(
+                        "\(probe.name): missing HLBC instruction \(required)"
+                    )
+                }
+                for forbidden in probe.forbiddenDisassembly
+                    where disassembly.contains(forbidden) {
+                    failures.append(
+                        "\(probe.name): unexpected HLBC instruction \(forbidden)"
+                    )
+                }
                 for (index, scenario) in probe.scenarios.enumerated() {
                     let actual = VM.Interpreter().invoke(
                         entry: fixture.entry,

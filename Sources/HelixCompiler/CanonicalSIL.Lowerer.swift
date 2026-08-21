@@ -643,6 +643,8 @@ public struct Lowerer: Sendable {
         var registerTypes: [Bytecode.ValueType] = []
         var values: [String: Bytecode.Register] = [:]
         var functionReferences: [String: ResolvedFunctionReference] = [:]
+        var unboundedRangeFunctionReferences = Set<String>()
+        var unboundedRangeClosureValues = Set<String>()
         var staticKeyPathValues: [String: CanonicalSIL.StaticKeyPath.Capture] = [:]
         var frozenObjectiveCBridgeResults = Set<Bytecode.Register>()
         var hostedAllocatorReferences: [String: Core.TypeID] = [:]
@@ -684,6 +686,12 @@ public struct Lowerer: Sendable {
         var nativeGlobalAddresses: [String: CanonicalSIL.DirectCallBinding] = [:]
         var characterMetatypeValues = Set<String>()
         var localMetatypeValues: [String: Bytecode.LocalTypeKey] = [:]
+        var progressionMetatypeValues: [
+            String: CanonicalSIL.Progression.SequenceType
+        ] = [:]
+        var partialRangeMetatypeValues: [
+            String: CanonicalSIL.RangeExpression.PartialShape
+        ] = [:]
         var dictionaryMetatypeValues: [String: (Bytecode.ValueType, Bytecode.ValueType)] = [:]
         var setMetatypeValues: [String: Bytecode.ValueType] = [:]
         var stackAddressTypes: [String: Bytecode.ValueType] = [:]
@@ -719,6 +727,17 @@ public struct Lowerer: Sendable {
         var progressionAddressValues: [
             String: CanonicalSIL.Progression.Value
         ] = [:]
+        var partialRangeValues: [
+            String: CanonicalSIL.RangeExpression.PartialValue
+        ] = [:]
+        var partialRangeAddresses: [
+            String: CanonicalSIL.RangeExpression.PartialShape
+        ] = [:]
+        var partialRangeAddressValues: [
+            String: CanonicalSIL.RangeExpression.PartialValue
+        ] = [:]
+        var retiredPartialRangeAddresses = Set<String>()
+        var partialRangeBoundProjectionRoots: [String: String] = [:]
         var progressionIteratorAddresses: [
             String: CanonicalSIL.Progression.SequenceType
         ] = [:]
@@ -10886,6 +10905,122 @@ public struct Lowerer: Sendable {
             )
         }
 
+        func partialRangeValue(
+            at token: String
+        ) throws -> CanonicalSIL.RangeExpression.PartialValue {
+            let address = addressBase(token)
+            if let value = partialRangeAddressValues[address] {
+                guard partialRangeAddresses[address] == value.shape else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "partial range storage has a mismatched value"
+                    )
+                }
+                return value
+            }
+            guard let value = partialRangeValues[token] else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "partial range operand is not initialized"
+                )
+            }
+            return value
+        }
+
+        func clearPartialRangeBoundProjections(root: String) {
+            let projections = partialRangeBoundProjectionRoots.compactMap {
+                projection, candidate in
+                candidate == root ? projection : nil
+            }
+            for projection in projections {
+                partialRangeBoundProjectionRoots.removeValue(
+                    forKey: projection
+                )
+                stackAddressTypes.removeValue(forKey: projection)
+                stackAddressValues.removeValue(forKey: projection)
+            }
+        }
+
+        func emitBoundedRangeContainment(
+            _ range: CanonicalSIL.Progression.Value,
+            candidate: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            let element = range.type.element
+            guard range.type.family == .range
+                    || range.type.family == .closedRange,
+                  element.isVMComparable,
+                  registerTypes[Int(candidate.rawValue)] == element,
+                  registerTypes[Int(range.start.rawValue)] == element,
+                  registerTypes[Int(range.end.rawValue)] == element
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "bounded RangeExpression operands do not match"
+                )
+            }
+            let meetsLower = try allocate(type: .bool)
+            appendInstruction(
+                .compare(
+                    result: meetsLower,
+                    predicate: .lessThanOrEqual,
+                    lhs: range.start,
+                    rhs: candidate
+                )
+            )
+            let meetsUpper = try allocate(type: .bool)
+            appendInstruction(
+                .compare(
+                    result: meetsUpper,
+                    predicate: range.type.family == .closedRange
+                        ? .lessThanOrEqual
+                        : .lessThan,
+                    lhs: candidate,
+                    rhs: range.end
+                )
+            )
+            let result = try allocate(type: .bool)
+            appendInstruction(
+                .booleanBinary(
+                    result: result,
+                    operation: .and,
+                    lhs: meetsLower,
+                    rhs: meetsUpper
+                )
+            )
+            return result
+        }
+
+        func emitPartialRangeContainment(
+            _ range: CanonicalSIL.RangeExpression.PartialValue,
+            candidate: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            let boundType = range.shape.boundType
+            guard boundType.isVMComparable,
+                  registerTypes[Int(range.bound.rawValue)] == boundType,
+                  registerTypes[Int(candidate.rawValue)] == boundType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "partial RangeExpression operands do not match"
+                )
+            }
+            let comparison = range.shape.boundary.containmentComparison
+            func operand(
+                _ source: CanonicalSIL.RangeExpression.ComparisonOperand
+            ) -> Bytecode.Register {
+                switch source {
+                case .bound: range.bound
+                case .candidate: candidate
+                }
+            }
+            let result = try allocate(type: .bool)
+            appendInstruction(
+                .compare(
+                    result: result,
+                    predicate: comparison.predicate,
+                    lhs: operand(comparison.lhs),
+                    rhs: operand(comparison.rhs)
+                )
+            )
+            return result
+        }
+
         func lowerCollectionIntrinsic(
             _ intrinsic: CanonicalSIL.CollectionIntrinsic,
             resultToken: String,
@@ -11017,6 +11152,45 @@ public struct Lowerer: Sendable {
                     reason: .integerOverflow
                 )
                 return result
+            }
+
+            func emitArraySubsequence(
+                source: CanonicalSIL.SequenceSpecialization,
+                sourceToken: String,
+                operation: Bytecode.ArraySubsequenceOperation,
+                bound: Bytecode.Register,
+                destination: String
+            ) throws {
+                let resultType = Bytecode.ValueType.array(source.element)
+                guard compilerAddressType(destination) == resultType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "collection subsequence output does not match Element"
+                    )
+                }
+                let materialized = try materializeSequenceOperand(
+                    source,
+                    token: sourceToken,
+                    context: "collection subsequence",
+                    line: line
+                )
+                let result = try allocate(type: resultType)
+                appendInstruction(
+                    .arraySubsequence(
+                        result: result,
+                        operation: operation,
+                        array: materialized.array,
+                        bound: bound
+                    )
+                )
+                for instruction in materialized.cleanup {
+                    appendInstruction(instruction)
+                }
+                try storeConstructedValue(
+                    result,
+                    at: destination,
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
             }
 
             switch intrinsic {
@@ -11441,7 +11615,6 @@ public struct Lowerer: Sendable {
                     genericArguments,
                     context: "collection subsequence"
                 )
-                let resultType = Bytecode.ValueType.array(source.element)
                 let normalizedSpelling = genericArguments
                     .trimmingCharacters(in: .whitespaces)
                     .trimmingPrefix("$")
@@ -11451,42 +11624,26 @@ public struct Lowerer: Sendable {
                 case .prefixUpTo, .prefixThrough, .suffixFrom: true
                 case .dropFirst, .dropLast, .prefix, .suffix: false
                 }
-                guard source.normalizedCollectionType == resultType,
+                guard source.normalizedCollectionType
+                        == .array(source.element),
                       !usesConcreteIndex || (
                           isConcreteArray
-                            && source.managedCollectionType == resultType
-                      ),
-                      compilerAddressType(arguments[0]) == resultType
+                            && source.managedCollectionType
+                                == .array(source.element)
+                      )
                 else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
                         "collection subsequence specialization \(genericArguments)"
                     )
                 }
                 let bound = try trivialOperand(arguments[1], as: .int64)
-                let materialized = try materializeSequenceOperand(
-                    source,
-                    token: arguments[2],
-                    context: "collection subsequence",
-                    line: line
+                try emitArraySubsequence(
+                    source: source,
+                    sourceToken: arguments[2],
+                    operation: operation,
+                    bound: bound,
+                    destination: arguments[0]
                 )
-                let result = try allocate(type: resultType)
-                appendInstruction(
-                    .arraySubsequence(
-                        result: result,
-                        operation: operation,
-                        array: materialized.array,
-                        bound: bound
-                    )
-                )
-                for instruction in materialized.cleanup {
-                    appendInstruction(instruction)
-                }
-                try storeConstructedValue(
-                    result,
-                    at: arguments[0],
-                    mode: .initialize
-                )
-                voidValues.insert(resultToken)
 
             case .adapter(.rangeSlice):
                 guard arguments.count == 2 else {
@@ -11525,6 +11682,98 @@ public struct Lowerer: Sendable {
                     progressionValues.removeValue(forKey: arguments[0])
                 }
                 values[resultToken] = result
+
+            case .adapter(.partialRangeSlice):
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard specializations.count == 2,
+                      arguments.count == 3,
+                      let rangeShape = try CanonicalSIL.RangeExpression
+                        .parsePartial(
+                          specializations[1],
+                          resolve: parseStoredType
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "partial range subscript has unsupported specializations"
+                    )
+                }
+                let source = try parseSequenceSpecialization(
+                    specializations[0],
+                    context: "partial range subscript"
+                )
+                let sourceIdentity = CanonicalSIL.SwiftTypeIdentity.normalized(
+                    specializations[0]
+                )
+                let isConcreteArray = ["Array<", "Swift.Array<"].contains {
+                    sourceIdentity.hasPrefix($0)
+                }
+                let range = try partialRangeValue(at: arguments[1])
+                guard isConcreteArray,
+                      source.managedCollectionType == .array(source.element),
+                      rangeShape.boundIdentity == "Int",
+                      rangeShape.boundType == .int64,
+                      range.shape == rangeShape
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "partial range subscript \(genericArguments)"
+                    )
+                }
+                try emitArraySubsequence(
+                    source: source,
+                    sourceToken: arguments[2],
+                    operation: rangeShape.boundary.subsequenceOperation,
+                    bound: range.bound,
+                    destination: arguments[0]
+                )
+                if partialRangeValues[arguments[1]] != nil,
+                   !hasFutureSemanticUse(
+                       of: arguments[1],
+                       after: currentSILLineIndex
+                   ) {
+                    partialRangeValues.removeValue(forKey: arguments[1])
+                }
+
+            case .adapter(.fullRangeSlice):
+                let source = try parseSequenceSpecialization(
+                    genericArguments,
+                    context: "full-range subscript"
+                )
+                let resultType = Bytecode.ValueType.array(source.element)
+                guard arguments.count == 3,
+                      source.normalizedCollectionType == resultType,
+                      unboundedRangeClosureValues.contains(arguments[1]),
+                      compilerAddressType(arguments[0]) == resultType
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "full-range subscript \(genericArguments)"
+                    )
+                }
+                let materialized = try materializeSequenceOperand(
+                    source,
+                    token: arguments[2],
+                    context: "full-range subscript",
+                    line: line
+                )
+                let result = try allocate(type: resultType)
+                appendInstruction(
+                    .copyValue(result: result, source: materialized.array)
+                )
+                for instruction in materialized.cleanup {
+                    appendInstruction(instruction)
+                }
+                try storeConstructedValue(
+                    result,
+                    at: arguments[0],
+                    mode: .initialize
+                )
+                voidValues.insert(resultToken)
+                if !hasFutureSemanticUse(
+                    of: arguments[1],
+                    after: currentSILLineIndex
+                ) {
+                    unboundedRangeClosureValues.remove(arguments[1])
+                }
 
             case .adapter(.zip):
                 let sequenceSpellings = splitTopLevel(genericArguments)
@@ -13682,6 +13931,43 @@ public struct Lowerer: Sendable {
                     line: line,
                     text: "Swift intrinsic requires control-flow lowering"
                 )
+            case let .partialRangeConstructor(boundary):
+                let boundType = try parseStoredType(genericArguments)
+                let shape = CanonicalSIL.RangeExpression.PartialShape(
+                    boundary: boundary,
+                    boundIdentity: CanonicalSIL.SwiftTypeIdentity.normalized(
+                        genericArguments
+                    ),
+                    boundType: boundType
+                )
+                guard arguments.count == 3,
+                      boundType.isVMComparable,
+                      partialRangeMetatypeValues[arguments[2]] == shape
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "partial range constructor has an unsupported specialization"
+                    )
+                }
+                let destination = addressBase(arguments[0])
+                guard partialRangeAddresses[destination] == shape,
+                      partialRangeAddressValues[destination] == nil,
+                      let bound = try copyStoredValue(
+                          at: arguments[1],
+                          line: line
+                      ),
+                      registerTypes[Int(bound.rawValue)] == boundType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "partial range constructor output does not match its metatype"
+                    )
+                }
+                partialRangeAddressValues[destination] = .init(
+                    shape: shape,
+                    bound: bound
+                )
+                retiredPartialRangeAddresses.remove(destination)
+                voidValues.insert(resultToken)
+
             case let .progressionConstructor(family):
                 guard arguments.count == 4,
                       !genericArguments.isEmpty,
@@ -13811,45 +14097,72 @@ public struct Lowerer: Sendable {
                       let needle = try copyStoredValue(
                           at: arguments[0],
                           line: line
-                      ),
-                      registerTypes[Int(needle.rawValue)] == element,
-                      registerTypes[Int(value.start.rawValue)] == element,
-                      registerTypes[Int(value.end.rawValue)] == element
+                      )
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Range.contains specialization does not match its operands"
                     )
                 }
-                let meetsLower = try allocate(type: .bool)
-                appendInstruction(
-                    .compare(
-                        result: meetsLower,
-                        predicate: .lessThanOrEqual,
-                        lhs: value.start,
-                        rhs: needle
-                    )
+                values[resultToken] = try emitBoundedRangeContainment(
+                    value,
+                    candidate: needle
                 )
-                let meetsUpper = try allocate(type: .bool)
-                appendInstruction(
-                    .compare(
-                        result: meetsUpper,
-                        predicate: family == .closedRange
-                            ? .lessThanOrEqual
-                            : .lessThan,
-                        lhs: needle,
-                        rhs: value.end
+
+            case .rangeExpressionContains:
+                guard arguments.count == 3,
+                      !genericArguments.isEmpty,
+                      let candidateType = stackType(at: arguments[1]),
+                      let candidate = try copyStoredValue(
+                          at: arguments[1],
+                          line: line
+                      ),
+                      registerTypes[Int(candidate.rawValue)] == candidateType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "RangeExpression pattern match has unsupported operands"
                     )
-                )
-                let result = try allocate(type: .bool)
-                values[resultToken] = result
-                appendInstruction(
-                    .booleanBinary(
-                        result: result,
-                        operation: .and,
-                        lhs: meetsLower,
-                        rhs: meetsUpper
+                }
+                if let type = try progressionSequenceType(genericArguments) {
+                    guard type.family == .range || type.family == .closedRange,
+                          type.element == candidateType,
+                          progressionMetatypeValues[arguments[2]] == type
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "bounded RangeExpression pattern specialization does not match"
+                        )
+                    }
+                    let range = try progressionOperand(
+                        arguments[0],
+                        expected: type,
+                        line: line
                     )
-                )
+                    values[resultToken] = try emitBoundedRangeContainment(
+                        range,
+                        candidate: candidate
+                    )
+                } else if let shape = try CanonicalSIL.RangeExpression
+                    .parsePartial(
+                        genericArguments,
+                        resolve: parseStoredType
+                    ) {
+                    let range = try partialRangeValue(at: arguments[0])
+                    guard shape.boundType == candidateType,
+                          range.shape == shape,
+                          partialRangeMetatypeValues[arguments[2]] == shape
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "partial RangeExpression pattern specialization does not match"
+                        )
+                    }
+                    values[resultToken] = try emitPartialRangeContainment(
+                        range,
+                        candidate: candidate
+                    )
+                } else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "RangeExpression pattern \(genericArguments)"
+                    )
+                }
 
             case .minimum, .maximum:
                 guard arguments.count == 3, !genericArguments.isEmpty else {
@@ -15836,6 +16149,7 @@ public struct Lowerer: Sendable {
             emitsRuntimeCleanup: Bool
         ) {
             if staticKeyPathValues[token] != nil { return }
+            if unboundedRangeClosureValues.remove(token) != nil { return }
             borrowedValueTokens.remove(token)
             if let value = mutableCaptureState.temporaryBorrowOwners.removeValue(
                 forKey: token
@@ -15905,6 +16219,21 @@ public struct Lowerer: Sendable {
                 if isFinalLexicalUse {
                     progressionAddresses.removeValue(forKey: address)
                     progressionAddressValues.removeValue(forKey: address)
+                }
+                return
+            }
+            if partialRangeAddresses[address] != nil {
+                if partialRangeAddressValues[address] == nil,
+                   !retiredPartialRangeAddresses.contains(address) {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "partial range storage is deallocated before initialization"
+                    )
+                }
+                if isFinalLexicalUse {
+                    clearPartialRangeBoundProjections(root: address)
+                    partialRangeAddresses.removeValue(forKey: address)
+                    partialRangeAddressValues.removeValue(forKey: address)
+                    retiredPartialRangeAddresses.remove(address)
                 }
                 return
             }
@@ -16489,6 +16818,26 @@ public struct Lowerer: Sendable {
 
             if let metatype = match(
                 line,
+                pattern: #"^(%[0-9]+) = metatype \$@(thin|thick) (.+)\.Type$"#
+            ), let type = try progressionSequenceType(metatype[2]),
+               type.family == .range || type.family == .closedRange {
+                progressionMetatypeValues[metatype[0]] = type
+                continue
+            }
+
+            if let metatype = match(
+                line,
+                pattern: #"^(%[0-9]+) = metatype \$@(thin|thick) (.+)\.Type$"#
+            ), let shape = try CanonicalSIL.RangeExpression.parsePartial(
+                metatype[2],
+                resolve: parseStoredType
+            ) {
+                partialRangeMetatypeValues[metatype[0]] = shape
+                continue
+            }
+
+            if let metatype = match(
+                line,
                 pattern: #"^(%[0-9]+) = metatype \$@thin (?:Swift\.)?String\.Type$"#
             ) {
                 metatypeValues.insert(metatype[0])
@@ -16697,6 +17046,13 @@ public struct Lowerer: Sendable {
                     progressionAddresses[stack[0]] = type
                     continue
                 }
+                if let shape = try CanonicalSIL.RangeExpression.parsePartial(
+                    stack[1],
+                    resolve: parseStoredType
+                ) {
+                    partialRangeAddresses[stack[0]] = shape
+                    continue
+                }
                 if isCharacterType(stack[1]) {
                     // Character literals are represented as one-grapheme VM
                     // strings. This avoids importing Swift.Character layout.
@@ -16860,6 +17216,38 @@ public struct Lowerer: Sendable {
                     progressionAddressValues[destination] = progression
                     if copy[0] == "take" {
                         progressionAddressValues.removeValue(forKey: source)
+                    }
+                    continue
+                }
+                if let partialRange = partialRangeAddressValues[source] {
+                    guard source != destination,
+                          partialRangeAddresses[source] == partialRange.shape,
+                          partialRangeAddresses[destination] == partialRange.shape
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "partial range copy_addr requires matching storage"
+                        )
+                    }
+                    if copy[2] == "init" {
+                        guard partialRangeAddressValues[destination] == nil else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "partial range copy_addr initializes existing storage"
+                            )
+                        }
+                    } else {
+                        guard partialRangeAddressValues[destination] != nil else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "partial range copy_addr assigns uninitialized storage"
+                            )
+                        }
+                    }
+                    clearPartialRangeBoundProjections(root: destination)
+                    partialRangeAddressValues[destination] = partialRange
+                    retiredPartialRangeAddresses.remove(destination)
+                    if copy[0] == "take" {
+                        partialRangeAddressValues.removeValue(forKey: source)
+                        clearPartialRangeBoundProjections(root: source)
+                        retiredPartialRangeAddresses.insert(source)
                     }
                     continue
                 }
@@ -17055,6 +17443,7 @@ public struct Lowerer: Sendable {
                 guard stackAddressTypes[base] != nil
                         || pendingArrayIteratorTypes[base] != nil
                         || progressionAddresses[base] != nil
+                        || partialRangeAddresses[base] != nil
                         || progressionIteratorAddresses[base] != nil
                         || pendingDictionaryIteratorTypes[base] != nil
                         || pendingSetIteratorTypes[base] != nil
@@ -17698,6 +18087,27 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = struct_element_addr (%[0-9]+), #(.+)\.([^.]+)$"#
             ) {
+                let partialRangeRoot = addressBase(projection[1])
+                if let range = partialRangeAddressValues[partialRangeRoot] {
+                    guard partialRangeAddresses[partialRangeRoot]
+                            == range.shape,
+                          CanonicalSIL.RangeExpression
+                            .matchesPartialStoredField(
+                                owner: projection[2],
+                                field: projection[3],
+                                shape: range.shape
+                            )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "partial range projection does not match its stored bound"
+                        )
+                    }
+                    stackAddressTypes[projection[0]] = range.shape.boundType
+                    stackAddressValues[projection[0]] = range.bound
+                    partialRangeBoundProjectionRoots[projection[0]] =
+                        partialRangeRoot
+                    continue
+                }
                 let scalarWrappers: Set<String> = [
                     "Int", "Int8", "Int16", "Int32", "Int64",
                     "UInt", "UInt8", "UInt16", "UInt32", "UInt64",
@@ -17926,6 +18336,29 @@ public struct Lowerer: Sendable {
                     )
                 }
                 values[projection[0]] = result
+                continue
+            }
+
+            if let extraction = match(
+                line,
+                pattern: #"^(%[0-9]+) = struct_extract (%[0-9]+), #(.+)\.([^.]+)$"#
+            ), let range = partialRangeValues[extraction[1]] {
+                guard CanonicalSIL.RangeExpression.matchesPartialStoredField(
+                    owner: extraction[2],
+                    field: extraction[3],
+                    shape: range.shape
+                ) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "partial range extraction does not match its stored bound"
+                    )
+                }
+                values[extraction[0]] = range.bound
+                if !hasFutureSemanticUse(
+                    of: extraction[1],
+                    after: currentSILLineIndex
+                ) {
+                    partialRangeValues.removeValue(forKey: extraction[1])
+                }
                 continue
             }
 
@@ -18407,6 +18840,13 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = (?:dynamic_)?function_ref @([^\s:]+) : \$(.+)$"#
             ) {
+                if CanonicalSIL.RangeExpression
+                    .isUnboundedMarkerFunctionType(
+                    reference[2]
+                ) {
+                    unboundedRangeFunctionReferences.insert(reference[0])
+                    continue
+                }
                 let boundCall = directCalls.binding(for: reference[1])
                 let hasImageBody = boundCall.map { binding in
                     if case .function = binding.target { true } else { false }
@@ -18499,6 +18939,23 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = thin_to_thick_function (%[0-9]+) to \$(.+)$"#
             ) {
+                if unboundedRangeFunctionReferences.contains(conversion[1]) {
+                    guard CanonicalSIL.RangeExpression
+                        .isUnboundedMarkerClosureType(conversion[2])
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "unbounded range marker changes closure type"
+                        )
+                    }
+                    unboundedRangeClosureValues.insert(conversion[0])
+                    if !hasFutureSemanticUse(
+                        of: conversion[1],
+                        after: currentSILLineIndex
+                    ) {
+                        unboundedRangeFunctionReferences.remove(conversion[1])
+                    }
+                    continue
+                }
                 guard let reference = functionReferences[conversion[1]],
                       case let .function(functionID) = reference.binding.target
                 else {
@@ -18750,6 +19207,8 @@ public struct Lowerer: Sendable {
             if let borrowed = match(line, pattern: #"^(%[0-9]+) = begin_borrow (%[0-9]+)$"#) {
                 if let keyPath = staticKeyPathValues[borrowed[1]] {
                     staticKeyPathValues[borrowed[0]] = keyPath
+                } else if unboundedRangeClosureValues.contains(borrowed[1]) {
+                    unboundedRangeClosureValues.insert(borrowed[0])
                 } else if let allocation = arrayLiteralAllocationByValue[borrowed[1]] {
                     arrayLiteralAllocationByValue[borrowed[0]] = allocation
                     arrayLiteralStorageTokens[borrowed[0]] = allocation
@@ -20798,6 +21257,42 @@ public struct Lowerer: Sendable {
 
             if let store = match(
                 line,
+                pattern: #"^store (%[0-9]+) to (?:\[(trivial|init|assign)\] )?(%[0-9]+)$"#
+            ), let partialRange = partialRangeValues[store[0]] {
+                let address = addressBase(store[2])
+                guard partialRangeAddresses[address] == partialRange.shape else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "partial range value does not match its destination storage"
+                    )
+                }
+                if store[1] == "init" {
+                    guard partialRangeAddressValues[address] == nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "partial range store initializes existing storage"
+                        )
+                    }
+                } else if store[1] == "assign" {
+                    guard partialRangeAddressValues[address] != nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "partial range store assigns uninitialized storage"
+                        )
+                    }
+                }
+                clearPartialRangeBoundProjections(root: address)
+                let hasFutureUse = hasFutureSemanticUse(
+                    of: store[0],
+                    after: currentSILLineIndex
+                )
+                partialRangeAddressValues[address] = partialRange
+                retiredPartialRangeAddresses.remove(address)
+                if !hasFutureUse {
+                    partialRangeValues.removeValue(forKey: store[0])
+                }
+                continue
+            }
+
+            if let store = match(
+                line,
                 pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
             ), let state = pendingDictionaryIteratorValues.removeValue(forKey: store[0]) {
                 let address = addressBase(store[1])
@@ -21065,6 +21560,22 @@ public struct Lowerer: Sendable {
                     progressionValues[load[0]] = progression
                     continue
                 }
+                if let partialRange = partialRangeAddressValues[address] {
+                    guard partialRangeAddresses[address] == partialRange.shape,
+                          partialRangeValues[load[0]] == nil
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "partial range load references mismatched storage"
+                        )
+                    }
+                    if isTakingLoad {
+                        partialRangeAddressValues.removeValue(forKey: address)
+                        clearPartialRangeBoundProjections(root: address)
+                        retiredPartialRangeAddresses.insert(address)
+                    }
+                    partialRangeValues[load[0]] = partialRange
+                    continue
+                }
                 if let cell = mutableCell(at: load[2]),
                    let pointee = mutableCellPointee(at: load[2]) {
                     guard mode != "take" else {
@@ -21239,6 +21750,17 @@ public struct Lowerer: Sendable {
                 }
                 if catchScratchAddresses.contains(address),
                    runtimeStackSlots[address] == nil {
+                    continue
+                }
+                if let range = partialRangeAddressValues[address] {
+                    guard partialRangeAddresses[address] == range.shape else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "destroy_addr references mismatched partial range storage"
+                        )
+                    }
+                    partialRangeAddressValues.removeValue(forKey: address)
+                    clearPartialRangeBoundProjections(root: address)
+                    retiredPartialRangeAddresses.insert(address)
                     continue
                 }
                 if runtimeAddress(at: destroy[0]) != nil,
@@ -21562,6 +22084,18 @@ public struct Lowerer: Sendable {
                     progressionValues[copy[0]] = progression
                     continue
                 }
+                if let partialRange = partialRangeValues[copy[1]] {
+                    partialRangeValues[copy[0]] = partialRange
+                    continue
+                }
+                if unboundedRangeFunctionReferences.contains(copy[1]) {
+                    unboundedRangeFunctionReferences.insert(copy[0])
+                    continue
+                }
+                if unboundedRangeClosureValues.contains(copy[1]) {
+                    unboundedRangeClosureValues.insert(copy[0])
+                    continue
+                }
                 if let reference = functionReferences[copy[1]] {
                     functionReferences[copy[0]] = reference
                     continue
@@ -21635,6 +22169,36 @@ public struct Lowerer: Sendable {
                     }
                     continue
                 }
+                if let partialRange = partialRangeValues[move[1]] {
+                    partialRangeValues[move[0]] = partialRange
+                    if !hasFutureSemanticUse(
+                        of: move[1],
+                        after: currentSILLineIndex
+                    ) {
+                        partialRangeValues.removeValue(forKey: move[1])
+                    }
+                    continue
+                }
+                if unboundedRangeFunctionReferences.contains(move[1]) {
+                    unboundedRangeFunctionReferences.insert(move[0])
+                    if !hasFutureSemanticUse(
+                        of: move[1],
+                        after: currentSILLineIndex
+                    ) {
+                        unboundedRangeFunctionReferences.remove(move[1])
+                    }
+                    continue
+                }
+                if unboundedRangeClosureValues.contains(move[1]) {
+                    unboundedRangeClosureValues.insert(move[0])
+                    if !hasFutureSemanticUse(
+                        of: move[1],
+                        after: currentSILLineIndex
+                    ) {
+                        unboundedRangeClosureValues.remove(move[1])
+                    }
+                    continue
+                }
                 if let reference = functionReferences.removeValue(forKey: move[1]) {
                     functionReferences[move[0]] = reference
                     continue
@@ -21703,6 +22267,21 @@ public struct Lowerer: Sendable {
                     }
                     continue
                 }
+                if partialRangeValues[destroy[0]] != nil {
+                    if !hasFutureSemanticUse(
+                        of: destroy[0],
+                        after: currentSILLineIndex
+                    ) {
+                        partialRangeValues.removeValue(forKey: destroy[0])
+                    }
+                    continue
+                }
+                if unboundedRangeFunctionReferences.remove(destroy[0]) != nil {
+                    continue
+                }
+                if unboundedRangeClosureValues.remove(destroy[0]) != nil {
+                    continue
+                }
                 if functionReferences.removeValue(forKey: destroy[0]) != nil { continue }
                 if deferredForeignReferences.removeValue(forKey: destroy[0]) != nil {
                     continue
@@ -21744,6 +22323,30 @@ public struct Lowerer: Sendable {
                             after: currentSILLineIndex
                        ) {
                         progressionValues.removeValue(forKey: ownership[1])
+                    }
+                    continue
+                }
+                if partialRangeValues[ownership[1]] != nil {
+                    if ownership[0] == "release_value",
+                       !hasFutureSemanticUse(
+                           of: ownership[1],
+                           after: currentSILLineIndex
+                       ) {
+                        partialRangeValues.removeValue(
+                            forKey: ownership[1]
+                        )
+                    }
+                    continue
+                }
+                if unboundedRangeFunctionReferences.contains(ownership[1]) {
+                    if ownership[0] == "release_value" {
+                        unboundedRangeFunctionReferences.remove(ownership[1])
+                    }
+                    continue
+                }
+                if unboundedRangeClosureValues.contains(ownership[1]) {
+                    if ownership[0] == "release_value" {
+                        unboundedRangeClosureValues.remove(ownership[1])
                     }
                     continue
                 }
@@ -22480,6 +23083,19 @@ public struct Lowerer: Sendable {
                 + progressionAddressValues.count
                 + progressionIteratorAddresses.count
                 + progressionIteratorStates.count
+        )
+        recordIncompleteLifetime(
+            "partial-range",
+            count: partialRangeValues.count
+                + partialRangeAddresses.count
+                + partialRangeAddressValues.count
+                + retiredPartialRangeAddresses.count
+                + partialRangeBoundProjectionRoots.count
+        )
+        recordIncompleteLifetime(
+            "unbounded-range-marker",
+            count: unboundedRangeFunctionReferences.count
+                + unboundedRangeClosureValues.count
         )
         recordIncompleteLifetime(
             "assertion-trap",

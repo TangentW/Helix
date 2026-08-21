@@ -87,6 +87,8 @@ enum CollectionIntrinsic: Equatable {
         case arrayRepeat(hasMetatype: Bool)
         case subsequence(Bytecode.ArraySubsequenceOperation)
         case rangeSlice
+        case partialRangeSlice
+        case fullRangeSlice
         case zip
         case joined(hasSeparator: Bool)
     }
@@ -340,6 +342,13 @@ enum CollectionIntrinsic: Equatable {
             self = .adapter(.subsequence(.suffixFrom))
         case "$sSays10ArraySliceVyxGSnySiGcig":
             self = .adapter(.rangeSlice)
+        case "$sSMsEy11SubSequenceQzqd__cSXRd__5BoundQyd__5IndexRtzluig":
+            self = .adapter(.partialRangeSlice)
+        case
+            CanonicalSIL.RangeExpression.unboundedCollectionSubscriptMangledName,
+            CanonicalSIL.RangeExpression
+                .unboundedMutableCollectionSubscriptMangledName:
+            self = .adapter(.fullRangeSlice)
         case "$ss3zipys12Zip2SequenceVyxq_Gx_q_tSTRzSTR_r0_lF":
             self = .adapter(.zip)
         case "$sSTsST7ElementRpzrlE6joineds15FlattenSequenceVyxGyF":

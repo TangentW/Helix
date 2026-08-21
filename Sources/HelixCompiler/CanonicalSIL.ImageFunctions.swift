@@ -200,6 +200,9 @@ enum ImageFunctions {
         }
         var symbolByValue: [String: String] = [:]
         var usageBySymbol: [String: Set<ReferenceUsage>] = [:]
+        var unboundedRangeFunctionByValue: [String: String] = [:]
+        var unboundedRangeClosureByValue: [String: String] = [:]
+        var compilerOnlyUnboundedRangeSymbols = Set<String>()
 
         for rawLine in function.body.split(separator: "\n") {
             let line = String(rawLine).trimmingCharacters(in: .whitespaces)
@@ -209,7 +212,16 @@ enum ImageFunctions {
                 let end = suffix.firstIndex { $0 == " " || $0 == ":" }
                     ?? suffix.endIndex
                 let symbol = String(suffix[..<end])
-                if !symbol.isEmpty { symbolByValue[result] = symbol }
+                if !symbol.isEmpty {
+                    symbolByValue[result] = symbol
+                    if let type = functionReferenceType(in: line),
+                       CanonicalSIL.RangeExpression
+                        .isUnboundedMarkerFunctionType(type) {
+                        // `UnboundedRange_` is an inaccessible stdlib marker
+                        // used by the full-range subscript overload.
+                        unboundedRangeFunctionByValue[result] = symbol
+                    }
+                }
                 continue
             }
             for marker in [" = begin_borrow ", " = copy_value ", " = move_value "] {
@@ -219,15 +231,36 @@ enum ImageFunctions {
                       let symbol = symbolByValue[source]
                 else { continue }
                 symbolByValue[result] = symbol
+                if let marker = unboundedRangeFunctionByValue[source] {
+                    unboundedRangeFunctionByValue[result] = marker
+                }
+                if let marker = unboundedRangeClosureByValue[source] {
+                    unboundedRangeClosureByValue[result] = marker
+                }
             }
             if let source = silValue(after: "partial_apply", in: line)
                 ?? silValue(after: "thin_to_thick_function", in: line),
                let symbol = symbolByValue[source] {
+                if line.contains("thin_to_thick_function"),
+                   let result = silResultValue(in: line),
+                   let marker = unboundedRangeFunctionByValue[source],
+                   let targetType = type(after: " to $", in: line),
+                   CanonicalSIL.RangeExpression
+                    .isUnboundedMarkerClosureType(targetType) {
+                    unboundedRangeClosureByValue[result] = marker
+                }
                 usageBySymbol[symbol, default: []].insert(.closureConstruction)
                 continue
             }
             if let source = silValue(after: "apply", in: line),
                let symbol = symbolByValue[source] {
+                if CanonicalSIL.SwiftCoreIntrinsic(mangledName: symbol)
+                    == .collection(.adapter(.fullRangeSlice)),
+                   let arguments = applicationArguments(in: line),
+                   arguments.count == 3,
+                   let marker = unboundedRangeClosureByValue[arguments[1]] {
+                    compilerOnlyUnboundedRangeSymbols.insert(marker)
+                }
                 usageBySymbol[symbol, default: []].insert(.directCall)
             }
         }
@@ -243,6 +276,10 @@ enum ImageFunctions {
         return ReleaseCompiler.ImplementationFingerprint
             .referencedSymbols(in: executableBody).sorted().compactMap { symbol in
                 let usages = usageBySymbol[symbol, default: []]
+                if compilerOnlyUnboundedRangeSymbols.contains(symbol),
+                   usages == [.closureConstruction] {
+                    return nil
+                }
                 // A directly applied semantic intrinsic is a terminal compiler
                 // edge. A reference converted into a closure still needs a
                 // callable body and must never be silently discarded.
@@ -298,6 +335,42 @@ enum ImageFunctions {
         let end = tail.dropFirst().firstIndex { !$0.isNumber } ?? tail.endIndex
         let value = String(tail[..<end])
         return value.count > 1 ? value : nil
+    }
+
+    private static func functionReferenceType(in line: String) -> String? {
+        type(after: " : $", in: line)
+    }
+
+    private static func type(after marker: String, in line: String) -> String? {
+        guard let range = line.range(of: marker) else { return nil }
+        let value = line[range.upperBound...]
+            .trimmingCharacters(in: .whitespaces)
+        return value.isEmpty ? nil : value
+    }
+
+    private static func applicationArguments(in line: String) -> [String]? {
+        guard let apply = line.range(of: "apply "),
+              let open = line[apply.upperBound...].firstIndex(of: "("),
+              let close = line[open...].firstIndex(of: ")")
+        else { return nil }
+        return silValues(in: line[line.index(after: open)..<close])
+    }
+
+    private static func silValues(in text: Substring) -> [String] {
+        var result: [String] = []
+        var index = text.startIndex
+        while index < text.endIndex,
+              let percent = text[index...].firstIndex(of: "%") {
+            let digitsStart = text.index(after: percent)
+            let digits = text[digitsStart...].prefix(while: \.isNumber)
+            guard !digits.isEmpty else {
+                index = digitsStart
+                continue
+            }
+            result.append("%" + digits)
+            index = text.index(digitsStart, offsetBy: digits.count)
+        }
+        return result
     }
 }
 }

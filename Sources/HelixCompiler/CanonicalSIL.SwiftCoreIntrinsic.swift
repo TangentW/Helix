@@ -31,9 +31,13 @@ enum SwiftCoreIntrinsic: Equatable {
     case collectionMakeIterator(CanonicalSIL.CollectionIntrinsic.IteratorShape)
     case indexingIteratorNext(CanonicalSIL.CollectionIntrinsic.IteratorShape)
     case progressionConstructor(CanonicalSIL.Progression.Family)
+    case partialRangeConstructor(
+        CanonicalSIL.RangeExpression.PartialBoundary
+    )
     case progressionMakeIterator(CanonicalSIL.Progression.Family)
     case progressionIteratorNext(CanonicalSIL.Progression.Family)
     case rangeContains(CanonicalSIL.Progression.Family)
+    case rangeExpressionContains
     case dictionaryEmpty
     case dictionarySubscriptGet
     case dictionarySubscriptSet
@@ -244,12 +248,20 @@ enum SwiftCoreIntrinsic: Equatable {
             self = .progressionMakeIterator(.strideTo)
         case "$ss13StrideThroughV12makeIterators0abD0VyxGyF":
             self = .progressionMakeIterator(.strideThrough)
+        case "$ss16PartialRangeFromVyAByxGxcfC":
+            self = .partialRangeConstructor(.from)
+        case "$ss16PartialRangeUpToVyAByxGxcfC":
+            self = .partialRangeConstructor(.upTo)
+        case "$ss19PartialRangeThroughVyAByxGxcfC":
+            self = .partialRangeConstructor(.through)
         case "$ss16StrideToIteratorV4nextxSgyF":
             self = .progressionIteratorNext(.strideTo)
         case "$ss21StrideThroughIteratorV4nextxSgyF":
             self = .progressionIteratorNext(.strideThrough)
         case "$sSn8containsySbxF": self = .rangeContains(.range)
         case "$sSN8containsySbxF": self = .rangeContains(.closedRange)
+        case CanonicalSIL.RangeExpression.patternMatchMangledName:
+            self = .rangeExpressionContains
         case "$sS2Dyxq_GycfC": self = .dictionaryEmpty
         case "$sSDyq_Sgxcig": self = .dictionarySubscriptGet
         case "$sSDyq_Sgxcis": self = .dictionarySubscriptSet

@@ -266,9 +266,10 @@ does not by itself certify a physical device or distribution channel.
   element width and traps when its cardinality exceeds `Int.max`. Represented
   Comparable Range bounds also support `isEmpty` without implying iteration.
   Reverse predicate search, index-returning search, other index-sensitive
-  Collection boundaries/subsequences, and unbounded partial ranges remain
-  rejected until their direction, index identity, complexity, or termination
-  can be represented exactly.
+  Collection boundaries/subsequences, and using a one-sided partial range as
+  a potentially infinite Sequence source remain rejected until their
+  direction, index identity, complexity, or termination can be represented
+  exactly.
   Array-backed Collection and String `split` support both the
   `separator:maxSplits:omittingEmptySubsequences:` overload for recursively
   VM-defined Equatable elements and the throwing `whereSeparator:` overload
@@ -326,6 +327,18 @@ does not by itself certify a physical device or distribution channel.
   instead of adding API-specific opcodes. Zero strides and invalid range bounds
   preserve Swift traps, and integer extrema terminate without sentinel
   collisions.
+- `PartialRangeFrom`, `PartialRangeUpTo`, and `PartialRangeThrough`
+  containment, including the `RangeExpression.~=` calls emitted for switch
+  patterns, uses one typed comparison plan for represented integer, floating,
+  String, and Character bounds. Dynamic unordered floating bounds retain
+  Swift's constructor traps. Concrete Array subscripts with one-sided
+  `Int` bounds reuse the existing suffix/prefix subsequence operations, while
+  the full-range `[...]` marker is erased after a represented Array-backed or
+  String/Substring source is normalized through the existing materialization
+  boundary. These are compiler-only range values: no Swift generic collection
+  ABI is serialized, no standard-library method becomes a NativeImport, and no
+  source-API-specific opcode is added. Custom `Comparable` witnesses, private
+  `String.Index`, and derived ArraySlice indices remain fail-closed.
 - Newly introduced, non-exported file- or module-scope patch-local nonrecursive
   stored struct and enum values, concrete `Result`, field extraction, enum
   switch, instance/static computed getters and setters, and supported mutating
