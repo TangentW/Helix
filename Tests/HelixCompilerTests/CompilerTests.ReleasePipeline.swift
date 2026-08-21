@@ -1378,6 +1378,53 @@ struct ReleasePipeline {
         #expect(execution.standardOutput.contains("HELIX_GENERATED_BRIDGE_OK"))
     }
 
+    @Test("Generated Bridge link input excludes stale SwiftPM object files")
+    func generatedBridgeLinkInputUsesCurrentOutputMaps() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-runtime-objects-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let modules = root.appendingPathComponent("Modules", isDirectory: true)
+        try FileManager.default.createDirectory(at: modules, withIntermediateDirectories: true)
+        let targets = [
+            "HelixCore", "HelixBytecode", "HelixInterface",
+            "HelixVerifier", "HelixVM", "HelixRuntime", "HelixPatch",
+        ]
+        var expected: [URL] = []
+        for target in targets {
+            let targetDirectory = root.appendingPathComponent("\(target).build", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: targetDirectory,
+                withIntermediateDirectories: true
+            )
+            let active = targetDirectory.appendingPathComponent("Active.swift.o")
+            let stale = targetDirectory.appendingPathComponent("Removed.swift.o")
+            try Data().write(to: active)
+            try Data().write(to: stale)
+            expected.append(active)
+
+            let source = "/Sources/\(target)/Active.swift"
+            let outputMap = [source: ["object": active.path]]
+            let encoded = try JSONEncoder().encode(outputMap)
+            try encoded.write(to: targetDirectory.appendingPathComponent("output-file-map.json"))
+        }
+        let support = root
+            .appendingPathComponent("HelixRuntimeSupport.build", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let supportObject = support.appendingPathComponent("RuntimeAtomic.c.o")
+        try Data().write(to: supportObject)
+        expected.append(supportObject)
+
+        #expect(try runtimeObjectFiles(modules: modules) == expected)
+    }
+
+    private struct SwiftPMOutputFile: Decodable {
+        var object: String?
+    }
+
     private func runtimeObjectFiles(modules: URL) throws -> [URL] {
         let buildDirectory = modules.deletingLastPathComponent()
         let targetNames = [
@@ -1387,14 +1434,42 @@ struct ReleasePipeline {
         var result: [URL] = []
         for target in targetNames {
             let directory = buildDirectory.appendingPathComponent("\(target).build", isDirectory: true)
-            let files = try FileManager.default.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: nil
-            ).filter { $0.lastPathComponent.hasSuffix(".swift.o") }
-            guard !files.isEmpty else {
+            let mapURL = directory.appendingPathComponent("output-file-map.json")
+            let outputMap: [String: SwiftPMOutputFile]
+            do {
+                outputMap = try JSONDecoder().decode(
+                    [String: SwiftPMOutputFile].self,
+                    from: Data(contentsOf: mapURL)
+                )
+            } catch {
+                throw SwiftFrontend.Error.launchFailed(
+                    "invalid SwiftPM output map for \(target)"
+                )
+            }
+            let targetPath = directory.standardizedFileURL.path + "/"
+            let sourceRecords = outputMap.filter { !$0.key.isEmpty }
+            var objectPaths = Set<String>()
+            for record in sourceRecords {
+                guard let path = record.value.object else {
+                    throw SwiftFrontend.Error.launchFailed(
+                        "SwiftPM output map has no object for \(target) source \(record.key)"
+                    )
+                }
+                let object = URL(fileURLWithPath: path).standardizedFileURL
+                guard object.path.hasPrefix(targetPath),
+                      object.path.hasSuffix(".o"),
+                      FileManager.default.fileExists(atPath: object.path)
+                else {
+                    throw SwiftFrontend.Error.launchFailed(
+                        "invalid object file in SwiftPM output map for \(target)"
+                    )
+                }
+                objectPaths.insert(object.path)
+            }
+            guard !objectPaths.isEmpty else {
                 throw SwiftFrontend.Error.launchFailed("missing object files for \(target)")
             }
-            result.append(contentsOf: files.sorted(by: { $0.path < $1.path }))
+            result.append(contentsOf: objectPaths.sorted().map(URL.init(fileURLWithPath:)))
         }
         let supportObject = buildDirectory
             .appendingPathComponent("HelixRuntimeSupport.build", isDirectory: true)
