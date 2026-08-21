@@ -91,6 +91,23 @@ enum CollectionIntrinsic: Equatable {
         case joined(hasSeparator: Bool)
     }
 
+    /// Identifies the concrete destination carried by a stdlib
+    /// RangeReplaceableCollection entry point. This preserves logical wrapper
+    /// identity even when multiple Swift collections share one HLBC storage
+    /// representation.
+    enum RangeReplaceableDestination: Equatable {
+        /// The first generic substitution is the concrete collection `Self`.
+        case genericSelf
+        /// A concrete Array entry point substitutes only `Element`.
+        case array
+        /// A concrete ArraySlice entry point substitutes only `Element`.
+        case arraySlice
+        /// A concrete String entry point has no destination substitution.
+        case string
+        /// A concrete Substring entry point has no destination substitution.
+        case substring
+    }
+
     /// Variable-length mutations classified by the frontend specialization
     /// that identifies `Self`. Their implementation is shared by every
     /// collection with a complete represented storage model.
@@ -105,17 +122,38 @@ enum CollectionIntrinsic: Equatable {
             case reserveCapacity
         }
 
-        enum Source: Equatable {
-            /// The generic substitution is the concrete collection `Self`.
-            case genericSelf
-            /// A concrete Array-backed entry point substitutes only `Element`.
-            case arrayBackedElement
-            /// A concrete String entry point has no generic substitution.
-            case stringCharacters
+        var operation: Operation
+        var destination: RangeReplaceableDestination
+    }
+
+    /// Element and finite-Sequence appends share one semantic plan across
+    /// every represented RangeReplaceableCollection. These cases describe
+    /// frontend ABI shape only; lowering is driven by the resolved storage and
+    /// element types.
+    struct RangeReplaceableAppend: Equatable {
+        enum ContentsSource: Equatable {
+            /// The next generic substitution is the concrete Sequence source.
+            case genericArgument
+            /// The source has the same logical collection type as the
+            /// destination, as in concrete String or Array `+=`.
+            case destination
+            /// A concrete source is fixed by the frontend entry point.
+            case fixed(RangeReplaceableDestination)
         }
 
-        var operation: Operation
-        var source: Source
+        enum Input: Equatable {
+            case element
+            case contents(ContentsSource)
+        }
+
+        enum CallShape: Equatable {
+            case method
+            case additionAssignment
+        }
+
+        var destination: RangeReplaceableDestination
+        var input: Input
+        var callShape: CallShape
     }
 
     /// Array-backed structural edits share value-semantic VM primitives. The
@@ -123,8 +161,6 @@ enum CollectionIntrinsic: Equatable {
     /// behavior by element type.
     enum ArrayEdit: Equatable {
         case concatenating
-        case concatenateInPlace
-        case appendContents
         case insertElement
         case insertContents
         case replaceSubrange
@@ -138,8 +174,7 @@ enum CollectionIntrinsic: Equatable {
         ) throws -> (array: Bytecode.ValueType, element: Bytecode.ValueType) {
             let array: Bytecode.ValueType
             switch self {
-            case .concatenating, .concatenateInPlace, .insertElement,
-                 .removeAt:
+            case .concatenating, .insertElement, .removeAt:
                 guard specializations.count == 1 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Array edit has unsupported specializations"
@@ -150,7 +185,7 @@ enum CollectionIntrinsic: Equatable {
                         specializations[0]
                     )
                 )
-            case .appendContents, .replaceSubrange:
+            case .replaceSubrange:
                 guard specializations.count == 2,
                       case let .array(sourceElement) = specializations[1],
                       sourceElement == CanonicalSIL.ValueRepresentation.storable(
@@ -199,6 +234,7 @@ enum CollectionIntrinsic: Equatable {
     case arrayIndex(ArrayIndexOperation)
     case adapter(Adapter)
     case rangeReplaceableEdit(RangeReplaceableEdit)
+    case rangeReplaceableAppend(RangeReplaceableAppend)
     case arrayEdit(ArrayEdit)
 
     init?(mangledName: String) {
@@ -312,10 +348,118 @@ enum CollectionIntrinsic: Equatable {
             self = .adapter(.joined(hasSeparator: true))
         case "$sSa1poiySayxGAB_ABtFZ":
             self = .arrayEdit(.concatenating)
-        case "$sSa2peoiyySayxGz_ABtFZ":
-            self = .arrayEdit(.concatenateInPlace)
+        case "$sSS6appendyySJF":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .string,
+                    input: .element,
+                    callShape: .method
+                )
+            )
+        case "$sSS6appendyySSF", "$sSS6append10contentsOfySS_tF":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .string,
+                    input: .contents(.destination),
+                    callShape: .method
+                )
+            )
+        case "$sSS6append10contentsOfySs_tF":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .string,
+                    input: .contents(.fixed(.substring)),
+                    callShape: .method
+                )
+            )
+        case "$sSS6append10contentsOfyx_tSTRzSJ7ElementRtzlF":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .string,
+                    input: .contents(.genericArgument),
+                    callShape: .method
+                )
+            )
+        case "$sSs6append10contentsOfyx_tSTRzSJ7ElementRtzlF":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .substring,
+                    input: .contents(.genericArgument),
+                    callShape: .method
+                )
+            )
+        case "$sSmsE6appendyy7ElementQznF":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .genericSelf,
+                    input: .element,
+                    callShape: .method
+                )
+            )
+        case "$sSmsE6append10contentsOfyqd__n_tSTRd__7ElementQyd__ACRtzlF":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .genericSelf,
+                    input: .contents(.genericArgument),
+                    callShape: .method
+                )
+            )
+        case "$sSa6appendyyxnF":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .array,
+                    input: .element,
+                    callShape: .method
+                )
+            )
+        case "$ss10ArraySliceV6appendyyxnF":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .arraySlice,
+                    input: .element,
+                    callShape: .method
+                )
+            )
         case "$sSa6append10contentsOfyqd__n_t7ElementQyd__RszSTRd__lF":
-            self = .arrayEdit(.appendContents)
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .array,
+                    input: .contents(.genericArgument),
+                    callShape: .method
+                )
+            )
+        case "$ss10ArraySliceV6append10contentsOfyqd__n_t7ElementQyd__RszSTRd__lF":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .arraySlice,
+                    input: .contents(.genericArgument),
+                    callShape: .method
+                )
+            )
+        case "$sSS2peoiyySSz_SStFZ":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .string,
+                    input: .contents(.destination),
+                    callShape: .additionAssignment
+                )
+            )
+        case "$sSa2peoiyySayxGz_ABtFZ":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .array,
+                    input: .contents(.destination),
+                    callShape: .additionAssignment
+                )
+            )
+        case "$sSmsE2peoiyyxz_qd__tSTRd__7ElementQyd__ABRtzlFZ":
+            self = .rangeReplaceableAppend(
+                .init(
+                    destination: .genericSelf,
+                    input: .contents(.genericArgument),
+                    callShape: .additionAssignment
+                )
+            )
         case "$sSa6insert_2atyxn_SitF":
             self = .arrayEdit(.insertElement)
         case "$sSmsE6insert10contentsOf2atyqd__n_5IndexQztSlRd__7ElementQyd__AFRtzlF":
@@ -327,45 +471,45 @@ enum CollectionIntrinsic: Equatable {
         case "$sSmsE11removeFirst7ElementQzyF",
              "$sSms11SubSequenceQzRszrlE11removeFirst7ElementQzyF":
             self = .rangeReplaceableEdit(
-                .init(operation: .removeFirst, source: .genericSelf)
+                .init(operation: .removeFirst, destination: .genericSelf)
             )
         case "$sSmsSKRzrlE10removeLast7ElementSTQzyF",
              "$sSmsSKRz11SubSequenceSlQzRszrlE10removeLast7ElementSTQzyF":
             self = .rangeReplaceableEdit(
-                .init(operation: .removeLast, source: .genericSelf)
+                .init(operation: .removeLast, destination: .genericSelf)
             )
         case "$sSmsE11removeFirstyySiF",
              "$sSms11SubSequenceQzRszrlE11removeFirstyySiF":
             self = .rangeReplaceableEdit(
-                .init(operation: .removeFirstCount, source: .genericSelf)
+                .init(operation: .removeFirstCount, destination: .genericSelf)
             )
         case "$sSmsSKRzrlE10removeLastyySiF",
              "$sSmsSKRz11SubSequenceSlQzRszrlE10removeLastyySiF":
             self = .rangeReplaceableEdit(
-                .init(operation: .removeLastCount, source: .genericSelf)
+                .init(operation: .removeLastCount, destination: .genericSelf)
             )
         case "$sSmsSKRzrlE7popLast7ElementSTQzSgyF",
              "$sSmsSKRz11SubSequenceSlQzRszrlE7popLast7ElementSTQzSgyF":
             self = .rangeReplaceableEdit(
-                .init(operation: .popLast, source: .genericSelf)
+                .init(operation: .popLast, destination: .genericSelf)
             )
         case "$sSmsE14removeSubrangeyySny5IndexQzGF":
             self = .arrayEdit(.removeSubrange)
         case "$sSa9removeAll15keepingCapacityySb_tF":
             self = .rangeReplaceableEdit(
-                .init(operation: .removeAll, source: .arrayBackedElement)
+                .init(operation: .removeAll, destination: .array)
             )
         case "$ss10ArraySliceV9removeAll15keepingCapacityySb_tF":
             self = .rangeReplaceableEdit(
-                .init(operation: .removeAll, source: .arrayBackedElement)
+                .init(operation: .removeAll, destination: .arraySlice)
             )
         case "$sSS9removeAll15keepingCapacityySb_tF":
             self = .rangeReplaceableEdit(
-                .init(operation: .removeAll, source: .stringCharacters)
+                .init(operation: .removeAll, destination: .string)
             )
         case "$sSmsE9removeAll15keepingCapacityySb_tF":
             self = .rangeReplaceableEdit(
-                .init(operation: .removeAll, source: .genericSelf)
+                .init(operation: .removeAll, destination: .genericSelf)
             )
         case "$sSMsSKRzrlE7reverseyyF":
             self = .arrayEdit(.reverse)
@@ -373,19 +517,19 @@ enum CollectionIntrinsic: Equatable {
             self = .arrayEdit(.swapAt)
         case "$sSa15reserveCapacityyySiF":
             self = .rangeReplaceableEdit(
-                .init(operation: .reserveCapacity, source: .arrayBackedElement)
+                .init(operation: .reserveCapacity, destination: .array)
             )
         case "$ss10ArraySliceV15reserveCapacityyySiF":
             self = .rangeReplaceableEdit(
-                .init(operation: .reserveCapacity, source: .arrayBackedElement)
+                .init(operation: .reserveCapacity, destination: .arraySlice)
             )
         case "$sSS15reserveCapacityyySiF":
             self = .rangeReplaceableEdit(
-                .init(operation: .reserveCapacity, source: .stringCharacters)
+                .init(operation: .reserveCapacity, destination: .string)
             )
         case "$sSmsE15reserveCapacityyySiF":
             self = .rangeReplaceableEdit(
-                .init(operation: .reserveCapacity, source: .genericSelf)
+                .init(operation: .reserveCapacity, destination: .genericSelf)
             )
         default:
             return nil

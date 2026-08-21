@@ -295,6 +295,32 @@ public struct Lowerer: Sendable {
         var elementType: Bytecode.ValueType
     }
 
+    private struct RangeReplaceableDestinationPlan {
+        var representation: CanonicalSIL
+            .RangeReplaceableCollectionRepresentation
+        /// Canonical frontend identity retained independently from the erased
+        /// HLBC storage type for operator-metatype validation.
+        var logicalTypeIdentity: String
+        /// Source-level Element identity retained independently from its
+        /// potentially erased HLBC ValueType.
+        var logicalElementTypeIdentity: String
+    }
+
+    private struct RangeReplaceableAppendPlan {
+        enum Input {
+            case element(token: String)
+            case sequence(
+                token: String,
+                specialization: CanonicalSIL.SequenceSpecialization
+            )
+        }
+
+        var destination: RangeReplaceableDestinationPlan
+        var destinationToken: String
+        var input: Input
+        var metatypeToken: String?
+    }
+
     private struct ArrayPredicateMutationPlan {
         var operation: CanonicalSIL.ArrayPredicateMutationIntrinsic
         var sourceToken: String
@@ -638,6 +664,7 @@ public struct Lowerer: Sendable {
         var retypedIntegerOperands: [String: [Bytecode.ValueType: Bytecode.Register]] = [:]
         var boolLiterals: [String: Bool] = [:]
         var metatypeValues = Set<String>()
+        var representedCollectionMetatypeIdentities: [String: String] = [:]
         var scalarMetatypeValues: [String: Bytecode.ValueType] = [:]
         var compilerEnumMetatypeValues = Set<String>()
         var compilerEnumValues: [String: CompilerEnumCase] = [:]
@@ -8827,6 +8854,104 @@ public struct Lowerer: Sendable {
             return result
         }
 
+        func appendDistinctCleanups(
+            _ groups: [[IntermediateRepresentation.Instruction]]
+        ) {
+            // Source and destination materializations may borrow the same
+            // temporary owner. Preserve cleanup order while releasing each
+            // aliased resource exactly once.
+            var appended = Set<IntermediateRepresentation.Instruction>()
+            for instruction in groups.joined() {
+                if appended.insert(instruction).inserted {
+                    appendInstruction(instruction)
+                }
+            }
+        }
+
+        func materializeRangeReplaceableElements(
+            _ representation: CanonicalSIL
+                .RangeReplaceableCollectionRepresentation,
+            token: String,
+            context: String,
+            line: Int
+        ) throws -> (
+            elements: Bytecode.Register,
+            cleanup: [IntermediateRepresentation.Instruction]
+        ) {
+            guard compilerAddressType(token) == representation.storageType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) destination does not match its specialization"
+                )
+            }
+            let materialized = try materializeSequenceOperand(
+                representation.sequence,
+                token: token,
+                context: context,
+                line: line
+            )
+            guard registerTypes[Int(materialized.array.rawValue)]
+                    == representation.elementsType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) produced mismatched element storage"
+                )
+            }
+            return (
+                elements: materialized.array,
+                cleanup: materialized.cleanup
+            )
+        }
+
+        func finalizeRangeReplaceableElements(
+            _ elements: Bytecode.Register,
+            representation: CanonicalSIL
+                .RangeReplaceableCollectionRepresentation,
+            context: String
+        ) throws -> Bytecode.Register {
+            guard registerTypes[Int(elements.rawValue)]
+                    == representation.elementsType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) finalizer received mismatched elements"
+                )
+            }
+            switch representation {
+            case .representedArray:
+                return elements
+            case .stringCharacters:
+                return try lowerStringJoin(
+                    elements: elements,
+                    separator: nil,
+                    elementKind: .character,
+                    context: context
+                )
+            }
+        }
+
+        func makeEmptyRangeReplaceableElements(
+            _ representation: CanonicalSIL
+                .RangeReplaceableCollectionRepresentation
+        ) throws -> Bytecode.Register {
+            let result = try allocate(type: representation.elementsType)
+            appendInstruction(.makeArray(result: result, elements: []))
+            return result
+        }
+
+        func makeEmptyRangeReplaceableStorage(
+            _ representation: CanonicalSIL
+                .RangeReplaceableCollectionRepresentation
+        ) throws -> Bytecode.Register {
+            switch representation {
+            case .representedArray:
+                return try makeEmptyRangeReplaceableElements(representation)
+            case .stringCharacters:
+                let result = try allocate(type: .string)
+                appendInstruction(.constantString(result: result, value: ""))
+                return result
+            }
+        }
+
         /// Executes equality membership through the shared cursor so a finite
         /// progression can short-circuit without first allocating its full
         /// element sequence. The same CFG also remains valid for represented
@@ -11632,7 +11757,7 @@ public struct Lowerer: Sendable {
                 let context = "RangeReplaceableCollection edit"
                 let representation = try
                     parseRangeReplaceableCollectionRepresentation(
-                        source: edit.source,
+                        destination: edit.destination,
                         genericArguments: genericArguments,
                         context: context
                     )
@@ -11649,52 +11774,6 @@ public struct Lowerer: Sendable {
                             result: result,
                             bitPattern: bitPattern
                         )
-                    )
-                    return result
-                }
-
-                func materializeDestination(
-                    at token: String
-                ) throws -> (
-                    elements: Bytecode.Register,
-                    cleanup: [IntermediateRepresentation.Instruction]
-                ) {
-                    guard compilerAddressType(token) == storageType else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "\(context) destination does not match its specialization"
-                        )
-                    }
-                    let materialized = try materializeSequenceOperand(
-                        representation.sequence,
-                        token: token,
-                        context: context,
-                        line: line
-                    )
-                    guard registerTypes[Int(materialized.array.rawValue)]
-                            == elementsType
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "\(context) produced mismatched element storage"
-                        )
-                    }
-                    return (
-                        elements: materialized.array,
-                        cleanup: materialized.cleanup
-                    )
-                }
-
-                func appendCleanup(
-                    _ cleanup: [IntermediateRepresentation.Instruction]
-                ) {
-                    for instruction in cleanup {
-                        appendInstruction(instruction)
-                    }
-                }
-
-                func emptyElements() throws -> Bytecode.Register {
-                    let result = try allocate(type: elementsType)
-                    appendInstruction(
-                        .makeArray(result: result, elements: [])
                     )
                     return result
                 }
@@ -11725,41 +11804,6 @@ public struct Lowerer: Sendable {
                     return result
                 }
 
-                func finalizeElements(
-                    _ elements: Bytecode.Register
-                ) throws -> Bytecode.Register {
-                    guard registerTypes[Int(elements.rawValue)] == elementsType
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "\(context) finalizer received mismatched elements"
-                        )
-                    }
-                    switch representation {
-                    case .representedArray:
-                        return elements
-                    case .stringCharacters:
-                        return try lowerStringJoin(
-                            elements: elements,
-                            separator: nil,
-                            elementKind: .character,
-                            context: context
-                        )
-                    }
-                }
-
-                func emptyStorage() throws -> Bytecode.Register {
-                    switch representation {
-                    case .representedArray:
-                        return try emptyElements()
-                    case .stringCharacters:
-                        let result = try allocate(type: .string)
-                        appendInstruction(
-                            .constantString(result: result, value: "")
-                        )
-                        return result
-                    }
-                }
-
                 switch edit.operation {
                 case .removeFirst, .removeLast:
                     guard arguments.count == 2,
@@ -11769,8 +11813,11 @@ public struct Lowerer: Sendable {
                             "RangeReplaceableCollection element removal has unsupported arguments"
                         )
                     }
-                    let destination = try materializeDestination(
-                        at: arguments[1]
+                    let destination = try materializeRangeReplaceableElements(
+                        representation,
+                        token: arguments[1],
+                        context: context,
+                        line: line
                     )
                     let index: Bytecode.Register
                     if edit.operation == .removeFirst {
@@ -11796,7 +11843,9 @@ public struct Lowerer: Sendable {
                         index,
                         integerConstant(1)
                     )
-                    let empty = try emptyElements()
+                    let empty = try makeEmptyRangeReplaceableElements(
+                        representation
+                    )
                     let updatedElements = try replace(
                         destination.elements,
                         from: index,
@@ -11804,8 +11853,12 @@ public struct Lowerer: Sendable {
                         with: empty
                     )
                     destroyLinearTemporary(empty)
-                    let updated = try finalizeElements(updatedElements)
-                    appendCleanup(destination.cleanup)
+                    let updated = try finalizeRangeReplaceableElements(
+                        updatedElements,
+                        representation: representation,
+                        context: context
+                    )
+                    appendDistinctCleanups([destination.cleanup])
                     try storeConstructedValue(
                         removed,
                         at: arguments[0],
@@ -11829,8 +11882,11 @@ public struct Lowerer: Sendable {
                         count,
                         reason: "Collection removal count must not be negative"
                     )
-                    let destination = try materializeDestination(
-                        at: arguments[1]
+                    let destination = try materializeRangeReplaceableElements(
+                        representation,
+                        token: arguments[1],
+                        context: context,
+                        line: line
                     )
                     let zero = try integerConstant(0)
                     let end = try emitArrayCount(destination.elements)
@@ -11847,7 +11903,9 @@ public struct Lowerer: Sendable {
                         )
                         upperBound = end
                     }
-                    let empty = try emptyElements()
+                    let empty = try makeEmptyRangeReplaceableElements(
+                        representation
+                    )
                     let updatedElements = try replace(
                         destination.elements,
                         from: lowerBound,
@@ -11855,8 +11913,12 @@ public struct Lowerer: Sendable {
                         with: empty
                     )
                     destroyLinearTemporary(empty)
-                    let updated = try finalizeElements(updatedElements)
-                    appendCleanup(destination.cleanup)
+                    let updated = try finalizeRangeReplaceableElements(
+                        updatedElements,
+                        representation: representation,
+                        context: context
+                    )
+                    appendDistinctCleanups([destination.cleanup])
                     try storeConstructedValue(
                         updated,
                         at: arguments[1],
@@ -11873,8 +11935,11 @@ public struct Lowerer: Sendable {
                             "RangeReplaceableCollection.popLast has unsupported arguments"
                         )
                     }
-                    let destination = try materializeDestination(
-                        at: arguments[1]
+                    let destination = try materializeRangeReplaceableElements(
+                        representation,
+                        token: arguments[1],
+                        context: context,
+                        line: line
                     )
                     let removed = try allocate(type: .optional(element))
                     let updatedElements = try allocate(type: elementsType)
@@ -11885,8 +11950,12 @@ public struct Lowerer: Sendable {
                             array: destination.elements
                         )
                     )
-                    let updated = try finalizeElements(updatedElements)
-                    appendCleanup(destination.cleanup)
+                    let updated = try finalizeRangeReplaceableElements(
+                        updatedElements,
+                        representation: representation,
+                        context: context
+                    )
+                    appendDistinctCleanups([destination.cleanup])
                     try storeConstructedValue(
                         removed,
                         at: arguments[0],
@@ -11918,7 +11987,9 @@ public struct Lowerer: Sendable {
                             "RangeReplaceableCollection.removeAll references uninitialized storage"
                         )
                     }
-                    let result = try emptyStorage()
+                    let result = try makeEmptyRangeReplaceableStorage(
+                        representation
+                    )
                     if let owner = destination.temporaryOwner {
                         appendInstruction(.destroyValue(owner))
                     }
@@ -11944,6 +12015,177 @@ public struct Lowerer: Sendable {
                         line: line
                     )
                 }
+
+            case let .rangeReplaceableAppend(append):
+                let context = "RangeReplaceableCollection append"
+                let plan = try parseRangeReplaceableAppendPlan(
+                    append,
+                    genericArguments: genericArguments,
+                    arguments: arguments,
+                    context: context
+                )
+                if let metatypeToken = plan.metatypeToken {
+                    guard representedCollectionMetatypeIdentities[
+                        metatypeToken
+                    ] == plan.destination.logicalTypeIdentity else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "RangeReplaceableCollection += metatype does not match Self"
+                        )
+                    }
+                }
+
+                let representation = plan.destination.representation
+                let storageType = representation.storageType
+                let element = representation.element
+                let elementsType = representation.elementsType
+
+                switch representation {
+                case .stringCharacters:
+                    let destination = try borrowOperand(
+                        plan.destinationToken,
+                        as: storageType,
+                        context: context
+                    )
+                    let suffix: Bytecode.Register
+                    var sourceCleanup: [
+                        IntermediateRepresentation.Instruction
+                    ] = []
+                    switch plan.input {
+                    case let .element(token):
+                        let source = try borrowOperand(
+                            token,
+                            as: element,
+                            context: context
+                        )
+                        suffix = source.register
+                        if let owner = source.temporaryOwner {
+                            sourceCleanup.append(.destroyValue(owner))
+                        }
+
+                    case let .sequence(token, specialization):
+                        if specialization == .stringCharacters {
+                            let source = try borrowOperand(
+                                token,
+                                as: .string,
+                                context: context
+                            )
+                            suffix = source.register
+                            if let owner = source.temporaryOwner {
+                                sourceCleanup.append(.destroyValue(owner))
+                            }
+                        } else {
+                            let source = try materializeSequenceOperand(
+                                specialization,
+                                token: token,
+                                context: context,
+                                line: line
+                            )
+                            guard registerTypes[Int(source.array.rawValue)]
+                                    == elementsType
+                            else {
+                                throw CanonicalSIL.LoweringError.malformedSIL(
+                                    "\(context) source does not match Element"
+                                )
+                            }
+                            suffix = try lowerStringJoin(
+                                elements: source.array,
+                                separator: nil,
+                                elementKind: .character,
+                                context: context
+                            )
+                            sourceCleanup = source.cleanup
+                        }
+                    }
+
+                    let result = try allocate(type: .string)
+                    appendInstruction(
+                        .stringConcat(
+                            result: result,
+                            lhs: destination.register,
+                            rhs: suffix
+                        )
+                    )
+                    appendDistinctCleanups([
+                        sourceCleanup,
+                        destination.temporaryOwner.map {
+                            [.destroyValue($0)]
+                        } ?? [],
+                    ])
+                    try storeConstructedValue(
+                        result,
+                        at: plan.destinationToken,
+                        mode: .assign
+                    )
+
+                case .representedArray:
+                    let destination = try
+                        materializeRangeReplaceableElements(
+                            representation,
+                            token: plan.destinationToken,
+                            context: context,
+                            line: line
+                        )
+                    let result: Bytecode.Register
+                    var sourceCleanup: [
+                        IntermediateRepresentation.Instruction
+                    ] = []
+                    switch plan.input {
+                    case let .element(token):
+                        let source = try borrowOperand(
+                            token,
+                            as: element,
+                            context: context
+                        )
+                        result = try allocate(type: elementsType)
+                        appendInstruction(
+                            .arrayAppend(
+                                result: result,
+                                array: destination.elements,
+                                value: source.register
+                            )
+                        )
+                        if let owner = source.temporaryOwner {
+                            sourceCleanup.append(.destroyValue(owner))
+                        }
+
+                    case let .sequence(token, specialization):
+                        let source = try materializeSequenceOperand(
+                            specialization,
+                            token: token,
+                            context: context,
+                            line: line
+                        )
+                        guard registerTypes[Int(source.array.rawValue)]
+                                == elementsType
+                        else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "\(context) source does not match Element"
+                            )
+                        }
+                        let end = try emitArrayCount(destination.elements)
+                        result = try allocate(type: elementsType)
+                        appendInstruction(
+                            .arrayReplaceSubrange(
+                                result: result,
+                                array: destination.elements,
+                                lowerBound: end,
+                                upperBound: end,
+                                replacement: source.array
+                            )
+                        )
+                        sourceCleanup = source.cleanup
+                    }
+                    appendDistinctCleanups([
+                        sourceCleanup,
+                        destination.cleanup,
+                    ])
+                    try storeConstructedValue(
+                        result,
+                        at: plan.destinationToken,
+                        mode: .assign
+                    )
+                }
+                voidValues.insert(resultToken)
 
             case let .arrayEdit(operation):
                 let specializations = try splitTopLevel(genericArguments)
@@ -12081,47 +12323,6 @@ public struct Lowerer: Sendable {
                     )
                     destroyTemporaryOwners([lhs, rhs])
                     values[resultToken] = result
-
-                case .concatenateInPlace, .appendContents:
-                    guard arguments.count == (operation == .concatenateInPlace
-                        ? 3 : 2)
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Array append-contents edit has unsupported arguments"
-                        )
-                    }
-                    let destinationToken = operation == .concatenateInPlace
-                        ? arguments[0] : arguments[1]
-                    let sourceToken = operation == .concatenateInPlace
-                        ? arguments[1] : arguments[0]
-                    if operation == .concatenateInPlace,
-                       arrayMetatypeValues[arguments[2]] != element {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Array += metatype does not match Element"
-                        )
-                    }
-                    guard compilerAddressType(destinationToken) == arrayType
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Array append-contents destination has the wrong type"
-                        )
-                    }
-                    let destination = try borrowArray(at: destinationToken)
-                    let source = try borrowArray(at: sourceToken)
-                    let end = try emitArrayCount(destination.register)
-                    let result = try replace(
-                        destination.register,
-                        from: end,
-                        to: end,
-                        with: source.register
-                    )
-                    destroyTemporaryOwners([destination, source])
-                    try storeConstructedValue(
-                        result,
-                        at: destinationToken,
-                        mode: .assign
-                    )
-                    voidValues.insert(resultToken)
 
                 case .insertElement:
                     guard arguments.count == 3,
@@ -13235,79 +13436,6 @@ public struct Lowerer: Sendable {
                 values[resultToken] = result
                 appendInstruction(.stringConcat(result: result, lhs: lhs, rhs: rhs))
 
-            case .text(.mutation(.addAssign)):
-                guard genericArguments.isEmpty,
-                      arguments.count == 3,
-                      metatypeValues.contains(arguments[2]),
-                      compilerAddressType(arguments[0]) == .string,
-                      let lhs = try copyStoredValue(
-                          at: arguments[0],
-                          line: line
-                      )
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "String mutation has unsupported arguments"
-                    )
-                }
-                let rhs = try resolve(arguments[1], line: line)
-                guard registerTypes[Int(lhs.rawValue)] == .string,
-                      registerTypes[Int(rhs.rawValue)] == .string
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "String mutation operands must both be String"
-                    )
-                }
-                let result = try allocate(type: .string)
-                appendInstruction(
-                    .stringConcat(result: result, lhs: lhs, rhs: rhs)
-                )
-                try storeConstructedValue(
-                    result,
-                    at: arguments[0],
-                    mode: .assign
-                )
-                voidValues.insert(resultToken)
-
-            case .text(.mutation(.append)):
-                guard genericArguments.isEmpty,
-                      arguments.count == 2,
-                      compilerAddressType(arguments[1]) == .string,
-                      let lhs = try copyStoredValue(
-                          at: arguments[1],
-                          line: line
-                      )
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "String.append has unsupported arguments"
-                    )
-                }
-                let borrowedRHS = try borrowStoredValue(
-                    at: arguments[0],
-                    line: line
-                )
-                let rhs = try borrowedRHS?.register
-                    ?? resolve(arguments[0], line: line)
-                guard registerTypes[Int(lhs.rawValue)] == .string,
-                      registerTypes[Int(rhs.rawValue)] == .string
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "String.append operands must use represented text values"
-                    )
-                }
-                let result = try allocate(type: .string)
-                appendInstruction(
-                    .stringConcat(result: result, lhs: lhs, rhs: rhs)
-                )
-                if let owner = borrowedRHS?.temporaryOwner {
-                    appendInstruction(.destroyValue(owner))
-                }
-                try storeConstructedValue(
-                    result,
-                    at: arguments[1],
-                    mode: .assign
-                )
-                voidValues.insert(resultToken)
-
             case .text(.construction(.repeating)):
                 guard genericArguments.isEmpty,
                       arguments.count == 3,
@@ -13834,58 +13962,6 @@ public struct Lowerer: Sendable {
                     needleToken: arguments[0],
                     line: line
                 )
-
-            case .arrayAppend:
-                guard arguments.count == 2,
-                      !genericArguments.isEmpty,
-                      let valueType = stackType(at: arguments[0]),
-                      let arrayType = stackType(at: arguments[1])
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array.append has unsupported inout arguments"
-                    )
-                }
-                guard let borrowedValue = try borrowStoredValue(
-                    at: arguments[0],
-                    line: line
-                ), let borrowedArray = try borrowStoredValue(
-                    at: arguments[1],
-                    line: line
-                ) else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array.append references uninitialized storage"
-                    )
-                }
-                let element = try parseStoredType(genericArguments)
-                guard valueType == element,
-                      registerTypes[
-                        Int(borrowedValue.register.rawValue)
-                      ] == element,
-                      arrayType == .array(element),
-                      registerTypes[
-                        Int(borrowedArray.register.rawValue)
-                      ] == arrayType
-                else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Array.append types do not match Array.Element"
-                    )
-                }
-                let result = try allocate(type: arrayType)
-                appendInstruction(
-                    .arrayAppend(
-                        result: result,
-                        array: borrowedArray.register,
-                        value: borrowedValue.register
-                    )
-                )
-                for owner in [
-                    borrowedValue.temporaryOwner,
-                    borrowedArray.temporaryOwner,
-                ].compactMap({ $0 }) {
-                    appendInstruction(.destroyValue(owner))
-                }
-                try storeConstructedValue(result, at: arguments[1], mode: .assign)
-                voidValues.insert(resultToken)
 
             case let .collectionMakeIterator(shape):
                 if shape == .collection,
@@ -15488,6 +15564,19 @@ public struct Lowerer: Sendable {
 
             if let metatype = match(
                 line,
+                pattern: #"^(%[0-9]+) = metatype \$@(thin|thick) (.+)\.Type$"#
+            ), let sequence = try? parseSequenceSpecialization(
+                metatype[2],
+                context: "RangeReplaceableCollection metatype"
+            ), CanonicalSIL.RangeReplaceableCollectionRepresentation(
+                sequence: sequence
+            ) != nil {
+                representedCollectionMetatypeIdentities[metatype[0]] =
+                    CanonicalSIL.SwiftTypeIdentity.normalized(metatype[2])
+            }
+
+            if let metatype = match(
+                line,
                 pattern: #"^(%[0-9]+) = metatype \$@thin (?:Swift\.)?String\.Type$"#
             ) {
                 metatypeValues.insert(metatype[0])
@@ -15579,6 +15668,13 @@ public struct Lowerer: Sendable {
             ), let type = try? parseType(metatype[1]),
                case let .native(typeID) = type {
                 nativeMetatypeValues[metatype[0]] = typeID
+                continue
+            }
+
+            if let metatype = match(
+                line,
+                pattern: #"^(%[0-9]+) = metatype \$@(thin|thick) (.+)\.Type$"#
+            ), representedCollectionMetatypeIdentities[metatype[0]] != nil {
                 continue
             }
 
@@ -22827,46 +22923,92 @@ public struct Lowerer: Sendable {
     }
 
     private func parseRangeReplaceableCollectionRepresentation(
-        source: CanonicalSIL.CollectionIntrinsic.RangeReplaceableEdit.Source,
+        destination: CanonicalSIL.CollectionIntrinsic
+            .RangeReplaceableDestination,
         genericArguments: String,
         context: String
     ) throws -> CanonicalSIL.RangeReplaceableCollectionRepresentation {
-        let spellings = splitTopLevel(genericArguments)
-            .filter { !$0.isEmpty }
-        let sequence: CanonicalSIL.SequenceSpecialization
-        switch source {
-        case .genericSelf:
-            guard spellings.count == 1 else {
+        var spellings = ArraySlice(
+            splitTopLevel(genericArguments).filter { !$0.isEmpty }
+        )
+        let plan = try parseRangeReplaceableDestination(
+            destination,
+            genericSpellings: &spellings,
+            context: context
+        )
+        guard spellings.isEmpty else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "\(context) has unexpected generic specializations"
+            )
+        }
+        return plan.representation
+    }
+
+    private func parseRangeReplaceableDestination(
+        _ destination: CanonicalSIL.CollectionIntrinsic
+            .RangeReplaceableDestination,
+        genericSpellings: inout ArraySlice<String>,
+        context: String
+    ) throws -> RangeReplaceableDestinationPlan {
+        func takeGeneric(_ description: String) throws -> String {
+            guard let spelling = genericSpellings.first else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "\(context) has an incomplete Self specialization"
+                    "\(context) has an incomplete \(description) specialization"
+                )
+            }
+            genericSpellings = genericSpellings.dropFirst()
+            return spelling
+        }
+
+        let sequence: CanonicalSIL.SequenceSpecialization
+        let logicalType: String
+        let logicalElementTypeIdentity: String
+        switch destination {
+        case .genericSelf:
+            let spelling = try takeGeneric("Self")
+            guard CanonicalSIL.SwiftTypeIdentity
+                    .isRepresentedRangeReplaceableCollection(spelling),
+                  let elementIdentity = CanonicalSIL.SwiftTypeIdentity
+                    .representedSequenceElement(of: spelling)
+            else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "\(context) destination \(spelling) is not a represented "
+                        + "RangeReplaceableCollection"
                 )
             }
             sequence = try parseSequenceSpecialization(
-                spellings[0],
+                spelling,
                 context: context
             )
+            logicalType = spelling
+            logicalElementTypeIdentity = elementIdentity
 
-        case .arrayBackedElement:
-            guard spellings.count == 1 else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "\(context) has an incomplete Array-backed Element specialization"
-                )
-            }
+        case .array, .arraySlice:
+            let spelling = try takeGeneric("Element")
             let element = CanonicalSIL.ValueRepresentation.storable(
-                try parseType(spellings[0])
+                try parseType(spelling)
             )
             sequence = .managedCollection(
                 type: .array(element),
                 element: element
             )
+            let wrapper = destination == .array ? "Array" : "ArraySlice"
+            logicalType = "\(wrapper)<\(spelling)>"
+            logicalElementTypeIdentity = CanonicalSIL.SwiftTypeIdentity
+                .normalized(spelling)
 
-        case .stringCharacters:
-            guard spellings.isEmpty else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "\(context) String entry point unexpectedly has generic specializations"
+        case .string, .substring:
+            logicalElementTypeIdentity = "Character"
+            if destination == .string {
+                sequence = .stringCharacters
+                logicalType = "String"
+            } else {
+                sequence = .managedCollection(
+                    type: .array(.string),
+                    element: .string
                 )
+                logicalType = "Substring"
             }
-            sequence = .stringCharacters
         }
 
         guard let representation = CanonicalSIL
@@ -22876,7 +23018,126 @@ public struct Lowerer: Sendable {
                 "\(context) requires represented Array-backed or String storage"
             )
         }
-        return representation
+        return .init(
+            representation: representation,
+            logicalTypeIdentity: CanonicalSIL.SwiftTypeIdentity.normalized(
+                logicalType
+            ),
+            logicalElementTypeIdentity: logicalElementTypeIdentity
+        )
+    }
+
+    private func parseRangeReplaceableAppendPlan(
+        _ append: CanonicalSIL.CollectionIntrinsic.RangeReplaceableAppend,
+        genericArguments: String,
+        arguments: [String],
+        context: String
+    ) throws -> RangeReplaceableAppendPlan {
+        let destinationToken: String
+        let inputToken: String
+        let metatypeToken: String?
+        switch append.callShape {
+        case .method:
+            guard arguments.count == 2 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) method has unsupported arguments"
+                )
+            }
+            inputToken = arguments[0]
+            destinationToken = arguments[1]
+            metatypeToken = nil
+
+        case .additionAssignment:
+            guard arguments.count == 3 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) operator has unsupported arguments"
+                )
+            }
+            destinationToken = arguments[0]
+            inputToken = arguments[1]
+            metatypeToken = arguments[2]
+        }
+
+        var spellings = ArraySlice(
+            splitTopLevel(genericArguments).filter { !$0.isEmpty }
+        )
+        let destination = try parseRangeReplaceableDestination(
+            append.destination,
+            genericSpellings: &spellings,
+            context: context
+        )
+        let input: RangeReplaceableAppendPlan.Input
+        switch append.input {
+        case .element:
+            input = .element(token: inputToken)
+
+        case let .contents(source):
+            let specialization: CanonicalSIL.SequenceSpecialization
+            let logicalElementTypeIdentity: String
+            switch source {
+            case .genericArgument:
+                guard let spelling = spellings.first else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "\(context) has an incomplete Sequence specialization"
+                    )
+                }
+                spellings = spellings.dropFirst()
+                specialization = try parseSequenceSpecialization(
+                    spelling,
+                    context: context
+                )
+                guard let identity = CanonicalSIL.SwiftTypeIdentity
+                    .representedSequenceElement(of: spelling)
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "\(context) cannot recover Sequence.Element identity "
+                            + "for \(spelling)"
+                    )
+                }
+                logicalElementTypeIdentity = identity
+
+            case .destination:
+                specialization = destination.representation.sequence
+                logicalElementTypeIdentity = destination
+                    .logicalElementTypeIdentity
+
+            case let .fixed(fixed):
+                var fixedSpellings = ArraySlice<String>()
+                let fixedPlan = try parseRangeReplaceableDestination(
+                    fixed,
+                    genericSpellings: &fixedSpellings,
+                    context: context
+                )
+                specialization = fixedPlan.representation.sequence
+                logicalElementTypeIdentity = fixedPlan
+                    .logicalElementTypeIdentity
+            }
+            guard specialization.element
+                    == destination.representation.element,
+                  logicalElementTypeIdentity
+                    == destination.logicalElementTypeIdentity
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) source Sequence.Element does not match destination Element"
+                )
+            }
+            input = .sequence(
+                token: inputToken,
+                specialization: specialization
+            )
+        }
+
+        guard spellings.isEmpty else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "\(context) has unexpected generic specializations"
+            )
+        }
+        return .init(
+            destination: destination,
+            destinationToken: destinationToken,
+            input: input,
+            metatypeToken: metatypeToken
+        )
     }
 
     private func parseCollectionQuerySpecialization(

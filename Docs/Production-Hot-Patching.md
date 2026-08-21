@@ -198,11 +198,16 @@ Sequence plans. String/Substring conversion, Character-sequence construction,
 nested Character flattening, String-sequence joining, append/repetition,
 String/Character comparison, and text interpolation use two verifier-visible
 representation primitives rather than Swift generic NativeImports or per-
-source-API opcodes. Edge/count removal, `popLast`, clearing, and capacity hints
-reuse one represented `RangeReplaceableCollection` mutation plan across String,
-Substring, Array, and normalized Array-backed views. Private String indices,
-UTF views, index-sensitive mutation, and Foundation text semantics remain fail-
-closed.
+source-API opcodes. Element append, finite-Sequence
+`append(contentsOf:)`/`+=`, edge/count removal, `popLast`, clearing, and capacity
+hints reuse one represented `RangeReplaceableCollection` mutation plan across
+String, Substring, Array, and normalized Array-backed views. Contents sources
+reuse the existing represented managed-Collection/progression materialization
+boundary after canonical source-level Element identity and physical shape are
+checked; direct String/Character suffixes avoid segmenting the destination.
+Private
+String indices, UTF views, index-sensitive mutation, and Foundation text
+semantics remain fail-closed.
 Frontend Array/Dictionary cast helpers may erase tuple labels only when the
 original types differ solely by those labels and both complete VM types match;
 real element, key, value, and reference conversions remain rejected.

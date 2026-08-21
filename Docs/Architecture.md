@@ -182,12 +182,21 @@ Both workflows depend on stable, build-specific identities:
   finite Sequence operations materialize once and then reuse the same cursor,
   builder, split, subsequence, relation, and closure control flow as other
   represented Collections. A separate represented
-  `RangeReplaceableCollection` plan covers edge and counted-edge removal,
-  `popLast`, clearing, and capacity hints across String, Substring, Array, and
-  normalized Array-backed views. String enters that plan through its Character
-  Array and is finalized with `string_join.character`; Array-backed storage
-  executes the same typed edits directly. UTF views, `String.Index`, and
-  index-sensitive mutation remain outside this representation and fail closed.
+  `RangeReplaceableCollection` plan resolves frontend method/operator shapes to
+  one logical destination plus either an Element or a finite Sequence source.
+  It covers `append`, `append(contentsOf:)`, `+=`, edge and counted-edge
+  removal, `popLast`, clearing, and capacity hints across String, Substring,
+  Array, and normalized Array-backed views. A String destination concatenates a
+  direct Character/String suffix without segmenting its existing contents and
+  joins other represented Character sequences once; Array-backed destinations
+  use the same typed scalar append or half-open range replacement as ArraySlice.
+  Source Sequence storage may be a matching represented managed Collection or
+  supported finite progression. Canonical source-level Element identity
+  (including tuple labels and distinctions erased by HLBC), concrete operator
+  metatypes, physical Element shape, and ownership are validated before the
+  edit; no generic Swift NativeImport or source-API opcode is introduced. UTF
+  views, `String.Index`, and index-sensitive mutation remain outside this
+  representation and fail closed.
 - Finite integer `Range`/`ClosedRange` and supported numeric `StrideTo`/
   `StrideThrough` values form a second, compiler-only concrete Sequence
   specialization. They retain typed bounds and stride registers rather than a

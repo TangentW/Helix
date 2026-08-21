@@ -20,11 +20,6 @@ enum TextIntrinsic: Equatable {
         var operandKind: CanonicalSIL.TextRepresentation.Kind
     }
 
-    enum Mutation: Equatable {
-        case addAssign
-        case append
-    }
-
     enum Construction: Equatable {
         case repeating
         case losslessDescription
@@ -44,7 +39,6 @@ enum TextIntrinsic: Equatable {
     case literal(LiteralKind)
     case comparison(Comparison)
     case concatenation
-    case mutation(Mutation)
     case transform(Bytecode.StringTransformOperation)
     case predicate(Bytecode.StringPredicateOperation)
     case construction(Construction)
@@ -68,11 +62,6 @@ enum TextIntrinsic: Equatable {
             self = .comparison(.init(operation: .less, operandKind: .character))
         case "$sSS1poiyS2S_SStFZ":
             self = .concatenation
-        case "$sSS2peoiyySSz_SStFZ":
-            self = .mutation(.addAssign)
-        case "$sSS6appendyySSF", "$sSS6appendyySJF",
-             "$sSS6append10contentsOfySS_tF":
-            self = .mutation(.append)
         case "$sSS10uppercasedSSyF":
             self = .transform(.uppercase)
         case "$sSS10lowercasedSSyF":

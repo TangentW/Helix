@@ -25,7 +25,6 @@ enum SwiftCoreIntrinsic: Equatable {
     case arraySubscript
     case arraySubscriptModify
     case sequenceContains
-    case arrayAppend
     case collectionMakeIterator(CanonicalSIL.CollectionIntrinsic.IteratorShape)
     case indexingIteratorNext(CanonicalSIL.CollectionIntrinsic.IteratorShape)
     case progressionConstructor(CanonicalSIL.Progression.Family)
@@ -190,7 +189,6 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sSayxSicig": self = .arraySubscript
         case "$sSayxSiciM": self = .arraySubscriptModify
         case "$sSTsSQ7ElementRpzrlE8containsySbABF": self = .sequenceContains
-        case "$sSa6appendyyxnF": self = .arrayAppend
         case "$sSlss16IndexingIteratorVyxG0B0RtzrlE04makeB0ACyF":
             self = .collectionMakeIterator(.collection)
         case "$ss18ReversedCollectionV12makeIteratorAB0D0Vyx_GyF":

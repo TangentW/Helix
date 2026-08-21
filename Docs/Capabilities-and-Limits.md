@@ -58,16 +58,20 @@ does not by itself certify a physical device or distribution channel.
   producer or Shell boundary; `Substring` is normalized to its Character
   sequence and does not preserve private slice storage or index identity.
   Supported operations include String/Character literals and equality/
-  ordering, String concatenation, `+=`, String/Character append, scalar and
-  text interpolation, repeating and
+  ordering, String append of a Character or String, Substring append of a
+  Character, and finite Character-Sequence `append(contentsOf:)`/`+=` for
+  both String and Substring,
+  scalar and text interpolation, repeating and
   common String construction, Unicode `uppercased`/`lowercased`, count/empty,
   prefix/suffix/contains predicates, String/Substring conversion, Character-
   sequence construction, String-sequence joining, grapheme-correct
   `removeFirst`/`removeLast` (including counted forms), `popLast`, clearing, and
   capacity hints. These mutations share one represented
   `RangeReplaceableCollection` plan with Array-backed values rather than text-
-  specific bytecode. Variable-size text operations precharge deterministic
-  UTF-8 work and output storage.
+  specific bytecode. Direct Character/String suffixes avoid segmenting the
+  existing String; other represented Character sequences are materialized and
+  joined once. Variable-size text operations precharge deterministic UTF-8
+  work and output storage.
 - Tuple, `Void`, and `Optional`, including the ordinary control flow produced by
   `if let`, `guard let`, `??`, and `try?`, including address-based Optional
   projection emitted by semantic Dictionary lookup SIL. Explicit
@@ -105,11 +109,17 @@ does not by itself certify a physical device or distribution channel.
   `starts(with:)`, `lexicographicallyPrecedes`, `startIndex`/`endIndex`,
   `distance(from:to:)`, index movement and limited offsets, `indices`,
   `popLast`, iteration, checked subscript access, and value-returning updates.
-  Structural edits accept represented copyable element types and matching
-  Array-backed sources. They share verified half-open range replacement and
-  swap primitives, so bounds checks, overflow behavior, ownership, and
-  allocation-before-copy charging do not depend on a particular element or
-  SDK type. Capacity-changing hints are supported, but reading `Array.capacity`
+  Element append, `append(contentsOf:)`, and `+=` also apply to normalized
+  ArraySlice destinations. Contents sources may be any supported finite
+  represented Sequence with matching canonical source-level Element identity
+  and physical shape, including managed Array/ArraySlice/Set/Dictionary
+  storage, String/Substring Character sequences, and supported concrete
+  progressions. Remaining
+  structural edits accept represented copyable element types and matching
+  Array-backed sources. They share verified scalar append, half-open range
+  replacement, and swap primitives, so bounds checks, overflow behavior,
+  ownership, and allocation-before-copy charging do not depend on a particular
+  element or SDK type. Capacity-changing hints are supported, but reading `Array.capacity`
   is intentionally rejected because physical VM storage capacity is not Swift
   Array semantics. `randomElement()` is likewise rejected until randomness and
   its observable policy are represented explicitly.
@@ -180,9 +190,13 @@ does not by itself certify a physical device or distribution channel.
   same finite Sequence cursor as a verified Character Array for element-based
   traversal, including `first`/`last`, transforms, relations, and adapters.
   String, Substring, Array, and normalized Array-backed views also share typed
-  edge/count removal, `popLast`, and clearing; capacity hints are retained only
-  to the extent observable through supported APIs. String finalizes the edited
-  Character sequence back to text, while Array-backed storage remains direct.
+  Element/Sequence append, edge/count removal, `popLast`, and clearing;
+  capacity hints are retained only to the extent observable through supported
+  APIs. Concrete `+=` metatypes, canonical source-level Element identity
+  (including tuple labels and distinctions erased by HLBC), physical shape,
+  and linear ownership are checked before mutation.
+  String finalizes normalized Character sources back to text, while
+  Array-backed storage remains direct.
   Fully concrete `map`, `flatMap`,
   `compactMap`, `reduce`, `reduce(into:_:)`, `forEach`, `first(where:)`,
   `contains(where:)`, `allSatisfy`, `count(where:)`, and comparator-driven
