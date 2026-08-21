@@ -86,6 +86,22 @@ Both workflows depend on stable, build-specific identities:
   an invocation-lifetime closure, and requires the lexical closure to end before
   the address scope; the runtime address token independently invalidates stale
   access.
+- Native callbacks use an explicit sparse parameter contract rather than making
+  closure values part of the ordinary boundary codec. Each callback-bearing
+  NativeImport identity freezes its parameter index and `nonescaping` or
+  `escaping` lifetime. A nonescaping handle shares the importing invocation's
+  budget and is invalidated when that call returns. An escaping handle retains
+  the immutable generation lease and closure context, reuses an enclosing
+  pinned context when one still exists, and otherwise creates a fresh bounded
+  callback invocation against the original image. Same-thread recursion is
+  allowed, but overlapping cross-thread calls through one handle fail closed;
+  this runtime mechanism does not claim general Swift `Sendable` semantics.
+  Dynamic lexical scopes cannot enter an escaping handle;
+  callback arguments are re-encoded and shape-checked at every invocation.
+  Because a nonthrowing native closure has no error channel, the automatic
+  profile currently accepts synchronous, nonthrowing, `Void` callbacks only:
+  a synchronous failure becomes the containing NativeImport trap, while a
+  later escaping failure is reported through pinned Runtime telemetry.
 - Array, Dictionary, and Set are typed VM values rather than projections of
   private Swift runtime layouts. One bounded recursive value-semantics model
   supplies VM-defined Equatable and Hashable behavior for supported scalars and

@@ -270,9 +270,11 @@ struct NativeImportCatalogPipeline {
         let receipt = output.receipt
         #expect(receipt.nativeImportCandidates.count == 6)
         #expect(receipt.nativeImportCandidates.filter(\.isEmittedToDevice).count == 5)
-        #expect(receipt.nativeImportCandidates.first {
+        let emittedIncrement = try #require(receipt.nativeImportCandidates.first {
             $0.canonicalCallee == incrementCallee
-        }?.id == .init(rawValue: 0))
+        })
+        #expect(emittedIncrement.id != nil)
+        #expect(emittedIncrement.isEmittedToDevice)
         #expect(receipt.nativeImportCandidates.first {
             $0.canonicalCallee == dormantCallee
         }?.id == nil)

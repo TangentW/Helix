@@ -1292,7 +1292,11 @@ public struct Engine: Verification.ImageVerifying {
                 }
             }
         }
-        try verifyClosureScopeLifetimes(function, blocks: blocks)
+        try verifyClosureScopeLifetimes(
+            function,
+            blocks: blocks,
+            shell: shell
+        )
 
         let predecessors = try buildPredecessors(function: function, blocks: blocks)
         guard predecessors[function.entryBlock]?.isEmpty == true else {
@@ -1719,7 +1723,8 @@ public struct Engine: Verification.ImageVerifying {
     /// unrelated merge.
     private func verifyClosureScopeLifetimes(
         _ function: Bytecode.Function,
-        blocks: [Bytecode.BlockID: Bytecode.Block]
+        blocks: [Bytecode.BlockID: Bytecode.Block],
+        shell: Verification.ShellInterface
     ) throws {
         let scopedRegisters: Set<Bytecode.Register> = Set(
             function.blocks.flatMap { block -> [Bytecode.Register] in
@@ -1852,6 +1857,22 @@ public struct Engine: Verification.ImageVerifying {
                         )
                     }
                     state.closed.insert(closure)
+                case let .nativeApply(_, importID, arguments),
+                     let .nativeTryApply(importID, arguments, _, _):
+                    let nonescapingParameters = Set(
+                        shell.imports[importID]?.contract.callbacks.compactMap {
+                            callback in
+                            callback.lifetime == .nonescaping
+                                ? Int(callback.parameterIndex) : nil
+                        } ?? []
+                    )
+                    for (index, argument) in arguments.enumerated()
+                    where state.open.contains(argument)
+                        && !nonescapingParameters.contains(index) {
+                        throw fail(
+                            "a dynamically scoped closure cannot enter an escaping NativeImport callback"
+                        )
+                    }
                 case .returnValue, .throwError:
                     guard state.open.isEmpty else {
                         throw fail(
@@ -4567,7 +4588,8 @@ public struct Engine: Verification.ImageVerifying {
                 case let .nativeApply(result, importID, arguments):
                     try consumeOwnedCallArguments(
                         arguments,
-                        conventions: Array(repeating: .owned, count: arguments.count),
+                        conventions: shell.imports[importID]?.parameterConventions
+                            ?? Array(repeating: .owned, count: arguments.count),
                         live: &live,
                         function: function,
                         fail: fail
@@ -4626,11 +4648,21 @@ public struct Engine: Verification.ImageVerifying {
                     )
                     try forward(live, to: normalTarget)
                     try forward(live, to: errorTarget)
-                case let .entryTryApply(_, arguments, normalTarget, errorTarget),
-                     let .nativeTryApply(_, arguments, normalTarget, errorTarget):
+                case let .entryTryApply(_, arguments, normalTarget, errorTarget):
                     try consumeOwnedCallArguments(
                         arguments,
                         conventions: Array(repeating: .owned, count: arguments.count),
+                        live: &live,
+                        function: function,
+                        fail: fail
+                    )
+                    try forward(live, to: normalTarget)
+                    try forward(live, to: errorTarget)
+                case let .nativeTryApply(importID, arguments, normalTarget, errorTarget):
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: shell.imports[importID]?.parameterConventions
+                            ?? Array(repeating: .owned, count: arguments.count),
                         live: &live,
                         function: function,
                         fail: fail

@@ -143,6 +143,61 @@ struct Archive {
         #expect(try original.computeShellInterfaceHash() != changed.computeShellInterfaceHash())
     }
 
+    @Test("Native callback contracts survive archive validation and hashing")
+    func nativeCallbackContractRoundTrip() throws {
+        var archive = try fixture()
+        let callback = Bytecode.ClosureSignature(
+            parameters: [.bool],
+            parameterConventions: [.owned],
+            result: .void
+        )
+        let signature = Core.LoweredSignature(
+            parameters: ["@escaping (Swift.Bool) -> Swift.Void"],
+            result: "Swift.Void"
+        )
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true,
+            callbacks: [.init(parameterIndex: 0, lifetime: .escaping)]
+        )
+        let key = try Core.NativeImportKey.derive(
+            namespace: archive.metadata.shellNamespaceID,
+            canonicalCallee: "Fixture.install(_:)",
+            signature: signature,
+            effects: .init(),
+            contract: contract
+        )
+        archive.capabilities += [
+            .nativeImportsV1, .closureValuesV1, .escapingClosureValuesV1,
+        ]
+        archive.nativeImports = [
+            .init(
+                id: .init(rawValue: 0),
+                key: key,
+                canonicalCallee: "Fixture.install(_:)",
+                silMangledNames: ["$s7Fixture7installyyySbccF"],
+                parameterTypes: [.closure(callback)],
+                resultType: .void,
+                signature: signature,
+                effects: .init(),
+                contract: contract,
+                isEmittedToDevice: true
+            ),
+        ]
+        archive.shellInterfaceHash = try archive.computeShellInterfaceHash()
+
+        try archive.validate()
+        let decoded = try InterfaceArchive.Codec.decode(
+            InterfaceArchive.Codec.encode(archive)
+        ).archive
+        #expect(decoded.nativeImports[0].contract.callbacks == contract.callbacks)
+        #expect(decoded.schemaVersion == 1)
+        #expect(decoded.compatibility.interfaceArchive == .init(1, 0, 0))
+    }
+
     private func fixture() throws -> InterfaceArchive.Archive {
         let namespace = Core.ShellNamespaceID.derive(
             bundleID: "dev.helix.interface",

@@ -65,6 +65,7 @@ public struct Interpreter: Sendable {
     public var nativeTypeCatalog: VM.NativeTypeCatalog
     public var entryInvocation: VM.EntryInvocation?
     public var objectHost: VM.ObjectHost?
+    public var nativeCallbackHost: VM.NativeCallbackHost?
     public var trapObserver: VM.TrapObserver?
 
     public init(
@@ -72,12 +73,14 @@ public struct Interpreter: Sendable {
         nativeTypeCatalog: VM.NativeTypeCatalog = .init(),
         entryInvocation: VM.EntryInvocation? = nil,
         objectHost: VM.ObjectHost? = nil,
+        nativeCallbackHost: VM.NativeCallbackHost? = nil,
         trapObserver: VM.TrapObserver? = nil
     ) {
         self.nativeCatalog = nativeCatalog
         self.nativeTypeCatalog = nativeTypeCatalog
         self.entryInvocation = entryInvocation
         self.objectHost = objectHost
+        self.nativeCallbackHost = nativeCallbackHost
         self.trapObserver = trapObserver
     }
 
@@ -178,6 +181,104 @@ public struct Interpreter: Sendable {
                 trace: trace
             )
             return .returned(value)
+        } catch let business as VM.BusinessError {
+            return .businessError(business.error.message)
+        } catch let trap as VM.RuntimeTrap {
+            trapObserver?(.init(trap: trap, programCounter: trace.programCounter))
+            return .trapped(trap)
+        } catch {
+            let trap = VM.RuntimeTrap.nativeFailure(String(describing: error))
+            trapObserver?(.init(trap: trap, programCounter: trace.programCounter))
+            return .trapped(trap)
+        }
+    }
+
+    /// Re-enters one closure through a Runtime-owned native callback host.
+    /// Callback arguments cross a native boundary, while captures remain
+    /// image-internal values validated against the closure body's trailing ABI.
+    package func invokeNativeCallback(
+        _ closure: VM.Closure,
+        image: Verification.Image,
+        arguments: [VM.Value],
+        budget: VM.InvocationBudget
+    ) -> VM.ExecutionResult {
+        let trace = ExecutionTrace()
+        do {
+            // Runtime can only construct this route from an already verified,
+            // catalog-bound image. Revalidating the full image on every callback
+            // would create unmetered work outside the callback fuel budget.
+            try budget.checkDeadline()
+            try closure.dynamicScope?.requireActive()
+            try budget.consumeLinearWork(
+                elementCount: image.module.functions.count
+                    + image.module.localTypes.count
+            )
+            let functions = Dictionary(
+                uniqueKeysWithValues: image.module.functions.map { ($0.id, $0) }
+            )
+            let localTypes = Dictionary(
+                uniqueKeysWithValues: image.module.localTypes.map { ($0.key, $0) }
+            )
+            try budget.checkDeadline()
+            guard let function = functions[closure.functionID],
+                  function.kind == .closureBody,
+                  function.resultType == closure.signature.result,
+                  function.effects == closure.signature.effects,
+                  !function.effects.isAsync,
+                  !function.effects.mayThrow,
+                  function.parameterRegisters.count
+                    == arguments.count + closure.captures.count,
+                  arguments.count == closure.signature.parameters.count,
+                  Array(function.parameterConventions.prefix(arguments.count))
+                    == closure.signature.parameterConventions
+            else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "native callback closure disagrees with its verified body ABI"
+                )
+            }
+            guard !function.effects.requiresMainActor || Thread.isMainThread else {
+                throw VM.RuntimeTrap.mainActorViolation
+            }
+            for (value, expected) in zip(arguments, closure.signature.parameters) {
+                try budget.consumeBoundaryValue(value)
+                try validateRuntimeValue(
+                    value,
+                    expected: expected,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+            }
+            let captureRegisters = function.parameterRegisters.suffix(
+                closure.captures.count
+            )
+            for (value, register) in zip(closure.captures, captureRegisters) {
+                guard let expected = function.type(of: register) else {
+                    throw VM.RuntimeTrap.invalidProgramCounter
+                }
+                try validateRuntimeValue(
+                    value,
+                    expected: expected,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+            }
+            let callValues = arguments + closure.captures
+            try chargeCallShape(callValues, budget: budget)
+            let value = try execute(
+                functionID: closure.functionID,
+                functions: functions,
+                arguments: callValues,
+                localTypes: localTypes,
+                budget: budget,
+                trace: trace
+            )
+            guard value == nil, closure.signature.result == .void else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: .void,
+                    actual: value?.type
+                )
+            }
+            return .returned(nil)
         } catch let business as VM.BusinessError {
             return .businessError(business.error.message)
         } catch let trap as VM.RuntimeTrap {
@@ -4133,7 +4234,7 @@ public struct Interpreter: Sendable {
                     }
                     try consumeOwnedCallArguments(
                         arguments,
-                        conventions: Array(repeating: .owned, count: arguments.count),
+                        conventions: nativeParameterConventions(invoker),
                         function: function,
                         localTypes: localTypes,
                         registers: &registers
@@ -4462,7 +4563,7 @@ public struct Interpreter: Sendable {
                     }
                     try consumeOwnedCallArguments(
                         arguments,
-                        conventions: Array(repeating: .owned, count: arguments.count),
+                        conventions: nativeParameterConventions(invoker),
                         function: function,
                         localTypes: localTypes,
                         registers: &registers
@@ -6937,7 +7038,9 @@ public struct Interpreter: Sendable {
         let context = try budget.beginNativeInvocation(
             id: id,
             effects: invoker.effects,
-            contract: invoker.contract
+            contract: invoker.contract,
+            parameterTypes: invoker.parameterTypes,
+            callbackHost: nativeCallbackHost
         )
         let result: VM.NativeInvocationResult
         do {
@@ -6955,6 +7058,18 @@ public struct Interpreter: Sendable {
         }
         try context.finish(requireCooperation: true)
         return result
+    }
+
+    private func nativeParameterConventions(
+        _ invoker: any VM.NativeInvoker
+    ) -> [Bytecode.ParameterConvention] {
+        let nonescaping = Set(invoker.contract.callbacks.compactMap { callback in
+            callback.lifetime == .nonescaping
+                ? Int(callback.parameterIndex) : nil
+        })
+        return invoker.parameterTypes.indices.map {
+            nonescaping.contains($0) ? .borrowed : .owned
+        }
     }
 
     private func runtimeTrap(for reason: Bytecode.TrapReason) -> VM.RuntimeTrap {

@@ -59,6 +59,16 @@ public struct ResolvedNativeImport: Hashable, Sendable {
         self.contract = contract
         self.capability = capability
     }
+
+    public var parameterConventions: [Bytecode.ParameterConvention] {
+        let nonescaping = Set(contract.callbacks.compactMap { callback in
+            callback.lifetime == .nonescaping
+                ? Int(callback.parameterIndex) : nil
+        })
+        return parameterTypes.indices.map {
+            nonescaping.contains($0) ? .borrowed : .owned
+        }
+    }
 }
 
 public enum NativeTypeKind: String, Hashable, Sendable {
@@ -133,13 +143,86 @@ public struct ShellInterface: Sendable {
         }
         for id in imports.keys.sorted() {
             guard let descriptor = imports[id] else { continue }
-            for type in descriptor.parameterTypes + [descriptor.resultType] {
-                try Self.validateBoundaryType(
-                    type,
-                    owner: "native import \(descriptor.id)",
-                    capabilities: capabilities
+            let callbacks = descriptor.contract.callbacks
+            do {
+                try descriptor.contract.validate(effects: descriptor.effects)
+            } catch {
+                throw Verification.Error.invalidShellInterface(
+                    "native import \(descriptor.id) has an invalid contract: \(error)"
                 )
             }
+            guard callbacks == callbacks.sorted(),
+                  Set(callbacks.map(\.parameterIndex)).count == callbacks.count,
+                  callbacks.allSatisfy({
+                Int($0.parameterIndex) < descriptor.parameterTypes.count
+            }) else {
+                throw Verification.Error.invalidShellInterface(
+                    "native import \(descriptor.id) has an out-of-range callback parameter"
+                )
+            }
+            let callbackByIndex = Dictionary(
+                uniqueKeysWithValues: callbacks.map { (Int($0.parameterIndex), $0) }
+            )
+            for (parameterIndex, type) in descriptor.parameterTypes.enumerated() {
+                if let callback = callbackByIndex[parameterIndex] {
+                    try Self.validateNativeCallbackType(
+                        type,
+                        callback: callback,
+                        owner: "native import \(descriptor.id) parameter \(parameterIndex)",
+                        capabilities: capabilities
+                    )
+                } else {
+                    try Self.validateBoundaryType(
+                        type,
+                        owner: "native import \(descriptor.id)",
+                        capabilities: capabilities
+                    )
+                }
+            }
+            guard !descriptor.resultType.containsClosure else {
+                throw Verification.Error.invalidShellInterface(
+                    "native import \(descriptor.id) cannot return a callback"
+                )
+            }
+            try Self.validateBoundaryType(
+                descriptor.resultType,
+                owner: "native import \(descriptor.id)",
+                capabilities: capabilities
+            )
+        }
+    }
+
+    private static func validateNativeCallbackType(
+        _ type: Bytecode.ValueType,
+        callback: Core.NativeImportCallback,
+        owner: String,
+        capabilities: Set<Core.Capability>
+    ) throws {
+        guard capabilities.contains(.closureValuesV1),
+              callback.lifetime != .escaping
+                || capabilities.contains(.escapingClosureValuesV1),
+              let shape = type.nativeCallbackShape,
+              shape.signature.result == .void,
+              !shape.signature.effects.mayThrow,
+              !shape.signature.effects.isAsync,
+              !shape.signature.parameterConventions.contains(.inout),
+              !(callback.lifetime == .nonescaping && shape.isOptional)
+        else {
+            throw Verification.Error.invalidShellInterface(
+                "\(owner) must be a synchronous, nonthrowing, Void callback with a valid lifetime"
+            )
+        }
+        for parameter in shape.signature.parameters {
+            guard !parameter.containsClosure else {
+                throw Verification.Error.invalidShellInterface(
+                    "\(owner) cannot accept a higher-order callback"
+                )
+            }
+            try validateBoundaryType(
+                parameter,
+                owner: owner,
+                capabilities: capabilities
+            )
         }
     }
 

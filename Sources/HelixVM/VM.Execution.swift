@@ -423,6 +423,8 @@ public final class InvocationBudget: @unchecked Sendable {
         id: Core.NativeImportID,
         effects: Core.Effects,
         contract: Core.NativeImportContract,
+        parameterTypes: [Bytecode.ValueType] = [],
+        callbackHost: VM.NativeCallbackHost? = nil,
         isMainThread: Bool = Thread.isMainThread
     ) throws -> VM.NativeInvocationContext {
         try contract.validate(effects: effects)
@@ -451,7 +453,10 @@ public final class InvocationBudget: @unchecked Sendable {
                 budget: self,
                 deadlineNanoseconds: importDeadline,
                 requiresCooperation: contract.execution.deadlineMode == .cooperative,
-                requiresMainActor: effects.requiresMainActor
+                requiresMainActor: effects.requiresMainActor,
+                callbacks: contract.callbacks,
+                parameterTypes: parameterTypes,
+                callbackHost: callbackHost
             )
         }
     }

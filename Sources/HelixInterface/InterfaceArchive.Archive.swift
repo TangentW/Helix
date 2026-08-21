@@ -558,6 +558,42 @@ public struct Archive: Codable, Hashable, Sendable {
                     "native import does not use the current contract capability"
                 )
             }
+            let callbackByIndex = Dictionary(
+                uniqueKeysWithValues: item.contract.callbacks.map {
+                    (Int($0.parameterIndex), $0)
+                }
+            )
+            guard callbackByIndex.count == item.contract.callbacks.count,
+                  callbackByIndex.keys.allSatisfy(item.parameterTypes.indices.contains),
+                  !item.resultType.containsClosure
+            else {
+                throw InterfaceArchive.Error.invalidArchive(
+                    "native import callback parameters are inconsistent"
+                )
+            }
+            for (index, type) in item.parameterTypes.enumerated() {
+                if let callback = callbackByIndex[index] {
+                    guard capabilities.contains(.closureValuesV1),
+                          callback.lifetime != .escaping
+                            || capabilities.contains(.escapingClosureValuesV1),
+                          let shape = type.nativeCallbackShape,
+                          shape.signature.result == .void,
+                          !shape.signature.effects.mayThrow,
+                          !shape.signature.effects.isAsync,
+                          !shape.signature.parameterConventions.contains(.inout),
+                          !(callback.lifetime == .nonescaping && shape.isOptional),
+                          shape.signature.parameters.allSatisfy({ !$0.containsClosure })
+                    else {
+                        throw InterfaceArchive.Error.invalidArchive(
+                            "native import has an unsupported callback signature"
+                        )
+                    }
+                } else if type.containsClosure {
+                    throw InterfaceArchive.Error.invalidArchive(
+                        "native import closure parameter has no callback lifetime contract"
+                    )
+                }
+            }
             if item.abiAdapter == .mutatingValueReceiver {
                 guard item.parameterTypes.count >= 1,
                       case let .native(receiver) = item.parameterTypes.last,
@@ -716,9 +752,20 @@ public struct Archive: Codable, Hashable, Sendable {
             try validateDeviceEffects(function.effects)
         }
         for item in emittedImports {
-            for type in item.parameterTypes + [item.resultType] {
-                try validateDeviceType(type)
+            let callbackIndices = Set(item.contract.callbacks.map {
+                Int($0.parameterIndex)
+            })
+            for (index, type) in item.parameterTypes.enumerated() {
+                if callbackIndices.contains(index),
+                   let shape = type.nativeCallbackShape {
+                    for parameter in shape.signature.parameters {
+                        try validateDeviceType(parameter)
+                    }
+                } else {
+                    try validateDeviceType(type)
+                }
             }
+            try validateDeviceType(item.resultType)
             guard item.effects.requiresMainActor
                     || !(item.parameterTypes + [item.resultType]).contains(
                         where: usesMainActorType

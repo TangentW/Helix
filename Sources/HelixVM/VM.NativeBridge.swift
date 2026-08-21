@@ -32,6 +32,10 @@ public struct NativeInvocationContext {
         let deadlineNanoseconds: UInt64
         let requiresCooperation: Bool
         let requiresMainActor: Bool
+        let callbackByParameter: [Int: Core.NativeImportCallback]
+        let parameterTypes: [Bytecode.ValueType]
+        let callbackHost: VM.NativeCallbackHost?
+        let callbackEpoch: VM.NativeCallbackEpoch?
         let lock = NSLock()
         var checkpointCount: UInt32 = 0
         var isFinished = false
@@ -41,13 +45,26 @@ public struct NativeInvocationContext {
             budget: VM.InvocationBudget,
             deadlineNanoseconds: UInt64,
             requiresCooperation: Bool,
-            requiresMainActor: Bool
+            requiresMainActor: Bool,
+            callbacks: [Core.NativeImportCallback],
+            parameterTypes: [Bytecode.ValueType],
+            callbackHost: VM.NativeCallbackHost?
         ) {
             self.id = id
             self.budget = budget
             self.deadlineNanoseconds = deadlineNanoseconds
             self.requiresCooperation = requiresCooperation
             self.requiresMainActor = requiresMainActor
+            callbackByParameter = callbacks.isEmpty ? [:] : Dictionary(
+                uniqueKeysWithValues: callbacks.map {
+                    (Int($0.parameterIndex), $0)
+                }
+            )
+            self.parameterTypes = callbacks.isEmpty ? [] : parameterTypes
+            self.callbackHost = callbacks.isEmpty ? nil : callbackHost
+            callbackEpoch = callbacks.isEmpty
+                ? nil
+                : VM.NativeCallbackEpoch(budget: budget)
         }
     }
 
@@ -58,14 +75,74 @@ public struct NativeInvocationContext {
         budget: VM.InvocationBudget,
         deadlineNanoseconds: UInt64,
         requiresCooperation: Bool,
-        requiresMainActor: Bool
+        requiresMainActor: Bool,
+        callbacks: [Core.NativeImportCallback],
+        parameterTypes: [Bytecode.ValueType],
+        callbackHost: VM.NativeCallbackHost?
     ) {
         state = State(
             id: id,
             budget: budget,
             deadlineNanoseconds: deadlineNanoseconds,
             requiresCooperation: requiresCooperation,
-            requiresMainActor: requiresMainActor
+            requiresMainActor: requiresMainActor,
+            callbacks: callbacks,
+            parameterTypes: parameterTypes,
+            callbackHost: callbackHost
+        )
+    }
+
+    /// Exports one VM closure through the lifetime frozen for a NativeImport parameter.
+    public func makeCallback(
+        parameterIndex: Int,
+        from value: VM.Value
+    ) throws -> VM.NativeCallback {
+        let (callback, epoch, host) = try state.lock.withLock {
+            guard !state.isFinished else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "native invocation context escaped its synchronous call"
+                )
+            }
+            guard let callback = state.callbackByParameter[parameterIndex] else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "native import parameter \(parameterIndex) is not authorized as a callback"
+                )
+            }
+            guard let host = state.callbackHost else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "native callback export has no pinned Runtime host"
+                )
+            }
+            guard let epoch = state.callbackEpoch else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "native callback export has no active callback epoch"
+                )
+            }
+            return (callback, epoch, host)
+        }
+        guard state.parameterTypes.indices.contains(parameterIndex),
+              let expectedShape = state.parameterTypes[parameterIndex]
+                .nativeCallbackShape,
+              case let .closure(closure) = value,
+              closure.signature == expectedShape.signature,
+              closure.signature.result == .void,
+              !closure.signature.effects.mayThrow,
+              !closure.signature.effects.isAsync
+        else {
+            throw VM.RuntimeTrap.nativeFailure(
+                "native callback export received an unsupported closure value"
+            )
+        }
+        if callback.lifetime == .escaping, closure.dynamicScope != nil {
+            throw VM.RuntimeTrap.nativeFailure(
+                "a dynamically scoped closure cannot escape through NativeImport"
+            )
+        }
+        return VM.NativeCallback(
+            closure: closure,
+            lifetime: callback.lifetime,
+            epoch: epoch,
+            host: host
         )
     }
 
@@ -119,12 +196,14 @@ public struct NativeInvocationContext {
             state.isFinished = true
             return state.checkpointCount
         }
+        let callbackFailure = state.callbackEpoch?.finish()
         try state.budget.finishNativeInvocation(
             id: state.id,
             deadlineNanoseconds: state.deadlineNanoseconds,
             requiresCooperation: requireCooperation && state.requiresCooperation,
             checkpointCount: snapshot
         )
+        if let callbackFailure { throw callbackFailure }
     }
 }
 

@@ -165,6 +165,25 @@ struct Identities {
         )
         #expect(getterKey != methodKey)
 
+        let callbackMethod = Core.NativeImportContract.bounded(
+            kind: .instanceMethod,
+            domain: .uiKit,
+            access: .read,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true,
+            callbacks: [
+                .init(parameterIndex: 0, lifetime: .nonescaping),
+            ]
+        )
+        let callbackKey = try Core.NativeImportKey.derive(
+            namespace: namespace,
+            canonicalCallee: "UIKit.UIView.isHidden.getter",
+            signature: signature,
+            effects: effects,
+            contract: callbackMethod
+        )
+        #expect(callbackKey != methodKey)
+
         #expect(throws: Core.NativeImportContractError.self) {
             try getter.validate(
                 effects: .init(requiresMainActor: true, isAsync: true)
@@ -229,6 +248,21 @@ struct Identities {
         )
         #expect(throws: Core.NativeImportContractError.self) {
             try oversizedMainThreadWork.validate(effects: .init())
+        }
+
+        var duplicateCallbacks = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        duplicateCallbacks.callbacks = [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ]
+        #expect(throws: Core.NativeImportContractError.self) {
+            try duplicateCallbacks.validate(effects: .init())
         }
     }
 

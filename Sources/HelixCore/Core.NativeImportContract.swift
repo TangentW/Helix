@@ -85,17 +85,21 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
     public var domain: Core.NativeImportDomain
     public var access: Core.NativeImportAccess
     public var execution: Core.NativeImportExecutionPolicy
+    /// Sparse, index-aligned callback lifetime authority for this import.
+    public var callbacks: [Core.NativeImportCallback]
 
     public init(
         kind: Core.NativeImportKind,
         domain: Core.NativeImportDomain,
         access: Core.NativeImportAccess,
-        execution: Core.NativeImportExecutionPolicy
+        execution: Core.NativeImportExecutionPolicy,
+        callbacks: [Core.NativeImportCallback] = []
     ) {
         self.kind = kind
         self.domain = domain
         self.access = access
         self.execution = execution
+        self.callbacks = callbacks.sorted()
     }
 
     public static func bounded(
@@ -103,7 +107,8 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
         domain: Core.NativeImportDomain,
         access: Core.NativeImportAccess,
         maximumDurationMicroseconds: UInt32,
-        allowsMainThread: Bool
+        allowsMainThread: Bool,
+        callbacks: [Core.NativeImportCallback] = []
     ) -> Self {
         Self(
             kind: kind,
@@ -113,7 +118,8 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
                 deadlineMode: .bounded,
                 maximumDurationMicroseconds: maximumDurationMicroseconds,
                 allowsMainThread: allowsMainThread
-            )
+            ),
+            callbacks: callbacks
         )
     }
 
@@ -122,7 +128,8 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
         domain: Core.NativeImportDomain,
         access: Core.NativeImportAccess,
         maximumDurationMicroseconds: UInt32,
-        allowsMainThread: Bool
+        allowsMainThread: Bool,
+        callbacks: [Core.NativeImportCallback] = []
     ) -> Self {
         Self(
             kind: kind,
@@ -132,7 +139,8 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
                 deadlineMode: .cooperative,
                 maximumDurationMicroseconds: maximumDurationMicroseconds,
                 allowsMainThread: allowsMainThread
-            )
+            ),
+            callbacks: callbacks
         )
     }
 
@@ -140,6 +148,14 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
         guard !effects.isAsync else {
             throw Core.NativeImportContractError.invalid(
                 "native imports use the synchronous invocation contract"
+            )
+        }
+        guard callbacks.count <= 64,
+              callbacks == callbacks.sorted(),
+              Set(callbacks.map(\.parameterIndex)).count == callbacks.count
+        else {
+            throw Core.NativeImportContractError.invalid(
+                "callback parameters must be unique, sorted, and bounded"
             )
         }
         guard Self.isValidDomain(domain.rawValue) else {

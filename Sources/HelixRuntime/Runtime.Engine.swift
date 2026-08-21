@@ -238,6 +238,28 @@ public final class Engine: @unchecked Sendable {
         let generationID = context.lease.generation.id
         let image = route.image
         let telemetryObserver = observer
+        let trapObserver: VM.TrapObserver = { diagnostic in
+            let function = diagnostic.programCounter.flatMap { programCounter in
+                image.module.functions.first { $0.id == programCounter.functionID }
+            }
+            let sourceLocation = diagnostic.programCounter.flatMap { programCounter in
+                image.module.sourceLocation(
+                    functionID: programCounter.functionID,
+                    blockID: programCounter.blockID,
+                    instructionOffset: programCounter.instructionOffset
+                )
+            } ?? function?.sourceLocation
+            telemetryObserver.didTrap(
+                diagnostic: .init(
+                    generationID: generationID,
+                    entry: entry,
+                    trap: diagnostic.trap,
+                    programCounter: diagnostic.programCounter,
+                    functionName: function?.name,
+                    sourceLocation: sourceLocation
+                )
+            )
+        }
         let interpreter = VM.Interpreter(
             nativeCatalog: nativeCatalog,
             nativeTypeCatalog: nativeTypeCatalog,
@@ -262,28 +284,12 @@ public final class Engine: @unchecked Sendable {
                 context: context,
                 image: image
             ),
-            trapObserver: { diagnostic in
-                let function = diagnostic.programCounter.flatMap { programCounter in
-                    image.module.functions.first { $0.id == programCounter.functionID }
-                }
-                let sourceLocation = diagnostic.programCounter.flatMap { programCounter in
-                    image.module.sourceLocation(
-                        functionID: programCounter.functionID,
-                        blockID: programCounter.blockID,
-                        instructionOffset: programCounter.instructionOffset
-                    )
-                } ?? function?.sourceLocation
-                telemetryObserver.didTrap(
-                    diagnostic: .init(
-                        generationID: generationID,
-                        entry: entry,
-                        trap: diagnostic.trap,
-                        programCounter: diagnostic.programCounter,
-                        functionName: function?.name,
-                        sourceLocation: sourceLocation
-                    )
-                )
-            }
+            nativeCallbackHost: makeNativeCallbackHost(
+                context: context,
+                image: image,
+                trapObserver: trapObserver
+            ),
+            trapObserver: trapObserver
         )
         let result = interpreter.invoke(
             function: route.functionID,
@@ -329,6 +335,29 @@ public final class Engine: @unchecked Sendable {
             let budget = context.budget()
             let generationID = lease.generation.id
             let telemetryObserver = observer
+            let trapObserver: VM.TrapObserver = { diagnostic in
+                let function = diagnostic.programCounter.flatMap { programCounter in
+                    image.module.functions.first { $0.id == programCounter.functionID }
+                }
+                let sourceLocation = diagnostic.programCounter.flatMap { programCounter in
+                    image.module.sourceLocation(
+                        functionID: programCounter.functionID,
+                        blockID: programCounter.blockID,
+                        instructionOffset: programCounter.instructionOffset
+                    )
+                } ?? function?.sourceLocation
+                telemetryObserver.didTrap(
+                    hostedDiagnostic: .init(
+                        generationID: generationID,
+                        typeKey: typeKey,
+                        selector: method.selector,
+                        trap: diagnostic.trap,
+                        programCounter: diagnostic.programCounter,
+                        functionName: function?.name,
+                        sourceLocation: sourceLocation
+                    )
+                )
+            }
             let interpreter = VM.Interpreter(
                 nativeCatalog: nativeCatalog,
                 nativeTypeCatalog: nativeTypeCatalog,
@@ -357,29 +386,12 @@ public final class Engine: @unchecked Sendable {
                     context: context,
                     image: image
                 ),
-                trapObserver: { diagnostic in
-                    let function = diagnostic.programCounter.flatMap { programCounter in
-                        image.module.functions.first { $0.id == programCounter.functionID }
-                    }
-                    let sourceLocation = diagnostic.programCounter.flatMap { programCounter in
-                        image.module.sourceLocation(
-                            functionID: programCounter.functionID,
-                            blockID: programCounter.blockID,
-                            instructionOffset: programCounter.instructionOffset
-                        )
-                    } ?? function?.sourceLocation
-                    telemetryObserver.didTrap(
-                        hostedDiagnostic: .init(
-                            generationID: generationID,
-                            typeKey: typeKey,
-                            selector: method.selector,
-                            trap: diagnostic.trap,
-                            programCounter: diagnostic.programCounter,
-                            functionName: function?.name,
-                            sourceLocation: sourceLocation
-                        )
-                    )
-                }
+                nativeCallbackHost: makeNativeCallbackHost(
+                    context: context,
+                    image: image,
+                    trapObserver: trapObserver
+                ),
+                trapObserver: trapObserver
             )
             let result = interpreter.invoke(
                 function: method.functionID,
@@ -406,6 +418,133 @@ public final class Engine: @unchecked Sendable {
         }
         let context = Runtime.ExecutionContext(lease: lease)
         return contexts.withIsolatedContext(context) { execute(context) }
+    }
+
+    private func makeNativeCallbackHost(
+        context: Runtime.ExecutionContext,
+        image: Verification.Image,
+        trapObserver: @escaping VM.TrapObserver
+    ) -> VM.NativeCallbackHost {
+        let lease = context.lease
+        return VM.NativeCallbackHost(
+            invoke: { [weak self, weak context] closure, arguments, preferredBudget in
+                guard let self else {
+                    let trap = VM.RuntimeTrap.nativeFailure(
+                        "Helix Runtime was released before an escaping callback ran"
+                    )
+                    trapObserver(.init(trap: trap, programCounter: nil))
+                    return .trapped(trap)
+                }
+                return self.invokeNativeCallback(
+                    closure,
+                    image: image,
+                    lease: lease,
+                    originatingContext: context,
+                    arguments: arguments,
+                    preferredBudget: preferredBudget,
+                    trapObserver: trapObserver
+                )
+            },
+            reportFailure: { trap in
+                trapObserver(.init(trap: trap, programCounter: nil))
+            }
+        )
+    }
+
+    private func invokeNativeCallback(
+        _ closure: VM.Closure,
+        image: Verification.Image,
+        lease: Runtime.GenerationLease,
+        originatingContext: Runtime.ExecutionContext?,
+        arguments: [VM.Value],
+        preferredBudget: VM.InvocationBudget?,
+        trapObserver: @escaping VM.TrapObserver
+    ) -> VM.ExecutionResult {
+        let reportsDirectly = preferredBudget == nil
+        let execute: (
+            Runtime.ExecutionContext,
+            VM.InvocationBudget
+        ) -> VM.ExecutionResult = { [self] context, budget in
+            let interpreter = VM.Interpreter(
+                nativeCatalog: nativeCatalog,
+                nativeTypeCatalog: nativeTypeCatalog,
+                entryInvocation: { [weak self, weak context] entry, values, nestedBudget in
+                    guard let self, let context else {
+                        return .trapped(
+                            .explicit("Helix Runtime was released during a native callback")
+                        )
+                    }
+                    guard nestedBudget === budget else {
+                        return .trapped(
+                            .explicit("native callback attempted to replace its invocation budget")
+                        )
+                    }
+                    return self.executionResult(
+                        self.invokePinned(
+                            entry: entry,
+                            arguments: values,
+                            context: context,
+                            originalResolution: .catalog
+                        )
+                    )
+                },
+                objectHost: Runtime.HostedClasses.makeObjectHost(
+                    engine: self,
+                    context: context,
+                    image: image
+                ),
+                nativeCallbackHost: makeNativeCallbackHost(
+                    context: context,
+                    image: image,
+                    trapObserver: trapObserver
+                ),
+                trapObserver: reportsDirectly ? trapObserver : nil
+            )
+            let result = interpreter.invokeNativeCallback(
+                closure,
+                image: image,
+                arguments: arguments,
+                budget: budget
+            )
+            if reportsDirectly,
+               case let .trapped(trap) = result,
+               isRuntimeInvariantViolation(trap) {
+                let activeBeforeQuarantine = registry.snapshot().activeGenerationID
+                registry.quarantine(lease.generation.id)
+                let activeAfterQuarantine = registry.snapshot().activeGenerationID
+                if activeBeforeQuarantine == lease.generation.id,
+                   activeAfterQuarantine != activeBeforeQuarantine {
+                    observer.didRollback(
+                        from: lease.generation.id,
+                        to: activeAfterQuarantine
+                    )
+                }
+            }
+            return result
+        }
+
+        if let preferredBudget {
+            guard let originatingContext,
+                  originatingContext.lease.generation.id == lease.generation.id,
+                  originatingContext.budget() === preferredBudget
+            else {
+                let trap = VM.RuntimeTrap.nativeFailure(
+                    "native callback lost its active invocation context"
+                )
+                return .trapped(trap)
+            }
+            return contexts.withIsolatedContext(originatingContext) {
+                execute(originatingContext, preferredBudget)
+            }
+        }
+        if let current = contexts.current,
+           current.lease.generation.id == lease.generation.id {
+            return execute(current, current.budget())
+        }
+        let callbackContext = Runtime.ExecutionContext(lease: lease)
+        return contexts.withIsolatedContext(callbackContext) {
+            execute(callbackContext, callbackContext.budget())
+        }
     }
 
     private func routeEncodedFromBridgePinned(
