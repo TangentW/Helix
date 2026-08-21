@@ -130,8 +130,9 @@ does not by itself certify a physical device or distribution channel.
   `removeAll(keepingCapacity:)`, `swapAt`, `reserveCapacity`, `first`/`last`,
   `firstIndex(of:)`/`lastIndex(of:)`, `min`/`max`, `elementsEqual`,
   `starts(with:)`, `lexicographicallyPrecedes`, `startIndex`/`endIndex`,
-  `distance(from:to:)`, index movement and limited offsets, `indices`,
-  `popLast`, iteration, checked subscript access, and value-returning updates.
+  `distance(from:to:)`, index movement and limited offsets, the mutating
+  `formIndex(after:)`/`formIndex(before:)`/offset family, `indices`, `popLast`,
+  iteration, checked subscript access, and value-returning updates.
   Element append, `append(contentsOf:)`, and `+=` also apply to normalized
   ArraySlice destinations. Contents sources may be any supported finite
   represented Sequence with matching canonical source-level Element identity
@@ -142,10 +143,13 @@ does not by itself certify a physical device or distribution channel.
   Array-backed sources. They share verified scalar append, half-open range
   replacement, and swap primitives, so bounds checks, overflow behavior,
   ownership, and allocation-before-copy charging do not depend on a particular
-  element or SDK type. Capacity-changing hints are supported, but reading `Array.capacity`
-  is intentionally rejected because physical VM storage capacity is not Swift
-  Array semantics. `randomElement()` is likewise rejected until randomness and
-  its observable policy are represented explicitly.
+  element or SDK type. Capacity-changing hints and the empty
+  `Dictionary(minimumCapacity:)`/`Set(minimumCapacity:)` constructors are
+  supported; all retain Swift's nonnegative precondition even though physical
+  reserve size is not observable through represented APIs. Reading
+  `Array.capacity` is intentionally rejected because physical VM storage
+  capacity is not Swift Array semantics. `randomElement()` is likewise rejected
+  until randomness and its observable policy are represented explicitly.
   Generic indirect results may initialize either a complete element or one
   tuple field in raw Array-literal construction storage through the same typed
   compiler-address sink used by ordinary stores.
@@ -153,7 +157,8 @@ does not by itself certify a physical device or distribution channel.
   lazy `subscript(_:default:)` lookup and scoped mutation,
   `updateValue(_:forKey:)`, `removeValue(forKey:)`,
   `removeAll(keepingCapacity:)`, `keys`/`values` sequence materialization,
-  `init(uniqueKeysWithValues:)`, `init(_:uniquingKeysWith:)`, both Dictionary-
+  `init(minimumCapacity:)`, `init(uniqueKeysWithValues:)`,
+  `init(_:uniquingKeysWith:)`, both Dictionary-
   and represented-Sequence forms of `merging`/`merge`,
   `init(grouping:by:)`, `reserveCapacity`, and iteration are supported for
   eligible key and value types. Grouping accepts represented managed
@@ -196,9 +201,8 @@ does not by itself certify a physical device or distribution channel.
   copyable Array, Set, and Dictionary elements plus supported finite
   progressions because the callback runs through the ordinary verified closure
   ABI; mutating `sort(by:)` uses the same Array-backed integer-index boundary.
-  Set supports empty and literal
-  construction, plus construction from Array, Set, and supported finite
-  Sequences;
+  Set supports empty, `minimumCapacity`, and literal construction, plus
+  construction from Array, Set, and supported finite Sequences;
   `count`, `isEmpty`, `first`, `contains`, `insert`, `update`, `remove`,
   `popFirst`, `removeFirst`, `removeAll`, the capacity hint, iteration, the
   union/intersection/subtraction/symmetric-difference families, and the common
@@ -210,7 +214,8 @@ does not by itself certify a physical device or distribution channel.
   fail-closed because downloaded code cannot invoke arbitrary hashing or
   equality. Generic `Array()` and `Dictionary()` construction is supported for
   represented element/key/value types. Array, Dictionary, and Set share direct
-  `count`, `isEmpty`, and `first` queries; Array additionally supports `last`
+  `count`, exact Collection `underestimatedCount`, `isEmpty`, and `first`
+  queries; Array additionally supports `last`
   through its represented bidirectional storage, and normalized Array-backed
   views use the same queries. String has direct `count`/`isEmpty` and enters the
   same finite Sequence cursor as a verified Character Array for element-based
@@ -270,12 +275,17 @@ does not by itself certify a physical device or distribution channel.
   consumers retain cursor short-circuiting or one-candidate streaming, while
   sorting and Set results materialize through the shared typed builder. Their
   callbacks retain the same throwing and mutable-capture behavior as managed
-  Collections. Integer Range/ClosedRange `count`, `isEmpty`, `first`, and
-  `last` are constant-time bound queries; count is exact across the full
-  element width and traps when its cardinality exceeds `Int.max`. Represented
-  Comparable Range bounds also support `isEmpty`, `overlaps`,
-  `clamped(to:)`, and direct lower/upper-bound access without implying
-  iteration. Empty ranges never overlap; clamping preserves the selected
+  Collections. Integer Range/ClosedRange `count`, `underestimatedCount`,
+  `isEmpty`, `first`, and `last` are constant-time bound queries; count is exact
+  across the full element width and traps when its cardinality exceeds
+  `Int.max`. StrideTo/StrideThrough `underestimatedCount` follows the native
+  exact Sequence witness through the same fuel-bounded cursor with constant
+  auxiliary storage. `Zip2Sequence.underestimatedCount` recursively preserves
+  source witness estimates, including zero for represented enumerated and
+  flattened/joined sources rather than substituting the exact materialized
+  tuple count. Represented Comparable Range bounds also support `isEmpty`,
+  `overlaps`, `clamped(to:)`, and direct lower/upper-bound access without
+  implying iteration. Empty ranges never overlap; clamping preserves the selected
   original bound on equality, including floating signed zero.
   Progression index results, opaque-index collection operations, and using a
   one-sided partial range as a potentially infinite Sequence source remain
@@ -305,8 +315,13 @@ does not by itself certify a physical device or distribution channel.
   prefixes/suffixes, `Range<Int>`/`ClosedRange<Int>` and one-sided range
   slicing, `joined()`,
   `joined(separator:)`, iteration, and composed `Slice<Base>` when `Base` is
-  already Array-backed. This includes explicit `Slice(base:bounds:)`, concrete
-  Slice boundaries/movement/indices, and read/write element subscripts.
+  already Array-backed. Half-open fixed-width-integer Range values also support
+  count-based `dropFirst`/`dropLast`/`prefix`/`suffix` by moving and clamping a
+  typed bound in constant time, including full-width Int/UInt extremes. This
+  includes explicit `Slice(base:bounds:)`, concrete Slice
+  boundaries/movement/indices, and read/write element subscripts. Repeated uses
+  the same zero-based integer-index surface, including generic associated-index
+  indirect results, subscript access, and mutating `formIndex` operations.
   `ArraySlice` and recursively Array-backed `Slice`
   values carry their logical base through nested views, bounds, movement,
   distance, indices, element/range subscripts, searches, predicate subsequences,

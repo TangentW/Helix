@@ -17,6 +17,37 @@ enum SwiftTypeIdentity {
         representedSequenceElement(ofNormalized: normalized(raw))
     }
 
+    /// Whether generic dispatch through `Sequence` reports the materialized
+    /// element count as `underestimatedCount`. This differs from a statically
+    /// selected Collection getter: adapters such as EnumeratedSequence and
+    /// FlattenSequence use the Sequence default of zero, including when they
+    /// conditionally conform to Collection at the call site.
+    static func sequenceWitnessHasExactUnderestimatedCount(
+        _ raw: String
+    ) -> Bool? {
+        let type = normalized(raw)
+        guard representedSequenceElement(ofNormalized: type) != nil else {
+            return nil
+        }
+        guard let generic = genericType(type) else { return true }
+        switch generic.name {
+        case "EnumeratedSequence", "FlattenSequence", "JoinedSequence":
+            return false
+        case "Zip2Sequence":
+            guard generic.arguments.count == 2,
+                  let lhs = sequenceWitnessHasExactUnderestimatedCount(
+                    generic.arguments[0]
+                  ),
+                  let rhs = sequenceWitnessHasExactUnderestimatedCount(
+                    generic.arguments[1]
+                  )
+            else { return nil }
+            return lhs && rhs
+        default:
+            return true
+        }
+    }
+
     /// The currently represented mutable variable-length collection family.
     /// `Slice` is admitted recursively only when its base is itself in that
     /// family; read-only adapters such as ReversedCollection and Repeated must

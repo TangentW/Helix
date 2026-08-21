@@ -175,23 +175,28 @@ and cross-source Sequence relations over represented managed Collections and
 finite concrete progressions, plus nonmutating ordering over both;
 type-generic,
 Array-backed structural concatenation/insertion/replacement/removal/reversal/
-swap, predicate removal, bidirectional partition, and capacity hints, including
+swap, predicate removal, bidirectional partition, capacity hints, and the
+represented integer-index `formIndex` family, including
 context-typed nil elements and generic indirect results written into
 Array-literal construction storage;
 Array-backed storage separates physical elements from its logical integer index
 base, so `ArraySlice` and recursive Array-backed `Slice` values preserve bounds
 across calls, aggregates, Optional payloads, derived views, search, split,
-ordering, and supported mutation. `Array(sequence)` intentionally materializes
-a new zero-based Array;
+ordering, and supported mutation. Repeated uses the same zero-based movement,
+distance, indices, subscript, and generic associated-index ABI.
+`Array(sequence)` intentionally materializes a new zero-based Array;
 Dictionary lookup/subscript mutation including lazy default
 lookup and scoped default-value writeback, `updateValue`,
 `removeValue`, `removeAll`, key/value projection, unique-key sequence
 construction, uniquing construction, Dictionary/represented-Sequence
-`merging`/`merge`, represented-Collection grouping, and capacity hints; typed Set
+`merging`/`merge`, represented-Collection grouping, capacity hints, and validated
+`minimumCapacity` construction; typed Set
 construction/query/mutation/iteration/algebra with recursively VM-defined
-Equatable/Hashable semantics. Managed Array, Dictionary, and Set share direct
-`count`, `isEmpty`, and `first` queries; represented Array additionally supports
-`last`, as do normalized Array-backed views. Common fully concrete transforms,
+Equatable/Hashable semantics, including validated `minimumCapacity` construction.
+Managed Array, Dictionary, and Set share direct `count`, exact Collection
+`underestimatedCount`, `isEmpty`, and `first` queries; represented Array
+additionally supports `last`, as do normalized Array-backed views. Common fully
+concrete transforms,
 reductions, visits, predicate queries including `count(where:)`, and comparator
 selection share one closure traversal across Array, Dictionary, and Set; all
 three preserve their container through `filter`, while Dictionary also supports
@@ -244,8 +249,13 @@ forward Sequence transforms, reductions, visits, predicates, comparator
 selection, natural extrema/order, relations, Set construction/algebra, and
 Array-backed adapters over those finite progression sources. Element-only
 consumers stream the existing typed cursor; only stored results reuse the typed
-builder. Integer Range/ClosedRange boundary queries are constant-time, and their
-exact full-width count traps if it cannot fit `Int`; represented Comparable
+builder. Integer Range/ClosedRange boundary and underestimated-count queries are
+constant-time, and their exact full-width count traps if it cannot fit `Int`;
+Stride underestimated counts stream the same fuel-bounded cursor with constant
+auxiliary storage. Half-open fixed-width-integer Range count subsequences move
+and clamp one bound in constant time without narrowing the complete cardinality
+to Int. Zip preserves recursive source Sequence-witness estimates rather than
+substituting a materialized tuple count. Represented Comparable
 Range bounds also support `isEmpty`, `overlaps`, `clamped(to:)`, and direct
 bound projection through the same typed compare/select plan. Empty-range
 overlap and floating signed-zero selection match native Swift. Neither path uses Swift generic

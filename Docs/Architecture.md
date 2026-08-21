@@ -169,10 +169,17 @@ Both workflows depend on stable, build-specific identities:
   iteration. Frontend-specific generic-substitution shapes for concrete and
   protocol-extension entry points resolve to this same specialization before
   lowering. Represented Array, Dictionary, and Set therefore share
-  `count`/`isEmpty`/`first`; Array additionally supplies its represented
-  bidirectional `last`, and normalized Array-backed views use the same Array
-  query semantics. Element-only consumers such as equality membership, natural
-  extrema, and cross-container Sequence relations stream that cursor directly,
+  `count`/`isEmpty`/`first` and exact Collection `underestimatedCount`; Array
+  additionally supplies its represented bidirectional `last`, and normalized
+  Array-backed views use the same Array query semantics. The concrete
+  `Zip2Sequence` getter retains its distinct Sequence-witness rule: a represented
+  enumerated or flattened/joined source contributes zero rather than the exact
+  length of the already materialized tuple Array. Empty Dictionary/Set creation
+  and `minimumCapacity` creation share one typed constructor plan; capacity is
+  otherwise unobservable through the represented storage, but Swift's
+  nonnegative precondition is retained. Element-only consumers such as
+  equality membership, natural extrema, and cross-container Sequence relations
+  stream that cursor directly,
   preserving short-circuiting and first-element ties without allocating an
   intermediate Array. Operations whose result inherently needs complete
   storage or random access—such as `sorted`, `Set(sequence)`, `enumerated`,
@@ -185,9 +192,12 @@ Both workflows depend on stable, build-specific identities:
   or opaque; `ArraySlice` and recursively Array-backed `Slice` values therefore
   retain their public bounds across calls, aggregates, Optional storage,
   derived views, search, split, ordering, and mutation. The explicit
-  `Slice(base:bounds:)` constructor and concrete Slice index/
-  subscript ABI shapes normalize at the frontend into those same range and
-  mutation semantics. Two generic HLBC primitives read or replace that base;
+  `Slice(base:bounds:)` constructor and concrete Slice index/subscript ABI
+  shapes normalize at the frontend into those same range and mutation
+  semantics. Array, ArraySlice, recursively Array-backed Slice, and Repeated
+  also share nonmutating movement and the mutating `formIndex` family; generic
+  associated-index results use their actual indirect SIL ABI rather than an
+  Array-only call shape. Two generic HLBC primitives read or replace that base;
   replacement consumes an owned temporary and transfers its storage metadata
   without copying the elements again. Collection APIs still lower to shared
   cursor, range, builder, and mutation semantics rather than per-API opcodes.
@@ -226,16 +236,23 @@ Both workflows depend on stable, build-specific identities:
   specialization. They retain typed bounds and stride registers rather than a
   Swift runtime object. Forward higher-order operations, equality membership,
   natural extrema, and Sequence relations stream them directly. Integer
-  `Range`/`ClosedRange` queries compute `count`, `isEmpty`, `first`, and `last`
+  `Range`/`ClosedRange` queries compute `count`, `underestimatedCount`,
+  `isEmpty`, `first`, and `last`
   directly from their bounds; full-width cardinality uses an unsigned order key
   and traps if the exact value cannot fit `Int`, without walking the range.
+  StrideTo/StrideThrough retain their exact Sequence-witness
+  `underestimatedCount` by streaming the same fuel-bounded cursor with constant
+  auxiliary storage. Count-based drop/prefix/suffix operations on half-open
+  fixed-width-integer Range values move one typed bound in constant time,
+  clamp at the opposite bound without narrowing the whole cardinality to Int,
+  and keep the result as a compiler-only progression.
   Comparable represented `Range` bounds also support `isEmpty`, `overlaps`,
   `clamped(to:)`, and direct lower/upper-bound projection without gaining
   iteration semantics. These operations reuse typed compare/select control
   flow, including Swift's empty-range overlap rule and equality-preserving
   floating-point selection, rather than importing the generic Range ABI.
-  Natural and
-  comparator sorting, Set construction/algebra, and other APIs whose result
+  Natural and comparator sorting, Set construction/algebra, and other APIs
+  whose result
   requires complete storage materialize through the same typed Array builder.
 - Nonthrowing value mutation is expressed through the shared compiler-address
   sink rather than API-shaped bytecode. `Bool.toggle()` is one typed Boolean

@@ -170,13 +170,15 @@ String 在一次受验证的 Character Array 物化后也复用这套 closure CF
 
 可表示的 managed Collection 与有限具体 progression 共用一种强类型 Sequence 策略。等值 `contains(_:)`、自然极值与跨来源关系直接驱动 cursor，因此短路与首个 tie 不需要中间 Array；`enumerated`、`Array(sequence)`、异构 `zip`、自然/comparator `sorted` 与 `Set(sequence)` 只有在结果需要完整存储时才复用统一 builder。稳定的 comparator `sorted(by:)` 可接受 Array、Set、Dictionary 与受支持有限 progression element；自然 `sorted()` 可接受 element 为 VM-comparable 标量的这些来源。可变 `sort()`/`sort(by:)` 接受具有可表示整数索引模型的 Array-backed mutable Collection，保留逻辑基址，并继续只在 normal continuation 写回。
 
-managed Array、Dictionary、Set 共用直接的 `count`、`isEmpty`、`first` 查询；具有已表示双向存储的 Array 另支持 `last`，已经归一的 Array-backed view 使用同一套查询语义。String 的 `count`/`isEmpty` 直接执行，`first`/`last` 则通过其经过验证的 Character Array 进入相同边界语义。
+managed Array、Dictionary、Set 共用直接的 `count`、精确 Collection `underestimatedCount`、`isEmpty`、`first` 查询；具有已表示双向存储的 Array 另支持 `last`，已经归一的 Array-backed view 使用同一套查询语义。Zip 会保留来源的 Sequence-witness 估算规则：可表示的 enumerated 与 flattened/joined 输入贡献 `0`，不会被已经物化的 Tuple Array 精确长度替代。String 的 `count`/`isEmpty` 直接执行，`first`/`last` 则通过其经过验证的 Character Array 进入相同边界语义。
 
-有限整数 Range 与受支持数值 stride 也会进入同一套正向 closure 遍历，用于产生 Array 的变换、归约、访问、短路 predicate 与 comparator selection。等值 membership、自然极值与混合来源 Sequence 关系同样直接流式驱动这些仅存在于 Compiler 的强类型 bounds/stride 值；排序、Set 构造/代数、`Array(sequence)`、`enumerated`、`reversed` 与 `zip` 只有在结果需要完整存储或随机访问表示时才复用强类型 Array builder。
+Array、ArraySlice、递归 Array-backed Slice 与 Repeated 共用已表示的整数索引移动及变异式 `formIndex` 家族；泛型 associated-index 结果保留 frontend 的间接返回 ABI。Dictionary/Set 的空构造与 `minimumCapacity` 构造共用一个强类型计划，并在产生空 storage 前验证非负 precondition。
+
+有限整数 Range 与受支持数值 stride 也会进入同一套正向 closure 遍历，用于产生 Array 的变换、归约、访问、短路 predicate 与 comparator selection。等值 membership、自然极值与混合来源 Sequence 关系同样直接流式驱动这些仅存在于 Compiler 的强类型 bounds/stride 值；Stride 的 `underestimatedCount` 通过同一受 fuel 限制的 cursor 精确计数，只使用常数额外空间。半开定宽整数 Range 的计数式 subsequence 会在常数时间内移动并 clamp 一个强类型 bound，不把完整基数收窄到 Int。排序、Set 构造/代数、`Array(sequence)`、`enumerated`、`reversed` 与 `zip` 只有在结果需要完整存储或随机访问表示时才复用强类型 Array builder。
 
 可表示整数、浮点、String 与 Character bounds 的单侧 `RangeExpression` containment 和 switch pattern 共用标量比较计划。Array-backed 来源的整数 `Range`、`ClosedRange`、单侧与全范围下标统一复用强类型 slice 边界并保留逻辑基址；String/Substring 的全范围物化仍保留独立 Character 表示。Compiler 会消除这些范围 wrapper，不把 Swift 泛型 Collection ABI 绑定为 NativeImport，也不为每个源码 API 增加 opcode。把单侧范围当作可能无限的 Sequence、progression index 结果、私有 `String.Index`、`ReversedCollection.Index` 与其他不透明 index identity 仍会明确 fail closed，不会猜测语义。
 
-整数 Range/ClosedRange 的 `count`、`isEmpty`、`first`、`last` 是直接读取 bounds 的常数时间操作；count 精确覆盖完整 element 位宽，并在基数超过 `Int.max` 时 trap。具有可表示 Comparable bounds 的 Range 还支持 `isEmpty`、`overlaps`、`clamped(to:)` 与上下界直接投影，但不会因此获得迭代能力；共享的强类型 compare/select 计划会保留空区间 overlap 和浮点相等/signed-zero 语义，不引入泛型 NativeImport。
+整数 Range/ClosedRange 的 `count`、`underestimatedCount`、`isEmpty`、`first`、`last` 是直接读取 bounds 的常数时间操作；count 精确覆盖完整 element 位宽，并在基数超过 `Int.max` 时 trap。具有可表示 Comparable bounds 的 Range 还支持 `isEmpty`、`overlaps`、`clamped(to:)` 与上下界直接投影，但不会因此获得迭代能力；共享的强类型 compare/select 计划会保留空区间 overlap 和浮点相等/signed-zero 语义，不引入泛型 NativeImport。
 
 `Bool.toggle()` 与全局 `swap` 同样通过共享 compiler-address sink 上的值修改计划执行。swap 会验证 storage 不重叠，并在写入任一 destination 前读取两个可表示值，因此普通局部变量、aggregate projection、frame storage 与可变 closure capture 无需各自的 API adapter。
 

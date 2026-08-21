@@ -248,6 +248,14 @@ public struct Lowerer: Sendable {
         case stringCharacters
     }
 
+    private struct CollectionQueryPlan {
+        var source: CanonicalSIL.SequenceSpecialization
+        /// The Collection getter is exact. Zip2Sequence instead invokes each
+        /// source through its Sequence witness, for which some represented
+        /// adapters intentionally report zero.
+        var underestimatedCountIsExact: Bool
+    }
+
     private struct SequenceHigherOrderPlan {
         var operation: CanonicalSIL.HigherOrderIntrinsic
         var sourceToken: String
@@ -8995,6 +9003,95 @@ public struct Lowerer: Sendable {
             return borrowed
         }
 
+        /// StrideTo/StrideThrough expose an exact underestimatedCount through
+        /// their Sequence witness. Count by the same typed cursor so floating
+        /// stepping and endpoint inclusion remain identical without building
+        /// a temporary Array; VM fuel bounds pathological progressions.
+        func lowerProgressionCountByTraversal(
+            _ value: CanonicalSIL.Progression.Value,
+            line: Int
+        ) throws -> Bytecode.Register {
+            let state = try makeProgressionCursor(value, line: line)
+            let cursor = SequenceCursor.progression(
+                end: state.end,
+                stride: state.stride,
+                cursorSlot: state.cursorSlot,
+                boundary: state.type.family.boundary
+            )
+            let zero = try allocate(type: .int64)
+            let one = try allocate(type: .int64)
+            appendInstruction(.constantInteger(result: zero, bitPattern: 0))
+            appendInstruction(.constantInteger(result: one, bitPattern: 1))
+
+            let loop = try allocateSyntheticBlockID()
+            let increment = try allocateSyntheticBlockID()
+            let finish = try allocateSyntheticBlockID()
+            let overflowTrap = try allocateSyntheticBlockID()
+            let completion = try allocateSyntheticBlockID()
+            let count = try allocate(type: .int64)
+            let next = try allocate(type: .optional(state.type.element))
+            let element = try allocate(type: state.type.element)
+            let incremented = try allocate(type: .int64)
+            let overflow = try allocate(type: .bool)
+            let result = try allocate(type: .int64)
+
+            appendInstruction(.branch(target: loop, arguments: [zero]))
+            finishCurrent()
+            appendSyntheticBlock(
+                id: loop,
+                parameters: [count],
+                instructions: [
+                    try sequenceNextInstruction(
+                        cursor: cursor,
+                        result: next,
+                        direction: .forward
+                    ),
+                    .switchOptional(
+                        optional: next,
+                        someTarget: increment,
+                        noneTarget: finish
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: increment,
+                parameters: [element],
+                instructions: [
+                    .checkedBinary(
+                        result: incremented,
+                        overflow: overflow,
+                        operation: .add,
+                        lhs: count,
+                        rhs: one
+                    ),
+                    .conditionalBranch(
+                        condition: overflow,
+                        trueTarget: overflowTrap,
+                        trueArguments: [],
+                        falseTarget: loop,
+                        falseArguments: [incremented]
+                    ),
+                ]
+            )
+            appendSyntheticBlock(
+                id: finish,
+                instructions: [
+                    .destroyStack(state.cursorSlot),
+                    .branch(target: completion, arguments: [count]),
+                ]
+            )
+            appendSyntheticBlock(
+                id: overflowTrap,
+                instructions: [.trap(.integerOverflow)]
+            )
+            current = .init(
+                id: completion,
+                parameters: [result],
+                instructions: []
+            )
+            return result
+        }
+
         func lowerSequenceCount(
             _ specialization: CanonicalSIL.SequenceSpecialization,
             sourceToken: String,
@@ -9057,7 +9154,10 @@ public struct Lowerer: Sendable {
                     expected: type,
                     line: line
                 )
-                return try lowerIntegerProgressionCount(value)
+                if type.family == .range || type.family == .closedRange {
+                    return try lowerIntegerProgressionCount(value)
+                }
+                return try lowerProgressionCountByTraversal(value, line: line)
             }
         }
 
@@ -11275,6 +11375,31 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func validateCapacity(
+            token: String,
+            displayName: String,
+            line: Int
+        ) throws {
+            let capacity: Bytecode.Register
+            if let stored = try copyStoredValue(
+                at: token,
+                line: line
+            ) {
+                capacity = stored
+            } else {
+                capacity = try resolve(token, line: line)
+            }
+            guard registerTypes[Int(capacity.rawValue)] == .int64 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(displayName) has unsupported arguments"
+                )
+            }
+            try appendNonnegativePrecondition(
+                capacity,
+                reason: "\(displayName) must not be negative"
+            )
+        }
+
         func lowerCapacityHint(
             capacityToken: String,
             storageToken: String,
@@ -11288,23 +11413,10 @@ public struct Lowerer: Sendable {
                     "\(displayName) storage does not match its specialization"
                 )
             }
-            let capacity: Bytecode.Register
-            if let stored = try copyStoredValue(
-                at: capacityToken,
+            try validateCapacity(
+                token: capacityToken,
+                displayName: displayName,
                 line: line
-            ) {
-                capacity = stored
-            } else {
-                capacity = try resolve(capacityToken, line: line)
-            }
-            guard registerTypes[Int(capacity.rawValue)] == .int64 else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "\(displayName) has unsupported arguments"
-                )
-            }
-            try appendNonnegativePrecondition(
-                capacity,
-                reason: "\(displayName) must not be negative"
             )
             guard let collection = try borrowStoredValue(
                 at: storageToken,
@@ -11675,18 +11787,129 @@ public struct Lowerer: Sendable {
                 voidValues.insert(resultToken)
             }
 
+            /// Moves one integer Range boundary toward the opposite boundary
+            /// by at most `count` elements. Narrow integers use Int64 working
+            /// arithmetic; UInt64 reinterprets the already-proven nonnegative
+            /// count. This keeps the operation constant-time without ever
+            /// narrowing the complete Range cardinality to Int.
+            func clampedIntegerRangeBoundary(
+                from initial: Bytecode.Register,
+                toward limit: Bytecode.Register,
+                count: Bytecode.Register,
+                direction: Bytecode.CollectionTraversalDirection
+            ) throws -> Bytecode.Register {
+                let element = registerTypes[Int(initial.rawValue)]
+                guard case let .integer(width, signed) = element,
+                      registerTypes[Int(limit.rawValue)] == element,
+                      registerTypes[Int(count.rawValue)] == .int64
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "integer Range subsequence boundaries do not match"
+                    )
+                }
+                try appendNonnegativePrecondition(
+                    count,
+                    reason: "collection subsequence count must not be negative"
+                )
+
+                let workingType: Bytecode.ValueType = width < 64 || signed
+                    ? .int64
+                    : .integer(bitWidth: 64, signed: false)
+                func convert(
+                    _ value: Bytecode.Register,
+                    to type: Bytecode.ValueType,
+                    operation: Bytecode.IntegerConversionOperation
+                ) throws -> Bytecode.Register {
+                    guard registerTypes[Int(value.rawValue)] != type else {
+                        return value
+                    }
+                    let converted = try allocate(type: type)
+                    appendInstruction(
+                        .integerConvert(
+                            result: converted,
+                            operation: operation,
+                            value: value
+                        )
+                    )
+                    return converted
+                }
+
+                let widening: Bytecode.IntegerConversionOperation = signed
+                    ? .signExtend : .zeroExtend
+                let workingInitial = try convert(
+                    initial,
+                    to: workingType,
+                    operation: width < 64 ? widening : .reinterpret
+                )
+                let workingLimit = try convert(
+                    limit,
+                    to: workingType,
+                    operation: width < 64 ? widening : .reinterpret
+                )
+                let workingCount = try convert(
+                    count,
+                    to: workingType,
+                    operation: .reinterpret
+                )
+                let candidate = try allocate(type: workingType)
+                let overflow = try allocate(type: .bool)
+                appendInstruction(
+                    .checkedBinary(
+                        result: candidate,
+                        overflow: overflow,
+                        operation: direction == .forward ? .add : .subtract,
+                        lhs: workingInitial,
+                        rhs: workingCount
+                    )
+                )
+                let crossesLimit = try allocate(type: .bool)
+                appendInstruction(
+                    .compare(
+                        result: crossesLimit,
+                        predicate: direction == .forward
+                            ? .greaterThan : .lessThan,
+                        lhs: candidate,
+                        rhs: workingLimit
+                    )
+                )
+                let clampsToLimit = try allocate(type: .bool)
+                appendInstruction(
+                    .booleanBinary(
+                        result: clampsToLimit,
+                        operation: .or,
+                        lhs: overflow,
+                        rhs: crossesLimit
+                    )
+                )
+                let selected = try allocate(type: workingType)
+                appendInstruction(
+                    .select(
+                        result: selected,
+                        condition: clampsToLimit,
+                        trueValue: workingLimit,
+                        falseValue: candidate
+                    )
+                )
+                return try convert(
+                    selected,
+                    to: element,
+                    operation: .clamp
+                )
+            }
+
             switch intrinsic {
             case let .query(query):
-                let specialization = try parseCollectionQuerySpecialization(
+                let queryPlan = try parseCollectionQuerySpecialization(
                     query.source,
                     genericArguments: genericArguments
                 )
+                let specialization = queryPlan.source
                 let result: Bytecode.Register
                 switch query.operation {
                 case .count:
                     guard arguments.count == 1 else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Collection.count has unsupported arguments"
+                            "Collection count query has unsupported arguments"
                         )
                     }
                     result = try lowerSequenceCount(
@@ -11694,6 +11917,26 @@ public struct Lowerer: Sendable {
                         sourceToken: arguments[0],
                         line: line
                     )
+                    values[resultToken] = result
+
+                case .underestimatedCount:
+                    guard arguments.count == 1 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Collection underestimatedCount query has unsupported arguments"
+                        )
+                    }
+                    if queryPlan.underestimatedCountIsExact {
+                        result = try lowerSequenceCount(
+                            specialization,
+                            sourceToken: arguments[0],
+                            line: line
+                        )
+                    } else {
+                        result = try allocate(type: .int64)
+                        appendInstruction(
+                            .constantInteger(result: result, bitPattern: 0)
+                        )
+                    }
                     values[resultToken] = result
 
                 case .isEmpty:
@@ -12181,6 +12424,49 @@ public struct Lowerer: Sendable {
                     genericArguments,
                     context: "collection subsequence"
                 )
+                if case let .progression(type) = source {
+                    guard type.family == .range,
+                          case .integer = type.element,
+                          [.dropFirst, .dropLast, .prefix, .suffix]
+                            .contains(operation),
+                          arguments.count == 3
+                    else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "collection subsequence specialization \(genericArguments)"
+                        )
+                    }
+                    let output = addressBase(arguments[0])
+                    guard progressionAddresses[output] == type else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Range subsequence output does not match its specialization"
+                        )
+                    }
+                    let count = try trivialOperand(arguments[1], as: .int64)
+                    let value = try progressionOperand(
+                        arguments[2],
+                        expected: type,
+                        line: line
+                    )
+                    let movesForward = operation == .dropFirst
+                        || operation == .prefix
+                    let boundary = try clampedIntegerRangeBoundary(
+                        from: movesForward ? value.start : value.end,
+                        toward: movesForward ? value.end : value.start,
+                        count: count,
+                        direction: movesForward ? .forward : .reverse
+                    )
+                    let replacesLowerBound = operation == .dropFirst
+                        || operation == .suffix
+                    progressionAddressValues[output] = .init(
+                        type: type,
+                        start: replacesLowerBound ? boundary : value.start,
+                        end: replacesLowerBound ? value.end : boundary,
+                        stride: nil
+                    )
+                    retiredProgressionAddresses.remove(output)
+                    voidValues.insert(resultToken)
+                    return
+                }
                 let indexModel = typeEnvironment.collectionIndexModel(
                     for: genericArguments
                 )
@@ -12564,13 +12850,11 @@ public struct Lowerer: Sendable {
                         "Collection index operation requires a represented integer index for \(genericArguments)"
                     )
                 }
-                let returnsSliceIndexIndirectly = intrinsic.source == .sliceBase
-                    && intrinsic.operation != .distance
-                    && intrinsic.operation != .indices
+                let returnsIndexIndirectly = intrinsic.returnsIndexIndirectly
 
                 func input(_ directPosition: Int) -> String {
                     arguments[
-                        directPosition + (returnsSliceIndexIndirectly ? 1 : 0)
+                        directPosition + (returnsIndexIndirectly ? 1 : 0)
                     ]
                 }
 
@@ -12578,7 +12862,7 @@ public struct Lowerer: Sendable {
                     _ result: Bytecode.Register,
                     as resultType: Bytecode.ValueType
                 ) throws {
-                    if returnsSliceIndexIndirectly {
+                    if returnsIndexIndirectly {
                         guard compilerAddressType(arguments[0]) == resultType
                         else {
                             throw CanonicalSIL.LoweringError.malformedSIL(
@@ -12674,7 +12958,7 @@ public struct Lowerer: Sendable {
                 switch intrinsic.operation {
                 case .start, .end:
                     guard arguments.count
-                            == (returnsSliceIndexIndirectly ? 2 : 1)
+                            == (returnsIndexIndirectly ? 2 : 1)
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Collection boundary index has unsupported arguments"
@@ -12693,7 +12977,7 @@ public struct Lowerer: Sendable {
 
                 case .distance:
                     guard arguments.count
-                            == 3 + (returnsSliceIndexIndirectly ? 1 : 0)
+                            == 3 + (returnsIndexIndirectly ? 1 : 0)
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Collection distance has unsupported arguments"
@@ -12747,9 +13031,13 @@ public struct Lowerer: Sendable {
                     destroyBorrowedOwners([array])
                     voidValues.insert(resultToken)
 
-                case .after, .before:
+                case .after, .before, .formAfter, .formBefore:
+                    let mutatesIndex = intrinsic.operation == .formAfter
+                        || intrinsic.operation == .formBefore
+                    let movesForward = intrinsic.operation == .after
+                        || intrinsic.operation == .formAfter
                     guard arguments.count
-                            == 2 + (returnsSliceIndexIndirectly ? 1 : 0)
+                            == 2 + (returnsIndexIndirectly ? 1 : 0)
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Collection index movement has unsupported arguments"
@@ -12761,7 +13049,7 @@ public struct Lowerer: Sendable {
                         as: collection,
                         context: "Collection index movement"
                     )
-                    if intrinsic.operation == .after {
+                    if movesForward {
                         try validateIndex(
                             index,
                             in: array.register,
@@ -12790,18 +13078,31 @@ public struct Lowerer: Sendable {
                         .constantInteger(result: one, bitPattern: 1)
                     )
                     let result = try emitCheckedIndexArithmetic(
-                        intrinsic.operation == .after ? .add : .subtract,
+                        movesForward ? .add : .subtract,
                         index,
                         one
                     )
                     destroyBorrowedOwners([array])
-                    try publish(result, as: .int64)
+                    if mutatesIndex {
+                        try storeConstructedValue(
+                            result,
+                            at: input(0),
+                            mode: .assign
+                        )
+                        voidValues.insert(resultToken)
+                    } else {
+                        try publish(result, as: .int64)
+                    }
 
-                case .offsetBy, .offsetByLimited:
+                case .offsetBy, .offsetByLimited, .formOffsetBy,
+                     .formOffsetByLimited:
+                    let mutatesIndex = intrinsic.operation == .formOffsetBy
+                        || intrinsic.operation == .formOffsetByLimited
                     let isLimited = intrinsic.operation == .offsetByLimited
+                        || intrinsic.operation == .formOffsetByLimited
                     let directArgumentCount = isLimited ? 4 : 3
                     guard arguments.count == directArgumentCount
-                        + (returnsSliceIndexIndirectly ? 1 : 0)
+                        + (returnsIndexIndirectly ? 1 : 0)
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Collection offset index has unsupported arguments"
@@ -12831,7 +13132,16 @@ public struct Lowerer: Sendable {
                             allowsEnd: true
                         )
                         destroyBorrowedOwners([array])
-                        try publish(destination, as: .int64)
+                        if mutatesIndex {
+                            try storeConstructedValue(
+                                destination,
+                                at: input(0),
+                                mode: .assign
+                            )
+                            voidValues.insert(resultToken)
+                        } else {
+                            try publish(destination, as: .int64)
+                        }
                         break
                     }
 
@@ -12927,6 +13237,27 @@ public struct Lowerer: Sendable {
                         ),
                         reason: .explicit("Collection index is out of bounds")
                     )
+                    if mutatesIndex {
+                        let updated = try allocate(type: .int64)
+                        appendInstruction(
+                            .select(
+                                result: updated,
+                                condition: exceeded,
+                                trueValue: limit,
+                                falseValue: destination
+                            )
+                        )
+                        let succeeded = try negated(exceeded)
+                        destroyBorrowedOwners([array])
+                        try storeConstructedValue(
+                            updated,
+                            at: input(0),
+                            mode: .assign
+                        )
+                        values[resultToken] = succeeded
+                        break
+                    }
+
                     let some = try allocate(type: .optional(.int64))
                     appendInstruction(
                         .makeOptionalSome(result: some, value: destination)
@@ -16301,21 +16632,32 @@ public struct Lowerer: Sendable {
                 try storeConstructedValue(result, at: arguments[0], mode: .initialize)
                 voidValues.insert(resultToken)
 
-            case .dictionaryEmpty:
-                guard arguments.count == 1 else {
+            case .dictionaryEmpty, .dictionaryMinimumCapacity:
+                let hasCapacity = intrinsic == .dictionaryMinimumCapacity
+                guard arguments.count == (hasCapacity ? 2 : 1) else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Dictionary.init() has unsupported arguments"
+                        "Dictionary initializer has unsupported arguments"
                     )
                 }
                 let types = try parseDictionaryGenericArguments(
                     genericArguments
                 )
-                guard let metatype = dictionaryMetatypeValues[arguments[0]],
+                let metatypeIndex = hasCapacity ? 1 : 0
+                guard let metatype = dictionaryMetatypeValues[
+                        arguments[metatypeIndex]
+                      ],
                       metatype.0 == types.key,
                       metatype.1 == types.value
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Dictionary.init() metatype does not match Key and Value"
+                        "Dictionary initializer metatype does not match Key and Value"
+                    )
+                }
+                if hasCapacity {
+                    try validateCapacity(
+                        token: arguments[0],
+                        displayName: "Dictionary capacity",
+                        line: line
                     )
                 }
                 let result = try makeEmptyDictionary(
@@ -16795,16 +17137,27 @@ public struct Lowerer: Sendable {
                 try storeConstructedValue(result, at: arguments[0], mode: .initialize)
                 voidValues.insert(resultToken)
 
-            case .setEmpty:
-                guard arguments.count == 1 else {
+            case .setEmpty, .setMinimumCapacity:
+                let hasCapacity = intrinsic == .setMinimumCapacity
+                guard arguments.count == (hasCapacity ? 2 : 1) else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Set.init() has unsupported arguments"
+                        "Set initializer has unsupported arguments"
                     )
                 }
                 let types = try parseSetGenericArguments(genericArguments)
-                guard setMetatypeValues[arguments[0]] == types.element else {
+                let metatypeIndex = hasCapacity ? 1 : 0
+                guard setMetatypeValues[arguments[metatypeIndex]]
+                        == types.element
+                else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Set.init() metatype does not match Element"
+                        "Set initializer metatype does not match Element"
+                    )
+                }
+                if hasCapacity {
+                    try validateCapacity(
+                        token: arguments[0],
+                        displayName: "Set capacity",
+                        line: line
                     )
                 }
                 let emptyArray = try allocate(type: .array(types.element))
@@ -19623,7 +19976,7 @@ public struct Lowerer: Sendable {
                     .managedCollection(type: type, element: element)
                 let result: Bytecode.Register
                 switch operation {
-                case .count:
+                case .count, .underestimatedCount:
                     result = try lowerSequenceCount(
                         specialization,
                         sourceToken: projection[1],
@@ -25962,10 +26315,15 @@ public struct Lowerer: Sendable {
     private func parseCollectionQuerySpecialization(
         _ source: CanonicalSIL.CollectionIntrinsic.Query.Source,
         genericArguments: String
-    ) throws -> CanonicalSIL.SequenceSpecialization {
+    ) throws -> CollectionQueryPlan {
         let spellings = splitTopLevel(genericArguments)
             .filter { !$0.isEmpty }
         let context = "Collection query"
+        func exact(
+            _ source: CanonicalSIL.SequenceSpecialization
+        ) -> CollectionQueryPlan {
+            .init(source: source, underestimatedCountIsExact: true)
+        }
         switch source {
         case .collection:
             guard spellings.count == 1 else {
@@ -25973,9 +26331,11 @@ public struct Lowerer: Sendable {
                     "Collection query has an incomplete Self specialization"
                 )
             }
-            return try parseSequenceSpecialization(
-                spellings[0],
-                context: context
+            return try exact(
+                parseSequenceSpecialization(
+                    spellings[0],
+                    context: context
+                )
             )
 
         case .stringCharacters:
@@ -25984,7 +26344,7 @@ public struct Lowerer: Sendable {
                     "String query unexpectedly has generic specializations"
                 )
             }
-            return .stringCharacters
+            return exact(.stringCharacters)
 
         case .arrayBackedElement:
             guard spellings.count == 1 else {
@@ -25995,9 +26355,11 @@ public struct Lowerer: Sendable {
             let element = ValueRepresentation.storable(
                 try parseType(spellings[0])
             )
-            return .managedCollection(
-                type: .array(element),
-                element: element
+            return exact(
+                .managedCollection(
+                    type: .array(element),
+                    element: element
+                )
             )
 
         case .dictionaryKeyValue:
@@ -26012,9 +26374,11 @@ public struct Lowerer: Sendable {
             let value = ValueRepresentation.storable(
                 try parseType(spellings[1])
             )
-            return .managedCollection(
-                type: .dictionary(key: key, value: value),
-                element: .tuple([key, value])
+            return exact(
+                .managedCollection(
+                    type: .dictionary(key: key, value: value),
+                    element: .tuple([key, value])
+                )
             )
 
         case .setElement:
@@ -26026,9 +26390,41 @@ public struct Lowerer: Sendable {
             let element = ValueRepresentation.storable(
                 try parseType(spellings[0])
             )
-            return .managedCollection(
-                type: .set(element),
-                element: element
+            return exact(
+                .managedCollection(
+                    type: .set(element),
+                    element: element
+                )
+            )
+
+        case .zipped:
+            guard spellings.count == 2 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Zip2Sequence query has incomplete source specializations"
+                )
+            }
+            let sources = try spellings.map {
+                try parseSequenceSpecialization($0, context: context)
+            }
+            let element: Bytecode.ValueType = .tuple(
+                sources.map(\.element)
+            )
+            let hasExactEstimate = try spellings.allSatisfy { spelling in
+                guard let isExact = CanonicalSIL.SwiftTypeIdentity
+                    .sequenceWitnessHasExactUnderestimatedCount(spelling)
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "Zip2Sequence underestimatedCount source \(spelling)"
+                    )
+                }
+                return isExact
+            }
+            return .init(
+                source: .managedCollection(
+                    type: .array(element),
+                    element: element
+                ),
+                underestimatedCountIsExact: hasExactEstimate
             )
 
         case let .progressionElement(family):
@@ -26041,7 +26437,7 @@ public struct Lowerer: Sendable {
                 family: family,
                 element: try parseStoredType(spellings[0])
             )
-            return .progression(type)
+            return exact(.progression(type))
         }
     }
 

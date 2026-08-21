@@ -17,6 +17,76 @@ struct SequenceQuerySemanticsMatrix {
         var expected: VM.ExecutionResult
     }
 
+    @Test("Count-like query entry points share semantic classification")
+    func classifiesUnderestimatedCountEntryPoints() {
+        #expect(
+            CanonicalSIL.CollectionIntrinsic(
+                mangledName: "$sSlsE19underestimatedCountSivg"
+            ) == .query(
+                .init(operation: .underestimatedCount, source: .collection)
+            )
+        )
+        #expect(
+            CanonicalSIL.CollectionIntrinsic(
+                mangledName: "$ss8StrideToV19underestimatedCountSivg"
+            ) == .query(
+                .init(
+                    operation: .underestimatedCount,
+                    source: .progressionElement(.strideTo)
+                )
+            )
+        )
+        #expect(
+            CanonicalSIL.CollectionIntrinsic(
+                mangledName: "$ss13StrideThroughV19underestimatedCountSivg"
+            ) == .query(
+                .init(
+                    operation: .underestimatedCount,
+                    source: .progressionElement(.strideThrough)
+                )
+            )
+        )
+        typealias Identity = CanonicalSIL.SwiftTypeIdentity
+        #expect(
+            Identity.sequenceWitnessHasExactUnderestimatedCount(
+                "Array<Int>"
+            ) == true
+        )
+        #expect(
+            Identity.sequenceWitnessHasExactUnderestimatedCount(
+                "EnumeratedSequence<Array<Int>>"
+            ) == false
+        )
+        #expect(
+            Identity.sequenceWitnessHasExactUnderestimatedCount(
+                "Zip2Sequence<Array<Int>, Repeated<String>>"
+            ) == true
+        )
+        #expect(
+            Identity.sequenceWitnessHasExactUnderestimatedCount(
+                "Zip2Sequence<FlattenSequence<Array<Array<Int>>>, Array<Int>>"
+            ) == false
+        )
+        #expect(
+            Identity.sequenceWitnessHasExactUnderestimatedCount(
+                "Zip2Sequence<Zip2Sequence<Array<Int>, Repeated<String>>, "
+                    + "EnumeratedSequence<Array<Int>>>"
+            ) == false
+        )
+        #expect(
+            Identity.sequenceWitnessHasExactUnderestimatedCount(
+                "OpaqueSequence<Int>"
+            ) == nil
+        )
+        #expect(
+            CanonicalSIL.CollectionIntrinsic(
+                mangledName: "$ss12Zip2SequenceV19underestimatedCountSivg"
+            ) == .query(
+                .init(operation: .underestimatedCount, source: .zipped)
+            )
+        )
+    }
+
     @Test("Represented Collections and integer Ranges share typed queries")
     func lowersManagedAndRangeQueries() throws {
         try execute([
@@ -598,6 +668,242 @@ struct SequenceQuerySemanticsMatrix {
         #expect(predicateDisassembly.contains("checked_add"))
         #expect(!predicateDisassembly.contains("make_array_builder"))
         #expect(!predicateDisassembly.contains("collection_materialize"))
+    }
+
+    @Test("Represented Sequences preserve native underestimated counts")
+    func lowersUnderestimatedCountWithoutWitnessDispatch() throws {
+        try execute([
+            .init(
+                name: "arrayUnderestimatedCount",
+                source: """
+                public func arrayUnderestimatedCount(_ values: [Int]) -> Int {
+                    values.underestimatedCount
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integers([1, 2, 3])],
+                        expected: .returned(try integer(3))
+                    ),
+                    .init(
+                        arguments: [try integers([])],
+                        expected: .returned(try integer(0))
+                    ),
+                ]
+            ),
+            .init(
+                name: "managedUnderestimatedCounts",
+                source: """
+                public func managedUnderestimatedCounts(
+                    _ dictionary: [String: Int],
+                    _ set: Set<Int>,
+                    _ values: [Int]
+                ) -> (Int, Int, Int, Int) {
+                    let slice = values.dropFirst()
+                    let repeated = repeatElement(7, count: values.count)
+                    return (
+                        dictionary.underestimatedCount,
+                        set.underestimatedCount,
+                        slice.underestimatedCount,
+                        repeated.underestimatedCount
+                    )
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try dictionary([("a", 1), ("b", 2)]),
+                            try set([4, 8, 15]),
+                            try integers([1, 2, 3, 4]),
+                        ],
+                        expected: .returned(.tuple([
+                            try integer(2), try integer(3),
+                            try integer(3), try integer(4),
+                        ]))
+                    ),
+                ]
+            ),
+            .init(
+                name: "textUnderestimatedCount",
+                source: """
+                public func textUnderestimatedCount(_ value: String) -> Int {
+                    value.underestimatedCount
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [.string("A👨‍👩‍👧‍👦B")],
+                        expected: .returned(try integer(3))
+                    ),
+                ]
+            ),
+            .init(
+                name: "rangeUnderestimatedCount",
+                source: """
+                public func rangeUnderestimatedCount(
+                    _ lower: Int,
+                    _ upper: Int
+                ) -> Int {
+                    (lower..<upper).underestimatedCount
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [try integer(-2), try integer(3)],
+                        expected: .returned(try integer(5))
+                    ),
+                ]
+            ),
+            .init(
+                name: "strideToUnderestimatedCount",
+                source: """
+                public func strideToUnderestimatedCount(
+                    _ start: Int,
+                    _ end: Int,
+                    _ step: Int
+                ) -> Int {
+                    stride(from: start, to: end, by: step).underestimatedCount
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try integer(0), try integer(10), try integer(3),
+                        ],
+                        expected: .returned(try integer(4))
+                    ),
+                    .init(
+                        arguments: [
+                            try integer(0), try integer(10), try integer(-1),
+                        ],
+                        expected: .returned(try integer(0))
+                    ),
+                ]
+            ),
+            .init(
+                name: "strideThroughUnderestimatedCount",
+                source: """
+                public func strideThroughUnderestimatedCount(
+                    _ start: Int,
+                    _ end: Int,
+                    _ step: Int
+                ) -> Int {
+                    stride(
+                        from: start,
+                        through: end,
+                        by: step
+                    ).underestimatedCount
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try integer(10), try integer(0), try integer(-3),
+                        ],
+                        expected: .returned(try integer(4))
+                    ),
+                ]
+            ),
+            .init(
+                name: "floatingStrideUnderestimatedCount",
+                source: """
+                public func floatingStrideUnderestimatedCount(
+                    _ start: Double,
+                    _ end: Double,
+                    _ step: Double
+                ) -> Int {
+                    stride(from: start, to: end, by: step).underestimatedCount
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            .float64(0), .float64(2), .float64(0.5),
+                        ],
+                        expected: .returned(try integer(4))
+                    ),
+                ]
+            ),
+            .init(
+                name: "enumeratedUnderestimatedCount",
+                source: """
+                public func enumeratedUnderestimatedCount(
+                    _ values: [String]
+                ) -> Int {
+                    values.enumerated().underestimatedCount
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [strings(["a", "b"])],
+                        expected: .returned(try integer(2))
+                    ),
+                ]
+            ),
+            .init(
+                name: "zippedUnderestimatedCount",
+                source: """
+                public func zippedUnderestimatedCount(
+                    _ lhs: [Int],
+                    _ rhs: [String]
+                ) -> Int {
+                    zip(lhs, rhs).underestimatedCount
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]),
+                            strings(["a", "b"]),
+                        ],
+                        expected: .returned(try integer(2))
+                    ),
+                ]
+            ),
+            .init(
+                name: "zippedEnumeratedUnderestimatedCount",
+                source: """
+                public func zippedEnumeratedUnderestimatedCount(
+                    _ lhs: [Int],
+                    _ rhs: [String]
+                ) -> Int {
+                    zip(lhs.enumerated(), rhs).underestimatedCount
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]),
+                            strings(["a", "b", "c"]),
+                        ],
+                        expected: .returned(try integer(0))
+                    ),
+                ]
+            ),
+            .init(
+                name: "zippedFlattenedUnderestimatedCount",
+                source: """
+                public func zippedFlattenedUnderestimatedCount(
+                    _ lhs: [[Int]],
+                    _ rhs: [String]
+                ) -> Int {
+                    zip(lhs.joined(), rhs).underestimatedCount
+                }
+                """,
+                scenarios: [
+                    .init(
+                        arguments: [
+                            .array(
+                                [try integers([1, 2]), try integers([3])],
+                                elementType: .array(.int64)
+                            ),
+                            strings(["a", "b", "c"]),
+                        ],
+                        expected: .returned(try integer(0))
+                    ),
+                ]
+            ),
+        ])
     }
 
     @Test("Opaque iteration and representation-dependent queries fail closed")

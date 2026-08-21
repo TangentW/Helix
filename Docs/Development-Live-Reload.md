@@ -465,9 +465,13 @@ traversal for common `map`/`flatMap`/`compactMap`, reduction, visit, predicate,
 project their specialized value callback from each represented `(Key, Value)`
 element, while `reduce(into:_:)` uses scoped inout accumulation. Represented
 managed Collections and finite concrete progressions share one typed Sequence
-strategy. Managed Array, Dictionary, and Set share direct `count`, `isEmpty`,
-and `first` queries, while represented Array storage additionally supplies
-`last`; normalized Array-backed views use the same query semantics. Equality
+strategy. Managed Array, Dictionary, and Set share direct `count`, exact
+Collection `underestimatedCount`, `isEmpty`, and `first` queries, while
+represented Array storage additionally supplies `last`; normalized
+Array-backed views use the same query semantics. Zip retains the source
+Sequence-witness estimate, including zero for represented enumerated and
+flattened/joined inputs instead of substituting its materialized tuple count.
+Equality
 `contains(_:)`, natural extrema, and cross-source relations
 drive its cursor directly, so short-circuiting and first-tie semantics do not
 require an intermediate Array. `enumerated`, `Array(sequence)`, heterogeneous
@@ -485,11 +489,16 @@ closure traversal for Array-producing transforms, reductions, visits,
 short-circuit predicates, and comparator selection. Equality membership,
 natural extrema, and mixed-source Sequence relations also stream those
 compiler-only typed bounds/stride values. Integer Range/ClosedRange `count`,
-`isEmpty`, `first`, and `last` are constant-time bound operations with exact
-full-width cardinality and checked `Int` overflow; represented Comparable Range
+`underestimatedCount`, `isEmpty`, `first`, and `last` are constant-time bound
+operations with exact full-width cardinality and checked `Int` overflow;
+represented Comparable Range
 bounds also support `isEmpty`, `overlaps`, `clamped(to:)`, and direct bound
 projection. Their typed compare/select plan preserves empty-range overlap and
 floating-point equality/signed-zero behavior without a generic NativeImport.
+Stride underestimated counts stream the same fuel-bounded cursor with constant
+auxiliary storage. Half-open fixed-width-integer Range count subsequences move
+and clamp one typed bound in constant time without narrowing the complete
+cardinality to Int.
 Sorting, Set construction/algebra,
 `Array(sequence)`, `enumerated`, `reversed`, and `zip` reuse the typed Array
 builder when a complete stored or random-access representation is required.
@@ -527,6 +536,11 @@ opcode nor a generic standard-library NativeImport.
 Common Array structural edits—including nonmutating concatenation,
 contents insertion, range replacement/removal, reversal, and swapping—are
 supported for matching Array-backed sources and represented copyable elements.
+Array, ArraySlice, recursively Array-backed Slice, and Repeated share the
+represented integer-index movement and mutating `formIndex` families; generic
+associated-index results preserve the frontend's indirect result ABI. Empty and
+`minimumCapacity` Dictionary/Set construction share a typed plan that validates
+the nonnegative precondition before producing represented empty storage.
 Element append, `append(contentsOf:)`, `+=`, edge/count removal, `popLast`,
 clearing, and capacity hints use the broader represented
 `RangeReplaceableCollection` plan shared by String, Substring, Array, and

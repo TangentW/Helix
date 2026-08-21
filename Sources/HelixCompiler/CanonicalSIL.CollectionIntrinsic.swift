@@ -9,6 +9,7 @@ enum CollectionIntrinsic: Equatable {
     struct Query: Equatable {
         enum Operation: Equatable {
             case count
+            case underestimatedCount
             case isEmpty
             case first
             case last
@@ -23,6 +24,10 @@ enum CollectionIntrinsic: Equatable {
             case arrayBackedElement
             case dictionaryKeyValue
             case setElement
+            /// `Zip2Sequence` carries its concrete sources as separate
+            /// substitutions, while lowering stores the materialized tuple
+            /// sequence in represented Array storage.
+            case zipped
             case progressionElement(CanonicalSIL.Progression.Family)
         }
 
@@ -241,6 +246,28 @@ enum CollectionIntrinsic: Equatable {
             self = .query(.init(operation: .count, source: .arrayBackedElement))
         case "$sSlsE5countSivg":
             self = .query(.init(operation: .count, source: .collection))
+        case "$sSlsE19underestimatedCountSivg":
+            self = .query(
+                .init(operation: .underestimatedCount, source: .collection)
+            )
+        case "$ss12Zip2SequenceV19underestimatedCountSivg":
+            self = .query(
+                .init(operation: .underestimatedCount, source: .zipped)
+            )
+        case "$ss8StrideToV19underestimatedCountSivg":
+            self = .query(
+                .init(
+                    operation: .underestimatedCount,
+                    source: .progressionElement(.strideTo)
+                )
+            )
+        case "$ss13StrideThroughV19underestimatedCountSivg":
+            self = .query(
+                .init(
+                    operation: .underestimatedCount,
+                    source: .progressionElement(.strideThrough)
+                )
+            )
         case "$sSD5countSivg":
             self = .query(.init(operation: .count, source: .dictionaryKeyValue))
         case "$sSh5countSivg":
@@ -289,7 +316,7 @@ enum CollectionIntrinsic: Equatable {
             self = .relation(.startsWith)
         case "$sSTsSL7ElementRpzrlE25lexicographicallyPrecedesySbqd__STRd__AAQyd__ABRSlF":
             self = .relation(.lexicographicallyPrecedes)
-        case "$sSa10startIndexSivg":
+        case "$sSa10startIndexSivg", "$ss8RepeatedV10startIndexSivg":
             self = .collectionIndex(
                 .init(operation: .start, source: .arrayElement)
             )
@@ -301,7 +328,7 @@ enum CollectionIntrinsic: Equatable {
             self = .collectionIndex(
                 .init(operation: .start, source: .sliceBase)
             )
-        case "$sSa8endIndexSivg":
+        case "$sSa8endIndexSivg", "$ss8RepeatedV8endIndexSivg":
             self = .collectionIndex(
                 .init(operation: .end, source: .arrayElement)
             )
@@ -325,6 +352,10 @@ enum CollectionIntrinsic: Equatable {
             self = .collectionIndex(
                 .init(operation: .distance, source: .sliceBase)
             )
+        case "$sSksSx5IndexRpzSnyABG7IndicesRtzSiAA_6StrideRTzrlE8distance4from2toSiAB_ABtF":
+            self = .collectionIndex(
+                .init(operation: .distance, source: .genericCollection)
+            )
         case "$sSksSx5IndexRpzSnyABG7IndicesRtzSiAA_6StrideRTzrlE7indicesACvg":
             self = .collectionIndex(
                 .init(operation: .indices, source: .genericCollection)
@@ -345,6 +376,10 @@ enum CollectionIntrinsic: Equatable {
             self = .collectionIndex(
                 .init(operation: .after, source: .sliceBase)
             )
+        case "$sSksSx5IndexRpzSnyABG7IndicesRtzSiAA_6StrideRTzrlE5index5afterA2B_tF":
+            self = .collectionIndex(
+                .init(operation: .after, source: .genericCollection)
+            )
         case "$sSa5index6beforeS2i_tF":
             self = .collectionIndex(
                 .init(operation: .before, source: .arrayElement)
@@ -356,6 +391,10 @@ enum CollectionIntrinsic: Equatable {
         case "$ss5SliceVsSKRzrlE5index6before5IndexQzAF_tF":
             self = .collectionIndex(
                 .init(operation: .before, source: .sliceBase)
+            )
+        case "$sSksSx5IndexRpzSnyABG7IndicesRtzSiAA_6StrideRTzrlE5index6beforeA2B_tF":
+            self = .collectionIndex(
+                .init(operation: .before, source: .genericCollection)
             )
         case "$sSa5index_8offsetByS2i_SitF":
             self = .collectionIndex(
@@ -369,6 +408,10 @@ enum CollectionIntrinsic: Equatable {
             self = .collectionIndex(
                 .init(operation: .offsetBy, source: .sliceBase)
             )
+        case "$sSksSx5IndexRpzSnyABG7IndicesRtzSiAA_6StrideRTzrlE5index_8offsetByA2B_SitF":
+            self = .collectionIndex(
+                .init(operation: .offsetBy, source: .genericCollection)
+            )
         case "$sSa5index_8offsetBy07limitedC0SiSgSi_S2itF":
             self = .collectionIndex(
                 .init(operation: .offsetByLimited, source: .arrayElement)
@@ -380,6 +423,53 @@ enum CollectionIntrinsic: Equatable {
         case "$ss5SliceV5index_8offsetBy07limitedD05IndexQzSgAG_SiAGtF":
             self = .collectionIndex(
                 .init(operation: .offsetByLimited, source: .sliceBase)
+            )
+        case "$sSksE5index_8offsetBy07limitedC05IndexQzSgAE_SiAEtF":
+            self = .collectionIndex(
+                .init(operation: .offsetByLimited, source: .genericCollection)
+            )
+        case "$sSa9formIndex5afterySiz_tF":
+            self = .collectionIndex(
+                .init(operation: .formAfter, source: .arrayElement)
+            )
+        case "$ss10ArraySliceV9formIndex5afterySiz_tF":
+            self = .collectionIndex(
+                .init(operation: .formAfter, source: .arraySliceElement)
+            )
+        case "$ss5SliceV9formIndex5aftery0C0Qzz_tF":
+            self = .collectionIndex(
+                .init(operation: .formAfter, source: .sliceBase)
+            )
+        case "$sSlsE9formIndex5aftery0B0Qzz_tF":
+            self = .collectionIndex(
+                .init(operation: .formAfter, source: .genericCollection)
+            )
+        case "$sSa9formIndex6beforeySiz_tF":
+            self = .collectionIndex(
+                .init(operation: .formBefore, source: .arrayElement)
+            )
+        case "$ss10ArraySliceV9formIndex6beforeySiz_tF":
+            self = .collectionIndex(
+                .init(operation: .formBefore, source: .arraySliceElement)
+            )
+        case "$ss5SliceVsSKRzrlE9formIndex6beforey0C0Qzz_tF":
+            self = .collectionIndex(
+                .init(operation: .formBefore, source: .sliceBase)
+            )
+        case "$sSKsE9formIndex6beforey0B0Qzz_tF":
+            self = .collectionIndex(
+                .init(operation: .formBefore, source: .genericCollection)
+            )
+        case "$sSlsE9formIndex_8offsetByy0B0Qzz_SitF":
+            self = .collectionIndex(
+                .init(operation: .formOffsetBy, source: .genericCollection)
+            )
+        case "$sSlsE9formIndex_8offsetBy07limitedD0Sb0B0Qzz_SiAEtF":
+            self = .collectionIndex(
+                .init(
+                    operation: .formOffsetByLimited,
+                    source: .genericCollection
+                )
             )
         case "$sSTsE10enumerateds18EnumeratedSequenceVyxGyF":
             self = .adapter(.transform(.enumerated))

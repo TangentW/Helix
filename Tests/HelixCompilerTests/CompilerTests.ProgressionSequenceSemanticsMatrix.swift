@@ -382,6 +382,186 @@ struct ProgressionSequenceSemanticsMatrix {
         ])
     }
 
+    @Test("Integer Range count subsequences retain finite progression semantics")
+    func lowersIntegerRangeSubsequences() throws {
+        try execute([
+            Probe(
+                name: "rangeCountSubsequences",
+                source: """
+                public func rangeCountSubsequences(
+                    _ lower: Int,
+                    _ upper: Int,
+                    _ count: Int
+                ) -> ([Int], [Int], [Int], [Int]) {
+                    let values = lower..<upper
+                    return (
+                        Array(values.dropFirst(count)),
+                        Array(values.dropLast(count)),
+                        Array(values.prefix(count)),
+                        Array(values.suffix(count))
+                    )
+                }
+                """,
+                arguments: [
+                    try integer(2), try integer(7), try integer(2),
+                ],
+                expected: .tuple([
+                    try integers([4, 5, 6]),
+                    try integers([2, 3, 4]),
+                    try integers([2, 3]),
+                    try integers([5, 6]),
+                ])
+            ),
+            Probe(
+                name: "clampedRangeCountSubsequences",
+                source: """
+                public func clampedRangeCountSubsequences(
+                    _ count: Int
+                ) -> ([Int], [Int], [Int], [Int]) {
+                    let values = 2..<5
+                    return (
+                        Array(values.dropFirst(count)),
+                        Array(values.dropLast(count)),
+                        Array(values.prefix(count)),
+                        Array(values.suffix(count))
+                    )
+                }
+                """,
+                arguments: [try integer(20)],
+                expected: .tuple([
+                    try integers([]),
+                    try integers([]),
+                    try integers([2, 3, 4]),
+                    try integers([2, 3, 4]),
+                ])
+            ),
+            Probe(
+                name: "overflowClampedRangeCountSubsequences",
+                source: """
+                public func overflowClampedRangeCountSubsequences(
+                    _ count: Int
+                ) -> (Bool, Bool, Int, Int) {
+                    let values = 2..<5
+                    return (
+                        values.dropFirst(count).isEmpty,
+                        values.dropLast(count).isEmpty,
+                        values.prefix(count).count,
+                        values.suffix(count).count
+                    )
+                }
+                """,
+                arguments: [try integer(.max)],
+                expected: .tuple([
+                    .bool(true), .bool(true),
+                    try integer(3), try integer(3),
+                ])
+            ),
+            Probe(
+                name: "wideRangePrefix",
+                source: """
+                public func wideRangePrefix(_ count: Int) -> [Int] {
+                    Array((Int.min..<Int.max).prefix(count))
+                }
+                """,
+                arguments: [try integer(2)],
+                expected: try integers([.min, .min + 1])
+            ),
+            Probe(
+                name: "wideRangeSuffix",
+                source: """
+                public func wideRangeSuffix(_ count: Int) -> [Int] {
+                    Array((Int.min..<Int.max).suffix(count))
+                }
+                """,
+                arguments: [try integer(2)],
+                expected: try integers([.max - 2, .max - 1])
+            ),
+            Probe(
+                name: "uint8RangeSuffix",
+                source: """
+                public func uint8RangeSuffix(
+                    _ lower: UInt8,
+                    _ upper: UInt8,
+                    _ count: Int
+                ) -> [UInt8] {
+                    Array((lower..<upper).suffix(count))
+                }
+                """,
+                arguments: [
+                    try unsignedInteger(250, width: 8),
+                    try unsignedInteger(255, width: 8),
+                    try integer(2),
+                ],
+                expected: .array(
+                    [
+                        try unsignedInteger(253, width: 8),
+                        try unsignedInteger(254, width: 8),
+                    ],
+                    elementType: .integer(bitWidth: 8, signed: false)
+                )
+            ),
+            Probe(
+                name: "uint64ExtremeRangeEdges",
+                source: """
+                public func uint64ExtremeRangeEdges(
+                    _ count: Int
+                ) -> ([UInt64], [UInt64]) {
+                    let values = UInt64.min..<UInt64.max
+                    return (
+                        Array(values.prefix(count)),
+                        Array(values.suffix(count))
+                    )
+                }
+                """,
+                arguments: [try integer(2)],
+                expected: .tuple([
+                    .array(
+                        [
+                            try unsignedInteger(0, width: 64),
+                            try unsignedInteger(1, width: 64),
+                        ],
+                        elementType: .integer(bitWidth: 64, signed: false)
+                    ),
+                    .array(
+                        [
+                            try unsignedInteger(.max - 2, width: 64),
+                            try unsignedInteger(.max - 1, width: 64),
+                        ],
+                        elementType: .integer(bitWidth: 64, signed: false)
+                    ),
+                ])
+            ),
+            Probe(
+                name: "int8RangePrefixPastElementMaximum",
+                source: """
+                public func int8RangePrefixPastElementMaximum(
+                    _ count: Int
+                ) -> Int8? {
+                    (Int8.min..<Int8.max).prefix(count).last
+                }
+                """,
+                arguments: [try integer(128)],
+                expected: .optional(try signedInteger(-1, width: 8))
+            ),
+            Probe(
+                name: "negativeRangeSubsequenceCount",
+                source: """
+                public func negativeRangeSubsequenceCount(
+                    _ count: Int
+                ) -> [Int] {
+                    Array((0..<4).dropFirst(count))
+                }
+                """,
+                arguments: [try integer(-1)],
+                expected: .trapped(
+                    .explicit(
+                        "collection subsequence count must not be negative"
+                    )
+                )
+            ),
+        ])
+    }
+
     @Test("Unrepresented Sequence semantics fail closed")
     func rejectsUnsupportedSequenceSources() {
         expectUnsupported(
@@ -498,6 +678,15 @@ struct ProgressionSequenceSemanticsMatrix {
     ) throws -> VM.Value {
         .integer(
             try .init(rawBits: value, bitWidth: width, isSigned: false)
+        )
+    }
+
+    private func signedInteger(
+        _ value: Int64,
+        width: UInt16
+    ) throws -> VM.Value {
+        .integer(
+            try .init(signed: value, bitWidth: width, isSigned: true)
         )
     }
 }

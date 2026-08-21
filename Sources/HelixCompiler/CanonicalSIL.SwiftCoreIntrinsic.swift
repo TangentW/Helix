@@ -42,6 +42,7 @@ enum SwiftCoreIntrinsic: Equatable {
     case rangeContains(CanonicalSIL.Progression.Family)
     case rangeExpressionContains
     case dictionaryEmpty
+    case dictionaryMinimumCapacity
     case dictionarySubscriptGet
     case dictionarySubscriptSet
     case dictionaryDefaultSubscriptGet
@@ -56,6 +57,7 @@ enum SwiftCoreIntrinsic: Equatable {
     case dictionaryMakeIterator
     case dictionaryIteratorNext
     case setEmpty
+    case setMinimumCapacity
     case setContains
     case setInsert
     case setUpdate
@@ -226,7 +228,8 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$ss3maxyxx_xtSLRzlF": self = .maximum
         case "$ss3absyxxSLRzs13SignedNumericRzlF": self = .absoluteValue
         case "$sS2ayxGycfC": self = .arrayEmpty
-        case "$sSayxSicig": self = .arraySubscript(.arrayElement)
+        case "$sSayxSicig", "$ss8RepeatedVyxSicig":
+            self = .arraySubscript(.arrayElement)
         case "$ss10ArraySliceVyxSicig":
             self = .arraySubscript(.arraySliceElement)
         case "$ss5SliceVy7ElementQz5IndexQzcig",
@@ -285,6 +288,8 @@ enum SwiftCoreIntrinsic: Equatable {
         case CanonicalSIL.RangeExpression.patternMatchMangledName:
             self = .rangeExpressionContains
         case "$sS2Dyxq_GycfC": self = .dictionaryEmpty
+        case "$sSD15minimumCapacitySDyxq_GSi_tcfC":
+            self = .dictionaryMinimumCapacity
         case "$sSDyq_Sgxcig": self = .dictionarySubscriptGet
         case "$sSDyq_Sgxcis": self = .dictionarySubscriptSet
         case "$sSD_7defaultq_x_q_yXKtcig": self = .dictionaryDefaultSubscriptGet
@@ -301,6 +306,8 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$sSD12makeIteratorSD0B0Vyxq__GyF": self = .dictionaryMakeIterator
         case "$sSD8IteratorV4nextx3key_q_5valuetSgyF": self = .dictionaryIteratorNext
         case "$sS2hyxGycfC": self = .setEmpty
+        case "$sSh15minimumCapacityShyxGSi_tcfC":
+            self = .setMinimumCapacity
         case "$sSh8containsySbxF": self = .setContains
         case "$sSh6insertySb8inserted_x17memberAfterInserttxnF": self = .setInsert
         case "$sSh6update4withxSgxn_tF": self = .setUpdate

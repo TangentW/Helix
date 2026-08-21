@@ -23,23 +23,52 @@ enum CollectionIndex {
         case before
         case offsetBy
         case offsetByLimited
+        case formAfter
+        case formBefore
+        case formOffsetBy
+        case formOffsetByLimited
+
+        var returnsIndexValue: Bool {
+            switch self {
+            case .start, .end, .after, .before, .offsetBy, .offsetByLimited:
+                true
+            case .distance, .indices, .formAfter, .formBefore,
+                 .formOffsetBy, .formOffsetByLimited:
+                false
+            }
+        }
     }
 
     /// Identifies how a stdlib entry point carries its Collection
     /// specialization. Concrete Array-family methods substitute Element;
     /// protocol-extension entry points substitute the complete Self type.
     enum Source: Equatable {
+        /// A concrete zero-based Array-backed entry point substitutes only its
+        /// Element. Array and Repeated currently share this physical ABI.
         case arrayElement
         case arraySliceElement
         /// A concrete `Slice<Base>` entry point substitutes `Base` rather than
         /// the complete slice type.
         case sliceBase
         case genericCollection
+
+        var usesAssociatedIndexABI: Bool {
+            switch self {
+            case .arrayElement, .arraySliceElement:
+                false
+            case .sliceBase, .genericCollection:
+                true
+            }
+        }
     }
 
     struct Intrinsic: Equatable {
         var operation: Operation
         var source: Source
+
+        var returnsIndexIndirectly: Bool {
+            operation.returnsIndexValue && source.usesAssociatedIndexABI
+        }
     }
 
     static func model(for raw: String) -> Model {
