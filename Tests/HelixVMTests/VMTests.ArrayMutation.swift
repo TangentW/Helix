@@ -14,7 +14,7 @@ struct ArrayMutation {
         try state.swapAt(0, 2, budget: budget)
         try state.swapAt(1, 1, budget: budget)
 
-        #expect(try state.finish().map(integer) == [30, 20, 10])
+        #expect(try state.finish().elements.map(integer) == [30, 20, 10])
     }
 
     @Test("State validates element types, indices, and terminal transitions")
@@ -81,7 +81,22 @@ struct ArrayMutation {
         #expect(throws: VM.RuntimeTrap.instructionFuelExhausted) {
             try swapState.swapAt(0, 1, budget: exhaustedSwap)
         }
-        #expect(try swapState.finish().map(integer) == [1, 2])
+        #expect(try swapState.finish().elements.map(integer) == [1, 2])
+    }
+
+    @Test("Mutation state retains the source view's index base")
+    func preservesIndexBase() throws {
+        let state = try VM.ArrayMutationState(
+            elementType: .int64,
+            elements: [try value(1), try value(2)],
+            indexBase: 9
+        )
+        try state.swapAt(0, 1, budget: generousBudget())
+        let storage = try state.finish()
+
+        #expect(storage.indexBase == 9)
+        #expect(try storage.elements.map(integer) == [2, 1])
+        #expect(try storage.endIndex() == 11)
     }
 
     private func makeState(_ values: [Int64]) throws -> VM.ArrayMutationState {

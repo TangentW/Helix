@@ -110,5 +110,46 @@ struct ArrayAdapters {
             )
         }
     }
+
+    @Test("Derived views preserve logical integer-index bounds")
+    func preservesViewBases() throws {
+        let storage = VM.ArrayStorage(
+            elements: [.bool(false), .bool(true), .bool(false)],
+            elementType: .bool,
+            indexBase: 7
+        )
+
+        #expect(
+            try VM.ArrayAdapters.subsequence(
+                storage: storage,
+                bound: 1,
+                operation: .dropFirst
+            ) == .init(bounds: 1..<3, indexBase: 8)
+        )
+        #expect(
+            try VM.ArrayAdapters.subsequence(
+                storage: storage,
+                bound: 8,
+                operation: .prefixThrough
+            ) == .init(bounds: 0..<2, indexBase: 7)
+        )
+        #expect(
+            try VM.ArrayAdapters.rangeSlice(
+                storage: storage,
+                lowerBound: 8,
+                upperBound: 10
+            ) == .init(bounds: 1..<3, indexBase: 8)
+        )
+        #expect(try storage.endIndex() == 10)
+
+        let overflowing = VM.ArrayStorage(
+            elements: [.bool(true)],
+            elementType: .bool,
+            indexBase: .max
+        )
+        #expect(throws: VM.RuntimeTrap.integerOverflow) {
+            _ = try overflowing.endIndex()
+        }
+    }
 }
 }

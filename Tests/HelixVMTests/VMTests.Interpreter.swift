@@ -3606,6 +3606,136 @@ struct Interpreter {
         )
     }
 
+    @Test("Array rebasing preserves logical identity and rejects overflow")
+    func executesArrayRebasing() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "arrayRebasing",
+            parameterRegisters: [
+                .init(rawValue: 0), .init(rawValue: 1),
+            ],
+            resultType: arrayType,
+            registerTypes: [arrayType, .int64, arrayType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                    ],
+                    instructions: [
+                        .arrayRebase(
+                            result: .init(rawValue: 2),
+                            array: .init(rawValue: 0),
+                            indexBase: .init(rawValue: 1)
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .collectionsV1],
+            signature: .init(
+                parameters: ["Swift.Array<Swift.Int>", "Swift.Int"],
+                result: "Swift.Array<Swift.Int>"
+            ),
+            parameterTypes: [arrayType, .int64],
+            resultType: arrayType
+        )
+        let element = VM.Value.integer(
+            try .init(signed: 1, bitWidth: 64, isSigned: true)
+        )
+        let input = VM.Value.array([element], elementType: .int64)
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    input,
+                    .integer(
+                        try .init(signed: 7, bitWidth: 64, isSigned: true)
+                    ),
+                ]
+            ) == .returned(
+                .array([element], elementType: .int64, indexBase: 7)
+            )
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    input,
+                    .integer(
+                        try .init(
+                            signed: .max,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    ),
+                ]
+            ) == .trapped(.integerOverflow)
+        )
+    }
+
+    @Test("Array writes reject a logical end-index overflow")
+    func rejectsArrayWriteIndexOverflow() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "arrayAppendOverflow",
+            parameterRegisters: [
+                .init(rawValue: 0), .init(rawValue: 1),
+            ],
+            resultType: arrayType,
+            registerTypes: [arrayType, .int64, arrayType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                    ],
+                    instructions: [
+                        .arrayAppend(
+                            result: .init(rawValue: 2),
+                            array: .init(rawValue: 0),
+                            value: .init(rawValue: 1)
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: function,
+            capabilities: [.baselineV1, .collectionsV1],
+            signature: .init(
+                parameters: ["Swift.Array<Swift.Int>", "Swift.Int"],
+                result: "Swift.Array<Swift.Int>"
+            ),
+            parameterTypes: [arrayType, .int64],
+            resultType: arrayType
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    .array([], elementType: .int64, indexBase: .max),
+                    .integer(
+                        try .init(signed: 1, bitWidth: 64, isSigned: true)
+                    ),
+                ]
+            ) == .trapped(.integerOverflow)
+        )
+    }
+
     @Test("Direct Array splitting is typed and fuel-bounded")
     func executesDirectArraySplitting() throws {
         let arrayType = Bytecode.ValueType.array(.int64)
@@ -3670,8 +3800,15 @@ struct Interpreter {
                 try .init(signed: value, bitWidth: 64, isSigned: true)
             )
         }
-        func array(_ values: [Int64]) throws -> VM.Value {
-            .array(try values.map(integer), elementType: .int64)
+        func array(
+            _ values: [Int64],
+            indexBase: Int64 = 0
+        ) throws -> VM.Value {
+            .array(
+                try values.map(integer),
+                elementType: .int64,
+                indexBase: indexBase
+            )
         }
         let input = try array([0, 1, 0, 2, 0])
         let arguments = [
@@ -3687,7 +3824,10 @@ struct Interpreter {
                 arguments: arguments
             ) == .returned(
                 .array(
-                    [try array([1]), try array([2])],
+                    [
+                        try array([1], indexBase: 1),
+                        try array([2], indexBase: 3),
+                    ],
                     elementType: arrayType
                 )
             )
@@ -4167,6 +4307,64 @@ struct Interpreter {
                 key: one,
                 element: ten,
                 matchingIndex: 1
+            )
+        }
+        let basedGroup = VM.DictionaryBuilder(
+            keyType: .int64,
+            valueType: .array(.int64),
+            entries: [
+                .init(
+                    key: one,
+                    value: .array(
+                        [ten],
+                        elementType: .int64,
+                        indexBase: 7
+                    )
+                ),
+            ]
+        )
+        try basedGroup.preflightArrayElementAppend(matchingIndex: 0)
+        try basedGroup.appendArrayElement(
+            key: one,
+            element: twenty,
+            matchingIndex: 0
+        )
+        #expect(
+            try basedGroup.finish() == [
+                .init(
+                    key: one,
+                    value: .array(
+                        [ten, twenty],
+                        elementType: .int64,
+                        indexBase: 7
+                    )
+                ),
+            ]
+        )
+        let overflowingGroup = VM.DictionaryBuilder(
+            keyType: .int64,
+            valueType: .array(.int64),
+            entries: [
+                .init(
+                    key: one,
+                    value: .array(
+                        [],
+                        elementType: .int64,
+                        indexBase: .max
+                    )
+                ),
+            ]
+        )
+        #expect(throws: VM.RuntimeTrap.integerOverflow) {
+            try overflowingGroup.preflightArrayElementAppend(
+                matchingIndex: 0
+            )
+        }
+        #expect(throws: VM.RuntimeTrap.integerOverflow) {
+            try overflowingGroup.appendArrayElement(
+                key: one,
+                element: ten,
+                matchingIndex: 0
             )
         }
         let scalarDirect = VM.DictionaryBuilder(

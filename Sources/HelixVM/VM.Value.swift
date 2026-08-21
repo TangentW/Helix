@@ -67,7 +67,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
     case float(VM.FloatingValue)
     case string(String)
     case any(VM.AnyValue)
-    case array([VM.Value], elementType: Bytecode.ValueType)
+    case array(VM.ArrayStorage)
     case dictionary(
         [VM.DictionaryEntry],
         keyType: Bytecode.ValueType,
@@ -101,7 +101,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .float(value): .float(bitWidth: value.bitWidth)
         case .string: .string
         case .any: .any
-        case let .array(_, elementType): .array(elementType)
+        case let .array(storage): .array(storage.elementType)
         case let .dictionary(_, keyType, valueType):
             .dictionary(key: keyType, value: valueType)
         case let .set(value): .set(value.elementType)
@@ -134,7 +134,8 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .float(value): value.description
         case let .string(value): String(reflecting: value)
         case let .any(value): value.payload.description
-        case let .array(values, _): "[\(values.map(\.description).joined(separator: ", "))]"
+        case let .array(storage):
+            "[\(storage.elements.map(\.description).joined(separator: ", "))]"
         case let .dictionary(entries, _, _):
             "[\(entries.map { "\($0.key.description): \($0.value.description)" }.joined(separator: ", "))]"
         case let .set(value): value.description
@@ -156,6 +157,22 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
         case let .arraySplitState(state): state.description
         case let .closure(closure): closure.description
         }
+    }
+
+    /// Constructs zero-based Array storage by default. Derived collection
+    /// views opt into a preserved logical base explicitly.
+    public static func array(
+        _ elements: [VM.Value],
+        elementType: Bytecode.ValueType,
+        indexBase: Int64 = 0
+    ) -> Self {
+        .array(
+            .init(
+                elements: elements,
+                elementType: elementType,
+                indexBase: indexBase
+            )
+        )
     }
 }
 
@@ -270,9 +287,9 @@ extension VM.Value {
         case let (.any(value), .any):
             value.concreteType.isAnyPayloadV1
                 && value.payload.matches(value.concreteType, depth: depth + 1)
-        case let (.array(values, actualElement), .array(expectedElement)):
-            actualElement == expectedElement
-                && values.allSatisfy {
+        case let (.array(storage), .array(expectedElement)):
+            storage.elementType == expectedElement
+                && storage.elements.allSatisfy {
                     $0.matches(expectedElement, depth: depth + 1)
                 }
         case let (

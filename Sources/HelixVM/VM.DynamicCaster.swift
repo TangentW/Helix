@@ -112,15 +112,17 @@ struct DynamicCaster {
             return .tuple(converted)
 
         case let (.array(sourceElement), .array(targetElement)):
-            guard case let .array(values, actualElement) = value,
-                  actualElement == sourceElement
+            guard case let .array(storage) = value,
+                  storage.elementType == sourceElement
             else {
                 throw VM.RuntimeTrap.typeMismatch(expected: sourceType, actual: value.type)
             }
-            try budget.consumeAggregateStorage(elementCount: values.count)
+            try budget.consumeAggregateStorage(
+                elementCount: storage.elements.count
+            )
             var converted: [VM.Value] = []
-            converted.reserveCapacity(values.count)
-            for element in values {
+            converted.reserveCapacity(storage.elements.count)
+            for element in storage.elements {
                 guard let result = try cast(
                     element,
                     from: sourceElement,
@@ -131,7 +133,11 @@ struct DynamicCaster {
                 }
                 converted.append(result)
             }
-            return .array(converted, elementType: targetElement)
+            return .array(
+                converted,
+                elementType: targetElement,
+                indexBase: storage.indexBase
+            )
 
         case let (
             .dictionary(sourceKey, sourceValue),
@@ -150,7 +156,7 @@ struct DynamicCaster {
             try budget.consumeAggregateStorage(elementCount: storedElements.partialValue)
             var converted: [VM.DictionaryEntry] = []
             converted.reserveCapacity(entries.count)
-            var keys = Set<VM.Value>()
+            var keys = Set<VM.HashableValue>()
             keys.reserveCapacity(entries.count)
             for entry in entries {
                 guard let key = try cast(
@@ -166,7 +172,9 @@ struct DynamicCaster {
                 ) else {
                     return nil
                 }
-                guard keys.insert(key).inserted else { return nil }
+                guard keys.insert(.init(value: key)).inserted else {
+                    return nil
+                }
                 converted.append(.init(key: key, value: item))
             }
             return .dictionary(

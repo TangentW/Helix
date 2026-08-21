@@ -350,19 +350,24 @@ struct HigherOrderTraversalSemanticsMatrix {
         ])
     }
 
-    @Test("firstIndex rejects slices until their base index is represented")
-    func rejectsFirstIndexOnNormalizedSlice() {
-        #expect(throws: CanonicalSIL.LoweringError.self) {
-            _ = try FrontendExecutionHarness.compile(
+    @Test("firstIndex maps physical traversal back to a slice index")
+    func lowersFirstIndexOnSlice() throws {
+        try run([
+            .init(
+                name: "slicedFirstIndex",
                 source: """
                 public func slicedFirstIndex(_ values: [Int]) -> Int? {
                     values.dropFirst().firstIndex { $0 > 0 }
                 }
                 """,
-                functionName: "slicedFirstIndex",
-                moduleName: "HelixTraversal_slicedFirstIndex"
-            )
-        }
+                scenarios: [
+                    .init(
+                        arguments: [try integers([0, 2, 3])],
+                        expected: .returned(.optional(try integer(1)))
+                    ),
+                ]
+            ),
+        ])
     }
 
     @Test("lazy Sequence.drop remains rejected instead of becoming eager")

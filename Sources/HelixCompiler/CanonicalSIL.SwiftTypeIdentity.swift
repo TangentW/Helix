@@ -192,7 +192,7 @@ enum SwiftTypeIdentity {
         return raw
     }
 
-    private static func genericType(
+    static func genericType(
         _ raw: String
     ) -> (name: String, arguments: [String])? {
         guard let generic = parsedGenericType(raw), generic.suffix.isEmpty

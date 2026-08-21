@@ -34,10 +34,13 @@ struct HashableValue: Hashable, Sendable {
             case let (.some(lhs), .some(rhs)): equal(lhs, rhs)
             default: false
             }
-        case let (.array(lhs, lhsType), .array(rhs, rhsType)):
-            return lhsType == rhsType
-                && lhs.count == rhs.count
-                && (sharesStorage(lhs, rhs) || zip(lhs, rhs).allSatisfy(equal))
+        case let (.array(lhs), .array(rhs)):
+            // Swift collection equality is element-based. A slice's logical
+            // base is representation metadata, not part of Equatable/Hashable.
+            return lhs.elementType == rhs.elementType
+                && lhs.elements.count == rhs.elements.count
+                && (sharesStorage(lhs.elements, rhs.elements)
+                    || zip(lhs.elements, rhs.elements).allSatisfy(equal))
         case let (
             .dictionary(lhs, lhsKey, lhsValue),
             .dictionary(rhs, rhsKey, rhsValue)
@@ -89,11 +92,12 @@ struct HashableValue: Hashable, Sendable {
             } else {
                 hasher.combine(false)
             }
-        case let .array(values, elementType):
+        case let .array(storage):
+            // Keep hashing aligned with the element-based equality above.
             hasher.combine(5 as UInt8)
-            hasher.combine(elementType)
-            hasher.combine(values.count)
-            for value in values {
+            hasher.combine(storage.elementType)
+            hasher.combine(storage.elements.count)
+            for value in storage.elements {
                 hash(value, into: &hasher)
             }
         case let .dictionary(entries, keyType, valueType):
@@ -180,8 +184,8 @@ struct HashableValue: Hashable, Sendable {
 
         var bytes: UInt64 = 0
         switch rhs {
-        case let .array(elements, _):
-            for element in elements {
+        case let .array(storage):
+            for element in storage.elements {
                 bytes = try checkedAdd(
                     bytes,
                     equalityScratchBytes(for: element, depth: depth + 1)

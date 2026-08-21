@@ -11,6 +11,9 @@ public final class ArraySplitState: @unchecked Sendable, Hashable,
     CustomStringConvertible {
     private let lock = NSLock()
     let elementType: Bytecode.ValueType
+    // Recorded ranges are physical; each emitted segment translates its lower
+    // bound back into the source collection's logical index space.
+    private let indexBase: Int64
     private var elements: [VM.Value]
     private let maximumSplits: Int
     private let omitsEmptySubsequences: Bool
@@ -25,6 +28,7 @@ public final class ArraySplitState: @unchecked Sendable, Hashable,
     init(
         elementType: Bytecode.ValueType,
         elements: [VM.Value],
+        indexBase: Int64 = 0,
         maximumSplits: Int,
         omitsEmptySubsequences: Bool
     ) throws {
@@ -41,8 +45,14 @@ public final class ArraySplitState: @unchecked Sendable, Hashable,
         }
         self.elementType = elementType
         self.elements = elements
+        self.indexBase = indexBase
         self.maximumSplits = maximumSplits
         self.omitsEmptySubsequences = omitsEmptySubsequences
+        _ = try VM.ArrayStorage(
+            elements: elements,
+            elementType: elementType,
+            indexBase: indexBase
+        ).endIndex()
     }
 
     /// Returns one element for predicate evaluation. Once the split limit is
@@ -129,8 +139,19 @@ public final class ArraySplitState: @unchecked Sendable, Hashable,
             }
 
             isFinished = true
-            let result = ranges.map {
-                VM.Value.array(Array(elements[$0]), elementType: elementType)
+            let result = try ranges.map { range in
+                guard let offset = Int64(exactly: range.lowerBound) else {
+                    throw VM.RuntimeTrap.integerOverflow
+                }
+                let base = indexBase.addingReportingOverflow(offset)
+                guard !base.overflow else {
+                    throw VM.RuntimeTrap.integerOverflow
+                }
+                return VM.Value.array(
+                    Array(elements[range]),
+                    elementType: elementType,
+                    indexBase: base.partialValue
+                )
             }
             elements = []
             completedRanges = []

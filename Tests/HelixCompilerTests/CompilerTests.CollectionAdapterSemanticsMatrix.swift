@@ -1082,29 +1082,25 @@ struct CollectionAdapterSemanticsMatrix {
         ])
     }
 
-    @Test("ArraySlice index wrappers are not silently treated as zero-based")
-    func rejectsUnmodeledSliceIndices() {
-        do {
-            _ = try FrontendExecutionHarness.compile(
+    @Test("ArraySlice index adapters retain their logical base")
+    func lowersSliceIndices() throws {
+        try run([
+            .init(
+                name: "slicedIndex",
                 source: """
                 public func slicedIndex(_ values: [Int]) -> [Int] {
                     let slice = values.dropFirst()
                     return Array(slice.prefix(upTo: 2))
                 }
                 """,
-                functionName: "slicedIndex",
-                moduleName: "HelixAdapterNegativeFixture"
-            )
-            Issue.record("ArraySlice index semantics unexpectedly compiled")
-        } catch let error as CanonicalSIL.LoweringError {
-            guard case let .unsupportedType(detail) = error else {
-                Issue.record("unexpected ArraySlice diagnostic: \(error)")
-                return
-            }
-            #expect(detail.contains("ArraySlice<Int>"))
-        } catch {
-            Issue.record("unexpected ArraySlice diagnostic: \(error)")
-        }
+                scenarios: [
+                    .init(
+                        arguments: [try integers([0, 1, 2, 3])],
+                        expected: .returned(try integers([1]))
+                    ),
+                ]
+            ),
+        ])
     }
 
     @Test("Composed slices normalize only an Array-backed base")
@@ -1119,6 +1115,16 @@ struct CollectionAdapterSemanticsMatrix {
             environment.collectionIndexModel(
                 for: "Slice<ReversedCollection<Array<Int>>>"
             ) == .opaque
+        )
+        #expect(
+            environment.collectionIndexModel(
+                for: "Slice<Array<Int>>"
+            ) == .preservedBaseInteger
+        )
+        #expect(
+            environment.collectionIndexModel(
+                for: "Slice<ArraySlice<Int>>"
+            ) == .preservedBaseInteger
         )
         #expect(throws: CanonicalSIL.LoweringError.self) {
             _ = try environment.resolve("Slice<Set<Int>>")

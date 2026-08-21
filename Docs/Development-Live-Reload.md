@@ -449,7 +449,9 @@ builder only when their result needs complete storage. Stable comparator
 elements through the same verified sort CFG. String and Array-backed sources
 share short-circuiting Collection prefix/drop predicates and reverse `last`
 searches; direct Sequence prefix also accepts supported finite progressions.
-Mutating `sort(by:)` remains Array-only.
+Mutating natural/comparator ordering accepts represented Array-backed mutable
+collections whose canonical index model is integer-based. It preserves the
+logical index base and commits comparator ordering only on normal completion.
 Finite integer ranges and supported numeric strides enter that same forward
 closure traversal for Array-producing transforms, reductions, visits,
 short-circuit predicates, and comparator selection. Equality membership,
@@ -462,14 +464,14 @@ bounds also support `isEmpty`. Sorting, Set construction/algebra,
 builder when a complete stored or random-access representation is required.
 One-sided `RangeExpression` containment and switch patterns over represented
 integer, floating, String, and Character bounds reuse the scalar comparison
-plan. Concrete Array partial-range subscripts reuse existing typed
-suffix/prefix operations, and full-range subscripts over represented
-Array-backed or String/Substring sources reuse the ordinary sequence
-materialization boundary. The compiler erases these range wrappers instead of
-binding Swift's generic Collection ABI as NativeImports or adding one opcode
-per source API. Using a one-sided range as a potentially infinite Sequence,
-progression index results, private String or derived ArraySlice indices, other
-index-sensitive Collection operations, and reverse predicate traversal remain
+plan. Integer `Range`, `ClosedRange`, one-sided, and full-range subscripts over
+Array-backed sources reuse the same typed slice boundary and preserve the
+source's logical base; String/Substring full-range materialization retains its
+separate Character representation. The compiler erases these range wrappers
+instead of binding Swift's generic Collection ABI as NativeImports or adding
+one opcode per source API. Using a one-sided range as a potentially infinite
+Sequence, progression index results, private `String.Index`,
+`ReversedCollection.Index`, and other opaque index identities remain
 fail-closed rather than acquiring guessed semantics.
 Array `partition(by:)` and `removeAll(where:)` share a typed linear mutable
 snapshot while their predicate calls remain ordinary verified CFG edges;
@@ -479,8 +481,9 @@ use one linear element buffer
 and a typed Array/Dictionary/Set finalizer, while
 separator- and predicate-driven Array-backed `split` use one kind-checked
 linear range state with exact `maxSplits`, empty-segment, and throwing-edge
-semantics. Split subsequences are normalized by element sequence and therefore
-do not preserve a source view's public index identity. Meanwhile,
+semantics. Every Array-backed split segment retains its logical lower bound;
+String subsequences retain Character elements but do not claim `String.Index`
+identity. Meanwhile,
 supported Optional and Result payload transforms use the same selected-case
 plan. `Result(catching:)` uses a construction plan over the throwing closure's
 ordinary verified normal/error CFG edges, so it needs neither an API-specific
@@ -515,9 +518,9 @@ labels and both recursively normalized managed types are identical. A real
 collection element conversion still fails closed.
 Natural `sorted()` is available across represented managed Collections and
 supported finite progressions whose elements are VM-comparable scalars;
-mutating `sort()` remains Array-only.
-Mutating ordering commits only on its normal continuation, so a throwing
-callback leaves the original Array unchanged.
+mutating `sort()` uses the same integer-index Array-backed boundary. Mutating
+ordering commits only on its normal continuation, so a throwing callback leaves
+the original collection unchanged.
 Multi-branch local initialization
 uses field-sensitive definite/possible state, so conditional replacement and
 cleanup are supported while reads remain fail-closed until every field is

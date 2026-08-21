@@ -116,6 +116,61 @@ struct Container {
         #expect(try Bytecode.Encoder.encode(decoded) == bytes)
     }
 
+    @Test("Array-backed index identity uses the current HLBC 1.0 wire format")
+    func arrayIndexIdentityRoundTrip() throws {
+        let array = Bytecode.ValueType.array(.int64)
+        let resultType = Bytecode.ValueType.tuple([.int64, array])
+        var module = try makeAddModule()
+        module.capabilities.insert(.collectionsV1)
+        module.functions[0] = .init(
+            id: .init(rawValue: 0),
+            name: "arrayIndexIdentity",
+            parameterRegisters: [
+                .init(rawValue: 0), .init(rawValue: 1),
+            ],
+            resultType: resultType,
+            registerTypes: [
+                array, .int64, .int64, array, resultType,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                    ],
+                    instructions: [
+                        .arrayIndexBase(
+                            result: .init(rawValue: 2),
+                            array: .init(rawValue: 0)
+                        ),
+                        .arrayRebase(
+                            result: .init(rawValue: 3),
+                            array: .init(rawValue: 0),
+                            indexBase: .init(rawValue: 1)
+                        ),
+                        .makeTuple(
+                            result: .init(rawValue: 4),
+                            elements: [
+                                .init(rawValue: 2), .init(rawValue: 3),
+                            ]
+                        ),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ]
+        )
+
+        let bytes = try Bytecode.Encoder.encode(module)
+        let decoded = try Bytecode.Decoder.decode(bytes).module
+        let disassembly = Bytecode.Disassembler.disassemble(decoded)
+
+        #expect(decoded == module)
+        #expect(try Bytecode.Encoder.encode(decoded) == bytes)
+        #expect(disassembly.contains("array_index_base"))
+        #expect(disassembly.contains("array_rebase"))
+    }
+
     @Test("Text representation primitives share the current HLBC 1.0 wire format")
     func textRepresentationRoundTrip() throws {
         let strings = Bytecode.ValueType.array(.string)

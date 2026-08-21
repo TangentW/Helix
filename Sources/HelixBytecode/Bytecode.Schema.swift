@@ -649,6 +649,14 @@ public enum Instruction: Codable, Hashable, Sendable {
     case makeArray(result: Bytecode.Register, elements: [Bytecode.Register])
     case arrayCount(result: Bytecode.Register, array: Bytecode.Register)
     case arrayIsEmpty(result: Bytecode.Register, array: Bytecode.Register)
+    /// Reads the logical start index carried by Array-backed storage.
+    case arrayIndexBase(result: Bytecode.Register, array: Bytecode.Register)
+    /// Consumes Array-backed storage while assigning a new logical start index.
+    case arrayRebase(
+        result: Bytecode.Register,
+        array: Bytecode.Register,
+        indexBase: Bytecode.Register
+    )
     case arrayGet(
         result: Bytecode.Register,
         array: Bytecode.Register,
@@ -1084,6 +1092,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .makeArray(result, _),
              let .arrayCount(result, _),
              let .arrayIsEmpty(result, _),
+             let .arrayIndexBase(result, _),
+             let .arrayRebase(result, _, _),
              let .arrayGet(result, _, _),
              let .arrayBoundary(result, _, _),
              let .arraySearch(result, _, _, _),
@@ -1270,8 +1280,11 @@ public enum Instruction: Codable, Hashable, Sendable {
         case let .makeArray(_, elements):
             elements
         case let .arrayCount(_, array), let .arrayIsEmpty(_, array),
+             let .arrayIndexBase(_, array),
              let .arrayBoundary(_, _, array):
             [array]
+        case let .arrayRebase(_, array, indexBase):
+            [array, indexBase]
         case let .arrayGet(_, array, index):
             [array, index]
         case let .arraySearch(_, _, array, value):

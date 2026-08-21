@@ -97,6 +97,53 @@ enum RangeExpression {
         var bound: Bytecode.Register
     }
 
+    enum CollectionSliceBoundary: Equatable, Sendable {
+        case halfOpen
+        case closed
+        case partial(PartialBoundary)
+    }
+
+    struct CollectionSliceShape: Equatable, Sendable {
+        var boundary: CollectionSliceBoundary
+        var boundIdentity: String
+        var boundType: Bytecode.ValueType
+    }
+
+    static func parseCollectionSlice(
+        _ raw: String,
+        resolve: (String) throws -> Bytecode.ValueType
+    ) throws -> CollectionSliceShape? {
+        if let partial = try parsePartial(raw, resolve: resolve) {
+            return .init(
+                boundary: .partial(partial.boundary),
+                boundIdentity: partial.boundIdentity,
+                boundType: partial.boundType
+            )
+        }
+        let spelling = CanonicalSIL.SwiftTypeIdentity.normalized(raw)
+        guard let generic = CanonicalSIL.SwiftTypeIdentity.genericType(
+            spelling
+        ), generic.arguments.count == 1 else {
+            return nil
+        }
+        let boundary: CollectionSliceBoundary
+        switch generic.name {
+        case "Range": boundary = .halfOpen
+        case "ClosedRange": boundary = .closed
+        default: return nil
+        }
+        let boundIdentity = generic.arguments[0]
+        let boundType = try resolve(boundIdentity)
+        guard boundType.isVMComparable else {
+            throw CanonicalSIL.LoweringError.unsupportedType(spelling)
+        }
+        return .init(
+            boundary: boundary,
+            boundIdentity: boundIdentity,
+            boundType: boundType
+        )
+    }
+
     static func parsePartial(
         _ raw: String,
         resolve: (String) throws -> Bytecode.ValueType

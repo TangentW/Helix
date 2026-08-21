@@ -86,7 +86,7 @@ struct ContextualRuntimeTypes {
             elements: [nilValue, one]
         )
         try mutation.swapAt(0, 1, budget: generousBudget())
-        #expect(try mutation.finish() == [one, nilValue])
+        #expect(try mutation.finish().elements == [one, nilValue])
 
         let sort = try VM.ArraySortState(
             elementType: elementType,
@@ -119,7 +119,11 @@ struct ContextualRuntimeTypes {
         }
         #expect(
             try split.finish(budget: splitBudget) == [
-                .array([one], elementType: elementType),
+                .array(
+                    [one],
+                    elementType: elementType,
+                    indexBase: 1
+                ),
             ]
         )
     }

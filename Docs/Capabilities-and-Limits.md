@@ -173,9 +173,10 @@ does not by itself certify a physical device or distribution channel.
   writeback on both `end_apply` and `abort_apply`, covering nested and throwing
   inout mutation without collection-API-specific bytecode.
   Array append accepts represented copyable elements, including frozen imported
-  reference values. Array also supports zero-based `reverse()` and
-  `removeAll(where:)`; predicate removal is available for any represented
-  copyable element. Equality is defined recursively
+  reference values. Represented Array-backed integer-index collections also
+  support `reverse()` and `removeAll(where:)` while retaining a view's logical
+  base; predicate removal is available for any represented copyable element.
+  Equality is defined recursively
   for Bool, fixed-width integers, floating-point values, String, and supported
   Optional, Array, Dictionary, and Set values. Dictionary and Set comparison is
   order-independent, collection equality preserves Swift's shared-storage fast
@@ -184,10 +185,12 @@ does not by itself certify a physical device or distribution channel.
   String elements that the VM can compare without executing a user witness.
   Nonmutating `sorted()` accepts any represented managed Collection or
   supported finite progression with such an element, while mutating `sort()`
-  remains Array-only. Comparator-driven `sorted(by:)` accepts represented
+  accepts represented Array-backed mutable collections with integer indices.
+  Comparator-driven `sorted(by:)` accepts represented
   copyable Array, Set, and Dictionary elements plus supported finite
   progressions because the callback runs through the ordinary verified closure
-  ABI; mutating `sort(by:)` remains Array-only. Set supports empty and literal
+  ABI; mutating `sort(by:)` uses the same Array-backed integer-index boundary.
+  Set supports empty and literal
   construction, plus construction from Array, Set, and supported finite
   Sequences;
   `count`, `isEmpty`, `first`, `contains`, `insert`, `update`, `remove`,
@@ -235,10 +238,10 @@ does not by itself certify a physical device or distribution channel.
   Reverse `last(where:)` accepts String and Array-backed sources. String and
   Array-backed sources support Collection `prefix(while:)`/`drop(while:)`;
   direct Sequence `prefix(while:)` also accepts represented finite
-  specializations, including supported progressions. Zero-based
-  `firstIndex(where:)`/`lastIndex(where:)`, mutating `sort(by:)`,
-  zero-based `reverse()`, `removeAll(where:)`, and zero-based `partition(by:)`
-  retain their existing constraints. Producing
+  specializations, including supported progressions. Array-backed integer-index
+  sources preserve their logical base for `firstIndex(where:)`/
+  `lastIndex(where:)`, mutating sort, `reverse()`, `removeAll(where:)`, and
+  `partition(by:)`. Producing
   variants use one linear invocation-local element buffer followed by a typed
   String, Array, Dictionary, or Set finalizer instead of repeated copy-on-write edits.
   The `last` searches invoke their predicates from the end; comparator selection
@@ -265,11 +268,10 @@ does not by itself certify a physical device or distribution channel.
   `last` are constant-time bound queries; count is exact across the full
   element width and traps when its cardinality exceeds `Int.max`. Represented
   Comparable Range bounds also support `isEmpty` without implying iteration.
-  Reverse predicate search, index-returning search, other index-sensitive
-  Collection boundaries/subsequences, and using a one-sided partial range as
-  a potentially infinite Sequence source remain rejected until their
-  direction, index identity, complexity, or termination can be represented
-  exactly.
+  Progression index results, opaque-index collection operations, and using a
+  one-sided partial range as a potentially infinite Sequence source remain
+  rejected until their direction, index identity, complexity, or termination
+  can be represented exactly.
   Array-backed Collection and String `split` support both the
   `separator:maxSplits:omittingEmptySubsequences:` overload for recursively
   VM-defined Equatable elements and the throwing `whereSeparator:` overload
@@ -277,9 +279,9 @@ does not by itself certify a physical device or distribution channel.
   state: omitted empty segments do not consume `maxSplits`, predicate calls
   stop as soon as the limit is reached, a negative limit traps before any
   callback, and throwing edges destroy all transient ownership. Returned
-  subsequences preserve element order but are normalized to Arrays; String
-  subsequences use the represented `Substring` Character Array. Original
-  collection and String index identity is not retained.
+  subsequences preserve element order. Array-backed integer-index sources also
+  preserve each segment's logical lower bound; String subsequences use the
+  represented `Substring` Character Array and do not retain `String.Index`.
   The lazy Sequence `drop(while:)` overload remains rejected: eagerly
   materializing it would change predicate side-effect timing.
   `enumerated()`, `Array(sequence)`, heterogeneous `zip`, and `reversed()`
@@ -290,12 +292,18 @@ does not by itself certify a physical device or distribution channel.
   transforms, and relations; nested represented Character sequences can be
   flattened and reconstructed as String. Array-backed adapters additionally support
   `reversed()`, `repeatElement`, `Array(repeating:count:)`, count-based
-  `dropFirst`/`dropLast`/`prefix`/`suffix`, concrete Array index
-  prefixes/suffixes, `Range<Int>` slicing, `joined()`,
+  `dropFirst`/`dropLast`/`prefix`/`suffix`, integer-index
+  prefixes/suffixes, `Range<Int>`/`ClosedRange<Int>` and one-sided range
+  slicing, `joined()`,
   `joined(separator:)`, iteration, and composed `Slice<Base>` when `Base` is
-  already Array-backed. These views are normalized by element sequence; index-based
-  operations on a derived ArraySlice remain rejected until its preserved base
-  index is modeled, rather than being treated incorrectly as zero-based.
+  already Array-backed. This includes explicit `Slice(base:bounds:)`, concrete
+  Slice boundaries/movement/indices, and read/write element subscripts.
+  `ArraySlice` and recursively Array-backed `Slice`
+  values carry their logical base through nested views, bounds, movement,
+  distance, indices, element/range subscripts, searches, predicate subsequences,
+  split, sorting, and supported mutations. `Array(sequence)` intentionally
+  resets the newly materialized Array to zero. Collections with opaque private
+  indices remain fail-closed rather than being approximated as integer offsets.
   `Optional.map`/`flatMap`
   and concrete `Result.map`/`mapError`/`flatMap`/`flatMapError` whose payloads
   are valid patch-local values use one selected-case transform with explicit
@@ -337,8 +345,10 @@ does not by itself certify a physical device or distribution channel.
   String/Substring source is normalized through the existing materialization
   boundary. These are compiler-only range values: no Swift generic collection
   ABI is serialized, no standard-library method becomes a NativeImport, and no
-  source-API-specific opcode is added. Custom `Comparable` witnesses, private
-  `String.Index`, and derived ArraySlice indices remain fail-closed.
+  source-API-specific opcode is added. The same range subscripts work for
+  represented Array-backed integer-index views and retain their lower bound.
+  Custom `Comparable` witnesses and private indices such as `String.Index`
+  remain fail-closed.
 - Newly introduced, non-exported file- or module-scope patch-local nonrecursive
   stored struct and enum values, concrete `Result`, field extraction, enum
   switch, instance/static computed getters and setters, and supported mutating

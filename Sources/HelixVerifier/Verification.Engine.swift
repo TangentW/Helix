@@ -2349,6 +2349,31 @@ public struct Engine: Verification.ImageVerifying {
             guard type(result) == .bool, case .array = type(array) else {
                 throw fail("array_is_empty needs an Array operand and Bool result")
             }
+        case let .arrayIndexBase(result, array):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail(
+                    "Array-backed index identity requires \(Core.Capability.collectionsV1)"
+                )
+            }
+            guard type(result) == .int64, case .array = type(array) else {
+                throw fail(
+                    "array_index_base needs an Array-backed operand and Int64 result"
+                )
+            }
+        case let .arrayRebase(result, array, indexBase):
+            guard capabilities.contains(.collectionsV1) else {
+                throw fail(
+                    "Array-backed index identity requires \(Core.Capability.collectionsV1)"
+                )
+            }
+            guard case .array = type(array),
+                  type(result) == type(array),
+                  type(indexBase) == .int64
+            else {
+                throw fail(
+                    "array_rebase requires matching Arrays and an Int64 base"
+                )
+            }
         case let .arrayGet(result, array, index):
             guard capabilities.contains(.collectionsV1) else {
                 throw fail("Array subscript requires \(Core.Capability.collectionsV1)")
@@ -3861,6 +3886,18 @@ public struct Engine: Verification.ImageVerifying {
                         }
                     }
                     if function.type(of: result)?.requiresLinearOwnership == true { live.insert(result) }
+                case let .arrayRebase(result, array, _):
+                    if function.type(of: array)?.requiresLinearOwnership
+                        == true,
+                       live.remove(array) == nil {
+                        throw fail(
+                            "array_rebase consumes a non-live Array"
+                        )
+                    }
+                    if function.type(of: result)?.requiresLinearOwnership
+                        == true {
+                        live.insert(result)
+                    }
                 case let .select(result, _, _, _),
                      let .arrayGet(result, _, _),
                      let .arrayBoundary(result, _, _),
@@ -4073,7 +4110,8 @@ public struct Engine: Verification.ImageVerifying {
                      .stringPredicate, .stringTransform, .stringCharacters,
                      .stringJoin, .scalarFromString, .integerToString,
                      .stringify,
-                     .arrayCount, .arrayIsEmpty, .arraySearch,
+                     .arrayCount, .arrayIsEmpty, .arrayIndexBase,
+                     .arraySearch,
                      .dictionaryCount, .dictionaryIsEmpty,
                      .setCount, .setIsEmpty, .setContains, .setRelation,
                      .compare:

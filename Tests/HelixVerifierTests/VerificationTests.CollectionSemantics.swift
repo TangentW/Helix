@@ -129,6 +129,62 @@ struct CollectionSemantics {
 
     }
 
+    @Test("Array index identity primitives require matching typed storage")
+    func verifiesArrayIndexIdentity() throws {
+        let integers = Bytecode.ValueType.array(.int64)
+        _ = try verify(
+            fixture(
+                parameterTypes: [integers],
+                resultType: .int64,
+                registerTypes: [integers, .int64],
+                instruction: .arrayIndexBase(
+                    result: register(1),
+                    array: register(0)
+                ),
+                cleanup: [.destroyValue(register(0))]
+            )
+        )
+        _ = try verify(
+            fixture(
+                parameterTypes: [integers, .int64],
+                resultType: integers,
+                registerTypes: [integers, .int64, integers],
+                instruction: .arrayRebase(
+                    result: register(2),
+                    array: register(0),
+                    indexBase: register(1)
+                )
+            )
+        )
+
+        try expectInvalid(
+            fixture(
+                parameterTypes: [integers],
+                resultType: .bool,
+                registerTypes: [integers, .bool],
+                instruction: .arrayIndexBase(
+                    result: register(1),
+                    array: register(0)
+                ),
+                cleanup: [.destroyValue(register(0))]
+            ),
+            reason: "array_index_base needs an Array-backed operand and Int64 result"
+        )
+        try expectInvalid(
+            fixture(
+                parameterTypes: [integers, .bool],
+                resultType: integers,
+                registerTypes: [integers, .bool, integers],
+                instruction: .arrayRebase(
+                    result: register(2),
+                    array: register(0),
+                    indexBase: register(1)
+                )
+            ),
+            reason: "array_rebase requires matching Arrays and an Int64 base"
+        )
+    }
+
     @Test("Ordering predicates cannot manufacture Comparable for Bool")
     func rejectsSyntheticOrdering() throws {
         try expectInvalid(
@@ -287,6 +343,33 @@ struct CollectionSemantics {
 
         _ = try verify(adapterFixture)
 
+        var rebaseFixture = try fixture(
+            parameterTypes: [array, .int64],
+            resultType: array,
+            registerTypes: [array, .int64, array],
+            instruction: .arrayRebase(
+                result: register(2),
+                array: register(0),
+                indexBase: register(1)
+            )
+        )
+        rebaseFixture.module.capabilities.insert(.nativeTypesV1)
+        rebaseFixture.shell.capabilities.insert(.nativeTypesV1)
+        rebaseFixture.policy.acceptedCapabilities.insert(.nativeTypesV1)
+        rebaseFixture.shell.types = adapterFixture.shell.types
+        _ = try verify(rebaseFixture)
+
+        var reusedRebaseFixture = rebaseFixture
+        reusedRebaseFixture.module.functions[0].blocks[0].instructions.insert(
+            .destroyValue(register(0)),
+            at: 1
+        )
+        try expectInvalid(
+            reusedRebaseFixture,
+            offset: 1,
+            reason: "instruction uses a consumed owned value"
+        )
+
         var materializationFixture = try fixture(
             parameterTypes: [array],
             resultType: array,
@@ -400,13 +483,14 @@ struct CollectionSemantics {
 
     private func expectInvalid(
         _ fixture: Fixture,
+        offset: Int = 0,
         reason: String
     ) throws {
         #expect(
             throws: Verification.Error.invalidInstruction(
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
-                offset: 0,
+                offset: offset,
                 reason: reason
             )
         ) {

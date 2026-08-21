@@ -165,10 +165,20 @@ Both workflows depend on stable, build-specific identities:
   `Array(sequence)`, and heterogeneous `zip`—reuse one typed Array
   materialization path and the existing bounded Array algorithms. Reversed,
   repeated, sliced, and joined views remain Array-backed where their index or
-  nested-sequence semantics need that stronger representation. Only element-
-  sequence semantics are normalized; an ArraySlice's non-zero-based index
-  identity is not erased into an Array index, so unsupported slice-index APIs
-  still fail closed.
+  nested-sequence semantics need that stronger representation. Array-backed
+  storage keeps physical elements separate from a logical integer index base.
+  The compiler classifies each concrete source as zero-based, preserved-base,
+  or opaque; `ArraySlice` and recursively Array-backed `Slice` values therefore
+  retain their public bounds across calls, aggregates, Optional storage,
+  derived views, search, split, ordering, and mutation. The explicit
+  `Slice(base:bounds:)` constructor and concrete Slice index/
+  subscript ABI shapes normalize at the frontend into those same range and
+  mutation semantics. Two generic HLBC primitives read or replace that base;
+  replacement consumes an owned temporary and transfers its storage metadata
+  without copying the elements again. Collection APIs still lower to shared
+  cursor, range, builder, and mutation semantics rather than per-API opcodes.
+  Private index identities such as `String.Index` and
+  `ReversedCollection.Index` remain fail-closed.
 - Swift text has a logical contract separate from its compact HLBC storage.
   String and Character both occupy the verifier's String value type, but every
   Character producer and Shell codec proves exactly one extended grapheme

@@ -239,18 +239,25 @@ struct HigherOrderReverseTraversalSemanticsMatrix {
         ])
     }
 
-    @Test("lastIndex rejects normalized collections whose index identity is lost")
-    func rejectsUnrepresentedLastIndices() {
+    @Test("lastIndex preserves slices and rejects opaque reversed indices")
+    func rejectsUnrepresentedLastIndices() throws {
+        let sliced = try FrontendExecutionHarness.compile(
+            source: """
+            public func slicedLastIndex(_ values: [Int]) -> Int? {
+                values.dropFirst().lastIndex { $0 > 0 }
+            }
+            """,
+            functionName: "slicedLastIndex",
+            moduleName: "HelixReverseTraversal_slicedLastIndex"
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: sliced.entry,
+                image: sliced.image,
+                arguments: [try integers([0, 2, 3])]
+            ) == .returned(.optional(try integer(2)))
+        )
         let probes = [
-            (
-                name: "slicedLastIndex",
-                source: """
-                public func slicedLastIndex(_ values: [Int]) -> Int? {
-                    values.dropFirst().lastIndex { $0 > 0 }
-                }
-                """,
-                expectedType: "ArraySlice<Int>"
-            ),
             (
                 name: "reversedLastIndex",
                 source: """

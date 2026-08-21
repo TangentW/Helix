@@ -232,13 +232,13 @@ enum DynamicAny {
             }
             return try boxOptional(decoded, wrappedType: wrapped)
         case let .array(element):
-            guard case let .array(elements, actualElement) = value,
-                  actualElement == element
+            guard case let .array(storage) = value,
+                  storage.elementType == element
             else {
                 throw VM.RuntimeTrap.typeMismatch(expected: type, actual: value.type)
             }
             return try decodeArray(
-                elements,
+                storage.elements,
                 elementType: element,
                 depth: depth + 1
             )

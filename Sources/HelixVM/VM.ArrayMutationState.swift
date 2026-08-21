@@ -12,10 +12,17 @@ public final class ArrayMutationState: @unchecked Sendable, Hashable,
     CustomStringConvertible {
     private let lock = NSLock()
     let elementType: Bytecode.ValueType
+    // Algorithms address dense physical slots; finish reattaches this base to
+    // the completed value exposed to Swift collection semantics.
+    private let indexBase: Int64
     private var elements: [VM.Value]
     private var isFinished = false
 
-    init(elementType: Bytecode.ValueType, elements: [VM.Value]) throws {
+    init(
+        elementType: Bytecode.ValueType,
+        elements: [VM.Value],
+        indexBase: Int64 = 0
+    ) throws {
         if let mismatched = elements.first(where: { !$0.hasRuntimeType(elementType) }) {
             throw VM.RuntimeTrap.typeMismatch(
                 expected: elementType,
@@ -24,6 +31,12 @@ public final class ArrayMutationState: @unchecked Sendable, Hashable,
         }
         self.elementType = elementType
         self.elements = elements
+        self.indexBase = indexBase
+        _ = try VM.ArrayStorage(
+            elements: elements,
+            elementType: elementType,
+            indexBase: indexBase
+        ).endIndex()
     }
 
     func element(
@@ -60,7 +73,7 @@ public final class ArrayMutationState: @unchecked Sendable, Hashable,
         }
     }
 
-    func finish() throws -> [VM.Value] {
+    func finish() throws -> VM.ArrayStorage {
         try lock.withLock {
             guard !isFinished else {
                 throw VM.RuntimeTrap.explicit(
@@ -68,7 +81,11 @@ public final class ArrayMutationState: @unchecked Sendable, Hashable,
                 )
             }
             isFinished = true
-            let result = elements
+            let result = VM.ArrayStorage(
+                elements: elements,
+                elementType: elementType,
+                indexBase: indexBase
+            )
             elements = []
             return result
         }

@@ -329,7 +329,9 @@ struct RangeReplaceableCollectionMutationSemanticsMatrix {
             invoke(
                 fixture,
                 arguments: [try integers([0, 1, 2]), try integer(8), .bool(true)]
-            ) == .returned(try integers([]))
+            ) == .returned(
+                .array([], elementType: .int64, indexBase: 1)
+            )
         )
         #expect(
             invoke(

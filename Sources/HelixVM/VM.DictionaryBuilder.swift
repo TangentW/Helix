@@ -110,29 +110,55 @@ public final class DictionaryBuilder: @unchecked Sendable, Hashable,
                 )
                 return
             }
-            guard entries.indices.contains(matchingIndex),
-                  entries[matchingIndex].value.hasRuntimeType(valueType)
-            else {
-                throw VM.RuntimeTrap.invalidProgramCounter
-            }
 
             // Move the uniquely owned Array buffer out of the entry before
             // appending. Keeping the old enum payload alive here would force
             // Swift COW to copy the entire group on every element.
-            var owned = entries[matchingIndex].value
-            guard case .array(var elements, let actualType) = owned,
-                  actualType == elementType
-            else {
-                throw VM.RuntimeTrap.invalidProgramCounter
+            let indexBase: Int64
+            var elements: [VM.Value]
+            do {
+                guard let storage = try arrayStorageForAppendLocked(
+                    matchingIndex: matchingIndex,
+                    elementType: elementType
+                ) else {
+                    throw VM.RuntimeTrap.invalidProgramCounter
+                }
+                indexBase = storage.indexBase
+                elements = storage.elements
+                entries[matchingIndex].value = .array(
+                    [],
+                    elementType: elementType,
+                    indexBase: indexBase
+                )
             }
-            entries[matchingIndex].value = .array(
-                [],
-                elementType: elementType
-            )
-            owned = .array([], elementType: elementType)
             elements.append(element)
             entries[matchingIndex].value = .array(
                 elements,
+                elementType: elementType,
+                indexBase: indexBase
+            )
+        }
+    }
+
+    /// Validates count growth before the interpreter charges or copies the
+    /// appended element. `appendArrayElement` repeats the check under the same
+    /// lock as mutation so the state remains sound if its execution model ever
+    /// becomes concurrent.
+    func preflightArrayElementAppend(matchingIndex: Int?) throws {
+        try withLock {
+            guard !isFinished else {
+                throw VM.RuntimeTrap.explicit(
+                    "Dictionary builder is already finished"
+                )
+            }
+            guard case let .array(elementType) = valueType else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: .array(.never),
+                    actual: valueType
+                )
+            }
+            _ = try arrayStorageForAppendLocked(
+                matchingIndex: matchingIndex,
                 elementType: elementType
             )
         }
@@ -165,6 +191,31 @@ public final class DictionaryBuilder: @unchecked Sendable, Hashable,
 
     public var description: String {
         "DictionaryBuilder<\(keyType), \(valueType)>"
+    }
+
+    /// Caller must hold `lock`; mutation uses the returned storage before
+    /// releasing that lock.
+    private func arrayStorageForAppendLocked(
+        matchingIndex: Int?,
+        elementType: Bytecode.ValueType
+    ) throws -> VM.ArrayStorage? {
+        guard let matchingIndex else { return nil }
+        guard entries.indices.contains(matchingIndex),
+              entries[matchingIndex].value.hasRuntimeType(valueType),
+              case let .array(storage) = entries[matchingIndex].value,
+              storage.elementType == elementType
+        else {
+            throw VM.RuntimeTrap.invalidProgramCounter
+        }
+        let newCount = storage.elements.count.addingReportingOverflow(1)
+        guard !newCount.overflow else {
+            throw VM.RuntimeTrap.vmHeapLimitExceeded
+        }
+        _ = try VM.ArrayStorage.validatedEndIndex(
+            elementCount: newCount.partialValue,
+            indexBase: storage.indexBase
+        )
+        return storage
     }
 
     private func withLock<T>(_ body: () throws -> T) rethrows -> T {

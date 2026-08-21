@@ -5,12 +5,6 @@ import HelixInterface
 
 extension CanonicalSIL {
 public struct TypeEnvironment: Sendable {
-    enum CollectionIndexModel: Sendable {
-        case zeroBasedInteger
-        case preservedBaseInteger
-        case opaque
-    }
-
     indirect enum StructFieldPlan: Sendable {
         case parameter(index: Int, type: Bytecode.ValueType)
         case tuple(
@@ -467,32 +461,10 @@ public struct TypeEnvironment: Sendable {
         try resolve(raw, relativeTo: nil)
     }
 
-    /// Array-backed normalization can preserve element order without always
-    /// preserving a Collection's public index identity.
-    func collectionIndexModel(for raw: String) -> CollectionIndexModel {
-        var type = raw.trimmingCharacters(in: .whitespaces)
-        var removedPrefix = true
-        while removedPrefix {
-            removedPrefix = false
-            for prefix in [
-                "$", "@owned ", "@guaranteed ", "@unowned ",
-                "@autoreleased ", "@in ", "@in_guaranteed ",
-            ] where type.hasPrefix(prefix) {
-                type.removeFirst(prefix.count)
-                type = type.trimmingCharacters(in: .whitespaces)
-                removedPrefix = true
-                break
-            }
-        }
-        if ["Array<", "Swift.Array<", "Repeated<", "Swift.Repeated<"]
-            .contains(where: type.hasPrefix) {
-            return .zeroBasedInteger
-        }
-        if ["ArraySlice<", "Swift.ArraySlice<"]
-            .contains(where: type.hasPrefix) {
-            return .preservedBaseInteger
-        }
-        return .opaque
+    func collectionIndexModel(
+        for raw: String
+    ) -> CanonicalSIL.CollectionIndex.Model {
+        CanonicalSIL.CollectionIndex.model(for: raw)
     }
 
     private func resolve(
@@ -623,9 +595,9 @@ public struct TypeEnvironment: Sendable {
         }
 
         // These standard-library adapters are compiler-only views in HLBC.
-        // Their supported APIs observe sequence elements, not private storage
-        // or index wrappers, so lowering normalizes them to the VM's typed
-        // Array representation and keeps unsupported index APIs fail-closed.
+        // Array-backed integer-index slices retain a logical base in the VM
+        // value; adapters with private index wrappers remain fail-closed for
+        // index-sensitive APIs even when their elements normalize to Array.
         for slicePrefix in ["Slice<", "Swift.Slice<"]
         where type.hasPrefix(slicePrefix) && type.hasSuffix(">") {
             let base = ValueRepresentation.storable(

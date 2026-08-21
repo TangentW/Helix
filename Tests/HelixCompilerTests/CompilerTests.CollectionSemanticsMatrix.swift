@@ -385,7 +385,7 @@ struct CollectionSemanticsMatrix {
         ])
     }
 
-    @Test("Array indices and distance lower to checked Int progressions")
+    @Test("Array indices enforce Collection bounds and checked Int progressions")
     func lowersArrayIndexAPIs() throws {
         try run([
             Probe(
@@ -446,10 +446,20 @@ struct CollectionSemanticsMatrix {
                     .init(
                         arguments: [
                             try integers([1]),
+                            try integer(0),
+                            try integer(1),
+                        ],
+                        expected: .returned(try integer(1))
+                    ),
+                    .init(
+                        arguments: [
+                            try integers([1]),
                             try integer(-1),
                             try integer(0),
                         ],
-                        expected: .returned(try integer(1))
+                        expected: .trapped(
+                            .explicit("Collection index is out of bounds")
+                        )
                     ),
                     .init(
                         arguments: [
@@ -457,7 +467,9 @@ struct CollectionSemanticsMatrix {
                             try integer(0),
                             try integer(2),
                         ],
-                        expected: .returned(try integer(2))
+                        expected: .trapped(
+                            .explicit("Collection index is out of bounds")
+                        )
                     ),
                     .init(
                         arguments: [
@@ -465,7 +477,9 @@ struct CollectionSemanticsMatrix {
                             try integer(.min),
                             try integer(.max),
                         ],
-                        expected: .trapped(.integerOverflow)
+                        expected: .trapped(
+                            .explicit("Collection index is out of bounds")
+                        )
                     ),
                 ]
             ),
@@ -501,24 +515,30 @@ struct CollectionSemanticsMatrix {
                 """,
                 scenarios: [
                     .init(
-                        arguments: [try integers([1, 2, 3]), try integer(0)],
+                        arguments: [try integers([1, 2, 3]), try integer(1)],
                         expected: .returned(
-                            .tuple([try integer(1), try integer(-1)])
+                            .tuple([try integer(2), try integer(0)])
                         )
                     ),
                     .init(
-                        arguments: [try integers([]), try integer(-1)],
-                        expected: .returned(
-                            .tuple([try integer(0), try integer(-2)])
+                        arguments: [try integers([1, 2, 3]), try integer(0)],
+                        expected: .trapped(
+                            .explicit(
+                                "Collection index(before:) precedes startIndex"
+                            )
                         )
                     ),
                     .init(
                         arguments: [try integers([]), try integer(.max)],
-                        expected: .trapped(.integerOverflow)
+                        expected: .trapped(
+                            .explicit("Collection index is out of bounds")
+                        )
                     ),
                     .init(
                         arguments: [try integers([]), try integer(.min)],
-                        expected: .trapped(.integerOverflow)
+                        expected: .trapped(
+                            .explicit("Collection index is out of bounds")
+                        )
                     ),
                 ]
             ),
@@ -537,10 +557,28 @@ struct CollectionSemanticsMatrix {
                     .init(
                         arguments: [
                             try integers([1, 2, 3]),
+                            try integer(0),
+                            try integer(2),
+                        ],
+                        expected: .returned(try integer(2))
+                    ),
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]),
+                            try integer(3),
+                            try integer(-3),
+                        ],
+                        expected: .returned(try integer(0))
+                    ),
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]),
                             try integer(-1),
                             try integer(2),
                         ],
-                        expected: .returned(try integer(1))
+                        expected: .trapped(
+                            .explicit("Collection index is out of bounds")
+                        )
                     ),
                     .init(
                         arguments: [
@@ -548,7 +586,27 @@ struct CollectionSemanticsMatrix {
                             try integer(.min),
                             try integer(-1),
                         ],
+                        expected: .trapped(
+                            .explicit("Collection index is out of bounds")
+                        )
+                    ),
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]),
+                            try integer(3),
+                            try integer(.max),
+                        ],
                         expected: .trapped(.integerOverflow)
+                    ),
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]),
+                            try integer(0),
+                            try integer(4),
+                        ],
+                        expected: .trapped(
+                            .explicit("Collection index is out of bounds")
+                        )
                     ),
                 ]
             ),
@@ -574,14 +632,8 @@ struct CollectionSemanticsMatrix {
                     try limitedOffsetScenario(2, -2, limit: 1, expected: nil),
                     try limitedOffsetScenario(2, -2, limit: 0, expected: 0),
                     try limitedOffsetScenario(2, 1, limit: 0, expected: 3),
-                    try limitedOffsetScenario(0, -1, limit: 2, expected: -1),
+                    try limitedOffsetScenario(1, -1, limit: 3, expected: 0),
                     try limitedOffsetScenario(0, 0, limit: 0, expected: 0),
-                    try limitedOffsetScenario(
-                        .max,
-                        1,
-                        limit: .max,
-                        expected: nil
-                    ),
                     try limitedOffsetScenario(
                         0,
                         .max,
@@ -589,25 +641,41 @@ struct CollectionSemanticsMatrix {
                         expected: nil
                     ),
                     try limitedOffsetScenario(
-                        .min,
-                        -1,
-                        limit: .min,
-                        expected: nil
-                    ),
-                    try limitedOffsetScenario(
-                        0,
-                        .min,
-                        limit: -1,
+                        3,
+                        .max,
+                        limit: 3,
                         expected: nil
                     ),
                     .init(
                         arguments: [
-                            try integers([]),
+                            try integers([1, 2, 3]),
+                            try integer(3),
                             try integer(.max),
-                            try integer(1),
-                            try integer(.min),
+                            try integer(0),
                         ],
                         expected: .trapped(.integerOverflow)
+                    ),
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]),
+                            try integer(-1),
+                            try integer(1),
+                            try integer(2),
+                        ],
+                        expected: .trapped(
+                            .explicit("Collection index is out of bounds")
+                        )
+                    ),
+                    .init(
+                        arguments: [
+                            try integers([1, 2, 3]),
+                            try integer(0),
+                            try integer(-1),
+                            try integer(-1),
+                        ],
+                        expected: .trapped(
+                            .explicit("Collection index is out of bounds")
+                        )
                     ),
                 ]
             ),

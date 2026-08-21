@@ -61,17 +61,6 @@ enum CollectionIntrinsic: Equatable {
         case dictionary
     }
 
-    enum ArrayIndexOperation: Equatable {
-        case start
-        case end
-        case distance
-        case indices
-        case after
-        case before
-        case offsetBy
-        case offsetByLimited
-    }
-
     enum IteratorShape: Equatable {
         case collection
         case reversed
@@ -85,9 +74,10 @@ enum CollectionIntrinsic: Equatable {
         case transform(Bytecode.ArrayAdapterOperation)
         case arrayFromSequence
         case arrayRepeat(hasMetatype: Bool)
+        case sliceFromBounds
         case subsequence(Bytecode.ArraySubsequenceOperation)
         case rangeSlice
-        case partialRangeSlice
+        case rangeExpressionSlice
         case fullRangeSlice
         case zip
         case joined(hasSeparator: Bool)
@@ -233,7 +223,7 @@ enum CollectionIntrinsic: Equatable {
     case search(Bytecode.ArraySearchOperation)
     case extremum(ExtremumOperation)
     case relation(RelationOperation)
-    case arrayIndex(ArrayIndexOperation)
+    case collectionIndex(CanonicalSIL.CollectionIndex.Intrinsic)
     case adapter(Adapter)
     case rangeReplaceableEdit(RangeReplaceableEdit)
     case rangeReplaceableAppend(RangeReplaceableAppend)
@@ -300,21 +290,97 @@ enum CollectionIntrinsic: Equatable {
         case "$sSTsSL7ElementRpzrlE25lexicographicallyPrecedesySbqd__STRd__AAQyd__ABRSlF":
             self = .relation(.lexicographicallyPrecedes)
         case "$sSa10startIndexSivg":
-            self = .arrayIndex(.start)
+            self = .collectionIndex(
+                .init(operation: .start, source: .arrayElement)
+            )
+        case "$ss10ArraySliceV10startIndexSivg":
+            self = .collectionIndex(
+                .init(operation: .start, source: .arraySliceElement)
+            )
+        case "$ss5SliceV10startIndex0C0Qzvg":
+            self = .collectionIndex(
+                .init(operation: .start, source: .sliceBase)
+            )
         case "$sSa8endIndexSivg":
-            self = .arrayIndex(.end)
+            self = .collectionIndex(
+                .init(operation: .end, source: .arrayElement)
+            )
+        case "$ss10ArraySliceV8endIndexSivg":
+            self = .collectionIndex(
+                .init(operation: .end, source: .arraySliceElement)
+            )
+        case "$ss5SliceV8endIndex0C0Qzvg":
+            self = .collectionIndex(
+                .init(operation: .end, source: .sliceBase)
+            )
         case "$sSa8distance4from2toS2i_SitF":
-            self = .arrayIndex(.distance)
+            self = .collectionIndex(
+                .init(operation: .distance, source: .arrayElement)
+            )
+        case "$ss10ArraySliceV8distance4from2toS2i_SitF":
+            self = .collectionIndex(
+                .init(operation: .distance, source: .arraySliceElement)
+            )
+        case "$ss5SliceV8distance4from2toSi5IndexQz_AGtF":
+            self = .collectionIndex(
+                .init(operation: .distance, source: .sliceBase)
+            )
         case "$sSksSx5IndexRpzSnyABG7IndicesRtzSiAA_6StrideRTzrlE7indicesACvg":
-            self = .arrayIndex(.indices)
+            self = .collectionIndex(
+                .init(operation: .indices, source: .genericCollection)
+            )
+        case "$ss5SliceV7indices7IndicesQzvg":
+            self = .collectionIndex(
+                .init(operation: .indices, source: .sliceBase)
+            )
         case "$sSa5index5afterS2i_tF":
-            self = .arrayIndex(.after)
+            self = .collectionIndex(
+                .init(operation: .after, source: .arrayElement)
+            )
+        case "$ss10ArraySliceV5index5afterS2i_tF":
+            self = .collectionIndex(
+                .init(operation: .after, source: .arraySliceElement)
+            )
+        case "$ss5SliceV5index5after5IndexQzAF_tF":
+            self = .collectionIndex(
+                .init(operation: .after, source: .sliceBase)
+            )
         case "$sSa5index6beforeS2i_tF":
-            self = .arrayIndex(.before)
+            self = .collectionIndex(
+                .init(operation: .before, source: .arrayElement)
+            )
+        case "$ss10ArraySliceV5index6beforeS2i_tF":
+            self = .collectionIndex(
+                .init(operation: .before, source: .arraySliceElement)
+            )
+        case "$ss5SliceVsSKRzrlE5index6before5IndexQzAF_tF":
+            self = .collectionIndex(
+                .init(operation: .before, source: .sliceBase)
+            )
         case "$sSa5index_8offsetByS2i_SitF":
-            self = .arrayIndex(.offsetBy)
+            self = .collectionIndex(
+                .init(operation: .offsetBy, source: .arrayElement)
+            )
+        case "$ss10ArraySliceV5index_8offsetByS2i_SitF":
+            self = .collectionIndex(
+                .init(operation: .offsetBy, source: .arraySliceElement)
+            )
+        case "$ss5SliceV5index_8offsetBy5IndexQzAF_SitF":
+            self = .collectionIndex(
+                .init(operation: .offsetBy, source: .sliceBase)
+            )
         case "$sSa5index_8offsetBy07limitedC0SiSgSi_S2itF":
-            self = .arrayIndex(.offsetByLimited)
+            self = .collectionIndex(
+                .init(operation: .offsetByLimited, source: .arrayElement)
+            )
+        case "$ss10ArraySliceV5index_8offsetBy07limitedE0SiSgSi_S2itF":
+            self = .collectionIndex(
+                .init(operation: .offsetByLimited, source: .arraySliceElement)
+            )
+        case "$ss5SliceV5index_8offsetBy07limitedD05IndexQzSgAG_SiAGtF":
+            self = .collectionIndex(
+                .init(operation: .offsetByLimited, source: .sliceBase)
+            )
         case "$sSTsE10enumerateds18EnumeratedSequenceVyxGyF":
             self = .adapter(.transform(.enumerated))
         case "$sSKsE8reverseds18ReversedCollectionVyxGyF":
@@ -325,6 +391,8 @@ enum CollectionIntrinsic: Equatable {
             self = .adapter(.arrayRepeat(hasMetatype: true))
         case "$ss13repeatElement_5counts8RepeatedVyxGx_SitlF":
             self = .adapter(.arrayRepeat(hasMetatype: false))
+        case "$ss5SliceV4base6boundsAByxGx_Sny5IndexQzGtcfC":
+            self = .adapter(.sliceFromBounds)
         case "$sSlsE9dropFirsty11SubSequenceQzSiF":
             self = .adapter(.subsequence(.dropFirst))
         case "$sSlsE8dropLasty11SubSequenceQzSiF",
@@ -340,10 +408,11 @@ enum CollectionIntrinsic: Equatable {
             self = .adapter(.subsequence(.prefixThrough))
         case "$sSlsE6suffix4from11SubSequenceQz5IndexQz_tF":
             self = .adapter(.subsequence(.suffixFrom))
-        case "$sSays10ArraySliceVyxGSnySiGcig":
+        case "$sSays10ArraySliceVyxGSnySiGcig",
+             "$ss10ArraySliceVyAByxGSnySiGcig":
             self = .adapter(.rangeSlice)
         case "$sSMsEy11SubSequenceQzqd__cSXRd__5BoundQyd__5IndexRtzluig":
-            self = .adapter(.partialRangeSlice)
+            self = .adapter(.rangeExpressionSlice)
         case
             CanonicalSIL.RangeExpression.unboundedCollectionSubscriptMangledName,
             CanonicalSIL.RangeExpression
@@ -473,7 +542,8 @@ enum CollectionIntrinsic: Equatable {
             self = .arrayEdit(.insertElement)
         case "$sSmsE6insert10contentsOf2atyqd__n_5IndexQztSlRd__7ElementQyd__AFRtzlF":
             self = .arrayEdit(.insertContents)
-        case "$sSa15replaceSubrange_4withySnySiG_qd__nt7ElementQyd__RszSlRd__lF":
+        case "$sSa15replaceSubrange_4withySnySiG_qd__nt7ElementQyd__RszSlRd__lF",
+             "$ss10ArraySliceV15replaceSubrange_4withySnySiG_qd__nt7ElementQyd__RszSlRd__lF":
             self = .arrayEdit(.replaceSubrange)
         case "$sSa6remove2atxSi_tF":
             self = .arrayEdit(.removeAt)

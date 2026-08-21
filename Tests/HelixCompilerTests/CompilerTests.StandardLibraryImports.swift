@@ -33,13 +33,13 @@ struct StandardLibraryImports {
         ) throws -> VM.NativeInvocationResult {
             try context.checkpoint()
             guard arguments.count == 3,
-                  case let .array(values, elementType) = arguments[0],
-                  elementType == .any,
-                  values.count == 2,
-                  case let .any(label) = values[0],
+                  case let .array(storage) = arguments[0],
+                  storage.elementType == .any,
+                  storage.elements.count == 2,
+                  case let .any(label) = storage.elements[0],
                   label.concreteType == .string,
                   label.payload == .string("value: 4"),
-                  case let .any(number) = values[1],
+                  case let .any(number) = storage.elements[1],
                   number.concreteType == .int64,
                   case let .integer(integer) = number.payload,
                   integer.signedValue == 4,

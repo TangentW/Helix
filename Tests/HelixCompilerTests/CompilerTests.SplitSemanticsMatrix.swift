@@ -116,6 +116,23 @@ struct SplitSemanticsMatrix {
                 try splitNestedIntegers([[[1]], [[2]], [[3]]])
             )
         )
+
+        let indices = try FrontendExecutionHarness.compile(
+            source: """
+            public func splitIndices(_ values: [Int]) -> [Int] {
+                values.dropFirst().split(separator: 0).map { $0.startIndex }
+            }
+            """,
+            functionName: "splitIndices",
+            moduleName: "HelixSplitIndicesFixture"
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: indices.entry,
+                image: indices.image,
+                arguments: [try integers([9, 1, 0, 2])]
+            ) == .returned(try integers([1, 3]))
+        )
     }
 
     @Test("Predicate split supports captures, throws, and exact early stop")

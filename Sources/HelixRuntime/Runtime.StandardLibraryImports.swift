@@ -49,8 +49,8 @@ public enum StandardLibraryImports {
 
     static func formatPrint(arguments: [VM.Value]) throws -> String {
         guard arguments.count == 3,
-              case let .array(values, elementType) = arguments[0],
-              elementType == .any
+              case let .array(storage) = arguments[0],
+              storage.elementType == .any
         else {
             throw VM.RuntimeTrap.nativeFailure(
                 "Swift.print expects Array<Any>, String, and String"
@@ -66,7 +66,7 @@ public enum StandardLibraryImports {
         )
 
         var buffer = PrintBuffer(maximumUTF8Bytes: maximumPrintUTF8Bytes)
-        for (index, value) in values.enumerated() {
+        for (index, value) in storage.elements.enumerated() {
             if index > 0 { buffer.write(separator) }
             let decoded = try Runtime.BridgeValueCodec.decodeAny(value)
             Swift.print(decoded, terminator: "", to: &buffer)

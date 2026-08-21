@@ -466,9 +466,12 @@ public final class InvocationBudget: @unchecked Sendable {
         case let .string(string):
             try consumeUTF8Work(byteCount: string.utf8.count)
             try consumeVMHeap(bytes: UInt64(string.utf8.count))
-        case let .array(values, _):
-            try consumeAggregateStorage(elementCount: values.count)
-            for value in values { try consumeBoundaryValue(value, depth: depth + 1) }
+        case let .array(storage):
+            _ = try storage.endIndex()
+            try consumeAggregateStorage(elementCount: storage.elements.count)
+            for value in storage.elements {
+                try consumeBoundaryValue(value, depth: depth + 1)
+            }
         case let .dictionary(entries, _, _):
             let elementCount = entries.count.multipliedReportingOverflow(by: 2)
             guard !elementCount.overflow else { throw VM.RuntimeTrap.vmHeapLimitExceeded }

@@ -93,6 +93,36 @@ struct ArraySplitting {
         )
     }
 
+    @Test("Split segments retain their source logical ranges")
+    func preservesSegmentIndexBases() throws {
+        let state = try VM.ArraySplitState(
+            elementType: .int64,
+            elements: [try value(1), try value(0), try value(2)],
+            indexBase: 5,
+            maximumSplits: 1,
+            omitsEmptySubsequences: true
+        )
+        let budget = generousBudget()
+        while let element = try state.nextElement() {
+            try state.acceptElement(
+                isSeparator: try integer(element) == 0,
+                budget: budget
+            )
+        }
+        let segments = try state.finish(budget: budget)
+        guard segments.count == 2,
+              case let .array(first) = segments[0],
+              case let .array(second) = segments[1]
+        else {
+            Issue.record("split did not produce two Array-backed segments")
+            return
+        }
+
+        #expect(first.indexBase == 5)
+        #expect(second.indexBase == 7)
+        #expect(try arrays(segments) == [[1], [2]])
+    }
+
     @Test("Split state rejects invalid transitions and element types")
     func rejectsInvalidTransitions() throws {
         #expect(
@@ -116,6 +146,15 @@ struct ArraySplitting {
             _ = try VM.ArraySplitState(
                 elementType: .int64,
                 elements: [.bool(true)],
+                maximumSplits: 1,
+                omitsEmptySubsequences: true
+            )
+        }
+        #expect(throws: VM.RuntimeTrap.integerOverflow) {
+            _ = try VM.ArraySplitState(
+                elementType: .int64,
+                elements: [try value(1)],
+                indexBase: .max,
                 maximumSplits: 1,
                 omitsEmptySubsequences: true
             )
@@ -225,15 +264,15 @@ struct ArraySplitting {
 
     private func arrays(_ values: [VM.Value]) throws -> [[Int]] {
         try values.map { value in
-            guard case let .array(elements, elementType) = value,
-                  elementType == .int64
+            guard case let .array(storage) = value,
+                  storage.elementType == .int64
             else {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: .array(.int64),
                     actual: value.type
                 )
             }
-            return try elements.map(integer)
+            return try storage.elements.map(integer)
         }
     }
 

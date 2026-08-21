@@ -505,10 +505,19 @@ public final class Encoder {
             case let .any(erased):
                 try addAggregate(1, to: &result, limits: limits)
                 try append([erased.payload], below: depth, to: &pending, limits: limits)
-            case let .array(elements, _):
-                try validate(elements.count, limits: limits)
-                try addAggregate(elements.count, to: &result, limits: limits)
-                try append(elements, below: depth, to: &pending, limits: limits)
+            case let .array(storage):
+                try validate(storage.elements.count, limits: limits)
+                try addAggregate(
+                    storage.elements.count,
+                    to: &result,
+                    limits: limits
+                )
+                try append(
+                    storage.elements,
+                    below: depth,
+                    to: &pending,
+                    limits: limits
+                )
             case let .dictionary(entries, _, _):
                 let childCount = entries.count.multipliedReportingOverflow(by: 2)
                 guard !childCount.overflow else {

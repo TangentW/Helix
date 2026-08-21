@@ -247,6 +247,10 @@ public enum Disassembler {
             "\(result) = array_count \(array)"
         case let .arrayIsEmpty(result, array):
             "\(result) = array_is_empty \(array)"
+        case let .arrayIndexBase(result, array):
+            "\(result) = array_index_base \(array)"
+        case let .arrayRebase(result, array, indexBase):
+            "\(result) = array_rebase \(array), base: \(indexBase)"
         case let .arrayGet(result, array, index):
             "\(result) = array_get \(array)[\(index)]"
         case let .arrayBoundary(result, operation, array):

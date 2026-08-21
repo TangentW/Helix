@@ -477,16 +477,6 @@ struct RangeExpressionSemanticsMatrix {
             """,
             diagnostic: "String.Index"
         )
-        expectUnsupported(
-            name: "derivedArraySlicePartial",
-            source: """
-            public func derivedArraySlicePartial(_ values: [Int]) -> [Int] {
-                let tail = values.dropFirst()
-                return Array(tail[2...])
-            }
-            """,
-            diagnostic: "ArraySlice<Int>"
-        )
     }
 
     private func expectUnsupported(

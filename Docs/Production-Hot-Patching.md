@@ -178,6 +178,11 @@ Array-backed structural concatenation/insertion/replacement/removal/reversal/
 swap, predicate removal, bidirectional partition, and capacity hints, including
 context-typed nil elements and generic indirect results written into
 Array-literal construction storage;
+Array-backed storage separates physical elements from its logical integer index
+base, so `ArraySlice` and recursive Array-backed `Slice` values preserve bounds
+across calls, aggregates, Optional payloads, derived views, search, split,
+ordering, and supported mutation. `Array(sequence)` intentionally materializes
+a new zero-based Array;
 Dictionary lookup/subscript mutation including lazy default
 lookup and scoped default-value writeback, `updateValue`,
 `removeValue`, `removeAll`, key/value projection, unique-key sequence
@@ -244,14 +249,15 @@ exact full-width count traps if it cannot fit `Int`; represented Comparable
 Range bounds also support `isEmpty`. Neither path uses Swift generic
 NativeImports or per-API opcodes. One-sided `RangeExpression` containment and
 switch matching over represented integer, floating, String, and Character
-bounds reuse the same typed comparisons. Concrete Array partial-range
-subscripts reuse existing suffix/prefix subsequence operations; full-range
-subscripts over represented Array-backed and String/Substring sources erase
-the marker and reuse the ordinary materialization boundary. These compiler-only
+bounds reuse the same typed comparisons. Integer `Range`, `ClosedRange`,
+one-sided, and full-range subscripts over Array-backed sources reuse the typed
+slice boundary and preserve the logical base; String/Substring full-range
+materialization retains its Character representation. These compiler-only
 plans do not serialize Swift generic metadata or witness tables and do not add
 a NativeImport or opcode for each collection API. Potentially infinite
-partial-range Sequence sources, custom `Comparable` witnesses, private String
-indices, and derived ArraySlice index identity remain rejected.
+partial-range Sequence sources, custom `Comparable` witnesses, private
+`String.Index`, `ReversedCollection.Index`, and other opaque index identities
+remain rejected.
 Reading VM storage as `Array.capacity` and
 unrepresented randomness through `randomElement()` remain rejected. The
 subset also includes

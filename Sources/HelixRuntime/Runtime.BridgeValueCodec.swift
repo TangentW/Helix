@@ -148,8 +148,8 @@ public enum BridgeValueCodec {
         _ value: VM.Value,
         as type: Substring.Type
     ) throws -> Substring {
-        guard case let .array(elements, elementType) = value,
-              elementType == .string
+        guard case let .array(storage) = value,
+              storage.elementType == .string
         else {
             throw VM.RuntimeTrap.typeMismatch(
                 expected: .array(.string),
@@ -157,7 +157,7 @@ public enum BridgeValueCodec {
             )
         }
         var result = String()
-        for element in elements {
+        for element in storage.elements {
             let character = try decode(element, as: Character.self)
             result.append(character)
         }
@@ -179,15 +179,15 @@ public enum BridgeValueCodec {
         elementType: Bytecode.ValueType,
         decodeElement: (VM.Value) throws -> Element
     ) throws -> [Element] {
-        guard case let .array(elements, actualElementType) = value,
-              actualElementType == elementType
+        guard case let .array(storage) = value,
+              storage.elementType == elementType
         else {
             throw VM.RuntimeTrap.typeMismatch(
                 expected: .array(elementType),
                 actual: value.type
             )
         }
-        return try elements.map(decodeElement)
+        return try storage.elements.map(decodeElement)
     }
 
     /// Encodes a Set with a compiler-supplied element codec and VM element type.

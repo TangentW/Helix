@@ -1735,14 +1735,15 @@ public struct Interpreter: Sendable {
                         elementsRegister,
                         registers: registers
                     )
-                    guard case let .array(elements, elementType) = elementsValue,
-                          elementType == .string
+                    guard case let .array(storage) = elementsValue,
+                          storage.elementType == .string
                     else {
                         throw VM.RuntimeTrap.typeMismatch(
                             expected: .array(.string),
                             actual: elementsValue.type
                         )
                     }
+                    let elements = storage.elements
                     let separator = try separatorRegister.map {
                         try self.string($0, registers: registers)
                     }
@@ -1930,20 +1931,65 @@ public struct Interpreter: Sendable {
                 case let .arrayIsEmpty(result, operand):
                     let (values, _) = try array(operand, registers: registers)
                     try initialize(.bool(values.isEmpty), register: result, registers: &registers)
-                case let .arrayGet(result, array, index):
-                    let (values, _) = try self.array(array, registers: registers)
-                    let integer = try integer(index, registers: registers)
-                    let offset = integer.signedValue
-                    guard offset >= 0,
-                          let exact = Int(exactly: offset),
-                          values.indices.contains(exact)
+                case let .arrayIndexBase(result, operand):
+                    let storage = try arrayStorage(
+                        operand,
+                        registers: registers
+                    )
+                    _ = try storage.endIndex()
+                    try initialize(
+                        .integer(
+                            VM.Integer(
+                                signed: storage.indexBase,
+                                bitWidth: 64,
+                                isSigned: true
+                            )
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arrayRebase(result, operand, indexBase):
+                    guard let arrayType = function.type(of: operand),
+                          case .array = arrayType,
+                          case let .array(storage) = try consume(
+                            operand,
+                            type: arrayType,
+                            registers: &registers
+                          )
                     else {
-                        throw VM.RuntimeTrap.arrayIndexOutOfBounds(
-                            index: offset,
-                            count: values.count
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .array(.never),
+                            actual: function.type(of: operand)
                         )
                     }
-                    let value = try copyCharging(values[exact], budget: budget)
+                    let base = try integer(
+                        indexBase,
+                        registers: registers
+                    ).signedValue
+                    let rebased = VM.ArrayStorage(
+                        elements: storage.elements,
+                        elementType: storage.elementType,
+                        indexBase: base
+                    )
+                    _ = try rebased.endIndex()
+                    try initialize(
+                        .array(rebased),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .arrayGet(result, array, index):
+                    let storage = try arrayStorage(
+                        array,
+                        registers: registers
+                    )
+                    let integer = try integer(index, registers: registers)
+                    let exact = try storage.physicalOffset(
+                        for: integer.signedValue
+                    )
+                    let value = try copyCharging(
+                        storage.elements[exact],
+                        budget: budget
+                    )
                     try initialize(value, register: result, registers: &registers)
                 case let .arrayBoundary(result, operation, operand):
                     let (values, _) = try array(operand, registers: registers)
@@ -1961,13 +2007,13 @@ public struct Interpreter: Sendable {
                     }
                     try initialize(.optional(value), register: result, registers: &registers)
                 case let .arraySearch(result, operation, array, value):
-                    let (values, _) = try self.array(
+                    let storage = try arrayStorage(
                         array,
                         registers: registers
                     )
                     let needle = try read(value, registers: registers)
                     let index = try VM.CollectionSemantics.searchIndex(
-                        in: values,
+                        in: storage.elements,
                         matching: needle,
                         operation: operation
                     ) { left, right in
@@ -1979,12 +2025,18 @@ public struct Interpreter: Sendable {
                     }
                     let wrapped: VM.Value?
                     if let index {
-                        guard let exact = Int64(exactly: index) else {
+                        guard let offset = Int64(exactly: index) else {
+                            throw VM.RuntimeTrap.integerOverflow
+                        }
+                        let exact = storage.indexBase.addingReportingOverflow(
+                            offset
+                        )
+                        guard !exact.overflow else {
                             throw VM.RuntimeTrap.integerOverflow
                         }
                         wrapped = .integer(
                             try VM.Integer(
-                                signed: exact,
+                                signed: exact.partialValue,
                                 bitWidth: 64,
                                 isSigned: true
                             )
@@ -2053,20 +2105,21 @@ public struct Interpreter: Sendable {
                     array,
                     bound
                 ):
-                    let (elements, elementType) = try self.array(
+                    let storage = try arrayStorage(
                         array,
                         registers: registers
                     )
                     let bound = try integer(bound, registers: registers)
-                    let bounds = try VM.ArrayAdapters.subsequenceBounds(
-                        count: elements.count,
+                    let slice = try VM.ArrayAdapters.subsequence(
+                        storage: storage,
                         bound: bound.signedValue,
                         operation: operation
                     )
                     let sliced = try copiedArray(
-                        elements,
-                        elementType: elementType,
-                        bounds: bounds,
+                        storage.elements,
+                        elementType: storage.elementType,
+                        bounds: slice.bounds,
+                        indexBase: slice.indexBase,
                         budget: budget
                     )
                     try initialize(
@@ -2080,7 +2133,7 @@ public struct Interpreter: Sendable {
                     lowerBound,
                     upperBound
                 ):
-                    let (elements, elementType) = try self.array(
+                    let storage = try arrayStorage(
                         array,
                         registers: registers
                     )
@@ -2092,15 +2145,16 @@ public struct Interpreter: Sendable {
                         upperBound,
                         registers: registers
                     )
-                    let bounds = try VM.ArrayAdapters.rangeBounds(
-                        count: elements.count,
+                    let slice = try VM.ArrayAdapters.rangeSlice(
+                        storage: storage,
                         lowerBound: lower.signedValue,
                         upperBound: upper.signedValue
                     )
                     let sliced = try copiedArray(
-                        elements,
-                        elementType: elementType,
-                        bounds: bounds,
+                        storage.elements,
+                        elementType: storage.elementType,
+                        bounds: slice.bounds,
+                        indexBase: slice.indexBase,
                         budget: budget
                     )
                     try initialize(
@@ -2190,15 +2244,15 @@ public struct Interpreter: Sendable {
                     upperBound,
                     replacement
                 ):
-                    let (elements, elementType) = try self.array(
+                    let storage = try arrayStorage(
                         array,
                         registers: registers
                     )
                     let (replacementElements, replacementElementType) =
                         try self.array(replacement, registers: registers)
-                    guard replacementElementType == elementType else {
+                    guard replacementElementType == storage.elementType else {
                         throw VM.RuntimeTrap.typeMismatch(
-                            expected: .array(elementType),
+                            expected: .array(storage.elementType),
                             actual: .array(replacementElementType)
                         )
                     }
@@ -2210,16 +2264,17 @@ public struct Interpreter: Sendable {
                         upperBound,
                         registers: registers
                     )
-                    let bounds = try VM.ArrayAdapters.rangeBounds(
-                        count: elements.count,
+                    _ = try storage.endIndex()
+                    let bounds = try storage.physicalBounds(
                         lowerBound: lower.signedValue,
                         upperBound: upper.signedValue
                     )
                     let replaced = try replacingArraySubrange(
-                        elements,
-                        elementType: elementType,
+                        storage.elements,
+                        elementType: storage.elementType,
                         bounds: bounds,
                         with: replacementElements,
+                        indexBase: storage.indexBase,
                         budget: budget
                     )
                     try initialize(
@@ -2233,7 +2288,7 @@ public struct Interpreter: Sendable {
                     lhsIndex,
                     rhsIndex
                 ):
-                    let (elements, elementType) = try self.array(
+                    let storage = try arrayStorage(
                         array,
                         registers: registers
                     )
@@ -2246,8 +2301,7 @@ public struct Interpreter: Sendable {
                         registers: registers
                     )
                     let swapped = try swappingArrayElements(
-                        elements,
-                        elementType: elementType,
+                        storage,
                         lhsIndex: lhs.signedValue,
                         rhsIndex: rhs.signedValue,
                         budget: budget
@@ -2258,14 +2312,20 @@ public struct Interpreter: Sendable {
                         registers: &registers
                     )
                 case let .arrayAppend(result, array, value):
-                    let (elements, elementType) = try self.array(
+                    let storage = try arrayStorage(
                         array,
                         registers: registers
                     )
+                    _ = try storage.endIndex()
+                    let elements = storage.elements
                     let newCount = elements.count.addingReportingOverflow(1)
                     guard !newCount.overflow else {
                         throw VM.RuntimeTrap.vmHeapLimitExceeded
                     }
+                    _ = try VM.ArrayStorage.validatedEndIndex(
+                        elementCount: newCount.partialValue,
+                        indexBase: storage.indexBase
+                    )
                     let sourceElement = try read(value, registers: registers)
                     try budget.consumeLinearWork(elementCount: newCount.partialValue)
                     try chargeAggregate(
@@ -2280,8 +2340,13 @@ public struct Interpreter: Sendable {
                     let newElement = try copy(sourceElement)
                     appended.append(newElement)
                     try budget.checkDeadline()
+                    let appendedValue = try validatedArrayValue(
+                        appended,
+                        elementType: storage.elementType,
+                        indexBase: storage.indexBase
+                    )
                     try initialize(
-                        .array(appended, elementType: elementType),
+                        appendedValue,
                         register: result,
                         registers: &registers
                     )
@@ -2390,19 +2455,18 @@ public struct Interpreter: Sendable {
                             actual: function.type(of: result)
                         )
                     }
-                    let (elements, elementType) = try array(
+                    let storage = try arrayStorage(
                         arrayRegister,
                         registers: registers
                     )
-                    guard elementType == expectedElement else {
+                    guard storage.elementType == expectedElement else {
                         throw VM.RuntimeTrap.typeMismatch(
                             expected: .array(expectedElement),
-                            actual: .array(elementType)
+                            actual: .array(storage.elementType)
                         )
                     }
                     let state = try makeArrayMutationState(
-                        elements,
-                        elementType: elementType,
+                        storage,
                         budget: budget
                     )
                     try initialize(
@@ -2477,10 +2541,14 @@ public struct Interpreter: Sendable {
                             actual: function.type(of: stateRegister)
                         )
                     }
-                    let elements = try state.finish()
+                    let storage = try state.finish()
                     try budget.checkDeadline()
                     try initialize(
-                        .array(elements, elementType: element),
+                        .array(
+                            storage.elements,
+                            elementType: element,
+                            indexBase: storage.indexBase
+                        ),
                         register: result,
                         registers: &registers
                     )
@@ -2675,6 +2743,9 @@ public struct Interpreter: Sendable {
                             budget: budget
                         )
                     }
+                    try builder.preflightArrayElementAppend(
+                        matchingIndex: matchingIndex
+                    )
                     try budget.consumeLinearWork(elementCount: 1)
                     if matchingIndex == nil {
                         try budget.consumeAggregateElementStorage(
@@ -2886,7 +2957,7 @@ public struct Interpreter: Sendable {
                     maximumSplitsRegister,
                     omittingEmptyRegister
                 ):
-                    let (elements, elementType) = try array(
+                    let storage = try arrayStorage(
                         arrayRegister,
                         registers: registers
                     )
@@ -2903,8 +2974,9 @@ public struct Interpreter: Sendable {
                         registers: registers
                     )
                     let state = try makeArraySplitState(
-                        elements,
-                        elementType: elementType,
+                        storage.elements,
+                        elementType: storage.elementType,
+                        indexBase: storage.indexBase,
                         maximumSplits: maximumSplits,
                         omitsEmptySubsequences: omitsEmpty,
                         budget: budget
@@ -2915,7 +2987,7 @@ public struct Interpreter: Sendable {
                                 .equal,
                                 lhs: element,
                                 rhs: separator,
-                                type: elementType,
+                                type: storage.elementType,
                                 budget: budget
                             ),
                             budget: budget
@@ -2926,7 +2998,7 @@ public struct Interpreter: Sendable {
                     try initialize(
                         .array(
                             segments,
-                            elementType: .array(elementType)
+                            elementType: .array(storage.elementType)
                         ),
                         register: result,
                         registers: &registers
@@ -2937,13 +3009,14 @@ public struct Interpreter: Sendable {
                     maximumSplitsRegister,
                     omittingEmptyRegister
                 ):
-                    let (elements, elementType) = try array(
+                    let storage = try arrayStorage(
                         arrayRegister,
                         registers: registers
                     )
                     let state = try makeArraySplitState(
-                        elements,
-                        elementType: elementType,
+                        storage.elements,
+                        elementType: storage.elementType,
+                        indexBase: storage.indexBase,
                         maximumSplits: try splitMaximum(
                             maximumSplitsRegister,
                             registers: registers
@@ -3033,20 +3106,13 @@ public struct Interpreter: Sendable {
                         registers: &registers
                     )
                 case let .arrayUpdate(result, array, index, value):
-                    let (elements, elementType) = try self.array(
+                    let storage = try arrayStorage(
                         array,
                         registers: registers
                     )
                     let offset = try integer(index, registers: registers).signedValue
-                    guard offset >= 0,
-                          let exact = Int(exactly: offset),
-                          elements.indices.contains(exact)
-                    else {
-                        throw VM.RuntimeTrap.arrayIndexOutOfBounds(
-                            index: offset,
-                            count: elements.count
-                        )
-                    }
+                    let exact = try storage.physicalOffset(for: offset)
+                    let elements = storage.elements
                     let replacement = try read(value, registers: registers)
                     try budget.consumeLinearWork(elementCount: elements.count)
                     try chargeAggregate(elementCount: elements.count, budget: budget)
@@ -3065,15 +3131,21 @@ public struct Interpreter: Sendable {
                     }
                     try budget.checkDeadline()
                     try initialize(
-                        .array(updated, elementType: elementType),
+                        .array(
+                            updated,
+                            elementType: storage.elementType,
+                            indexBase: storage.indexBase
+                        ),
                         register: result,
                         registers: &registers
                     )
                 case let .arrayPopLast(elementResult, arrayResult, array):
-                    let (elements, elementType) = try self.array(
+                    let storage = try arrayStorage(
                         array,
                         registers: registers
                     )
+                    _ = try storage.endIndex()
+                    let elements = storage.elements
                     let remainingCount = max(elements.count - 1, 0)
                     try budget.consumeLinearWork(elementCount: elements.count)
                     try chargeAggregate(elementCount: remainingCount, budget: budget)
@@ -3096,7 +3168,11 @@ public struct Interpreter: Sendable {
                         registers: &registers
                     )
                     try initialize(
-                        .array(remaining, elementType: elementType),
+                        .array(
+                            remaining,
+                            elementType: storage.elementType,
+                            indexBase: storage.indexBase
+                        ),
                         register: arrayResult,
                         registers: &registers
                     )
@@ -3132,8 +3208,8 @@ public struct Interpreter: Sendable {
                     )
                     let elementCount: Int
                     switch collection {
-                    case let .array(elements, _):
-                        elementCount = elements.count
+                    case let .array(storage):
+                        elementCount = storage.elements.count
                     case let .dictionary(entries, _, _):
                         guard direction == .forward else {
                             throw VM.RuntimeTrap.invalidProgramCounter
@@ -3194,10 +3270,10 @@ public struct Interpreter: Sendable {
                     let next: VM.Value?
                     if let selectedIndex, let advancedIndex {
                         switch collection {
-                        case let .array(elements, _):
+                        case let .array(storage):
                             try chargeAggregate(elementCount: 1, budget: budget)
                             next = try copyCharging(
-                                elements[selectedIndex],
+                                storage.elements[selectedIndex],
                                 budget: budget
                             )
                         case let .dictionary(entries, _, _):
@@ -3264,17 +3340,18 @@ public struct Interpreter: Sendable {
                     )
                 case let .makeDictionary(result, pairs):
                     guard case let .dictionary(keyType, valueType) = function.type(of: result),
-                          case let .array(pairValues, pairType) = try read(
+                          case let .array(storage) = try read(
                               pairs,
                               registers: registers
                           ),
-                          pairType == .tuple([keyType, valueType])
+                          storage.elementType == .tuple([keyType, valueType])
                     else {
                         throw VM.RuntimeTrap.typeMismatch(
                             expected: .array(.never),
                             actual: function.type(of: pairs)
                         )
                     }
+                    let pairValues = storage.elements
                     try budget.consumeLinearWork(elementCount: pairValues.count)
                     try chargeAggregate(
                         elementCount: pairValues.count,
@@ -3503,9 +3580,10 @@ public struct Interpreter: Sendable {
                     let sourceValue = try read(source, registers: registers)
                     let set: VM.SetValue
                     switch sourceValue {
-                    case let .array(elements, actualType) where actualType == elementType:
+                    case let .array(storage)
+                    where storage.elementType == elementType:
                         set = try normalizedSetValue(
-                            elements,
+                            storage.elements,
                             elementType: elementType,
                             budget: budget
                         )
@@ -4472,11 +4550,12 @@ public struct Interpreter: Sendable {
                     depth: depth + 1
                 )
             }
-        case let (.array(values, actualElement), .array(expectedElement)):
-            guard actualElement == expectedElement else {
+        case let (.array(storage), .array(expectedElement)):
+            guard storage.elementType == expectedElement else {
                 throw VM.RuntimeTrap.typeMismatch(expected: expected, actual: value.type)
             }
-            for element in values {
+            _ = try storage.endIndex()
+            for element in storage.elements {
                 try validateRuntimeValue(
                     element,
                     expected: expectedElement,
@@ -4711,8 +4790,12 @@ public struct Interpreter: Sendable {
             )
         case let .tuple(elements):
             .tuple(try elements.map(copy))
-        case let .array(elements, elementType):
-            .array(try elements.map(copy), elementType: elementType)
+        case let .array(storage):
+            .array(
+                try storage.elements.map(copy),
+                elementType: storage.elementType,
+                indexBase: storage.indexBase
+            )
         case let .dictionary(entries, keyType, valueType):
             .dictionary(
                 try entries.map {
@@ -4888,9 +4971,11 @@ public struct Interpreter: Sendable {
             for element in elements {
                 try chargeCopiedValue(element, budget: budget, depth: depth + 1)
             }
-        case let .array(elements, _):
-            try budget.consumeAggregateStorage(elementCount: elements.count)
-            for element in elements {
+        case let .array(storage):
+            try budget.consumeAggregateStorage(
+                elementCount: storage.elements.count
+            )
+            for element in storage.elements {
                 try chargeCopiedValue(element, budget: budget, depth: depth + 1)
             }
         case let .dictionary(entries, _, _):
@@ -4958,8 +5043,12 @@ public struct Interpreter: Sendable {
                 budget: budget,
                 depth: depth + 1
             )
-        case let .tuple(elements), let .array(elements, _):
+        case let .tuple(elements):
             for element in elements {
+                try chargeValueTraversal(element, budget: budget, depth: depth + 1)
+            }
+        case let .array(storage):
+            for element in storage.elements {
                 try chargeValueTraversal(element, budget: budget, depth: depth + 1)
             }
         case let .dictionary(entries, _, _):
@@ -5029,8 +5118,12 @@ public struct Interpreter: Sendable {
                 budget: budget,
                 depth: depth + 1
             )
-        case let .tuple(elements), let .array(elements, _):
+        case let .tuple(elements):
             for element in elements {
+                try chargeShapeValidation(element, budget: budget, depth: depth + 1)
+            }
+        case let .array(storage):
+            for element in storage.elements {
                 try chargeShapeValidation(element, budget: budget, depth: depth + 1)
             }
         case let .dictionary(entries, _, _):
@@ -5256,11 +5349,23 @@ public struct Interpreter: Sendable {
         _ register: Bytecode.Register,
         registers: [VM.Value?]
     ) throws -> (values: [VM.Value], elementType: Bytecode.ValueType) {
+        let storage = try arrayStorage(register, registers: registers)
+        return (storage.elements, storage.elementType)
+    }
+
+    private func arrayStorage(
+        _ register: Bytecode.Register,
+        registers: [VM.Value?]
+    ) throws -> VM.ArrayStorage {
         let value = try read(register, registers: registers)
-        guard case let .array(values, elementType) = value else {
-            throw VM.RuntimeTrap.typeMismatch(expected: .array(.never), actual: value.type)
+        guard case let .array(storage) = value else {
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: .array(.never),
+                actual: value.type
+            )
         }
-        return (values, elementType)
+        _ = try storage.endIndex()
+        return storage
     }
 
     private func dictionary(
@@ -5302,9 +5407,9 @@ public struct Interpreter: Sendable {
         let elements: [VM.Value]
         let elementType: Bytecode.ValueType
         switch collection {
-        case let .array(source, sourceElementType):
-            elements = source
-            elementType = sourceElementType
+        case let .array(storage):
+            elements = storage.elements
+            elementType = storage.elementType
         case let .set(source):
             elements = source.elements
             elementType = source.elementType
@@ -5580,6 +5685,7 @@ public struct Interpreter: Sendable {
         _ elements: [VM.Value],
         elementType: Bytecode.ValueType,
         bounds: Range<Int>,
+        indexBase: Int64 = 0,
         budget: VM.InvocationBudget
     ) throws -> VM.Value {
         guard bounds.lowerBound >= 0,
@@ -5587,9 +5693,17 @@ public struct Interpreter: Sendable {
         else {
             throw VM.RuntimeTrap.invalidProgramCounter
         }
+        _ = try VM.ArrayStorage.validatedEndIndex(
+            elementCount: bounds.count,
+            indexBase: indexBase
+        )
         if bounds.lowerBound == 0, bounds.upperBound == elements.count {
             return try copyCharging(
-                .array(elements, elementType: elementType),
+                validatedArrayValue(
+                    elements,
+                    elementType: elementType,
+                    indexBase: indexBase
+                ),
                 budget: budget
             )
         }
@@ -5600,7 +5714,11 @@ public struct Interpreter: Sendable {
         }
         let result = try elements[bounds].map(copy)
         try budget.checkDeadline()
-        return .array(result, elementType: elementType)
+        return try validatedArrayValue(
+            result,
+            elementType: elementType,
+            indexBase: indexBase
+        )
     }
 
     private func replacingArraySubrange(
@@ -5608,6 +5726,7 @@ public struct Interpreter: Sendable {
         elementType: Bytecode.ValueType,
         bounds: Range<Int>,
         with replacement: [VM.Value],
+        indexBase: Int64 = 0,
         budget: VM.InvocationBudget
     ) throws -> VM.Value {
         guard bounds.lowerBound >= 0,
@@ -5623,6 +5742,10 @@ public struct Interpreter: Sendable {
             throw VM.RuntimeTrap.vmHeapLimitExceeded
         }
         let outputCount = newCount.partialValue
+        _ = try VM.ArrayStorage.validatedEndIndex(
+            elementCount: outputCount,
+            indexBase: indexBase
+        )
         try budget.consumeLinearWork(elementCount: outputCount)
         try chargeAggregate(elementCount: outputCount, budget: budget)
         for element in elements[..<bounds.lowerBound] {
@@ -5646,7 +5769,25 @@ public struct Interpreter: Sendable {
             result.append(try copy(element))
         }
         try budget.checkDeadline()
-        return .array(result, elementType: elementType)
+        return try validatedArrayValue(
+            result,
+            elementType: elementType,
+            indexBase: indexBase
+        )
+    }
+
+    private func validatedArrayValue(
+        _ elements: [VM.Value],
+        elementType: Bytecode.ValueType,
+        indexBase: Int64
+    ) throws -> VM.Value {
+        let storage = VM.ArrayStorage(
+            elements: elements,
+            elementType: elementType,
+            indexBase: indexBase
+        )
+        _ = try storage.endIndex()
+        return .array(storage)
     }
 
     private func makeArraySortState(
@@ -5672,23 +5813,30 @@ public struct Interpreter: Sendable {
     }
 
     private func makeArrayMutationState(
-        _ elements: [VM.Value],
-        elementType: Bytecode.ValueType,
+        _ storage: VM.ArrayStorage,
         budget: VM.InvocationBudget
     ) throws -> VM.ArrayMutationState {
-        try budget.consumeLinearWork(elementCount: elements.count)
-        try chargeAggregate(elementCount: elements.count, budget: budget)
-        for element in elements {
+        try budget.consumeLinearWork(elementCount: storage.elements.count)
+        try chargeAggregate(
+            elementCount: storage.elements.count,
+            budget: budget
+        )
+        for element in storage.elements {
             try prepareCopy(element, budget: budget)
         }
-        let copied = try elements.map(copy)
+        let copied = try storage.elements.map(copy)
         try budget.checkDeadline()
-        return try .init(elementType: elementType, elements: copied)
+        return try .init(
+            elementType: storage.elementType,
+            elements: copied,
+            indexBase: storage.indexBase
+        )
     }
 
     private func makeArraySplitState(
         _ elements: [VM.Value],
         elementType: Bytecode.ValueType,
+        indexBase: Int64,
         maximumSplits: Int,
         omitsEmptySubsequences: Bool,
         budget: VM.InvocationBudget
@@ -5703,6 +5851,7 @@ public struct Interpreter: Sendable {
         return try .init(
             elementType: elementType,
             elements: copied,
+            indexBase: indexBase,
             maximumSplits: maximumSplits,
             omitsEmptySubsequences: omitsEmptySubsequences
         )
@@ -5721,27 +5870,14 @@ public struct Interpreter: Sendable {
     }
 
     private func swappingArrayElements(
-        _ elements: [VM.Value],
-        elementType: Bytecode.ValueType,
+        _ storage: VM.ArrayStorage,
         lhsIndex: Int64,
         rhsIndex: Int64,
         budget: VM.InvocationBudget
     ) throws -> VM.Value {
-        func validatedIndex(_ index: Int64) throws -> Int {
-            guard index >= 0,
-                  let exact = Int(exactly: index),
-                  elements.indices.contains(exact)
-            else {
-                throw VM.RuntimeTrap.arrayIndexOutOfBounds(
-                    index: index,
-                    count: elements.count
-                )
-            }
-            return exact
-        }
-
-        let lhs = try validatedIndex(lhsIndex)
-        let rhs = try validatedIndex(rhsIndex)
+        let elements = storage.elements
+        let lhs = try storage.physicalOffset(for: lhsIndex)
+        let rhs = try storage.physicalOffset(for: rhsIndex)
         try budget.consumeLinearWork(elementCount: elements.count)
         try chargeAggregate(elementCount: elements.count, budget: budget)
         for element in elements {
@@ -5750,7 +5886,11 @@ public struct Interpreter: Sendable {
         var result = try elements.map(copy)
         result.swapAt(lhs, rhs)
         try budget.checkDeadline()
-        return .array(result, elementType: elementType)
+        return .array(
+            result,
+            elementType: storage.elementType,
+            indexBase: storage.indexBase
+        )
     }
 
     private func zippedArray(
@@ -5800,15 +5940,17 @@ public struct Interpreter: Sendable {
         try budget.consumeLinearWork(elementCount: nested.count)
         var resultCount = 0
         for value in nested {
-            guard case let .array(elements, actualType) = value,
-                  actualType == elementType
+            guard case let .array(storage) = value,
+                  storage.elementType == elementType
             else {
                 throw VM.RuntimeTrap.typeMismatch(
                     expected: .array(elementType),
                     actual: value.type
                 )
             }
-            let sum = resultCount.addingReportingOverflow(elements.count)
+            let sum = resultCount.addingReportingOverflow(
+                storage.elements.count
+            )
             guard !sum.overflow else {
                 throw VM.RuntimeTrap.vmHeapLimitExceeded
             }
@@ -5834,10 +5976,10 @@ public struct Interpreter: Sendable {
                     try prepareCopy(element, budget: budget)
                 }
             }
-            guard case let .array(elements, _) = value else {
+            guard case let .array(storage) = value else {
                 throw VM.RuntimeTrap.invalidProgramCounter
             }
-            for element in elements {
+            for element in storage.elements {
                 try prepareCopy(element, budget: budget)
             }
         }
@@ -5850,10 +5992,10 @@ public struct Interpreter: Sendable {
                     result.append(try copy(element))
                 }
             }
-            guard case let .array(elements, _) = value else {
+            guard case let .array(storage) = value else {
                 throw VM.RuntimeTrap.invalidProgramCounter
             }
-            for element in elements {
+            for element in storage.elements {
                 result.append(try copy(element))
             }
         }

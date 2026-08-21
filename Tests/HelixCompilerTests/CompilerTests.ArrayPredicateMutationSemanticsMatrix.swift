@@ -207,31 +207,26 @@ struct ArrayPredicateMutationSemanticsMatrix {
         )
     }
 
-    @Test("ArraySlice reverse remains fail-closed without index identity")
-    func rejectsArraySliceReverse() {
-        do {
-            _ = try FrontendExecutionHarness.compile(
-                source: """
+    @Test("ArraySlice reverse preserves its represented index base")
+    func reversesArraySlice() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
                 public func reverseSlice(_ values: [Int]) -> [Int] {
                     var slice = values.dropFirst()
                     slice.reverse()
                     return Array(slice)
                 }
                 """,
-                functionName: "reverseSlice",
-                moduleName: "HelixArraySliceReverseNegative"
-            )
-            Issue.record("ArraySlice reverse unexpectedly compiled")
-        } catch let error as CanonicalSIL.LoweringError {
-            guard case let .unsupportedType(detail) = error else {
-                Issue.record("unexpected ArraySlice diagnostic: \(error)")
-                return
-            }
-            #expect(detail.contains("zero-based Array indices"))
-            #expect(detail.contains("ArraySlice<Int>"))
-        } catch {
-            Issue.record("unexpected ArraySlice diagnostic: \(error)")
-        }
+            functionName: "reverseSlice",
+            moduleName: "HelixArraySliceReverse"
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [try integers([1, 2, 3])]
+            ) == .returned(try integers([3, 2]))
+        )
     }
 
     private func integer(_ value: Int64) throws -> VM.Value {

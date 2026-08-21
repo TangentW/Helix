@@ -258,6 +258,56 @@ struct AnyExecution {
         )
     }
 
+    @Test("Dictionary casts reject keys that collide after index-base erasure")
+    func dictionaryCastRejectsSemanticArrayKeyCollisions() throws {
+        let sourceElement = Bytecode.ValueType.optional(.optional(.int64))
+        let targetElement = Bytecode.ValueType.optional(.int64)
+        let sourceKey = Bytecode.ValueType.array(sourceElement)
+        let targetKey = Bytecode.ValueType.array(targetElement)
+        let sourceType = Bytecode.ValueType.dictionary(
+            key: sourceKey,
+            value: .int64
+        )
+        let targetType = Bytecode.ValueType.dictionary(
+            key: targetKey,
+            value: .int64
+        )
+        let source = VM.Value.dictionary(
+            [
+                .init(
+                    key: .array(
+                        [.optional(nil)],
+                        elementType: sourceElement
+                    ),
+                    value: try integer(1)
+                ),
+                .init(
+                    key: .array(
+                        [.optional(.optional(nil))],
+                        elementType: sourceElement,
+                        indexBase: 1
+                    ),
+                    value: try integer(2)
+                ),
+            ],
+            keyType: sourceKey,
+            valueType: .int64
+        )
+        let caster = VM.DynamicCaster(
+            budget: .init(
+                limits: .init(maxWallTimeMainThreadMilliseconds: 1_000)
+            )
+        )
+
+        #expect(
+            try caster.cast(
+                source,
+                from: sourceType,
+                to: targetType
+            ) == nil
+        )
+    }
+
     @Test("A failed element cast rejects the complete collection")
     func collectionCastIsAtomic() throws {
         let boxedInt = VM.Value.any(

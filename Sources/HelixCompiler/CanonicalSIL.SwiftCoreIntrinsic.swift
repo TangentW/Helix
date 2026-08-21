@@ -25,8 +25,9 @@ enum SwiftCoreIntrinsic: Equatable {
     case maximum
     case absoluteValue
     case arrayEmpty
-    case arraySubscript
-    case arraySubscriptModify
+    case arraySubscript(CanonicalSIL.CollectionIndex.Source)
+    case arraySubscriptSet(CanonicalSIL.CollectionIndex.Source)
+    case arraySubscriptModify(CanonicalSIL.CollectionIndex.Source)
     case sequenceContains
     case collectionMakeIterator(CanonicalSIL.CollectionIntrinsic.IteratorShape)
     case indexingIteratorNext(CanonicalSIL.CollectionIntrinsic.IteratorShape)
@@ -213,8 +214,17 @@ enum SwiftCoreIntrinsic: Equatable {
         case "$ss3maxyxx_xtSLRzlF": self = .maximum
         case "$ss3absyxxSLRzs13SignedNumericRzlF": self = .absoluteValue
         case "$sS2ayxGycfC": self = .arrayEmpty
-        case "$sSayxSicig": self = .arraySubscript
-        case "$sSayxSiciM": self = .arraySubscriptModify
+        case "$sSayxSicig": self = .arraySubscript(.arrayElement)
+        case "$ss10ArraySliceVyxSicig":
+            self = .arraySubscript(.arraySliceElement)
+        case "$ss5SliceVy7ElementQz5IndexQzcig",
+             "$ss5SliceVsSMRzrlEy7ElementQz5IndexQzcig":
+            self = .arraySubscript(.sliceBase)
+        case "$ss5SliceVsSMRzrlEy7ElementQz5IndexQzcis":
+            self = .arraySubscriptSet(.sliceBase)
+        case "$sSayxSiciM": self = .arraySubscriptModify(.arrayElement)
+        case "$ss10ArraySliceVyxSiciM":
+            self = .arraySubscriptModify(.arraySliceElement)
         case "$sSTsSQ7ElementRpzrlE8containsySbABF": self = .sequenceContains
         case "$sSlss16IndexingIteratorVyxG0B0RtzrlE04makeB0ACyF":
             self = .collectionMakeIterator(.collection)
