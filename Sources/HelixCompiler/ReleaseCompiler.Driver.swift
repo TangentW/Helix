@@ -998,10 +998,8 @@ extension ReleaseCompiler {
             guard !typeEnvironment.isStructFactory(symbol),
                   !typeEnvironment.isHostedClassAllocator(symbol),
                   file.function(mangledName: symbol).map(
-                      typeEnvironment.hasStructFactorySignature
-                  ) != true,
-                  file.function(mangledName: symbol)?.hasNominalValueConstructorABI != true
-                    || typeEnvironment.isClassAllocator(symbol)
+                    typeEnvironment.isOpaqueStructFactory
+                  ) != true
             else { return nil }
             let isRooted = archive.functions.contains {
                 symbol != $0.mangledName && symbol.hasPrefix($0.mangledName)

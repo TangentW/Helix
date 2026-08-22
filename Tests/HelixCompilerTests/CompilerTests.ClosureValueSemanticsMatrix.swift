@@ -29,14 +29,42 @@ struct ClosureValueSemanticsMatrix {
           return %3
         } // end sil function '\(symbol)'
         """)
-        let function = try #require(file.function(mangledName: symbol))
         let fields = try file.typeEnvironment.structFields(
             for: .init(rawValue: "Callbacks")
         )
 
         #expect(fields.count == 2)
-        #expect(file.typeEnvironment.hasStructFactorySignature(function))
         #expect(file.typeEnvironment.isStructFactory(symbol))
+    }
+
+    @Test("Only pure opaque struct factories are compiler-elided")
+    func recognizesOpaqueStructFactoryBoundaries() {
+        let pure = CanonicalSIL.Function(
+            mangledName: "$s7Fixture6HiddenV5valueACSi_tcfC",
+            loweredType: "@convention(method) (Int, @thin Hidden.Type) -> Hidden",
+            body: """
+            bb0(%0 : $Int, %1 : $@thin Hidden.Type):
+              %2 = struct $Hidden (%0)
+              return %2
+            """
+        )
+        let custom = CanonicalSIL.Function(
+            mangledName: "$s7Fixture6HiddenVyACSi_tcfC",
+            loweredType: "@convention(method) (Int, @thin Hidden.Type) -> Hidden",
+            body: """
+            bb0(%0 : $Int, %1 : $@thin Hidden.Type):
+              %2 = integer_literal $Builtin.Int64, 1
+              %3 = struct_extract %0, #Int._value
+              %4 = builtin "sadd_with_overflow_Int64"(%3, %2, %2) : $(Builtin.Int64, Builtin.Int1)
+              %5 = tuple_extract %4, 0
+              %6 = struct $Int (%5)
+              %7 = struct $Hidden (%6)
+              return %7
+            """
+        )
+
+        #expect(CanonicalSIL.TypeEnvironment.empty.isOpaqueStructFactory(pure))
+        #expect(!CanonicalSIL.TypeEnvironment.empty.isOpaqueStructFactory(custom))
     }
 
     @Test("Optional closures preserve invocation and nil semantics")

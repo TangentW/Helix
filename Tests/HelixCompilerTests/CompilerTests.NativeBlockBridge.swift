@@ -30,6 +30,17 @@ struct NativeBlockBridge {
         #expect(CanonicalSIL.ClosureReabstraction
             .nonescapingAdapterClosureType(in: adapter)
             == "@MainActor (Swift.Bool) -> ()")
+
+        let higherOrderAdapter = "$@convention(thin) "
+            + "(@guaranteed @noescape @callee_guaranteed (Swift.Int) "
+            + "-> @owned @callee_guaranteed (Swift.String) -> Swift.Bool) "
+            + "-> @owned @callee_guaranteed (Swift.String) -> Swift.Bool"
+        #expect(
+            CanonicalSIL.ClosureReabstraction.nonescapingAdapterClosureType(
+                in: higherOrderAdapter
+            ) == "(Swift.Int) -> @owned @callee_guaranteed (Swift.String) "
+                + "-> Swift.Bool"
+        )
     }
 
     @Test("Rejects malformed or semantically different noescape adapters")

@@ -1953,6 +1953,82 @@ struct ReleaseDriver {
         )
     }
 
+    @Test("Production patches link nominal constructors used as closures")
+    func buildsNominalConstructorClosurePatch() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-release-constructor-closure-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        private enum Choice { case value(Int) }
+        private struct Point {
+            let x: Int
+            init(_ value: Int) { self.x = value + 1 }
+        }
+        public func transform(_ value: Int) -> Int {
+            let wrap: (Int) -> Choice = Choice.value
+            let make: (Int) -> Point = Point.init
+            switch wrap(make(value).x) {
+            case let .value(result): return result + 1
+            }
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            optimization: "-Onone"
+        )
+        let root = try #require(archive.functions.first)
+        let entry = try #require(root.entryIndex)
+
+        let changed = baseline.replacingOccurrences(
+            of: "return result + 1",
+            with: "return result + 3"
+        )
+        try Data(changed.utf8).write(to: sourceURL)
+        let result = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+
+        #expect(result.module.functions.contains { $0.kind == .closureBody })
+        #expect(result.disassembly.contains("make_closure"))
+        #expect(result.module.localTypes.count == 2)
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: entry,
+                image: image,
+                arguments: [
+                    .integer(
+                        try VM.Integer(
+                            signed: 4,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    ),
+                ]
+            ) == .returned(
+                .integer(
+                    try VM.Integer(signed: 8, bitWidth: 64, isSigned: true)
+                )
+            )
+        )
+    }
+
     @Test("Production sync escaping closures can return and capture VM closures")
     func buildsEscapingClosurePatch() throws {
         let directory = FileManager.default.temporaryDirectory

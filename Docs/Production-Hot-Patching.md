@@ -315,7 +315,9 @@ safe weak and checked-unowned capture storage,
 same-image `@escaping` return/capture flows, recursively stored and higher-order
 closure values, dynamically checked `withoutActuallyEscaping`, lexical
 nonescaping capture of caller-owned `inout`, fully concrete compiler
-specializations, reabstraction thunks, and default-argument generators,
+specializations, reabstraction thunks, default-argument generators, first-class
+patch-local enum cases, concrete `Optional`/`Result` case constructors,
+patch-local struct initializers and static factories,
 automatically frozen `Swift.print`, `Swift.debugPrint`, and fixed
 String-description NativeImports, and top-level non-suspending
 `async`, `async throws`, and `@MainActor async` entries. A new `final` class may

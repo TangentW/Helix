@@ -192,11 +192,6 @@ public struct Lowerer: Sendable {
         var index: Int
     }
 
-    private struct TupleComponentStorageKey: Hashable {
-        var root: String
-        var path: [Int]
-    }
-
     /// Field identity is independent of how compiler-only aggregate values are
     /// cached. Both tuples and patch-local structs use declaration-order paths.
     private struct AggregateComponentAddress {
@@ -233,6 +228,7 @@ public struct Lowerer: Sendable {
     enum MetatypeIdentity: Equatable, Sendable {
         case native(Core.TypeID)
         case local(Bytecode.LocalTypeKey)
+        case swift(String)
     }
 
     struct ErasedMetatype: Equatable, Sendable {
@@ -865,6 +861,7 @@ public struct Lowerer: Sendable {
         var retypedIntegerOperands: [String: [Bytecode.ValueType: Bytecode.Register]] = [:]
         var boolLiterals: [String: Bool] = [:]
         var metatypeValues = Set<String>()
+        var staticMetatypeIdentities: [String: MetatypeIdentity] = [:]
         var representedCollectionMetatypeIdentities: [String: String] = [:]
         var scalarMetatypeValues: [String: Bytecode.ValueType] = [:]
         var compilerEnumMetatypeValues = Set<String>()
@@ -970,7 +967,9 @@ public struct Lowerer: Sendable {
         var arrayLiteralAddresses: [String: ArrayLiteralAddress] = [:]
         var arrayLiteralComponentAddresses: [String: ArrayLiteralComponentAddress] = [:]
         var tupleComponentAddresses: [String: TupleComponentAddress] = [:]
-        var tupleComponentValues: [TupleComponentStorageKey: Bytecode.Register] = [:]
+        var aggregateComponentValues: [
+            CompilerStorageIdentity: Bytecode.Register
+        ] = [:]
         var aggregateComponentAddresses: [String: AggregateComponentAddress] = [:]
         var tupleValues: [String: (Bytecode.Register, Bytecode.Register)] = [:]
         var unpackedTuples: [Bytecode.Register: [Bytecode.Register]] = [:]
@@ -1750,68 +1749,58 @@ public struct Lowerer: Sendable {
             guard runtimeAddress(at: token) == nil,
                   mutableCell(at: token) == nil
             else { return nil }
-            if let key = tupleComponentStorageKey(for: token) {
-                return tupleComponentValues[key]
+            if let key = aggregateComponentStorageIdentity(for: token),
+               let component = aggregateComponentValues[key] {
+                return component
             }
             return stackAddressValues[addressBase(token)]
         }
 
         func recordCompilerAddressValue(_ value: Bytecode.Register, at token: String) {
-            if let key = tupleComponentStorageKey(for: token) {
+            if let key = aggregateComponentStorageIdentity(for: token) {
                 // A projected write invalidates any cached aggregate snapshot
                 // containing that field, as well as nested snapshots replaced
                 // by the write. Storage itself is keyed by semantic field path
                 // so distinct SIL projections alias one value.
                 stackAddressValues.removeValue(forKey: key.root)
-                tupleComponentValues = tupleComponentValues.filter { candidate, _ in
-                    guard candidate.root == key.root else { return true }
-                    return !candidate.path.starts(with: key.path)
-                        && !key.path.starts(with: candidate.path)
+                stackAddressValues.removeValue(forKey: addressBase(token))
+                aggregateComponentValues = aggregateComponentValues.filter {
+                    candidate,
+                    _ in
+                    !candidate.overlaps(key)
                 }
-                tupleComponentValues[key] = value
+                aggregateComponentValues[key] = value
                 return
             }
             let root = addressBase(token)
             stackAddressValues[root] = value
-            tupleComponentValues = tupleComponentValues.filter { $0.key.root != root }
+            aggregateComponentValues = aggregateComponentValues.filter {
+                $0.key.root != root
+            }
         }
 
         @discardableResult
         func removeCompilerAddressValue(at token: String) -> Bytecode.Register? {
-            if let key = tupleComponentStorageKey(for: token) {
-                let removed = tupleComponentValues[key]
+            if let key = aggregateComponentStorageIdentity(for: token) {
+                let removed = aggregateComponentValues[key]
+                    ?? stackAddressValues[addressBase(token)]
                 stackAddressValues.removeValue(forKey: key.root)
-                tupleComponentValues = tupleComponentValues.filter { candidate, _ in
-                    guard candidate.root == key.root else { return true }
-                    return !candidate.path.starts(with: key.path)
-                        && !key.path.starts(with: candidate.path)
+                stackAddressValues.removeValue(forKey: addressBase(token))
+                aggregateComponentValues = aggregateComponentValues.filter {
+                    candidate,
+                    _ in
+                    !candidate.overlaps(key)
                 }
                 return removed
             }
             return stackAddressValues.removeValue(forKey: addressBase(token))
         }
 
-        func tupleComponentStorageKey(
+        func aggregateComponentStorageIdentity(
             for token: String
-        ) -> TupleComponentStorageKey? {
-            var current = token
-            var reversedPath: [Int] = []
-            var visited = Set<String>()
-            while visited.insert(current).inserted {
-                if let component = tupleComponentAddresses[current] {
-                    reversedPath.append(component.index)
-                    current = component.base
-                    continue
-                }
-                let canonical = addressBase(current)
-                guard canonical != current else { break }
-                current = canonical
-            }
-            guard !reversedPath.isEmpty else { return nil }
-            return .init(
-                root: addressBase(current),
-                path: Array(reversedPath.reversed())
-            )
+        ) -> CompilerStorageIdentity? {
+            let identity = compilerStorageIdentity(for: token)
+            return identity.path.isEmpty ? nil : identity
         }
 
         func unpackTupleValue(
@@ -1845,11 +1834,26 @@ public struct Lowerer: Sendable {
             return elements
         }
 
-        /// Compiler-only tuple storage may alternate between one aggregate
-        /// register and field registers. Rebuild the requested aggregate only
-        /// when every leaf is initialized; making that transition explicit
-        /// preserves linear ownership for nested tuples as well as scalars.
-        func rebuildTupleStorageValue(
+        func compilerAggregateFieldTypes(
+            _ type: Bytecode.ValueType
+        ) throws -> [Bytecode.ValueType]? {
+            switch type {
+            case let .tuple(types):
+                return types
+            case let .local(key):
+                guard case let .structure(fields) = try typeEnvironment
+                    .definition(for: key).kind
+                else { return nil }
+                return fields.map(\.type)
+            default:
+                return nil
+            }
+        }
+
+        /// Compiler-only tuple and local-struct storage may alternate between
+        /// one aggregate register and independently initialized fields. Rebuild
+        /// only after every leaf exists so nested ownership remains explicit.
+        func rebuildAggregateStorageValue(
             root: String,
             type: Bytecode.ValueType,
             path: [Int] = []
@@ -1858,27 +1862,28 @@ public struct Lowerer: Sendable {
                 return aggregate
             }
             if !path.isEmpty,
-               let aggregate = tupleComponentValues[
+               let aggregate = aggregateComponentValues[
                 .init(root: root, path: path)
                ] {
                 return aggregate
             }
-            guard case let .tuple(types) = type else { return nil }
+            guard let types = try compilerAggregateFieldTypes(type) else {
+                return nil
+            }
 
             var elements: [Bytecode.Register] = []
             elements.reserveCapacity(types.count)
             for (index, elementType) in types.enumerated() {
                 let childPath = path + [index]
-                let childKey = TupleComponentStorageKey(
+                let childKey = CompilerStorageIdentity(
                     root: root,
                     path: childPath
                 )
-                let child: Bytecode.Register? = if let value = tupleComponentValues[
-                    childKey
-                ] {
+                let child: Bytecode.Register? = if let value =
+                    aggregateComponentValues[childKey] {
                     value
-                } else if case .tuple = elementType {
-                    try rebuildTupleStorageValue(
+                } else if try compilerAggregateFieldTypes(elementType) != nil {
+                    try rebuildAggregateStorageValue(
                         root: root,
                         type: elementType,
                         path: childPath
@@ -1893,8 +1898,17 @@ public struct Lowerer: Sendable {
             }
 
             let result = try allocate(type: type)
-            appendInstruction(.makeTuple(result: result, elements: elements))
-            tupleComponentValues = tupleComponentValues.filter {
+            switch type {
+            case .tuple:
+                appendInstruction(.makeTuple(result: result, elements: elements))
+            case .local:
+                appendInstruction(.makeStruct(result: result, fields: elements))
+            default:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "compiler aggregate reconstruction lost its aggregate type"
+                )
+            }
+            aggregateComponentValues = aggregateComponentValues.filter {
                 candidate,
                 _ in
                 guard candidate.root == root else { return true }
@@ -1904,7 +1918,9 @@ public struct Lowerer: Sendable {
             if path.isEmpty {
                 stackAddressValues[root] = result
             } else {
-                tupleComponentValues[.init(root: root, path: path)] = result
+                aggregateComponentValues[
+                    .init(root: root, path: path)
+                ] = result
             }
             return result
         }
@@ -1921,11 +1937,11 @@ public struct Lowerer: Sendable {
                     "tuple address does not contain a tuple VM value"
                 )
             }
-            let baseKey = tupleComponentStorageKey(for: base)
+            let baseKey = aggregateComponentStorageIdentity(for: base)
             let root = baseKey?.root ?? addressBase(base)
             let basePath = baseKey?.path ?? []
             let targets = Set(tupleComponentAddresses.keys.compactMap {
-                tupleComponentStorageKey(for: $0)
+                aggregateComponentStorageIdentity(for: $0)
             }.filter {
                 $0.root == root
                     && $0.path.count > basePath.count
@@ -1947,18 +1963,18 @@ public struct Lowerer: Sendable {
                 var currentPath = basePath
                 for index in target.path.dropFirst(basePath.count) {
                     let childPath = currentPath + [index]
-                    let childKey = TupleComponentStorageKey(
+                    let childKey = CompilerStorageIdentity(
                         root: root,
                         path: childPath
                     )
-                    if let cached = tupleComponentValues[childKey] {
+                    if let cached = aggregateComponentValues[childKey] {
                         current = cached
                     } else {
                         let elements = try unpackTupleValue(current)
                         if currentPath.isEmpty {
                             stackAddressValues.removeValue(forKey: root)
                         } else {
-                            tupleComponentValues.removeValue(
+                            aggregateComponentValues.removeValue(
                                 forKey: .init(
                                     root: root,
                                     path: currentPath
@@ -1971,7 +1987,7 @@ public struct Lowerer: Sendable {
                             )
                         }
                         for (childIndex, element) in elements.enumerated() {
-                            tupleComponentValues[
+                            aggregateComponentValues[
                                 .init(
                                     root: root,
                                     path: currentPath + [childIndex]
@@ -1984,7 +2000,7 @@ public struct Lowerer: Sendable {
                 }
             }
             if let baseKey {
-                tupleComponentValues.removeValue(forKey: baseKey)
+                aggregateComponentValues.removeValue(forKey: baseKey)
             } else {
                 stackAddressValues.removeValue(forKey: root)
             }
@@ -2070,13 +2086,15 @@ public struct Lowerer: Sendable {
         }
 
         @discardableResult
-        func removeTupleComponentValues(rootedAt root: String) -> [Bytecode.Register] {
+        func removeAggregateComponentValues(
+            rootedAt root: String
+        ) -> [Bytecode.Register] {
             let canonicalRoot = addressBase(root)
-            let matching = tupleComponentValues.filter {
+            let matching = aggregateComponentValues.filter {
                 $0.key.root == canonicalRoot
             }
             for key in matching.keys {
-                tupleComponentValues.removeValue(forKey: key)
+                aggregateComponentValues.removeValue(forKey: key)
             }
             return Array(matching.values)
         }
@@ -2136,28 +2154,29 @@ public struct Lowerer: Sendable {
             guard runtimeAddress(at: token) == nil,
                   mutableCell(at: token) == nil
             else { return nil }
-            if let key = tupleComponentStorageKey(for: token) {
+            if let key = aggregateComponentStorageIdentity(for: token) {
                 if let rootAggregate = stackAddressValues[key.root] {
-                    try materializeTupleComponents(
-                        at: key.root,
-                        tuple: rootAggregate
-                    )
-                    return tupleComponentValues[key]
+                    if case .tuple = registerTypes[Int(rootAggregate.rawValue)] {
+                        try materializeTupleComponents(
+                            at: key.root,
+                            tuple: rootAggregate
+                        )
+                        return aggregateComponentValues[key]
+                    }
+                    return nil
                 }
-                guard let componentType = stackType(at: token),
-                      case .tuple = componentType
-                else { return nil }
-                return try rebuildTupleStorageValue(
+                guard let componentType = stackType(at: token) else {
+                    return nil
+                }
+                return try rebuildAggregateStorageValue(
                     root: key.root,
                     type: componentType,
                     path: key.path
                 )
             }
             let root = addressBase(token)
-            guard let rootType = stackAddressTypes[root],
-                  case .tuple = rootType
-            else { return nil }
-            return try rebuildTupleStorageValue(root: root, type: rootType)
+            guard let rootType = stackAddressTypes[root] else { return nil }
+            return try rebuildAggregateStorageValue(root: root, type: rootType)
         }
 
         func copyStoredValue(
@@ -3234,39 +3253,67 @@ public struct Lowerer: Sendable {
             let physicalValueCount = Int(
                 reference.binding.parameterProjection.physicalParameterCount
             )
-            guard !reference.erasedMetatypes.isEmpty else {
-                guard tokens.count == physicalValueCount else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "direct call physical argument count does not match its frozen ABI"
-                    )
-                }
-                return tokens
+            let totalPhysicalCount = physicalValueCount
+                + reference.erasedMetatypes.count
+            return try eraseMetatypeValues(
+                tokens,
+                physicalRange: 0..<totalPhysicalCount,
+                for: reference,
+                line: line,
+                context: "direct call"
+            )
+        }
+
+        func eraseMetatypeCaptures(
+            _ tokens: [String],
+            for reference: ResolvedFunctionReference,
+            line: Int
+        ) throws -> [String] {
+            let totalPhysicalCount = Int(
+                reference.binding.parameterProjection.physicalParameterCount
+            ) + reference.erasedMetatypes.count
+            guard tokens.count <= totalPhysicalCount else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "partial_apply captures more physical values than its callee accepts"
+                )
             }
+            let firstCapturedIndex = totalPhysicalCount - tokens.count
+            return try eraseMetatypeValues(
+                tokens,
+                physicalRange: firstCapturedIndex..<totalPhysicalCount,
+                for: reference,
+                line: line,
+                context: "partial_apply"
+            )
+        }
+
+        func eraseMetatypeValues(
+            _ tokens: [String],
+            physicalRange: Range<Int>,
+            for reference: ResolvedFunctionReference,
+            line: Int,
+            context: String
+        ) throws -> [String] {
             let erasedByIndex = Dictionary(
                 uniqueKeysWithValues: reference.erasedMetatypes.map {
                     ($0.physicalIndex, $0.identity)
                 }
             )
-            guard tokens.count
-                    == physicalValueCount + erasedByIndex.count
+            guard physicalRange.lowerBound >= 0,
+                  physicalRange.count == tokens.count
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "direct call physical argument count does not match its frozen ABI"
+                    "\(context) physical argument count does not match its frozen ABI"
                 )
             }
             var physicalValues: [String] = []
-            physicalValues.reserveCapacity(physicalValueCount)
-            for (index, token) in tokens.enumerated() {
-                if let identity = erasedByIndex[index] {
-                    let matches: Bool = switch identity {
-                    case let .native(typeID):
-                        nativeMetatypeValues[token] == typeID
-                    case let .local(key):
-                        localMetatypeValues[token] == key
-                    }
-                    guard matches else {
+            physicalValues.reserveCapacity(tokens.count)
+            for (offset, token) in tokens.enumerated() {
+                let physicalIndex = physicalRange.lowerBound + offset
+                if let identity = erasedByIndex[physicalIndex] {
+                    guard staticMetatypeIdentities[token] == identity else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "direct call metatype argument does not match its concrete type"
+                            "\(context) metatype argument does not match its concrete type"
                         )
                     }
                 } else {
@@ -3274,6 +3321,51 @@ public struct Lowerer: Sendable {
                 }
             }
             return physicalValues
+        }
+
+        /// Metatypes erased from HLBC remain compiler facts when canonical SIL
+        /// introduces ownership-neutral SSA aliases around a captured value.
+        @discardableResult
+        func aliasStaticMetatype(
+            _ destination: String,
+            from source: String,
+            consuming: Bool = false
+        ) -> Bool {
+            guard let identity = staticMetatypeIdentities[source] else {
+                return false
+            }
+
+            func transferMapping<Value>(_ values: inout [String: Value]) {
+                guard let value = values[source] else { return }
+                values[destination] = value
+                if consuming { values.removeValue(forKey: source) }
+            }
+
+            func transferMembership(_ values: inout Set<String>) {
+                guard values.contains(source) else { return }
+                values.insert(destination)
+                if consuming { values.remove(source) }
+            }
+
+            staticMetatypeIdentities[destination] = identity
+            if consuming {
+                staticMetatypeIdentities.removeValue(forKey: source)
+            }
+            transferMapping(&representedCollectionMetatypeIdentities)
+            transferMapping(&scalarMetatypeValues)
+            transferMembership(&compilerEnumMetatypeValues)
+            transferMembership(&metatypeValues)
+            transferMapping(&arrayMetatypeValues)
+            transferMapping(&nativeMetatypeValues)
+            transferMapping(&hostedMetatypeValues)
+            transferMembership(&characterMetatypeValues)
+            transferMapping(&localMetatypeValues)
+            transferMapping(&progressionMetatypeValues)
+            transferMapping(&partialRangeMetatypeValues)
+            transferMapping(&dictionaryMetatypeValues)
+            transferMapping(&setMetatypeValues)
+            transferMembership(&stringInterpolationMetatypes)
+            return true
         }
 
         func projectNativeImportArguments(
@@ -4270,7 +4362,7 @@ public struct Lowerer: Sendable {
                 initialValue = value
             }
             stackAddressValues.removeValue(forKey: root)
-            removeTupleComponentValues(rootedAt: root)
+            removeAggregateComponentValues(rootedAt: root)
 
             let cell = try allocate(type: .mutableCell(pointee))
             appendInstruction(
@@ -4474,10 +4566,17 @@ public struct Lowerer: Sendable {
                 guard candidateIdentity.root == identity.root,
                       let updated = updatedValues[candidateIdentity.path]
                 else { continue }
-                if let key = tupleComponentStorageKey(for: candidate) {
-                    tupleComponentValues[key] = updated
-                } else {
+                if stackAddressValues[addressBase(candidate)] != nil {
+                    if let key = aggregateComponentStorageIdentity(
+                        for: candidate
+                    ) {
+                        aggregateComponentValues.removeValue(forKey: key)
+                    }
                     stackAddressValues[addressBase(candidate)] = updated
+                } else if let key = aggregateComponentStorageIdentity(
+                    for: candidate
+                ) {
+                    aggregateComponentValues[key] = updated
                 }
             }
             return true
@@ -4573,10 +4672,17 @@ public struct Lowerer: Sendable {
                     ), candidateProjection.root == projection.root,
                        let updated = updatedValues[candidateProjection.path]
                     else { continue }
-                    if let key = tupleComponentStorageKey(for: candidate) {
-                        tupleComponentValues[key] = updated
-                    } else {
+                    if stackAddressValues[addressBase(candidate)] != nil {
+                        if let key = aggregateComponentStorageIdentity(
+                            for: candidate
+                        ) {
+                            aggregateComponentValues.removeValue(forKey: key)
+                        }
                         stackAddressValues[addressBase(candidate)] = updated
+                    } else if let key = aggregateComponentStorageIdentity(
+                        for: candidate
+                    ) {
+                        aggregateComponentValues[key] = updated
                     }
                 }
                 let optional = try allocate(type: .optional(wrapped))
@@ -19587,7 +19693,7 @@ public struct Lowerer: Sendable {
             // Some imported C values are trivial in SIL but owned in HLBC.
             // A terminating edge relies on frame unwind instead of emitting
             // cleanup after its terminator.
-            var storedValues = removeTupleComponentValues(rootedAt: address)
+            var storedValues = removeAggregateComponentValues(rootedAt: address)
             if let aggregate = stackAddressValues.removeValue(forKey: address) {
                 storedValues.append(aggregate)
             }
@@ -19756,11 +19862,14 @@ public struct Lowerer: Sendable {
                     }
                 }
                 for (token, identity) in block.erasedMetatypeParameters {
+                    staticMetatypeIdentities[token] = identity
                     switch identity {
                     case let .native(typeID):
                         nativeMetatypeValues[token] = typeID
                     case let .local(key):
                         localMetatypeValues[token] = key
+                    case .swift:
+                        break
                     }
                 }
                 for (silValue, register) in explicitParameters {
@@ -20060,6 +20169,15 @@ public struct Lowerer: Sendable {
 
             if let metatype = match(
                 line,
+                pattern: #"^(%[0-9]+) = metatype \$@(thin|thick|objc_metatype) (.+)\.Type$"#
+            ), let identity = metatypeIdentity(
+                "@\(metatype[1]) \(metatype[2]).Type"
+            ) {
+                staticMetatypeIdentities[metatype[0]] = identity
+            }
+
+            if let metatype = match(
+                line,
                 pattern: #"^(%[0-9]+) = metatype \$@(thin|thick) (.+)\.Type$"#
             ), let sequence = try? parseSequenceSpecialization(
                 metatype[2],
@@ -20201,8 +20319,8 @@ public struct Lowerer: Sendable {
 
             if let metatype = match(
                 line,
-                pattern: #"^(%[0-9]+) = metatype \$@(thin|thick) (.+)\.Type$"#
-            ), representedCollectionMetatypeIdentities[metatype[0]] != nil {
+                pattern: #"^(%[0-9]+) = metatype \$@(thin|thick|objc_metatype) (.+)\.Type$"#
+            ), staticMetatypeIdentities[metatype[0]] != nil {
                 continue
             }
 
@@ -21794,6 +21912,28 @@ public struct Lowerer: Sendable {
                     )
                     continue
                 }
+                if runtimeAddress(at: projection[1]) == nil,
+                   stackValue(at: projection[1]) == nil,
+                   case let .local(key) = stackType(at: projection[1]),
+                   typeEnvironment.localKey(for: projection[2]) == key,
+                   case let .structure(fields) = try typeEnvironment
+                    .definition(for: key).kind {
+                    let index = try typeEnvironment.structFieldIndex(
+                        type: key,
+                        name: projection[3]
+                    )
+                    guard fields.indices.contains(index) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "local struct field projection is out of bounds"
+                        )
+                    }
+                    stackAddressTypes[projection[0]] = fields[index].type
+                    aggregateComponentAddresses[projection[0]] = .init(
+                        base: projection[1],
+                        index: index
+                    )
+                    continue
+                }
                 guard let base = runtimeAddress(at: projection[1]),
                       let basePointee = stackType(at: projection[1])
                 else {
@@ -22887,13 +23027,15 @@ public struct Lowerer: Sendable {
                         mangledName: binding.mangledName
                     )
                 }
-                let captureTokens = try parseApplyValueTokens(
+                let physicalCaptureTokens = try parseApplyValueTokens(
                     closure[3],
                     line: sourceLine
                 )
                 if case let .staticKeyPathProjection(identity) = binding.abiAdapter {
-                    guard captureTokens.count == 1,
-                          let keyPath = staticKeyPathValues[captureTokens[0]],
+                    guard physicalCaptureTokens.count == 1,
+                          let keyPath = staticKeyPathValues[
+                            physicalCaptureTokens[0]
+                          ],
                           keyPath.identity == identity,
                           keyPath.rootType == binding.parameterTypes[0],
                           keyPath.valueType == binding.resultType,
@@ -22934,6 +23076,11 @@ public struct Lowerer: Sendable {
                     )
                     continue
                 }
+                let captureTokens = try eraseMetatypeCaptures(
+                    physicalCaptureTokens,
+                    for: reference,
+                    line: sourceLine
+                )
                 guard captureTokens.count <= binding.parameterTypes.count else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "partial_apply captures more values than its callee accepts"
@@ -23134,6 +23281,9 @@ public struct Lowerer: Sendable {
             }
 
             if let borrowed = match(line, pattern: #"^(%[0-9]+) = begin_borrow (%[0-9]+)$"#) {
+                if aliasStaticMetatype(borrowed[0], from: borrowed[1]) {
+                    continue
+                }
                 if let keyPath = staticKeyPathValues[borrowed[1]] {
                     staticKeyPathValues[borrowed[0]] = keyPath
                 } else if unboundedRangeClosureValues.contains(borrowed[1]) {
@@ -26328,6 +26478,9 @@ public struct Lowerer: Sendable {
                     staticKeyPathValues[copy[0]] = keyPath
                     continue
                 }
+                if aliasStaticMetatype(copy[0], from: copy[1]) {
+                    continue
+                }
                 if let progression = progressionValues[copy[1]] {
                     progressionValues[copy[0]] = progression
                     continue
@@ -26430,6 +26583,13 @@ public struct Lowerer: Sendable {
             ) {
                 if let keyPath = staticKeyPathValues[move[1]] {
                     staticKeyPathValues[move[0]] = keyPath
+                    continue
+                }
+                if aliasStaticMetatype(
+                    move[0],
+                    from: move[1],
+                    consuming: true
+                ) {
                     continue
                 }
                 if let progression = progressionValues[move[1]] {
@@ -27743,12 +27903,13 @@ public struct Lowerer: Sendable {
         in raw: String
     ) throws -> (prefix: String, parameters: [String]) {
         let text = try CanonicalSIL.SubstitutedFunctionType.specialize(raw)
-        guard let arrow = outerFunctionArrow(in: text) else {
+        guard let arrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(in: text) else {
             throw CanonicalSIL.LoweringError.malformedSIL("function type has no result arrow")
         }
         let prefix = String(text[..<arrow.lowerBound])
         guard let close = prefix.lastIndex(of: ")"),
-              let open = matchingOpeningParenthesis(for: close, in: prefix),
+              let open = CanonicalSIL.FunctionTypeSyntax
+                .matchingOpeningParenthesis(for: close, in: prefix),
               open < close
         else {
             throw CanonicalSIL.LoweringError.malformedSIL("function type has no parameter tuple")
@@ -27819,13 +27980,14 @@ public struct Lowerer: Sendable {
         erasedMetatypes: [ErasedMetatype]
     ) {
         let text = try CanonicalSIL.SubstitutedFunctionType.specialize(text)
-        guard let arrow = outerFunctionArrow(in: text) else {
+        guard let arrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(in: text) else {
             throw CanonicalSIL.LoweringError.malformedSIL("function type has no result arrow")
         }
         let resultText = String(text[arrow.upperBound...]).trimmingCharacters(in: .whitespaces)
         let prefix = String(text[..<arrow.lowerBound])
         guard let close = prefix.lastIndex(of: ")"),
-              let open = matchingOpeningParenthesis(for: close, in: prefix),
+              let open = CanonicalSIL.FunctionTypeSyntax
+                .matchingOpeningParenthesis(for: close, in: prefix),
               open < close
         else {
             throw CanonicalSIL.LoweringError.malformedSIL("function type has no parameter tuple")
@@ -28063,20 +28225,45 @@ public struct Lowerer: Sendable {
 
     private func metatypeIdentity(_ raw: String) -> MetatypeIdentity? {
         var spelling = raw.trimmingCharacters(in: .whitespaces)
-        if spelling.hasPrefix("$") { spelling.removeFirst() }
+        let parameterDecorations = [
+            "@closureCapture ",
+            "@guaranteed ",
+            "@owned ",
+            "@unowned ",
+            "@in_guaranteed ",
+        ]
+        var removedDecoration = true
+        while removedDecoration {
+            removedDecoration = false
+            spelling = spelling.trimmingCharacters(in: .whitespaces)
+            if spelling.hasPrefix("$") {
+                spelling.removeFirst()
+                removedDecoration = true
+                continue
+            }
+            for decoration in parameterDecorations
+            where spelling.hasPrefix(decoration) {
+                spelling.removeFirst(decoration.count)
+                removedDecoration = true
+                break
+            }
+        }
         let prefixes = ["@thin ", "@thick ", "@objc_metatype "]
         guard let prefix = prefixes.first(where: spelling.hasPrefix),
               spelling.hasSuffix(".Type")
         else { return nil }
         let start = spelling.index(spelling.startIndex, offsetBy: prefix.count)
         let end = spelling.index(spelling.endIndex, offsetBy: -".Type".count)
+        let representedType = String(spelling[start..<end])
         guard start < end,
-              let type = try? parseType(String(spelling[start..<end]))
+              let type = try? parseType(representedType)
         else { return nil }
         return switch type {
         case let .native(typeID): .native(typeID)
         case let .local(key): .local(key)
-        default: nil
+        default: .swift(
+            CanonicalSIL.SwiftTypeIdentity.normalized(representedType)
+        )
         }
     }
 
@@ -28216,7 +28403,7 @@ public struct Lowerer: Sendable {
             options: .regularExpression
         ) != nil, text.contains("@block_storage ")
         else { return nil }
-        guard let arrow = outerFunctionArrow(in: text) else {
+        guard let arrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(in: text) else {
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "native block invoke thunk has no result: \(raw)"
             )
@@ -28224,7 +28411,8 @@ public struct Lowerer: Sendable {
         let physicalResult = String(text[arrow.upperBound...])
         let prefix = String(text[..<arrow.lowerBound])
         guard let close = prefix.lastIndex(of: ")"),
-              let open = matchingOpeningParenthesis(for: close, in: prefix)
+              let open = CanonicalSIL.FunctionTypeSyntax
+                .matchingOpeningParenthesis(for: close, in: prefix)
         else {
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "native block invoke thunk has no parameter tuple"
@@ -28475,7 +28663,9 @@ public struct Lowerer: Sendable {
         ) else { return false }
         spelling.removeSubrange(convention)
         spelling = spelling.trimmingCharacters(in: .whitespaces)
-        guard let arrow = outerFunctionArrow(in: spelling) else { return false }
+        guard let arrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(
+            in: spelling
+        ) else { return false }
         let result = spelling[arrow.upperBound...]
             .trimmingCharacters(in: .whitespaces)
         guard !result.isEmpty, result.utf8.count <= 4_096,
@@ -28483,7 +28673,8 @@ public struct Lowerer: Sendable {
         else { return false }
         let prefix = String(spelling[..<arrow.lowerBound])
         guard let close = prefix.lastIndex(of: ")"),
-              let open = matchingOpeningParenthesis(for: close, in: prefix)
+              let open = CanonicalSIL.FunctionTypeSyntax
+                .matchingOpeningParenthesis(for: close, in: prefix)
         else { return false }
         let parameters = splitTopLevel(
             String(prefix[prefix.index(after: open)..<close])
@@ -28644,62 +28835,6 @@ public struct Lowerer: Sendable {
             of: #"@convention\s*\(\s*method\s*\)"#,
             options: .regularExpression
         ) != nil
-    }
-
-    private func matchingOpeningParenthesis(
-        for close: String.Index,
-        in text: String
-    ) -> String.Index? {
-        var depth = 0
-        var index = close
-        while true {
-            switch text[index] {
-            case ")":
-                depth += 1
-            case "(":
-                depth -= 1
-                if depth == 0 { return index }
-            default:
-                break
-            }
-            guard index > text.startIndex else { return nil }
-            index = text.index(before: index)
-        }
-    }
-
-    private func outerFunctionArrow(in text: String) -> Range<String.Index>? {
-        var parenthesisDepth = 0
-        var angleDepth = 0
-        var bracketDepth = 0
-        var index = text.startIndex
-        while index < text.endIndex {
-            switch text[index] {
-            case "(": parenthesisDepth += 1
-            case ")": parenthesisDepth -= 1
-            case "<": angleDepth += 1
-            case ">":
-                let previous = index > text.startIndex
-                    ? text[text.index(before: index)]
-                    : nil
-                if previous != "-" { angleDepth -= 1 }
-            case "[": bracketDepth += 1
-            case "]": bracketDepth -= 1
-            case "-" where parenthesisDepth == 0
-                    && angleDepth == 0
-                    && bracketDepth == 0:
-                let next = text.index(after: index)
-                if next < text.endIndex, text[next] == ">" {
-                    return index..<text.index(after: next)
-                }
-            default:
-                break
-            }
-            guard parenthesisDepth >= 0, angleDepth >= 0, bracketDepth >= 0 else {
-                return nil
-            }
-            index = text.index(after: index)
-        }
-        return nil
     }
 
     private func parseType(_ raw: String) throws -> Bytecode.ValueType {

@@ -40,13 +40,14 @@ enum ClosureReabstraction {
             of: #"^@convention\s*\(\s*thin\s*\)"#,
             options: .regularExpression
         ) != nil,
-              let arrow = type.range(of: " -> ", options: .backwards)
+              let arrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(in: type)
         else { return nil }
         let outerResult = type[arrow.upperBound...]
             .trimmingCharacters(in: .whitespaces)
         let prefix = String(type[..<arrow.lowerBound])
         guard let close = prefix.lastIndex(of: ")"),
-              let open = matchingOpeningParenthesis(for: close, in: prefix),
+              let open = CanonicalSIL.FunctionTypeSyntax
+                .matchingOpeningParenthesis(for: close, in: prefix),
               splitTopLevel(
                 String(prefix[prefix.index(after: open)..<close])
               ) == nil
@@ -90,33 +91,13 @@ enum ClosureReabstraction {
             parameter = parameter.trimmingCharacters(in: .whitespaces)
         }
         guard sawNonescaping, sawCalleeConvention,
-              let closureArrow = parameter.range(
-                of: " -> ",
-                options: .backwards
+              let closureArrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(
+                in: parameter
               ),
               parameter[closureArrow.upperBound...]
                 .trimmingCharacters(in: .whitespaces) == outerResult
         else { return nil }
         return actorAnnotation.map { "\($0) \(parameter)" } ?? parameter
-    }
-
-    private static func matchingOpeningParenthesis(
-        for close: String.Index,
-        in value: String
-    ) -> String.Index? {
-        var depth = 0
-        var index = close
-        while true {
-            switch value[index] {
-            case ")": depth += 1
-            case "(":
-                depth -= 1
-                if depth == 0 { return index }
-            default: break
-            }
-            guard index > value.startIndex else { return nil }
-            index = value.index(before: index)
-        }
     }
 
     /// Returns a separator only when the outer tuple contains more than one

@@ -682,7 +682,8 @@ public struct TypeEnvironment: Sendable {
             return .mutableCell(pointee)
         }
 
-        if type.contains(" -> "), outerClosureArrow(in: type) != nil {
+        if type.contains(" -> "),
+           CanonicalSIL.FunctionTypeSyntax.outerArrow(in: type) != nil {
             return .closure(
                 try resolveClosureSignature(type, relativeTo: parentScope)
             )
@@ -1108,7 +1109,7 @@ public struct TypeEnvironment: Sendable {
         guard !type.hasPrefix("@convention("),
               !type.hasPrefix("@async "),
               !type.contains(" @async "),
-              let arrow = outerClosureArrow(in: type)
+              let arrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(in: type)
         else {
             throw CanonicalSIL.LoweringError.unsupportedType(raw)
         }
@@ -1333,54 +1334,12 @@ public struct TypeEnvironment: Sendable {
         }
     }
 
-    private func outerClosureArrow(
-        in text: String
-    ) -> Range<String.Index>? {
-        var parenthesisDepth = 0
-        var angleDepth = 0
-        var bracketDepth = 0
-        var index = text.startIndex
-        while index < text.endIndex {
-            switch text[index] {
-            case "(": parenthesisDepth += 1
-            case ")": parenthesisDepth -= 1
-            case "<": angleDepth += 1
-            case ">":
-                let previous = index > text.startIndex
-                    ? text[text.index(before: index)]
-                    : nil
-                if previous != "-" { angleDepth -= 1 }
-            case "[": bracketDepth += 1
-            case "]": bracketDepth -= 1
-            case "-" where parenthesisDepth == 0
-                    && angleDepth == 0
-                    && bracketDepth == 0:
-                let next = text.index(after: index)
-                if next < text.endIndex, text[next] == ">" {
-                    return index..<text.index(after: next)
-                }
-            default:
-                break
-            }
-            guard parenthesisDepth >= 0,
-                  angleDepth >= 0,
-                  bracketDepth >= 0
-            else { return nil }
-            index = text.index(after: index)
-        }
-        return nil
-    }
-
     func structFactory(_ mangledName: String) -> StructFactory? {
         structFactories[mangledName]
     }
 
     func classAllocator(_ mangledName: String) -> Bytecode.LocalTypeKey? {
         classAllocators[mangledName]
-    }
-
-    func isClassAllocator(_ mangledName: String) -> Bool {
-        classAllocators[mangledName] != nil
     }
 
     func isHostedClassAllocator(_ mangledName: String) -> Bool {
@@ -1392,8 +1351,103 @@ public struct TypeEnvironment: Sendable {
         structFactories[mangledName] != nil
     }
 
-    func hasStructFactorySignature(_ function: CanonicalSIL.Function) -> Bool {
-        (try? structFactoryShape(function)) != nil
+    /// A function-local nominal declaration is absent from canonical SIL's
+    /// declaration summary. Its synthesized memberwise initializer may still
+    /// remain in the semantic pass after the optimized root has scalarized it.
+    /// Omit only an exact, side-effect-free identity constructor; any body with
+    /// computation remains an ordinary image candidate and fails closed when
+    /// its nominal shape is unavailable.
+    func isOpaqueStructFactory(_ function: CanonicalSIL.Function) -> Bool {
+        guard function.loweredType.contains("@convention(method)"),
+              let arrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(
+                in: function.loweredType
+              )
+        else { return false }
+        var result = function.loweredType[arrow.upperBound...]
+            .trimmingCharacters(in: .whitespaces)
+        if result.hasPrefix("@owned ") {
+            result.removeFirst("@owned ".count)
+        }
+        guard !result.isEmpty, (try? resolve(result)) == nil else {
+            return false
+        }
+
+        let prefix = String(function.loweredType[..<arrow.lowerBound])
+        guard let parameterRange = outerParameterTuple(in: prefix) else {
+            return false
+        }
+        let parameters = splitTopLevel(String(prefix[parameterRange]))
+        guard var metatype = parameters.last?
+            .trimmingCharacters(in: .whitespaces),
+              metatype.hasPrefix("@thin "),
+              metatype.hasSuffix(".Type")
+        else { return false }
+        metatype.removeFirst("@thin ".count)
+        metatype.removeLast(".Type".count)
+        guard metatype == result else { return false }
+
+        let lines = function.body.split(separator: "\n").map { rawLine in
+            CanonicalSIL.DebugMetadata.strippingComment(from: String(rawLine))
+                .trimmingCharacters(in: .whitespaces)
+        }.filter {
+            !$0.isEmpty && !$0.hasPrefix("bb") && !$0.hasPrefix("debug_value")
+        }
+        if lines.count == 2,
+           let construction = Self.captures(
+            lines[0],
+            pattern: #"^(%[0-9]+) = struct \$([^ ]+) \((.*)\)$"#
+           ), construction[1] == result,
+           let returned = Self.captures(
+            lines[1],
+            pattern: #"^return (%[0-9]+)$"#
+           ), returned[0] == construction[0] {
+            let rawOperands = splitTopLevel(construction[2])
+            let valueParameters = Array(parameters.dropLast())
+            if valueParameters.isEmpty {
+                return rawOperands == [""]
+            }
+            guard rawOperands.count == valueParameters.count else {
+                return false
+            }
+            for (index, pair) in zip(rawOperands, valueParameters).enumerated() {
+                let operand = pair.0.split(
+                    separator: ":",
+                    maxSplits: 1,
+                    omittingEmptySubsequences: false
+                )
+                guard (1...2).contains(operand.count),
+                      operand[0].trimmingCharacters(in: .whitespaces)
+                        == "%\(index)"
+                else { return false }
+                if operand.count == 2,
+                   CanonicalSIL.SwiftTypeIdentity.normalized(
+                    String(operand[1])
+                   ) != CanonicalSIL.SwiftTypeIdentity.normalized(pair.1) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        guard parameters.count == 1, lines.count == 4,
+              let allocation = Self.captures(
+                lines[0],
+                pattern: #"^(%[0-9]+) = alloc_stack(?: \[[^]]+\])? \$([^,]+)(?:,.*)?$"#
+              ), allocation[1] == result,
+              let load = Self.captures(
+                lines[1],
+                pattern: #"^(%[0-9]+) = load(?: \[(?:trivial|copy|take)\])? (%[0-9]+)$"#
+              ), load[1] == allocation[0],
+              let deallocation = Self.captures(
+                lines[2],
+                pattern: #"^dealloc_stack (%[0-9]+)$"#
+              ), deallocation[0] == allocation[0],
+              let returned = Self.captures(
+                lines[3],
+                pattern: #"^return (%[0-9]+)$"#
+              ), returned[0] == load[0]
+        else { return false }
+        return true
     }
 
     func definition(for key: Bytecode.LocalTypeKey) throws -> Bytecode.LocalTypeDefinition {
@@ -2116,7 +2170,9 @@ public struct TypeEnvironment: Sendable {
     private func detectClassAllocator(
         _ function: CanonicalSIL.Function
     ) throws -> Bytecode.LocalTypeKey? {
-        guard let arrow = function.loweredType.range(of: " -> ", options: .backwards) else {
+        guard let arrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(
+            in: function.loweredType
+        ) else {
             return nil
         }
         var rawResult = function.loweredType[arrow.upperBound...]
@@ -2140,7 +2196,9 @@ public struct TypeEnvironment: Sendable {
         physicalParameterTypes: [Bytecode.ValueType],
         rawResult: String
     )? {
-        guard let arrow = function.loweredType.range(of: " -> ", options: .backwards) else {
+        guard let arrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(
+            in: function.loweredType
+        ) else {
             return nil
         }
         let rawResult = String(function.loweredType[arrow.upperBound...])
@@ -2168,9 +2226,14 @@ public struct TypeEnvironment: Sendable {
         let fieldPlans = fields.map { makePlan($0.type) }
 
         guard parameters.count == physicalParameterTypes.count + 1,
-              parameters.last?.trimmingCharacters(in: .whitespaces)
-                == "@thin \(key.rawValue).Type"
+              var metatype = parameters.last?
+                .trimmingCharacters(in: .whitespaces),
+              metatype.hasPrefix("@thin "),
+              metatype.hasSuffix(".Type")
         else { return nil }
+        metatype.removeFirst("@thin ".count)
+        metatype.removeLast(".Type".count)
+        guard localKey(for: metatype) == key else { return nil }
         for (parameter, expectedType) in zip(
             parameters.dropLast(),
             physicalParameterTypes
@@ -2194,24 +2257,11 @@ public struct TypeEnvironment: Sendable {
     private func outerParameterTuple(
         in prefix: String
     ) -> Range<String.Index>? {
-        guard let close = prefix.lastIndex(of: ")") else { return nil }
-        var depth = 0
-        var index = close
-        while true {
-            switch prefix[index] {
-            case ")":
-                depth += 1
-            case "(":
-                depth -= 1
-                if depth == 0 {
-                    return prefix.index(after: index)..<close
-                }
-            default:
-                break
-            }
-            guard index > prefix.startIndex else { return nil }
-            index = prefix.index(before: index)
-        }
+        guard let close = prefix.lastIndex(of: ")"),
+              let open = CanonicalSIL.FunctionTypeSyntax
+                .matchingOpeningParenthesis(for: close, in: prefix)
+        else { return nil }
+        return prefix.index(after: open)..<close
     }
 
     private func resultKey(

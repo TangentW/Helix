@@ -34,22 +34,3 @@ enum SymbolIdentity {
     }
 }
 }
-
-extension CanonicalSIL.Function {
-    /// Synthesized value-type initializers carry a metatype solely to select
-    /// the Swift constructor. They are lowered by local-type construction, not
-    /// linked as ordinary functions with an unsupported metatype ABI.
-    var hasNominalValueConstructorABI: Bool {
-        guard let arrow = loweredType.range(of: " -> ", options: .backwards) else {
-            return false
-        }
-        var result = loweredType[arrow.upperBound...]
-            .trimmingCharacters(in: .whitespaces)
-        for prefix in ["@out ", "@owned "] where result.hasPrefix(prefix) {
-            result.removeFirst(prefix.count)
-        }
-        guard !result.isEmpty else { return false }
-        let parameters = loweredType[..<arrow.lowerBound]
-        return parameters.contains("@thin \(result).Type")
-    }
-}

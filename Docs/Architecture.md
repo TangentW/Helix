@@ -457,6 +457,14 @@ Both workflows depend on stable, build-specific identities:
   ownership verifier. Capture-list and local-variable `weak`/`unowned` storage
   is normalized with mutable capture boxes into one managed-capture ABI; direct
   and specialized closure bodies therefore share the same storage identity.
+  One structural SIL function-type parser identifies the outer result arrow even
+  when parameters or results are themselves functions. Concrete metatype
+  parameters retain their physical indices and nominal/value identity as
+  compiler facts; direct calls and `partial_apply` validate and remove those
+  values before projecting the logical callable ABI. This admits ordinary
+  first-class enum cases, concrete standard-library case constructors,
+  patch-local struct initializers, and patch-local static factories without
+  runtime metadata or type-specific constructor rules.
   Compiler and VM ownership transfer follows the verified static type graph, so
   replacing Optional, Array, Dictionary, Set, enum, tuple, or struct storage
   releases obsolete class owners without scanning aggregate contents at
@@ -488,7 +496,12 @@ Both workflows depend on stable, build-specific identities:
   identity and remains block-local; writes, takes, and destruction invalidate
   every overlapping fact. A frame-local projected take or destroy deinitializes
   only its exact leaves and preserves sibling ownership, while caller-owned and
-  object storage are rejected without a writeback contract. Runtime shape
+  object storage are rejected without a writeback contract. Compiler-only tuple
+  and patch-local struct build regions use that same path identity. A field
+  write invalidates overlapping aggregate snapshots, and reconstruction emits a
+  complete aggregate only when every recursively required leaf has a value;
+  partially initialized storage remains unreadable and is cleaned up field by
+  field. Runtime shape
   allocation and partial storage are charged to the invocation budget;
   projected decomposition precharges its shape-bounded linear work before any
   storage mutation.

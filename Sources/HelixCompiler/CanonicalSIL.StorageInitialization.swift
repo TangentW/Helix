@@ -1613,10 +1613,13 @@ enum StorageInitialization {
         parameterSpellings: [String],
         indirectResultEdges: [IndirectResultEdge]
     )? {
-        guard let arrow = outerFunctionArrow(in: text) else { return nil }
+        guard let arrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(
+            in: text
+        ) else { return nil }
         let prefix = String(text[..<arrow.lowerBound])
         guard let close = prefix.lastIndex(of: ")"),
-              let open = matchingOpeningParenthesis(for: close, in: prefix),
+              let open = CanonicalSIL.FunctionTypeSyntax
+                .matchingOpeningParenthesis(for: close, in: prefix),
               let parameters = splitTopLevelValidated(
                 String(prefix[prefix.index(after: open)..<close])
               )
@@ -1716,60 +1719,6 @@ enum StorageInitialization {
             index = text.index(after: index)
         }
         return false
-    }
-
-    private static func outerFunctionArrow(
-        in text: String
-    ) -> Range<String.Index>? {
-        var depths = (parenthesis: 0, angle: 0, square: 0)
-        var index = text.startIndex
-        while index < text.endIndex {
-            switch text[index] {
-            case "(": depths.parenthesis += 1
-            case ")": depths.parenthesis -= 1
-            case "<": depths.angle += 1
-            case ">":
-                let previous = index > text.startIndex
-                    ? text[text.index(before: index)]
-                    : nil
-                if previous != "-" { depths.angle -= 1 }
-            case "[": depths.square += 1
-            case "]": depths.square -= 1
-            case "-" where depths == (0, 0, 0):
-                let next = text.index(after: index)
-                if next < text.endIndex, text[next] == ">" {
-                    return index..<text.index(after: next)
-                }
-            default:
-                break
-            }
-            guard depths.parenthesis >= 0,
-                  depths.angle >= 0,
-                  depths.square >= 0
-            else { return nil }
-            index = text.index(after: index)
-        }
-        return nil
-    }
-
-    private static func matchingOpeningParenthesis(
-        for close: String.Index,
-        in text: String
-    ) -> String.Index? {
-        var depth = 0
-        var index = close
-        while true {
-            switch text[index] {
-            case ")": depth += 1
-            case "(":
-                depth -= 1
-                if depth == 0 { return index }
-            default:
-                break
-            }
-            guard depth >= 0, index > text.startIndex else { return nil }
-            index = text.index(before: index)
-        }
     }
 
     private static func splitTopLevelValidated(

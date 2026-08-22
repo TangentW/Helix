@@ -422,7 +422,9 @@ does not by itself certify a physical device or distribution channel.
   Closure values may appear in Optional, tuple, Array, Dictionary, patch-local
   struct/enum/class storage, mutable closure variables, and higher-order
   parameter/result signatures. Capture lists, recursive closure variables,
-  local and bound method references, multiple trailing closures, and escaping
+  local and bound method references, patch-local enum-case constructors,
+  concrete `Optional.some`/`Result.success` constructors, patch-local struct
+  initializers and static factories, multiple trailing closures, and escaping
   autoclosures all use this same value model. Concrete closure ABIs preserve
   per-parameter owned/borrowed/inout conventions, including `@in_guaranteed`
   Optional and imported SDK reference values used by the supported higher-order
@@ -435,6 +437,12 @@ does not by itself certify a physical device or distribution channel.
   compiler-generated functions, using the closure-body role only when partially
   applied; direct-only closure and `defer` helpers retain their physical capture
   ABI as concrete specializations. They are never resolved through NativeImport.
+  Concrete nominal metatypes carried by those Swift callables remain validated
+  compiler facts at their physical parameter positions and are erased before
+  direct or partial application enters HLBC. Custom value initializers may build
+  a patch-local struct through field projections; the compiler reconstructs the
+  aggregate only after every required field is initialized, using the same
+  field-path storage and ownership model as tuple initialization.
   On-stack `partial_apply` and `withoutActuallyEscaping` use explicit dynamic
   scope identities. The Verifier proves that every normal and throwing CFG path
   closes the scope, and the VM rejects a scoped closure still reachable through
