@@ -4,7 +4,7 @@ import HelixCore
 import HelixInterface
 
 extension FrontendReceipt.Adapter {
-    func makeStoredPropertyDrafts(
+    func makeSourcePropertyDrafts(
         _ item: [String: Any],
         context: NominalContext?,
         source: SourceState,
@@ -17,10 +17,6 @@ extension FrontendReceipt.Adapter {
         importedSwiftTypeAliases: [String: String]
     ) throws -> [Draft] {
         guard let context,
-              context.kind == .reference,
-              let receiverType = context.referenceTypeID,
-              item["static"] as? Bool != true,
-              item["readImpl"] as? String == "stored",
               let name = baseName(in: item),
               Self.isSwiftIdentifier(name),
               let access = item["access"] as? String,
@@ -37,6 +33,18 @@ extension FrontendReceipt.Adapter {
               let accessors = item["accessors"] as? [[String: Any]]
         else { return [] }
 
+        let isStatic = item["static"] as? Bool == true
+        let receiverType = isStatic ? nil : context.referenceTypeID
+        let readImplementation = item["readImpl"] as? String
+        let writeImplementation = item["writeImpl"] as? String
+        // Static access has no bridged receiver. Instance access currently
+        // requires the identity-preserving source-class Bridge; value-type
+        // mutation needs a distinct inout ABI and actor instances are outside
+        // the synchronous closure stage.
+        guard isStatic || context.kind == .reference && receiverType != nil else {
+            return []
+        }
+
         let isolation = propertyRequiresMainActor(item, demangled: demangled)
             ? "MainActor" : nil
         let effects = Core.Effects(requiresMainActor: isolation != nil)
@@ -47,27 +55,25 @@ extension FrontendReceipt.Adapter {
             )
         var drafts: [Draft] = []
 
-        if let getter = accessors.first(where: { $0["get"] as? Bool == true }) {
+        if let readImplementation,
+           ["getter", "stored"].contains(readImplementation),
+           let getter = accessors.first(where: { $0["get"] as? Bool == true }) {
             let canonical = "\(moduleName).\(context.canonicalName).\(name).get"
             if scope.includes(
                 logicalPath: source.logicalPath,
                 canonicalCallee: canonical,
                 accessLevel: access
-            ) {
-                drafts.append(try makeStoredPropertyDraft(
+            ), let draft = try makeSourcePropertyDraft(
                     accessor: getter,
-                    dispatch: .instanceGetter,
+                    dispatch: isStatic ? .staticGetter : .instanceGetter,
                     canonicalCallee: canonical,
-                    silSymbols: [
-                        CanonicalSIL.NativePropertySymbol.getter(
-                            ownerType: context.moduleQualifiedName,
-                            property: name
-                        ),
-                        CanonicalSIL.NativePropertySymbol.getter(
-                            ownerType: context.canonicalName,
-                            property: name
-                        ),
-                    ],
+                    silSymbols: sourcePropertySymbols(
+                        operation: .getter,
+                        isStored: readImplementation == "stored",
+                        isStatic: isStatic,
+                        context: context,
+                        name: name
+                    ),
                     name: name,
                     access: access,
                     propertySwiftType: propertySwiftType,
@@ -81,32 +87,30 @@ extension FrontendReceipt.Adapter {
                     effects: effects,
                     isolation: isolation,
                     silFile: silFile
-                ))
+                ) {
+                drafts.append(draft)
             }
         }
 
-        if item["writeImpl"] as? String == "stored",
+        if let writeImplementation,
+           ["setter", "stored"].contains(writeImplementation),
            let setter = accessors.first(where: { $0["set"] as? Bool == true }) {
             let canonical = "\(moduleName).\(context.canonicalName).\(name).set"
             if scope.includes(
                 logicalPath: source.logicalPath,
                 canonicalCallee: canonical,
                 accessLevel: access
-            ) {
-                drafts.append(try makeStoredPropertyDraft(
+            ), let draft = try makeSourcePropertyDraft(
                     accessor: setter,
-                    dispatch: .instanceSetter,
+                    dispatch: isStatic ? .staticSetter : .instanceSetter,
                     canonicalCallee: canonical,
-                    silSymbols: [
-                        CanonicalSIL.NativePropertySymbol.setter(
-                            ownerType: context.moduleQualifiedName,
-                            property: name
-                        ),
-                        CanonicalSIL.NativePropertySymbol.setter(
-                            ownerType: context.canonicalName,
-                            property: name
-                        ),
-                    ],
+                    silSymbols: sourcePropertySymbols(
+                        operation: .setter,
+                        isStored: writeImplementation == "stored",
+                        isStatic: isStatic,
+                        context: context,
+                        name: name
+                    ),
                     name: name,
                     access: access,
                     propertySwiftType: propertySwiftType,
@@ -120,13 +124,14 @@ extension FrontendReceipt.Adapter {
                     effects: effects,
                     isolation: isolation,
                     silFile: silFile
-                ))
+                ) {
+                drafts.append(draft)
             }
         }
         return drafts
     }
 
-    private func makeStoredPropertyDraft(
+    private func makeSourcePropertyDraft(
         accessor: [String: Any],
         dispatch: NativeImportDiscovery.Dispatch,
         canonicalCallee: String,
@@ -137,17 +142,17 @@ extension FrontendReceipt.Adapter {
         generatedPropertySwiftType: String,
         propertyType: Bytecode.ValueType,
         context: NominalContext,
-        receiverType: Core.TypeID,
+        receiverType: Core.TypeID?,
         source: SourceState,
         importedModules: [String],
         moduleName: String,
         effects: Core.Effects,
         isolation: String?,
         silFile: CanonicalSIL.File
-    ) throws -> Draft {
+    ) throws -> Draft? {
         guard let usr = accessor["usr"] as? String, usr.hasPrefix("s:") else {
             throw FrontendReceipt.Error.malformedAST(
-                "stored property \(canonicalCallee) has no Swift accessor identity"
+                "source property \(canonicalCallee) has no Swift accessor identity"
             )
         }
         let astMangledName = "$s" + usr.dropFirst(2)
@@ -156,28 +161,45 @@ extension FrontendReceipt.Adapter {
         else {
             throw FrontendReceipt.Error.missingSILFunction(astMangledName)
         }
+        // Async and throwing accessors require a different invocation ABI.
+        // Canonical SIL is authoritative here; checking its complete lowered
+        // type also excludes async/throwing callable property shapes, which are
+        // outside the synchronous native-callable profile.
+        guard !sil.loweredType.contains("@async"),
+              !sil.loweredType.contains("@error")
+        else { return nil }
+
         let mangledName = sil.mangledName
-        let isSetter = dispatch == .instanceSetter
-        let parameterSwiftTypes = isSetter
-            ? [propertySwiftType, context.canonicalName]
-            : [context.canonicalName]
-        let generatedParameterSwiftTypes = isSetter
-            ? [generatedPropertySwiftType, context.canonicalName]
-            : [context.canonicalName]
-        let parameterTypes: [Bytecode.ValueType] = isSetter
-            ? [propertyType, .native(receiverType)]
-            : [.native(receiverType)]
+        let isSetter = dispatch == .instanceSetter || dispatch == .staticSetter
+        let receiverSwiftTypes = receiverType.map { _ in [context.canonicalName] } ?? []
+        let receiverValueTypes = receiverType.map { [Bytecode.ValueType.native($0)] } ?? []
+        let parameterSwiftTypes = (isSetter ? [propertySwiftType] : [])
+            + receiverSwiftTypes
+        let generatedParameterSwiftTypes = (
+            isSetter ? [generatedPropertySwiftType] : []
+        ) + receiverSwiftTypes
+        let parameterTypes = (isSetter ? [propertyType] : [])
+            + receiverValueTypes
         let resultSwiftType = isSetter ? "Swift.Void" : propertySwiftType
         let generatedResultSwiftType = isSetter
             ? "Swift.Void" : generatedPropertySwiftType
         let resultType: Bytecode.ValueType = isSetter ? .void : propertyType
+        let callbacks = FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: parameterSwiftTypes,
+            parameterTypes: parameterTypes,
+            authoritativeLifetimes: isSetter
+                ? FrontendReceipt.NativeBridgeProfile.storedValueLifetimes(
+                    parameterTypes: parameterTypes
+                ) : [:]
+        )
+        guard let callbacks else { return nil }
         let signature = Core.LoweredSignature(
             parameters: parameterSwiftTypes,
             result: resultSwiftType,
             isolation: isolation
         )
         let interface = ReleaseCompiler.DeclarationInterface(
-            declarationKind: isSetter ? "stored-property-setter" : "stored-property-getter",
+            declarationKind: isSetter ? "source-property-setter" : "source-property-getter",
             baseName: name,
             argumentLabels: isSetter ? ["_"] : [],
             accessLevel: access,
@@ -203,7 +225,7 @@ extension FrontendReceipt.Adapter {
             hasCompleteDynamicCoverage: false,
             forcedPatchability: .rejected(
                 "HLXIDX023",
-                explanation: "stored property access is represented by an exact NativeImport"
+                explanation: "source property access is represented by an exact NativeImport"
             )
         )
         return Draft(
@@ -231,14 +253,49 @@ extension FrontendReceipt.Adapter {
                 parameterTypes: parameterTypes,
                 resultType: resultType,
                 signature: signature,
+                callbacks: callbacks,
                 inferredEffects: effects,
                 isGeneric: false,
                 hasInOut: false,
                 hasTypedThrows: false,
                 hasUnsupportedAttributes: false
             ),
-            referenceReceiverType: context.moduleQualifiedName
+            referenceReceiverType: receiverType == nil
+                ? nil : context.moduleQualifiedName
         )
+    }
+
+    private enum SourcePropertyOperation {
+        case getter
+        case setter
+    }
+
+    /// Stored class fields lower through storage projections as well as their
+    /// accessor functions. Computed and static properties use only their exact
+    /// accessor symbol, which `makeSourcePropertyDraft` appends after resolving
+    /// canonical SIL.
+    private func sourcePropertySymbols(
+        operation: SourcePropertyOperation,
+        isStored: Bool,
+        isStatic: Bool,
+        context: NominalContext,
+        name: String
+    ) -> [String] {
+        guard isStored, !isStatic, context.kind == .reference else { return [] }
+        return [context.moduleQualifiedName, context.canonicalName].map { owner in
+            switch operation {
+            case .getter:
+                CanonicalSIL.NativePropertySymbol.getter(
+                    ownerType: owner,
+                    property: name
+                )
+            case .setter:
+                CanonicalSIL.NativePropertySymbol.setter(
+                    ownerType: owner,
+                    property: name
+                )
+            }
+        }
     }
 
     private func propertyRequiresMainActor(

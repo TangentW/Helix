@@ -469,7 +469,7 @@ does not by itself certify a physical device or distribution channel.
   Swift symbol; recursive, rethrowing, higher-order, and escaping-function-value
   forms use that same path. Unresolved arguments, packs, and bodies that retain
   metadata or witness dispatch remain fail-closed.
-- Exact NativeImport callback parameters under one generated, framework-neutral
+- Exact NativeImport callable crossings under one generated, framework-neutral
   bridge profile. Typed AST supplies the source closure spelling; canonical SIL
   supplies the physical `@noescape`/escaping lifetime, Objective-C block
   reabstraction, ownership, and global-actor evidence. The current profile
@@ -483,6 +483,13 @@ does not by itself certify a physical device or distribution channel.
   bounded `Error` proxies; the VM keeps its native identity, exact ownership
   and MainActor requirements, resource accounting, and a non-Sendable overlap
   gate when invoking it.
+  A NativeImport itself may return a direct or Optional native-origin callable
+  with the same signature profile. Returned callables are escaping by
+  construction. The generated Bridge must create their identity-bearing target
+  and encode it before the synchronous import context closes, under that
+  import's exact deadline and signed resource limits; an image-local closure
+  cannot be substituted. Their parameters and result cannot contain a second
+  callable layer, and callable containers remain excluded.
   Results may be `Void` or ordinary recursive bridge values with deterministic
   failure values: scalars, text, `Any`, Optional, empty collections, and
   recursively defaultable tuples. Direct native results are rejected because
@@ -579,9 +586,10 @@ does not by itself certify a physical device or distribution channel.
 - Actor-isolated instance roots, custom global actors, and arbitrary executor
   hops. The limited `@MainActor async` leaf case above is distinct.
 - A closure crossing a Shell Entry, or crossing NativeImport outside the exact
-  callback-parameter profile above. Ordinary native values, native properties,
-  native results, and the general boundary codec cannot contain closures; only
-  an exact escaping callback parameter may retain its pinned handle. Callback
+  callable profile above. Ordinary native values and the general boundary
+  codec cannot contain closures; only an exact callback parameter or a direct
+  or Optional native-origin callable result may use the typed handle boundary.
+  Callback
   results without a framework-neutral failure value, throwing or async callback
   ABIs, `inout` callback parameters, recursive/nonescaping nested callable
   parameters or callable containers, and

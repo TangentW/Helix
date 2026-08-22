@@ -1,9 +1,9 @@
 import Foundation
 import HelixBytecode
 import HelixCore
-import HelixVM
 import Testing
 @testable import HelixRuntime
+@testable import HelixVM
 
 extension RuntimeTests {
 @Suite("Bridge input encoding limits")
@@ -343,6 +343,156 @@ struct BridgeInput {
         }
     }
 
+    @Test("NativeImport results use one bounded encoder for returned callables")
+    func nativeImportCallableResultEncoding() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64
+        )
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 1_000,
+            allowsMainThread: true
+        )
+        let budget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000)
+        )
+        let context = try budget.beginNativeInvocation(
+            id: .init(rawValue: 0),
+            effects: .init(),
+            contract: contract
+        )
+        let encoded = try Runtime.BridgeValueCodec.encodeNativeImportResult(
+            expectedType: .closure(signature),
+            context: context
+        ) { encoder in
+            try encoder.encodeNativeClosure(signature: signature) {
+                arguments,
+                resultEncoder in
+                guard case let .integer(value) = arguments.first else {
+                    throw VM.RuntimeTrap.typeMismatch(
+                        expected: .int64,
+                        actual: arguments.first?.type
+                    )
+                }
+                return try resultEncoder.encode(value.signedValue + 1)
+            }
+        }
+        try context.finish(requireCooperation: false)
+        guard case let .closure(closure) = encoded,
+              let nativeClosure = closure.nativeTarget
+        else {
+            Issue.record("expected a returned native-origin callable")
+            return
+        }
+        let result = try nativeClosure.invoke(
+            arguments: [
+                .integer(
+                    try .init(signed: 41, bitWidth: 64, isSigned: true)
+                ),
+            ],
+            budget: .init(limits: .init())
+        )
+        #expect(
+            result == .integer(
+                try .init(signed: 42, bitWidth: 64, isSigned: true)
+            )
+        )
+
+        let rejectedBudget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000)
+        )
+        let rejectedContext = try rejectedBudget.beginNativeInvocation(
+            id: .init(rawValue: 1),
+            effects: .init(),
+            contract: contract
+        )
+        defer { try? rejectedContext.finish(requireCooperation: false) }
+        let imageClosure = VM.Value.closure(
+            .init(
+                functionID: .init(rawValue: 7),
+                signature: signature,
+                captures: []
+            )
+        )
+        #expect(
+            throws: Runtime.BridgeInputError.encodedTypeMismatch(
+                expected: "a bridge-created native closure",
+                actual: imageClosure.type.description
+            )
+        ) {
+            _ = try Runtime.BridgeValueCodec.encodeNativeImportResult(
+                expectedType: .closure(signature),
+                context: rejectedContext
+            ) { _ in imageClosure }
+        }
+
+        let constrainedBudget = VM.InvocationBudget(
+            limits: .init(
+                maxVMHeapBytes: VM.NativeClosure.estimatedVMByteCount - 1,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+        )
+        let constrainedContext = try constrainedBudget.beginNativeInvocation(
+            id: .init(rawValue: 2),
+            effects: .init(),
+            contract: contract
+        )
+        defer { try? constrainedContext.finish(requireCooperation: false) }
+        #expect(
+            throws: Runtime.BridgeInputError.estimatedVMByteLimitExceeded(
+                maximum: VM.NativeClosure.estimatedVMByteCount - 1
+            )
+        ) {
+            _ = try Runtime.BridgeValueCodec.encodeNativeImportResult(
+                expectedType: .closure(signature),
+                context: constrainedContext
+            ) { encoder in
+                try encoder.encodeNativeClosure(
+                    signature: signature
+                ) { _, resultEncoder in
+                    try resultEncoder.encode(Int64(0))
+                }
+            }
+        }
+    }
+
+    @Test("NativeImport result encoding enforces the exact import deadline")
+    func nativeImportResultEncodingDeadline() throws {
+        let clock = ControlledClock()
+        let importID = Core.NativeImportID(rawValue: 3)
+        let budget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            isMainThread: true,
+            nowNanoseconds: { clock.now() }
+        )
+        let context = try budget.beginNativeInvocation(
+            id: importID,
+            effects: .init(),
+            contract: .bounded(
+                kind: .globalFunction,
+                domain: .application,
+                access: .pure,
+                maximumDurationMicroseconds: 1_000,
+                allowsMainThread: true
+            )
+        )
+        defer { try? context.finish(requireCooperation: false) }
+        clock.set(2_000_000)
+
+        #expect(throws: VM.RuntimeTrap.nativeImportDeadlineExceeded(importID)) {
+            _ = try Runtime.BridgeValueCodec.encodeNativeImportResult(
+                expectedType: .int64,
+                context: context
+            ) { encoder in
+                try encoder.encode(Int64(1))
+            }
+        }
+    }
+
     @Test("Native callables enforce actor isolation")
     func nativeClosureEnforcesActorIsolation() async throws {
         let mainActorSignature = Bytecode.ClosureSignature(
@@ -645,6 +795,19 @@ struct BridgeInput {
 
     private enum SyntheticDeadline: Error, Equatable {
         case expired
+    }
+
+    private final class ControlledClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: UInt64 = 0
+
+        func now() -> UInt64 {
+            lock.withLock { value }
+        }
+
+        func set(_ value: UInt64) {
+            lock.withLock { self.value = value }
+        }
     }
 
     private struct DescribedError: Error, CustomStringConvertible {

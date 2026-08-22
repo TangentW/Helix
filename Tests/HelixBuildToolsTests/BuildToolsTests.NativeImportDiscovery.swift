@@ -1099,7 +1099,7 @@ struct NativeImportDiscoveryTests {
         #expect(completion.parameters == [.bool])
         #expect(completion.parameterConventions == [.owned])
         #expect(completion.result == .void)
-        #expect(completion.isNativeBridgeCallableArgument)
+        #expect(completion.isNativeBridgeCallable)
     }
 
     @Test("Physical SIL aliases collapse to one deterministic logical import")
@@ -1384,6 +1384,20 @@ struct NativeImportDiscoveryTests {
             ) -> Bool {
                 body({ !$0 }, { $0 + 1 })
             }
+            public func makeTransform(_ offset: Int) -> (Int) -> Int {
+                { value in value + offset }
+            }
+            public func makeOptionalTransform(
+                _ offset: Int?
+            ) -> ((Int) -> Int)? {
+                guard let offset else { return nil }
+                return { value in value + offset }
+            }
+            public func makeMainTransform(
+                _ offset: Int
+            ) -> @MainActor (Int) -> Int {
+                { value in value + offset }
+            }
             public func invokeTuple(
                 _ body: () -> (value: Int, accepted: Bool)
             ) -> (value: Int, accepted: Bool) {
@@ -1394,6 +1408,9 @@ struct NativeImportDiscoveryTests {
             }
             public enum Math {
                 public static func doubled(_ value: Int) -> Int { value * 2 }
+                public static var incrementer: (Int) -> Int {
+                    { value in value + 1 }
+                }
             }
             public final class Counter {
                 public var value: Int = 0
@@ -1468,6 +1485,7 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).Counter.value.get",
             "\(moduleName).Counter.value.set",
             "\(moduleName).Math.doubled(_:)",
+            "\(moduleName).Math.incrementer.get",
             "\(moduleName).adjust(_:by:)",
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
@@ -1485,12 +1503,15 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).invokeTuple(_:)",
             "\(moduleName).keyword(_:repeat:)",
             "\(moduleName).mainValue(_:)",
+            "\(moduleName).makeMainTransform(_:)",
+            "\(moduleName).makeOptionalTransform(_:)",
+            "\(moduleName).makeTransform(_:)",
             "Swift.String.init(describing:)",
             "Swift.String.init(reflecting:)",
             "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
-        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...24).map {
+        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...28).map {
             Core.NativeImportID(rawValue: UInt32($0))
         })
         let callbacks = Dictionary(uniqueKeysWithValues: output.receipt
@@ -1531,7 +1552,33 @@ struct NativeImportDiscoveryTests {
         #expect(callbacks["\(moduleName).invokeProvider(_:)"] == [
             .init(parameterIndex: 0, lifetime: .escaping),
         ])
-        #expect(output.receipt.nativeImportBindings.count == 25)
+        let callableResults = Dictionary(uniqueKeysWithValues: output.receipt
+            .nativeImportCandidates.compactMap { record in
+                record.resultType.directClosureShape.map {
+                    (record.canonicalCallee, $0)
+                }
+            })
+        #expect(callableResults.count == 4)
+        #expect(
+            callableResults["\(moduleName).Math.incrementer.get"]?.isOptional
+                == false
+        )
+        #expect(
+            callableResults["\(moduleName).makeMainTransform(_:)"]?
+                .signature.effects.requiresMainActor == true
+        )
+        #expect(
+            callableResults["\(moduleName).makeOptionalTransform(_:)"]?
+                .isOptional == true
+        )
+        #expect(
+            callableResults["\(moduleName).makeTransform(_:)"]?.isOptional
+                == false
+        )
+        #expect(callableResults.values.allSatisfy {
+            $0.signature.isNativeBridgeCallable
+        })
+        #expect(output.receipt.nativeImportBindings.count == 29)
         #expect(output.receipt.nativeImportBindings.filter {
             $0.generated != nil
         }.allSatisfy {
@@ -1539,7 +1586,7 @@ struct NativeImportDiscoveryTests {
         })
         #expect(output.receipt.nativeImportBindings.filter {
             $0.generated != nil
-        }.count == 21)
+        }.count == 25)
         #expect(output.receipt.nativeImportBindings.contains {
             $0.generated == nil && $0.importedModules == ["HelixRuntime"]
         })
@@ -1551,6 +1598,7 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).Counter.value.get",
             "\(moduleName).Counter.value.set",
             "\(moduleName).Math.doubled(_:)",
+            "\(moduleName).Math.incrementer.get",
             "\(moduleName).adjust(_:by:)",
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
@@ -1568,6 +1616,9 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).invokeTuple(_:)",
             "\(moduleName).keyword(_:repeat:)",
             "\(moduleName).mainValue(_:)",
+            "\(moduleName).makeMainTransform(_:)",
+            "\(moduleName).makeOptionalTransform(_:)",
+            "\(moduleName).makeTransform(_:)",
             "Swift.String.init(describing:)",
             "Swift.String.init(reflecting:)",
             "Swift.debugPrint(_:separator:terminator:)",
@@ -1653,11 +1704,13 @@ struct NativeImportDiscoveryTests {
         #expect(generated.contains("try context.withMainActor"))
         #expect(generated.contains("BridgeValueCodec.decodeDictionary"))
         #expect(generated.contains("BridgeValueCodec.decodeAny"))
-        #expect(generated.contains("BridgeValueCodec.encodeAny"))
+        #expect(generated.contains("nativeResultEncoder.encodeAny"))
+        #expect(generated.contains("encodeNativeImportResult("))
         #expect(generated.contains("context.makeCallback("))
         #expect(generated.contains("nativeCallback"))
         #expect(generated.contains("encodeNativeCallbackArguments("))
         #expect(generated.contains("encodeNativeClosure("))
+        #expect(generated.contains("MainActor.assumeIsolated"))
         #expect(generated.contains("@escaping (Swift.Bool) ->"))
         #expect(generated.contains("(callbackArgument0)(nativeArgument0)"))
         #expect(generated.contains("(wrapped)(nativeArgument0)"))
@@ -1669,6 +1722,7 @@ struct NativeImportDiscoveryTests {
         #expect(generated.contains(".invokeResult("))
         #expect(generated.contains("failureResult: {"))
         #expect(generated.contains("Swift.Character(\"\\0\")"))
+        #expect(shell.archive.capabilities.contains(.mainActorSyncV1))
         #expect(generated.contains("(0, false)"))
         let bridge = try #require(
             shell.bridge.sourceFiles["Generated/\(moduleName)Bridge.swift"]
@@ -1690,7 +1744,12 @@ struct NativeImportDiscoveryTests {
                     let next = transform?(value) ?? value
                     return predicate(value <= 0) && next > value
                 }
+                let transformed = makeTransform(1)(value)
+                let optionalTransform = makeOptionalTransform(2)
+                let optionalValue = optionalTransform?(value) ?? value
+                let incremented = Math.incrementer(value)
                 return adjust(value, by: 1) + (accepted ? 3 : 4)
+                    + transformed + optionalValue + incremented
             }
             """.utf8
         ).write(to: patchURL)
@@ -1791,7 +1850,7 @@ struct NativeImportDiscoveryTests {
         )
     }
 
-    @Test("Managed Debug lowers private class storage reads and writes through exact imports")
+    @Test("Managed Debug lowers source property accessors through exact imports")
     func lowersManagedStoredProperties() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-properties-\(UUID().uuidString)",
@@ -1807,9 +1866,20 @@ struct NativeImportDiscoveryTests {
         let baseline = """
         public final class Counter {
             private var value: Int = 1
+            private var transform: ((Int) -> Int)?
+            private var projector: (Int) -> Int {
+                { input in input + self.value }
+            }
+            public static var incrementer: (Int) -> Int {
+                { input in input + 1 }
+            }
+            public func configure(_ body: @escaping (Int) -> Int) {
+                transform = body
+            }
             public func increment(_ amount: Int) -> Int {
                 value += amount
-                return value
+                let transformed = transform?(value) ?? value
+                return Self.incrementer(projector(transformed))
             }
         }
         """
@@ -1861,6 +1931,11 @@ struct NativeImportDiscoveryTests {
             )
         )
         #expect(output.receipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
+            "\(moduleName).Counter.configure(_:)",
+            "\(moduleName).Counter.incrementer.get",
+            "\(moduleName).Counter.projector.get",
+            "\(moduleName).Counter.transform.get",
+            "\(moduleName).Counter.transform.set",
             "\(moduleName).Counter.value.get",
             "\(moduleName).Counter.value.set",
             "Swift.String.init(describing:)",
@@ -1871,7 +1946,35 @@ struct NativeImportDiscoveryTests {
         #expect(output.receipt.roots.compactMap(\.bridge).count == 1)
         #expect(output.receipt.nativeImportBindings.compactMap(\.generated?.dispatch).sorted {
             $0.rawValue < $1.rawValue
-        } == [.instanceGetter, .instanceSetter])
+        } == [
+            .instanceGetter, .instanceGetter, .instanceGetter,
+            .instanceMethod,
+            .instanceSetter, .instanceSetter,
+            .staticGetter,
+        ])
+        let configure = try #require(
+            output.receipt.nativeImportCandidates.first {
+                $0.canonicalCallee == "\(moduleName).Counter.configure(_:)"
+            }
+        )
+        #expect(configure.contract.callbacks == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+        let transformSetter = try #require(
+            output.receipt.nativeImportCandidates.first {
+                $0.canonicalCallee == "\(moduleName).Counter.transform.set"
+            }
+        )
+        #expect(transformSetter.contract.callbacks == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+        let callablePropertyResults = output.receipt.nativeImportCandidates.filter {
+            $0.canonicalCallee.hasSuffix("incrementer.get")
+                || $0.canonicalCallee.hasSuffix("projector.get")
+                || $0.canonicalCallee.hasSuffix("transform.get")
+        }.compactMap { $0.resultType.directClosureShape }
+        #expect(callablePropertyResults.count == 3)
+        #expect(callablePropertyResults.filter(\.isOptional).count == 1)
 
         let shell = try ShellBuild.Materializer().materialize(
             receipt: output.receipt,
@@ -1881,6 +1984,10 @@ struct NativeImportDiscoveryTests {
             $0.contains("argument1.value = argument0")
         })
         #expect(generated.contains("argument0.value"))
+        #expect(generated.contains("argument1.transform = argument0"))
+        #expect(generated.contains("Counter.incrementer"))
+        #expect(generated.contains("encodeNativeClosure("))
+        #expect(generated.contains("context.makeCallback("))
         try typeCheckGeneratedBridge(
             shell: shell,
             directory: directory,
@@ -1900,9 +2007,9 @@ struct NativeImportDiscoveryTests {
             )
         )
         #expect(
-            patch.disassembly.components(separatedBy: "native_apply").count - 1 >= 3
+            patch.disassembly.components(separatedBy: "native_apply").count - 1 >= 6
         )
-        #expect(patch.module.imports.count == 2)
+        #expect(patch.module.imports.count == 5)
         _ = try Verification.Engine().verify(
             bytes: patch.bytecode,
             shell: Verification.ShellInterface(archive: shell.archive),

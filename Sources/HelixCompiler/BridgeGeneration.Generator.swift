@@ -1429,27 +1429,46 @@ public struct Generator: Sendable {
             invocation = callBody
                 + "\nreturn .returned(try Runtime.BridgeValueCodec.encodeVoid())"
         } else {
-            let encoded = renderEncode(
+            let encodedValue = renderEncode(
                 expression: "result",
                 shape: resultShape,
                 type: record.resultType,
-                nativeCatalog: "try Runtime.Bridge.shared.requireNativeTypeCatalog()"
+                nativeCatalog: "try Runtime.Bridge.shared.requireNativeTypeCatalog()",
+                inputEncoder: "nativeResultEncoder"
             )
+            let encoded = """
+            try Runtime.BridgeValueCodec.encodeNativeImportResult(
+                expectedType: \(render(record.resultType)),
+                context: context
+            ) { nativeResultEncoder in
+            \(indent(encodedValue, spaces: 4))
+            }
+            """
             if record.effects.requiresMainActor {
                 // Keep potentially non-Sendable native values actor-isolated;
                 // only their Sendable VM representation crosses the boundary.
-                let call = """
-                try context.withMainActor {
-                    let result: \(resultShape.rendered) = \(directCall)
-                    return \(encoded)
+                if record.effects.mayThrow {
+                    invocation = """
+                    return try context.withMainActor {
+                        let result: \(resultShape.rendered)
+                        do {
+                            result = \(directCall)
+                        } catch let trap as VM.RuntimeTrap {
+                            throw trap
+                        } catch {
+                            return .businessError(String(describing: error))
+                        }
+                        return .returned(\(encoded))
+                    }
+                    """
+                } else {
+                    invocation = """
+                    return try context.withMainActor {
+                        let result: \(resultShape.rendered) = \(directCall)
+                        return .returned(\(encoded))
+                    }
+                    """
                 }
-                """
-                let callBody = renderGeneratedThrowingCall(
-                    call,
-                    resultDeclaration: "let encodedResult: VM.Value",
-                    effects: record.effects
-                )
-                invocation = callBody + "\nreturn .returned(encodedResult)"
             } else {
                 let callBody = renderGeneratedThrowingCall(
                     directCall,
@@ -1695,12 +1714,12 @@ public struct Generator: Sendable {
     ) -> Bool {
         switch (shape, type) {
         case let (.function(_, _, _), .closure(signature)):
-            return signature.isNativeBridgeCallableArgument
+            return signature.isNativeBridgeCallable
         case let (
             .optional(.function(_, _, _)),
             .optional(.closure(signature))
         ):
-            return signature.isNativeBridgeCallableArgument
+            return signature.isNativeBridgeCallable
         default:
             return !type.containsClosureValue && type.isNativeBridgeValue
         }
@@ -1855,7 +1874,7 @@ public struct Generator: Sendable {
             .optional(.closure(signature))
         ):
             guard let inputEncoder,
-                  signature.isNativeBridgeCallableArgument
+                  signature.isNativeBridgeCallable
             else {
                 preconditionFailure(
                     "validated optional native callable requires a callback encoder"
@@ -1958,7 +1977,7 @@ public struct Generator: Sendable {
             .closure(signature)
         ):
             guard let inputEncoder,
-                  signature.isNativeBridgeCallableArgument
+                  signature.isNativeBridgeCallable
             else {
                 preconditionFailure(
                     "validated native callable requires an escaping callback encoder"

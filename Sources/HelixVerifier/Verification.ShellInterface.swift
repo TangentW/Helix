@@ -202,21 +202,24 @@ public struct ShellInterface: Sendable {
                     )
                 }
             }
-            guard !descriptor.resultType.containsClosureValue else {
-                throw Verification.Error.invalidShellInterface(
-                    "native import \(descriptor.id) cannot return a callback"
-                )
-            }
             guard descriptor.resultType.isNativeImportBridgeResult else {
                 throw Verification.Error.invalidShellInterface(
                     "native import \(descriptor.id) has an unsupported result"
                 )
             }
-            try Self.validateBoundaryType(
-                descriptor.resultType,
-                owner: "native import \(descriptor.id)",
-                capabilities: capabilities
-            )
+            if let callable = descriptor.resultType.directClosureShape {
+                try Self.validateNativeCallable(
+                    callable.signature,
+                    owner: "native import \(descriptor.id) result",
+                    capabilities: capabilities
+                )
+            } else {
+                try Self.validateBoundaryType(
+                    descriptor.resultType,
+                    owner: "native import \(descriptor.id)",
+                    capabilities: capabilities
+                )
+            }
         }
     }
 
@@ -231,6 +234,8 @@ public struct ShellInterface: Sendable {
                 || capabilities.contains(.escapingClosureValuesV1),
               let shape = type.directClosureShape,
               shape.signature.isNativeBridgeCallback,
+              !shape.signature.effects.requiresMainActor
+                || capabilities.contains(.mainActorSyncV1),
               !shape.signature.parameters.contains(where: \.containsClosureValue)
                 || capabilities.contains(.escapingClosureValuesV1),
               !(callback.lifetime == .nonescaping && shape.isOptional)
@@ -241,7 +246,7 @@ public struct ShellInterface: Sendable {
         }
         for parameter in shape.signature.parameters {
             if let callable = parameter.directClosureShape {
-                try validateNativeCallableArgument(
+                try validateNativeCallable(
                     callable.signature,
                     owner: owner,
                     capabilities: capabilities
@@ -267,16 +272,19 @@ public struct ShellInterface: Sendable {
         )
     }
 
-    private static func validateNativeCallableArgument(
+    private static func validateNativeCallable(
         _ signature: Bytecode.ClosureSignature,
         owner: String,
         capabilities: Set<Core.Capability>
     ) throws {
-        guard capabilities.contains(.escapingClosureValuesV1),
-              signature.isNativeBridgeCallableArgument
+        guard capabilities.contains(.closureValuesV1),
+              capabilities.contains(.escapingClosureValuesV1),
+              signature.isNativeBridgeCallable,
+              !signature.effects.requiresMainActor
+                || capabilities.contains(.mainActorSyncV1)
         else {
             throw Verification.Error.invalidShellInterface(
-                "\(owner) has an unsupported native callable argument"
+                "\(owner) has an unsupported native callable"
             )
         }
         for parameter in signature.parameters {

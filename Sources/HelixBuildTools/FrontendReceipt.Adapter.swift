@@ -1205,7 +1205,7 @@ extension FrontendReceipt.Adapter {
                     drafts.append(draft)
                 }
             case "var_decl":
-                drafts.append(contentsOf: try makeStoredPropertyDrafts(
+                drafts.append(contentsOf: try makeSourcePropertyDrafts(
                     item,
                     context: context,
                     source: source,

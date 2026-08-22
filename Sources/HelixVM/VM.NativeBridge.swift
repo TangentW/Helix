@@ -25,8 +25,11 @@ public protocol NativeInvoker: Sendable {
 
 /// A synchronous import's only authority to consume work and observe deadlines.
 /// Cooperative factories must checkpoint at least once before returning.
-public struct NativeInvocationContext {
-    private final class State {
+public struct NativeInvocationContext: Sendable {
+    /// The context may be handed through a generated `@Sendable` invoker. All
+    /// mutable admission state is lock-protected, and every operation also
+    /// rejects use after the synchronous native invocation has finished.
+    private final class State: @unchecked Sendable {
         let id: Core.NativeImportID
         let budget: VM.InvocationBudget
         let deadlineNanoseconds: UInt64
@@ -162,6 +165,28 @@ public struct NativeInvocationContext {
                 throw VM.RuntimeTrap.instructionFuelExhausted
             }
             state.checkpointCount = next.partialValue
+        }
+    }
+
+    package var resourceLimits: Core.ResourceLimits {
+        state.budget.resourceLimits
+    }
+
+    /// Polls both the root and exact NativeImport deadlines without satisfying
+    /// a cooperative-import checkpoint. Result encoding occurs after the
+    /// native operation, so it must not mask a factory that failed to cooperate
+    /// while doing its own work.
+    package func checkResultEncodingDeadline() throws {
+        try state.lock.withLock {
+            guard !state.isFinished else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "native invocation context escaped its synchronous call"
+                )
+            }
+            try state.budget.checkNativeInvocationDeadline(
+                id: state.id,
+                deadlineNanoseconds: state.deadlineNanoseconds
+            )
         }
     }
 

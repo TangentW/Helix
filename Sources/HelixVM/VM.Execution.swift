@@ -194,6 +194,7 @@ public struct RootExecutionContext: Equatable, Sendable {
 
 public final class InvocationBudget: @unchecked Sendable {
     private let lock = NSLock()
+    package let resourceLimits: Core.ResourceLimits
     private var remainingFuel: UInt64
     private var currentDepth: UInt32 = 0
     private var nativeCalls: UInt32 = 0
@@ -221,6 +222,7 @@ public final class InvocationBudget: @unchecked Sendable {
         isMainThread: Bool,
         nowNanoseconds: @escaping @Sendable () -> UInt64
     ) {
+        resourceLimits = limits
         remainingFuel = limits.instructionFuelPerEntry
         maximumDepth = limits.maxCallDepth
         maximumNativeCalls = limits.maxNativeCallsPerEntry
@@ -478,6 +480,18 @@ public final class InvocationBudget: @unchecked Sendable {
         }
     }
 
+    func checkNativeInvocationDeadline(
+        id: Core.NativeImportID,
+        deadlineNanoseconds: UInt64
+    ) throws {
+        try lock.withLock {
+            try ensureWithinDeadline()
+            guard nowNanoseconds() <= deadlineNanoseconds else {
+                throw VM.RuntimeTrap.nativeImportDeadlineExceeded(id)
+            }
+        }
+    }
+
     func finishNativeInvocation(
         id: Core.NativeImportID,
         deadlineNanoseconds: UInt64,
@@ -565,11 +579,12 @@ public final class InvocationBudget: @unchecked Sendable {
         try consumeBoundaryValue(value, depth: 0)
     }
 
-    /// Charges an SDK callback argument graph. Unlike an ordinary Shell
-    /// boundary, this path admits one direct bridge-created native closure or
-    /// one Optional containing it. Other aggregates retain the ordinary rule,
-    /// so a callable cannot be smuggled through Any or collection storage.
-    package func consumeNativeCallbackBoundaryValue(
+    /// Charges a NativeImport result or SDK callback argument graph. Unlike an
+    /// ordinary Shell boundary, this path admits one direct bridge-created
+    /// native closure or one Optional containing it. Other aggregates retain
+    /// the ordinary rule, so a callable cannot be smuggled through Any or
+    /// collection storage.
+    package func consumeNativeCallableBoundaryValue(
         _ value: VM.Value
     ) throws {
         switch value {
@@ -590,7 +605,7 @@ public final class InvocationBudget: @unchecked Sendable {
         try consumeWork(units: 1)
         guard let target = closure.nativeTarget,
               target.signature == closure.signature,
-              closure.signature.isNativeBridgeCallableArgument,
+              closure.signature.isNativeBridgeCallable,
               closure.captures.isEmpty,
               closure.dynamicScope == nil
         else {

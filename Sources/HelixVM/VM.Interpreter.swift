@@ -247,7 +247,7 @@ public struct Interpreter: Sendable {
                 throw VM.RuntimeTrap.mainActorViolation
             }
             for (value, expected) in zip(arguments, closure.signature.parameters) {
-                try budget.consumeNativeCallbackBoundaryValue(value)
+                try budget.consumeNativeCallableBoundaryValue(value)
                 try validateRuntimeValue(
                     value,
                     expected: expected,
@@ -4267,7 +4267,9 @@ public struct Interpreter: Sendable {
                         budget: budget
                     ) {
                     case let .returned(value):
-                        if let value { try budget.consumeBoundaryValue(value) }
+                        if let value {
+                            try budget.consumeNativeCallableBoundaryValue(value)
+                        }
                         if let value {
                             try validateRuntimeValue(
                                 value,
@@ -4441,7 +4443,7 @@ public struct Interpreter: Sendable {
                     case let .native(nativeClosure):
                         guard closure.captures.isEmpty,
                               nativeClosure.signature == closure.signature,
-                              closure.signature.isNativeBridgeCallableArgument,
+                              closure.signature.isNativeBridgeCallable,
                               arguments.count == closure.signature.parameters.count
                         else {
                             throw VM.RuntimeTrap.nativeFailure(
@@ -4467,6 +4469,9 @@ public struct Interpreter: Sendable {
                         )
                         try budget.checkDeadline()
                         if let value {
+                            // Native callable signatures are closure-free at
+                            // their own result boundary; do not extend the
+                            // NativeImport-only callable-result exception.
                             try budget.consumeBoundaryValue(value)
                             try validateRuntimeValue(
                                 value,

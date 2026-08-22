@@ -4,7 +4,7 @@ import HelixBytecode
 #endif
 
 extension VM {
-/// One typed, native-origin callable temporarily represented as a VM closure.
+/// One typed, native-origin callable represented as a VM closure.
 ///
 /// The Swift closure context is deliberately type-erased only after generated
 /// code has frozen its exact callable signature. The wrapper is unchecked
@@ -40,7 +40,7 @@ package final class NativeClosure: @unchecked Sendable, Hashable {
         budget: VM.InvocationBudget
     ) throws -> VM.Value? {
         try budget.checkDeadline()
-        guard signature.isNativeBridgeCallableArgument,
+        guard signature.isNativeBridgeCallable,
               arguments.count == signature.parameters.count,
               zip(arguments, signature.parameters).allSatisfy({
                   $0.matches($1)

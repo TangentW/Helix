@@ -1,7 +1,8 @@
 extension Bytecode.ValueType {
     /// Whether this value shape embeds Swift's Error existential. NativeImport
-    /// supports it only as an SDK callback argument, where generated block
-    /// thunks can normalize NSError-backed values into the bounded VM proxy.
+    /// supports it only inside an exact native callable signature, where
+    /// generated adapters normalize NSError-backed values into the bounded VM
+    /// proxy.
     public var containsErrorExistential: Bool {
         switch self {
         case .error:
@@ -57,7 +58,9 @@ extension Bytecode.ValueType {
     }
 
     public var isNativeImportBridgeResult: Bool {
-        self == .void || isOrdinaryNativeImportBridgeValue
+        self == .void
+            || isOrdinaryNativeImportBridgeValue
+            || isNativeBridgeCallableValue
     }
 
     /// Whether a nonthrowing native callback can return a deterministic value
@@ -127,19 +130,28 @@ extension Bytecode.ValueType {
     public var isNativeBridgeCallbackArgument: Bool {
         if isNativeBridgeValue { return true }
         guard let shape = directClosureShape else { return false }
-        return shape.signature.isNativeBridgeCallableArgument
+        return shape.signature.isNativeBridgeCallable
+    }
+
+    /// A direct native-origin callable or one Optional wrapping it. Returned
+    /// function values are escaping by construction and use the same typed
+    /// runtime target as callable arguments supplied by SDK callbacks.
+    public var isNativeBridgeCallableValue: Bool {
+        guard let shape = directClosureShape else { return false }
+        return shape.signature.isNativeBridgeCallable
     }
 }
 
 extension Bytecode.ClosureSignature {
-    /// A native-origin callable that an SDK callback may lend to the VM.
+    /// A native-origin callable that an SDK callback or NativeImport result may
+    /// supply to the VM.
     ///
     /// Invocation travels from VM to Swift, so bridge failures have a VM trap
     /// channel and the native result does not need the deterministic fallback
     /// required by a Swift callback that returns into an SDK frame. A second
     /// callable layer is deliberately rejected until its independent lifetime
     /// can be represented and enforced.
-    public var isNativeBridgeCallableArgument: Bool {
+    public var isNativeBridgeCallable: Bool {
         hasCanonicalCallableEffects
             && hasCanonicalThrownType
             && (result == .void

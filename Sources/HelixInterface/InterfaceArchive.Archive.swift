@@ -657,8 +657,9 @@ public struct Archive: Codable, Hashable, Sendable {
                 }
             )
             guard callbackByIndex.count == item.contract.callbacks.count,
-                  callbackByIndex.keys.allSatisfy(item.parameterTypes.indices.contains),
-                  !item.resultType.containsClosureValue
+                  callbackByIndex.keys.allSatisfy(
+                      item.parameterTypes.indices.contains
+                  )
             else {
                 throw InterfaceArchive.Error.invalidArchive(
                     "native import callback parameters are inconsistent"
@@ -837,20 +838,22 @@ public struct Archive: Codable, Hashable, Sendable {
                 throw InterfaceArchive.Error.invalidArchive("async leaf-entry capability is absent")
             }
         }
-        func validateNativeCallableArgument(
+        func validateNativeCallable(
             _ signature: Bytecode.ClosureSignature
         ) throws {
-            guard capabilities.contains(.escapingClosureValuesV1),
-                  signature.isNativeBridgeCallableArgument
+            guard capabilities.contains(.closureValuesV1),
+                  capabilities.contains(.escapingClosureValuesV1),
+                  signature.isNativeBridgeCallable
             else {
                 throw InterfaceArchive.Error.invalidArchive(
-                    "native import callback has an unsupported callable argument"
+                    "native import has an unsupported native callable"
                 )
             }
             for parameter in signature.parameters {
                 try validateDeviceType(parameter, allowingError: true)
             }
             try validateDeviceType(signature.result, allowingError: true)
+            try validateDeviceEffects(signature.effects)
         }
         func usesMainActorType(_ type: Bytecode.ValueType) -> Bool {
             switch type {
@@ -898,9 +901,10 @@ public struct Archive: Codable, Hashable, Sendable {
             for (index, type) in item.parameterTypes.enumerated() {
                 if callbackIndices.contains(index),
                    let shape = type.directClosureShape {
+                    try validateDeviceEffects(shape.signature.effects)
                     for parameter in shape.signature.parameters {
                         if let callable = parameter.directClosureShape {
-                            try validateNativeCallableArgument(
+                            try validateNativeCallable(
                                 callable.signature
                             )
                         } else {
@@ -925,7 +929,11 @@ public struct Archive: Codable, Hashable, Sendable {
                     "native import has an unsupported result"
                 )
             }
-            try validateDeviceType(item.resultType)
+            if let callable = item.resultType.directClosureShape {
+                try validateNativeCallable(callable.signature)
+            } else {
+                try validateDeviceType(item.resultType)
+            }
             // NativeImport effects describe the exact imported declaration,
             // not the nominal isolation of its receiver or result. Swift SDKs
             // can explicitly expose `nonisolated` members on MainActor types;

@@ -864,6 +864,86 @@ struct ImportedFrameworks {
         #expect(!instructions.contains(.destroyValue(parameter)))
     }
 
+    @Test("Explicit retain owners close on every mutually exclusive path")
+    func closesRetainedOwnersAcrossBranches() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            ["NSObject": objectType],
+            kinds: [objectType: .reference]
+        )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture7inspectyySo8NSObjectC_SbtF",
+                loweredType: "@convention(thin) (@guaranteed NSObject, Bool) -> ()",
+                body: """
+                bb0(%0 : @guaranteed $NSObject, %1 : $Bool):
+                  strong_retain %0
+                  cond_br %1, bb1, bb2
+                bb1:
+                  strong_release %0
+                  br bb3
+                bb2:
+                  strong_release %0
+                  br bb3
+                bb3:
+                  %3 = tuple ()
+                  return %3
+                """
+            ),
+            displayName: "Fixture.inspect"
+        )
+        let parameter = try #require(lowered.parameterRegisters.first)
+        let retained = try #require(lowered.blocks.flatMap(\.instructions).compactMap {
+            instruction -> Bytecode.Register? in
+            guard case let .copyValue(result, source) = instruction,
+                  source == parameter
+            else { return nil }
+            return result
+        }.first)
+
+        for blockID in [Bytecode.BlockID(rawValue: 1), .init(rawValue: 2)] {
+            let block = try #require(lowered.blocks.first { $0.id == blockID })
+            #expect(block.instructions.contains(.destroyValue(retained)))
+        }
+        #expect(!lowered.blocks.flatMap(\.instructions).contains(.destroyValue(parameter)))
+    }
+
+    @Test("Explicit retain owners must agree at CFG merges")
+    func rejectsUnbalancedRetainedOwnerBranch() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            ["NSObject": objectType],
+            kinds: [objectType: .reference]
+        )
+
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer(
+                typeEnvironment: environment
+            ).lower(
+                .init(
+                    mangledName: "$s7Fixture7inspectyySo8NSObjectC_SbtF",
+                    loweredType: "@convention(thin) (@guaranteed NSObject, Bool) -> ()",
+                    body: """
+                    bb0(%0 : @guaranteed $NSObject, %1 : $Bool):
+                      strong_retain %0
+                      cond_br %1, bb1, bb2
+                    bb1:
+                      strong_release %0
+                      br bb3
+                    bb2:
+                      br bb3
+                    bb3:
+                      %3 = tuple ()
+                      return %3
+                    """
+                ),
+                displayName: "Fixture.inspect"
+            )
+        }
+    }
+
     @Test("Unqualified imported reference loads promote retained owners")
     func promotesRetainedImportedGlobalLoad() throws {
         let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))

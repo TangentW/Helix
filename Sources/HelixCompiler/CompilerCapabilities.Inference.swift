@@ -142,6 +142,9 @@ extension CompilerCapabilities {
             capabilities.insert(.structuredErrorsV1)
         case let .closure(signature):
             capabilities.insert(.closureValuesV1)
+            if signature.effects.requiresMainActor {
+                capabilities.insert(.mainActorSyncV1)
+            }
             if let thrownType = signature.thrownType {
                 collectThrownType(thrownType, into: &capabilities)
             }

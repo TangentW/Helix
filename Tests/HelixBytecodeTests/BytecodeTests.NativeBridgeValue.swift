@@ -60,14 +60,19 @@ struct NativeBridgeValue {
         #expect(!callback.isNativeBridgeCallback)
     }
 
-    @Test("Native callback eligibility admits one safe callable argument layer")
-    func validatesNativeCallableArguments() {
+    @Test("Native bridge eligibility admits one safe callable value layer")
+    func validatesNativeCallableValues() {
         let completion = Bytecode.ClosureSignature(
             parameters: [.bool],
             parameterConventions: [.owned],
             result: .void
         )
-        #expect(completion.isNativeBridgeCallableArgument)
+        #expect(completion.isNativeBridgeCallable)
+        #expect(Bytecode.ValueType.closure(completion).isNativeImportBridgeResult)
+        #expect(
+            Bytecode.ValueType.optional(.closure(completion))
+                .isNativeImportBridgeResult
+        )
         #expect(
             Bytecode.ValueType.closure(completion)
                 .nativeCallbackParameterConvention == .owned
@@ -95,17 +100,21 @@ struct NativeBridgeValue {
             parameterConventions: [.owned],
             result: .void
         )
-        #expect(!recursive.isNativeBridgeCallableArgument)
+        #expect(!recursive.isNativeBridgeCallable)
         #expect(
             !Bytecode.ValueType.array(.closure(completion))
                 .isNativeBridgeCallbackArgument
+        )
+        #expect(
+            !Bytecode.ValueType.array(.closure(completion))
+                .isNativeImportBridgeResult
         )
 
         var nativeResult = completion
         nativeResult.result = .native(
             .init(rawValue: .sha256("native-callable-result"))
         )
-        #expect(nativeResult.isNativeBridgeCallableArgument)
+        #expect(nativeResult.isNativeBridgeCallable)
         #expect(!nativeResult.isNativeBridgeCallback)
     }
 }

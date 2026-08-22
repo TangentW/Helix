@@ -88,7 +88,7 @@ Both workflows depend on stable, build-specific identities:
   an invocation-lifetime closure, and requires the lexical closure to end before
   the address scope; the runtime address token independently invalidates stale
   access.
-- Native callbacks use an explicit sparse parameter contract rather than making
+- Native callable boundary crossings use explicit contracts rather than making
   closure values part of the ordinary boundary codec. Each callback-bearing
   NativeImport identity freezes its parameter index and `nonescaping` or
   `escaping` lifetime. A nonescaping handle shares the importing invocation's
@@ -114,6 +114,14 @@ Both workflows depend on stable, build-specific identities:
   aggregate, and its own parameters and result cannot contain closures.
   Same-thread re-entry is allowed, while overlapping invocation of the same
   non-Sendable native callable fails closed.
+  An exact NativeImport may also return a direct or Optional native-origin
+  callable. That handle is escaping by construction, must be created by the
+  generated Bridge rather than substituted with an image-local closure, and is
+  encoded before the synchronous import context closes. Creation and every
+  later invocation retain the exact signature, generation identity, MainActor
+  requirement, deadline, resource limits, and non-Sendable overlap gate. The
+  same one-layer and closure-free-component restrictions apply, so this is one
+  typed callable boundary model rather than a special case for each SDK API.
   A Swift `Error` callback argument is reduced to a bounded textual dynamic-type
   name and reified as an opaque proxy; native payload graphs, type metadata, and
   semantic error identity do not enter HLBC. `Error` remains invalid in Shell
@@ -153,10 +161,11 @@ Both workflows depend on stable, build-specific identities:
   authority. Possession of the resulting image-local capability then permits
   higher-order invocation without adding execution authority to the closure
   type. Parameters, results, captures, represented aggregate wrappers, and
-  NativeImport callback positions all preserve the exact canonical closure
-  signature—there is no effect-authority variance at those boundaries. Shell
-  entry signatures and ordinary native value slots remain closure-free. These
-  are v1 contract fields and do not introduce a compatibility version split.
+  NativeImport callback positions and callable-result positions all preserve
+  the exact canonical closure signature—there is no effect-authority variance
+  at those boundaries. Shell entry signatures and every other native value
+  slot remain closure-free. These are v1 contract fields and do not introduce
+  a compatibility version split.
 - Foreign ABI normalization preserves the frozen logical Swift type while
   accepting proven compiler representations: Foundation value overlays may
   use their Objective-C bridge classes inside block thunks, Objective-C

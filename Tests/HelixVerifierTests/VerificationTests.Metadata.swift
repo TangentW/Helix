@@ -160,6 +160,135 @@ struct Metadata {
         }
     }
 
+    @Test("Shell admits only bounded native callable results")
+    func nativeCallableResultBoundary() throws {
+        let callable = Bytecode.ClosureSignature(
+            parameters: [.bool],
+            parameterConventions: [.owned],
+            result: .int64
+        )
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        var descriptor = Verification.ResolvedNativeImport(
+            id: .init(rawValue: 0),
+            key: .init(rawValue: .sha256("callable-result-import")),
+            parameterTypes: [],
+            resultType: .closure(callable),
+            signature: .init(
+                parameters: [],
+                result: "(Swift.Bool) -> Swift.Int"
+            ),
+            effects: .init(),
+            contract: contract
+        )
+        let compatibility = Core.Compatibility(
+            runtime: Core.Versions.runtime,
+            bytecode: Core.Versions.bytecode,
+            interfaceArchive: Core.Versions.interfaceArchive,
+            compilerFingerprint: "callable-result-shell"
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .nativeImportsV1, .closureValuesV1,
+            .escapingClosureValuesV1,
+        ]
+        _ = try Verification.ShellInterface(
+            interfaceHash: .sha256("callable-result-shell"),
+            compatibility: compatibility,
+            capabilities: capabilities,
+            imports: [descriptor]
+        )
+
+        descriptor.resultType = .optional(.closure(callable))
+        descriptor.signature.result = "((Swift.Bool) -> Swift.Int)?"
+        _ = try Verification.ShellInterface(
+            interfaceHash: .sha256("callable-result-shell"),
+            compatibility: compatibility,
+            capabilities: capabilities,
+            imports: [descriptor]
+        )
+
+        for missing in [
+            Core.Capability.closureValuesV1,
+            Core.Capability.escapingClosureValuesV1,
+        ] {
+            #expect(throws: Verification.Error.self) {
+                try Verification.ShellInterface(
+                    interfaceHash: .sha256("callable-result-shell"),
+                    compatibility: compatibility,
+                    capabilities: capabilities.subtracting([missing]),
+                    imports: [descriptor]
+                )
+            }
+        }
+
+        var mainActorCallable = callable
+        mainActorCallable.effects.requiresMainActor = true
+        descriptor.resultType = .closure(mainActorCallable)
+        descriptor.signature.result = "@MainActor (Swift.Bool) -> Swift.Int"
+        #expect(throws: Verification.Error.self) {
+            try Verification.ShellInterface(
+                interfaceHash: .sha256("callable-result-shell"),
+                compatibility: compatibility,
+                capabilities: capabilities,
+                imports: [descriptor]
+            )
+        }
+        _ = try Verification.ShellInterface(
+            interfaceHash: .sha256("callable-result-shell"),
+            compatibility: compatibility,
+            capabilities: capabilities.union([.mainActorSyncV1]),
+            imports: [descriptor]
+        )
+
+        descriptor.parameterTypes = [.closure(mainActorCallable)]
+        descriptor.resultType = .void
+        descriptor.signature.parameters = [
+            "@escaping @MainActor (Swift.Bool) -> Swift.Int",
+        ]
+        descriptor.signature.result = "Swift.Void"
+        descriptor.contract.callbacks = [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ]
+        #expect(throws: Verification.Error.self) {
+            try Verification.ShellInterface(
+                interfaceHash: .sha256("callable-result-shell"),
+                compatibility: compatibility,
+                capabilities: capabilities,
+                imports: [descriptor]
+            )
+        }
+        _ = try Verification.ShellInterface(
+            interfaceHash: .sha256("callable-result-shell"),
+            compatibility: compatibility,
+            capabilities: capabilities.union([.mainActorSyncV1]),
+            imports: [descriptor]
+        )
+
+        let recursive = Bytecode.ClosureSignature(
+            parameters: [.closure(callable)],
+            parameterConventions: [.owned],
+            result: .void
+        )
+        descriptor.parameterTypes = []
+        descriptor.resultType = .closure(recursive)
+        descriptor.signature.parameters = []
+        descriptor.signature.result = "((Swift.Bool) -> Swift.Int) -> Swift.Void"
+        descriptor.contract.callbacks = []
+        #expect(throws: Verification.Error.self) {
+            try Verification.ShellInterface(
+                interfaceHash: .sha256("callable-result-shell"),
+                compatibility: compatibility,
+                capabilities: capabilities,
+                imports: [descriptor]
+            )
+        }
+    }
+
     @Test("Native Error callbacks require the structured Error capability")
     func nativeErrorCallbackBoundary() throws {
         let callback = Bytecode.ClosureSignature(

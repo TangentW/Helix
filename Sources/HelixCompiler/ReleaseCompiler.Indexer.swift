@@ -272,7 +272,13 @@ public struct Indexer: Sendable {
             capabilities.insert(.untypedThrowsV1)
         }
         if records.contains(where: { $0.effects.requiresMainActor })
-            || imports.contains(where: { $0.isEmittedToDevice && $0.effects.requiresMainActor }) {
+            || imports.contains(where: {
+                $0.isEmittedToDevice
+                    && ($0.effects.requiresMainActor
+                        || ($0.parameterTypes + [$0.resultType]).contains(
+                            where: containsMainActorClosure
+                        ))
+            }) {
             capabilities.insert(.mainActorSyncV1)
         }
 
@@ -407,6 +413,28 @@ public struct Indexer: Sendable {
             }
         case .void, .never, .bool, .integer, .float, .string, .any, .local,
              .error:
+            false
+        }
+    }
+
+    private func containsMainActorClosure(_ type: Bytecode.ValueType) -> Bool {
+        switch type {
+        case let .closure(signature):
+            signature.effects.requiresMainActor
+                || signature.componentTypes.contains(
+                    where: containsMainActorClosure
+                )
+        case let .array(element), let .optional(element), let .set(element),
+             let .address(element), let .mutableCell(element),
+             let .nonOwningReference(_, element),
+             let .arrayState(_, element):
+            containsMainActorClosure(element)
+        case let .dictionary(key, value), let .dictionaryState(key, value):
+            containsMainActorClosure(key) || containsMainActorClosure(value)
+        case let .tuple(elements):
+            elements.contains(where: containsMainActorClosure)
+        case .void, .never, .bool, .integer, .float, .string, .any, .native,
+             .local, .error:
             false
         }
     }

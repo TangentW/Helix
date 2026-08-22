@@ -349,6 +349,12 @@ an ordinary recursive bridge value with a deterministic failure value: scalars, 
 Optional, empty collections, and recursively defaultable tuples are admitted.
 A direct native value is rejected because no framework-neutral instance can be
 fabricated, while an Optional native value can safely fall back to `nil`.
+Separately, an exact NativeImport may return a direct or Optional native-origin
+callable with that same synchronous, nonthrowing, closure-free component
+profile. The generated Bridge creates the identity-bearing escaping target and
+encodes it before the import context closes under its exact deadline and signed
+resource limits; an image-local closure cannot be substituted. MainActor and
+non-Sendable overlap checks remain attached to every later invocation.
 Direct or Optional `Error` callback arguments cross as bounded opaque proxies
 carrying only a textual dynamic-type name; native payload, metadata, and
 semantic identity remain outside HLBC. `Error` is not admitted in Shell entries,
@@ -374,7 +380,7 @@ It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch, a
 patch concrete Swift type identity visible to native code, function-local
 nominal declarations, hosted stored properties/custom initializers/arbitrary
 callback ABIs, changes to existing native stored layout, closure crossing a
-Shell Entry or a NativeImport position outside the exact callback profile,
+Shell Entry or a NativeImport position outside the exact callable profile,
 throwing/async/inout callback ABIs, recursive or nonescaping nested callable
 arguments, callback results without a
 framework-neutral failure value, concurrent `Sendable` closure execution,

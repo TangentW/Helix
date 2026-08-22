@@ -610,11 +610,13 @@ a compiler-only projection. Frame/runtime-backed inout helpers and closures may
 throw because their access scopes close on both continuations; overlapping or
 throwing compiler-only projections without symmetric writeback still fail
 closed. Ordinary closure values cannot cross the Shell/Native boundary or
-survive the current pinned VM invocation. Exact NativeImport callback
-parameters are the sole exception: their checked nonescaping/escaping handle
-lifetimes follow the generated callback contract described above, and one
-source-proven escaping native callable argument layer may enter through that
-callback and be invoked by ordinary typed closure control flow.
+survive the current pinned VM invocation. The exact NativeImport callable
+profile has two controlled crossings: checked nonescaping/escaping callback
+parameters, and direct or Optional native-origin callable results. A callback
+may receive one source-proven escaping native callable argument layer; an
+import may return the same native callable shape, escaping by construction.
+Both become identity-bearing targets invoked by ordinary typed closure control
+flow, while image-local closures remain invalid as native results.
 
 The current generator collects reachable ordinary functions, private class
 instance methods, computed accessors, and their non-exported patch-local types
@@ -628,6 +630,14 @@ one exception is a verifier-approved hosted-class projection to its frozen
 superclass. A type declared inside a function has
 no stable declaration identity in Helix's current textual SIL contract and is
 rejected with its exact type name; move it to file/module scope instead.
+
+For an existing source reference class, exact Bridge discovery also covers
+supported stored or computed instance properties and supported static
+properties through their canonical getter/setter SIL. A closure-valued setter
+is authoritatively escaping because assignment stores the value; direct and
+Optional closure-valued getters use the native callable-result contract above.
+Value-type instance mutation, async or throwing accessors, and unsupported
+callable signatures still fail closed rather than being inferred from names.
 
 An unrelated declaration is not collected merely because it exists, and this
 feature does not add source files or native ABI. Changes to an existing native

@@ -1354,6 +1354,44 @@ struct Interpreter {
         #expect(!rejectedBudget.sideEffectsCommitted)
     }
 
+    @Test("NativeImport callable results dispatch through typed closure_apply")
+    func invokesNativeCallableResult() throws {
+        let fixture = try makeNativeCallableResultImage()
+        let importID = Core.NativeImportID(rawValue: 0)
+        let key = try #require(fixture.shell.imports[importID]?.key)
+        let budget = VM.InvocationBudget(limits: fixture.effectiveResourceLimits)
+        let catalog = try VM.NativeCatalog([
+            CallableFactoryInvoker(key: key),
+        ])
+
+        #expect(
+            VM.Interpreter(nativeCatalog: catalog).invoke(
+                entry: .init(rawValue: 0),
+                image: fixture,
+                arguments: [],
+                budget: budget
+            ) == .returned(
+                .integer(
+                    try .init(signed: 42, bitWidth: 64, isSigned: true)
+                )
+            )
+        )
+        #expect(budget.sideEffectsCommitted)
+
+        let substituted = try VM.NativeCatalog([
+            ImageCallableFactoryInvoker(key: key),
+        ])
+        #expect(
+            VM.Interpreter(nativeCatalog: substituted).invoke(
+                entry: .init(rawValue: 0),
+                image: fixture,
+                arguments: []
+            ) == .trapped(
+                .explicit("closure values cannot cross a VM boundary")
+            )
+        )
+    }
+
     @Test("Native catalog effects must exactly match the frozen Shell descriptor")
     func rejectsMisdeclaredNativeEffectsBeforeInvocation() throws {
         let fixture = try makeNativeIncrementImage()
@@ -3609,7 +3647,7 @@ struct Interpreter {
             .closure(.init(nativeClosure: nativeClosure))
         )
         try VM.InvocationBudget(limits: .init())
-            .consumeNativeCallbackBoundaryValue(optionalNativeClosure)
+            .consumeNativeCallableBoundaryValue(optionalNativeClosure)
 
         let imageOrigin = VM.Value.closure(
             .init(
@@ -3636,7 +3674,7 @@ struct Interpreter {
             "closure values cannot cross a VM boundary"
         )) {
             try VM.InvocationBudget(limits: .init())
-                .consumeNativeCallbackBoundaryValue(.optional(imageOrigin))
+                .consumeNativeCallableBoundaryValue(.optional(imageOrigin))
         }
 
         let hiddenNativeClosure = VM.Value.array(
@@ -3647,7 +3685,7 @@ struct Interpreter {
             "closure values cannot cross a VM boundary"
         )) {
             try VM.InvocationBudget(limits: .init())
-                .consumeNativeCallbackBoundaryValue(hiddenNativeClosure)
+                .consumeNativeCallableBoundaryValue(hiddenNativeClosure)
         }
     }
 
@@ -6460,6 +6498,77 @@ struct Interpreter {
         }
     }
 
+    private struct CallableFactoryInvoker: VM.NativeInvoker {
+        static let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64
+        )
+
+        let id = Core.NativeImportID(rawValue: 0)
+        let key: Core.NativeImportKey
+        let parameterTypes: [Bytecode.ValueType] = []
+        let resultType: Bytecode.ValueType = .closure(Self.signature)
+        let effects = Core.Effects()
+        let contract = vmPureImportContract
+
+        func invoke(
+            arguments: [VM.Value],
+            context: VM.NativeInvocationContext
+        ) -> VM.NativeInvocationResult {
+            .returned(
+                .closure(
+                    .init(
+                        nativeClosure: VM.NativeClosure(
+                            signature: Self.signature
+                        ) { arguments, _ in
+                            guard case let .integer(value) = arguments.first
+                            else {
+                                throw VM.RuntimeTrap.typeMismatch(
+                                    expected: .int64,
+                                    actual: arguments.first?.type
+                                )
+                            }
+                            return .integer(
+                                try .init(
+                                    signed: value.signedValue + 1,
+                                    bitWidth: 64,
+                                    isSigned: true
+                                )
+                            )
+                        }
+                    )
+                )
+            )
+        }
+    }
+
+    private struct ImageCallableFactoryInvoker: VM.NativeInvoker {
+        let id = Core.NativeImportID(rawValue: 0)
+        let key: Core.NativeImportKey
+        let parameterTypes: [Bytecode.ValueType] = []
+        let resultType: Bytecode.ValueType = .closure(
+            CallableFactoryInvoker.signature
+        )
+        let effects = Core.Effects()
+        let contract = vmPureImportContract
+
+        func invoke(
+            arguments: [VM.Value],
+            context: VM.NativeInvocationContext
+        ) -> VM.NativeInvocationResult {
+            .returned(
+                .closure(
+                    .init(
+                        functionID: .init(rawValue: 1),
+                        signature: CallableFactoryInvoker.signature,
+                        captures: []
+                    )
+                )
+            )
+        }
+    }
+
     private struct NaNInvoker: VM.NativeInvoker {
         let id = Core.NativeImportID(rawValue: 1)
         let key: Core.NativeImportKey
@@ -6630,6 +6739,84 @@ struct Interpreter {
                 acceptedCapabilities: [.baselineV1, .nativeImportsV1],
                 allowedNativeImports: [.init(rawValue: 0)]
             )
+        )
+    }
+
+    private func makeNativeCallableResultImage() throws -> Verification.Image {
+        let callable = CallableFactoryInvoker.signature
+        let importSignature = Core.LoweredSignature(
+            parameters: [],
+            result: "(Swift.Int) -> Swift.Int"
+        )
+        let importKey = try Core.NativeImportKey.derive(
+            namespace: namespace(),
+            canonicalCallee: "Fixture.makeIncrementer()",
+            signature: importSignature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: .init(rawValue: 0),
+            key: importKey,
+            signature: importSignature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let descriptor = Verification.ResolvedNativeImport(
+            id: .init(rawValue: 0),
+            key: importKey,
+            parameterTypes: [],
+            resultType: .closure(callable),
+            signature: importSignature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "invokeNativeCallableResult",
+            parameterRegisters: [],
+            resultType: .int64,
+            registerTypes: [.closure(callable), .int64, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    instructions: [
+                        .nativeApply(
+                            result: .init(rawValue: 0),
+                            importID: .init(rawValue: 0),
+                            arguments: []
+                        ),
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            bitPattern: 41
+                        ),
+                        .closureApply(
+                            result: .init(rawValue: 2),
+                            closure: .init(rawValue: 0),
+                            arguments: [.init(rawValue: 1)]
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .nativeImportsV1, .closureValuesV1,
+            .escapingClosureValuesV1,
+        ]
+        return try makeVerified(
+            function: function,
+            capabilities: capabilities,
+            imports: [requirement],
+            shellImports: [descriptor],
+            policy: .init(
+                acceptedCapabilities: capabilities,
+                allowedNativeImports: [.init(rawValue: 0)]
+            ),
+            signature: .init(parameters: [], result: "Swift.Int"),
+            parameterTypes: [],
+            resultType: .int64
         )
     }
 

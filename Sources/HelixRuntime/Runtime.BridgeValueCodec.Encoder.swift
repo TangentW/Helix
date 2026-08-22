@@ -164,7 +164,7 @@ public final class Encoder {
             Runtime.BridgeValueCodec.Encoder
         ) throws -> VM.Value?
     ) throws -> VM.Value {
-        guard signature.isNativeBridgeCallableArgument else {
+        guard signature.isNativeBridgeCallable else {
             throw Runtime.BridgeInputError.encodedTypeMismatch(
                 expected: "a synchronous nonthrowing native callable ABI",
                 actual: signature.description
@@ -178,7 +178,7 @@ public final class Encoder {
             arguments,
             budget in
             let resultEncoder = Runtime.BridgeValueCodec.Encoder(
-                limits: resultLimits,
+                limits: resultLimits.constrained(by: budget.resourceLimits),
                 checkDeadline: { try budget.checkDeadline() }
             )
             let result = try invoke(arguments, resultEncoder)
@@ -605,7 +605,7 @@ public final class Encoder {
             case let .closure(closure):
                 guard let target = closure.nativeTarget,
                       target.signature == closure.signature,
-                      closure.signature.isNativeBridgeCallableArgument,
+                      closure.signature.isNativeBridgeCallable,
                       closure.captures.isEmpty
                 else {
                     throw Runtime.BridgeInputError.encodedTypeMismatch(

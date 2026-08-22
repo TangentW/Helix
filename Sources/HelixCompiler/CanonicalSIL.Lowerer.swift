@@ -862,6 +862,7 @@ public struct Lowerer: Sendable {
         var boolLiterals: [String: Bool] = [:]
         var metatypeValues = Set<String>()
         var staticMetatypeIdentities: [String: MetatypeIdentity] = [:]
+        var dynamicSelfMetatypeTypes: [String: String] = [:]
         var representedCollectionMetatypeIdentities: [String: String] = [:]
         var scalarMetatypeValues: [String: Bytecode.ValueType] = [:]
         var compilerEnumMetatypeValues = Set<String>()
@@ -908,7 +909,7 @@ public struct Lowerer: Sendable {
         var borrowedAddressValues: [String: Bytecode.Register] = [:]
         var borrowedValueTokens = Set<String>()
         var borrowedLoadTokens = Set<String>()
-        var pendingRetainedValues: [String: [Bytecode.Register]] = [:]
+        var retainFlow = CanonicalSIL.RetainFlow()
         var retainedValueAliasRoots: [String: String] = [:]
         var borrowedTemporaryValues: [String: Bytecode.Register] = [:]
         var compilerOwnedTemporaryValues: [String: Bytecode.Register] = [:]
@@ -1067,6 +1068,9 @@ public struct Lowerer: Sendable {
                     )
                 )
             }
+            if instruction.isTerminator {
+                retainFlow.recordExit(instruction, from: block.id)
+            }
         }
 
         func allocate(type: Bytecode.ValueType) throws -> Bytecode.Register {
@@ -1130,10 +1134,10 @@ public struct Lowerer: Sendable {
             let sourceRoot = retainedValueAliasRoot(for: sourceToken)
             let resultRoot = retainedValueAliasRoot(for: resultToken)
             guard resultRoot != sourceRoot else { return }
-            if let pending = pendingRetainedValues.removeValue(
+            if let pending = retainFlow.current.removeValue(
                 forKey: resultRoot
             ) {
-                pendingRetainedValues[sourceRoot, default: []]
+                retainFlow.current[sourceRoot, default: []]
                     .append(contentsOf: pending)
             }
             retainedValueAliasRoots[resultRoot] = sourceRoot
@@ -1145,20 +1149,20 @@ public struct Lowerer: Sendable {
             for token: String
         ) {
             let root = retainedValueAliasRoot(for: token)
-            pendingRetainedValues[root, default: []].append(value)
+            retainFlow.current[root, default: []].append(value)
         }
 
         func takePendingRetainedValue(
             for token: String
         ) -> Bytecode.Register? {
             let root = retainedValueAliasRoot(for: token)
-            guard var pending = pendingRetainedValues[root],
+            guard var pending = retainFlow.current[root],
                   let retained = pending.popLast()
             else { return nil }
             if pending.isEmpty {
-                pendingRetainedValues.removeValue(forKey: root)
+                retainFlow.current.removeValue(forKey: root)
             } else {
-                pendingRetainedValues[root] = pending
+                retainFlow.current[root] = pending
             }
             return retained
         }
@@ -1733,6 +1737,7 @@ public struct Lowerer: Sendable {
         func stackType(at token: String) -> Bytecode.ValueType? {
             mutableCellPointee(at: token)
                 ?? runtimeAddressPointees[token]
+                ?? nativePropertyAddresses[addressBase(token)]?.valueType
                 ?? stackAddressTypes[addressBase(token)]
         }
 
@@ -1754,6 +1759,41 @@ public struct Lowerer: Sendable {
                 return component
             }
             return stackAddressValues[addressBase(token)]
+        }
+
+        func loadNativePropertyValue(
+            _ property: NativePropertyAddress,
+            line: Int
+        ) throws -> Bytecode.Register {
+            guard let binding = property.getter else {
+                if let unavailable = property.unavailableGetter {
+                    throw CanonicalSIL.LoweringError.unavailableNativeImport(
+                        line: line,
+                        mangledName: unavailable.mangledName,
+                        canonicalCallee: unavailable.canonicalCallee,
+                        reason: unavailable.reason
+                    )
+                }
+                throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                    line: line,
+                    text: "stored property getter is absent from the frozen Shell"
+                )
+            }
+            guard case let .nativeImport(requirement) = binding.target else {
+                throw CanonicalSIL.LoweringError.invalidCallTable(
+                    "stored property getter is not a NativeImport"
+                )
+            }
+            let result = try allocate(type: property.valueType)
+            let receiver = try copyOwnedValue(property.receiver)
+            appendInstruction(
+                .nativeApply(
+                    result: result,
+                    importID: requirement.id,
+                    arguments: [receiver]
+                )
+            )
+            return result
         }
 
         func recordCompilerAddressValue(_ value: Bytecode.Register, at token: String) {
@@ -2235,6 +2275,24 @@ public struct Lowerer: Sendable {
             line: Int
         ) throws -> BorrowedStoredValue? {
             guard let type = stackType(at: token) else { return nil }
+            if let property = nativePropertyAddresses[addressBase(token)] {
+                let snapshot: Bytecode.Register
+                if let stored = stackValue(at: token) {
+                    snapshot = stored
+                } else {
+                    snapshot = try loadNativePropertyValue(property, line: line)
+                    recordCompilerAddressValue(snapshot, at: token)
+                }
+                guard registerTypes[Int(snapshot.rawValue)] == type else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "native property snapshot has the wrong VM type"
+                    )
+                }
+                // Enum-address inspection and payload projection must observe
+                // one getter snapshot. The corresponding end_access releases
+                // the snapshot on paths that do not consume its payload.
+                return .init(register: snapshot, temporaryOwner: nil)
+            }
             if runtimeAddress(at: token) != nil || mutableCell(at: token) != nil {
                 guard let copy = try copyStoredValue(at: token, line: line) else {
                     return nil
@@ -3989,6 +4047,10 @@ public struct Lowerer: Sendable {
             parameters: [Bytecode.Register] = [],
             instructions: [IntermediateRepresentation.Instruction]
         ) {
+            retainFlow.recordSyntheticBlock(
+                id: id,
+                instructions: instructions
+            )
             blocks.append(
                 .init(
                     id: id,
@@ -4034,6 +4096,7 @@ public struct Lowerer: Sendable {
             )
             finishCurrent()
             appendSyntheticBlock(id: trapID, instructions: [.trap(reason)])
+            retainFlow.activate(continuationID)
             current = IntermediateRepresentation.Block(
                 id: continuationID,
                 parameters: [],
@@ -9478,6 +9541,7 @@ public struct Lowerer: Sendable {
             )
 
             let result = try allocate(type: plan.output.type)
+            retainFlow.activate(completionTarget)
             current = .init(
                 id: completionTarget,
                 parameters: [result],
@@ -9685,6 +9749,7 @@ public struct Lowerer: Sendable {
             }
             finishCurrent()
 
+            retainFlow.activate(dispatch)
             current = .init(id: dispatch, parameters: [], instructions: [])
             try appendAlgebraicSwitch(
                 source: source,
@@ -9833,6 +9898,7 @@ public struct Lowerer: Sendable {
 
             if let directResultToken {
                 let mergedResult = try allocate(type: plan.output.type)
+                retainFlow.activate(completionTarget)
                 current = .init(
                     id: completionTarget,
                     parameters: [mergedResult],
@@ -10573,6 +10639,7 @@ public struct Lowerer: Sendable {
                 id: overflowTrap,
                 instructions: [.trap(.integerOverflow)]
             )
+            retainFlow.activate(completion)
             current = .init(
                 id: completion,
                 parameters: [result],
@@ -10905,6 +10972,7 @@ public struct Lowerer: Sendable {
                         .branch(target: completion, arguments: [absent]),
                     ]
                 )
+                retainFlow.activate(completion)
                 current = .init(
                     id: completion,
                     parameters: [result],
@@ -10975,6 +11043,7 @@ public struct Lowerer: Sendable {
                     .branch(target: completion, arguments: [finished]),
                 ]
             )
+            retainFlow.activate(completion)
             current = .init(
                 id: completion,
                 parameters: [result],
@@ -11311,6 +11380,7 @@ public struct Lowerer: Sendable {
                     ),
                 ]
             )
+            retainFlow.activate(completion)
             current = .init(
                 id: completion,
                 parameters: [result],
@@ -11478,6 +11548,7 @@ public struct Lowerer: Sendable {
                     .branch(target: completion, arguments: [noSelection]),
                 ]
             )
+            retainFlow.activate(completion)
             current = .init(
                 id: completion,
                 parameters: [result],
@@ -11907,6 +11978,7 @@ public struct Lowerer: Sendable {
                     .branch(target: completion, arguments: [falseValue]),
                 ]
             )
+            retainFlow.activate(completion)
             current = .init(
                 id: completion,
                 parameters: [result],
@@ -15731,6 +15803,7 @@ public struct Lowerer: Sendable {
             )
 
             let selected = try allocate(type: valueType)
+            retainFlow.activate(mergeTarget)
             current = .init(
                 id: mergeTarget,
                 parameters: [selected],
@@ -19816,6 +19889,7 @@ public struct Lowerer: Sendable {
             ) {
                 finishCurrent()
                 var loweredBlock = block.block
+                retainFlow.activate(loweredBlock.id)
                 let explicitParameters = block.parameters
                 if let suppressedType = suppressedTryNormalParameterTypes
                     .removeValue(forKey: block.block.id) {
@@ -20169,6 +20243,19 @@ public struct Lowerer: Sendable {
 
             if let metatype = match(
                 line,
+                pattern: #"^(%[0-9]+) = metatype \$@thick @dynamic_self (.+)\.Type$"#
+            ), metatypeIdentity("@thick \(metatype[1]).Type") != nil {
+                // Keep dynamic Self symbolic until SIL explicitly upcasts it
+                // to the declaring nominal. This preserves overridable class
+                // semantics while admitting the common `Self.staticMember`
+                // representation for an exact, non-overridable target.
+                dynamicSelfMetatypeTypes[metatype[0]] =
+                    CanonicalSIL.SwiftTypeIdentity.normalized(metatype[1])
+                continue
+            }
+
+            if let metatype = match(
+                line,
                 pattern: #"^(%[0-9]+) = metatype \$@(thin|thick|objc_metatype) (.+)\.Type$"#
             ), let identity = metatypeIdentity(
                 "@\(metatype[1]) \(metatype[2]).Type"
@@ -20321,6 +20408,24 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = metatype \$@(thin|thick|objc_metatype) (.+)\.Type$"#
             ), staticMetatypeIdentities[metatype[0]] != nil {
+                continue
+            }
+
+            if let cast = match(
+                line,
+                pattern: #"^(%[0-9]+) = upcast (%[0-9]+) to \$@(?:thick|objc_metatype) (.+)\.Type$"#
+            ), let dynamicOwner = dynamicSelfMetatypeTypes[cast[1]],
+               dynamicOwner == CanonicalSIL.SwiftTypeIdentity.normalized(cast[2]),
+               let identity = metatypeIdentity("@thick \(cast[2]).Type") {
+                staticMetatypeIdentities[cast[0]] = identity
+                switch identity {
+                case let .native(typeID):
+                    nativeMetatypeValues[cast[0]] = typeID
+                case let .local(key):
+                    localMetatypeValues[cast[0]] = key
+                case .swift:
+                    break
+                }
                 continue
             }
 
@@ -21148,6 +21253,16 @@ public struct Lowerer: Sendable {
                     of: token,
                     after: currentSILLineIndex
                 )
+                if nativePropertyAddresses[addressBase(token)] != nil,
+                   let snapshot = stackValue(at: token) {
+                    if !registerTypes[Int(snapshot.rawValue)].isTrivial {
+                        appendInstruction(.destroyValue(snapshot))
+                    }
+                    if !hasLaterTextualUse {
+                        removeCompilerAddressValue(at: token)
+                        invalidateOptionalStorageFacts(at: token)
+                    }
+                }
                 if passthroughRuntimeAccesses.contains(token) {
                     if hasLaterTextualUse {
                         deferredAccessMetadataCleanup.insert(token)
@@ -25821,35 +25936,11 @@ public struct Lowerer: Sendable {
                             text: "taking load from native application storage"
                         )
                     }
-                    guard let binding = property.getter else {
-                        if let unavailable = property.unavailableGetter {
-                            throw CanonicalSIL.LoweringError.unavailableNativeImport(
-                                line: sourceLine,
-                                mangledName: unavailable.mangledName,
-                                canonicalCallee: unavailable.canonicalCallee,
-                                reason: unavailable.reason
-                            )
-                        }
-                        throw CanonicalSIL.LoweringError.unsupportedInstruction(
-                            line: sourceLine,
-                            text: "stored property getter is absent from the frozen Shell"
-                        )
-                    }
-                    guard case let .nativeImport(requirement) = binding.target else {
-                        throw CanonicalSIL.LoweringError.invalidCallTable(
-                            "stored property getter is not a NativeImport"
-                        )
-                    }
-                    let result = try allocate(type: property.valueType)
-                    values[load[0]] = result
-                    let receiver = try copyOwnedValue(property.receiver)
-                    appendInstruction(
-                        .nativeApply(
-                            result: result,
-                            importID: requirement.id,
-                            arguments: [receiver]
-                        )
+                    let result = try loadNativePropertyValue(
+                        property,
+                        line: sourceLine
                     )
+                    values[load[0]] = result
                     if mode.isEmpty,
                        property.valueType.requiresLinearOwnership {
                         borrowedLoadTokens.insert(load[0])
@@ -27607,6 +27698,12 @@ public struct Lowerer: Sendable {
         }
         finishCurrent()
         guard let entryBlock else { throw CanonicalSIL.LoweringError.malformedSIL("function contains no entry block") }
+        if let conflict = retainFlow.conflict {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "path-sensitive retain lifetime is inconsistent: "
+                    + conflict
+            )
+        }
         guard pendingArrayLiterals.isEmpty else {
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "Array literal allocation is not finalized on every supported path"
@@ -27713,9 +27810,7 @@ public struct Lowerer: Sendable {
             "lexical-closure",
             count: onStackClosureValues.count
         )
-        let retainedValueTokens = pendingRetainedValues.flatMap { token, values in
-            Array(repeating: token, count: values.count)
-        }.sorted()
+        let retainedValueTokens = retainFlow.incompleteTerminalTokens
         recordIncompleteLifetime(
             "retained-value[\(retainedValueTokens.joined(separator: "|"))]",
             count: retainedValueTokens.count
