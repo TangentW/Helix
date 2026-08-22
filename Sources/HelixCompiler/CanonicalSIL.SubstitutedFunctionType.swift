@@ -92,7 +92,8 @@ enum SubstitutedFunctionType {
                 containsArchetypeSpelling(in: $0)
             }) {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "substituted function type retains a non-concrete substitution: \(unresolved)"
+                    "substituted function type retains a non-concrete substitution "
+                        + "\(unresolved) in \(raw)"
                 )
             }
 

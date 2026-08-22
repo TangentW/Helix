@@ -197,6 +197,12 @@ public struct Lowerer: Sendable {
         }
     }
 
+    private struct DeferredGenericFunctionReference {
+        var symbol: String
+        var loweredType: String
+        var bindings: [CanonicalSIL.DirectCallBinding]
+    }
+
     /// A Swift SDK default-expression helper is compiler implementation, not
     /// application code. Its value may be erased only when the frozen
     /// NativeImport projection proves that the corresponding source argument
@@ -769,6 +775,9 @@ public struct Lowerer: Sendable {
         var hostedAllocatorReferences: [String: Core.TypeID] = [:]
         var hostedSuperReferences: [String: HostedSuperReference] = [:]
         var deferredForeignReferences: [String: (reference: String, loweredType: String)] = [:]
+        var deferredGenericFunctionReferences: [
+            String: DeferredGenericFunctionReference
+        ] = [:]
         var swiftCoreReferences: [String: SwiftCoreIntrinsic] = [:]
         var objectiveCBridgeReferences: [String: ObjectiveCBridgeIntrinsic] = [:]
         var optionSetArrayLiteralReferences: [String: String] = [:]
@@ -2884,6 +2893,62 @@ public struct Lowerer: Sendable {
                 symbol: symbol,
                 line: line
             )
+        }
+
+        func resolveDeferredGenericFunctionReference(
+            _ deferred: DeferredGenericFunctionReference,
+            genericArguments rawArguments: String,
+            appliedLoweredType: String,
+            line: Int
+        ) throws -> (
+            references: ResolvedFunctionReferenceSet,
+            concreteLoweredType: String
+        ) {
+            guard CanonicalSIL.GenericFunction.validatesCallType(
+                appliedLoweredType,
+                against: deferred.loweredType
+            ) else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: deferred.symbol,
+                    detail: "generic apply changes its referenced SIL function type"
+                )
+            }
+            let arguments: [String]
+            do {
+                arguments = try CanonicalSIL.GenericFunction.arguments(
+                    in: rawArguments
+                )
+            } catch let error as CanonicalSIL.GenericFunction.SpecializationError {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: deferred.symbol,
+                    detail: error.description
+                )
+            }
+            let matching = deferred.bindings.filter {
+                $0.genericSpecialization?.arguments == arguments
+            }
+            guard matching.count == 1,
+                  let binding = matching.first,
+                  let specialization = binding.genericSpecialization
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: deferred.symbol,
+                    detail: "no unique image-local specialization matches <"
+                        + arguments.joined(separator: ", ") + ">"
+                )
+            }
+            let references = try resolveFunctionReferenceSet(
+                bindings: [binding],
+                loweredType: specialization.concreteLoweredType,
+                bridgesPhysicalTypes: true,
+                usesObjectiveCBridge: false,
+                symbol: deferred.symbol,
+                line: line
+            )
+            return (references, specialization.concreteLoweredType)
         }
 
         func eraseMetatypeArguments(
@@ -21727,6 +21792,8 @@ public struct Lowerer: Sendable {
             if let reference = match(
                 line,
                 pattern: #"^(%[0-9]+) = (?:dynamic_)?function_ref @([^\s:]+) : \$(.+)$"#
+            ), !CanonicalSIL.GenericFunction.isGeneric(
+                loweredType: reference[2]
             ), let signature = try nativeBlockThunkSignature(
                 reference[2]
             ) {
@@ -21777,6 +21844,32 @@ public struct Lowerer: Sendable {
                     )
                     continue
                 }
+                let genericImageBindings = boundCalls.filter {
+                    $0.genericSpecialization != nil
+                }
+                if CanonicalSIL.GenericFunction.isGeneric(
+                    loweredType: reference[2]
+                ), !genericImageBindings.isEmpty {
+                    guard genericImageBindings.count == boundCalls.count,
+                          genericImageBindings.allSatisfy({ binding in
+                              guard binding.genericSpecialization != nil,
+                                    case .function = binding.target
+                              else { return false }
+                              return true
+                          })
+                    else {
+                        throw CanonicalSIL.LoweringError.unboundCallee(
+                            line: sourceLine,
+                            mangledName: reference[1]
+                        )
+                    }
+                    deferredGenericFunctionReferences[reference[0]] = .init(
+                        symbol: reference[1],
+                        loweredType: reference[2],
+                        bindings: genericImageBindings
+                    )
+                    continue
+                }
                 if !hasImageBody,
                    let intrinsic = SwiftCoreIntrinsic(
                        mangledName: reference[1]
@@ -21812,6 +21905,13 @@ public struct Lowerer: Sendable {
                     if boundCalls.isEmpty {
                         continue
                     }
+                }
+                guard boundCalls.allSatisfy({
+                    $0.genericSpecialization == nil
+                }) else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "concrete function_ref @\(reference[1]) has generic-only bindings"
+                    )
                 }
                 guard !boundCalls.isEmpty else {
                     if let unavailable = directCalls.unavailableCall(for: reference[1]) {
@@ -21929,16 +22029,17 @@ public struct Lowerer: Sendable {
 
             if let closure = match(
                 line,
-                pattern: #"^(%[0-9]+) = partial_apply(?: \[[^\]]+\])* (%[0-9]+)\((.*)\) : \$(.+)$"#
+                pattern: #"^(%[0-9]+) = partial_apply(?: \[[^\]]+\])* (%[0-9]+)(?:<(.+)>)?\((.*)\) : \$(.+)$"#
             ) {
                 if let signature = nativeBlockNonescapingAdapters[closure[1]] {
                     let captureTokens = try parseApplyValueTokens(
-                        closure[2],
+                        closure[3],
                         line: sourceLine
                     )
-                    guard captureTokens.count == 1,
+                    guard closure[2].isEmpty,
+                          captureTokens.count == 1,
                           let physicalClosure = CanonicalSIL.ClosureReabstraction
-                            .nonescapingAdapterClosureType(in: closure[3]),
+                            .nonescapingAdapterClosureType(in: closure[4]),
                           case let .closure(physicalSignature) = try parseStoredType(
                             physicalClosure
                           ),
@@ -21969,7 +22070,41 @@ public struct Lowerer: Sendable {
                     aliasBorrowedTemporary(closure[0], to: captureTokens[0])
                     continue
                 }
-                guard let reference = functionReferences[closure[1]]?.sole,
+                let reference: ResolvedFunctionReference
+                let physicalLoweredType: String
+                if let resolved = functionReferences[closure[1]]?.sole {
+                    guard closure[2].isEmpty else {
+                        throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                            line: sourceLine,
+                            mangledName: resolved.binding.mangledName,
+                            detail: "a concrete partial_apply has generic arguments"
+                        )
+                    }
+                    reference = resolved
+                    physicalLoweredType = closure[4]
+                } else if let deferred = deferredGenericFunctionReferences[
+                    closure[1]
+                ] {
+                    let resolved = try resolveDeferredGenericFunctionReference(
+                        deferred,
+                        genericArguments: closure[2],
+                        appliedLoweredType: closure[4],
+                        line: sourceLine
+                    )
+                    guard let sole = resolved.references.sole else {
+                        throw CanonicalSIL.LoweringError.invalidCallTable(
+                            "generic partial_apply has no unique image-local target"
+                        )
+                    }
+                    reference = sole
+                    physicalLoweredType = resolved.concreteLoweredType
+                } else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: line
+                    )
+                }
+                guard
                       case let .function(functionID) = reference.binding.target
                 else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
@@ -21987,7 +22122,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let physicalType = try parseFunctionType(
-                    closure[3],
+                    physicalLoweredType,
                     bridgingTo: (
                         binding.parameterTypes,
                         binding.resultType
@@ -22017,7 +22152,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let captureTokens = try parseApplyValueTokens(
-                    closure[2],
+                    closure[3],
                     line: sourceLine
                 )
                 if case let .staticKeyPathProjection(identity) = binding.abiAdapter {
@@ -22271,6 +22406,10 @@ public struct Lowerer: Sendable {
                     arrayLiteralStorageTokens[borrowed[0]] = allocation
                 } else if let reference = functionReferences[borrowed[1]] {
                     functionReferences[borrowed[0]] = reference
+                } else if let reference = deferredGenericFunctionReferences[
+                    borrowed[1]
+                ] {
+                    deferredGenericFunctionReferences[borrowed[0]] = reference
                 } else if let reference = deferredForeignReferences[borrowed[1]] {
                     deferredForeignReferences[borrowed[0]] = reference
                 } else if let reference = hostedSuperReferences[borrowed[1]] {
@@ -22672,14 +22811,32 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let references: ResolvedFunctionReferenceSet
+                let appliedLoweredType: String
+                let usesGenericImageSpecialization: Bool
                 if let resolved = functionReferences[call[0]] {
                     references = resolved
+                    appliedLoweredType = call[3]
+                    usesGenericImageSpecialization = false
+                } else if let deferred = deferredGenericFunctionReferences[
+                    call[0]
+                ] {
+                    let resolved = try resolveDeferredGenericFunctionReference(
+                        deferred,
+                        genericArguments: call[1],
+                        appliedLoweredType: call[3],
+                        line: sourceLine
+                    )
+                    references = resolved.references
+                    appliedLoweredType = resolved.concreteLoweredType
+                    usesGenericImageSpecialization = true
                 } else if let deferred = deferredForeignReferences[call[0]] {
                     references = try resolveDeferredForeignReference(
                         deferred,
                         genericArguments: call[1],
                         line: sourceLine
                     )
+                    appliedLoweredType = call[3]
+                    usesGenericImageSpecialization = false
                 } else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
@@ -22742,7 +22899,7 @@ public struct Lowerer: Sendable {
                 )
                 let binding = reference.binding
                 let appliedType = try parseFunctionType(
-                    call[3],
+                    appliedLoweredType,
                     bridgingTo: (binding.parameterTypes, binding.resultType),
                     parameterProjection: binding.parameterProjection,
                     abiAdapter: binding.abiAdapter,
@@ -22763,7 +22920,8 @@ public struct Lowerer: Sendable {
                           appliedType.effects,
                           authoritative: binding.effects
                       ),
-                      call[1].isEmpty
+                      usesGenericImageSpecialization
+                        ? !call[1].isEmpty : call[1].isEmpty
                 else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
                         line: sourceLine,
@@ -23193,8 +23351,27 @@ public struct Lowerer: Sendable {
                 let references: ResolvedFunctionReferenceSet
                 let appliedLoweredType: String
                 if let resolved = functionReferences[call[1]] {
+                    guard call[2].isEmpty else {
+                        throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                            line: sourceLine,
+                            mangledName: resolved.variants.first?.binding
+                                .mangledName ?? "<direct-call>",
+                            detail: "a concrete callee is applied with generic arguments"
+                        )
+                    }
                     references = resolved
                     appliedLoweredType = call[4]
+                } else if let deferred = deferredGenericFunctionReferences[
+                    call[1]
+                ] {
+                    let resolved = try resolveDeferredGenericFunctionReference(
+                        deferred,
+                        genericArguments: call[2],
+                        appliedLoweredType: call[4],
+                        line: sourceLine
+                    )
+                    references = resolved.references
+                    appliedLoweredType = resolved.concreteLoweredType
                 } else if let deferred = deferredForeignReferences[call[1]] {
                     references = try resolveDeferredForeignReference(
                         deferred,
@@ -25344,6 +25521,10 @@ public struct Lowerer: Sendable {
                     functionReferences[copy[0]] = reference
                     continue
                 }
+                if let reference = deferredGenericFunctionReferences[copy[1]] {
+                    deferredGenericFunctionReferences[copy[0]] = reference
+                    continue
+                }
                 if let reference = deferredForeignReferences[copy[1]] {
                     deferredForeignReferences[copy[0]] = reference
                     continue
@@ -25448,6 +25629,11 @@ public struct Lowerer: Sendable {
                 }
                 if let reference = functionReferences.removeValue(forKey: move[1]) {
                     functionReferences[move[0]] = reference
+                    continue
+                }
+                if let reference = deferredGenericFunctionReferences
+                    .removeValue(forKey: move[1]) {
+                    deferredGenericFunctionReferences[move[0]] = reference
                     continue
                 }
                 if let reference = deferredForeignReferences.removeValue(forKey: move[1]) {

@@ -101,13 +101,14 @@ enum ImageFunctions {
             )
             bindings.append(
                 .init(
-                    mangledName: symbol,
+                    mangledName: item.bindingSymbol ?? symbol,
                     parameterTypes: signature.parameters,
                     parameterConventions: signature.parameterConventions,
                     resultType: signature.result,
                     effects: signature.effects,
                     target: .function(id),
-                    abiAdapter: item.abiAdapter
+                    abiAdapter: item.abiAdapter,
+                    genericSpecialization: item.genericSpecialization
                 )
             )
         }

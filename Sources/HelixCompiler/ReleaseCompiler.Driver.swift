@@ -530,6 +530,21 @@ extension ReleaseCompiler {
                         reason: "optimized and semantic SIL disagree on its physical ABI adapter"
                     )
                 }
+                if let optimized, let semantic,
+                   optimized.bindingSymbol != semantic.bindingSymbol {
+                    throw DriverError.generatedFunctionUnsupported(
+                        symbol,
+                        reason: "optimized and semantic SIL disagree on its bound Swift symbol"
+                    )
+                }
+                if let optimized, let semantic,
+                   optimized.genericSpecialization
+                    != semantic.genericSpecialization {
+                    throw DriverError.generatedFunctionUnsupported(
+                        symbol,
+                        reason: "optimized and semantic SIL disagree on its generic specialization"
+                    )
+                }
                 let executionEffectEnvelope = mergeExecutionEffectEnvelopes(
                     optimized?.executionEffectEnvelope,
                     semantic?.executionEffectEnvelope
@@ -578,13 +593,14 @@ extension ReleaseCompiler {
                 )
                 imageBindings.append(
                     .init(
-                        mangledName: symbol,
+                        mangledName: selected.bindingSymbol ?? symbol,
                         parameterTypes: signature.parameters,
                         parameterConventions: signature.parameterConventions,
                         resultType: signature.result,
                         effects: signature.effects,
                         target: .function(functionID),
-                        abiAdapter: selected.abiAdapter
+                        abiAdapter: selected.abiAdapter,
+                        genericSpecialization: selected.genericSpecialization
                     )
                 )
             }

@@ -29,6 +29,7 @@ public struct DirectCallBinding: Hashable, Sendable {
     public var effects: Core.Effects
     public var target: Target
     public var abiAdapter: ABIAdapter
+    var genericSpecialization: CanonicalSIL.GenericFunction.Specialization?
 
     public init(
         mangledName: String,
@@ -39,6 +40,30 @@ public struct DirectCallBinding: Hashable, Sendable {
         effects: Core.Effects = .init(),
         target: Target,
         abiAdapter: ABIAdapter = .direct
+    ) {
+        self.init(
+            mangledName: mangledName,
+            parameterTypes: parameterTypes,
+            parameterConventions: parameterConventions,
+            parameterProjection: parameterProjection,
+            resultType: resultType,
+            effects: effects,
+            target: target,
+            abiAdapter: abiAdapter,
+            genericSpecialization: nil
+        )
+    }
+
+    init(
+        mangledName: String,
+        parameterTypes: [Bytecode.ValueType],
+        parameterConventions: [Bytecode.ParameterConvention]? = nil,
+        parameterProjection: InterfaceArchive.NativeImportParameterProjection? = nil,
+        resultType: Bytecode.ValueType,
+        effects: Core.Effects = .init(),
+        target: Target,
+        abiAdapter: ABIAdapter = .direct,
+        genericSpecialization: CanonicalSIL.GenericFunction.Specialization?
     ) {
         self.mangledName = mangledName
         self.parameterTypes = parameterTypes
@@ -52,6 +77,7 @@ public struct DirectCallBinding: Hashable, Sendable {
         self.effects = effects
         self.target = target
         self.abiAdapter = abiAdapter
+        self.genericSpecialization = genericSpecialization
     }
 }
 
@@ -87,8 +113,27 @@ public struct DirectCallTable: Sendable {
             else {
                 throw CanonicalSIL.LoweringError.invalidCallTable(
                     "empty or convention-mismatched direct-call symbol "
-                        + value.mangledName
+                    + value.mangledName
                 )
+            }
+            if let specialization = value.genericSpecialization {
+                let reparsedArguments = try? CanonicalSIL.GenericFunction
+                    .arguments(in: specialization.arguments.joined(separator: ", "))
+                guard case .function = value.target,
+                      value.abiAdapter == .direct,
+                      value.parameterProjection == .identity(
+                        parameterCount: value.parameterTypes.count
+                      ),
+                      reparsedArguments == specialization.arguments,
+                      !specialization.concreteLoweredType.isEmpty,
+                      !CanonicalSIL.GenericFunction.isGeneric(
+                        loweredType: specialization.concreteLoweredType
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "generic specialization @\(value.mangledName) has an invalid concrete binding"
+                    )
+                }
             }
             if case let .nativeImport(requirement) = value.target {
                 guard requirement.effects == value.effects else {
@@ -165,18 +210,36 @@ public struct DirectCallTable: Sendable {
                 }
             }
             if let existing = result[value.mangledName] {
-                guard case .nativeImport = value.target,
-                      existing.allSatisfy({ binding in
-                          guard case .nativeImport = binding.target else {
-                              return false
-                          }
-                          return binding.parameterProjection.logicalParameterIndices
-                                  != value.parameterProjection.logicalParameterIndices
-                              && Self.nativeVariantsArePhysicallyCompatible(
-                                  binding,
-                                  value
-                              )
-                      })
+                let validNativeVariants: Bool = if case .nativeImport = value.target {
+                    existing.allSatisfy { binding in
+                        guard case .nativeImport = binding.target else {
+                            return false
+                        }
+                        return binding.parameterProjection.logicalParameterIndices
+                                != value.parameterProjection.logicalParameterIndices
+                            && Self.nativeVariantsArePhysicallyCompatible(
+                                binding,
+                                value
+                            )
+                    }
+                } else {
+                    false
+                }
+                let validGenericSpecializations: Bool = if
+                    case .function = value.target,
+                    let specialization = value.genericSpecialization
+                {
+                    existing.allSatisfy { binding in
+                        guard case .function = binding.target,
+                              let existingSpecialization = binding.genericSpecialization
+                        else { return false }
+                        return existingSpecialization.arguments
+                            != specialization.arguments
+                    }
+                } else {
+                    false
+                }
+                guard validNativeVariants || validGenericSpecializations
                 else {
                     throw CanonicalSIL.LoweringError.invalidCallTable(
                         "duplicate or physically inconsistent direct-call symbol "
@@ -318,6 +381,13 @@ public struct DirectCallTable: Sendable {
         let left = lhs.parameterProjection.logicalParameterIndices
         let right = rhs.parameterProjection.logicalParameterIndices
         if left != right { return left.lexicographicallyPrecedes(right) }
+        let leftSpecialization = lhs.genericSpecialization?.arguments ?? []
+        let rightSpecialization = rhs.genericSpecialization?.arguments ?? []
+        if leftSpecialization != rightSpecialization {
+            return leftSpecialization.lexicographicallyPrecedes(
+                rightSpecialization
+            )
+        }
         return false
     }
 

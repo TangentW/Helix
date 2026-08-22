@@ -9,6 +9,12 @@ enum ImageFunctions {
         var kind: Bytecode.FunctionKind
         var abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter
         var executionEffectEnvelope: Core.Effects? = nil
+        /// The source-level symbol named by `function_ref`. A materialized
+        /// generic body has a distinct build-time identity but remains bound
+        /// to this original callee.
+        var bindingSymbol: String? = nil
+        var genericSpecialization: CanonicalSIL.GenericFunction.Specialization?
+            = nil
     }
 
     struct Signature: Equatable, Sendable {
@@ -62,11 +68,37 @@ enum ImageFunctions {
             String: CanonicalSIL.DirectCallBinding.ABIAdapter
         ] = [:]
         var replacementBySymbol: [String: CanonicalSIL.Function] = [:]
+        var bindingSymbolBySymbol: [String: String] = [:]
+        var specializationBySymbol: [
+            String: CanonicalSIL.GenericFunction.Specialization
+        ] = [:]
         var result: [String: Discovered] = [:]
 
         while let next = pending.popLast() {
             let reference = next.reference
             let symbol = reference.symbol
+            let bindingSymbol = reference.bindingSymbol ?? symbol
+            let hadIdentity = bindingSymbolBySymbol[symbol] != nil
+            if hadIdentity {
+                guard bindingSymbolBySymbol[symbol] == bindingSymbol else {
+                    throw DiscoveryError.unsupported(
+                        symbol: bindingSymbol,
+                        reason: "one image-local identity aliases different Swift callees"
+                    )
+                }
+                guard specializationBySymbol[symbol]
+                        == reference.genericSpecialization
+                else {
+                    throw DiscoveryError.unsupported(
+                        symbol: bindingSymbol,
+                        reason: "one image-local identity aliases different generic specializations"
+                    )
+                }
+            }
+            bindingSymbolBySymbol[symbol] = bindingSymbol
+            if let specialization = reference.genericSpecialization {
+                specializationBySymbol[symbol] = specialization
+            }
             if let existingKind = kindBySymbol[symbol], existingKind != reference.kind {
                 throw DiscoveryError.unsupported(
                     symbol: symbol,
@@ -109,7 +141,7 @@ enum ImageFunctions {
                   !excludedSymbols.contains(symbol)
             else { continue }
             guard let function = replacementBySymbol[symbol]
-                    ?? file.function(mangledName: symbol)
+                    ?? file.function(mangledName: bindingSymbol)
             else {
                 // A generated symbol without a body remains eligible for a
                 // separately frozen Shell binding. Lowering reports an
@@ -120,7 +152,9 @@ enum ImageFunctions {
                 function: function,
                 kind: reference.kind,
                 abiAdapter: reference.abiAdapter,
-                executionEffectEnvelope: mergedAuthority.effects
+                executionEffectEnvelope: mergedAuthority.effects,
+                bindingSymbol: reference.bindingSymbol,
+                genericSpecialization: reference.genericSpecialization
             )
             pending.append(contentsOf: try references(
                     in: function,
@@ -224,6 +258,16 @@ enum ImageFunctions {
         var kind: Bytecode.FunctionKind
         var replacement: CanonicalSIL.Function?
         var abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter
+        var bindingSymbol: String? = nil
+        var genericSpecialization: CanonicalSIL.GenericFunction.Specialization?
+            = nil
+    }
+
+    private struct MaterializedGenericReference: Sendable {
+        var bindingSymbol: String
+        var specialization: CanonicalSIL.GenericFunction.Specialization
+        var function: CanonicalSIL.Function
+        var usages: Set<ReferenceUsage>
     }
 
     private struct RootExecutionAuthority: Equatable, Sendable {
@@ -279,6 +323,67 @@ enum ImageFunctions {
         var unboundedRangeClosureByValue: [String: String] = [:]
         var compilerOnlyUnboundedRangeSymbols = Set<String>()
         var compilerOnlyNativeBlockSymbols = Set<String>()
+        var materializedGenericReferences: [
+            String: MaterializedGenericReference
+        ] = [:]
+
+        func recordGenericReference(
+            value: String,
+            symbol: String,
+            line: String,
+            usage: ReferenceUsage
+        ) throws -> Bool {
+            // Direct semantic intrinsics are terminal compiler edges. Their
+            // serialized standard-library bodies are not image-local helpers,
+            // even when the SIL call carries concrete generic arguments.
+            if usage == .directCall,
+               CanonicalSIL.SwiftCoreIntrinsic(mangledName: symbol) != nil {
+                return false
+            }
+            guard let rawArguments = genericArguments(
+                appliedValue: value,
+                in: line
+            ), let declaration = file.function(mangledName: symbol),
+                  kindForSymbol(symbol) != nil,
+                  CanonicalSIL.GenericFunction.isGeneric(
+                    loweredType: declaration.loweredType
+                  )
+            else { return false }
+            let materialized: CanonicalSIL.GenericFunction.Materialized
+            do {
+                materialized = try CanonicalSIL.GenericFunction.specialize(
+                    declaration,
+                    arguments: rawArguments
+                )
+            } catch let error as CanonicalSIL.GenericFunction.SpecializationError {
+                throw DiscoveryError.unsupported(
+                    symbol: symbol,
+                    reason: error.description
+                )
+            }
+            let identity = materialized.function.mangledName
+            if var existing = materializedGenericReferences[identity] {
+                guard existing.bindingSymbol == symbol,
+                      existing.specialization == materialized.descriptor,
+                      existing.function == materialized.function
+                else {
+                    throw DiscoveryError.unsupported(
+                        symbol: symbol,
+                        reason: "generic specialization identity collision"
+                    )
+                }
+                existing.usages.insert(usage)
+                materializedGenericReferences[identity] = existing
+            } else {
+                materializedGenericReferences[identity] = .init(
+                    bindingSymbol: symbol,
+                    specialization: materialized.descriptor,
+                    function: materialized.function,
+                    usages: [usage]
+                )
+            }
+            return true
+        }
 
         for rawLine in function.body.split(separator: "\n") {
             let line = String(rawLine).trimmingCharacters(in: .whitespaces)
@@ -332,7 +437,16 @@ enum ImageFunctions {
                     .isUnboundedMarkerClosureType(targetType) {
                     unboundedRangeClosureByValue[result] = marker
                 }
-                usageBySymbol[symbol, default: []].insert(.closureConstruction)
+                if try !recordGenericReference(
+                    value: source,
+                    symbol: symbol,
+                    line: line,
+                    usage: .closureConstruction
+                ) {
+                    usageBySymbol[symbol, default: []].insert(
+                        .closureConstruction
+                    )
+                }
                 continue
             }
             if let source = silValue(after: "apply", in: line),
@@ -344,7 +458,14 @@ enum ImageFunctions {
                    let marker = unboundedRangeClosureByValue[arguments[1]] {
                     compilerOnlyUnboundedRangeSymbols.insert(marker)
                 }
-                usageBySymbol[symbol, default: []].insert(.directCall)
+                if try !recordGenericReference(
+                    value: source,
+                    symbol: symbol,
+                    line: line,
+                    usage: .directCall
+                ) {
+                    usageBySymbol[symbol, default: []].insert(.directCall)
+                }
             }
         }
 
@@ -356,9 +477,16 @@ enum ImageFunctions {
             separator: "\n",
             omittingEmptySubsequences: false
         ).filter { !$0.contains(" = keypath $") }.joined(separator: "\n")
-        return ReleaseCompiler.ImplementationFingerprint
+        let specializedBindingSymbols = Set(
+            materializedGenericReferences.values.map(\.bindingSymbol)
+        )
+        let ordinary: [Reference] = ReleaseCompiler.ImplementationFingerprint
             .referencedSymbols(in: executableBody).sorted().compactMap { symbol in
                 let usages = usageBySymbol[symbol, default: []]
+                if usages.isEmpty,
+                   specializedBindingSymbols.contains(symbol) {
+                    return nil
+                }
                 if compilerOnlyNativeBlockSymbols.contains(symbol) {
                     return nil
                 }
@@ -411,6 +539,24 @@ enum ImageFunctions {
                     abiAdapter: rewrites[symbol]?.adapter ?? .direct
                 )
             }
+        let specialized: [Reference] = materializedGenericReferences.keys
+            .sorted().compactMap { identity in
+                guard let item = materializedGenericReferences[identity],
+                      kindForSymbol(item.bindingSymbol) != nil
+                else { return nil }
+                let kind: Bytecode.FunctionKind = item.usages.contains(
+                    .closureConstruction
+                ) ? .closureBody : .concreteSpecialization
+                return .init(
+                    symbol: identity,
+                    kind: kind,
+                    replacement: item.function,
+                    abiAdapter: .direct,
+                    bindingSymbol: item.bindingSymbol,
+                    genericSpecialization: item.specialization
+                )
+            }
+        return ordinary + specialized
     }
 
     private static func silResultValue(in line: String) -> String? {
@@ -447,6 +593,16 @@ enum ImageFunctions {
               let close = line[open...].firstIndex(of: ")")
         else { return nil }
         return silValues(in: line[line.index(after: open)..<close])
+    }
+
+    private static func genericArguments(
+        appliedValue: String,
+        in line: String
+    ) -> String? {
+        CanonicalSIL.GenericFunction.appliedArguments(
+            to: appliedValue,
+            in: line
+        )
     }
 
     private static func silValues(in text: Substring) -> [String] {

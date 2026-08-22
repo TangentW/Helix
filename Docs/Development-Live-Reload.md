@@ -306,9 +306,10 @@ identify, and validate the object without exposing a process pointer in HLBC.
 This establishes the receiver path for class methods; individual property and
 method operations still need a supported Shell entry or exact NativeImport.
 The measured member path above supplies those exact imports for its proven
-shapes. Async, generic or closure-bearing SDK members, subscripts, actor
-executor hops, and any parameter/result shape outside the frozen Bridge surface
-are not silently approximated and currently require a normal build.
+shapes. Async or generic SDK members, closure-bearing members outside the exact
+synchronous callback profile, subscripts, actor executor hops, and any
+parameter/result shape outside the frozen Bridge surface are not silently
+approximated and currently require a normal build.
 
 Swift commonly spells a class receiver as `@guaranteed self` in SIL, while an
 Entry/NativeImport Bridge owns each value that crosses the device boundary.
@@ -466,7 +467,12 @@ instead of being mistaken for managed closure construction. Copyable linear
 captures such as frozen imported references are
 accepted when their closure-body capture convention is borrowed; fully concrete
 reabstraction thunks are linked into the image rather than treated as
-NativeImports. Mutable captures use the same VM-managed cell for scalar,
+NativeImports. Concrete same-image calls can also monomorphize source generic
+closure helpers from semantic SIL, including direct, throwing, recursive,
+rethrowing, returning, and escaping function-value forms; each concrete type
+argument list receives a deterministic image target. This path does not invent
+runtime metadata or witness dispatch, so any body that still needs either fails
+closed. Mutable captures use the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
 boxes. Safe `weak` and checked `unowned` capture lists and captured weak locals
 use a second managed storage kind shared by patch-local and frozen native
@@ -596,8 +602,10 @@ mutating helpers use verified temporary address storage when their receiver is
 a compiler-only projection. Frame/runtime-backed inout helpers and closures may
 throw because their access scopes close on both continuations; overlapping or
 throwing compiler-only projections without symmetric writeback still fail
-closed. The closure cannot cross the Shell/Native boundary or survive the
-current pinned VM invocation.
+closed. Ordinary closure values cannot cross the Shell/Native boundary or
+survive the current pinned VM invocation. Exact NativeImport callback
+parameters are the sole exception: their checked nonescaping/escaping handle
+lifetimes follow the generated callback contract described above.
 
 The current generator collects reachable ordinary functions, private class
 instance methods, computed accessors, and their non-exported patch-local types

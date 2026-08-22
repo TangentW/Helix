@@ -142,6 +142,9 @@ enum StorageInitialization {
         var storagePointees: [String: Bytecode.ValueType] = [:]
         var addressAliases: [String: String] = [:]
         var bindingByValue: [String: CanonicalSIL.DirectCallBinding] = [:]
+        var bindingsByValue: [
+            String: [CanonicalSIL.DirectCallBinding]
+        ] = [:]
         var pointees: [String: Bytecode.ValueType] = [:]
 
         let hiddenOutputTypes = [indirectResultType, indirectErrorType]
@@ -171,6 +174,49 @@ enum StorageInitialization {
             return current
         }
 
+        func selectedBinding(
+            for value: String,
+            appliedIn line: String
+        ) throws -> CanonicalSIL.DirectCallBinding? {
+            guard let bindings = bindingsByValue[value], !bindings.isEmpty else {
+                return nil
+            }
+            let genericBindings = bindings.filter {
+                $0.genericSpecialization != nil
+            }
+            guard !genericBindings.isEmpty else {
+                return bindings.count == 1 ? bindings[0] : nil
+            }
+            guard genericBindings.count == bindings.count,
+                  let rawArguments = CanonicalSIL.GenericFunction
+                    .appliedArguments(to: value, in: line)
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "generic application has mixed bindings or no concrete arguments"
+                )
+            }
+            let arguments: [String]
+            do {
+                arguments = try CanonicalSIL.GenericFunction.arguments(
+                    in: rawArguments
+                )
+            } catch let error as CanonicalSIL.GenericFunction.SpecializationError {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    error.description
+                )
+            }
+            let matching = genericBindings.filter {
+                $0.genericSpecialization?.arguments == arguments
+            }
+            guard matching.count == 1 else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "generic application has no unique concrete binding for <"
+                        + arguments.joined(separator: ", ") + ">"
+                )
+            }
+            return matching[0]
+        }
+
         for line in lines {
             guard !line.isEmpty else { continue }
 
@@ -185,9 +231,13 @@ enum StorageInitialization {
             }
             if line.contains("function_ref @"),
                let value = silResultValue(in: line),
-               let symbol = functionReferenceSymbol(in: line),
-               let binding = directCalls.binding(for: symbol) {
-                bindingByValue[value] = binding
+               let symbol = functionReferenceSymbol(in: line) {
+                let bindings = directCalls.bindings(for: symbol)
+                guard !bindings.isEmpty else { continue }
+                bindingsByValue[value] = bindings
+                if bindings.count == 1 {
+                    bindingByValue[value] = bindings[0]
+                }
                 continue
             }
             for marker in [
@@ -203,6 +253,9 @@ enum StorageInitialization {
                 if let binding = bindingByValue[source] {
                     bindingByValue[destination] = binding
                 }
+                if let bindings = bindingsByValue[source] {
+                    bindingsByValue[destination] = bindings
+                }
                 if allocations.contains(root(of: source)) {
                     addressAliases[destination] = root(of: source)
                 }
@@ -214,7 +267,10 @@ enum StorageInitialization {
                 continue
             }
             guard let application = partialApply(in: line),
-                  let binding = bindingByValue[application.callee]
+                  let binding = try selectedBinding(
+                    for: application.callee,
+                    appliedIn: line
+                  ) ?? bindingByValue[application.callee]
             else { continue }
             guard application.captures.count <= binding.parameterTypes.count else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
@@ -258,7 +314,21 @@ enum StorageInitialization {
         }
         var applicationEffects: [Int: ApplicationStorageEffects] = [:]
         for (line, text) in lines.enumerated() {
-            if let effects = try applicationStorageEffects(in: text) {
+            let concreteFunctionType: String?
+            if let callee = applicationCallee(in: text),
+               let binding = try selectedBinding(
+                for: callee,
+                appliedIn: text
+               ) {
+                concreteFunctionType = binding.genericSpecialization?
+                    .concreteLoweredType
+            } else {
+                concreteFunctionType = nil
+            }
+            if let effects = try applicationStorageEffects(
+                in: text,
+                concreteFunctionType: concreteFunctionType
+            ) {
                 applicationEffects[line] = effects
             }
         }
@@ -1429,7 +1499,8 @@ enum StorageInitialization {
     /// and an `@out` result initializes immediately for `apply` and only on
     /// the normal edge for `try_apply`.
     private static func applicationStorageEffects(
-        in line: String
+        in line: String,
+        concreteFunctionType: String? = nil
     ) throws -> ApplicationStorageEffects? {
         let argumentsText: String
         let functionType: String
@@ -1463,7 +1534,7 @@ enum StorageInitialization {
         }
 
         let specializedType = try CanonicalSIL.SubstitutedFunctionType
-            .specialize(functionType)
+            .specialize(concreteFunctionType ?? functionType)
         guard let shape = physicalFunctionShape(in: specializedType),
               let argumentComponents = splitTopLevelValidated(argumentsText)
         else {
@@ -1472,11 +1543,14 @@ enum StorageInitialization {
             )
         }
         let resultOffset = shape.indirectResultEdges.count
-        guard argumentComponents.count
-                == shape.parameterSpellings.count + resultOffset
+        let expectedArgumentCount = shape.parameterSpellings.count
+            + resultOffset
+        guard argumentComponents.count == expectedArgumentCount
         else {
             throw CanonicalSIL.LoweringError.malformedSIL(
-                "apply argument count differs from its physical function type"
+                "apply has \(argumentComponents.count) physical arguments, but "
+                    + "its function type requires \(expectedArgumentCount); "
+                    + "type \(specializedType)"
             )
         }
         let argumentTokens = argumentComponents.map {
@@ -1625,6 +1699,14 @@ enum StorageInitialization {
                 if previous != "-" { depths.angle -= 1 }
             case "[": depths.square += 1
             case "]": depths.square -= 1
+            case "-" where depths == (0, 0, 0):
+                let next = text.index(after: index)
+                if next < text.endIndex, text[next] == ">" {
+                    // The outer result is itself a function value. Any
+                    // convention following this arrow belongs to that
+                    // nested closure result, not to the current application.
+                    return false
+                }
             default: break
             }
             guard depths.parenthesis >= 0,
@@ -1930,6 +2012,13 @@ enum StorageInitialization {
         }
         guard captures.count == components.count else { return nil }
         return (callee, captures)
+    }
+
+    private static func applicationCallee(in line: String) -> String? {
+        captures(
+            line,
+            pattern: #"^(?:%[0-9]+ = )?(?:try_)?apply (%[0-9]+)(?:<.*>)?\("#
+        )?.first
     }
 
     private static func matchingClose(

@@ -522,17 +522,24 @@ struct CommonSurfaceAudit {
         )
     }
 
-    @Test("Opaque generic and stateful standard-library values fail closed")
-    func preservesCurrentFrontierDiagnostics() {
-        expectUnsupported(
-            name: "specializedGeneric",
+    @Test("Concrete generic helpers compile while opaque stateful values fail closed")
+    func preservesCurrentFrontierDiagnostics() throws {
+        let specializedGeneric = try FrontendExecutionHarness.compile(
             source: """
             private func auditIdentity<T>(_ value: T) -> T { value }
             public func specializedGeneric(_ value: Int) -> Int {
                 auditIdentity(value) + auditIdentity(1)
             }
             """,
-            diagnostic: "lowered signature is not fully concrete"
+            functionName: "specializedGeneric",
+            moduleName: "HelixCommonSurface_specializedGeneric"
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: specializedGeneric.entry,
+                image: specializedGeneric.image,
+                arguments: [try integer(5)]
+            ) == .returned(try integer(6))
         )
         expectUnsupported(
             name: "appliedDifference",

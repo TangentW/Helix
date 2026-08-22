@@ -442,8 +442,14 @@ does not by itself certify a physical device or distribution channel.
   loads become `nil` after deallocation, while a dead checked-unowned load is a
   controlled VM trap. `non-owning-references-1` gates this storage and every
   instruction that creates or accesses it.
-  Compiler-emitted fully concrete specializations are also supported when no
-  archetype, metadata, or witness dependency remains.
+  Compiler-emitted fully concrete specializations are supported when no
+  archetype, metadata, or witness dependency remains. Source generic helpers
+  used at concrete same-image `apply`, `try_apply`, or `partial_apply` sites are
+  also monomorphized from semantic SIL. Distinct argument lists receive
+  deterministic image identities while call bindings retain the original
+  Swift symbol; recursive, rethrowing, higher-order, and escaping-function-value
+  forms use that same path. Unresolved arguments, packs, and bodies that retain
+  metadata or witness dispatch remain fail-closed.
 - Exact NativeImport callback parameters under one generated, framework-neutral
   bridge profile. Typed AST supplies the source closure spelling; canonical SIL
   supplies the physical `@noescape`/escaping lifetime, Objective-C block

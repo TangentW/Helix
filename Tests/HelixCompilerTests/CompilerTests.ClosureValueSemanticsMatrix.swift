@@ -656,6 +656,49 @@ struct ClosureValueSemanticsMatrix {
         #expect(try invoke(fixture, [integer(17)]) == integer(-1))
     }
 
+    @Test("Aggregate capture temporaries release their reference roots in-frame")
+    func releasesAggregateCaptureTemporaries() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            @inline(never)
+            private func invokeEscaping(_ callback: @escaping () -> Int) -> Int {
+                callback()
+            }
+
+            @inline(never)
+            private func makeObserver(_ owner: Owner) -> () -> Int {
+                { [weak owner] in owner?.value ?? -1 }
+            }
+
+            public func aggregateCaptureDiesInFrame(_ value: Int) -> Int {
+                let observe: () -> Int
+                do {
+                    let owner = Owner(value)
+                    observe = makeObserver(owner)
+                    let retaining = {
+                        [captured = Optional(owner)] in
+                        captured?.value ?? -2
+                    }
+                    _ = invokeEscaping(retaining)
+                }
+                return observe()
+            }
+            """,
+            functionName: "aggregateCaptureDiesInFrame",
+            moduleName: "HelixAggregateCaptureLifetimeFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(19)]) == integer(-1))
+    }
+
     @Test("Weak captures observe release through patch-local value aggregates")
     func releasesWeakCaptureReferentsFromStructStorage() throws {
         let fixture = try FrontendExecutionHarness.compile(

@@ -441,6 +441,16 @@ Both workflows depend on stable, build-specific identities:
   SSA aliases as roots. Direct-only closure and `defer` helpers retain
   their physical address ABI as concrete specializations; only a body actually
   used by `partial_apply` receives the managed closure-capture ABI.
+  Semantic SIL generic helpers reached through concrete `apply`, `try_apply`,
+  or `partial_apply` sites enter the same image-function graph. The compiler
+  parses the declaration's outer generic clause, substitutes only complete
+  type tokens, assigns a deterministic specialization identity, and binds the
+  concrete image body back to the original Swift symbol plus its exact argument
+  list. Multiple concrete instantiations and recursive calls therefore remain
+  distinct, statically typed targets without depending on optimizer-private
+  symbols. Unresolved archetypes, packs, unstable declaration parameters, and
+  bodies that still require runtime metadata or witness dispatch fail before
+  lowering.
 - Frame-local and heap-promoted storage share one field-sensitive aggregate
   shape. The compiler promotes multi-block lifetimes, classifies
   initialize/assign/replace and conditional cleanup, and the Verifier computes
