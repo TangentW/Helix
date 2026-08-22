@@ -440,6 +440,32 @@ enum FunctionTypeSpelling {
 /// The single automatic NativeImport boundary profile shared by discovery,
 /// catalog validation, and generated SDK probing.
 enum NativeBridgeProfile {
+    static func authoritativeLifetimes(
+        _ callbacks: [Core.NativeImportCallback]
+    ) -> [Int: Core.NativeImportCallbackLifetime]? {
+        var result: [Int: Core.NativeImportCallbackLifetime] = [:]
+        result.reserveCapacity(callbacks.count)
+        for callback in callbacks {
+            guard result.updateValue(
+                callback.lifetime,
+                forKey: Int(callback.parameterIndex)
+            ) == nil else { return nil }
+        }
+        return result
+    }
+
+    /// A closure assigned through a setter is a stored value, not a
+    /// nonescaping call parameter. This remains true when the source-level
+    /// function type has no legal place to spell `@escaping`.
+    static func storedValueLifetimes(
+        parameterTypes: [Bytecode.ValueType]
+    ) -> [Int: Core.NativeImportCallbackLifetime] {
+        Dictionary(uniqueKeysWithValues: parameterTypes.indices.compactMap {
+            index in parameterTypes[index].directClosureShape == nil
+                ? nil : (index, .escaping)
+        })
+    }
+
     static func callbacks(
         parameterSpellings: [String],
         parameterTypes: [Bytecode.ValueType],
@@ -459,11 +485,18 @@ enum NativeBridgeProfile {
                       shape.signature.isNativeBridgeCallback,
                       let parameterIndex = UInt16(exactly: index)
                 else { return nil }
+                let lifetime = authoritativeLifetimes?[index]
+                    ?? boundary.lifetime
+                // Explicit `@escaping` and Optional closure syntax establish a
+                // minimum lifetime that an external contract cannot weaken.
+                // Only an unannotated direct function type is ambiguous: SIL
+                // or a storing setter may authoritatively promote it.
+                guard boundary.lifetime != .escaping || lifetime == .escaping
+                else { return nil }
                 callbacks.append(
                     .init(
                         parameterIndex: parameterIndex,
-                        lifetime: authoritativeLifetimes?[index]
-                            ?? boundary.lifetime
+                        lifetime: lifetime
                     )
                 )
             } else {

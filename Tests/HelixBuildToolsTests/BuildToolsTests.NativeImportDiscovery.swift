@@ -265,6 +265,29 @@ struct NativeImportDiscoveryTests {
         ) == [
             .init(parameterIndex: 0, lifetime: .escaping),
         ])
+        #expect(FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: [
+                "@escaping @Sendable (UIKit.UIView, [UIKit.UIView?]) -> Swift.Void",
+            ],
+            parameterTypes: [native],
+            authoritativeLifetimes: [:]
+        ) == nil)
+        #expect(FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: [
+                "@escaping @Sendable (UIKit.UIView, [UIKit.UIView?]) -> Swift.Void",
+            ],
+            parameterTypes: [native],
+            authoritativeLifetimes: [0: .nonescaping]
+        ) == nil)
+        #expect(FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: ["((Swift.Int, Swift.String?) -> ())?"],
+            parameterTypes: [optional],
+            authoritativeLifetimes: [0: .nonescaping]
+        ) == nil)
+        #expect(FrontendReceipt.NativeBridgeProfile.authoritativeLifetimes([
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ]) == nil)
 
         let erased = try #require(FrontendReceipt.ValueTypeParser.parse(
             "@escaping (Any, [Any]?, Swift.String, [Swift.Int]) -> Swift.Void",
@@ -308,6 +331,36 @@ struct NativeImportDiscoveryTests {
         #expect(!FrontendReceipt.NativeBridgeProfile.isResult(
             .optional(.error)
         ))
+    }
+
+    @Test("Closure values stored by setters always use escaping authority")
+    func derivesStoredClosurePropertyLifetime() throws {
+        let owner = Core.TypeID(rawValue: .sha256("CallbackStore"))
+        let operation = FrontendReceipt.Adapter.ImportedOperation(
+            silReferences: ["$s13CallbackStore7handleryycvs"],
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            importedModules: ["CallbackFramework"],
+            dispatch: .instanceSetter,
+            ownerType: "CallbackStore",
+            baseName: "handler",
+            argumentLabels: ["_"],
+            parameterSwiftTypes: ["(Swift.Int) -> ()", "CallbackStore"],
+            resultSwiftType: "()",
+            requiresMainActor: false
+        )
+
+        let declaration = try #require(
+            FrontendReceipt.Adapter().makeImportedOperationDeclarations(
+                [operation],
+                moduleName: "StoredCallbackFixture",
+                nativeTypes: ["CallbackStore": owner]
+            ).first
+        )
+
+        #expect(declaration.callbacks == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+        #expect(declaration.parameterTypes[0].directClosureShape != nil)
     }
 
     @Test("Managed SDK probing preserves NSError-backed Swift throws")
@@ -355,6 +408,46 @@ struct NativeImportDiscoveryTests {
         #expect(removals.first?.resultSwiftType == "()")
         #expect(removals.first?.mayThrow == true)
         #expect(removals.first?.parameterProjection == .identity(parameterCount: 2))
+    }
+
+    @Test("Managed SDK probing prefreezes native members used inside callbacks")
+    func discoversManagedSDKTimerInvalidation() throws {
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let expansion = try FrontendReceipt.ManagedDebugSurface.expand(
+            importedTypes: [
+                .init(
+                    canonicalName: "Timer",
+                    swiftType: "Timer",
+                    kind: .reference,
+                    aliases: ["NSTimer", "__C.NSTimer", "Foundation.Timer"],
+                    representation: .reference,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["Foundation"],
+                    requiresMainActor: false
+                ),
+            ],
+            minimumOS: .init(15),
+            frontend: frontend,
+            invocation: .init(
+                moduleName: "ManagedSDKTimerFixture",
+                targetTriple: "arm64-apple-ios15.0-simulator",
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: ["-parse-as-library"]
+            )
+        )
+
+        let invalidation = try #require(expansion.operations.first {
+            $0.ownerType == "Timer"
+                && $0.baseName == "invalidate"
+                && $0.dispatch == .instanceMethod
+        })
+        #expect(invalidation.parameterSwiftTypes == ["Timer"])
+        #expect(invalidation.resultSwiftType == "Swift.Void")
     }
 
     @Test("Imported calls retain NSError-backed Swift throwing ABI")
@@ -454,9 +547,12 @@ struct NativeImportDiscoveryTests {
         public final class CallbackOwner {
             public func invokeCallbacks(
                 _ view: UIView,
+                controller: UIViewController,
+                cell: UICollectionViewCell,
                 url: URL,
                 group: DispatchGroup,
-                operations: OperationQueue
+                operations: OperationQueue,
+                operation: Operation
             ) {
                 consumeNotification { notification in
                     _ = notification.name
@@ -506,6 +602,28 @@ struct NativeImportDiscoveryTests {
                 ) { view.alpha = 0.5 }
                 animator.addCompletion { position in
                     _ = position
+                }
+                cell.configurationUpdateHandler = { configuredCell, state in
+                    _ = configuredCell
+                    _ = state
+                }
+                operation.completionBlock = {
+                    _ = operation.isFinished
+                }
+                _ = UIAction { action in
+                    _ = action
+                }
+                _ = UIAlertAction(
+                    title: "Run",
+                    style: .default
+                ) { action in
+                    _ = action
+                }
+                controller.present(
+                    UIViewController(),
+                    animated: true
+                ) {
+                    view.setNeedsLayout()
                 }
                 _ = NotificationCenter.default.addObserver(
                     forName: nil,
@@ -664,6 +782,34 @@ struct NativeImportDiscoveryTests {
         ) == true)
         #expect(callbacksByName["addObserver"]?.parameterSwiftTypes.first
             == "NSNotification.Name?")
+        let configurationSetter = try #require(surface.operations.first {
+            $0.baseName == "configurationUpdateHandler"
+                && $0.dispatch == .instanceSetter
+        })
+        let operationCompletionSetter = try #require(surface.operations.first {
+            $0.baseName == "completionBlock"
+                && $0.dispatch == .instanceSetter
+        })
+        let presentation = try #require(surface.operations.first {
+            $0.baseName == "present"
+        })
+        let actionInitializer = try #require(surface.operations.first {
+            $0.baseName == "init"
+                && $0.ownerType == "UIAction"
+                && $0.parameterSwiftTypes.contains {
+                    $0.contains("UIAction") && $0.contains("->")
+                }
+        })
+        let alertInitializer = try #require(surface.operations.first {
+            $0.baseName == "init"
+                && $0.ownerType == "UIAlertAction"
+                && $0.parameterSwiftTypes.contains { $0.contains("->") }
+        })
+        #expect(surface.operations.contains {
+            $0.baseName == "default"
+                && $0.ownerType == "UIAlertAction.Style"
+                && $0.dispatch == .staticGetter
+        })
         #expect(surface.operations.contains {
             $0.baseName == "main" && $0.dispatch == .staticGetter
         })
@@ -780,7 +926,11 @@ struct NativeImportDiscoveryTests {
         })
         let resultOperations = try FrontendReceipt.Adapter()
             .makeImportedOperationDeclarations(
-                [predicateOperation, enumeratorOperation],
+                [
+                    predicateOperation, enumeratorOperation,
+                    configurationSetter, operationCompletionSetter,
+                    presentation, actionInitializer, alertInitializer,
+                ],
                 moduleName: invocation.moduleName,
                 nativeTypes: nativeTypes
             )
@@ -814,6 +964,36 @@ struct NativeImportDiscoveryTests {
         #expect(errorHandler.signature.parameters.last == .error)
         #expect(errorHandler.signature.result == .bool)
         #expect(errorHandler.signature.isNativeBridgeCallback)
+        let configurationDeclaration = try #require(resultOperations.first {
+            $0.baseName == "configurationUpdateHandler"
+        })
+        #expect(configurationDeclaration.callbacks == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+        #expect(configurationDeclaration.parameterSwiftTypes[0]
+            .contains("MainActor"))
+        let operationCompletionDeclaration = try #require(
+            resultOperations.first { $0.baseName == "completionBlock" }
+        )
+        #expect(operationCompletionDeclaration.callbacks == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+        #expect(operationCompletionDeclaration.parameterSwiftTypes[0]
+            .contains("@Sendable"))
+        let presentationDeclaration = try #require(resultOperations.first {
+            $0.baseName == "present"
+        })
+        #expect(presentationDeclaration.callbacks == [
+            .init(parameterIndex: 2, lifetime: .escaping),
+        ])
+        let initializerCallbacks = resultOperations.filter {
+            $0.baseName == "init" && !$0.callbacks.isEmpty
+        }
+        #expect(initializerCallbacks.count == 3)
+        #expect(initializerCallbacks.allSatisfy {
+            $0.callbacks.count == 1
+                && $0.callbacks[0].lifetime == .escaping
+        })
     }
 
     @Test("Physical SIL aliases collapse to one deterministic logical import")
@@ -1644,9 +1824,11 @@ struct NativeImportDiscoveryTests {
 
             public func runAnimations(
                 on view: UIView,
+                cell: UICollectionViewCell,
                 url: URL,
                 group: DispatchGroup,
-                operations: OperationQueue
+                operations: OperationQueue,
+                operation: Operation
             ) {
                 UIView.performWithoutAnimation {
                     view.alpha = 0.25
@@ -1702,6 +1884,25 @@ struct NativeImportDiscoveryTests {
                 ) { view.alpha = 0.5 }
                 animator.addCompletion { position in
                     _ = position
+                }
+                cell.configurationUpdateHandler = { configuredCell, state in
+                    _ = configuredCell
+                    _ = state
+                }
+                operation.completionBlock = {
+                    _ = operation.isFinished
+                }
+                _ = UIAction { action in
+                    _ = action
+                }
+                _ = UIAlertAction(
+                    title: "Run",
+                    style: .default
+                ) { action in
+                    _ = action
+                }
+                present(UIViewController(), animated: true) {
+                    view.setNeedsLayout()
                 }
                 _ = NotificationCenter.default.addObserver(
                     forName: nil,
@@ -1923,6 +2124,11 @@ struct NativeImportDiscoveryTests {
         #expect(generatedBridge.contains("addOperation"))
         #expect(generatedBridge.contains("addCompletion"))
         #expect(generatedBridge.contains("animateKeyframes"))
+        #expect(generatedBridge.contains(".configurationUpdateHandler ="))
+        #expect(generatedBridge.contains(".completionBlock ="))
+        #expect(generatedBridge.contains("UIAction("))
+        #expect(generatedBridge.contains("UIAlertAction("))
+        #expect(generatedBridge.contains(".present("))
         #expect(generatedBridge.contains("callbackEncoder.encodeError("))
         #expect(generatedBridge.contains("NSPredicate"))
         #expect(generatedBridge.contains("enumerator"))

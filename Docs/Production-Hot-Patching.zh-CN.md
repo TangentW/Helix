@@ -139,6 +139,8 @@ NativeImport 还可通过同一套生成式 adapter 接受精确的直接或 Opt
 
 HLBC 会携带经过 Verifier 检查的 function/block/instruction → 逻辑 Swift 位置映射；生产打包会移除构建机绝对路径。执行发生 trap 时，HLVM 会给出精确 program counter，Runtime 再补充固定的 generation、Shell entry、函数和逻辑文件/行/列。这是诊断映射，不是支持 breakpoint、单步或表达式求值的交互式调试器。
 
+同一套 NativeImport callback 发现与生成机制也覆盖原生 method、initializer、completion 参数及 callback 属性 setter，包括 `UIAction`/`UIAlertAction`、`UIViewController.present`、cell configuration handler 与 `Operation.completionBlock`。属性赋入 closure 属于存储，因此即使属性函数类型不能书写 `@escaping`，合同也会将其生命周期固定为 escaping，并保留表达式的 actor isolation；这里没有 framework/API 特例，也没有版本分叉。
+
 ## 构建补丁包
 
 精确输入取决于生成的 Release 集成，但核心命令面如下：

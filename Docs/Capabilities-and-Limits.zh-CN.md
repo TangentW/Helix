@@ -58,6 +58,8 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - 精确原生操作已冻结时的 Objective-C superclass dispatch 与 address-form Optional 控制流。同类型 receiver cast 只有在两端是同一 reference `TypeID` 时才作为 alias；Optional payload take 即使经过精确地址复制，也必须受 `.some` edge 支配。
 - 调用同 image helper、eligible Shell entry 与目标 Shell 已经生成的精确 allowlisted NativeImport。发布基线已经使用、且 Typed AST 语义与 canonical SIL 物理 ABI 能够对齐的外部 API 可以自动冻结；当前覆盖 reference、raw enum、OptionSet、opaque copyable value、accessor、method、全局值/函数与 operator、简单 imported C value、Selector、upcast、Foundation value-overlay bridge、Objective-C protocol 擦除、Swift `Any -> AnyObject` boxing，以及已验证的 String/Array Objective-C bridge。
 
+- NativeImport callback 的通用发现与生成路径还覆盖带 closure 的原生 initializer、completion 参数和 callback 属性 setter，例如 `UIAction`/`UIAlertAction`、`UIViewController.present`、cell configuration handler 与 `Operation.completionBlock`。属性赋值是存储行为，因此合同会将其 closure 生命周期固定为 escaping，并保留表达式上的 actor isolation；这不是 UIKit 或 Foundation 的逐 API 特例。
+
 ### 拒绝或有意未完成
 
 - generic root，以及仍需要运行时 generic metadata、witness table、未解析/泛型 reabstraction 或动态 specialization 的执行。这也包括尚未归一为可表示 managed Collection、迭代语义不透明的自定义 `Sequence`；Helix 不会把它们经 NativeImport 转交给 Swift 标准库执行。

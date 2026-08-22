@@ -485,18 +485,22 @@ does not by itself certify a physical device or distribution channel.
   Only a bounded textual dynamic-type name crosses; native payload, metadata,
   and semantic error identity do not. `Error` is rejected in Shell entries and
   ordinary NativeImport parameters/results, and as a callback result.
-  Nonescaping callbacks are valid only during the importing call. Escaping
-  callbacks may be retained by that exact native parameter, outlive the
-  originating VM invocation, and later re-enter the immutable image while
+  Nonescaping callbacks are valid only during the importing call. A callback
+  assigned through a native property setter is always treated as stored and
+  therefore escaping, even though `@escaping` is not legal in a property type;
+  actor isolation from the assigned expression remains part of the boundary.
+  Escaping callbacks may be retained by that exact native parameter, outlive
+  the originating VM invocation, and later re-enter the immutable image while
   retaining its generation lease. Callback execution is serialized across one
   Runtime Engine until general `Sendable` semantics exist: same-thread recursion
   is allowed, an active import cannot hop callback execution to another thread,
-  and overlapping cross-thread callbacks fail closed. This common path covers,
-  for example, UIKit animation/transition/property-animator callbacks,
-  `DispatchQueue.async`/`asyncAfter`, `DispatchGroup.notify`,
-  `OperationQueue.addOperation`, `Timer.scheduledTimer`,
-  `URLSession.dataTask`, `NotificationCenter.addObserver`, `NSPredicate`, and
-  `FileManager` enumeration; it is not a framework-specific list. If callback
+  and overlapping cross-thread callbacks fail closed. This common path covers
+  native methods, initializers, completion arguments, and callback-property
+  setters—for example UIKit animation/transition, `UIAction`/`UIAlertAction`,
+  `UIViewController.present`, cell configuration,
+  `DispatchQueue.async`/`asyncAfter`, `Operation`/`OperationQueue`, Timer,
+  URLSession, NotificationCenter, `NSPredicate`, and `FileManager`
+  enumeration. It is not a framework-specific list. If callback
   execution or result decoding fails, the wrapper returns its deterministic
   ABI value. An active importer retains the error and traps after the native
   frame returns; a detached escaping invocation reports Runtime telemetry.

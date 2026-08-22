@@ -4,7 +4,7 @@
 
 Helix 的核心思路只有一套：工程师修改普通 Swift 源码；但生产热补丁与开发期热重载必须使用不同的产物、信任边界和生命周期。它们共享编译器事实与身份合同，不共享下发通道。
 
-本文描述截至 2026 年 8 月 22 日仓库中已经存在的实现，不把尚未完成的资格验证写成产品承诺。
+本文描述截至 2026 年 8 月 23 日仓库中已经存在的实现，不把尚未完成的资格验证写成产品承诺。
 
 ## 两条工作流
 
@@ -36,6 +36,8 @@ flowchart TB
 
 两条路径都依赖稳定且绑定具体构建的身份：
 
+- NativeImport callback 的 method/initializer 生命周期以 canonical SIL 为权威；属性 setter 则属于存储语义，即使属性函数类型不能书写 `@escaping`，赋入的 closure 也始终冻结为 escaping，并保留赋值表达式的 actor isolation。method、initializer、completion 参数与 callback 属性 setter 共用同一生成式 adapter，不按 framework 分叉。
+- Objective-C overlay alias 只在 mangled type 本身就是精确的顶层 Objective-C nominal 时成立；`Timer.TimerPublisher` 这类嵌套 Swift 类型不会被错误折叠成外层 Objective-C class identity。
 - `FunctionKey` 标识 Swift callable，并纳入 Helix 关心的 ABI 与 effect 信息。
 - `EntryIndex` 是生产 Bridge 使用的紧凑 Shell 路由。
 - `TypeID` 与 `NativeImportID` 标识预先声明的类型操作和原生调用能力，补丁中不保存进程地址。

@@ -9,7 +9,7 @@ share compiler facts and identity contracts; they do not share a delivery
 channel.
 
 This document describes the implementation available in the repository as of
-August 22, 2026. It does not turn unfinished qualification work into a product
+August 23, 2026. It does not turn unfinished qualification work into a product
 claim.
 
 ## The two workflows
@@ -118,9 +118,13 @@ Both workflows depend on stable, build-specific identities:
   Discovery derives the callback's source spelling from typed AST, its
   `@noescape`/escaping authority from canonical SIL, and its global-actor
   requirement from both the applied expression and the closure body's SIL
-  isolation metadata. Generated adapters therefore cover Swift closure and
-  Objective-C block parameters without framework-specific callback code; the
-  block-storage, copy, and noescape reabstraction thunks remain compiler-only
+  isolation metadata. A property setter is the lifetime-specific form:
+  assigning a closure stores it and is therefore always `escaping`, even
+  though Swift cannot spell `@escaping` in the property's function type. The
+  assigned expression still supplies actor isolation. Generated adapters
+  therefore cover methods, initializers, callback-property setters, Swift
+  closures, and Objective-C blocks without framework-specific callback code;
+  block storage, copy, and noescape reabstraction thunks remain compiler-only
   ownership plumbing, while the original logical VM closure type is preserved.
   Native calls across UIKit, Dispatch, Foundation, and OperationQueue—including
   result-producing `NSPredicate` and `FileManager` enumeration callbacks—use
@@ -146,7 +150,10 @@ Both workflows depend on stable, build-specific identities:
   use their Objective-C bridge classes inside block thunks, Objective-C
   protocol existentials erase to the existing `AnyObject` identity only at a
   foreign boundary, and Swift `Any` boxing uses one exact generated
-  `Any -> AnyObject` NativeImport. Imported trivial values remain borrowed in
+  `Any -> AnyObject` NativeImport. An Objective-C overlay alias is admitted
+  only when the mangled type is that exact top-level nominal; a nested Swift
+  type such as `Timer.TimerPublisher` cannot collapse into its enclosing
+  Objective-C class identity. Imported trivial values remain borrowed in
   physical SIL even though their HLBC native handles are managed owners; the
   compiler materializes and retires those owners at generic value/address
   lifetime edges rather than by SDK-type special cases.

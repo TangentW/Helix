@@ -252,9 +252,18 @@ extension NativeImportDiscovery {
             let explicitParameterTypes = isInstanceDispatch(declaration.dispatch)
                 ? Array(declaration.parameterTypes.dropLast())
                 : declaration.parameterTypes
+            guard let callbackLifetimes = FrontendReceipt.NativeBridgeProfile
+                .authoritativeLifetimes(declaration.callbacks)
+            else {
+                return (
+                    "HLXNID005",
+                    "callback parameters are duplicated or invalid"
+                )
+            }
             let inferredCallbacks = FrontendReceipt.NativeBridgeProfile.callbacks(
                 parameterSpellings: declaration.signature.parameters,
-                parameterTypes: declaration.parameterTypes
+                parameterTypes: declaration.parameterTypes,
+                authoritativeLifetimes: callbackLifetimes
             )
             guard declaration.argumentLabels.count == explicitParameterTypes.count,
                   declaration.parameterSwiftTypes.count == declaration.parameterTypes.count,

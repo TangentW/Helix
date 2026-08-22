@@ -265,10 +265,23 @@ extension FrontendReceipt.Adapter {
                 isThrowing: operation.mayThrow,
                 isolation: isolation
             )
+            let storedValueLifetimes: [
+                Int: Core.NativeImportCallbackLifetime
+            ]? = switch operation.dispatch {
+            case .instanceSetter, .instanceValueSetter, .staticSetter:
+                FrontendReceipt.NativeBridgeProfile.storedValueLifetimes(
+                    parameterTypes: parameterTypes
+                )
+            case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+                 .anyObjectBridge, .instanceMethod, .staticGetter,
+                 .instanceGetter:
+                nil
+            }
             guard FrontendReceipt.NativeBridgeProfile.isResult(resultType),
                   let callbacks = FrontendReceipt.NativeBridgeProfile.callbacks(
                       parameterSpellings: operation.parameterSwiftTypes,
-                      parameterTypes: parameterTypes
+                      parameterTypes: parameterTypes,
+                      authoritativeLifetimes: storedValueLifetimes
                   ),
                   let bridgeParameterTypes = FrontendReceipt.NativeBridgeProfile
                     .generatedParameterSpellings(
@@ -717,6 +730,7 @@ extension FrontendReceipt.Adapter {
             try recordImportedProperty(
                 destination,
                 accessor: .instanceSetter,
+                assignedValue: item["src"] as? [String: Any],
                 function: function,
                 requiresMainActor: requiresMainActor,
                 source: source,
@@ -760,6 +774,7 @@ extension FrontendReceipt.Adapter {
             try recordImportedProperty(
                 item,
                 accessor: .instanceGetter,
+                assignedValue: nil,
                 function: function,
                 requiresMainActor: requiresMainActor,
                 source: source,
@@ -860,6 +875,7 @@ extension FrontendReceipt.Adapter {
     private func recordImportedProperty(
         _ expression: [String: Any],
         accessor: NativeImportDiscovery.Dispatch,
+        assignedValue: [String: Any]?,
         function: CanonicalSIL.Function,
         requiresMainActor: Bool,
         source: SourceState,
@@ -874,12 +890,22 @@ extension FrontendReceipt.Adapter {
               let usr = declaration["decl_usr"] as? String,
               let rawBaseName = declaration["base_name"] as? String,
               let baseName = Core.SwiftName.normalizedIdentifier(rawBaseName),
-              let propertyType = importedSwiftType(
+              var propertyType = importedSwiftType(
                   expression["type"],
                   demangled: demangled
               ),
               let base = expression["base"] as? [String: Any]
         else { return }
+
+        if accessor == .instanceSetter,
+           let assignedValue,
+           let actor = callbackGlobalActor(
+               in: assignedValue,
+               demangled: demangled
+           ), let isolated = FrontendReceipt.FunctionTypeSpelling
+               .applyingGlobalActor(actor, to: propertyType) {
+            propertyType = isolated
+        }
 
         let staticOwner = importedMetatypeInstanceType(
             base["type"],
@@ -2581,10 +2607,12 @@ extension FrontendReceipt.Adapter {
         let objectiveCClasses = Self.objectiveCClassNames(
             inMangledType: mangled
         )
+        let exactObjectiveCIdentity = Self.objectiveCNominalIdentity(
+            inMangledType: mangled
+        )
         let logicalNominal = importedNativeNominal(in: spelling)
         let exactObjectiveCReference: ImportedNativeType? = {
-            guard objectiveCClasses.count == 1,
-                  let runtimeName = objectiveCClasses.first,
+            guard let runtimeName = exactObjectiveCIdentity,
                   let logicalNominal,
                   !logicalNominal.contains("<"),
                   importedNominalRepresentation(
@@ -2815,7 +2843,7 @@ extension FrontendReceipt.Adapter {
                   let suffix = line[hash...].range(of: "!enumelt")
             else { return nil }
             let reference = String(line[hash..<suffix.upperBound])
-            guard reference.hasSuffix(".\(caseName)!enumelt") else { return nil }
+            guard enumCaseName(in: reference) == caseName else { return nil }
             return Candidate(
                 reference: reference,
                 location: function.sourceLocation(atBodyLine: offset + 1)
@@ -2874,6 +2902,17 @@ extension FrontendReceipt.Adapter {
         guard let separator = body.lastIndex(of: ".") else { return nil }
         let owner = String(body[..<separator])
         return owner.isEmpty ? nil : owner
+    }
+
+    private func enumCaseName(in reference: String) -> String? {
+        guard reference.hasPrefix("#"),
+              reference.hasSuffix("!enumelt")
+        else { return nil }
+        let body = reference.dropFirst().dropLast("!enumelt".count)
+        guard let separator = body.lastIndex(of: ".") else { return nil }
+        return Core.SwiftName.normalizedIdentifier(
+            String(body[body.index(after: separator)...])
+        )
     }
 
     static func foreignMemberReferences(

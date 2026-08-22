@@ -81,6 +81,55 @@ struct NativeImportCatalogPipeline {
         )
     }
 
+    @Test("Catalog validates authoritative native callback lifetimes")
+    func validatesCallbackLifetimeAuthority() throws {
+        var candidate = makeCandidate(
+            canonicalCallee: "Fixture.storeCallback(_:)",
+            symbol: "$s7Fixture13storeCallbackyyyycF",
+            factoryType: "FixtureSupport.CallbackFactory",
+            module: "FixtureSupport"
+        )
+        candidate.signature = .init(
+            parameters: ["(Swift.Int) -> Swift.Void"],
+            result: "Swift.Void"
+        )
+        candidate.effects.hasExternalSideEffects = true
+        candidate.contract = .bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .write,
+            maximumDurationMicroseconds: 1_000,
+            allowsMainThread: true,
+            callbacks: [
+                .init(parameterIndex: 0, lifetime: .escaping),
+            ]
+        )
+        try NativeImportCatalog.Document(candidates: [candidate]).validate()
+
+        var weakened = candidate
+        weakened.signature.parameters = [
+            "@escaping (Swift.Int) -> Swift.Void",
+        ]
+        weakened.contract.callbacks = [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+        ]
+        #expect(throws: NativeImportCatalog.Error.invalid(
+            "candidate Fixture.storeCallback(_:) has an invalid symbol, signature, factory, or type"
+        )) {
+            try NativeImportCatalog.Document(candidates: [weakened]).validate()
+        }
+
+        var duplicated = candidate
+        duplicated.contract.callbacks.append(
+            .init(parameterIndex: 0, lifetime: .nonescaping)
+        )
+        #expect(throws: NativeImportCatalog.Error.invalid(
+            "candidate Fixture.storeCallback(_:) has duplicate callback parameters"
+        )) {
+            try NativeImportCatalog.Document(candidates: [duplicated]).validate()
+        }
+    }
+
     @Test("Catalog models UIKit types, getters, setters, and execution effects explicitly")
     func validatesFrameworkContractsAndNativeTypes() throws {
         let viewType = NativeImportCatalog.NativeType(

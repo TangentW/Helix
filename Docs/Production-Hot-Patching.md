@@ -353,10 +353,14 @@ active importer retains the failure and traps after the native frame returns,
 whereas a detached escaping callback reports it through Runtime telemetry.
 Escaping handles retain their image and generation lease; callback execution is
 serialized until general Swift `Sendable` semantics exist. Checked
-source-default projection lets UIKit animation/transition/property-animator,
-Dispatch queue/group, OperationQueue, Timer, URLSession, NotificationCenter,
-`NSPredicate`, and `FileManager` enumeration callbacks share this path without
-per-API VM implementations. Swift `Any` boxing, Objective-C protocol erasure,
+source-default projection lets native methods, initializers, completion
+arguments, and callback-property setters across UIKit, Dispatch, Foundation,
+and OperationQueue share this path without per-API VM implementations. A
+closure property assignment is authoritatively escaping despite the absence
+of legal `@escaping` property syntax, and retains expression actor isolation.
+This includes `UIAction`/`UIAlertAction`, `UIViewController.present`, cell and
+operation completion handlers, `NSPredicate`, and `FileManager` enumeration.
+Swift `Any` boxing, Objective-C protocol erasure,
 and Foundation value-overlay bridges are likewise frozen as exact generic
 NativeImport adapters rather than API-specific runtime behavior. All ABI,
 schema, capability, and product versions remain 1/1.0.

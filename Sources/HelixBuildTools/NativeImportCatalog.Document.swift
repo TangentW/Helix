@@ -149,6 +149,13 @@ public struct Document: Codable, Hashable, Sendable {
             nativeTypeIDs[$0.canonicalName]!
         })
         for candidate in candidates {
+            guard let callbackLifetimes = FrontendReceipt.NativeBridgeProfile
+                .authoritativeLifetimes(candidate.contract.callbacks)
+            else {
+                throw NativeImportCatalog.Error.invalid(
+                    "candidate \(candidate.canonicalCallee) has duplicate callback parameters"
+                )
+            }
             let signatureParameters = candidate.signature.parameters.map {
                 FrontendReceipt.ValueTypeParser.parse(
                     $0,
@@ -188,7 +195,8 @@ public struct Document: Codable, Hashable, Sendable {
                   ),
                   FrontendReceipt.NativeBridgeProfile.callbacks(
                       parameterSpellings: candidate.signature.parameters,
-                      parameterTypes: signatureParameters.compactMap { $0 }
+                      parameterTypes: signatureParameters.compactMap { $0 },
+                      authoritativeLifetimes: callbackLifetimes
                   ) == candidate.contract.callbacks
             else {
                 throw NativeImportCatalog.Error.invalid(
