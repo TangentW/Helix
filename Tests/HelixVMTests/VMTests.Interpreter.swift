@@ -3400,6 +3400,249 @@ struct Interpreter {
         )
     }
 
+    @Test("Internal higher-order calls preserve target authority as a capability")
+    func executesClosureTargetAuthority() throws {
+        let formal = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .int64
+        )
+        let authority = Core.Effects(
+            mayAllocate: true,
+            hasExternalSideEffects: true
+        )
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "closureAuthorityRoot",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64, .closure(formal), .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeClosure(
+                            result: .init(rawValue: 1),
+                            function: .init(rawValue: 1),
+                            captures: [.init(rawValue: 0)]
+                        ),
+                        .apply(
+                            result: .init(rawValue: 2),
+                            function: .init(rawValue: 2),
+                            arguments: [.init(rawValue: 1)]
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ],
+            effects: authority
+        )
+        let body = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "authorizedClosureBody",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ],
+            effects: authority
+        )
+        let invoke = Bytecode.Function(
+            id: .init(rawValue: 2),
+            name: "invoke",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.closure(formal), .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .closureApply(
+                            result: .init(rawValue: 1),
+                            closure: .init(rawValue: 0),
+                            arguments: []
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [.baselineV1, .closureValuesV1],
+            additionalFunctions: [body, invoke]
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    .integer(try .init(signed: 7, bitWidth: 64, isSigned: true)),
+                ]
+            ) == .returned(
+                .integer(try .init(signed: 7, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
+    @Test("Canonical closures compose in aggregates and remain excluded from entries")
+    func validatesNestedClosureStorageAndEntryBoundary() throws {
+        let formal = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .int64
+        )
+        let authority = Core.Effects(mayAllocate: true)
+        let body = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "nestedClosureBody",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ],
+            effects: authority
+        )
+        let acceptOptional = Bytecode.Function(
+            id: .init(rawValue: 2),
+            name: "acceptOptional",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .optional(.closure(formal)), .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            bitPattern: 9
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "nestedClosureAuthorityRoot",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64,
+                .closure(formal),
+                .optional(.closure(formal)),
+                .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeClosure(
+                            result: .init(rawValue: 1),
+                            function: .init(rawValue: 1),
+                            captures: [.init(rawValue: 0)]
+                        ),
+                        .makeOptionalSome(
+                            result: .init(rawValue: 2),
+                            value: .init(rawValue: 1)
+                        ),
+                        .apply(
+                            result: .init(rawValue: 3),
+                            function: .init(rawValue: 2),
+                            arguments: [.init(rawValue: 2)]
+                        ),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ],
+            effects: authority
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .closureValuesV1, .escapingClosureValuesV1,
+        ]
+        let nestedImage = try makeVerified(
+            function: root,
+            capabilities: capabilities,
+            additionalFunctions: [body, acceptOptional]
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: nestedImage,
+                arguments: [
+                    .integer(try .init(signed: 1, bitWidth: 64, isSigned: true)),
+                ]
+            ) == .returned(
+                .integer(try .init(signed: 9, bitWidth: 64, isSigned: true))
+            )
+        )
+
+        let strictRoot = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "strictClosureEntry",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.closure(formal), .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            bitPattern: 1
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        #expect(
+            throws: Verification.Error.invalidShellInterface(
+                "patch-local nominal, Error, internal storage, and closure values "
+                    + "cannot appear in entry 0 signature"
+            )
+        ) {
+            try makeVerified(
+                function: strictRoot,
+                capabilities: [.baselineV1, .closureValuesV1],
+                signature: .init(
+                    parameters: ["() -> Swift.Int"],
+                    result: "Swift.Int"
+                ),
+                parameterTypes: [.closure(formal)]
+            )
+        }
+    }
+
     @Test("Mutable capture cells share updates across closure invocations")
     func executesMutableClosureCaptures() throws {
         let cellType = Bytecode.ValueType.mutableCell(.int64)

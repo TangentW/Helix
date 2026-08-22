@@ -93,6 +93,7 @@ public struct Driver: Sendable {
             rootID: request.functionID,
             typeEnvironment: typeEnvironment,
             directCalls: request.directCalls,
+            executionEffectEnvelope: request.effects ?? .init(),
             shellDeclarationSymbols: request.shellDeclarationSymbols
         )
         var root = try CanonicalSIL.Lowerer(

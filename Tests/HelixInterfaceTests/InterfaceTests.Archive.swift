@@ -173,6 +173,17 @@ struct Archive {
         archive.capabilities += [
             .nativeImportsV1, .closureValuesV1, .escapingClosureValuesV1,
         ]
+        let projection = InterfaceArchive.NativeImportParameterProjection(
+            physicalParameterCount: 3,
+            logicalParameterIndices: [2],
+            defaultArguments: [
+                .externalGenerator(
+                    physicalParameterIndex: 0,
+                    symbol: "$s7Fixture7installFfA_"
+                ),
+                .optionalNone(physicalParameterIndex: 1),
+            ]
+        )
         archive.nativeImports = [
             .init(
                 id: .init(rawValue: 0),
@@ -180,6 +191,7 @@ struct Archive {
                 canonicalCallee: "Fixture.install(_:)",
                 silMangledNames: ["$s7Fixture7installyyySbccF"],
                 parameterTypes: [.closure(callback)],
+                parameterProjection: projection,
                 resultType: .void,
                 signature: signature,
                 effects: .init(),
@@ -194,8 +206,163 @@ struct Archive {
             InterfaceArchive.Codec.encode(archive)
         ).archive
         #expect(decoded.nativeImports[0].contract.callbacks == contract.callbacks)
+        #expect(decoded.nativeImports[0].parameterProjection == projection)
         #expect(decoded.schemaVersion == 1)
         #expect(decoded.compatibility.interfaceArchive == .init(1, 0, 0))
+
+        for invalid in [
+            InterfaceArchive.NativeImportParameterProjection(
+                physicalParameterCount: 3,
+                logicalParameterIndices: [3]
+            ),
+            .init(
+                physicalParameterCount: 3,
+                logicalParameterIndices: [2, 2]
+            ),
+            .init(
+                physicalParameterCount: 3,
+                logicalParameterIndices: [2, 1]
+            ),
+        ] {
+            var malformed = decoded
+            malformed.nativeImports[0].parameterProjection = invalid
+            malformed.shellInterfaceHash = try malformed
+                .computeShellInterfaceHash()
+            #expect(throws: InterfaceArchive.Error.self) {
+                try malformed.validate()
+            }
+        }
+
+        var signatureCountMismatch = decoded
+        signatureCountMismatch.nativeImports[0].signature.parameters = []
+        signatureCountMismatch.shellInterfaceHash = try signatureCountMismatch
+            .computeShellInterfaceHash()
+        #expect(throws: InterfaceArchive.Error.self) {
+            try signatureCountMismatch.validate()
+        }
+
+        var isolationMismatch = decoded
+        isolationMismatch.nativeImports[0].signature.isolation = "Swift.MainActor"
+        isolationMismatch.shellInterfaceHash = try isolationMismatch
+            .computeShellInterfaceHash()
+        #expect(throws: InterfaceArchive.Error.self) {
+            try isolationMismatch.validate()
+        }
+
+        var borrowedCallback = decoded
+        borrowedCallback.nativeImports[0].parameterTypes = [
+            .closure(.init(
+                parameters: [.bool],
+                parameterConventions: [.borrowed],
+                result: .void
+            )),
+        ]
+        borrowedCallback.shellInterfaceHash = try borrowedCallback
+            .computeShellInterfaceHash()
+        #expect(throws: InterfaceArchive.Error.self) {
+            try borrowedCallback.validate()
+        }
+
+        var unbridgeableCallback = decoded
+        unbridgeableCallback.nativeImports[0].parameterTypes = [
+            .closure(.init(
+                parameters: [.address(.bool)],
+                parameterConventions: [.owned],
+                result: .void
+            )),
+        ]
+        unbridgeableCallback.shellInterfaceHash = try unbridgeableCallback
+            .computeShellInterfaceHash()
+        #expect(throws: InterfaceArchive.Error.self) {
+            try unbridgeableCallback.validate()
+        }
+    }
+
+    @Test("Physical variants may omit an optional callback default")
+    func optionalCallbackDefaultVariants() throws {
+        var archive = try fixture()
+        archive.capabilities += [
+            .nativeImportsV1, .closureValuesV1, .escapingClosureValuesV1,
+        ]
+        let symbol = "$s7Fixture8scheduleyyyyccSgF"
+        let callback = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .void
+        )
+        let omittedSignature = Core.LoweredSignature(
+            parameters: [],
+            result: "Swift.Void"
+        )
+        let explicitSignature = Core.LoweredSignature(
+            parameters: ["Swift.Optional<@escaping () -> Swift.Void>"],
+            result: "Swift.Void"
+        )
+        let omittedContract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let explicitContract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true,
+            callbacks: [.init(parameterIndex: 0, lifetime: .escaping)]
+        )
+        let omittedKey = try Core.NativeImportKey.derive(
+            namespace: archive.metadata.shellNamespaceID,
+            canonicalCallee: "Fixture.schedule()",
+            signature: omittedSignature,
+            effects: .init(),
+            contract: omittedContract
+        )
+        let explicitKey = try Core.NativeImportKey.derive(
+            namespace: archive.metadata.shellNamespaceID,
+            canonicalCallee: "Fixture.schedule(completion:)",
+            signature: explicitSignature,
+            effects: .init(),
+            contract: explicitContract
+        )
+        archive.nativeImports = [
+            .init(
+                id: .init(rawValue: 0),
+                key: omittedKey,
+                canonicalCallee: "Fixture.schedule()",
+                silMangledNames: [symbol],
+                parameterTypes: [],
+                parameterProjection: .init(
+                    physicalParameterCount: 1,
+                    logicalParameterIndices: [],
+                    defaultArguments: [
+                        .optionalNone(physicalParameterIndex: 0),
+                    ]
+                ),
+                resultType: .void,
+                signature: omittedSignature,
+                effects: .init(),
+                contract: omittedContract,
+                isEmittedToDevice: true
+            ),
+            .init(
+                id: .init(rawValue: 1),
+                key: explicitKey,
+                canonicalCallee: "Fixture.schedule(completion:)",
+                silMangledNames: [symbol],
+                parameterTypes: [.optional(.closure(callback))],
+                resultType: .void,
+                signature: explicitSignature,
+                effects: .init(),
+                contract: explicitContract,
+                isEmittedToDevice: true
+            ),
+        ]
+        archive.shellInterfaceHash = try archive.computeShellInterfaceHash()
+
+        try archive.validate()
     }
 
     private func fixture() throws -> InterfaceArchive.Archive {

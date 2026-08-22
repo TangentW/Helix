@@ -22,7 +22,7 @@ extension FrontendReceipt.Adapter {
             /// The declaration was unavailable, so isolation is conservatively
             /// inherited from the source context that performed the call.
             case enclosingContext
-            /// The captured SDK declaration supplied the isolation contract.
+            /// A generated SDK probe captured the imported declaration itself.
             case importedDeclaration
         }
 
@@ -34,6 +34,7 @@ extension FrontendReceipt.Adapter {
         var baseName: String
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
+        var parameterProjection: InterfaceArchive.NativeImportParameterProjection? = nil
         var resultSwiftType: String
         var requiresMainActor: Bool
         var mayThrow: Bool = false
@@ -48,6 +49,7 @@ extension FrontendReceipt.Adapter {
         var baseName: String
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
+        var parameterProjection: InterfaceArchive.NativeImportParameterProjection
         var resultSwiftType: String
 
         init(_ operation: ImportedOperation) {
@@ -56,13 +58,15 @@ extension FrontendReceipt.Adapter {
             baseName = operation.baseName
             argumentLabels = operation.argumentLabels
             parameterSwiftTypes = operation.parameterSwiftTypes
+            parameterProjection = operation.parameterProjection
+                ?? .identity(parameterCount: operation.parameterSwiftTypes.count)
             resultSwiftType = operation.resultSwiftType
         }
     }
 
     private struct ImportedOperationPhysicalABI: Hashable {
         var dispatch: NativeImportDiscovery.Dispatch
-        var parameterSwiftTypes: [String]
+        var physicalParameterCount: UInt16
         var resultSwiftType: String
         var requiresMainActor: Bool
         var mayThrow: Bool
@@ -70,11 +74,26 @@ extension FrontendReceipt.Adapter {
 
         init(_ operation: ImportedOperation) {
             dispatch = operation.dispatch
-            parameterSwiftTypes = operation.parameterSwiftTypes
+            physicalParameterCount = (operation.parameterProjection
+                ?? .identity(parameterCount: operation.parameterSwiftTypes.count))
+                .physicalParameterCount
             resultSwiftType = operation.resultSwiftType
             requiresMainActor = operation.requiresMainActor
             mayThrow = operation.mayThrow
             compilerOperation = operation.compilerOperation
+        }
+    }
+
+    private struct ImportedOperationLogicalABI: Hashable {
+        var physical: ImportedOperationPhysicalABI
+        var parameterSwiftTypes: [String]
+        var parameterProjection: InterfaceArchive.NativeImportParameterProjection
+
+        init(_ operation: ImportedOperation) {
+            physical = .init(operation)
+            parameterSwiftTypes = operation.parameterSwiftTypes
+            parameterProjection = operation.parameterProjection
+                ?? .identity(parameterCount: operation.parameterSwiftTypes.count)
         }
     }
 
@@ -220,6 +239,22 @@ extension FrontendReceipt.Adapter {
                 isThrowing: operation.mayThrow,
                 isolation: isolation
             )
+            guard FrontendReceipt.NativeBridgeProfile.isResult(resultType),
+                  let callbacks = FrontendReceipt.NativeBridgeProfile.callbacks(
+                      parameterSpellings: operation.parameterSwiftTypes,
+                      parameterTypes: parameterTypes
+                  ),
+                  let bridgeParameterTypes = FrontendReceipt.NativeBridgeProfile
+                    .generatedParameterSpellings(
+                        operation.parameterSwiftTypes,
+                        parameterTypes: parameterTypes
+                    )
+            else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "imported operation \(operation.ownerType).\(operation.baseName) "
+                        + "cannot use the generated NativeImport bridge profile"
+                )
+            }
             let modulePrefix = moduleName + "."
             func generatedSpelling(_ canonical: String) -> String {
                 canonical.hasPrefix(modulePrefix)
@@ -227,7 +262,7 @@ extension FrontendReceipt.Adapter {
                     : canonical
             }
             let generatedOwnerType = generatedSpelling(operation.ownerType)
-            let generatedParameterTypes = operation.parameterSwiftTypes.map(generatedSpelling)
+            let generatedParameterTypes = bridgeParameterTypes.map(generatedSpelling)
             let generatedResultType = generatedSpelling(operation.resultSwiftType)
             let prefix = [moduleName, "HelixExternal", operation.ownerType]
             let callableReference = operation.baseName + "("
@@ -262,11 +297,14 @@ extension FrontendReceipt.Adapter {
                 baseName: operation.baseName,
                 argumentLabels: operation.argumentLabels,
                 parameterSwiftTypes: generatedParameterTypes,
+                parameterProjection: operation.parameterProjection
+                    ?? .identity(parameterCount: parameterTypes.count),
                 resultSwiftType: generatedResultType,
                 importedModules: operation.importedModules,
                 parameterTypes: parameterTypes,
                 resultType: resultType,
                 signature: signature,
+                callbacks: callbacks,
                 inferredEffects: .init(
                     mayThrow: operation.mayThrow,
                     requiresMainActor: operation.requiresMainActor
@@ -284,6 +322,40 @@ extension FrontendReceipt.Adapter {
     private func canonicalizePhysicalOperations(
         _ operations: [ImportedOperation]
     ) throws -> [ImportedOperation] {
+        var bySymbol: [String: [ImportedOperation]] = [:]
+        for operation in operations {
+            for symbol in operation.silReferences {
+                bySymbol[symbol, default: []].append(operation)
+            }
+        }
+        for (symbol, values) in bySymbol where values.count > 1 {
+            let physicalSignatures = Set(values.map(ImportedOperationPhysicalABI.init))
+            guard physicalSignatures.count == 1 else {
+                let logicalShapes = values.map {
+                    "\($0.ownerType).\($0.baseName)("
+                        + $0.parameterSwiftTypes.joined(separator: ", ")
+                        + ") -> \($0.resultSwiftType)"
+                }.sorted().joined(separator: " versus ")
+                throw FrontendReceipt.Error.invalidRequest(
+                    "imported SIL operation \(symbol) has conflicting logical ABIs: "
+                        + logicalShapes
+                )
+            }
+            let byProjection = Dictionary(grouping: values) {
+                ($0.parameterProjection
+                    ?? .identity(parameterCount: $0.parameterSwiftTypes.count))
+                    .logicalParameterIndices
+            }
+            for projected in byProjection.values {
+                guard Set(projected.map(ImportedOperationLogicalABI.init)).count == 1
+                else {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "imported SIL operation \(symbol) has ambiguous logical variants"
+                    )
+                }
+            }
+        }
+
         guard operations.count > 1 else { return operations }
         var parents = Array(operations.indices)
         var sizes = Array(repeating: 1, count: operations.count)
@@ -304,13 +376,19 @@ extension FrontendReceipt.Adapter {
                 sizes[left] += sizes[right]
             }
         }
-        var firstUse: [String: Int] = [:]
+        struct VariantSymbol: Hashable {
+            var symbol: String
+            var abi: ImportedOperationLogicalABI
+        }
+        var firstUse: [VariantSymbol: Int] = [:]
         for (index, operation) in operations.enumerated() {
+            let abi = ImportedOperationLogicalABI(operation)
             for symbol in operation.silReferences {
-                if let existing = firstUse[symbol] {
+                let key = VariantSymbol(symbol: symbol, abi: abi)
+                if let existing = firstUse[key] {
                     unite(index, existing)
                 } else {
-                    firstUse[symbol] = index
+                    firstUse[key] = index
                 }
             }
         }
@@ -318,14 +396,8 @@ extension FrontendReceipt.Adapter {
         for index in operations.indices {
             groups[root(index), default: []].append(operations[index])
         }
-        return try groups.values.map { values in
+        return groups.values.map { values in
             guard values.count > 1 else { return values[0] }
-            let physicalSignatures = Set(values.map(ImportedOperationPhysicalABI.init))
-            guard physicalSignatures.count == 1 else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "one imported SIL operation has conflicting logical ABIs"
-                )
-            }
             var selected = values.sorted(by: importedOperationOrdering)[0]
             selected.silReferences = Array(Set(values.flatMap(\.silReferences))).sorted()
             selected.witnessFunctions = Array(Set(
@@ -744,6 +816,7 @@ extension FrontendReceipt.Adapter {
     }
 
     private struct ImportedSILCall: Hashable {
+        var referenceToken: String
         var symbol: String
         var loweredType: String
     }
@@ -773,18 +846,46 @@ extension FrontendReceipt.Adapter {
               )
         else { return }
 
-        let explicitArguments = ((expression["args"] as? [String: Any])?["args"]
+        let formalArguments = ((expression["args"] as? [String: Any])?["args"]
             as? [[String: Any]]) ?? []
-        var argumentValues: [[String: Any]] = []
-        var parameterTypes: [String] = []
+        var formalArgumentValues: [[String: Any]] = []
+        var formalParameterTypes: [String] = []
+        var explicitParameterIndices: [Int] = []
         var argumentLabels: [String] = []
-        for argument in explicitArguments {
+        for (index, argument) in formalArguments.enumerated() {
             guard let value = argument["expr"] as? [String: Any],
-                  let type = importedSwiftType(value["type"], demangled: demangled)
+                  var type = importedSwiftType(value["type"], demangled: demangled)
             else { return }
-            argumentValues.append(value)
-            parameterTypes.append(type)
+            if let actor = callbackGlobalActor(
+                in: value,
+                demangled: demangled
+            ), let isolated = FrontendReceipt.FunctionTypeSpelling
+                .applyingGlobalActor(actor, to: type) {
+                type = isolated
+            }
+            formalArgumentValues.append(value)
+            formalParameterTypes.append(type)
+            guard value["_kind"] as? String != "default_argument_expr" else {
+                continue
+            }
+            explicitParameterIndices.append(index)
             argumentLabels.append(argument["label"] as? String ?? "_")
+        }
+        if let formalFunctionType = importedSwiftType(
+            functionExpression["type"],
+            demangled: demangled
+        ) {
+            // Closure expression types do not carry the callee parameter's
+            // `@escaping` lifetime. The applied declaration's formal type is
+            // the authoritative source for callback boundary annotations.
+            formalParameterTypes = FrontendReceipt.FunctionTypeSpelling
+                .overlayCallbackParameters(
+                    formalParameterTypes,
+                    formalFunctionType: formalFunctionType
+                )
+        }
+        var parameterTypes = explicitParameterIndices.map {
+            formalParameterTypes[$0]
         }
 
         let dispatch: NativeImportDiscovery.Dispatch
@@ -822,10 +923,22 @@ extension FrontendReceipt.Adapter {
         let call: ImportedSILCall
         if usr.hasPrefix("s:") {
             let symbol = "$s" + usr.dropFirst(2)
-            guard let reference = swiftFunctionReference(
+            let expectedLocation = sourceRange(in: expression).flatMap {
+                sourceLocation(atUTF8Offset: $0.start, in: source)
+            }
+            let exactReference = swiftFunctionReference(
                 symbol: symbol,
-                in: function.body
-            ) else { return }
+                in: function,
+                sourceLocation: expectedLocation
+            )
+            let structuralReference = foreignCallReference(
+                in: function,
+                ownerType: ownerType,
+                baseName: baseName,
+                sourceLocation: expectedLocation,
+                allowsGlobalFunction: dispatch == .globalFunction
+            )
+            guard let reference = exactReference ?? structuralReference else { return }
             call = reference
         } else {
             let expectedLocation = sourceRange(in: expression).flatMap {
@@ -841,7 +954,7 @@ extension FrontendReceipt.Adapter {
             call = foreign
             let physicalParameters = physicalParameterSpellings(
                 in: foreign.loweredType
-            ).filter { !$0.contains("_metatype ") }
+            ).filter { !isPhysicalMetatypeParameter($0) }
             let alignedPhysicalParameters = alignForeignParameters(
                 physicalParameters,
                 logicalCount: parameterTypes.count,
@@ -863,8 +976,70 @@ extension FrontendReceipt.Adapter {
                 )
             }
         }
+        let physicalParameters = physicalParameterSpellings(
+            in: call.loweredType
+        ).filter { !isPhysicalMetatypeParameter($0) }
+        var physicalParameterIndices = explicitParameterIndices
+        if dispatch == .instanceMethod {
+            guard let receiverIndex = physicalParameters.indices.last else {
+                return
+            }
+            physicalParameterIndices.append(receiverIndex)
+        }
+        guard physicalParameters.count >= formalParameterTypes.count,
+              physicalParameterIndices.allSatisfy(physicalParameters.indices.contains),
+              let physicalParameterCount = UInt16(exactly: physicalParameters.count),
+              physicalParameterIndices.compactMap(UInt16.init(exactly:)).count
+                == physicalParameterIndices.count
+        else { return }
+        let logicalParameterIndices = physicalParameterIndices.compactMap(
+            UInt16.init(exactly:)
+        )
+        let usesNSErrorBridge = dispatch == .instanceMethod
+            && expression["throws"] != nil
+            && call.loweredType.contains(
+                "AutoreleasingUnsafeMutablePointer<Optional<NSError>>"
+            )
+            && physicalResultSpelling(in: call.loweredType) == "ObjCBool"
+        let parameterProjection: InterfaceArchive.NativeImportParameterProjection
+        if usesNSErrorBridge {
+            // NSErrorBridgePlan removes Clang Importer's hidden NSError ** and
+            // sentinel result before ordinary direct-call lowering. Its
+            // NativeImport boundary is therefore already the logical Swift
+            // throwing ABI, not a source-default projection.
+            guard physicalParameters.count == parameterTypes.count + 1,
+                  physicalParameterIndices.count == parameterTypes.count
+            else { return }
+            parameterProjection = .identity(
+                parameterCount: parameterTypes.count
+            )
+        } else {
+            guard let defaultArguments = nativeImportDefaultArguments(
+                in: function,
+                call: call,
+                logicalParameterIndices: logicalParameterIndices
+            ) else { return }
+            parameterProjection = .init(
+                physicalParameterCount: physicalParameterCount,
+                logicalParameterIndices: logicalParameterIndices,
+                defaultArguments: defaultArguments
+            )
+        }
+        guard parameterProjection.isValid(
+            logicalParameterCount: parameterTypes.count
+        ) else { return }
+        guard let callbackParameters = applyingNativeCallbackLifetimes(
+            to: parameterTypes,
+            physicalParameters: physicalParameterIndices.map {
+                physicalParameters[$0]
+            }
+        ) else { return }
+        parameterTypes = callbackParameters
 
-        for (value, type) in zip(argumentValues, parameterTypes) {
+        // Default argument values stay in the type environment so canonical
+        // SIL can validate their compiler-only storage, but they do not cross
+        // the NativeImport boundary or enter the generated invoker signature.
+        for (value, type) in zip(formalArgumentValues, formalParameterTypes) {
             recordImportedTypeSurface(
                 rawMangledType: value["type"],
                 spelling: type,
@@ -932,6 +1107,7 @@ extension FrontendReceipt.Adapter {
                 baseName: dispatch == .initializer ? "init" : baseName,
                 argumentLabels: argumentLabels,
                 parameterSwiftTypes: parameterTypes,
+                parameterProjection: parameterProjection,
                 resultSwiftType: resultType,
                 requiresMainActor: requiresMainActor,
                 mayThrow: expression["throws"] != nil
@@ -962,29 +1138,384 @@ extension FrontendReceipt.Adapter {
         }
     }
 
+    private func callbackGlobalActor(
+        in expression: [String: Any],
+        demangled: [String: String]
+    ) -> String? {
+        if let raw = expression["global_actor_isolated"] as? String,
+           let actor = demangled[raw],
+           actor == "MainActor" || actor == "Swift.MainActor" {
+            return actor
+        }
+        for key in ["sub_expr", "expr"] {
+            if let child = expression[key] as? [String: Any],
+               let actor = callbackGlobalActor(
+                   in: child,
+                   demangled: demangled
+               ) {
+                return actor
+            }
+        }
+        return nil
+    }
+
+    private func applyingNativeCallbackLifetimes(
+        to logicalParameters: [String],
+        physicalParameters: [String]
+    ) -> [String]? {
+        guard logicalParameters.count == physicalParameters.count else {
+            return nil
+        }
+        var lifetimes: [Int: Core.NativeImportCallbackLifetime] = [:]
+        for (index, pair) in zip(
+            logicalParameters,
+            physicalParameters
+        ).enumerated() {
+            guard let boundary = FrontendReceipt.FunctionTypeSpelling
+                .callbackBoundary(in: pair.0)
+            else {
+                guard !pair.1.contains(" -> ") else { return nil }
+                continue
+            }
+            guard pair.1.contains(" -> ") else { return nil }
+            let isNonescaping = pair.1.range(
+                of: #"(?:^|\s)@noescape(?:\s|$)"#,
+                options: .regularExpression
+            ) != nil
+            guard !boundary.isOptional || !isNonescaping else {
+                return nil
+            }
+            lifetimes[index] = isNonescaping ? .nonescaping : .escaping
+        }
+        guard !lifetimes.isEmpty else { return logicalParameters }
+        return FrontendReceipt.FunctionTypeSpelling
+            .applyingAuthoritativeLifetimes(
+                lifetimes,
+                to: logicalParameters
+            )
+    }
+
     private func swiftFunctionReference(
         symbol: String,
-        in body: String
+        in function: CanonicalSIL.Function,
+        sourceLocation: Core.SourceLocation?
     ) -> ImportedSILCall? {
+        struct Candidate: Hashable {
+            var call: ImportedSILCall
+            var location: Core.SourceLocation?
+        }
+
         let marker = "function_ref @\(symbol) : $"
-        let matches = Set(body.split(
+        let matches = Set(function.body.split(
             separator: "\n",
             omittingEmptySubsequences: false
-        ).compactMap { rawLine -> ImportedSILCall? in
+        ).enumerated().compactMap { offset, rawLine -> Candidate? in
             let line = String(rawLine)
-            guard let range = line.range(of: marker) else { return nil }
-            let loweredType = line[range.upperBound...]
+            guard let range = line.range(of: marker),
+                  let assignment = line.range(of: " = "),
+                  assignment.lowerBound < range.lowerBound
+            else { return nil }
+            let token = line[..<assignment.lowerBound]
                 .trimmingCharacters(in: .whitespaces)
+            guard token.hasPrefix("%") else { return nil }
+            let loweredType = debugMetadataStrippedSuffix(
+                String(line[range.upperBound...])
+            )
             guard !loweredType.isEmpty else { return nil }
-            return .init(symbol: symbol, loweredType: loweredType)
+            return .init(
+                call: .init(
+                    referenceToken: token,
+                    symbol: symbol,
+                    loweredType: loweredType
+                ),
+                location: function.sourceLocation(atBodyLine: offset + 1)
+            )
         })
-        return matches.count == 1 ? matches.first : nil
+        if let sourceLocation {
+            let exact = Set(matches.compactMap { candidate in
+                candidate.location == sourceLocation ? candidate.call : nil
+            })
+            if exact.count == 1 { return exact.first }
+            let lineMatches = Set(matches.compactMap { candidate in
+                candidate.location?.line == sourceLocation.line
+                    ? candidate.call : nil
+            })
+            if lineMatches.count == 1 { return lineMatches.first }
+        }
+        let calls = Set(matches.map(\.call))
+        return calls.count == 1 ? calls.first : nil
+    }
+
+    private struct ImportedSILApplication {
+        var resultToken: String?
+        var argumentTokens: [String]
+    }
+
+    /// Resolves the physical values supplied to one imported call without
+    /// interpreting their Swift semantics. This is intentionally a small SSA
+    /// provenance pass: the compiler may borrow or move a function reference,
+    /// but an ambiguous or multiply-applied reference is not guessed.
+    private func importedSILApplications(
+        of referenceToken: String,
+        in body: String
+    ) -> [ImportedSILApplication] {
+        let lines = body.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ).map(String.init)
+        var aliases: Set<String> = [referenceToken]
+        var changed = true
+        while changed {
+            changed = false
+            for rawLine in lines {
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                guard let assignment = line.range(of: " = ") else { continue }
+                let destination = String(line[..<assignment.lowerBound])
+                guard destination.hasPrefix("%") else { continue }
+                let rhs = String(line[assignment.upperBound...])
+                for operation in [
+                    "begin_borrow ", "copy_value ", "move_value ",
+                ] where rhs.hasPrefix(operation) {
+                    let source = rhs.dropFirst(operation.count).prefix {
+                        !$0.isWhitespace && $0 != ","
+                    }
+                    if aliases.contains(String(source)), aliases.insert(destination).inserted {
+                        changed = true
+                    }
+                }
+            }
+        }
+
+        return lines.compactMap { rawLine in
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            for operation in ["try_apply", "apply"] {
+                for token in aliases {
+                    let marker = "\(operation) \(token)"
+                    guard let call = line.range(of: marker) else { continue }
+                    var cursor = call.upperBound
+                    guard cursor < line.endIndex,
+                          line[cursor] == "<" || line[cursor] == "("
+                    else { continue }
+                    var angleDepth = 0
+                    var open: String.Index?
+                    while cursor < line.endIndex {
+                        switch line[cursor] {
+                        case "<": angleDepth += 1
+                        case ">": angleDepth -= 1
+                        case "(" where angleDepth == 0:
+                            open = cursor
+                        default: break
+                        }
+                        if open != nil { break }
+                        guard angleDepth >= 0 else { return nil }
+                        cursor = line.index(after: cursor)
+                    }
+                    guard let open else { return nil }
+                    var depth = 1
+                    cursor = line.index(after: open)
+                    var close: String.Index?
+                    while cursor < line.endIndex {
+                        switch line[cursor] {
+                        case "(": depth += 1
+                        case ")":
+                            depth -= 1
+                            if depth == 0 { close = cursor }
+                        default: break
+                        }
+                        if close != nil { break }
+                        cursor = line.index(after: cursor)
+                    }
+                    guard let close else { return nil }
+                    let arguments = splitPhysicalTypeList(
+                        String(line[line.index(after: open)..<close])
+                    )
+                    let result: String?
+                    if operation == "apply",
+                       let assignment = line[..<call.lowerBound].range(of: " = ") {
+                        let candidate = line[..<assignment.lowerBound]
+                            .trimmingCharacters(in: .whitespaces)
+                        result = candidate.hasPrefix("%") ? candidate : nil
+                    } else {
+                        result = nil
+                    }
+                    return .init(resultToken: result, argumentTokens: arguments)
+                }
+            }
+            return nil
+        }
+    }
+
+    private func importedSILValueAliases(in body: String) -> [String: String] {
+        var result: [String: String] = [:]
+        for rawLine in body.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard let assignment = line.range(of: " = ") else { continue }
+            let destination = String(line[..<assignment.lowerBound])
+            guard destination.hasPrefix("%") else { continue }
+            let rhs = String(line[assignment.upperBound...])
+            for operation in [
+                "begin_borrow ", "copy_value ", "move_value ",
+                "begin_access [read] ", "begin_access [modify] ",
+            ] where rhs.hasPrefix(operation) {
+                let tail = rhs.dropFirst(operation.count)
+                if let source = tail.split(whereSeparator: {
+                    $0.isWhitespace || $0 == ","
+                }).first(where: { $0.hasPrefix("%") }) {
+                    result[destination] = String(source)
+                }
+            }
+        }
+        return result
+    }
+
+    private func canonicalSILOrigin(
+        of token: String,
+        aliases: [String: String]
+    ) -> String {
+        var current = token
+        var visited = Set<String>()
+        while visited.insert(current).inserted, let source = aliases[current] {
+            current = source
+        }
+        return current
+    }
+
+    private func nativeImportDefaultArguments(
+        in function: CanonicalSIL.Function,
+        call: ImportedSILCall,
+        logicalParameterIndices: [UInt16]
+    ) -> [InterfaceArchive.NativeImportDefaultArgument]? {
+        let rawParameters = physicalParameterSpellings(in: call.loweredType)
+        let physicalParameters = rawParameters.filter {
+            !isPhysicalMetatypeParameter($0)
+        }
+        let selected = Set(logicalParameterIndices.map(Int.init))
+        let omitted = physicalParameters.indices.filter {
+            !selected.contains($0)
+        }
+        guard !omitted.isEmpty else { return [] }
+
+        let applications = importedSILApplications(
+            of: call.referenceToken,
+            in: function.body
+        )
+        guard applications.count == 1,
+              let application = applications.first,
+              application.argumentTokens.count >= rawParameters.count
+        else { return nil }
+        let rawArguments = Array(application.argumentTokens.suffix(rawParameters.count))
+        let physicalArguments = zip(rawParameters, rawArguments).compactMap {
+            isPhysicalMetatypeParameter($0.0) ? nil : $0.1
+        }
+        guard physicalArguments.count == physicalParameters.count else { return nil }
+
+        let aliases = importedSILValueAliases(in: function.body)
+        var inlineOptionalNone = Set<String>()
+        var generatorReferences: [String: (symbol: String, loweredType: String)] = [:]
+        for rawLine in function.body.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if let assignment = line.range(of: " = enum $"),
+               line.contains("#Optional.none!enumelt") {
+                let token = String(line[..<assignment.lowerBound])
+                if token.hasPrefix("%") { inlineOptionalNone.insert(token) }
+            }
+            guard let assignment = line.range(of: " = function_ref @"),
+                  let separator = line.range(
+                      of: " : $",
+                      range: assignment.upperBound..<line.endIndex
+                  )
+            else { continue }
+            let token = String(line[..<assignment.lowerBound])
+                .trimmingCharacters(in: .whitespaces)
+            let symbol = String(line[assignment.upperBound..<separator.lowerBound])
+            if token.hasPrefix("%"), ReleaseCompiler.ImplementationFingerprint
+                .isDefaultArgumentGenerator(symbol) {
+                generatorReferences[token] = (
+                    symbol,
+                    debugMetadataStrippedSuffix(
+                        String(line[separator.upperBound...])
+                    )
+                )
+            }
+        }
+
+        var generatedValues: [String: String] = [:]
+        var hasAmbiguousGeneratedValue = false
+        for (reference, generator) in generatorReferences {
+            for generated in importedSILApplications(
+                of: reference,
+                in: function.body
+            ) {
+                if let resultToken = generated.resultToken {
+                    let origin = canonicalSILOrigin(
+                        of: resultToken,
+                        aliases: aliases
+                    )
+                    if let existing = generatedValues[origin],
+                       existing != generator.symbol {
+                        hasAmbiguousGeneratedValue = true
+                    } else {
+                        generatedValues[origin] = generator.symbol
+                    }
+                }
+                let indirectResultCount = physicalResultSpelling(
+                    in: generator.loweredType
+                )?.hasPrefix("@out ") == true ? 1 : 0
+                for argument in generated.argumentTokens
+                    .prefix(indirectResultCount)
+                where argument.hasPrefix("%") {
+                    let origin = canonicalSILOrigin(
+                        of: argument,
+                        aliases: aliases
+                    )
+                    if let existing = generatedValues[origin],
+                       existing != generator.symbol {
+                        hasAmbiguousGeneratedValue = true
+                    } else {
+                        generatedValues[origin] = generator.symbol
+                    }
+                }
+            }
+        }
+        guard !hasAmbiguousGeneratedValue else { return nil }
+
+        var defaults: [InterfaceArchive.NativeImportDefaultArgument] = []
+        defaults.reserveCapacity(omitted.count)
+        for index in omitted {
+            guard let physicalIndex = UInt16(exactly: index) else { return nil }
+            let origin = canonicalSILOrigin(
+                of: physicalArguments[index],
+                aliases: aliases
+            )
+            if inlineOptionalNone.contains(origin) {
+                guard generatedValues[origin] == nil else { return nil }
+                defaults.append(
+                    .optionalNone(physicalParameterIndex: physicalIndex)
+                )
+                continue
+            }
+            guard let generator = generatedValues[origin] else { return nil }
+            defaults.append(
+                .externalGenerator(
+                    physicalParameterIndex: physicalIndex,
+                    symbol: generator
+                )
+            )
+        }
+        return defaults
     }
 
     private func objcLogicalType(
         _ swiftType: String,
         physicalSpelling rawPhysical: String
     ) -> String {
+        if let callback = FrontendReceipt.FunctionTypeSpelling
+            .callbackBoundary(in: swiftType) {
+            return callback.declaredSpelling
+        }
         let logical = swiftType.replacingOccurrences(of: "Swift.", with: "")
         var physical = rawPhysical.trimmingCharacters(in: .whitespaces)
         var changed = true
@@ -1055,6 +1586,25 @@ extension FrontendReceipt.Adapter {
         )
     }
 
+    private func debugMetadataStrippedSuffix(_ raw: String) -> String {
+        let end = raw.range(of: ", loc ")?.lowerBound ?? raw.endIndex
+        return String(raw[..<end]).trimmingCharacters(in: .whitespaces)
+    }
+
+    private func isPhysicalMetatypeParameter(_ raw: String) -> Bool {
+        var spelling = raw.trimmingCharacters(in: .whitespaces)
+        if spelling.hasPrefix("$") {
+            spelling.removeFirst()
+            spelling = spelling.trimmingCharacters(in: .whitespaces)
+        }
+        if spelling.contains("_metatype ") { return true }
+        for prefix in ["@thin ", "@thick ", "@objc_metatype "]
+        where spelling.hasPrefix(prefix) {
+            return spelling.hasSuffix(".Type")
+        }
+        return false
+    }
+
     private func physicalResultSpelling(in loweredType: String) -> String? {
         guard let arrow = loweredType.range(of: " -> ", options: .backwards) else {
             return nil
@@ -1069,19 +1619,32 @@ extension FrontendReceipt.Adapter {
         var start = raw.startIndex
         var angleDepth = 0
         var parenthesisDepth = 0
+        var bracketDepth = 0
         for index in raw.indices {
             switch raw[index] {
             case "<": angleDepth += 1
-            case ">": angleDepth -= 1
+            case ">":
+                let previous = index > raw.startIndex
+                    ? raw[raw.index(before: index)] : nil
+                if previous != "-" { angleDepth -= 1 }
             case "(": parenthesisDepth += 1
             case ")": parenthesisDepth -= 1
-            case "," where angleDepth == 0 && parenthesisDepth == 0:
+            case "[": bracketDepth += 1
+            case "]": bracketDepth -= 1
+            case "," where angleDepth == 0 && parenthesisDepth == 0
+                    && bracketDepth == 0:
                 result.append(
                     String(raw[start..<index]).trimmingCharacters(in: .whitespaces)
                 )
                 start = raw.index(after: index)
             default: break
             }
+            guard angleDepth >= 0, parenthesisDepth >= 0,
+                  bracketDepth >= 0
+            else { return [] }
+        }
+        guard angleDepth == 0, parenthesisDepth == 0, bracketDepth == 0 else {
+            return []
         }
         let tail = String(raw[start...]).trimmingCharacters(in: .whitespaces)
         if !tail.isEmpty { result.append(tail) }
@@ -1116,7 +1679,9 @@ extension FrontendReceipt.Adapter {
                 let token = String(line[..<assignment.lowerBound])
                     .trimmingCharacters(in: .whitespaces)
                 let reference = String(line[hash..<separator.lowerBound])
-                let loweredType = String(line[loweredMarker.upperBound...])
+                let loweredType = debugMetadataStrippedSuffix(
+                    String(line[loweredMarker.upperBound...])
+                )
                 let baseNameMatches = reference.contains(".\(baseName)!")
                     || (baseName == "init" && reference.contains(".init!"))
                 let ownerMatches = reference.hasPrefix("#\(owner).")
@@ -1137,7 +1702,11 @@ extension FrontendReceipt.Adapter {
                     )
                     methodCandidates.append(
                         .init(
-                            call: .init(symbol: symbol, loweredType: loweredType),
+                            call: .init(
+                                referenceToken: token,
+                                symbol: symbol,
+                                loweredType: loweredType
+                            ),
                             location: location
                         )
                     )
@@ -1148,13 +1717,28 @@ extension FrontendReceipt.Adapter {
                   let separator = line.range(of: " : $", range: marker.upperBound..<line.endIndex)
             else { continue }
             let symbol = String(line[marker.upperBound..<separator.lowerBound])
-            let loweredType = String(line[separator.upperBound...])
+            let loweredType = debugMetadataStrippedSuffix(
+                String(line[separator.upperBound...])
+            )
+            let token = line[..<marker.lowerBound]
+                .trimmingCharacters(in: .whitespaces)
             guard symbol.hasPrefix("$s"),
+                  token.hasPrefix("%"),
+                  !loweredType.isEmpty,
+                  !ReleaseCompiler.ImplementationFingerprint
+                    .isDefaultArgumentGenerator(symbol),
                   baseName == "init" || symbol.contains(baseName),
                   allowsGlobalFunction || symbol.contains(owner)
             else { continue }
             functionCandidates.append(
-                .init(call: .init(symbol: symbol, loweredType: loweredType), location: location)
+                .init(
+                    call: .init(
+                        referenceToken: token,
+                        symbol: symbol,
+                        loweredType: loweredType
+                    ),
+                    location: location
+                )
             )
         }
 
@@ -1702,7 +2286,7 @@ extension FrontendReceipt.Adapter {
         )
     }
 
-    private func isSelectorType(_ raw: String) -> Bool {
+    func isSelectorType(_ raw: String) -> Bool {
         ["Selector", "ObjectiveC.Selector"].contains(raw)
     }
 
@@ -1769,71 +2353,15 @@ extension FrontendReceipt.Adapter {
         requiresMainActor: Bool,
         types: inout [ImportedNativeType]
     ) -> ImportedNativeType.Representation? {
-        guard let discovered = importedNativeNominal(in: spelling),
-              let mangled = rawMangledType as? String
-        else { return nil }
-        let canonical = isSelectorType(discovered)
-            ? "ObjectiveC.Selector" : discovered
-        guard let representation = importedNominalRepresentation(
-            mangled,
-            spelling: canonical
+        guard let type = importedNativeType(
+            rawMangledType: rawMangledType,
+            spelling: spelling,
+            source: source,
+            importedModules: importedModules,
+            requiresMainActor: requiresMainActor
         ) else { return nil }
-        let kind: InterfaceArchive.TypeKind = representation == .reference
-            ? .reference : .value
-        types.append(
-            importedType(
-                canonicalName: canonical,
-                swiftType: canonical,
-                kind: kind,
-                representation: representation,
-                source: source,
-                importedModules: importedModules,
-                requiresMainActor: requiresMainActor
-            )
-        )
-        return representation
-    }
-
-    private func importedNominalRepresentation(
-        _ rawMangledType: String,
-        spelling: String
-    ) -> ImportedNativeType.Representation? {
-        var value = rawMangledType
-        guard value.hasPrefix("$s"), value.hasSuffix("D") else { return nil }
-        value.removeLast()
-        while value.hasSuffix("Sg") { value.removeLast(2) }
-        switch value.last {
-        case "C": return .reference
-        case "V", "O": return .opaqueValue
-        case "G" where rawMangledType.hasPrefix("$sSo") && spelling.contains("<"):
-            return .reference
-        default: return nil
-        }
-    }
-
-    private func importedNativeNominal(in raw: String) -> String? {
-        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        while value.hasSuffix("?") { value.removeLast() }
-        for prefix in ["Swift.Optional<", "Optional<"]
-        where value.hasPrefix(prefix) && value.hasSuffix(">") {
-            let start = value.index(value.startIndex, offsetBy: prefix.count)
-            return importedNativeNominal(
-                in: String(value[start..<value.index(before: value.endIndex)])
-            )
-        }
-        if value.hasPrefix("["), value.hasSuffix("]")
-            || value.hasPrefix("Swift.Array<") || value.hasPrefix("Array<")
-            || value.hasPrefix("Swift.Dictionary<") || value.hasPrefix("Dictionary<") {
-            return nil
-        }
-        guard FrontendReceipt.ValueTypeParser.parse(
-            value,
-            allowVoid: true
-        ) == nil,
-              !value.contains(" -> "),
-              !value.isEmpty
-        else { return nil }
-        return value
+        types.append(type)
+        return type.representation
     }
 
     private func swiftPropertyReference(
@@ -1841,9 +2369,17 @@ extension FrontendReceipt.Adapter {
         accessor: NativeImportDiscovery.Dispatch,
         in body: String
     ) -> String? {
-        guard usr.hasPrefix("s:"), usr.hasSuffix("vp") else { return nil }
-        let suffix = accessor == .instanceSetter ? "s" : "g"
-        let symbol = "$s" + usr.dropFirst(2).dropLast() + suffix
+        guard usr.hasPrefix("s:") else { return nil }
+        var mangling = String(usr.dropFirst(2))
+        guard let property = mangling.range(of: "vp", options: .backwards),
+              property.upperBound == mangling.endIndex
+                || mangling[property.upperBound...] == "Z"
+        else { return nil }
+        mangling.replaceSubrange(
+            property,
+            with: accessor == .instanceSetter ? "vs" : "vg"
+        )
+        let symbol = "$s" + mangling
         return body.contains("function_ref @\(symbol) ") ? symbol : nil
     }
 
@@ -1874,16 +2410,6 @@ extension FrontendReceipt.Adapter {
         return value.isEmpty ? nil : value
     }
 
-    private func normalizeImportedTypeSpelling(_ raw: String) -> String {
-        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        while value.hasPrefix("(extension in "),
-              let separator = value.range(of: "):") {
-            value = String(value[separator.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return value.replacingOccurrences(of: "__C.", with: "")
-    }
-
     private func importedSwiftType(
         _ rawType: Any?,
         demangled: [String: String]
@@ -1893,32 +2419,9 @@ extension FrontendReceipt.Adapter {
         else { return nil }
         value = normalizeImportedTypeSpelling(value)
         guard !value.isEmpty,
-              !value.hasSuffix(".Type"),
-              !value.contains(" -> ")
+              !value.hasSuffix(".Type")
         else { return nil }
         return value
-    }
-
-    private func importedType(
-        canonicalName: String,
-        swiftType: String,
-        kind: InterfaceArchive.TypeKind,
-        aliases: [String] = [],
-        representation: ImportedNativeType.Representation,
-        source: SourceState,
-        importedModules: [String],
-        requiresMainActor: Bool
-    ) -> ImportedNativeType {
-        .init(
-            canonicalName: canonicalName,
-            swiftType: swiftType,
-            kind: kind,
-            aliases: aliases,
-            representation: representation,
-            sourceFileLogicalID: source.logicalPath,
-            importedModules: importedModules,
-            requiresMainActor: requiresMainActor
-        )
     }
 
     private func normalizeImportedTypeAliases(
@@ -1936,15 +2439,8 @@ extension FrontendReceipt.Adapter {
                 aliases[alias] = type.swiftType
             }
         }
-        return operations.map { operation in
-            var normalized = operation
-            normalized.ownerType = aliases[operation.ownerType] ?? operation.ownerType
-            normalized.parameterSwiftTypes = operation.parameterSwiftTypes.map {
-                aliases[$0] ?? $0
-            }
-            normalized.resultSwiftType = aliases[operation.resultSwiftType]
-                ?? operation.resultSwiftType
-            return normalized
+        return operations.map {
+            applyingSwiftTypeAliases($0, aliases: aliases)
         }
     }
 
@@ -2109,7 +2605,7 @@ extension FrontendReceipt.Adapter {
     private func mergeOperationTypes(
         _ values: [ImportedNativeType]
     ) throws -> [ImportedNativeType] {
-        try mergeImportedNativeTypes(references: [], operationTypes: values)
+        try mergeImportedNativeTypes(discoveredTypes: [], operationTypes: values)
     }
 
     func mergeImportedOperations(
@@ -2142,6 +2638,8 @@ extension FrontendReceipt.Adapter {
                     existing.requiresMainActor = value.requiresMainActor
                     existing.isolationEvidence = .importedDeclaration
                 case (.enclosingContext, .enclosingContext):
+                    // A source call made from MainActor supplies conservative
+                    // evidence until an imported declaration is measured.
                     existing.requiresMainActor = existing.requiresMainActor
                         || value.requiresMainActor
                 }

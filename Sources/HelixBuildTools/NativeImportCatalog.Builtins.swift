@@ -73,8 +73,9 @@ enum Builtins {
         let merged = records + builtins
         guard Set(merged.map(\.key)).count == merged.count,
               Set(merged.map(\.canonicalCallee)).count == merged.count,
-              Set(merged.flatMap(\.silMangledNames)).count
-                == merged.reduce(0, { $0 + $1.silMangledNames.count })
+              Set(records.flatMap(\.silMangledNames)).isDisjoint(
+                  with: Set(builtins.flatMap(\.silMangledNames))
+              )
         else {
             throw FrontendReceipt.Error.invalidRequest(
                 "NativeImport Catalog conflicts with a Helix standard-library import"

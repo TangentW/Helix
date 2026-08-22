@@ -129,7 +129,9 @@ Dictionary 的具体能力还包括 uniquing 构造、Dictionary/可表示 Seque
 
 frontend 的 Array/Dictionary cast helper 只有在原始类型仅有 Tuple label 差异、且两端完整 VM 类型也相同时才可被消除；真正的 element、key、value 或 reference 转换仍会被拒绝。
 
-它并非任意 Swift。generic root、运行时 metadata/witness 分派、原生可识别的补丁具体 Swift 类型、函数内部 nominal 声明、hosted stored property/自定义 initializer/任意 callback ABI、已有原生类型的 stored layout 变化、closure 持久化或跨 Native/Shell 边界、async closure、`unowned(unsafe)`、weak/unowned stored-property layout、escaping closure 对调用者 `inout` 的捕获、真正的 `await`/continuation、actor-isolated `self`、custom global actor、不受限指针、基于反射的字段访问和未注册原生 API 都会被拒绝。实用矩阵见[能力与限制](Capabilities-and-Limits.zh-CN.md)。
+NativeImport 还可通过同一套生成式 adapter 接受精确的直接或 Optional callback 参数，Swift closure 与 Objective-C block 共用该路径。v1 profile 只接受同步、nonthrowing、返回 `Void` 的 callback，保留 nonescaping/escaping 与 global-actor 合同，并只允许递归可桥接的 callback 参数。escaping handle 会保留 image 与 generation lease；在通用 Swift `Sendable` 语义实现前，Runtime 会串行化 callback 执行。经过检查的源码默认参数投影使 `UIView.animate`、`DispatchQueue.main.async(group:execute:)` 与 `Timer.scheduledTimer` 等调用无需逐 API 的 VM 实现。
+
+它并非任意 Swift。generic root、运行时 metadata/witness 分派、原生可识别的补丁具体 Swift 类型、函数内部 nominal 声明、hosted stored property/自定义 initializer/任意 callback ABI、已有原生类型的 stored layout 变化、closure 穿过 Shell Entry 或上述精确 profile 之外的 NativeImport 位置、非 `Void`/throwing/async/高阶 callback ABI、并发 `Sendable` closure 执行、async closure、`unowned(unsafe)`、weak/unowned stored-property layout、escaping closure 对调用者 `inout` 的捕获、真正的 `await`/continuation、actor-isolated `self`、custom global actor、不受限指针、基于反射的字段访问和未注册原生 API 都会被拒绝。实用矩阵见[能力与限制](Capabilities-and-Limits.zh-CN.md)。
 
 HLBC 会携带经过 Verifier 检查的 function/block/instruction → 逻辑 Swift 位置映射；生产打包会移除构建机绝对路径。执行发生 trap 时，HLVM 会给出精确 program counter，Runtime 再补充固定的 generation、Shell entry、函数和逻辑文件/行/列。这是诊断映射，不是支持 breakpoint、单步或表达式求值的交互式调试器。
 

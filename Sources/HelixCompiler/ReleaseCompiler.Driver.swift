@@ -440,25 +440,19 @@ extension ReleaseCompiler {
             }.sorted { recordOrder($0.record, $1.record) }
 
             // The exact optimized SIL remains the source of change identity
-            // and is also the preferred lowering input. Swift commonly
-            // scalarizes local aggregates and inlines nonescaping closures in
-            // this representation, so HLBC does not need to emulate objects
-            // that exist only during compilation. A second, toolchain-pinned
-            // pass remains a deterministic fallback for public operations such
-            // as String and Array APIs whose optimized SIL exposes private
-            // standard-library storage layouts.
-            let loweringSILFile: CanonicalSIL.File
-            if request.archive.metadata.frontendInvocation.optimization == "-Onone" {
-                loweringSILFile = silFile
-            } else {
-                let loweringSIL = try SwiftFrontend.Driver(compilerURL: request.compilerURL)
-                    .emitCanonicalSIL(
-                        sourceFiles: orderedSourceFiles,
-                        invocation: request.archive.metadata.frontendInvocation,
-                        purpose: .semanticLowering
-                    )
-                loweringSILFile = try CanonicalSIL.File(text: loweringSIL)
-            }
+            // and the preferred lowering input. A separate toolchain-pinned
+            // semantic pass is always available: mandatory transforms can
+            // inline imported default generators even at -Onone, while patch
+            // call-variant selection requires their source-level provenance.
+            let loweringSIL = try SwiftFrontend.Driver(
+                compilerURL: request.compilerURL
+            ).emitCanonicalSIL(
+                sourceFiles: orderedSourceFiles,
+                invocation: request.archive.metadata.frontendInvocation,
+                purpose: .semanticLowering
+            )
+            let loweringSILFile = try CanonicalSIL.File(text: loweringSIL)
+            let hasDistinctSemanticFallback = loweringSIL != canonicalSIL
             let loweringTypeEnvironment = try loweringSILFile.typeEnvironment
                 .includingNativeTypes(
                     frozenNativeTypes,
@@ -474,19 +468,32 @@ extension ReleaseCompiler {
                 localFunctionIDs[item.record.key] = .init(rawValue: rawValue)
             }
             let compilationSymbols = Set(changedSIL.map(\.record.mangledName))
+            var fallbackImageExecutionEffectEnvelope = Core.Effects()
+            var rootExecutionEffects: [String: Core.Effects] = [:]
+            for item in changedSIL {
+                rootExecutionEffects[item.record.mangledName] = item.record.effects
+                fallbackImageExecutionEffectEnvelope.mayAllocate =
+                    fallbackImageExecutionEffectEnvelope.mayAllocate
+                        || item.record.effects.mayAllocate
+                fallbackImageExecutionEffectEnvelope.hasExternalSideEffects =
+                    fallbackImageExecutionEffectEnvelope.hasExternalSideEffects
+                        || item.record.effects.hasExternalSideEffects
+            }
             let optimizedImageFunctions = try discoverImageFunctions(
                 in: silFile,
                 startingAt: compilationSymbols,
                 archive: request.archive,
                 moduleName: moduleName,
-                typeEnvironment: silTypeEnvironment
+                typeEnvironment: silTypeEnvironment,
+                rootExecutionEffects: rootExecutionEffects
             )
             let semanticImageFunctions = try discoverImageFunctions(
                 in: loweringSILFile,
                 startingAt: compilationSymbols,
                 archive: request.archive,
                 moduleName: moduleName,
-                typeEnvironment: loweringTypeEnvironment
+                typeEnvironment: loweringTypeEnvironment,
+                rootExecutionEffects: rootExecutionEffects
             )
             let imageSymbols = Set(optimizedImageFunctions.keys)
                 .union(semanticImageFunctions.keys)
@@ -523,12 +530,17 @@ extension ReleaseCompiler {
                         reason: "optimized and semantic SIL disagree on its physical ABI adapter"
                     )
                 }
+                let executionEffectEnvelope = mergeExecutionEffectEnvelopes(
+                    optimized?.executionEffectEnvelope,
+                    semantic?.executionEffectEnvelope
+                ) ?? fallbackImageExecutionEffectEnvelope
                 let optimizedSignature = try optimized.map {
                     try generatedSignature(
                         of: $0.function,
                         environment: silTypeEnvironment,
                         symbol: symbol,
-                        kind: $0.kind
+                        kind: $0.kind,
+                        executionEffectEnvelope: executionEffectEnvelope
                     )
                 }
                 let semanticSignature = try semantic.map {
@@ -536,7 +548,8 @@ extension ReleaseCompiler {
                         of: $0.function,
                         environment: loweringTypeEnvironment,
                         symbol: symbol,
-                        kind: $0.kind
+                        kind: $0.kind,
+                        executionEffectEnvelope: executionEffectEnvelope
                     )
                 }
                 if let optimizedSignature, let semanticSignature,
@@ -607,8 +620,7 @@ extension ReleaseCompiler {
                     displayName: item.record.canonicalDeclaration,
                     directCalls: directCalls,
                     expectedEffects: item.record.effects,
-                    hasDistinctSemanticFallback:
-                        request.archive.metadata.frontendInvocation.optimization != "-Onone"
+                    hasDistinctSemanticFallback: hasDistinctSemanticFallback
                 )
                 let actualParameters = lowered.parameterRegisters.compactMap { register in
                     lowered.registerTypes.indices.contains(Int(register.rawValue))
@@ -864,7 +876,8 @@ extension ReleaseCompiler {
             startingAt archivedSymbols: Set<String>,
             archive: InterfaceArchive.Archive,
             moduleName: String,
-            typeEnvironment: CanonicalSIL.TypeEnvironment
+            typeEnvironment: CanonicalSIL.TypeEnvironment,
+            rootExecutionEffects: [String: Core.Effects]
         ) throws -> [String: DiscoveredImageFunction] {
             do {
                 let existingSymbols = Set(archive.functions.map(\.mangledName))
@@ -875,8 +888,17 @@ extension ReleaseCompiler {
                 var discovered = try CanonicalSIL.ImageFunctions.discover(
                     in: file,
                     startingAt: archivedSymbols.union(hostedSymbols),
-                    excluding: Set(archive.functions.map(\.mangledName)),
+                    excluding: Set(archive.functions.map(\.mangledName)).union(
+                        archive.nativeImports.flatMap { record in
+                            record.parameterProjection.defaultArguments.compactMap {
+                                argument in
+                                argument.origin == .externalGenerator
+                                    ? argument.generatorSymbol : nil
+                            }
+                        }
+                    ),
                     environment: typeEnvironment,
+                    executionEffectsByRoot: rootExecutionEffects,
                     kindForSymbol: { symbol in
                         generatedFunctionKind(
                             symbol,
@@ -888,10 +910,13 @@ extension ReleaseCompiler {
                     }
                 )
                 for candidate in hostedCandidates {
+                    let executionEffectEnvelope = discovered[candidate.symbol]?
+                        .executionEffectEnvelope
                     discovered[candidate.symbol] = .init(
                         function: candidate.function,
                         kind: .ordinary,
-                        abiAdapter: .direct
+                        abiAdapter: .direct,
+                        executionEffectEnvelope: executionEffectEnvelope
                     )
                 }
                 return discovered
@@ -903,18 +928,32 @@ extension ReleaseCompiler {
             }
         }
 
+        private func mergeExecutionEffectEnvelopes(
+            _ left: Core.Effects?,
+            _ right: Core.Effects?
+        ) -> Core.Effects? {
+            guard left != nil || right != nil else { return nil }
+            return .init(
+                mayAllocate: left?.mayAllocate == true || right?.mayAllocate == true,
+                hasExternalSideEffects: left?.hasExternalSideEffects == true
+                    || right?.hasExternalSideEffects == true
+            )
+        }
+
         private func generatedSignature(
             of function: CanonicalSIL.Function,
             environment: CanonicalSIL.TypeEnvironment,
             symbol: String,
-            kind: Bytecode.FunctionKind
+            kind: Bytecode.FunctionKind,
+            executionEffectEnvelope: Core.Effects
         ) throws -> ImageSignature {
             do {
                 return try CanonicalSIL.ImageFunctions.signature(
                     of: function,
                     environment: environment,
                     symbol: symbol,
-                    kind: kind
+                    kind: kind,
+                    executionEffectEnvelope: executionEffectEnvelope
                 )
             } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
                 switch error {

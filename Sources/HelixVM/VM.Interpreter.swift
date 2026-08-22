@@ -223,7 +223,10 @@ public struct Interpreter: Sendable {
             guard let function = functions[closure.functionID],
                   function.kind == .closureBody,
                   function.resultType == closure.signature.result,
-                  function.effects == closure.signature.effects,
+                  closure.signature.hasCanonicalCallableEffects,
+                  Bytecode.ClosureSignature.callableEffects(
+                      from: function.effects
+                  ) == closure.signature.effects,
                   !function.effects.isAsync,
                   !function.effects.mayThrow,
                   function.parameterRegisters.count
@@ -4228,7 +4231,9 @@ public struct Interpreter: Sendable {
                     let values = try arguments.map { try read($0, registers: registers) }
                     try chargeCallShape(values, budget: budget)
                     guard values.count == invoker.parameterTypes.count,
-                          zip(values, invoker.parameterTypes).allSatisfy({ $0.matches($1) })
+                          zip(values, invoker.parameterTypes).allSatisfy({
+                              $0.matches($1)
+                          })
                     else {
                         throw VM.RuntimeTrap.nativeFailure("runtime argument check failed for import \(importID)")
                     }
@@ -4318,18 +4323,15 @@ public struct Interpreter: Sendable {
                             ).type
                         )
                     }
-                    guard closure.dynamicScope == nil else {
-                        throw VM.RuntimeTrap.explicit(
-                            "a scoped closure cannot be wrapped again"
-                        )
-                    }
                     try initialize(
                         .closure(
                             .init(
                                 functionID: closure.functionID,
                                 signature: closure.signature,
                                 captures: closure.captures,
-                                dynamicScope: .init()
+                                dynamicScope: .init(
+                                    parent: closure.dynamicScope
+                                )
                             )
                         ),
                         register: result,
@@ -4555,7 +4557,9 @@ public struct Interpreter: Sendable {
                     let values = try arguments.map { try read($0, registers: registers) }
                     try chargeCallShape(values, budget: budget)
                     guard values.count == invoker.parameterTypes.count,
-                          zip(values, invoker.parameterTypes).allSatisfy({ $0.matches($1) })
+                          zip(values, invoker.parameterTypes).allSatisfy({
+                              $0.matches($1)
+                          })
                     else {
                         throw VM.RuntimeTrap.nativeFailure(
                             "runtime argument check failed for import \(importID)"
@@ -5446,7 +5450,7 @@ public struct Interpreter: Sendable {
             switch value {
             case let .closure(closure):
                 if let dynamicScope = closure.dynamicScope,
-                   dynamicScope === scope {
+                   dynamicScope.depends(on: scope) {
                     return true
                 }
                 for capture in closure.captures {

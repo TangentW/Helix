@@ -356,7 +356,9 @@ public struct Indexer: Sendable {
         if !candidate.hasCompleteDynamicCoverage {
             return .rejected("HLXIDX010", explanation: "one or more call sites contain an inlined copy")
         }
-        if (candidate.parameterTypes + [candidate.resultType]).contains(where: containsClosure) {
+        if (candidate.parameterTypes + [candidate.resultType]).contains(
+            where: \.containsClosureValue
+        ) {
             return .rejected(
                 "HLXIDX022",
                 explanation: "closure-valued declarations are patch-local helpers and cannot be Shell roots"
@@ -425,22 +427,6 @@ public struct Indexer: Sendable {
                 && isSupportedType(value, allowVoid: false)
         case let .set(element):
             element.isVMHashable && isSupportedType(element, allowVoid: false)
-        }
-    }
-
-    private func containsClosure(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .closure:
-            true
-        case let .array(element), let .optional(element), let .set(element),
-             let .address(element):
-            containsClosure(element)
-        case let .dictionary(key, value):
-            containsClosure(key) || containsClosure(value)
-        case let .tuple(elements):
-            elements.contains(where: containsClosure)
-        default:
-            false
         }
     }
 

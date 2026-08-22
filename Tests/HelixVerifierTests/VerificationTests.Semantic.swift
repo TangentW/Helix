@@ -59,6 +59,50 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Shell NativeImports require one current logical callback contract")
+    func rejectsInconsistentNativeImportSignature() throws {
+        let fixture = try makeFixture()
+        let callback = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .void
+        )
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: false,
+            callbacks: [
+                .init(parameterIndex: 0, lifetime: .nonescaping),
+            ]
+        )
+        let descriptor = Verification.ResolvedNativeImport(
+            id: .init(rawValue: 0),
+            key: .init(rawValue: .sha256("invalid-native-signature")),
+            parameterTypes: [.closure(callback)],
+            resultType: .void,
+            signature: .init(parameters: [], result: "Swift.Void"),
+            effects: .init(),
+            contract: contract
+        )
+
+        #expect(
+            throws: Verification.Error.invalidShellInterface(
+                "native import 0 has inconsistent signature, effects, isolation, or capability"
+            )
+        ) {
+            try Verification.ShellInterface(
+                interfaceHash: fixture.shell.interfaceHash,
+                compatibility: fixture.shell.compatibility,
+                capabilities: fixture.shell.capabilities.union([
+                    .nativeImportsV1, .closureValuesV1,
+                ]),
+                imports: [descriptor]
+            )
+        }
+    }
+
     @Test("A module for another Shell is rejected")
     func rejectsWrongShell() throws {
         let fixture = try makeFixture()
@@ -3941,6 +3985,148 @@ struct SemanticVerifier {
         #expect(image.module.functions[2].resultType == .closure(signature))
     }
 
+    @Test("Closure construction gates target authority outside its callable type")
+    func validatesClosureTargetAuthority() throws {
+        let formal = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .int64
+        )
+        let authority = Core.Effects(
+            mayAllocate: true,
+            hasExternalSideEffects: true
+        )
+        var fixture = try makeFixture { root in
+            root.registerTypes.append(contentsOf: [
+                .closure(formal), .int64,
+            ])
+            root.blocks[0].instructions = [
+                .makeClosure(
+                    result: .init(rawValue: 1),
+                    function: .init(rawValue: 1),
+                    captures: [.init(rawValue: 0)]
+                ),
+                .apply(
+                    result: .init(rawValue: 2),
+                    function: .init(rawValue: 2),
+                    arguments: [.init(rawValue: 1)]
+                ),
+                .returnValue(.init(rawValue: 2)),
+            ]
+            root.effects = authority
+        }
+        fixture.module.functions.append(contentsOf: [
+            .init(
+                id: .init(rawValue: 1),
+                name: "authorizedClosureBody",
+                kind: .closureBody,
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: .int64,
+                registerTypes: [.int64],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [.returnValue(.init(rawValue: 0))]
+                    ),
+                ],
+                effects: authority
+            ),
+            .init(
+                id: .init(rawValue: 2),
+                name: "invoke",
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: .int64,
+                registerTypes: [.closure(formal), .int64],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .closureApply(
+                                result: .init(rawValue: 1),
+                                closure: .init(rawValue: 0),
+                                arguments: []
+                            ),
+                            .returnValue(.init(rawValue: 1)),
+                        ]
+                    ),
+                ]
+            ),
+        ])
+        fixture.module.capabilities.insert(.closureValuesV1)
+        fixture.shell.capabilities.insert(.closureValuesV1)
+        fixture.policy.acceptedCapabilities.insert(.closureValuesV1)
+        fixture.shell.entries[.init(rawValue: 0)]?.effects = authority
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var unauthorized = fixture
+        unauthorized.module.functions[0].effects = .init()
+        unauthorized.shell.entries[.init(rawValue: 0)]?.effects = .init()
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "make_closure captures allocating target authority "
+                    + "in a nonallocating function"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(unauthorized.module),
+                shell: unauthorized.shell,
+                policy: unauthorized.policy
+            )
+        }
+
+        var authorityInType = fixture
+        var invalidSignature = formal
+        invalidSignature.effects.mayAllocate = true
+        authorityInType.module.functions[0].registerTypes[1] = .closure(
+            invalidSignature
+        )
+        #expect(
+            throws: Verification.Error.invalidFunction(
+                function: .init(rawValue: 0),
+                reason: "closure signature cannot carry execution authority"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(authorityInType.module),
+                shell: authorityInType.shell,
+                policy: authorityInType.policy
+            )
+        }
+
+        var actorMismatch = fixture
+        var actorFormal = formal
+        actorFormal.effects.requiresMainActor = true
+        actorMismatch.module.functions[2].registerTypes[0] = .closure(
+            actorFormal
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "call argument type mismatch"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(actorMismatch.module),
+                shell: actorMismatch.shell,
+                policy: actorMismatch.policy
+            )
+        }
+    }
+
     @Test("A closure may capture another closure only with escaping capability")
     func validatesNestedClosureCaptureCapability() throws {
         var fixture = try makeClosureFixture()
@@ -4179,6 +4365,57 @@ struct SemanticVerifier {
             shell: valid.shell,
             policy: valid.policy
         )
+
+        var nested = valid
+        nested.module.functions[0].registerTypes.append(.closure(signature))
+        nested.module.functions[0].blocks[0].instructions = [
+            .makeClosure(
+                result: .init(rawValue: 1),
+                function: .init(rawValue: 1),
+                captures: [.init(rawValue: 0)]
+            ),
+            .beginClosureScope(
+                result: .init(rawValue: 3),
+                closure: .init(rawValue: 1)
+            ),
+            .beginClosureScope(
+                result: .init(rawValue: 4),
+                closure: .init(rawValue: 3)
+            ),
+            .closureApply(
+                result: .init(rawValue: 2),
+                closure: .init(rawValue: 4),
+                arguments: [.init(rawValue: 0)]
+            ),
+            .endClosureScope(closure: .init(rawValue: 4)),
+            .endClosureScope(closure: .init(rawValue: 3)),
+            .returnValue(.init(rawValue: 2)),
+        ]
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(nested.module),
+            shell: nested.shell,
+            policy: nested.policy
+        )
+
+        var wrongNestedOrder = nested
+        wrongNestedOrder.module.functions[0].blocks[0].instructions.swapAt(
+            4,
+            5
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 4,
+                reason: "an outer closure scope cannot end before its nested scope"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(wrongNestedOrder.module),
+                shell: wrongNestedOrder.shell,
+                policy: wrongNestedOrder.policy
+            )
+        }
 
         var splitExit = valid
         splitExit.module.functions[0].registerTypes.append(.bool)

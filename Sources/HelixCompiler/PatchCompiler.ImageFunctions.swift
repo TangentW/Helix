@@ -23,6 +23,7 @@ enum ImageFunctions {
         rootID: Bytecode.FunctionID,
         typeEnvironment: CanonicalSIL.TypeEnvironment,
         directCalls: CanonicalSIL.DirectCallTable,
+        executionEffectEnvelope: Core.Effects,
         shellDeclarationSymbols: Set<String>
     ) throws -> Plan {
         let hostedCandidates = try typeEnvironment.hostedMethodCandidates(in: file)
@@ -36,8 +37,13 @@ enum ImageFunctions {
             discovered = try CanonicalSIL.ImageFunctions.discover(
                 in: file,
                 startingAt: rootSymbols,
-                excluding: directCalls.boundSymbols.union(rootSymbols),
+                excluding: directCalls.boundSymbols
+                    .union(rootSymbols)
+                    .union(directCalls.nativeDefaultArgumentGeneratorSymbols),
                 environment: typeEnvironment,
+                executionEffectsByRoot: [
+                    root.mangledName: executionEffectEnvelope,
+                ],
                 kindForSymbol: { symbol in
                     kind(
                         for: symbol,
@@ -52,10 +58,13 @@ enum ImageFunctions {
             throw map(error)
         }
         for candidate in hostedCandidates {
+            let executionEffectEnvelope = discovered[candidate.symbol]?
+                .executionEffectEnvelope
             discovered[candidate.symbol] = .init(
                 function: candidate.function,
                 kind: .ordinary,
-                abiAdapter: .direct
+                abiAdapter: .direct,
+                executionEffectEnvelope: executionEffectEnvelope
             )
         }
 
@@ -72,7 +81,9 @@ enum ImageFunctions {
                     of: item.function,
                     environment: typeEnvironment,
                     symbol: symbol,
-                    kind: item.kind
+                    kind: item.kind,
+                    executionEffectEnvelope: item.executionEffectEnvelope
+                        ?? executionEffectEnvelope
                 )
             } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
                 throw map(error)

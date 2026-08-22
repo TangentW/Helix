@@ -94,14 +94,43 @@ Both workflows depend on stable, build-specific identities:
   the immutable generation lease and closure context, reuses an enclosing
   pinned context when one still exists, and otherwise creates a fresh bounded
   callback invocation against the original image. Same-thread recursion is
-  allowed, but overlapping cross-thread calls through one handle fail closed;
-  this runtime mechanism does not claim general Swift `Sendable` semantics.
+  allowed, but the Runtime Engine serializes callback execution globally and
+  rejects overlapping cross-thread callbacks, even through different handles.
+  While a NativeImport is active, a callback also cannot hop away from the
+  importing thread. A detached escaping callback may run later on another
+  thread only after entering that same serialized domain. This mechanism does
+  not claim general Swift `Sendable` semantics.
   Dynamic lexical scopes cannot enter an escaping handle;
   callback arguments are re-encoded and shape-checked at every invocation.
   Because a nonthrowing native closure has no error channel, the automatic
   profile currently accepts synchronous, nonthrowing, `Void` callbacks only:
   a synchronous failure becomes the containing NativeImport trap, while a
   later escaping failure is reported through pinned Runtime telemetry.
+  Discovery derives the callback's source spelling from typed AST, its
+  `@noescape`/escaping authority from canonical SIL, and its global-actor
+  requirement from both the applied expression and the closure body's SIL
+  isolation metadata. Generated adapters therefore cover Swift closure and
+  Objective-C block parameters without framework-specific callback code; the
+  block-storage, copy, and noescape reabstraction thunks remain compiler-only
+  ownership plumbing, while the original logical VM closure type is preserved.
+  Native calls such as `UIView.performWithoutAnimation`, `UIView.animate`, and
+  `DispatchQueue.main.async` use this same path. The last API schedules an
+  escaping callback but does not imply support for Swift `async` closure ABIs.
+  If source syntax omits SDK defaults, HLXI records a checked physical-to-logical
+  parameter projection: lowering proves each erased SIL value came from that
+  declaration's default generator or an exact typed `Optional.none`, and the
+  generated Swift call supplies the default normally. A closure value records
+  only its exact Swift callable ABI: parameter shape and ownership, result,
+  throwing behavior, global actor, and async behavior. Allocation and external
+  side-effect authority remain properties of the concrete closure body;
+  verification permits `make_closure` only when the creator already has that
+  authority. Possession of the resulting image-local capability then permits
+  higher-order invocation without adding execution authority to the closure
+  type. Parameters, results, captures, represented aggregate wrappers, and
+  NativeImport callback positions all preserve the exact canonical closure
+  signature—there is no effect-authority variance at those boundaries. Shell
+  entry signatures and ordinary native value slots remain closure-free. These
+  are v1 contract fields and do not introduce a compatibility version split.
 - Array, Dictionary, and Set are typed VM values rather than projections of
   private Swift runtime layouts. One bounded recursive value-semantics model
   supplies VM-defined Equatable and Hashable behavior for supported scalars and

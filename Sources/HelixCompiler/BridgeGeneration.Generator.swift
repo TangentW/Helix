@@ -451,22 +451,43 @@ public struct Generator: Sendable {
     }
 
     private indirect enum SwiftTypeShape {
+        struct FunctionAttributes {
+            var isSendable: Bool
+            var globalActor: String?
+        }
+
         case named(String)
         case array(SwiftTypeShape)
         case dictionary(key: SwiftTypeShape, value: SwiftTypeShape)
         case set(SwiftTypeShape)
         case optional(SwiftTypeShape)
         case tuple([SwiftTypeShape])
+        case function(
+            attributes: FunctionAttributes,
+            parameters: [SwiftTypeShape],
+            result: SwiftTypeShape
+        )
 
         var rendered: String {
             switch self {
-            case let .named(name): name == "Swift.Any" ? "Any" : name
-            case let .array(element): "Swift.Array<\(element.rendered)>"
+            case let .named(name): return name == "Swift.Any" ? "Any" : name
+            case let .array(element): return "Swift.Array<\(element.rendered)>"
             case let .dictionary(key, value):
-                "Swift.Dictionary<\(key.rendered), \(value.rendered)>"
-            case let .set(element): "Swift.Set<\(element.rendered)>"
-            case let .optional(wrapped): "Swift.Optional<\(wrapped.rendered)>"
-            case let .tuple(elements): "(\(elements.map(\.rendered).joined(separator: ", ")))"
+                return "Swift.Dictionary<\(key.rendered), \(value.rendered)>"
+            case let .set(element): return "Swift.Set<\(element.rendered)>"
+            case let .optional(wrapped): return "Swift.Optional<\(wrapped.rendered)>"
+            case let .tuple(elements):
+                return "(\(elements.map(\.rendered).joined(separator: ", ")))"
+            case let .function(attributes, parameters, result):
+                var annotations: [String] = []
+                if let actor = attributes.globalActor {
+                    annotations.append("@\(actor)")
+                }
+                if attributes.isSendable { annotations.append("@Sendable") }
+                let prefix = annotations.isEmpty
+                    ? "" : annotations.joined(separator: " ") + " "
+                return prefix + "(\(parameters.map(\.rendered).joined(separator: ", ")))"
+                    + " -> \(result.rendered)"
             }
         }
     }
@@ -543,6 +564,12 @@ public struct Generator: Sendable {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { throw BridgeGeneration.Error.invalidSwiftType(raw) }
         try validateBalancedDelimiters(value)
+        if let function = try parseSwiftFunctionType(value) {
+            return function
+        }
+        if value.hasPrefix("@") {
+            throw BridgeGeneration.Error.invalidSwiftType(raw)
+        }
         if value.hasSuffix("?") {
             return .optional(try parseSwiftType(String(value.dropLast())))
         }
@@ -608,13 +635,224 @@ public struct Generator: Sendable {
         return .named(value)
     }
 
+    private func parseSwiftFunctionType(
+        _ raw: String
+    ) throws -> SwiftTypeShape? {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var isSendable = false
+        var globalActor: String?
+        var hasEscaping = false
+        var hasExplicitConvention = false
+        while value.hasPrefix("@") {
+            guard let annotation = consumeSwiftTypeAnnotation(from: &value) else {
+                throw BridgeGeneration.Error.invalidSwiftType(raw)
+            }
+            switch annotation {
+            case "escaping":
+                guard !hasEscaping else {
+                    throw BridgeGeneration.Error.invalidSwiftType(raw)
+                }
+                hasEscaping = true
+            case "convention(block)", "convention(swift)":
+                guard !hasExplicitConvention else {
+                    throw BridgeGeneration.Error.invalidSwiftType(raw)
+                }
+                hasExplicitConvention = true
+            case "Sendable":
+                guard !isSendable else {
+                    throw BridgeGeneration.Error.invalidSwiftType(raw)
+                }
+                isSendable = true
+            default:
+                guard isGlobalActorTypeAnnotation(annotation),
+                      globalActor == nil
+                else { throw BridgeGeneration.Error.invalidSwiftType(raw) }
+                globalActor = annotation
+            }
+        }
+        guard let arrow = topLevelSwiftFunctionArrow(in: value) else {
+            if let unwrapped = removingSwiftTypeParentheses(value) {
+                var annotations: [String] = []
+                if let globalActor { annotations.append("@\(globalActor)") }
+                if isSendable { annotations.append("@Sendable") }
+                let prefix = annotations.isEmpty
+                    ? "" : annotations.joined(separator: " ") + " "
+                return try parseSwiftFunctionType(prefix + unwrapped)
+            }
+            return nil
+        }
+        let left = value[..<arrow.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = value[arrow.upperBound...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard left.first == "(", !result.isEmpty,
+              let close = matchingSwiftTypeParenthesis(
+                  for: left.startIndex,
+                  in: left
+              )
+        else { throw BridgeGeneration.Error.invalidSwiftType(raw) }
+        let effects = left[left.index(after: close)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard effects.isEmpty else {
+            // Async and throwing callback ABIs require a different Runtime
+            // error/suspension contract and are intentionally not erased.
+            throw BridgeGeneration.Error.invalidSwiftType(raw)
+        }
+        let body = String(left[left.index(after: left.startIndex)..<close])
+        let parameterSpellings = body.isEmpty ? [] : try splitTopLevel(body)
+        let parameters = try parameterSpellings.map { parameter in
+            try parseSwiftType(removingSwiftTupleLabel(parameter))
+        }
+        return .function(
+            attributes: .init(
+                isSendable: isSendable,
+                globalActor: globalActor
+            ),
+            parameters: parameters,
+            result: try parseSwiftType(result)
+        )
+    }
+
+    private func consumeSwiftTypeAnnotation(
+        from value: inout String
+    ) -> String? {
+        guard value.first == "@" else { return nil }
+        var index = value.index(after: value.startIndex)
+        let start = index
+        while index < value.endIndex,
+              value[index] == "." || value[index] == "_"
+                || value[index].isLetter || value[index].isNumber {
+            index = value.index(after: index)
+        }
+        guard index > start else { return nil }
+        var annotation = String(value[start..<index])
+        if index < value.endIndex, value[index] == "(" {
+            guard let close = matchingSwiftTypeParenthesis(
+                for: index,
+                in: value
+            ) else { return nil }
+            annotation += value[index...close]
+            index = value.index(after: close)
+        }
+        guard index == value.endIndex || value[index].isWhitespace else {
+            return nil
+        }
+        value.removeSubrange(value.startIndex..<index)
+        value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return annotation
+    }
+
+    private func isGlobalActorTypeAnnotation(_ value: String) -> Bool {
+        let components = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard components.last?.hasSuffix("Actor") == true else { return false }
+        return components.allSatisfy { component in
+            guard let first = component.first,
+                  first == "_" || first.isLetter
+            else { return false }
+            return component.dropFirst().allSatisfy {
+                $0 == "_" || $0.isLetter || $0.isNumber
+            }
+        }
+    }
+
+    private func removingSwiftTypeParentheses(_ value: String) -> String? {
+        guard value.first == "(",
+              let close = matchingSwiftTypeParenthesis(
+                  for: value.startIndex,
+                  in: value
+              ), close == value.index(before: value.endIndex)
+        else { return nil }
+        return String(value[value.index(after: value.startIndex)..<close])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func matchingSwiftTypeParenthesis<S: StringProtocol>(
+        for open: S.Index,
+        in value: S
+    ) -> S.Index? {
+        var depth = 0
+        var index = open
+        while index < value.endIndex {
+            switch value[index] {
+            case "(": depth += 1
+            case ")":
+                depth -= 1
+                if depth == 0 { return index }
+            default: break
+            }
+            guard depth >= 0 else { return nil }
+            index = value.index(after: index)
+        }
+        return nil
+    }
+
+    private func topLevelSwiftFunctionArrow(
+        in value: String
+    ) -> Range<String.Index>? {
+        var angleDepth = 0
+        var parenthesisDepth = 0
+        var bracketDepth = 0
+        var index = value.startIndex
+        while index < value.endIndex {
+            switch value[index] {
+            case "<": angleDepth += 1
+            case ">":
+                let previous = index > value.startIndex
+                    ? value[value.index(before: index)] : nil
+                if previous != "-" { angleDepth -= 1 }
+            case "(": parenthesisDepth += 1
+            case ")": parenthesisDepth -= 1
+            case "[": bracketDepth += 1
+            case "]": bracketDepth -= 1
+            case "-" where angleDepth == 0 && parenthesisDepth == 0
+                    && bracketDepth == 0:
+                let next = value.index(after: index)
+                if next < value.endIndex, value[next] == ">" {
+                    return index..<value.index(after: next)
+                }
+            default: break
+            }
+            guard angleDepth >= 0, parenthesisDepth >= 0,
+                  bracketDepth >= 0
+            else { return nil }
+            index = value.index(after: index)
+        }
+        return nil
+    }
+
+    private func removingSwiftTupleLabel(_ raw: String) -> String {
+        var angleDepth = 0
+        var parenthesisDepth = 0
+        var bracketDepth = 0
+        for index in raw.indices {
+            switch raw[index] {
+            case "<": angleDepth += 1
+            case ">":
+                let previous = index > raw.startIndex
+                    ? raw[raw.index(before: index)] : nil
+                if previous != "-" { angleDepth -= 1 }
+            case "(": parenthesisDepth += 1
+            case ")": parenthesisDepth -= 1
+            case "[": bracketDepth += 1
+            case "]": bracketDepth -= 1
+            case ":" where angleDepth == 0 && parenthesisDepth == 0
+                    && bracketDepth == 0:
+                return String(raw[raw.index(after: index)...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            default: break
+            }
+        }
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func validateBalancedDelimiters(_ value: String) throws {
         var angleDepth = 0
         var parenthesisDepth = 0
+        var previous: Character?
         for character in value {
             switch character {
             case "<": angleDepth += 1
-            case ">": angleDepth -= 1
+            case ">" where previous != "-": angleDepth -= 1
             case "(": parenthesisDepth += 1
             case ")": parenthesisDepth -= 1
             default: break
@@ -622,6 +860,7 @@ public struct Generator: Sendable {
             guard angleDepth >= 0, parenthesisDepth >= 0 else {
                 throw BridgeGeneration.Error.invalidSwiftType(value)
             }
+            previous = character
         }
         guard angleDepth == 0, parenthesisDepth == 0 else {
             throw BridgeGeneration.Error.invalidSwiftType(value)
@@ -637,7 +876,9 @@ public struct Generator: Sendable {
             switch value[index] {
             case "<": angleDepth += 1
             case ">":
-                angleDepth -= 1
+                let previous = index > value.startIndex
+                    ? value[value.index(before: index)] : nil
+                if previous != "-" { angleDepth -= 1 }
                 guard angleDepth >= 0 else {
                     throw BridgeGeneration.Error.invalidSwiftType(value)
                 }
@@ -667,7 +908,10 @@ public struct Generator: Sendable {
         for index in value.indices {
             switch value[index] {
             case "<": angleDepth += 1
-            case ">": angleDepth -= 1
+            case ">":
+                let previous = index > value.startIndex
+                    ? value[value.index(before: index)] : nil
+                if previous != "-" { angleDepth -= 1 }
             case "(": parenthesisDepth += 1
             case ")": parenthesisDepth -= 1
             case "[": squareDepth += 1
@@ -743,6 +987,30 @@ public struct Generator: Sendable {
             return shapes.count == types.count && zip(shapes, types).allSatisfy {
                 swiftTypeMatches($0.0, type: $0.1, archive: archive)
             }
+        case let (
+            .function(attributes, parameterShapes, resultShape),
+            .closure(signature)
+        ):
+            let requiresMainActor: Bool
+            switch attributes.globalActor {
+            case nil:
+                requiresMainActor = false
+            case "MainActor", "Swift.MainActor":
+                requiresMainActor = true
+            default:
+                return false
+            }
+            return signature.effects.requiresMainActor == requiresMainActor
+                && parameterShapes.count == signature.parameters.count
+                && signature.isNativeBridgeCallback
+                && zip(parameterShapes, signature.parameters).allSatisfy {
+                    swiftTypeMatches($0.0, type: $0.1, archive: archive)
+                }
+                && swiftTypeMatches(
+                    resultShape,
+                    type: signature.result,
+                    archive: archive
+                )
         case let (.named(name), .bool):
             return ["Bool", "Swift.Bool"].contains(name)
         case let (.named(name), .string):
@@ -1067,9 +1335,22 @@ public struct Generator: Sendable {
         record: InterfaceArchive.NativeImportRecord
     ) throws -> String {
         let shapes = try generated.parameterSwiftTypes.map(parseSwiftType)
-        let decoded = zip(shapes, record.parameterTypes).enumerated().map { offset, pair in
+        let callbackByParameter = Dictionary(
+            uniqueKeysWithValues: record.contract.callbacks.map {
+                (Int($0.parameterIndex), $0)
+            }
+        )
+        let decoded = try zip(shapes, record.parameterTypes).enumerated().map {
+            offset, pair in
             let binding = generated.dispatch == .instanceValueSetter
                 && offset == record.parameterTypes.count - 1 ? "var" : "let"
+            if callbackByParameter[offset] != nil {
+                return try renderGeneratedNativeCallbackParameter(
+                    offset: offset,
+                    shape: pair.0,
+                    type: pair.1
+                )
+            }
             return "\(binding) argument\(offset): \(pair.0.rendered) = "
                 + renderDecode(
                     expression: "arguments[\(offset)]",
@@ -1146,6 +1427,93 @@ public struct Generator: Sendable {
         \(indent(body, spaces: 20))
                 }
             )
+        }
+        """
+    }
+
+    private func renderGeneratedNativeCallbackParameter(
+        offset: Int,
+        shape: SwiftTypeShape,
+        type: Bytecode.ValueType
+    ) throws -> String {
+        switch (shape, type) {
+        case let (.function(_, parameterShapes, _), .closure(signature)):
+            let callbackName = "nativeCallback\(offset)"
+            let wrapper = try renderGeneratedNativeCallbackWrapper(
+                callbackName: callbackName,
+                parameterShapes: parameterShapes,
+                signature: signature
+            )
+            return """
+            let \(callbackName) = try context.makeCallback(
+                parameterIndex: \(offset),
+                from: arguments[\(offset)]
+            )
+            let argument\(offset): \(shape.rendered) = \(wrapper)
+            """
+        case let (
+            .optional(.function(_, parameterShapes, _)),
+            .optional(.closure(signature))
+        ):
+            let callbackName = "nativeCallback\(offset)"
+            let wrapper = try renderGeneratedNativeCallbackWrapper(
+                callbackName: callbackName,
+                parameterShapes: parameterShapes,
+                signature: signature
+            )
+            return """
+            let argument\(offset): \(shape.rendered) = try Runtime.BridgeValueCodec.decodeOptional(
+                arguments[\(offset)]
+            ) { callbackValue in
+                let \(callbackName) = try context.makeCallback(
+                    parameterIndex: \(offset),
+                    from: callbackValue
+                )
+                return \(wrapper)
+            }
+            """
+        default:
+            throw BridgeGeneration.Error.invalidSwiftType(shape.rendered)
+        }
+    }
+
+    private func renderGeneratedNativeCallbackWrapper(
+        callbackName: String,
+        parameterShapes: [SwiftTypeShape],
+        signature: Bytecode.ClosureSignature
+    ) throws -> String {
+        guard parameterShapes.count == signature.parameters.count else {
+            throw BridgeGeneration.Error.invalidSwiftType(
+                "native callback parameter shape"
+            )
+        }
+        let parameters = parameterShapes.enumerated().map { index, shape in
+            "callbackArgument\(index): \(shape.rendered)"
+        }.joined(separator: ", ")
+        let encoded = zip(parameterShapes, signature.parameters).enumerated().map {
+            index, pair in
+            renderEncode(
+                expression: "callbackArgument\(index)",
+                shape: pair.0,
+                type: pair.1,
+                nativeCatalog: "try Runtime.Bridge.shared.requireNativeTypeCatalog()",
+                inputEncoder: "callbackEncoder"
+            )
+        }
+        let arguments = encoded.isEmpty
+            ? "[]"
+            : "[\n\(indent(encoded.joined(separator: ",\n"), spaces: 12))\n        ]"
+        let opening = parameters.isEmpty ? "{" : "{ (\(parameters)) in"
+        return """
+        \(opening)
+            \(callbackName).invokeVoid {
+                try Runtime.Bridge.shared.encodeNativeCallbackArguments(
+                    for: \(callbackName),
+                    count: \(signature.parameters.count)
+                ) { callbackEncoder in
+                    \(arguments)
+                }
+            }
         }
         """
     }
@@ -1581,7 +1949,11 @@ public struct Generator: Sendable {
               !record.effects.isAsync,
               record.capability == .nativeImportsV1,
               record.contract.domain == .application,
-              record.contract.execution.deadlineMode == .bounded
+              record.contract.execution.deadlineMode == .bounded,
+              areGeneratedNativeImportParameters(
+                  record.parameterTypes,
+                  callbacks: record.contract.callbacks
+              )
         else {
             throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
         }
@@ -1589,7 +1961,6 @@ public struct Generator: Sendable {
         case .globalFunction:
             guard generated.ownerType == nil,
                   record.contract.kind == .globalFunction,
-                  record.parameterTypes.allSatisfy(isGeneratedValueType),
                   isGeneratedResultType(record.resultType)
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
@@ -1599,7 +1970,6 @@ public struct Generator: Sendable {
                   let owner = generated.ownerType,
                   generated.baseName == "init",
                   isValidGeneratedSwiftTypeSpelling(owner),
-                  record.parameterTypes.allSatisfy(isGeneratedValueType),
                   isNativeType(record.resultType),
                   generated.resultSwiftType == owner
             else {
@@ -1609,7 +1979,6 @@ public struct Generator: Sendable {
             guard record.contract.kind == .staticMethod,
                   let owner = generated.ownerType,
                   isValidGeneratedSwiftTypeSpelling(owner),
-                  record.parameterTypes.allSatisfy(isGeneratedValueType),
                   isGeneratedResultType(record.resultType)
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
@@ -1635,7 +2004,7 @@ public struct Generator: Sendable {
                   generated.parameterSwiftTypes.isEmpty,
                   record.parameterTypes.isEmpty,
                   record.resultType != .void,
-                  isGeneratedValueType(record.resultType)
+                  record.resultType.isNativeBridgeValue
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
             }
@@ -1645,7 +2014,6 @@ public struct Generator: Sendable {
                   isValidGeneratedSwiftTypeSpelling(owner),
                   generated.argumentLabels == ["_"],
                   record.parameterTypes.count == 1,
-                  isGeneratedValueType(record.parameterTypes[0]),
                   record.resultType == .void,
                   generated.resultSwiftType == "Swift.Void"
             else {
@@ -1655,7 +2023,6 @@ public struct Generator: Sendable {
             guard record.contract.kind == .instanceMethod,
                   let owner = generated.ownerType,
                   isValidGeneratedSwiftTypeSpelling(owner),
-                  record.parameterTypes.dropLast().allSatisfy(isGeneratedValueType),
                   record.parameterTypes.last.map(isNativeType) == true,
                   generated.parameterSwiftTypes.last == owner,
                   isGeneratedResultType(record.resultType)
@@ -1671,7 +2038,7 @@ public struct Generator: Sendable {
                   isNativeType(record.parameterTypes[0]),
                   generated.parameterSwiftTypes == [owner],
                   record.resultType != .void,
-                  isGeneratedValueType(record.resultType)
+                  record.resultType.isNativeBridgeValue
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
             }
@@ -1682,7 +2049,6 @@ public struct Generator: Sendable {
                   isValidGeneratedSwiftTypeSpelling(owner),
                   generated.argumentLabels == ["_"],
                   record.parameterTypes.count == 2,
-                  isGeneratedValueType(record.parameterTypes[0]),
                   isNativeType(record.parameterTypes[1]),
                   generated.parameterSwiftTypes.last == owner,
                   record.resultType == .void
@@ -1696,7 +2062,6 @@ public struct Generator: Sendable {
                   isValidGeneratedSwiftTypeSpelling(owner),
                   generated.argumentLabels == ["_"],
                   record.parameterTypes.count == 2,
-                  isGeneratedValueType(record.parameterTypes[0]),
                   isNativeType(record.parameterTypes[1]),
                   generated.parameterSwiftTypes.last == owner,
                   record.resultType == record.parameterTypes[1],
@@ -1730,36 +2095,39 @@ public struct Generator: Sendable {
         }
     }
 
-    private func isGeneratedValueType(_ type: Bytecode.ValueType) -> Bool {
-        switch type {
-        case .bool, .integer, .float, .string, .any, .native:
-            true
-        case let .array(element), let .optional(element):
-            isGeneratedValueType(element)
-        case let .set(element):
-            element.isVMHashable && isGeneratedValueType(element)
-        case let .dictionary(key, value):
-            isGeneratedDictionaryKey(key) && isGeneratedValueType(value)
-        case let .tuple(elements):
-            !elements.isEmpty && elements.allSatisfy(isGeneratedValueType)
-        case .void, .never, .local, .error, .address, .mutableCell,
-             .nonOwningReference,
-             .arrayState, .dictionaryState, .closure:
-            false
+    private func areGeneratedNativeImportParameters(
+        _ types: [Bytecode.ValueType],
+        callbacks: [Core.NativeImportCallback]
+    ) -> Bool {
+        var callbackByParameter: [Int: Core.NativeImportCallback] = [:]
+        for callback in callbacks {
+            let index = Int(callback.parameterIndex)
+            guard index < types.count,
+                  callbackByParameter.updateValue(
+                      callback,
+                      forKey: index
+                  ) == nil
+            else { return false }
+        }
+        return types.indices.allSatisfy { index in
+            if callbackByParameter[index] != nil {
+                guard let shape = types[index].directClosureShape else {
+                    return false
+                }
+                return shape.signature.isNativeBridgeCallback
+            }
+            return !types[index].containsClosureValue
+                && types[index].isNativeBridgeValue
         }
     }
 
     private func isGeneratedResultType(_ type: Bytecode.ValueType) -> Bool {
-        type == .void || isGeneratedValueType(type)
+        type == .void || type.isNativeBridgeValue
     }
 
     private func isNativeType(_ type: Bytecode.ValueType) -> Bool {
         if case .native = type { return true }
         return false
-    }
-
-    private func isGeneratedDictionaryKey(_ type: Bytecode.ValueType) -> Bool {
-        type.isVMHashable && isGeneratedValueType(type)
     }
 
     private func isValidGeneratedSwiftTypeSpelling(_ raw: String) -> Bool {
@@ -1980,7 +2348,11 @@ public struct Generator: Sendable {
     }
 
     private func render(_ contract: Core.NativeImportContract) -> String {
-        """
+        let callbacks = contract.callbacks.map { callback in
+            "Core.NativeImportCallback(parameterIndex: \(callback.parameterIndex), "
+                + "lifetime: .\(callback.lifetime.rawValue))"
+        }.joined(separator: ", ")
+        return """
         Core.NativeImportContract(
             kind: .\(contract.kind.rawValue),
             domain: Core.NativeImportDomain(rawValue: \(quoted(contract.domain.rawValue))),
@@ -1989,7 +2361,8 @@ public struct Generator: Sendable {
                 deadlineMode: .\(contract.execution.deadlineMode.rawValue),
                 maximumDurationMicroseconds: \(contract.execution.maximumDurationMicroseconds),
                 allowsMainThread: \(contract.execution.allowsMainThread)
-            )
+            ),
+            callbacks: [\(callbacks)]
         )
         """
     }

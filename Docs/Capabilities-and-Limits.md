@@ -444,6 +444,25 @@ does not by itself certify a physical device or distribution channel.
   instruction that creates or accesses it.
   Compiler-emitted fully concrete specializations are also supported when no
   archetype, metadata, or witness dependency remains.
+- Exact NativeImport callback parameters under one generated, framework-neutral
+  bridge profile. Typed AST supplies the source closure spelling; canonical SIL
+  supplies the physical `@noescape`/escaping lifetime, Objective-C block
+  reabstraction, ownership, and global-actor evidence. The current profile
+  accepts direct or Optional synchronous, nonthrowing callbacks that return
+  `Void`; callback parameters may recursively use the ordinary native bridge
+  value family, but cannot be `inout`, higher-order, or image-local values.
+  Nonescaping callbacks are valid only during the importing call. Escaping
+  callbacks may be retained by that exact native parameter, outlive the
+  originating VM invocation, and later re-enter the immutable image while
+  retaining its generation lease. Callback execution is serialized across one
+  Runtime Engine until general `Sendable` semantics exist: same-thread recursion
+  is allowed, an active import cannot hop callback execution to another thread,
+  and overlapping cross-thread callbacks fail closed. This common path covers,
+  for example, `UIView.performWithoutAnimation`, `UIView.animate`,
+  `DispatchQueue.main.async`, and `Timer.scheduledTimer`; it is not a
+  framework-specific list. Source defaults omitted beside a callback are
+  represented by a checked physical-to-logical projection and are supplied by
+  the generated Swift invocation after SIL provenance and ownership validation.
 - Top-level non-suspending `async`, `async throws`, and `@MainActor async`
   entries. Exact generated Swift wrappers preserve their ABI while HLVM runs a
   body proven not to suspend.
@@ -508,9 +527,13 @@ does not by itself certify a physical device or distribution channel.
   cancellation, and cross-suspension ownership or generation leases.
 - Actor-isolated instance roots, custom global actors, and arbitrary executor
   hops. The limited `@MainActor async` leaf case above is distinct.
-- A closure crossing a Shell Entry or NativeImport boundary, being persisted in
-  native/global/native-property state, or outliving its pinned HLVM invocation
-  or generation. Async and `@Sendable` closure semantics remain unsupported.
+- A closure crossing a Shell Entry, or crossing NativeImport outside the exact
+  callback-parameter profile above. Ordinary native values, native properties,
+  native results, and the general boundary codec cannot contain closures; only
+  an exact escaping callback parameter may retain its pinned handle. Callback
+  results other than `Void`, throwing or async callback ABIs, `inout` callback
+  parameters, higher-order callback parameters, and concurrent `Sendable`
+  execution semantics remain unsupported.
   `unowned(unsafe)` is rejected because its dangling reference cannot be made
   safe, and weak/unowned stored properties are not yet a patch-local nominal
   layout feature. A caller-owned `inout` value may be captured only by the
@@ -565,7 +588,7 @@ machine code.
 | Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM |
 | Change an existing Shell struct/enum/actor instance root or existing native static/class method | Rejected until Shell value writeback, executor, and native metatype ABI are implemented; this does not restrict image-local value-type accessors/helpers |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
-| First use a public SDK member in a managed Debug body | Supported for a uniquely measured, synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS; unfamiliar `NSError` bridges, async/generic/closure-bearing members, subscripts, and unrepresentable signatures require a full build |
+| First use a public SDK member in a managed Debug body | Supported for a uniquely measured synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. Closure-bearing methods are supported when every callback fits the exact synchronous `Void` profile above; unfamiliar error bridges, async/generic callbacks or declarations, subscripts, and unrepresentable signatures require a full build |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |

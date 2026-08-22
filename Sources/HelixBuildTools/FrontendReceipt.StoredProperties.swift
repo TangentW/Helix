@@ -222,6 +222,9 @@ extension FrontendReceipt.Adapter {
                 baseName: name,
                 argumentLabels: isSetter ? ["_"] : [],
                 parameterSwiftTypes: generatedParameterSwiftTypes,
+                parameterProjection: .identity(
+                    parameterCount: parameterTypes.count
+                ),
                 resultSwiftType: generatedResultSwiftType,
                 importedModules: propertySwiftType == generatedPropertySwiftType
                     ? [] : importedModules,

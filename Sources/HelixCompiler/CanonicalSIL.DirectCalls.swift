@@ -1,5 +1,6 @@
 import HelixBytecode
 import HelixCore
+import HelixInterface
 
 extension CanonicalSIL {
 /// A statically resolved Swift call target. Helix never performs symbol lookup
@@ -23,6 +24,7 @@ public struct DirectCallBinding: Hashable, Sendable {
     public var mangledName: String
     public var parameterTypes: [Bytecode.ValueType]
     public var parameterConventions: [Bytecode.ParameterConvention]
+    public var parameterProjection: InterfaceArchive.NativeImportParameterProjection
     public var resultType: Bytecode.ValueType
     public var effects: Core.Effects
     public var target: Target
@@ -32,6 +34,7 @@ public struct DirectCallBinding: Hashable, Sendable {
         mangledName: String,
         parameterTypes: [Bytecode.ValueType],
         parameterConventions: [Bytecode.ParameterConvention]? = nil,
+        parameterProjection: InterfaceArchive.NativeImportParameterProjection? = nil,
         resultType: Bytecode.ValueType,
         effects: Core.Effects = .init(),
         target: Target,
@@ -43,6 +46,8 @@ public struct DirectCallBinding: Hashable, Sendable {
             if case .address = type { return .inout }
             return .owned
         }
+        self.parameterProjection = parameterProjection
+            ?? .identity(parameterCount: parameterTypes.count)
         self.resultType = resultType
         self.effects = effects
         self.target = target
@@ -63,7 +68,7 @@ public struct UnavailableDirectCall: Hashable, Sendable {
 }
 
 public struct DirectCallTable: Sendable {
-    private var bindings: [String: CanonicalSIL.DirectCallBinding]
+    private var bindings: [String: [CanonicalSIL.DirectCallBinding]]
     private var unavailableCalls: [String: CanonicalSIL.UnavailableDirectCall]
 
     public static let empty = CanonicalSIL.DirectCallTable(
@@ -75,20 +80,75 @@ public struct DirectCallTable: Sendable {
         _ values: [CanonicalSIL.DirectCallBinding],
         unavailable: [CanonicalSIL.UnavailableDirectCall] = []
     ) throws {
-        var result: [String: CanonicalSIL.DirectCallBinding] = [:]
+        var result: [String: [CanonicalSIL.DirectCallBinding]] = [:]
         for value in values {
             guard !value.mangledName.isEmpty,
-                  result.updateValue(value, forKey: value.mangledName) == nil
+                  value.parameterConventions.count == value.parameterTypes.count
             else {
                 throw CanonicalSIL.LoweringError.invalidCallTable(
-                    "duplicate or empty direct-call symbol \(value.mangledName)"
+                    "empty or convention-mismatched direct-call symbol "
+                        + value.mangledName
                 )
             }
-            if case let .nativeImport(requirement) = value.target,
-               requirement.effects != value.effects {
+            if case let .nativeImport(requirement) = value.target {
+                guard requirement.effects == value.effects else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "native import \(requirement.id) effect descriptor disagrees with its call binding"
+                    )
+                }
+                do {
+                    try requirement.contract.validate(effects: value.effects)
+                } catch {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "native import \(requirement.id) has an invalid contract: \(error)"
+                    )
+                }
+                var callbackIndices = Set<Int>()
+                for callback in requirement.contract.callbacks {
+                    let index = Int(callback.parameterIndex)
+                    let expectedConvention: Bytecode.ParameterConvention =
+                        callback.lifetime == .nonescaping
+                            ? .borrowed : .owned
+                    guard value.parameterTypes.indices.contains(index),
+                          callbackIndices.insert(index).inserted,
+                          value.parameterConventions[index]
+                            == expectedConvention,
+                          let shape = value.parameterTypes[index]
+                            .directClosureShape,
+                          shape.signature.isNativeBridgeCallback,
+                          !(shape.isOptional
+                            && callback.lifetime == .nonescaping)
+                    else {
+                        throw CanonicalSIL.LoweringError.invalidCallTable(
+                            "native import \(requirement.id) callback index or shape is invalid"
+                        )
+                    }
+                }
+                guard value.parameterTypes.enumerated().allSatisfy({
+                    index, type in
+                    callbackIndices.contains(index) || !type.containsClosureValue
+                }), value.parameterConventions.enumerated().allSatisfy({
+                    index, convention in
+                    callbackIndices.contains(index) || convention == .owned
+                }) else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "native import \(requirement.id) has an undeclared callback or invalid value convention"
+                    )
+                }
+            }
+            guard value.parameterProjection.isValid(
+                logicalParameterCount: value.parameterTypes.count
+            ) else {
                 throw CanonicalSIL.LoweringError.invalidCallTable(
-                    "native import \(requirement.id) effect descriptor disagrees with its call binding"
+                    "direct-call @\(value.mangledName) has an invalid physical parameter projection"
                 )
+            }
+            if !value.parameterProjection.omittedPhysicalParameterIndices.isEmpty {
+                guard case .nativeImport = value.target else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "non-NativeImport @\(value.mangledName) omits physical parameters"
+                    )
+                }
             }
             if case let .staticKeyPathProjection(identity) = value.abiAdapter {
                 guard !identity.isEmpty,
@@ -104,6 +164,30 @@ public struct DirectCallTable: Sendable {
                     )
                 }
             }
+            if let existing = result[value.mangledName] {
+                guard case .nativeImport = value.target,
+                      existing.allSatisfy({ binding in
+                          guard case .nativeImport = binding.target else {
+                              return false
+                          }
+                          return binding.parameterProjection.logicalParameterIndices
+                                  != value.parameterProjection.logicalParameterIndices
+                              && Self.nativeVariantsArePhysicallyCompatible(
+                                  binding,
+                                  value
+                              )
+                      })
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "duplicate or physically inconsistent direct-call symbol "
+                            + value.mangledName
+                    )
+                }
+            }
+            result[value.mangledName, default: []].append(value)
+        }
+        for symbol in Array(result.keys) {
+            result[symbol]?.sort(by: Self.bindingOrder)
         }
         var unavailableBySymbol: [String: CanonicalSIL.UnavailableDirectCall] = [:]
         for item in unavailable {
@@ -123,7 +207,20 @@ public struct DirectCallTable: Sendable {
     }
 
     func binding(for mangledName: String) -> CanonicalSIL.DirectCallBinding? {
-        bindings[mangledName]
+        guard let variants = bindings[mangledName], variants.count == 1 else {
+            return nil
+        }
+        return variants[0]
+    }
+
+    func bindings(
+        for mangledName: String
+    ) -> [CanonicalSIL.DirectCallBinding] {
+        bindings[mangledName] ?? []
+    }
+
+    func hasBinding(for mangledName: String) -> Bool {
+        bindings[mangledName] != nil
     }
 
     var boundSymbols: Set<String> {
@@ -131,9 +228,20 @@ public struct DirectCallTable: Sendable {
     }
 
     var functionIDs: Set<Bytecode.FunctionID> {
-        Set(bindings.values.compactMap { binding in
+        Set(bindings.values.flatMap { $0 }.compactMap { binding in
             guard case let .function(id) = binding.target else { return nil }
             return id
+        })
+    }
+
+    var nativeDefaultArgumentGeneratorSymbols: Set<String> {
+        Set(bindings.values.flatMap { $0 }.flatMap { binding -> [String] in
+            guard case .nativeImport = binding.target else { return [] }
+            return binding.parameterProjection.defaultArguments.compactMap {
+                argument in
+                argument.origin == .externalGenerator
+                    ? argument.generatorSymbol : nil
+            }
         })
     }
 
@@ -141,13 +249,13 @@ public struct DirectCallTable: Sendable {
         _ additionalBindings: [CanonicalSIL.DirectCallBinding]
     ) throws -> CanonicalSIL.DirectCallTable {
         try CanonicalSIL.DirectCallTable(
-            Array(bindings.values) + additionalBindings,
+            bindings.values.flatMap { $0 } + additionalBindings,
             unavailable: Array(unavailableCalls.values)
         )
     }
 
     func referencesInoutCallee(in body: String) -> Bool {
-        bindings.values.contains { binding in
+        bindings.values.flatMap { $0 }.contains { binding in
             binding.parameterConventions.contains(.inout)
                 && body.contains("function_ref @\(binding.mangledName)")
         }
@@ -176,7 +284,7 @@ public struct DirectCallTable: Sendable {
             }
         })
         var byID: [Core.NativeImportID: Bytecode.ImportRequirement] = [:]
-        for binding in bindings.values {
+        for binding in bindings.values.flatMap({ $0 }) {
             guard case let .nativeImport(requirement) = binding.target,
                   referencedIDs.contains(requirement.id)
             else { continue }
@@ -196,11 +304,104 @@ public struct DirectCallTable: Sendable {
     }
 
     private init(
-        unchecked bindings: [String: CanonicalSIL.DirectCallBinding],
+        unchecked bindings: [String: [CanonicalSIL.DirectCallBinding]],
         unavailableCalls: [String: CanonicalSIL.UnavailableDirectCall]
     ) {
         self.bindings = bindings
         self.unavailableCalls = unavailableCalls
+    }
+
+    private static func bindingOrder(
+        _ lhs: CanonicalSIL.DirectCallBinding,
+        _ rhs: CanonicalSIL.DirectCallBinding
+    ) -> Bool {
+        let left = lhs.parameterProjection.logicalParameterIndices
+        let right = rhs.parameterProjection.logicalParameterIndices
+        if left != right { return left.lexicographicallyPrecedes(right) }
+        return false
+    }
+
+    private static func nativeVariantsArePhysicallyCompatible(
+        _ lhs: CanonicalSIL.DirectCallBinding,
+        _ rhs: CanonicalSIL.DirectCallBinding
+    ) -> Bool {
+        guard case let .nativeImport(lhsRequirement) = lhs.target,
+              case let .nativeImport(rhsRequirement) = rhs.target,
+              lhs.parameterProjection.physicalParameterCount
+                == rhs.parameterProjection.physicalParameterCount,
+              lhs.resultType == rhs.resultType,
+              lhs.effects == rhs.effects,
+              lhs.abiAdapter == rhs.abiAdapter
+        else { return false }
+
+        var lhsBaseContract = lhsRequirement.contract
+        var rhsBaseContract = rhsRequirement.contract
+        lhsBaseContract.callbacks = []
+        rhsBaseContract.callbacks = []
+        guard lhsBaseContract == rhsBaseContract else { return false }
+
+        let lhsParameterTypes = Dictionary(uniqueKeysWithValues: zip(
+            lhs.parameterProjection.logicalParameterIndices,
+            lhs.parameterTypes
+        ))
+        let rhsParameterTypes = Dictionary(uniqueKeysWithValues: zip(
+            rhs.parameterProjection.logicalParameterIndices,
+            rhs.parameterTypes
+        ))
+        let lhsConventions = Dictionary(uniqueKeysWithValues: zip(
+            lhs.parameterProjection.logicalParameterIndices,
+            lhs.parameterConventions
+        ))
+        let rhsConventions = Dictionary(uniqueKeysWithValues: zip(
+            rhs.parameterProjection.logicalParameterIndices,
+            rhs.parameterConventions
+        ))
+        for index in Set(lhsParameterTypes.keys).intersection(
+            rhsParameterTypes.keys
+        ) {
+            guard lhsParameterTypes[index] == rhsParameterTypes[index],
+                  lhsConventions[index] == rhsConventions[index]
+            else {
+                return false
+            }
+        }
+
+        let lhsDefaults = Dictionary(uniqueKeysWithValues:
+            lhs.parameterProjection.defaultArguments.map {
+                ($0.physicalParameterIndex, $0)
+            }
+        )
+        let rhsDefaults = Dictionary(uniqueKeysWithValues:
+            rhs.parameterProjection.defaultArguments.map {
+                ($0.physicalParameterIndex, $0)
+            }
+        )
+        for index in Set(lhsDefaults.keys).intersection(rhsDefaults.keys) {
+            guard lhsDefaults[index] == rhsDefaults[index] else { return false }
+        }
+
+        func callbackLifetimes(
+            _ binding: CanonicalSIL.DirectCallBinding,
+            _ requirement: Bytecode.ImportRequirement
+        ) -> [UInt16: Core.NativeImportCallbackLifetime] {
+            Dictionary(uniqueKeysWithValues: requirement.contract.callbacks.map {
+                callback in
+                let logicalIndex = Int(callback.parameterIndex)
+                return (
+                    binding.parameterProjection
+                        .logicalParameterIndices[logicalIndex],
+                    callback.lifetime
+                )
+            })
+        }
+        let lhsCallbacks = callbackLifetimes(lhs, lhsRequirement)
+        let rhsCallbacks = callbackLifetimes(rhs, rhsRequirement)
+        for index in Set(lhsCallbacks.keys).intersection(rhsCallbacks.keys) {
+            guard lhsCallbacks[index] == rhsCallbacks[index] else {
+                return false
+            }
+        }
+        return true
     }
 }
 }

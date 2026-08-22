@@ -6,8 +6,13 @@ extension VM {
 /// identity, allowing the interpreter to reject a scoped closure that remains
 /// reachable at scope end.
 final class ClosureScope: @unchecked Sendable, Hashable {
+    private let parent: VM.ClosureScope?
     private let lock = NSLock()
     private var isActive = true
+
+    init(parent: VM.ClosureScope? = nil) {
+        self.parent = parent
+    }
 
     static func == (lhs: VM.ClosureScope, rhs: VM.ClosureScope) -> Bool {
         lhs === rhs
@@ -18,13 +23,26 @@ final class ClosureScope: @unchecked Sendable, Hashable {
     }
 
     func requireActive() throws {
-        try lock.withLock {
-            guard isActive else {
-                throw VM.RuntimeTrap.explicit(
-                    "dynamically scoped closure was used after its lifetime ended"
-                )
+        var current: VM.ClosureScope? = self
+        while let scope = current {
+            try scope.lock.withLock {
+                guard scope.isActive else {
+                    throw VM.RuntimeTrap.explicit(
+                        "dynamically scoped closure was used after its lifetime ended"
+                    )
+                }
             }
+            current = scope.parent
         }
+    }
+
+    func depends(on ancestor: VM.ClosureScope) -> Bool {
+        var current: VM.ClosureScope? = self
+        while let scope = current {
+            if scope === ancestor { return true }
+            current = scope.parent
+        }
+        return false
     }
 
     func end() throws {

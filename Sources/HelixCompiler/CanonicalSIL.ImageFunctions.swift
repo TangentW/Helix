@@ -8,6 +8,7 @@ enum ImageFunctions {
         var function: CanonicalSIL.Function
         var kind: Bytecode.FunctionKind
         var abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter
+        var executionEffectEnvelope: Core.Effects? = nil
     }
 
     struct Signature: Equatable, Sendable {
@@ -37,21 +38,25 @@ enum ImageFunctions {
         startingAt rootSymbols: Set<String>,
         excluding excludedSymbols: Set<String>,
         environment: CanonicalSIL.TypeEnvironment,
+        executionEffectsByRoot: [String: Core.Effects] = [:],
         kindForSymbol: (String) -> Bytecode.FunctionKind?
     ) throws -> [String: Discovered] {
-        var pending = try rootSymbols.sorted().flatMap { symbol in
-            try file.function(mangledName: symbol)
-                .map {
-                    try references(
-                        in: $0,
-                        file: file,
-                        environment: environment,
-                        kindForSymbol: kindForSymbol
-                    )
-                }
-                ?? []
+        var pending: [(reference: Reference, authority: RootExecutionAuthority)] = []
+        for symbol in rootSymbols.sorted() {
+            guard let function = file.function(mangledName: symbol) else {
+                continue
+            }
+            pending.append(contentsOf: try references(
+                in: function,
+                file: file,
+                environment: environment,
+                kindForSymbol: kindForSymbol
+            ).map {
+                ($0, RootExecutionAuthority(effects: executionEffectsByRoot[symbol]))
+            })
         }
         var visited = Set<String>()
+        var authorityBySymbol: [String: RootExecutionAuthority] = [:]
         var kindBySymbol: [String: Bytecode.FunctionKind] = [:]
         var adapterBySymbol: [
             String: CanonicalSIL.DirectCallBinding.ABIAdapter
@@ -59,7 +64,8 @@ enum ImageFunctions {
         var replacementBySymbol: [String: CanonicalSIL.Function] = [:]
         var result: [String: Discovered] = [:]
 
-        while let reference = pending.popLast() {
+        while let next = pending.popLast() {
+            let reference = next.reference
             let symbol = reference.symbol
             if let existingKind = kindBySymbol[symbol], existingKind != reference.kind {
                 throw DiscoveryError.unsupported(
@@ -91,7 +97,15 @@ enum ImageFunctions {
                     reason: "static KeyPath projection has no synthesized replacement body"
                 )
             }
-            guard visited.insert(symbol).inserted,
+            let isFirstVisit = visited.insert(symbol).inserted
+            let previousAuthority = authorityBySymbol[symbol, default: .init()]
+            var mergedAuthority = previousAuthority
+            mergedAuthority.formUnion(next.authority)
+            authorityBySymbol[symbol] = mergedAuthority
+            if result[symbol] != nil {
+                result[symbol]?.executionEffectEnvelope = mergedAuthority.effects
+            }
+            guard (isFirstVisit || mergedAuthority != previousAuthority),
                   !excludedSymbols.contains(symbol)
             else { continue }
             guard let function = replacementBySymbol[symbol]
@@ -105,16 +119,15 @@ enum ImageFunctions {
             result[symbol] = .init(
                 function: function,
                 kind: reference.kind,
-                abiAdapter: reference.abiAdapter
+                abiAdapter: reference.abiAdapter,
+                executionEffectEnvelope: mergedAuthority.effects
             )
-            pending.append(
-                contentsOf: try references(
+            pending.append(contentsOf: try references(
                     in: function,
                     file: file,
                     environment: environment,
                     kindForSymbol: kindForSymbol
-                )
-            )
+                ).map { ($0, mergedAuthority) })
         }
         return result
     }
@@ -123,7 +136,8 @@ enum ImageFunctions {
         of function: CanonicalSIL.Function,
         environment: CanonicalSIL.TypeEnvironment,
         symbol: String,
-        kind: Bytecode.FunctionKind
+        kind: Bytecode.FunctionKind,
+        executionEffectEnvelope: Core.Effects = .init()
     ) throws -> Signature {
         do {
             let parsed = try CanonicalSIL.Lowerer(
@@ -136,10 +150,43 @@ enum ImageFunctions {
                 )
             }
             var effects = parsed.effects
-            if let context = try environment.hostedMethodContext(for: function),
-               try environment.hostedMethodRequiresMainActor(context) {
+            let hostedContext = try environment.hostedMethodContext(for: function)
+            let hostedRequiresMainActor = try hostedContext.map {
+                try environment.hostedMethodRequiresMainActor($0)
+            } ?? false
+            switch function.isolation {
+            case .globalActor where function.isolation.isMainActor:
+                effects.requiresMainActor = true
+            case let .globalActor(actor):
+                throw DiscoveryError.unsupported(
+                    symbol: symbol,
+                    reason: "global actor \(actor) has no frozen synchronous executor contract"
+                )
+            case let .unknown(description):
+                throw DiscoveryError.unsupported(
+                    symbol: symbol,
+                    reason: "unknown Swift isolation metadata: \(description)"
+                )
+            case let .actorInstance(name) where !hostedRequiresMainActor:
+                throw DiscoveryError.unsupported(
+                    symbol: symbol,
+                    reason: "actor-instance isolation"
+                        + (name.map { " (\($0))" } ?? "")
+                        + " has no frozen synchronous executor contract"
+                )
+            case .unspecified, .nonisolated, .actorInstance:
+                break
+            }
+            if hostedRequiresMainActor {
                 effects.requiresMainActor = true
             }
+            // Image-local helpers are implementation details of their rooted
+            // patch entry. Swift's lowered type remains authoritative for
+            // throwing, async, and actor ABI, while these two policy effects
+            // inherit the entry's already-frozen execution authority.
+            effects.mayAllocate = executionEffectEnvelope.mayAllocate
+            effects.hasExternalSideEffects = executionEffectEnvelope
+                .hasExternalSideEffects
             let normalized = try CanonicalSIL.ManagedCaptureStorage.normalize(
                 body: function.body,
                 role: kind,
@@ -179,6 +226,34 @@ enum ImageFunctions {
         var abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter
     }
 
+    private struct RootExecutionAuthority: Equatable, Sendable {
+        var hasRoot = false
+        var mayAllocate = false
+        var hasExternalSideEffects = false
+
+        init(effects: Core.Effects? = nil) {
+            guard let effects else { return }
+            hasRoot = true
+            mayAllocate = effects.mayAllocate
+            hasExternalSideEffects = effects.hasExternalSideEffects
+        }
+
+        mutating func formUnion(_ other: Self) {
+            hasRoot = hasRoot || other.hasRoot
+            mayAllocate = mayAllocate || other.mayAllocate
+            hasExternalSideEffects = hasExternalSideEffects
+                || other.hasExternalSideEffects
+        }
+
+        var effects: Core.Effects? {
+            guard hasRoot else { return nil }
+            return .init(
+                mayAllocate: mayAllocate,
+                hasExternalSideEffects: hasExternalSideEffects
+            )
+        }
+    }
+
     private static func references(
         in function: CanonicalSIL.Function,
         file: CanonicalSIL.File,
@@ -203,6 +278,7 @@ enum ImageFunctions {
         var unboundedRangeFunctionByValue: [String: String] = [:]
         var unboundedRangeClosureByValue: [String: String] = [:]
         var compilerOnlyUnboundedRangeSymbols = Set<String>()
+        var compilerOnlyNativeBlockSymbols = Set<String>()
 
         for rawLine in function.body.split(separator: "\n") {
             let line = String(rawLine).trimmingCharacters(in: .whitespaces)
@@ -214,12 +290,19 @@ enum ImageFunctions {
                 let symbol = String(suffix[..<end])
                 if !symbol.isEmpty {
                     symbolByValue[result] = symbol
-                    if let type = functionReferenceType(in: line),
-                       CanonicalSIL.RangeExpression
+                    if let type = functionReferenceType(in: line) {
+                        if CanonicalSIL.ClosureReabstraction.compilerThunkKind(
+                            symbol: symbol,
+                            loweredType: type
+                        ) != nil {
+                            compilerOnlyNativeBlockSymbols.insert(symbol)
+                        }
+                        if CanonicalSIL.RangeExpression
                         .isUnboundedMarkerFunctionType(type) {
-                        // `UnboundedRange_` is an inaccessible stdlib marker
-                        // used by the full-range subscript overload.
-                        unboundedRangeFunctionByValue[result] = symbol
+                            // `UnboundedRange_` is an inaccessible stdlib marker
+                            // used by the full-range subscript overload.
+                            unboundedRangeFunctionByValue[result] = symbol
+                        }
                     }
                 }
                 continue
@@ -276,6 +359,9 @@ enum ImageFunctions {
         return ReleaseCompiler.ImplementationFingerprint
             .referencedSymbols(in: executableBody).sorted().compactMap { symbol in
                 let usages = usageBySymbol[symbol, default: []]
+                if compilerOnlyNativeBlockSymbols.contains(symbol) {
+                    return nil
+                }
                 if compilerOnlyUnboundedRangeSymbols.contains(symbol),
                    usages == [.closureConstruction] {
                     return nil

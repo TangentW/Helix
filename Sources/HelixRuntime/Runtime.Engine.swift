@@ -68,6 +68,9 @@ public final class Engine: @unchecked Sendable {
     /// Host-side ceilings applied before arguments enter the VM.
     public let bridgeInputLimits: Runtime.BridgeInputLimits
     private let contexts = Runtime.ExecutionContextStorage()
+    /// One recursive domain protects VM closure captures until Sendable
+    /// callback semantics are represented and verified explicitly.
+    private let nativeCallbackExecutionGate = VM.NativeCallbackExecutionGate()
 
     /// Creates a Runtime engine from generated original and native catalogs.
     ///
@@ -427,6 +430,8 @@ public final class Engine: @unchecked Sendable {
     ) -> VM.NativeCallbackHost {
         let lease = context.lease
         return VM.NativeCallbackHost(
+            resourceLimits: lease.resourceLimits,
+            executionGate: nativeCallbackExecutionGate,
             invoke: { [weak self, weak context] closure, arguments, preferredBudget in
                 guard let self else {
                     let trap = VM.RuntimeTrap.nativeFailure(
@@ -449,6 +454,32 @@ public final class Engine: @unchecked Sendable {
                 trapObserver(.init(trap: trap, programCounter: nil))
             }
         )
+    }
+
+    /// Encodes native callback arguments under both the Shell host ceilings
+    /// and the signed limits of the callback's pinned generation.
+    func encodeNativeCallbackArguments(
+        for callback: VM.NativeCallback,
+        count: Int,
+        arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value]
+    ) throws -> [VM.Value] {
+        let detachedBudget = VM.InvocationBudget(
+            limits: callback.resourceLimits
+        )
+        let encoder = Runtime.BridgeValueCodec.Encoder(
+            limits: bridgeInputLimits.constrained(
+                by: callback.resourceLimits
+            ),
+            checkDeadline: {
+                try callback.checkInputEncodingDeadline()
+                try detachedBudget.checkDeadline()
+            }
+        )
+        let encoded = try encoder.encodeArguments(count: count) {
+            try arguments(encoder)
+        }
+        try encoder.finalize(arguments: encoded)
+        return encoded
     }
 
     private func invokeNativeCallback(

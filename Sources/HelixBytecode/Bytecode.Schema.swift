@@ -78,6 +78,15 @@ public struct ClosureSignature: Codable, Hashable, Sendable, CustomStringConvert
             return "<invalid closure signature: \(parameters.count) parameters, "
                 + "\(parameterConventions.count) conventions>"
         }
+        var effectNames: [String] = []
+        if effects.mayThrow { effectNames.append("throws") }
+        if effects.mayAllocate { effectNames.append("allocates") }
+        if effects.hasExternalSideEffects { effectNames.append("external") }
+        if effects.requiresMainActor { effectNames.append("MainActor") }
+        if effects.isAsync { effectNames.append("async") }
+        let effectPrefix = effectNames.isEmpty
+            ? ""
+            : "[\(effectNames.joined(separator: ","))] "
         let arguments = zip(parameters, parameterConventions).map {
             parameter, convention in
             let prefix = switch convention {
@@ -87,7 +96,7 @@ public struct ClosureSignature: Codable, Hashable, Sendable, CustomStringConvert
             }
             return prefix + parameter.description
         }.joined(separator: ", ")
-        return "(\(arguments)) -> \(result)"
+        return "\(effectPrefix)(\(arguments)) -> \(result)"
     }
 }
 

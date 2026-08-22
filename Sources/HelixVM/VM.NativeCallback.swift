@@ -5,8 +5,27 @@ import HelixCore
 #endif
 
 extension VM {
+/// Serializes native callback execution until Helix models Swift `Sendable`
+/// closure semantics. The recursive lock admits ordinary same-thread callback
+/// re-entry while rejecting overlapping work from another thread.
+package final class NativeCallbackExecutionGate: @unchecked Sendable {
+    private let lock = NSRecursiveLock()
+
+    package init() {}
+
+    func tryEnter() -> Bool {
+        lock.try()
+    }
+
+    func leave() {
+        lock.unlock()
+    }
+}
+
 /// Runtime-owned route used by a NativeImport callback to re-enter its pinned image.
 public struct NativeCallbackHost: Sendable {
+    let resourceLimits: Core.ResourceLimits
+    private let executionGate: VM.NativeCallbackExecutionGate
     private let invocation: @Sendable (
         VM.Closure,
         [VM.Value],
@@ -15,6 +34,7 @@ public struct NativeCallbackHost: Sendable {
     private let failureReporter: @Sendable (VM.RuntimeTrap) -> Void
 
     public init(
+        resourceLimits: Core.ResourceLimits = .init(),
         invoke: @escaping @Sendable (
             VM.Closure,
             [VM.Value],
@@ -22,6 +42,26 @@ public struct NativeCallbackHost: Sendable {
         ) -> VM.ExecutionResult,
         reportFailure: @escaping @Sendable (VM.RuntimeTrap) -> Void = { _ in }
     ) {
+        self.init(
+            resourceLimits: resourceLimits,
+            executionGate: .init(),
+            invoke: invoke,
+            reportFailure: reportFailure
+        )
+    }
+
+    package init(
+        resourceLimits: Core.ResourceLimits,
+        executionGate: VM.NativeCallbackExecutionGate,
+        invoke: @escaping @Sendable (
+            VM.Closure,
+            [VM.Value],
+            VM.InvocationBudget?
+        ) -> VM.ExecutionResult,
+        reportFailure: @escaping @Sendable (VM.RuntimeTrap) -> Void = { _ in }
+    ) {
+        self.resourceLimits = resourceLimits
+        self.executionGate = executionGate
         invocation = invoke
         failureReporter = reportFailure
     }
@@ -37,6 +77,14 @@ public struct NativeCallbackHost: Sendable {
     func reportFailure(_ trap: VM.RuntimeTrap) {
         failureReporter(trap)
     }
+
+    func tryEnterExecution() -> Bool {
+        executionGate.tryEnter()
+    }
+
+    func leaveExecution() {
+        executionGate.leave()
+    }
 }
 
 /// A Sendable native-facing handle for one verified VM closure.
@@ -46,11 +94,13 @@ public struct NativeCallbackHost: Sendable {
 public final class NativeCallback: @unchecked Sendable {
     public let signature: Bytecode.ClosureSignature
     public let lifetime: Core.NativeImportCallbackLifetime
+    /// Signed generation limits used to bound generated native-argument
+    /// encoding before the resulting VM values enter the interpreter.
+    public let resourceLimits: Core.ResourceLimits
 
     private let closure: VM.Closure
     private let epoch: VM.NativeCallbackEpoch
     private let host: VM.NativeCallbackHost
-    private let invocationLock = NSRecursiveLock()
 
     init(
         closure: VM.Closure,
@@ -60,6 +110,7 @@ public final class NativeCallback: @unchecked Sendable {
     ) {
         signature = closure.signature
         self.lifetime = lifetime
+        resourceLimits = host.resourceLimits
         self.closure = closure
         self.epoch = epoch
         self.host = host
@@ -77,14 +128,14 @@ public final class NativeCallback: @unchecked Sendable {
         do {
             admission = try epoch.begin(lifetime: lifetime)
         } catch let trap as VM.RuntimeTrap {
-            host.reportFailure(trap)
+            if !epoch.recordFailure(trap) { host.reportFailure(trap) }
             return
         } catch {
             host.reportFailure(.nativeFailure(String(describing: error)))
             return
         }
         defer { epoch.end(admission) }
-        guard invocationLock.try() else {
+        guard host.tryEnterExecution() else {
             record(
                 .nativeFailure(
                     "concurrent invocation of a non-Sendable native callback is unsupported"
@@ -93,7 +144,7 @@ public final class NativeCallback: @unchecked Sendable {
             )
             return
         }
-        defer { invocationLock.unlock() }
+        defer { host.leaveExecution() }
 
         let arguments: [VM.Value]
         do {
@@ -148,6 +199,13 @@ public final class NativeCallback: @unchecked Sendable {
         }
     }
 
+    /// Polls the originating invocation deadline while it is still active.
+    /// A detached escaping callback receives a fresh deadline from Runtime's
+    /// bounded input encoder instead.
+    public func checkInputEncodingDeadline() throws {
+        try epoch.checkActiveDeadline()
+    }
+
     private func record(
         _ trap: VM.RuntimeTrap,
         admittedDuringNativeInvocation: Bool
@@ -170,6 +228,7 @@ final class NativeCallbackEpoch: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private let originatingThread = ObjectIdentifier(Thread.current)
     private var budget: VM.InvocationBudget?
     private var isActive = true
     private var activeNonescapingCalls = 0
@@ -186,6 +245,12 @@ final class NativeCallbackEpoch: @unchecked Sendable {
             if lifetime == .nonescaping, !isActive {
                 throw VM.RuntimeTrap.nativeFailure(
                     "nonescaping native callback outlived its importing call"
+                )
+            }
+            if isActive,
+               ObjectIdentifier(Thread.current) != originatingThread {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "concurrent invocation of a non-Sendable native callback is unsupported"
                 )
             }
             if lifetime == .nonescaping { activeNonescapingCalls += 1 }
@@ -226,6 +291,11 @@ final class NativeCallbackEpoch: @unchecked Sendable {
             }
             return firstFailure
         }
+    }
+
+    func checkActiveDeadline() throws {
+        let activeBudget = lock.withLock { isActive ? budget : nil }
+        try activeBudget?.checkDeadline()
     }
 }
 }

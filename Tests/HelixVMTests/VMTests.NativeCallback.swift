@@ -7,6 +7,93 @@ import Testing
 extension VMTests {
 @Suite("Native callback lifetime")
 struct NativeCallback {
+    @Test("Native callbacks require an exact canonical callable signature")
+    func callbackRequiresCanonicalSignature() throws {
+        let box = InvocationBox()
+        let expected = closure().signature
+        let value = VM.Value.closure(.init(
+            functionID: .init(rawValue: 7),
+            signature: expected,
+            captures: []
+        ))
+        #expect(expected.hasCanonicalCallableEffects)
+        #expect(value.matches(.closure(expected)))
+        let budget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let context = try budget.beginNativeInvocation(
+            id: .init(rawValue: 0),
+            effects: .init(),
+            contract: contract(lifetime: .escaping),
+            parameterTypes: [.closure(expected)],
+            callbackHost: host(box: box),
+            isMainThread: false
+        )
+        _ = try context.makeCallback(
+            parameterIndex: 0,
+            from: value
+        )
+        try context.finish(requireCooperation: true)
+
+        var authorityInType = expected
+        authorityInType.effects.mayAllocate = true
+        authorityInType.effects.hasExternalSideEffects = true
+        #expect(!authorityInType.hasCanonicalCallableEffects)
+        let authorityBudget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let authorityContext = try authorityBudget.beginNativeInvocation(
+            id: .init(rawValue: 0),
+            effects: .init(),
+            contract: contract(lifetime: .escaping),
+            parameterTypes: [.closure(expected)],
+            callbackHost: host(box: box),
+            isMainThread: false
+        )
+        #expect(throws: VM.RuntimeTrap.self) {
+            try authorityContext.makeCallback(
+                parameterIndex: 0,
+                from: .closure(.init(
+                    functionID: .init(rawValue: 7),
+                    signature: authorityInType,
+                    captures: []
+                ))
+            )
+        }
+        try authorityContext.finish(requireCooperation: true)
+
+        var actorMismatch = expected
+        actorMismatch.effects.requiresMainActor = true
+        let mismatchBudget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let mismatchContext = try mismatchBudget.beginNativeInvocation(
+            id: .init(rawValue: 0),
+            effects: .init(),
+            contract: contract(lifetime: .escaping),
+            parameterTypes: [.closure(expected)],
+            callbackHost: host(box: box),
+            isMainThread: false
+        )
+        #expect(throws: VM.RuntimeTrap.self) {
+            try mismatchContext.makeCallback(
+                parameterIndex: 0,
+                from: .closure(.init(
+                    functionID: .init(rawValue: 7),
+                    signature: actorMismatch,
+                    captures: []
+                ))
+            )
+        }
+        try mismatchContext.finish(requireCooperation: true)
+    }
+
     @Test("Nonescaping callback shares its import budget and expires on return")
     func nonescapingLifetime() throws {
         let box = InvocationBox()
@@ -135,10 +222,9 @@ struct NativeCallback {
         #expect(box.failures.isEmpty)
     }
 
-    @Test("Returning while a nonescaping callback executes fails the import")
-    func nonescapingCallbackCannotOverlapReturn() throws {
-        let entered = DispatchSemaphore(value: 0)
-        let release = DispatchSemaphore(value: 0)
+    @Test("An active callback cannot cross threads before its import returns")
+    func activeCallbackCannotCrossThread() throws {
+        let box = InvocationBox()
         let finished = DispatchSemaphore(value: 0)
         let budget = VM.InvocationBudget(
             limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
@@ -150,11 +236,7 @@ struct NativeCallback {
             effects: .init(),
             contract: contract(lifetime: .nonescaping),
             parameterTypes: [.closure(closure().signature)],
-            callbackHost: .init(invoke: { _, _, _ in
-                entered.signal()
-                _ = release.wait(timeout: .now() + 10)
-                return .returned(nil)
-            }),
+            callbackHost: host(box: box),
             isMainThread: false
         )
         let callback = try context.makeCallback(
@@ -166,15 +248,15 @@ struct NativeCallback {
             finished.signal()
         }
         worker.start()
-        try #require(entered.wait(timeout: .now() + 10) == .success)
+        try #require(finished.wait(timeout: .now() + 10) == .success)
 
         #expect(throws: VM.RuntimeTrap.nativeFailure(
-            "nonescaping native callback was still executing when its importing call returned"
+            "concurrent invocation of a non-Sendable native callback is unsupported"
         )) {
             try context.finish(requireCooperation: true)
         }
-        release.signal()
-        try #require(finished.wait(timeout: .now() + 10) == .success)
+        #expect(box.arguments.isEmpty)
+        #expect(box.failures.isEmpty)
     }
 
     @Test("Overlapping cross-thread calls fail closed without entering the host twice")
@@ -217,6 +299,64 @@ struct NativeCallback {
         worker.start()
         try #require(entered.wait(timeout: .now() + 10) == .success)
         callback.invokeVoid { [.bool(false)] }
+        release.signal()
+        try #require(finished.wait(timeout: .now() + 10) == .success)
+
+        #expect(box.arguments == [[.bool(true)]])
+        #expect(box.failures == [
+            .nativeFailure(
+                "concurrent invocation of a non-Sendable native callback is unsupported"
+            ),
+        ])
+    }
+
+    @Test("Distinct escaping handles share one non-Sendable execution domain")
+    func rejectsConcurrentInvocationAcrossHandles() throws {
+        let box = InvocationBox()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let sharedHost = VM.NativeCallbackHost(
+            invoke: { _, arguments, callbackBudget in
+                box.record(arguments: arguments, budget: callbackBudget)
+                entered.signal()
+                _ = release.wait(timeout: .now() + 10)
+                return .returned(nil)
+            },
+            reportFailure: { box.record(failure: $0) }
+        )
+
+        func makeCallback() throws -> VM.NativeCallback {
+            let budget = VM.InvocationBudget(
+                limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+                isMainThread: false,
+                nowNanoseconds: { 0 }
+            )
+            let context = try budget.beginNativeInvocation(
+                id: .init(rawValue: 0),
+                effects: .init(),
+                contract: contract(lifetime: .escaping),
+                parameterTypes: [.closure(closure().signature)],
+                callbackHost: sharedHost,
+                isMainThread: false
+            )
+            let callback = try context.makeCallback(
+                parameterIndex: 0,
+                from: .closure(closure())
+            )
+            try context.finish(requireCooperation: true)
+            return callback
+        }
+
+        let first = try makeCallback()
+        let second = try makeCallback()
+        let worker = Thread {
+            first.invokeVoid { [.bool(true)] }
+            finished.signal()
+        }
+        worker.start()
+        try #require(entered.wait(timeout: .now() + 10) == .success)
+        second.invokeVoid { [.bool(false)] }
         release.signal()
         try #require(finished.wait(timeout: .now() + 10) == .success)
 

@@ -33,11 +33,13 @@ extension NativeImportDiscovery {
         var baseName: String
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
+        var parameterProjection: InterfaceArchive.NativeImportParameterProjection
         var resultSwiftType: String
         var importedModules: [String] = []
         var parameterTypes: [Bytecode.ValueType]
         var resultType: Bytecode.ValueType
         var signature: Core.LoweredSignature
+        var callbacks: [Core.NativeImportCallback] = []
         var inferredEffects: Core.Effects
         var isGeneric: Bool
         var hasInOut: Bool
@@ -133,7 +135,8 @@ extension NativeImportDiscovery {
                     domain: .application,
                     access: operationAccess,
                     maximumDurationMicroseconds: scope.maximumDurationMicroseconds,
-                    allowsMainThread: scope.allowsMainThread
+                    allowsMainThread: scope.allowsMainThread,
+                    callbacks: declaration.callbacks
                 )
                 try contract.validate(effects: effects)
                 let key = try Core.NativeImportKey.derive(
@@ -153,6 +156,7 @@ extension NativeImportDiscovery {
                                 ? [declaration.mangledName]
                                 : declaration.silSymbols,
                             parameterTypes: declaration.parameterTypes,
+                            parameterProjection: declaration.parameterProjection,
                             resultType: declaration.resultType,
                             signature: declaration.signature,
                             effects: effects,
@@ -175,10 +179,7 @@ extension NativeImportDiscovery {
                     )
                 )
             }
-            guard Set(candidates.map(\.record.key)).count == candidates.count,
-                  Set(candidates.flatMap(\.record.silMangledNames)).count
-                    == candidates.reduce(0, { $0 + $1.record.silMangledNames.count })
-            else {
+            guard Set(candidates.map(\.record.key)).count == candidates.count else {
                 throw FrontendReceipt.Error.invalidRequest(
                     "source NativeImport discovery produced duplicate identities"
                 )
@@ -247,10 +248,19 @@ extension NativeImportDiscovery {
             let explicitParameterTypes = isInstanceDispatch(declaration.dispatch)
                 ? Array(declaration.parameterTypes.dropLast())
                 : declaration.parameterTypes
+            let inferredCallbacks = FrontendReceipt.NativeBridgeProfile.callbacks(
+                parameterSpellings: declaration.signature.parameters,
+                parameterTypes: declaration.parameterTypes
+            )
             guard declaration.argumentLabels.count == explicitParameterTypes.count,
                   declaration.parameterSwiftTypes.count == declaration.parameterTypes.count,
-                  explicitParameterTypes.allSatisfy(isAutomaticallyBridgeable),
-                  isAutomaticallyBridgeableResult(declaration.resultType)
+                  declaration.parameterProjection.isValid(
+                      logicalParameterCount: declaration.parameterTypes.count
+                  ),
+                  inferredCallbacks == declaration.callbacks,
+                  FrontendReceipt.NativeBridgeProfile.isResult(
+                      declaration.resultType
+                  )
             else {
                 return (
                     "HLXNID005",
@@ -316,32 +326,6 @@ extension NativeImportDiscovery {
             if case .native = type { return true }
             return false
         }
-
-        private func isAutomaticallyBridgeable(_ type: Bytecode.ValueType) -> Bool {
-            switch type {
-            case .bool, .integer, .float, .string, .any, .native:
-                true
-            case let .array(element), let .optional(element):
-                isAutomaticallyBridgeable(element)
-            case let .set(element):
-                element.isVMHashable && isAutomaticallyBridgeable(element)
-            case let .dictionary(key, value):
-                key.isVMHashable
-                    && isAutomaticallyBridgeable(key)
-                    && isAutomaticallyBridgeable(value)
-            case let .tuple(elements):
-                !elements.isEmpty && elements.allSatisfy(isAutomaticallyBridgeable)
-            case .void, .never, .local, .error, .address, .mutableCell,
-                 .nonOwningReference,
-                 .arrayState, .dictionaryState, .closure:
-                false
-            }
-        }
-
-        private func isAutomaticallyBridgeableResult(_ type: Bytecode.ValueType) -> Bool {
-            type == .void || isAutomaticallyBridgeable(type)
-        }
-
 
         private func isSwiftIdentifier(_ value: String) -> Bool {
             guard let first = value.first, first == "_" || first.isLetter else {

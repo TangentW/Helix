@@ -1830,7 +1830,7 @@ struct ImportedFrameworks {
             contract: .bounded(
                 kind: kind,
                 domain: .application,
-                access: .pure,
+                access: effects.hasExternalSideEffects ? .write : .pure,
                 maximumDurationMicroseconds: 500,
                 allowsMainThread: true
             )

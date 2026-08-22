@@ -9,14 +9,21 @@ public struct Function: Hashable, Sendable {
     public var mangledName: String
     public var loweredType: String
     public var body: String
+    public var isolation: CanonicalSIL.FunctionIsolation
     public var declarationLocation: Core.SourceLocation?
     var debugLineLocations: [CanonicalSIL.DebugLineLocation]
     var hasStrippedDebugMetadata: Bool
 
-    public init(mangledName: String, loweredType: String, body: String) {
+    public init(
+        mangledName: String,
+        loweredType: String,
+        body: String,
+        isolation: CanonicalSIL.FunctionIsolation = .unspecified
+    ) {
         self.mangledName = mangledName
         self.loweredType = loweredType
         self.body = body
+        self.isolation = isolation
         declarationLocation = nil
         debugLineLocations = []
         hasStrippedDebugMetadata = false
@@ -33,12 +40,14 @@ public struct Function: Hashable, Sendable {
         mangledName: String,
         loweredType: String,
         body: String,
+        isolation: CanonicalSIL.FunctionIsolation,
         declarationLocation: Core.SourceLocation?,
         debugLineLocations: [CanonicalSIL.DebugLineLocation]
     ) {
         self.mangledName = mangledName
         self.loweredType = loweredType
         self.body = body
+        self.isolation = isolation
         self.declarationLocation = declarationLocation
         self.debugLineLocations = debugLineLocations
         hasStrippedDebugMetadata = true
@@ -109,6 +118,20 @@ public struct File: Sendable {
             }
             let name = String(line[nameRange])
             let type = String(line[typeRange])
+            var isolation: CanonicalSIL.FunctionIsolation = .unspecified
+            var commentIndex = index
+            while commentIndex > 0 {
+                commentIndex -= 1
+                let comment = lines[commentIndex]
+                    .trimmingCharacters(in: .whitespaces)
+                guard comment.hasPrefix("//") else { break }
+                if let parsed = CanonicalSIL.FunctionIsolation.parse(
+                    comment: comment
+                ) {
+                    isolation = parsed
+                    break
+                }
+            }
             var bodyLines: [String] = []
             index += 1
             while index < lines.count {
@@ -140,6 +163,7 @@ public struct File: Sendable {
                     mangledName: name,
                     loweredType: type,
                     body: normalizedBody,
+                    isolation: isolation,
                     declarationLocation: declarationLocations[name],
                     debugLineLocations: debugLineLocations
                 )

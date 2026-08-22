@@ -363,6 +363,11 @@ public struct Engine: Verification.ImageVerifying {
                     "local type members cannot contain Dictionary operation states"
                 )
             case let .closure(signature):
+                guard signature.hasCanonicalCallableEffects else {
+                    throw Verification.Error.invalidModule(
+                        "local type closure signature cannot carry execution authority"
+                    )
+                }
                 guard signature.parameters.count <= 64,
                       signature.parameterConventions.count
                         == signature.parameters.count,
@@ -1559,6 +1564,12 @@ public struct Engine: Verification.ImageVerifying {
                         reason: "closure signature contains more than 64 parameters"
                     )
                 }
+                guard signature.hasCanonicalCallableEffects else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "closure signature cannot carry execution authority"
+                    )
+                }
                 guard signature.parameterConventions.count
                         == signature.parameters.count,
                       zip(
@@ -1749,6 +1760,30 @@ public struct Engine: Verification.ImageVerifying {
             }
         }
         guard !scopedRegisters.isEmpty || hasScopeEnd else { return }
+        let parentByScope = Dictionary(uniqueKeysWithValues:
+            function.blocks.flatMap { block in
+                block.instructions.compactMap { instruction in
+                    if case let .beginClosureScope(result, closure) = instruction {
+                        return (result, closure)
+                    }
+                    return nil
+                }
+            }
+        )
+
+        func depends(
+            _ candidate: Bytecode.Register,
+            on ancestor: Bytecode.Register
+        ) -> Bool {
+            var current = candidate
+            var visited = Set<Bytecode.Register>()
+            while let parent = parentByScope[current],
+                  visited.insert(current).inserted {
+                if parent == ancestor { return true }
+                current = parent
+            }
+            return false
+        }
 
         var usesBeforeDefinition: [Bytecode.BlockID: Set<Bytecode.Register>]
             = [:]
@@ -1831,12 +1866,10 @@ public struct Engine: Verification.ImageVerifying {
                     )
                 }
                 switch instruction {
-                case let .beginClosureScope(result, closure):
-                    guard !state.open.contains(closure),
-                          !state.open.contains(result)
-                    else {
+                case let .beginClosureScope(result, _):
+                    guard !state.open.contains(result) else {
                         throw fail(
-                            "a scoped closure cannot be wrapped again before it closes"
+                            "a closure scope result cannot be reopened before it closes"
                         )
                     }
                     state.closed.remove(result)
@@ -1851,11 +1884,19 @@ public struct Engine: Verification.ImageVerifying {
                     state.closed.remove(result)
                     state.open.insert(result)
                 case let .endClosureScope(closure):
-                    guard state.open.remove(closure) != nil else {
+                    guard state.open.contains(closure) else {
                         throw fail(
                             "end_closure_scope has no matching open scope"
                         )
                     }
+                    guard !state.open.contains(where: {
+                        $0 != closure && depends($0, on: closure)
+                    }) else {
+                        throw fail(
+                            "an outer closure scope cannot end before its nested scope"
+                        )
+                    }
+                    state.open.remove(closure)
                     state.closed.insert(closure)
                 case let .nativeApply(_, importID, arguments),
                      let .nativeTryApply(importID, arguments, _, _):
@@ -3711,7 +3752,15 @@ public struct Engine: Verification.ImageVerifying {
                 operation: "entry_apply",
                 fail: fail
             )
-            try verifyCall(arguments: arguments, result: result, parameterTypes: descriptor.parameterTypes, resultType: descriptor.resultType, function: function, block: block, offset: offset)
+            try verifyCall(
+                arguments: arguments,
+                result: result,
+                parameterTypes: descriptor.parameterTypes,
+                resultType: descriptor.resultType,
+                function: function,
+                block: block,
+                offset: offset
+            )
         case let .nativeApply(result, importID, arguments):
             guard let requirement = declaredImports[importID] else {
                 throw fail("native import \(importID) is used but not declared")
@@ -3726,7 +3775,15 @@ public struct Engine: Verification.ImageVerifying {
                 operation: "native_apply",
                 fail: fail
             )
-            try verifyCall(arguments: arguments, result: result, parameterTypes: descriptor.parameterTypes, resultType: descriptor.resultType, function: function, block: block, offset: offset)
+            try verifyCall(
+                arguments: arguments,
+                result: result,
+                parameterTypes: descriptor.parameterTypes,
+                resultType: descriptor.resultType,
+                function: function,
+                block: block,
+                offset: offset
+            )
         case let .makeClosure(result, calleeID, captures, _):
             guard capabilities.contains(.closureValuesV1) else {
                 throw fail("make_closure requires \(Core.Capability.closureValuesV1)")
@@ -3741,10 +3798,20 @@ public struct Engine: Verification.ImageVerifying {
                 throw fail("make_closure target must be a closure body")
             }
             guard callee.resultType == signature.result,
-                  callee.effects == signature.effects
+                  signature.hasCanonicalCallableEffects,
+                  Bytecode.ClosureSignature.callableEffects(
+                      from: callee.effects
+                  ) == signature.effects
             else {
-                throw fail("closure body result or effects do not match its closure signature")
+                throw fail(
+                    "closure body result or callable effects do not match its closure signature"
+                )
             }
+            try verifyClosureTargetAuthority(
+                callee.effects,
+                allowedBy: function.effects,
+                fail: fail
+            )
             let calleeParameters = try parameterTypes(of: callee)
             let captureTypes = captures.map(type)
             guard calleeParameters == signature.parameters + captureTypes else {
@@ -4107,6 +4174,27 @@ public struct Engine: Verification.ImageVerifying {
         }
     }
 
+    /// A closure is an image-local capability for its concrete target. Swift's
+    /// function type carries callable ABI only, so target resource authority
+    /// is checked once when that capability is constructed.
+    private func verifyClosureTargetAuthority(
+        _ target: Core.Effects,
+        allowedBy creator: Core.Effects,
+        fail: (String) -> Verification.Error
+    ) throws {
+        if target.mayAllocate, !creator.mayAllocate {
+            throw fail(
+                "make_closure captures allocating target authority in a nonallocating function"
+            )
+        }
+        if target.hasExternalSideEffects,
+           !creator.hasExternalSideEffects {
+            throw fail(
+                "make_closure captures external-side-effect authority in a pure function"
+            )
+        }
+    }
+
     private func verifyTryCall(
         arguments: [Bytecode.Register],
         parameterTypes: [Bytecode.ValueType],
@@ -4205,7 +4293,8 @@ public struct Engine: Verification.ImageVerifying {
             .invalidInstruction(function: function.id, block: block.id, offset: offset, reason: $0)
         }
         guard arguments.count == parameterTypes.count else { throw fail("call argument count mismatch") }
-        for (argument, expected) in zip(arguments, parameterTypes) where function.type(of: argument) != expected {
+        for (argument, expected) in zip(arguments, parameterTypes)
+        where function.type(of: argument) != expected {
             throw fail("call argument type mismatch")
         }
         if resultType == .void {

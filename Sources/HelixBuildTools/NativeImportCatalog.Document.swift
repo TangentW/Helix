@@ -183,10 +183,13 @@ public struct Document: Codable, Hashable, Sendable {
                   candidate.importedModules.contains(
                       String(candidate.factoryType.split(separator: ".")[0])
                   ),
-                  Self.isSupported(signatureResult!, allowVoid: true),
-                  signatureParameters.compactMap({ $0 }).allSatisfy({
-                      Self.isSupported($0, allowVoid: false)
-                  })
+                  FrontendReceipt.NativeBridgeProfile.isResult(
+                      signatureResult!
+                  ),
+                  FrontendReceipt.NativeBridgeProfile.callbacks(
+                      parameterSpellings: candidate.signature.parameters,
+                      parameterTypes: signatureParameters.compactMap { $0 }
+                  ) == candidate.contract.callbacks
             else {
                 throw NativeImportCatalog.Error.invalid(
                     "candidate \(candidate.canonicalCallee) has an invalid symbol, signature, factory, or type"
@@ -217,28 +220,6 @@ public struct Document: Codable, Hashable, Sendable {
                     )
                 }
             }
-        }
-    }
-
-    private static func isSupported(_ type: Bytecode.ValueType, allowVoid: Bool) -> Bool {
-        switch type {
-        case .void: allowVoid
-        case .never: false
-        case .address, .mutableCell, .nonOwningReference, .arrayState,
-             .dictionaryState,
-             .closure: false
-        case .bool, .integer, .float, .string, .any, .native: true
-        case .local, .error: false
-        case let .array(element): isSupported(element, allowVoid: false)
-        case let .dictionary(key, value):
-            key.isVMHashable
-                && isSupported(key, allowVoid: false)
-                && isSupported(value, allowVoid: false)
-        case let .set(element):
-            element.isVMHashable && isSupported(element, allowVoid: false)
-        case let .optional(wrapped): isSupported(wrapped, allowVoid: false)
-        case let .tuple(elements):
-            !elements.isEmpty && elements.allSatisfy { isSupported($0, allowVoid: false) }
         }
     }
 

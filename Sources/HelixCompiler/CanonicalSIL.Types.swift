@@ -975,6 +975,7 @@ public struct TypeEnvironment: Sendable {
         var type = try CanonicalSIL.SubstitutedFunctionType
             .specialize(raw)
             .trimmingCharacters(in: .whitespaces)
+        var requiresMainActor = false
         var removedAttribute = true
         while removedAttribute {
             removedAttribute = false
@@ -982,9 +983,45 @@ public struct TypeEnvironment: Sendable {
                 "@noescape ",
                 "@callee_guaranteed ",
                 "@callee_owned ",
+                "@Sendable ",
+                "@escaping ",
+                "@autoclosure ",
             ] where type.hasPrefix(attribute) {
                 type.removeFirst(attribute.count)
+                type = type.trimmingCharacters(in: .whitespaces)
                 removedAttribute = true
+                break
+            }
+            if removedAttribute { continue }
+            if let actor = type.range(
+                of: #"^@[A-Za-z_][A-Za-z0-9_.]*Actor\b\s*"#,
+                options: .regularExpression
+            ) {
+                let annotation = String(type[actor])
+                    .trimmingCharacters(in: .whitespaces)
+                switch CanonicalSIL.FunctionIsolation
+                    .loweredTypeAnnotation(in: annotation) {
+                case .mainActor:
+                    requiresMainActor = true
+                case let .unsupported(name):
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "closure global actor \(name)"
+                    )
+                case .none:
+                    throw CanonicalSIL.LoweringError.unsupportedType(raw)
+                }
+                type.removeSubrange(actor)
+                type = type.trimmingCharacters(in: .whitespaces)
+                removedAttribute = true
+                continue
+            }
+            if type.range(
+                of: #"^@isolated\s*\([^)]*\)\s*"#,
+                options: .regularExpression
+            ) != nil {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "isolated(any) closure"
+                )
             }
         }
         guard !type.hasPrefix("@convention("),
@@ -1052,7 +1089,10 @@ public struct TypeEnvironment: Sendable {
             parameters: parameters,
             parameterConventions: parameterConventions,
             result: result,
-            effects: .init(mayThrow: mayThrow)
+            effects: .init(
+                mayThrow: mayThrow,
+                requiresMainActor: requiresMainActor
+            )
         )
     }
 

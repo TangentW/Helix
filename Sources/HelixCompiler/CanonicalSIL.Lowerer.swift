@@ -1,6 +1,7 @@
 import Foundation
 import HelixBytecode
 import HelixCore
+import HelixInterface
 
 extension CanonicalSIL {
 public struct Lowerer: Sendable {
@@ -177,10 +178,48 @@ public struct Lowerer: Sendable {
     private struct ResolvedFunctionReference {
         var binding: CanonicalSIL.DirectCallBinding
         var physicalParameterConventions: [Bytecode.ParameterConvention]
+        var physicalValueParameterSpellings: [String]
         var hasIndirectResult: Bool
         var indirectErrorType: Bytecode.ValueType?
         var erasedMetatypes: [ErasedMetatype]
         var usesObjectiveCBridge: Bool
+    }
+
+    /// One physical Swift function reference can name several frozen source
+    /// call variants when different default arguments were omitted. The
+    /// concrete NativeImport is selected only at `apply`, where SSA default
+    /// provenance is available.
+    private struct ResolvedFunctionReferenceSet {
+        var variants: [ResolvedFunctionReference]
+
+        var sole: ResolvedFunctionReference? {
+            variants.count == 1 ? variants[0] : nil
+        }
+    }
+
+    /// A Swift SDK default-expression helper is compiler implementation, not
+    /// application code. Its value may be erased only when the frozen
+    /// NativeImport projection proves that the corresponding source argument
+    /// was omitted and the generated Swift invoker will supply the default.
+    private struct ExternalDefaultArgumentGenerator: Equatable {
+        var symbol: String
+        var ownerSymbols: Set<String>
+        var loweredType: String
+    }
+
+    private struct ExternalDefaultArgumentValue: Equatable {
+        var ownerSymbols: Set<String>
+        var generatorSymbol: String
+        var valueType: Bytecode.ValueType
+        var isProjected = false
+    }
+
+    private struct ExternalDefaultArgumentAddress: Equatable {
+        var ownerSymbols: Set<String>
+        var generatorSymbol: String
+        var valueType: Bytecode.ValueType
+        var isConsumed = false
+        var isDestroyed = false
     }
 
     private struct HostedSuperReference {
@@ -642,7 +681,7 @@ public struct Lowerer: Sendable {
             }
             if let destruction = match(
                 instruction,
-                pattern: #"^%[0-9]+ = destroy_not_escaped_closure (%[0-9]+)$"#
+                pattern: #"^%[0-9]+ = destroy_not_escaped_closure(?: \[[^\]]+\])* (%[0-9]+)$"#
             ) {
                 dynamicClosureScopeEndCounts[destruction[0], default: 0] += 1
             }
@@ -711,7 +750,18 @@ public struct Lowerer: Sendable {
             : maximumOriginalBlock + 1
         var registerTypes: [Bytecode.ValueType] = []
         var values: [String: Bytecode.Register] = [:]
-        var functionReferences: [String: ResolvedFunctionReference] = [:]
+        var functionReferences: [String: ResolvedFunctionReferenceSet] = [:]
+        var externalDefaultArgumentGenerators: [
+            String: ExternalDefaultArgumentGenerator
+        ] = [:]
+        var externalDefaultArgumentValues: [
+            String: ExternalDefaultArgumentValue
+        ] = [:]
+        var externalDefaultArgumentAddresses: [
+            String: ExternalDefaultArgumentAddress
+        ] = [:]
+        var inlineOptionalNoneValues = Set<String>()
+        var projectedInlineOptionalNoneOwners = Set<Bytecode.Register>()
         var unboundedRangeFunctionReferences = Set<String>()
         var unboundedRangeClosureValues = Set<String>()
         var staticKeyPathValues: [String: CanonicalSIL.StaticKeyPath.Capture] = [:]
@@ -841,6 +891,9 @@ public struct Lowerer: Sendable {
         var aggregateComponentAddresses: [String: AggregateComponentAddress] = [:]
         var tupleValues: [String: (Bytecode.Register, Bytecode.Register)] = [:]
         var unpackedTuples: [Bytecode.Register: [Bytecode.Register]] = [:]
+        var nativeBlockStorageRoots = Set<String>()
+        var nativeBlockThunkSignatures: [String: Bytecode.ClosureSignature] = [:]
+        var nativeBlockNonescapingAdapters: [String: Bytecode.ClosureSignature] = [:]
         var onStackClosureValues: [String: Bytecode.Register] = [:]
         var dynamicallyScopedClosureValues: [String: Int] = [:]
         var voidValues = Set<String>()
@@ -1182,6 +1235,31 @@ public struct Lowerer: Sendable {
                 return
             }
             recordPendingRetainedValue(retained, for: token)
+        }
+
+        func releaseClosureValueIfFinal(
+            token: String,
+            value: Bytecode.Register
+        ) throws {
+            guard case .closure = registerTypes[Int(value.rawValue)] else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "closure release references a non-closure value"
+                )
+            }
+            // Canonical non-OSSA SIL may keep using the same closure reference
+            // after a strong_release while an aggregate or another explicit
+            // owner keeps its context alive. A VM register is itself one
+            // strong root, so end that root only at the token's final semantic
+            // release; owned aggregate/copy edges already have distinct roots.
+            guard borrowedTemporaryValue(for: token) != nil
+                    || (!isBorrowedValue(token: token, register: value)
+                        && !hasFutureSemanticUse(
+                            of: token,
+                            after: currentSILLineIndex
+                        ))
+            else { return }
+            try closeBorrowedTemporaryLifetime(for: token, resolved: value)
+            appendInstruction(.destroyValue(value))
         }
 
         func isBorrowedParameter(_ register: Bytecode.Register) -> Bool {
@@ -2324,22 +2402,75 @@ public struct Lowerer: Sendable {
                 return try materializeUnitValue()
             }
             let value = try resolve(token, line: line)
-            if let expectedType,
-               registerTypes[Int(value.rawValue)] != expectedType {
+            if let expectedType {
                 let actualType = registerTypes[Int(value.rawValue)]
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "stored value \(token) at SIL line \(line) has type "
-                        + "\(actualType), expected "
-                        + "\(expectedType)"
-                )
+                guard actualType == expectedType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "stored value \(token) in \(displayName) at SIL line \(line) has type "
+                            + "\(actualType), expected "
+                            + "\(expectedType)"
+                    )
+                }
             }
             return value
+        }
+
+        func nativeCallbackParameterIndices(
+            for binding: CanonicalSIL.DirectCallBinding
+        ) -> Set<Int> {
+            guard case let .nativeImport(requirement) = binding.target else {
+                return []
+            }
+            return Set(requirement.contract.callbacks.map {
+                Int($0.parameterIndex)
+            })
+        }
+
+        func nativeCallbackParameterConventions(
+            for binding: CanonicalSIL.DirectCallBinding
+        ) -> [Int: Bytecode.ParameterConvention] {
+            let indices = nativeCallbackParameterIndices(for: binding)
+            return Dictionary(uniqueKeysWithValues: indices.map { index in
+                (index, binding.parameterConventions[index])
+            })
+        }
+
+        func preservesPhysicalClosureOwnership(
+            for binding: CanonicalSIL.DirectCallBinding
+        ) -> Bool {
+            if case .nativeImport = binding.target { return true }
+            return false
+        }
+
+        func physicalActorIsolationIsCompatible(
+            _ physical: Core.Effects,
+            authoritative: Core.Effects
+        ) -> Bool {
+            // Compiler thunks may erase a rooted MainActor annotation from
+            // their printed function type. The inverse would silently grant
+            // a nonisolated callable permission to execute actor-bound SIL.
+            !physical.requiresMainActor
+                || authoritative.requiresMainActor
+        }
+
+        func directCallArgumentsMatch(
+            _ arguments: [Bytecode.Register],
+            binding: CanonicalSIL.DirectCallBinding
+        ) -> Bool {
+            guard arguments.count == binding.parameterTypes.count else {
+                return false
+            }
+            return zip(arguments, binding.parameterTypes).allSatisfy {
+                argument, expected in
+                registerTypes[Int(argument.rawValue)] == expected
+            }
         }
 
         func prepareDirectCallArguments(
             _ tokens: [String],
             physicalConventions: [Bytecode.ParameterConvention],
             logicalTypes: [Bytecode.ValueType],
+            nativeCallbackConventions: [Int: Bytecode.ParameterConvention] = [:],
             line: Int,
             allowsCompilerInoutWriteback: Bool
         ) throws -> PreparedDirectCallArguments {
@@ -2375,11 +2506,30 @@ public struct Lowerer: Sendable {
                 PreparedDirectCallArguments.CompilerInoutWriteback
             ] = []
             arguments.reserveCapacity(tokens.count)
-            for ((token, convention), logicalType) in zip(
+            for (index, pair) in zip(
                 zip(tokens, physicalConventions),
                 logicalTypes
-            ) {
+            ).enumerated() {
+                let ((token, convention), logicalType) = pair
                 let value: Bytecode.Register
+                if let boundaryConvention = nativeCallbackConventions[index] {
+                    guard convention != .inout else {
+                        throw CanonicalSIL.LoweringError.invalidCallTable(
+                            "NativeImport callback parameters cannot use inout"
+                        )
+                    }
+                    value = boundaryConvention == .owned
+                        ? try prepareOwnedValue(token, line: line)
+                        : try resolveStorableValue(token, line: line)
+                    let actual = registerTypes[Int(value.rawValue)]
+                    guard actual == logicalType else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "NativeImport callback argument does not match its callable ABI"
+                        )
+                    }
+                    arguments.append(value)
+                    continue
+                }
                 if case let .mutableCell(pointee) = logicalType {
                     guard let existing = mutableCell(at: token),
                           mutableCellPointee(at: token) == pointee
@@ -2594,11 +2744,26 @@ public struct Lowerer: Sendable {
                         }
                         return pair.0 == pair.1
                     }
-                case .entry, .nativeImport:
+                case .entry:
                     // Device boundaries own values. A guaranteed physical
                     // parameter is adapted with an explicit VM copy.
                     return !physical.contains(.inout)
                         && binding.parameterConventions.allSatisfy { $0 == .owned }
+                case .nativeImport:
+                    return zip(physical, binding.parameterConventions)
+                        .allSatisfy { pair in
+                        let (physical, logical) = pair
+                        guard physical != .inout, logical != .inout else {
+                            return false
+                        }
+                        // Nonescaping callback authority is borrowed all the
+                        // way through the NativeImport, so a physical +1
+                        // callback cannot be silently weakened. Escaping
+                        // callbacks and ordinary logical parameters own their
+                        // boundary value and may adapt a physical +0 argument
+                        // with an explicit copy.
+                        return logical == .owned || physical == .borrowed
+                    }
                 }
             case .mutatingValueReceiver:
                 guard case .nativeImport = binding.target,
@@ -2612,11 +2777,78 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func resolveFunctionReferenceSet(
+            bindings: [CanonicalSIL.DirectCallBinding],
+            loweredType: String,
+            bridgesPhysicalTypes: Bool,
+            usesObjectiveCBridge: Bool,
+            symbol: String,
+            line: Int
+        ) throws -> ResolvedFunctionReferenceSet {
+            guard !bindings.isEmpty else {
+                throw CanonicalSIL.LoweringError.unboundCallee(
+                    line: line,
+                    mangledName: symbol
+                )
+            }
+            let physicalSpellings = try physicalValueParameterSpellings(
+                in: loweredType
+            )
+            let variants: [ResolvedFunctionReference] = try bindings.map { binding in
+                let bridge: (
+                    parameters: [Bytecode.ValueType],
+                    result: Bytecode.ValueType
+                )? = bridgesPhysicalTypes
+                    ? (binding.parameterTypes, binding.resultType) : nil
+                let callee = try parseFunctionType(
+                    loweredType,
+                    bridgingTo: bridge,
+                    parameterProjection: binding.parameterProjection,
+                    abiAdapter: binding.abiAdapter,
+                    preservingClosureOwnership:
+                        preservesPhysicalClosureOwnership(for: binding)
+                )
+                guard callee.parameters == binding.parameterTypes,
+                      acceptsPhysicalConventions(
+                          callee.parameterConventions,
+                          for: binding
+                      ),
+                      callee.result == binding.resultType,
+                      callee.effects.mayThrow == binding.effects.mayThrow,
+                      callee.effects.isAsync == binding.effects.isAsync,
+                      physicalActorIsolationIsCompatible(
+                          callee.effects,
+                          authoritative: binding.effects
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: line,
+                        mangledName: symbol,
+                        detail: "actual \(callee.parameters) "
+                            + "\(callee.parameterConventions) -> \(callee.result) "
+                            + "\(callee.effects); expected \(binding.parameterTypes) "
+                            + "\(binding.parameterConventions) -> "
+                            + "\(binding.resultType) \(binding.effects)"
+                    )
+                }
+                return ResolvedFunctionReference(
+                    binding: binding,
+                    physicalParameterConventions: callee.parameterConventions,
+                    physicalValueParameterSpellings: physicalSpellings,
+                    hasIndirectResult: callee.hasIndirectResult,
+                    indirectErrorType: callee.indirectErrorType,
+                    erasedMetatypes: callee.erasedMetatypes,
+                    usesObjectiveCBridge: usesObjectiveCBridge
+                )
+            }
+            return .init(variants: variants)
+        }
+
         func resolveDeferredForeignReference(
             _ deferred: (reference: String, loweredType: String),
             genericArguments rawArguments: String,
             line: Int
-        ) throws -> ResolvedFunctionReference {
+        ) throws -> ResolvedFunctionReferenceSet {
             let genericArguments = splitTopLevel(rawArguments).filter { !$0.isEmpty }
             guard !genericArguments.isEmpty else {
                 throw CanonicalSIL.LoweringError.unsupportedInstruction(
@@ -2629,7 +2861,8 @@ public struct Lowerer: Sendable {
                 loweredType: deferred.loweredType,
                 genericArguments: genericArguments
             )
-            guard let binding = directCalls.binding(for: symbol) else {
+            let bindings = directCalls.bindings(for: symbol)
+            guard !bindings.isEmpty else {
                 if let unavailable = directCalls.unavailableCall(for: symbol) {
                     throw CanonicalSIL.LoweringError.unavailableNativeImport(
                         line: line,
@@ -2643,37 +2876,13 @@ public struct Lowerer: Sendable {
                     mangledName: symbol
                 )
             }
-            let callee = try parseFunctionType(
-                deferred.loweredType,
-                bridgingTo: (binding.parameterTypes, binding.resultType),
-                abiAdapter: binding.abiAdapter
-            )
-            guard callee.parameters == binding.parameterTypes,
-                  acceptsPhysicalConventions(
-                      callee.parameterConventions,
-                      for: binding
-                  ),
-                  callee.result == binding.resultType,
-                  callee.effects.mayThrow == binding.effects.mayThrow,
-                  callee.effects.isAsync == binding.effects.isAsync
-            else {
-                throw CanonicalSIL.LoweringError.callSignatureMismatch(
-                    line: line,
-                    mangledName: symbol,
-                    detail: "specialized foreign reference has \(callee.parameters) "
-                        + "\(callee.parameterConventions) -> \(callee.result) "
-                        + "\(callee.effects); expected \(binding.parameterTypes) "
-                        + "\(binding.parameterConventions) -> \(binding.resultType) "
-                        + "\(binding.effects)"
-                )
-            }
-            return .init(
-                binding: binding,
-                physicalParameterConventions: callee.parameterConventions,
-                hasIndirectResult: callee.hasIndirectResult,
-                indirectErrorType: callee.indirectErrorType,
-                erasedMetatypes: callee.erasedMetatypes,
-                usesObjectiveCBridge: true
+            return try resolveFunctionReferenceSet(
+                bindings: bindings,
+                loweredType: deferred.loweredType,
+                bridgesPhysicalTypes: true,
+                usesObjectiveCBridge: true,
+                symbol: symbol,
+                line: line
             )
         }
 
@@ -2682,21 +2891,31 @@ public struct Lowerer: Sendable {
             for reference: ResolvedFunctionReference,
             line: Int
         ) throws -> [String] {
-            guard !reference.erasedMetatypes.isEmpty else { return tokens }
+            let physicalValueCount = Int(
+                reference.binding.parameterProjection.physicalParameterCount
+            )
+            guard !reference.erasedMetatypes.isEmpty else {
+                guard tokens.count == physicalValueCount else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "direct call physical argument count does not match its frozen ABI"
+                    )
+                }
+                return tokens
+            }
             let erasedByIndex = Dictionary(
                 uniqueKeysWithValues: reference.erasedMetatypes.map {
                     ($0.physicalIndex, $0.identity)
                 }
             )
             guard tokens.count
-                    == reference.physicalParameterConventions.count + erasedByIndex.count
+                    == physicalValueCount + erasedByIndex.count
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "direct call physical argument count does not match its frozen ABI"
                 )
             }
-            var logical: [String] = []
-            logical.reserveCapacity(reference.physicalParameterConventions.count)
+            var physicalValues: [String] = []
+            physicalValues.reserveCapacity(physicalValueCount)
             for (index, token) in tokens.enumerated() {
                 if let identity = erasedByIndex[index] {
                     let matches: Bool = switch identity {
@@ -2711,10 +2930,371 @@ public struct Lowerer: Sendable {
                         )
                     }
                 } else {
-                    logical.append(token)
+                    physicalValues.append(token)
                 }
             }
-            return logical
+            return physicalValues
+        }
+
+        func projectNativeImportArguments(
+            _ physicalTokens: [String],
+            for reference: ResolvedFunctionReference,
+            line: Int
+        ) throws -> [String] {
+            let binding = reference.binding
+            let projection = binding.parameterProjection
+            guard physicalTokens.count == Int(projection.physicalParameterCount)
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "NativeImport physical argument count does not match its frozen projection"
+                )
+            }
+            guard case .nativeImport = binding.target else {
+                guard projection.omittedPhysicalParameterIndices.isEmpty else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "only a NativeImport may omit physical call arguments"
+                    )
+                }
+                return physicalTokens
+            }
+            let selected = Set(projection.logicalParameterIndices.map(Int.init))
+            for index in selected {
+                let token = physicalTokens[index]
+                let address = addressBase(token)
+                guard externalDefaultArgumentAddresses[address] == nil,
+                      externalDefaultArgumentValues[token] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "NativeImport selected a compiler default argument as an explicit value"
+                    )
+                }
+            }
+            let defaults = Dictionary(
+                uniqueKeysWithValues: projection.defaultArguments.map {
+                    (Int($0.physicalParameterIndex), $0)
+                }
+            )
+            for (index, token) in physicalTokens.enumerated()
+            where !selected.contains(index) {
+                guard reference.physicalValueParameterSpellings.indices
+                    .contains(index),
+                      let defaultArgument = defaults[index]
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "NativeImport projection has no physical default descriptor"
+                    )
+                }
+                let expectedDefaultType = try parseStoredType(
+                    reference.physicalValueParameterSpellings[index]
+                )
+                let address = addressBase(token)
+                switch defaultArgument.origin {
+                case .externalGenerator:
+                    guard let generatorSymbol = defaultArgument.generatorSymbol else {
+                        throw CanonicalSIL.LoweringError.invalidCallTable(
+                            "NativeImport external default has no generator symbol"
+                        )
+                    }
+                    if var value = externalDefaultArgumentAddresses[address] {
+                        guard value.ownerSymbols.contains(binding.mangledName),
+                              value.generatorSymbol == generatorSymbol,
+                              !value.isConsumed,
+                              value.valueType == expectedDefaultType
+                        else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "NativeImport default argument address has the wrong owner, generator, type, or lifetime"
+                            )
+                        }
+                        value.isConsumed = true
+                        externalDefaultArgumentAddresses[address] = value
+                        continue
+                    }
+                    if var value = externalDefaultArgumentValues[token] {
+                        guard value.ownerSymbols.contains(binding.mangledName),
+                              value.generatorSymbol == generatorSymbol,
+                              !value.isProjected,
+                              value.valueType == expectedDefaultType
+                        else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "NativeImport default argument value has the wrong owner, generator, or type"
+                            )
+                        }
+                        let physicalSpelling = reference
+                            .physicalValueParameterSpellings[index]
+                        if hasExplicitBorrowedValueConvention(
+                            physicalSpelling
+                        ),
+                           !expectedDefaultType.isTrivial {
+                            // The physical +0 call leaves the generator's +1
+                            // nontrivial result alive for its following Swift
+                            // ownership cleanup. Retain only compiler
+                            // provenance; no VM value exists.
+                            value.isProjected = true
+                            externalDefaultArgumentValues[token] = value
+                        } else {
+                            externalDefaultArgumentValues.removeValue(
+                                forKey: token
+                            )
+                        }
+                        continue
+                    }
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "NativeImport omitted physical parameter is not the frozen default generator"
+                    )
+                case .optionalNone:
+                    guard inlineOptionalNoneValues.remove(token) != nil else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "NativeImport omitted physical parameter is not Optional.none"
+                        )
+                    }
+                    // Clang-imported Optional defaults such as `group: nil`
+                    // are emitted directly rather than through an fA helper.
+                    // Preserve the physical apply's ownership edge even
+                    // though the default-only parameter is projected away.
+                    let value = try resolve(token, line: line)
+                    guard case .optional = registerTypes[Int(value.rawValue)],
+                          registerTypes[Int(value.rawValue)]
+                            == expectedDefaultType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "NativeImport inline default argument is not the expected Optional.none"
+                        )
+                    }
+                    if requiresManagedOwnership(
+                        registerTypes[Int(value.rawValue)]
+                    ) {
+                        // Projection removes the value from the physical call,
+                        // so retire its VM owner independently of whether SIL
+                        // passed that owner +0 or +1. Any later destroy/release
+                        // is compiler ownership plumbing for this same erased
+                        // SSA value and must not release it twice.
+                        appendInstruction(.destroyValue(value))
+                        projectedInlineOptionalNoneOwners.insert(value)
+                    }
+                }
+            }
+            return projection.logicalParameterIndices.map {
+                physicalTokens[Int($0)]
+            }
+        }
+
+        func nativeImportProjectionMatches(
+            _ physicalTokens: [String],
+            reference: ResolvedFunctionReference
+        ) throws -> Bool {
+            let binding = reference.binding
+            let projection = binding.parameterProjection
+            guard case .nativeImport = binding.target,
+                  physicalTokens.count == Int(projection.physicalParameterCount)
+            else { return false }
+            let selected = Set(projection.logicalParameterIndices.map(Int.init))
+            let defaults = Dictionary(
+                uniqueKeysWithValues: projection.defaultArguments.map {
+                    (Int($0.physicalParameterIndex), $0)
+                }
+            )
+            for (index, token) in physicalTokens.enumerated() {
+                let address = addressBase(token)
+                if selected.contains(index) {
+                    if externalDefaultArgumentAddresses[address] != nil
+                        || externalDefaultArgumentValues[token] != nil {
+                        return false
+                    }
+                    continue
+                }
+                guard let descriptor = defaults[index],
+                      reference.physicalValueParameterSpellings.indices
+                        .contains(index)
+                else { return false }
+                let expected = try parseStoredType(
+                    reference.physicalValueParameterSpellings[index]
+                )
+                switch descriptor.origin {
+                case .externalGenerator:
+                    guard let generator = descriptor.generatorSymbol else {
+                        return false
+                    }
+                    if let value = externalDefaultArgumentAddresses[address] {
+                        guard value.ownerSymbols.contains(binding.mangledName),
+                              value.generatorSymbol == generator,
+                              !value.isConsumed,
+                              value.valueType == expected
+                        else { return false }
+                    } else if let value = externalDefaultArgumentValues[token] {
+                        guard value.ownerSymbols.contains(binding.mangledName),
+                              value.generatorSymbol == generator,
+                              value.valueType == expected
+                        else { return false }
+                    } else {
+                        return false
+                    }
+                case .optionalNone:
+                    guard inlineOptionalNoneValues.contains(token),
+                          let value = values[token],
+                          registerTypes[Int(value.rawValue)] == expected,
+                          case .optional = expected
+                    else { return false }
+                }
+            }
+            return true
+        }
+
+        func selectFunctionReference(
+            _ references: ResolvedFunctionReferenceSet,
+            physicalTokens: [String],
+            line: Int
+        ) throws -> ResolvedFunctionReference {
+            guard references.variants.count > 1 else {
+                guard let reference = references.sole else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "function reference has no frozen call variant"
+                    )
+                }
+                return reference
+            }
+            let matching = try references.variants.filter {
+                try nativeImportProjectionMatches(
+                    physicalTokens,
+                    reference: $0
+                )
+            }
+            guard let minimumCount = matching.map({
+                $0.binding.parameterTypes.count
+            }).min() else {
+                let evidence = physicalTokens.enumerated().map { index, token in
+                    let address = addressBase(token)
+                    if let value = externalDefaultArgumentAddresses[address] {
+                        return "\(index)=generator@\(value.generatorSymbol)"
+                    }
+                    if let value = externalDefaultArgumentValues[token] {
+                        return "\(index)=generator@\(value.generatorSymbol)"
+                    }
+                    if inlineOptionalNoneValues.contains(token) {
+                        return "\(index)=Optional.none"
+                    }
+                    return "\(index)=explicit"
+                }.joined(separator: ",")
+                let variants = references.variants.map { reference in
+                    let projection = reference.binding.parameterProjection
+                    let defaults = projection.defaultArguments.map { argument in
+                        switch argument.origin {
+                        case .externalGenerator:
+                            "\(argument.physicalParameterIndex)=generator@"
+                                + (argument.generatorSymbol ?? "<missing>")
+                        case .optionalNone:
+                            "\(argument.physicalParameterIndex)=Optional.none"
+                        }
+                    }.joined(separator: ",")
+                    return "[\(projection.logicalParameterIndices)]{\(defaults)}"
+                }.joined(separator: ";")
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: references.variants[0].binding.mangledName,
+                    detail: "no frozen source-call variant matches the physical default arguments; "
+                        + "evidence \(evidence); variants \(variants)"
+                )
+            }
+            // Canonicalize every value whose provenance exactly matches a
+            // frozen default. Swift can emit the same physical Optional.none
+            // for an omitted argument and for an explicit `nil`; both have
+            // identical semantics, while retaining the larger projection
+            // would manufacture an unnecessary linear Optional owner.
+            let mostCanonical = matching.filter {
+                $0.binding.parameterTypes.count == minimumCount
+            }
+            guard mostCanonical.count == 1, let selected = mostCanonical.first else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: references.variants[0].binding.mangledName,
+                    detail: "physical default arguments match multiple equally canonical frozen source-call variants"
+                )
+            }
+            return selected
+        }
+
+        func lowerExternalDefaultArgumentGenerator(
+            _ generator: ExternalDefaultArgumentGenerator,
+            resultToken: String,
+            genericArguments: String,
+            argumentText: String,
+            appliedLoweredType: String,
+            line: Int
+        ) throws {
+            guard genericArguments.isEmpty else {
+                throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                    line: line,
+                    text: "generic external default argument"
+                )
+            }
+            let referenceType = try parseFunctionType(generator.loweredType)
+            let appliedType = try parseFunctionType(appliedLoweredType)
+            guard referenceType.parameters.isEmpty,
+                  referenceType.parameterConventions.isEmpty,
+                  referenceType.erasedMetatypes.isEmpty,
+                  referenceType.result != .void,
+                  referenceType.effects == .init(),
+                  appliedType.parameters == referenceType.parameters,
+                  appliedType.parameterConventions
+                    == referenceType.parameterConventions,
+                  appliedType.result == referenceType.result,
+                  appliedType.hasIndirectResult
+                    == referenceType.hasIndirectResult,
+                  appliedType.indirectErrorType == nil,
+                  appliedType.effects == referenceType.effects
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "external default-argument helper changes its physical ABI"
+                )
+            }
+            var arguments = try parseApplyValueTokens(
+                argumentText,
+                line: line
+            )
+            let destinations = try consumeIndirectCallDestinations(
+                from: &arguments,
+                resultType: referenceType.result,
+                hasIndirectResult: referenceType.hasIndirectResult,
+                indirectErrorType: nil,
+                physicalArgumentCount: 0
+            )
+            guard arguments.isEmpty, destinations.error == nil else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "external default-argument helper has runtime inputs"
+                )
+            }
+            if let destination = destinations.result {
+                let root = addressBase(destination)
+                guard !resultToken.isEmpty,
+                      stackType(at: destination) == referenceType.result,
+                      stackAddressValues[root] == nil,
+                      externalDefaultArgumentAddresses[root] == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "external default argument has invalid indirect storage"
+                    )
+                }
+                externalDefaultArgumentAddresses[root] = .init(
+                    ownerSymbols: generator.ownerSymbols,
+                    generatorSymbol: generator.symbol,
+                    valueType: referenceType.result
+                )
+                voidValues.insert(resultToken)
+            } else {
+                guard !resultToken.isEmpty,
+                      externalDefaultArgumentValues.updateValue(
+                        .init(
+                            ownerSymbols: generator.ownerSymbols,
+                            generatorSymbol: generator.symbol,
+                            valueType: referenceType.result
+                        ),
+                        forKey: resultToken
+                      ) == nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "external default argument has no unique direct result"
+                    )
+                }
+            }
         }
 
         func adaptBoundaryArguments(
@@ -2725,10 +3305,20 @@ public struct Lowerer: Sendable {
             switch binding.target {
             case .function:
                 return arguments
-            case .entry, .nativeImport:
+            case .entry:
                 return try zip(arguments, physicalConventions).map {
-                    argument, convention in
-                    convention == .borrowed
+                    argument, physical in
+                    physical == .borrowed
+                        ? try copyOwnedValue(argument)
+                        : argument
+                }
+            case .nativeImport:
+                return try zip(
+                    zip(arguments, physicalConventions),
+                    binding.parameterConventions
+                ).map { pair, logical in
+                    let (argument, physical) = pair
+                    return physical == .borrowed && logical == .owned
                         ? try copyOwnedValue(argument)
                         : argument
                 }
@@ -3701,7 +4291,12 @@ public struct Lowerer: Sendable {
                 return
             }
             let type = registerTypes[Int(value.rawValue)]
-            if case .closure = type { return }
+            if case .closure = type {
+                if operation == .release {
+                    try releaseClosureValueIfFinal(token: token, value: value)
+                }
+                return
+            }
             if case .mutableCell = type { return }
             if case .nonOwningReference = type { return }
             guard type == .string || type == .error
@@ -3822,6 +4417,9 @@ public struct Lowerer: Sendable {
                 valueTokens,
                 physicalConventions: valueConventions,
                 logicalTypes: Array(binding.parameterTypes.dropLast()),
+                nativeCallbackConventions: nativeCallbackParameterConventions(
+                    for: binding
+                ),
                 line: line,
                 allowsCompilerInoutWriteback: true
             )
@@ -3871,8 +4469,7 @@ public struct Lowerer: Sendable {
             // the enclosing value until the replacement is assigned or its
             // aggregate spine is rebuilt.
             arguments.append(receiver)
-            guard arguments.map({ registerTypes[Int($0.rawValue)] })
-                    == binding.parameterTypes
+            guard directCallArgumentsMatch(arguments, binding: binding)
             else {
                 throw CanonicalSIL.LoweringError.callSignatureMismatch(
                     line: line,
@@ -18040,6 +18637,7 @@ public struct Lowerer: Sendable {
             if staticKeyPathValues[token] != nil { return }
             if unboundedRangeClosureValues.remove(token) != nil { return }
             borrowedValueTokens.remove(token)
+            inlineOptionalNoneValues.remove(token)
             if let value = mutableCaptureState.temporaryBorrowOwners.removeValue(
                 forKey: token
             ), requiresManagedOwnership(registerTypes[Int(value.rawValue)]),
@@ -18081,6 +18679,20 @@ public struct Lowerer: Sendable {
                 remainingDeallocStackUses.removeValue(forKey: token)
             } else {
                 remainingDeallocStackUses[token] = remainingUses - 1
+            }
+            if let value = externalDefaultArgumentAddresses[address] {
+                guard value.isConsumed,
+                      !explicitlyDestroyedAddresses.contains(token)
+                        || value.isDestroyed
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "external default argument storage has an incomplete lifetime"
+                    )
+                }
+                if isFinalLexicalUse {
+                    externalDefaultArgumentAddresses.removeValue(forKey: address)
+                }
+                return
             }
             if compilerEnumAddressTypes[address] != nil {
                 if isFinalLexicalUse {
@@ -18560,9 +19172,17 @@ public struct Lowerer: Sendable {
                     guard parameterRegisters.count == signature.parameters.count else {
                         throw CanonicalSIL.LoweringError.malformedSIL("entry parameter count does not match function type")
                     }
-                    for (register, expected) in zip(parameterRegisters, signature.parameters)
-                    where registerTypes[Int(register.rawValue)] != expected {
-                        throw CanonicalSIL.LoweringError.malformedSIL("entry parameter type does not match function type")
+                    for (register, expected) in zip(
+                        parameterRegisters,
+                        signature.parameters
+                    ) {
+                        let actual = registerTypes[Int(register.rawValue)]
+                        guard actual == expected else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "entry parameter in \(displayName) has type "
+                                    + "\(actual), expected \(expected)"
+                            )
+                        }
                     }
                     for ((parameter, convention), type) in zip(
                         zip(explicitParameters, signature.parameterConventions),
@@ -18611,6 +19231,9 @@ public struct Lowerer: Sendable {
                     bridge.argumentTokens,
                     physicalConventions: physicalConventions,
                     logicalTypes: binding.parameterTypes,
+                    nativeCallbackConventions: nativeCallbackParameterConventions(
+                        for: binding
+                    ),
                     line: sourceLine,
                     allowsCompilerInoutWriteback: false
                 )
@@ -18619,8 +19242,7 @@ public struct Lowerer: Sendable {
                     physicalConventions: physicalConventions,
                     binding: binding
                 )
-                guard arguments.map({ registerTypes[Int($0.rawValue)] })
-                        == binding.parameterTypes,
+                guard directCallArgumentsMatch(arguments, binding: binding),
                       case let .nativeImport(requirement) = binding.target
                 else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
@@ -18937,6 +19559,13 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = alloc_stack(?: \[[^\]]+\])* \$(.+?)(?:, (?:var|let),.*)?$"#
             ) {
+                if let signature = try nativeBlockStorageClosureSignature(
+                    stack[1]
+                ) {
+                    stackAddressTypes[stack[0]] = .closure(signature)
+                    nativeBlockStorageRoots.insert(stack[0])
+                    continue
+                }
                 let compilerEnumType = stack[1]
                     .replacingOccurrences(of: "Swift.", with: "")
                 if compilerEnumType == "FloatingPointRoundingRule" {
@@ -19042,6 +19671,97 @@ public struct Lowerer: Sendable {
                     values[stack[0]] = address
                     appendInstruction(.stackAddress(result: address, slot: slot))
                 }
+                continue
+            }
+
+            if let projection = match(
+                line,
+                pattern: #"^(%[0-9]+) = project_block_storage (%[0-9]+)$"#
+            ) {
+                let root = addressBase(projection[1])
+                guard nativeBlockStorageRoots.contains(root),
+                      stackAddressTypes[root]?.directClosureShape != nil
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "project_block_storage does not reference typed native block storage"
+                    )
+                }
+                addressAliases[projection[0]] = root
+                continue
+            }
+
+            if let header = match(
+                line,
+                pattern: #"^(%[0-9]+) = init_block_storage_header (%[0-9]+), invoke (%[0-9]+) : \$(.+), type \$(.+)$"#
+            ) {
+                let root = addressBase(header[1])
+                guard nativeBlockStorageRoots.contains(root),
+                      let storedType = stackAddressTypes[root],
+                      case let .closure(expected) = storedType,
+                      let referencedThunk = nativeBlockThunkSignatures[
+                        header[2]
+                      ],
+                      let headerThunk = try nativeBlockThunkSignature(header[3]),
+                      headerThunk == referencedThunk,
+                      closurePhysicalABIMatches(referencedThunk, expected),
+                      isSupportedBlockBridgeSpelling(
+                          header[4],
+                          to: storedType
+                      ),
+                      let value = try resolvedStackValue(
+                          at: root,
+                          line: sourceLine
+                      ),
+                      registerTypes[Int(value.rawValue)] == storedType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "native block header does not match its stored closure ABI"
+                    )
+                }
+                values[header[0]] = value
+                continue
+            }
+
+            if let copy = match(
+                line,
+                pattern: #"^(%[0-9]+) = copy_block (%[0-9]+)$"#
+            ) {
+                let source = try resolve(copy[1], line: sourceLine)
+                guard case .closure = registerTypes[Int(source.rawValue)] else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "copy_block operand is not a represented closure"
+                    )
+                }
+                let result = try allocate(
+                    type: registerTypes[Int(source.rawValue)]
+                )
+                values[copy[0]] = result
+                appendInstruction(.copyValue(result: result, source: source))
+                continue
+            }
+
+            if let copy = match(
+                line,
+                pattern: #"^(%[0-9]+) = copy_block_without_escaping (%[0-9]+) withoutEscaping (%[0-9]+)$"#
+            ) {
+                let source = try resolve(copy[1], line: sourceLine)
+                let dependency = try resolve(copy[2], line: sourceLine)
+                guard case let .closure(sourceSignature) = registerTypes[
+                    Int(source.rawValue)
+                ], case let .closure(dependencySignature) = registerTypes[
+                    Int(dependency.rawValue)
+                ], sourceSignature == dependencySignature
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "copy_block_without_escaping changes its dependent closure ABI"
+                    )
+                }
+                // This token is a +0 block view. Its dependency retains the
+                // dynamic scope; the nonescaping NativeImport convention is
+                // responsible for keeping the boundary borrowed.
+                values[copy[0]] = source
+                aliasRetainedValue(copy[0], to: copy[1])
+                aliasBorrowedTemporary(copy[0], to: copy[1])
                 continue
             }
 
@@ -20955,9 +21675,10 @@ public struct Lowerer: Sendable {
                     reference: reference[1],
                     loweredType: reference[2]
                 )
-                let resolvedSymbol = directCalls.binding(for: reference[1]) == nil
+                let resolvedSymbol = !directCalls.hasBinding(for: reference[1])
                     ? exactForeignSymbol : reference[1]
-                guard let binding = directCalls.binding(for: resolvedSymbol) else {
+                let bindings = directCalls.bindings(for: resolvedSymbol)
+                guard !bindings.isEmpty else {
                     if let unavailable = directCalls.unavailableCall(for: resolvedSymbol)
                         ?? directCalls.unavailableCall(for: reference[1]) {
                         throw CanonicalSIL.LoweringError.unavailableNativeImport(
@@ -20972,42 +21693,49 @@ public struct Lowerer: Sendable {
                         mangledName: exactForeignSymbol
                     )
                 }
-                let physicalBridge: (
-                    parameters: [Bytecode.ValueType], result: Bytecode.ValueType
-                )? = usesObjectiveCBridge
-                    ? (binding.parameterTypes, binding.resultType)
-                    : nil
-                let callee = try parseFunctionType(
-                    reference[2],
-                    bridgingTo: physicalBridge,
-                    abiAdapter: binding.abiAdapter
+                functionReferences[reference[0]] = try resolveFunctionReferenceSet(
+                    bindings: bindings,
+                    loweredType: reference[2],
+                    bridgesPhysicalTypes: usesObjectiveCBridge,
+                    usesObjectiveCBridge: usesObjectiveCBridge,
+                    symbol: resolvedSymbol,
+                    line: sourceLine
                 )
-                guard callee.parameters == binding.parameterTypes,
-                      acceptsPhysicalConventions(
-                          callee.parameterConventions,
-                          for: binding
+                continue
+            }
+
+            if let reference = match(
+                line,
+                pattern: #"^(%[0-9]+) = (?:dynamic_)?function_ref @([^\s:]+) : \$(.+)$"#
+            ), reference[1].hasSuffix("TR"),
+               let closureType = CanonicalSIL.ClosureReabstraction
+                .nonescapingAdapterClosureType(in: reference[2]) {
+                guard case let .closure(signature) = try parseStoredType(
+                        closureType
                       ),
-                      callee.result == binding.resultType,
-                      callee.effects.mayThrow == binding.effects.mayThrow,
-                      callee.effects.isAsync == binding.effects.isAsync
+                      !signature.effects.isAsync
                 else {
-                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
-                        line: sourceLine,
-                        mangledName: reference[1],
-                        detail: "actual \(callee.parameters) \(callee.parameterConventions) "
-                            + "-> \(callee.result) \(callee.effects); expected "
-                            + "\(binding.parameterTypes) \(binding.parameterConventions) "
-                            + "-> \(binding.resultType) \(binding.effects)"
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "noescape reabstraction adapter @\(reference[1]) has "
+                            + "an unsupported closure ABI \(closureType)"
                     )
                 }
-                functionReferences[reference[0]] = .init(
-                    binding: binding,
-                    physicalParameterConventions: callee.parameterConventions,
-                    hasIndirectResult: callee.hasIndirectResult,
-                    indirectErrorType: callee.indirectErrorType,
-                    erasedMetatypes: callee.erasedMetatypes,
-                    usesObjectiveCBridge: usesObjectiveCBridge
-                )
+                nativeBlockNonescapingAdapters[reference[0]] = signature
+                continue
+            }
+
+            if let reference = match(
+                line,
+                pattern: #"^(%[0-9]+) = (?:dynamic_)?function_ref @([^\s:]+) : \$(.+)$"#
+            ), let signature = try nativeBlockThunkSignature(
+                reference[2]
+            ) {
+                guard reference[1].hasSuffix("TR") else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "native block invoke helper is not a Swift reabstraction thunk"
+                    )
+                }
+                nativeBlockThunkSignatures[reference[0]] = signature
                 continue
             }
 
@@ -21022,10 +21750,33 @@ public struct Lowerer: Sendable {
                     unboundedRangeFunctionReferences.insert(reference[0])
                     continue
                 }
-                let boundCall = directCalls.binding(for: reference[1])
-                let hasImageBody = boundCall.map { binding in
+                let boundCalls = directCalls.bindings(for: reference[1])
+                let hasImageBody = boundCalls.contains { binding in
                     if case .function = binding.target { true } else { false }
-                } ?? false
+                }
+                let defaultOwners = Set(
+                    ReleaseCompiler.ImplementationFingerprint
+                        .defaultArgumentOwners(of: reference[1])
+                ).filter { owner in
+                    directCalls.bindings(for: owner).contains(where: { ownerBinding in
+                       guard case .nativeImport = ownerBinding.target else {
+                           return false
+                       }
+                       return ownerBinding.parameterProjection.defaultArguments
+                           .contains { argument in
+                               argument.origin == .externalGenerator
+                                   && argument.generatorSymbol == reference[1]
+                           }
+                    })
+                }
+                if !defaultOwners.isEmpty {
+                    externalDefaultArgumentGenerators[reference[0]] = .init(
+                        symbol: reference[1],
+                        ownerSymbols: defaultOwners,
+                        loweredType: reference[2]
+                    )
+                    continue
+                }
                 if !hasImageBody,
                    let intrinsic = SwiftCoreIntrinsic(
                        mangledName: reference[1]
@@ -21058,11 +21809,11 @@ public struct Lowerer: Sendable {
                     loweredType: reference[2]
                 ) {
                     hostedAllocatorReferences[reference[0]] = allocatorType
-                    if directCalls.binding(for: reference[1]) == nil {
+                    if boundCalls.isEmpty {
                         continue
                     }
                 }
-                guard let binding = boundCall else {
+                guard !boundCalls.isEmpty else {
                     if let unavailable = directCalls.unavailableCall(for: reference[1]) {
                         throw CanonicalSIL.LoweringError.unavailableNativeImport(
                             line: sourceLine,
@@ -21076,36 +21827,13 @@ public struct Lowerer: Sendable {
                         mangledName: reference[1]
                     )
                 }
-                let callee = try parseFunctionType(
-                    reference[2],
-                    bridgingTo: (binding.parameterTypes, binding.resultType),
-                    abiAdapter: binding.abiAdapter
-                )
-                guard callee.parameters == binding.parameterTypes,
-                      acceptsPhysicalConventions(
-                          callee.parameterConventions,
-                          for: binding
-                      ),
-                      callee.result == binding.resultType,
-                      callee.effects.mayThrow == binding.effects.mayThrow,
-                      callee.effects.isAsync == binding.effects.isAsync
-                else {
-                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
-                        line: sourceLine,
-                        mangledName: reference[1],
-                        detail: "actual \(callee.parameters) \(callee.parameterConventions) "
-                            + "-> \(callee.result) \(callee.effects); expected "
-                            + "\(binding.parameterTypes) \(binding.parameterConventions) "
-                            + "-> \(binding.resultType) \(binding.effects)"
-                    )
-                }
-                functionReferences[reference[0]] = .init(
-                    binding: binding,
-                    physicalParameterConventions: callee.parameterConventions,
-                    hasIndirectResult: callee.hasIndirectResult,
-                    indirectErrorType: callee.indirectErrorType,
-                    erasedMetatypes: callee.erasedMetatypes,
-                    usesObjectiveCBridge: false
+                functionReferences[reference[0]] = try resolveFunctionReferenceSet(
+                    bindings: boundCalls,
+                    loweredType: reference[2],
+                    bridgesPhysicalTypes: true,
+                    usesObjectiveCBridge: false,
+                    symbol: reference[1],
+                    line: sourceLine
                 )
                 continue
             }
@@ -21131,31 +21859,67 @@ public struct Lowerer: Sendable {
                     }
                     continue
                 }
-                guard let reference = functionReferences[conversion[1]],
-                      case let .function(functionID) = reference.binding.target
+                guard let references = functionReferences[conversion[1]] else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: line + " (function reference was not resolved)"
+                    )
+                }
+                guard let reference = references.sole else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "thin_to_thick_function has \(references.variants.count) "
+                            + "candidate function bindings"
+                    )
+                }
+                guard case let .function(functionID) = reference.binding.target
                 else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
-                        text: line
+                        text: line + " (target is not an image-local function)"
                     )
                 }
                 let binding = reference.binding
-                guard
-                      binding.abiAdapter == .direct,
+                let convertedType = try parseType(conversion[2])
+                guard case let .closure(signature) = convertedType else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: line + " (target is not a closure value type)"
+                    )
+                }
+                guard binding.abiAdapter == .direct,
                       !binding.effects.isAsync,
-                      case let .closure(signature) = try parseType(conversion[2]),
                       signature.parameters == binding.parameterTypes,
                       signature.parameterConventions
                         == binding.parameterConventions,
                       signature.result == binding.resultType,
-                      signature.effects == binding.effects
+                      signature.effects.mayThrow == binding.effects.mayThrow,
+                      signature.effects.isAsync == binding.effects.isAsync,
+                      physicalActorIsolationIsCompatible(
+                          signature.effects,
+                          authoritative: binding.effects
+                      )
                 else {
-                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
                         line: sourceLine,
-                        text: line
+                        mangledName: binding.mangledName,
+                        detail: "thin_to_thick produced \(signature.parameters) "
+                            + "\(signature.parameterConventions) -> "
+                            + "\(signature.result) \(signature.effects); expected "
+                            + "\(binding.parameterTypes) "
+                            + "\(binding.parameterConventions) -> "
+                            + "\(binding.resultType) "
+                            + "\(binding.effects)"
                     )
                 }
-                let result = try allocate(type: .closure(signature))
+                let logicalSignature = Bytecode.ClosureSignature(
+                    parameters: binding.parameterTypes,
+                    parameterConventions: binding.parameterConventions,
+                    result: binding.resultType,
+                    effects: Bytecode.ClosureSignature.callableEffects(
+                        from: binding.effects
+                    )
+                )
+                let result = try allocate(type: .closure(logicalSignature))
                 values[conversion[0]] = result
                 appendInstruction(
                     .makeClosure(result: result, function: functionID, captures: [])
@@ -21167,7 +21931,45 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = partial_apply(?: \[[^\]]+\])* (%[0-9]+)\((.*)\) : \$(.+)$"#
             ) {
-                guard let reference = functionReferences[closure[1]],
+                if let signature = nativeBlockNonescapingAdapters[closure[1]] {
+                    let captureTokens = try parseApplyValueTokens(
+                        closure[2],
+                        line: sourceLine
+                    )
+                    guard captureTokens.count == 1,
+                          let physicalClosure = CanonicalSIL.ClosureReabstraction
+                            .nonescapingAdapterClosureType(in: closure[3]),
+                          case let .closure(physicalSignature) = try parseStoredType(
+                            physicalClosure
+                          ),
+                          let source = try captureTokens.first.map({
+                            try resolve($0, line: sourceLine)
+                          }),
+                          case let .closure(sourceSignature) = registerTypes[
+                            Int(source.rawValue)
+                          ],
+                          closurePhysicalABIMatches(
+                              physicalSignature,
+                              signature
+                          ),
+                          closurePhysicalABIMatches(
+                              sourceSignature,
+                              signature
+                          )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "native block noescape adapter changes its closure ABI"
+                        )
+                    }
+                    // The VM closure ABI does not distinguish Swift's
+                    // noescape reabstraction view; block storage retains or
+                    // borrows it according to the frozen NativeImport contract.
+                    values[closure[0]] = source
+                    aliasRetainedValue(closure[0], to: captureTokens[0])
+                    aliasBorrowedTemporary(closure[0], to: captureTokens[0])
+                    continue
+                }
+                guard let reference = functionReferences[closure[1]]?.sole,
                       case let .function(functionID) = reference.binding.target
                 else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
@@ -21190,7 +21992,10 @@ public struct Lowerer: Sendable {
                         binding.parameterTypes,
                         binding.resultType
                     ),
-                    abiAdapter: binding.abiAdapter
+                    parameterProjection: binding.parameterProjection,
+                    abiAdapter: binding.abiAdapter,
+                    preservingClosureOwnership:
+                        preservesPhysicalClosureOwnership(for: binding)
                 )
                 guard physicalType.parameters == binding.parameterTypes,
                       physicalType.parameterConventions
@@ -21200,7 +22005,11 @@ public struct Lowerer: Sendable {
                       physicalType.indirectErrorType
                         == reference.indirectErrorType,
                       physicalType.effects.mayThrow == binding.effects.mayThrow,
-                      physicalType.effects.isAsync == binding.effects.isAsync
+                      physicalType.effects.isAsync == binding.effects.isAsync,
+                      physicalActorIsolationIsCompatible(
+                          physicalType.effects,
+                          authoritative: binding.effects
+                      )
                 else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
                         line: sourceLine,
@@ -21229,7 +22038,9 @@ public struct Lowerer: Sendable {
                         parameters: binding.parameterTypes,
                         parameterConventions: binding.parameterConventions,
                         result: binding.resultType,
-                        effects: binding.effects
+                        effects: Bytecode.ClosureSignature.callableEffects(
+                            from: binding.effects
+                        )
                     )
                     let result = try allocate(type: .closure(signature))
                     values[closure[0]] = result
@@ -21290,7 +22101,9 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let captureTypes = captures.map { registerTypes[Int($0.rawValue)] }
-                guard captureTypes == expectedCaptureTypes else {
+                guard zip(captureTypes, expectedCaptureTypes).allSatisfy({
+                    $0 == $1
+                }) else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
                         line: sourceLine,
                         mangledName: binding.mangledName
@@ -21302,7 +22115,9 @@ public struct Lowerer: Sendable {
                         binding.parameterConventions.prefix(invocationCount)
                     ),
                     result: binding.resultType,
-                    effects: binding.effects
+                    effects: Bytecode.ClosureSignature.callableEffects(
+                        from: binding.effects
+                    )
                 )
                 let result = try allocate(type: .closure(signature))
                 values[closure[0]] = result
@@ -21358,13 +22173,15 @@ public struct Lowerer: Sendable {
                     )
                 } else {
                     values[dependence[0]] = source
+                    aliasRetainedValue(dependence[0], to: dependence[1])
+                    aliasBorrowedTemporary(dependence[0], to: dependence[1])
                 }
                 continue
             }
 
             if let scopeEnd = match(
                 line,
-                pattern: #"^(%[0-9]+) = destroy_not_escaped_closure (%[0-9]+)$"#
+                pattern: #"^(%[0-9]+) = destroy_not_escaped_closure(?: \[[^\]]+\])* (%[0-9]+)$"#
             ) {
                 guard let remainingEnds = dynamicallyScopedClosureValues[
                     scopeEnd[1]
@@ -21406,33 +22223,41 @@ public struct Lowerer: Sendable {
                 guard case let .closure(actual) = registerTypes[
                     Int(source.rawValue)
                 ], case let .closure(expected) = try parseType(conversion[2]),
-                   actual == expected
+                   closurePhysicalABIMatches(actual, expected)
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "convert_function changes the represented closure ABI"
+                        "convert_function changes the represented closure ABI "
+                            + "from \(registerTypes[Int(source.rawValue)]) "
+                            + "to \(conversion[2])"
                     )
                 }
                 // Direct and indirect SIL results share one value result in
                 // HLBC. A fully concrete conversion that preserves the VM
                 // signature is therefore an ownership-neutral closure alias.
                 values[conversion[0]] = source
+                aliasRetainedValue(conversion[0], to: conversion[1])
+                aliasBorrowedTemporary(conversion[0], to: conversion[1])
                 continue
             }
 
             if let conversion = match(
                 line,
-                pattern: #"^(%[0-9]+) = convert_escape_to_noescape (%[0-9]+) to \$(.+)$"#
+                pattern: #"^(%[0-9]+) = convert_escape_to_noescape(?: \[[^\]]+\])* (%[0-9]+) to \$(.+)$"#
             ) {
                 let source = try resolve(conversion[1], line: sourceLine)
                 guard case let .closure(actual) = registerTypes[Int(source.rawValue)],
                       case let .closure(expected) = try parseType(conversion[2]),
-                      actual == expected
+                      closurePhysicalABIMatches(actual, expected)
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "convert_escape_to_noescape changes the closure signature"
+                        "convert_escape_to_noescape changes the closure signature "
+                            + "from \(registerTypes[Int(source.rawValue)]) "
+                            + "to \(conversion[2])"
                     )
                 }
                 values[conversion[0]] = source
+                aliasRetainedValue(conversion[0], to: conversion[1])
+                aliasBorrowedTemporary(conversion[0], to: conversion[1])
                 continue
             }
 
@@ -21461,6 +22286,11 @@ public struct Lowerer: Sendable {
                 } else {
                     values[borrowed[0]] = try resolve(borrowed[1], line: sourceLine)
                     borrowedValueTokens.insert(borrowed[0])
+                    aliasRetainedValue(borrowed[0], to: borrowed[1])
+                    aliasBorrowedTemporary(borrowed[0], to: borrowed[1])
+                    if inlineOptionalNoneValues.contains(borrowed[1]) {
+                        inlineOptionalNoneValues.insert(borrowed[0])
+                    }
                     if let payload = knownOptionalSomePayloads[borrowed[1]] {
                         knownOptionalSomePayloads[borrowed[0]] = payload
                     }
@@ -21658,7 +22488,11 @@ public struct Lowerer: Sendable {
                             == signature.parameterConventions,
                           appliedType.result == signature.result,
                           appliedType.effects.mayThrow,
-                          !appliedType.effects.isAsync
+                          !appliedType.effects.isAsync,
+                          physicalActorIsolationIsCompatible(
+                              appliedType.effects,
+                              authoritative: signature.effects
+                          )
                     else {
                         throw CanonicalSIL.LoweringError.callSignatureMismatch(
                             line: sourceLine,
@@ -21837,11 +22671,11 @@ public struct Lowerer: Sendable {
                         text: line
                     )
                 }
-                let reference: ResolvedFunctionReference
+                let references: ResolvedFunctionReferenceSet
                 if let resolved = functionReferences[call[0]] {
-                    reference = resolved
+                    references = resolved
                 } else if let deferred = deferredForeignReferences[call[0]] {
-                    reference = try resolveDeferredForeignReference(
+                    references = try resolveDeferredForeignReference(
                         deferred,
                         genericArguments: call[1],
                         line: sourceLine
@@ -21852,26 +22686,68 @@ public struct Lowerer: Sendable {
                         text: line
                     )
                 }
-                let binding = reference.binding
-                if case .staticKeyPathProjection = binding.abiAdapter {
+                guard let physicalReference = references.variants.first else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "function reference has no frozen call variant"
+                    )
+                }
+                let physicalBinding = physicalReference.binding
+                if case .staticKeyPathProjection = physicalBinding.abiAdapter {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
                         text: "static KeyPath projection must be formed by partial_apply"
                     )
                 }
                 guard
-                      binding.effects.mayThrow,
-                      !binding.effects.isAsync
+                      physicalBinding.effects.mayThrow,
+                      !physicalBinding.effects.isAsync
                 else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
                         text: line
                     )
                 }
+                let normalTarget = try parseBlockID(call[4])
+                let errorTarget = try parseBlockID(call[5])
+                var argumentTokens = try parseApplyValueTokens(
+                    call[2],
+                    line: sourceLine
+                )
+                let destinations = try consumeIndirectCallDestinations(
+                    from: &argumentTokens,
+                    resultType: physicalBinding.resultType,
+                    hasIndirectResult: physicalReference.hasIndirectResult,
+                    indirectErrorType: physicalReference.indirectErrorType,
+                    physicalArgumentCount: Int(
+                        physicalBinding.parameterProjection.physicalParameterCount
+                    )
+                        + physicalReference.erasedMetatypes.count
+                )
+                try bindIndirectTryCallDestinations(
+                    destinations,
+                    resultType: physicalBinding.resultType,
+                    indirectErrorType: physicalReference.indirectErrorType,
+                    normalTarget: normalTarget,
+                    errorTarget: errorTarget
+                )
+                argumentTokens = try eraseMetatypeArguments(
+                    argumentTokens,
+                    for: physicalReference,
+                    line: sourceLine
+                )
+                let reference = try selectFunctionReference(
+                    references,
+                    physicalTokens: argumentTokens,
+                    line: sourceLine
+                )
+                let binding = reference.binding
                 let appliedType = try parseFunctionType(
                     call[3],
                     bridgingTo: (binding.parameterTypes, binding.resultType),
-                    abiAdapter: binding.abiAdapter
+                    parameterProjection: binding.parameterProjection,
+                    abiAdapter: binding.abiAdapter,
+                    preservingClosureOwnership:
+                        preservesPhysicalClosureOwnership(for: binding)
                 )
                 guard appliedType.parameters == binding.parameterTypes,
                       appliedType.parameterConventions
@@ -21883,6 +22759,10 @@ public struct Lowerer: Sendable {
                       appliedType.erasedMetatypes == reference.erasedMetatypes,
                       appliedType.effects.mayThrow,
                       !appliedType.effects.isAsync,
+                      physicalActorIsolationIsCompatible(
+                          appliedType.effects,
+                          authoritative: binding.effects
+                      ),
                       call[1].isEmpty
                 else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
@@ -21890,28 +22770,7 @@ public struct Lowerer: Sendable {
                         mangledName: binding.mangledName
                     )
                 }
-                let normalTarget = try parseBlockID(call[4])
-                let errorTarget = try parseBlockID(call[5])
-                var argumentTokens = try parseApplyValueTokens(
-                    call[2],
-                    line: sourceLine
-                )
-                let destinations = try consumeIndirectCallDestinations(
-                    from: &argumentTokens,
-                    resultType: binding.resultType,
-                    hasIndirectResult: reference.hasIndirectResult,
-                    indirectErrorType: reference.indirectErrorType,
-                    physicalArgumentCount: reference.physicalParameterConventions.count
-                        + reference.erasedMetatypes.count
-                )
-                try bindIndirectTryCallDestinations(
-                    destinations,
-                    resultType: binding.resultType,
-                    indirectErrorType: reference.indirectErrorType,
-                    normalTarget: normalTarget,
-                    errorTarget: errorTarget
-                )
-                argumentTokens = try eraseMetatypeArguments(
+                argumentTokens = try projectNativeImportArguments(
                     argumentTokens,
                     for: reference,
                     line: sourceLine
@@ -21920,6 +22779,9 @@ public struct Lowerer: Sendable {
                     argumentTokens,
                     physicalConventions: reference.physicalParameterConventions,
                     logicalTypes: binding.parameterTypes,
+                    nativeCallbackConventions: nativeCallbackParameterConventions(
+                        for: binding
+                    ),
                     line: sourceLine,
                     allowsCompilerInoutWriteback: false
                 )
@@ -21928,7 +22790,7 @@ public struct Lowerer: Sendable {
                     physicalConventions: reference.physicalParameterConventions,
                     binding: binding
                 )
-                guard arguments.map({ registerTypes[Int($0.rawValue)] }) == binding.parameterTypes else {
+                guard directCallArgumentsMatch(arguments, binding: binding) else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
                         line: sourceLine,
                         mangledName: binding.mangledName
@@ -21974,6 +22836,17 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(?:(%[0-9]+) = )?apply (%[0-9]+)(?:<(.+)>)?\((.*)\) : \$(.+)$"#
             ) {
+                if let generator = externalDefaultArgumentGenerators[call[1]] {
+                    try lowerExternalDefaultArgumentGenerator(
+                        generator,
+                        resultToken: call[0],
+                        genericArguments: call[2],
+                        argumentText: call[3],
+                        appliedLoweredType: call[4],
+                        line: sourceLine
+                    )
+                    continue
+                }
                 if let reference = hostedSuperReferences[call[1]] {
                     guard call[2].isEmpty else {
                         throw CanonicalSIL.LoweringError.unsupportedInstruction(
@@ -22084,6 +22957,10 @@ public struct Lowerer: Sendable {
                           appliedType.result == signature.result,
                           appliedType.effects.mayThrow == signature.effects.mayThrow,
                           appliedType.effects.isAsync == signature.effects.isAsync,
+                          physicalActorIsolationIsCompatible(
+                              appliedType.effects,
+                              authoritative: signature.effects
+                          ),
                           !signature.effects.isAsync
                     else {
                         throw CanonicalSIL.LoweringError.callSignatureMismatch(
@@ -22313,13 +23190,13 @@ public struct Lowerer: Sendable {
                     )
                     continue
                 }
-                let reference: ResolvedFunctionReference
+                let references: ResolvedFunctionReferenceSet
                 let appliedLoweredType: String
                 if let resolved = functionReferences[call[1]] {
-                    reference = resolved
+                    references = resolved
                     appliedLoweredType = call[4]
                 } else if let deferred = deferredForeignReferences[call[1]] {
-                    reference = try resolveDeferredForeignReference(
+                    references = try resolveDeferredForeignReference(
                         deferred,
                         genericArguments: call[2],
                         line: sourceLine
@@ -22374,7 +23251,10 @@ public struct Lowerer: Sendable {
                     appliedLoweredType = specialize(call[4])
                     let callee = try parseFunctionType(
                         specializedReferenceType,
-                        bridgingTo: (binding.parameterTypes, binding.resultType)
+                        bridgingTo: (binding.parameterTypes, binding.resultType),
+                        parameterProjection: binding.parameterProjection,
+                        preservingClosureOwnership:
+                            preservesPhysicalClosureOwnership(for: binding)
                     )
                     guard callee.parameters == binding.parameterTypes,
                           acceptsPhysicalConventions(
@@ -22383,7 +23263,11 @@ public struct Lowerer: Sendable {
                           ),
                           callee.result == binding.resultType,
                           callee.effects.mayThrow == binding.effects.mayThrow,
-                          callee.effects.isAsync == binding.effects.isAsync
+                          callee.effects.isAsync == binding.effects.isAsync,
+                          physicalActorIsolationIsCompatible(
+                              callee.effects,
+                              authoritative: binding.effects
+                          )
                     else {
                         throw CanonicalSIL.LoweringError.callSignatureMismatch(
                             line: sourceLine,
@@ -22395,31 +23279,76 @@ public struct Lowerer: Sendable {
                                 + "\(binding.effects)"
                         )
                     }
-                    reference = .init(
-                        binding: binding,
-                        physicalParameterConventions: callee.parameterConventions,
-                        hasIndirectResult: callee.hasIndirectResult,
-                        indirectErrorType: callee.indirectErrorType,
-                        erasedMetatypes: callee.erasedMetatypes,
-                        usesObjectiveCBridge: false
-                    )
+                    references = .init(variants: [
+                        .init(
+                            binding: binding,
+                            physicalParameterConventions: callee.parameterConventions,
+                            physicalValueParameterSpellings:
+                                try physicalValueParameterSpellings(
+                                    in: specializedReferenceType
+                                ),
+                            hasIndirectResult: callee.hasIndirectResult,
+                            indirectErrorType: callee.indirectErrorType,
+                            erasedMetatypes: callee.erasedMetatypes,
+                            usesObjectiveCBridge: false
+                        ),
+                    ])
                 } else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
                         text: line
                     )
                 }
-                let binding = reference.binding
-                if case .staticKeyPathProjection = binding.abiAdapter {
+                guard let physicalReference = references.variants.first else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "function reference has no frozen call variant"
+                    )
+                }
+                let physicalBinding = physicalReference.binding
+                if case .staticKeyPathProjection = physicalBinding.abiAdapter {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
                         text: "static KeyPath projection must be formed by partial_apply"
                     )
                 }
+                var argumentTokens = try parseApplyValueTokens(
+                    call[3],
+                    line: sourceLine
+                )
+                let destinations = try consumeIndirectCallDestinations(
+                    from: &argumentTokens,
+                    resultType: physicalBinding.resultType,
+                    hasIndirectResult: physicalReference.hasIndirectResult,
+                    indirectErrorType: physicalReference.indirectErrorType,
+                    physicalArgumentCount: Int(
+                        physicalBinding.parameterProjection.physicalParameterCount
+                    )
+                        + physicalReference.erasedMetatypes.count
+                )
+                guard destinations.error == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "ordinary apply carries an indirect Error result"
+                    )
+                }
+                let indirectResultDestination = destinations.result
+                argumentTokens = try eraseMetatypeArguments(
+                    argumentTokens,
+                    for: physicalReference,
+                    line: sourceLine
+                )
+                let reference = try selectFunctionReference(
+                    references,
+                    physicalTokens: argumentTokens,
+                    line: sourceLine
+                )
+                let binding = reference.binding
                 let appliedType = try parseFunctionType(
                     appliedLoweredType,
                     bridgingTo: (binding.parameterTypes, binding.resultType),
-                    abiAdapter: binding.abiAdapter
+                    parameterProjection: binding.parameterProjection,
+                    abiAdapter: binding.abiAdapter,
+                    preservingClosureOwnership:
+                        preservesPhysicalClosureOwnership(for: binding)
                 )
                 guard appliedType.parameters == binding.parameterTypes,
                       appliedType.parameterConventions
@@ -22431,6 +23360,10 @@ public struct Lowerer: Sendable {
                       appliedType.erasedMetatypes == reference.erasedMetatypes,
                       appliedType.effects.mayThrow == binding.effects.mayThrow,
                       appliedType.effects.isAsync == binding.effects.isAsync,
+                      physicalActorIsolationIsCompatible(
+                          appliedType.effects,
+                          authoritative: binding.effects
+                      ),
                       !binding.effects.isAsync
                 else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
@@ -22438,25 +23371,7 @@ public struct Lowerer: Sendable {
                         mangledName: binding.mangledName
                     )
                 }
-                var argumentTokens = try parseApplyValueTokens(
-                    call[3],
-                    line: sourceLine
-                )
-                let destinations = try consumeIndirectCallDestinations(
-                    from: &argumentTokens,
-                    resultType: binding.resultType,
-                    hasIndirectResult: reference.hasIndirectResult,
-                    indirectErrorType: reference.indirectErrorType,
-                    physicalArgumentCount: reference.physicalParameterConventions.count
-                        + reference.erasedMetatypes.count
-                )
-                guard destinations.error == nil else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "ordinary apply carries an indirect Error result"
-                    )
-                }
-                let indirectResultDestination = destinations.result
-                argumentTokens = try eraseMetatypeArguments(
+                argumentTokens = try projectNativeImportArguments(
                     argumentTokens,
                     for: reference,
                     line: sourceLine
@@ -22479,6 +23394,9 @@ public struct Lowerer: Sendable {
                     argumentTokens,
                     physicalConventions: reference.physicalParameterConventions,
                     logicalTypes: binding.parameterTypes,
+                    nativeCallbackConventions: nativeCallbackParameterConventions(
+                        for: binding
+                    ),
                     line: sourceLine,
                     allowsCompilerInoutWriteback: true
                 )
@@ -22487,7 +23405,7 @@ public struct Lowerer: Sendable {
                     physicalConventions: reference.physicalParameterConventions,
                     binding: binding
                 )
-                guard arguments.map({ registerTypes[Int($0.rawValue)] }) == binding.parameterTypes else {
+                guard directCallArgumentsMatch(arguments, binding: binding) else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
                         line: sourceLine,
                         mangledName: binding.mangledName
@@ -23062,6 +23980,7 @@ public struct Lowerer: Sendable {
                 let wrapped = ValueRepresentation.storable(resolvedWrapped)
                 let result = try allocate(type: .optional(wrapped))
                 values[optional[0]] = result
+                inlineOptionalNoneValues.insert(optional[0])
                 appendInstruction(.makeOptionalNone(result: result))
                 continue
             }
@@ -23367,6 +24286,34 @@ public struct Lowerer: Sendable {
                     )
                 }
                 continue
+            }
+
+            if let store = match(
+                line,
+                pattern: #"^store (%[0-9]+) to (?:\[(?:trivial|init|assign)\] )?(%[0-9]+)$"#
+            ) {
+                let root = addressBase(store[1])
+                if nativeBlockStorageRoots.contains(root),
+                   case let .closure(physicalSignature) = stackAddressTypes[root],
+                   let source = values[store[0]],
+                   case let .closure(logicalSignature) = registerTypes[
+                    Int(source.rawValue)
+                   ], closurePhysicalABIMatches(
+                    physicalSignature,
+                    logicalSignature
+                   ) {
+                    let logicalType = Bytecode.ValueType.closure(
+                        logicalSignature
+                    )
+                    stackAddressTypes[root] = logicalType
+                    let value = try prepareStoredValue(
+                        store[0],
+                        expectedType: logicalType,
+                        line: sourceLine
+                    )
+                    try storeConstructedValue(value, at: store[1])
+                    continue
+                }
             }
 
             if let store = match(
@@ -23984,6 +24931,16 @@ public struct Lowerer: Sendable {
             if let destroy = match(line, pattern: #"^destroy_addr (%[0-9]+)$"#) {
                 let address = addressBase(destroy[0])
                 invalidateOptionalStorageFacts(at: destroy[0])
+                if var value = externalDefaultArgumentAddresses[address] {
+                    guard value.isConsumed, !value.isDestroyed else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "external default argument storage is destroyed before use or twice"
+                        )
+                    }
+                    value.isDestroyed = true
+                    externalDefaultArgumentAddresses[address] = value
+                    continue
+                }
                 if compilerEnumAddressTypes[address] != nil {
                     guard compilerEnumAddressCases.removeValue(forKey: address) != nil else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -24424,6 +25381,9 @@ public struct Lowerer: Sendable {
                 if let payload = knownOptionalSomePayloads[copy[1]] {
                     knownOptionalSomePayloads[copy[0]] = payload
                 }
+                if inlineOptionalNoneValues.contains(copy[1]) {
+                    inlineOptionalNoneValues.insert(copy[0])
+                }
                 inheritKnownOptionalValueCase(
                     from: copy[1],
                     to: copy[0]
@@ -24529,6 +25489,9 @@ public struct Lowerer: Sendable {
                 if let payload = knownOptionalSomePayloads.removeValue(forKey: move[1]) {
                     knownOptionalSomePayloads[move[0]] = payload
                 }
+                if inlineOptionalNoneValues.remove(move[1]) != nil {
+                    inlineOptionalNoneValues.insert(move[0])
+                }
                 inheritKnownOptionalValueCase(
                     from: move[1],
                     to: move[0]
@@ -24542,6 +25505,16 @@ public struct Lowerer: Sendable {
                 continue
             }
             if let destroy = match(line, pattern: #"^destroy_value (%[0-9]+)$"#) {
+                if let value = externalDefaultArgumentValues.removeValue(
+                    forKey: destroy[0]
+                ) {
+                    guard value.isProjected else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "external default argument is destroyed before its NativeImport"
+                        )
+                    }
+                    continue
+                }
                 if staticKeyPathValues[destroy[0]] != nil {
                     continue
                 }
@@ -24585,14 +25558,17 @@ public struct Lowerer: Sendable {
                     continue
                 }
                 if localFactoryReferences.removeValue(forKey: destroy[0]) != nil { continue }
+                inlineOptionalNoneValues.remove(destroy[0])
                 knownOptionalSomePayloads.removeValue(forKey: destroy[0])
                 optionalAddressSelectionConditions.removeValue(forKey: destroy[0])
                 let value = try resolve(destroy[0], line: sourceLine)
+                if projectedInlineOptionalNoneOwners.contains(value) {
+                    continue
+                }
                 try closeBorrowedTemporaryLifetime(
                     for: destroy[0],
                     resolved: value
                 )
-                if case .closure = registerTypes[Int(value.rawValue)] { continue }
                 appendInstruction(.destroyValue(value))
                 continue
             }
@@ -24600,6 +25576,19 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(retain_value|release_value) (%[0-9]+)$"#
             ) {
+                if let value = externalDefaultArgumentValues[ownership[1]] {
+                    guard ownership[0] == "release_value",
+                          value.isProjected
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "external default argument has unsupported value ownership plumbing"
+                        )
+                    }
+                    externalDefaultArgumentValues.removeValue(
+                        forKey: ownership[1]
+                    )
+                    continue
+                }
                 if staticKeyPathValues[ownership[1]] != nil {
                     continue
                 }
@@ -24645,9 +25634,23 @@ public struct Lowerer: Sendable {
                     continue
                 }
                 let value = try resolve(ownership[1], line: sourceLine)
-                if requiresManagedOwnership(
-                    registerTypes[Int(value.rawValue)]
-                ) {
+                if projectedInlineOptionalNoneOwners.contains(value) {
+                    guard ownership[0] == "release_value" else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "projected Optional.none owner is retained after erasure"
+                        )
+                    }
+                    continue
+                }
+                let valueType = registerTypes[Int(value.rawValue)]
+                if case .closure = valueType {
+                    if ownership[0] == "release_value" {
+                        try releaseClosureValueIfFinal(
+                            token: ownership[1],
+                            value: value
+                        )
+                    }
+                } else if requiresManagedOwnership(valueType) {
                     if ownership[0] == "retain_value" {
                         try materializeRetain(of: ownership[1], value: value)
                     } else if borrowedTemporaryValue(for: ownership[1]) != nil
@@ -24668,6 +25671,17 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^strong_(retain|release) (%[0-9]+)$"#
             ) {
+                if let value = externalDefaultArgumentValues[ownership[1]] {
+                    guard ownership[0] == "release", value.isProjected else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "external default closure has unsupported reference ownership plumbing"
+                        )
+                    }
+                    externalDefaultArgumentValues.removeValue(
+                        forKey: ownership[1]
+                    )
+                    continue
+                }
                 if staticKeyPathValues[ownership[1]] != nil {
                     continue
                 }
@@ -24687,6 +25701,14 @@ public struct Lowerer: Sendable {
                     continue
                 }
                 let value = try resolve(ownership[1], line: sourceLine)
+                if projectedInlineOptionalNoneOwners.contains(value) {
+                    guard operation == .release else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "projected Optional.none owner is retained after erasure"
+                        )
+                    }
+                    continue
+                }
                 try applyStrongReferenceOperation(
                     operation,
                     to: ownership[1],
@@ -25460,6 +26482,11 @@ public struct Lowerer: Sendable {
                 + compilerEnumAddressCases.count
         )
         recordIncompleteLifetime(
+            "external-default-argument",
+            count: externalDefaultArgumentValues.count
+                + externalDefaultArgumentAddresses.count
+        )
+        recordIncompleteLifetime(
             "borrowed-call-cleanup",
             count: implicitOwnerCleanups.values.reduce(0) {
                 $0 + $1.count
@@ -25555,9 +26582,68 @@ public struct Lowerer: Sendable {
     /// Build-time indexers use this to freeze the same ABI that lowering enforces.
     public func parseParameterConventions(
         _ text: String,
-        parameterTypes: [Bytecode.ValueType]
+        parameterTypes: [Bytecode.ValueType],
+        preservingClosureOwnership: Bool = false
     ) throws -> [Bytecode.ParameterConvention] {
-        let text = try CanonicalSIL.SubstitutedFunctionType.specialize(text)
+        let (prefix, physicalParameters) = try functionParameterSpellings(
+            in: text
+        )
+        let rawParameters = sourceValueParameterSpellings(
+            physicalParameters,
+            logicalParameterCount: parameterTypes.count
+        )
+        guard rawParameters.count == parameterTypes.count else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "function type parameter count does not match resolved types"
+            )
+        }
+        return parameterConventions(
+            rawParameters: rawParameters,
+            parameterTypes: parameterTypes,
+            implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix),
+            preservesClosureOwnership: preservingClosureOwnership
+        )
+    }
+
+    /// Recovers callback escape authority from the lowered ABI. Swift's typed
+    /// AST erases parameter-only `@escaping`, while canonical SIL preserves the
+    /// inverse `@noescape` marker. Keeping that interpretation here prevents
+    /// source indexing and patch lowering from developing separate SIL parsers.
+    public func parseNativeCallbackLifetimes(
+        _ text: String,
+        parameterTypes: [Bytecode.ValueType]
+    ) throws -> [Int: Core.NativeImportCallbackLifetime] {
+        let (_, physicalParameters) = try functionParameterSpellings(in: text)
+        let rawParameters = sourceValueParameterSpellings(
+            physicalParameters,
+            logicalParameterCount: parameterTypes.count
+        )
+        guard rawParameters.count == parameterTypes.count else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "function type parameter count does not match resolved types"
+            )
+        }
+        var lifetimes: [Int: Core.NativeImportCallbackLifetime] = [:]
+        for (index, pair) in zip(rawParameters, parameterTypes).enumerated() {
+            guard let callback = pair.1.directClosureShape else { continue }
+            let isNonescaping = pair.0.range(
+                of: #"(?:^|\s)@noescape(?:\s|$)"#,
+                options: .regularExpression
+            ) != nil
+            guard !callback.isOptional || !isNonescaping else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "an Optional callback cannot use the @noescape ABI"
+                )
+            }
+            lifetimes[index] = isNonescaping ? .nonescaping : .escaping
+        }
+        return lifetimes
+    }
+
+    private func functionParameterSpellings(
+        in raw: String
+    ) throws -> (prefix: String, parameters: [String]) {
+        let text = try CanonicalSIL.SubstitutedFunctionType.specialize(raw)
         guard let arrow = outerFunctionArrow(in: text) else {
             throw CanonicalSIL.LoweringError.malformedSIL("function type has no result arrow")
         }
@@ -25569,17 +26655,38 @@ public struct Lowerer: Sendable {
             throw CanonicalSIL.LoweringError.malformedSIL("function type has no parameter tuple")
         }
         let parametersText = prefix[prefix.index(after: open)..<close]
-        let rawParameters = splitTopLevel(String(parametersText)).filter { !$0.isEmpty }
-        guard rawParameters.count == parameterTypes.count else {
-            throw CanonicalSIL.LoweringError.malformedSIL(
-                "function type parameter count does not match resolved types"
-            )
-        }
-        return parameterConventions(
-            rawParameters: rawParameters,
-            parameterTypes: parameterTypes,
-            implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix)
+        return (
+            prefix,
+            splitTopLevel(String(parametersText)).filter { !$0.isEmpty }
         )
+    }
+
+    private func physicalValueParameterSpellings(
+        in raw: String
+    ) throws -> [String] {
+        try functionParameterSpellings(in: raw).parameters.filter {
+            metatypeIdentity($0) == nil
+        }
+    }
+
+    private func sourceValueParameterSpellings(
+        _ physical: [String],
+        logicalParameterCount: Int
+    ) -> [String] {
+        guard physical.count != logicalParameterCount else { return physical }
+        return physical.filter { !isSyntacticMetatypeParameter($0) }
+    }
+
+    private func isSyntacticMetatypeParameter(_ raw: String) -> Bool {
+        var spelling = raw.trimmingCharacters(in: .whitespaces)
+        if spelling.hasPrefix("$") {
+            spelling.removeFirst()
+            spelling = spelling.trimmingCharacters(in: .whitespaces)
+        }
+        if spelling.contains("_metatype ") { return true }
+        return ["@thin ", "@thick ", "@objc_metatype "].contains {
+            spelling.hasPrefix($0) && spelling.hasSuffix(".Type")
+        }
     }
 
     func parseFunctionType(
@@ -25587,7 +26694,9 @@ public struct Lowerer: Sendable {
         bridgingTo expected: (
             parameters: [Bytecode.ValueType], result: Bytecode.ValueType
         )? = nil,
-        abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter = .direct
+        parameterProjection: InterfaceArchive.NativeImportParameterProjection? = nil,
+        abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter = .direct,
+        preservingClosureOwnership: Bool = false
     ) throws -> (
         parameters: [Bytecode.ValueType],
         parameterConventions: [Bytecode.ParameterConvention],
@@ -25610,6 +26719,20 @@ public struct Lowerer: Sendable {
             throw CanonicalSIL.LoweringError.malformedSIL("function type has no parameter tuple")
         }
         let parametersText = prefix[prefix.index(after: open)..<close]
+        let outerAttributes = String(prefix[..<open])
+        let requiresMainActor: Bool
+        switch CanonicalSIL.FunctionIsolation.loweredTypeAnnotation(
+            in: outerAttributes
+        ) {
+        case .none:
+            requiresMainActor = false
+        case .mainActor:
+            requiresMainActor = true
+        case let .unsupported(actor):
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "function global actor \(actor)"
+            )
+        }
         let rawParameters = splitTopLevel(String(parametersText)).filter { !$0.isEmpty }
         let parameters: [Bytecode.ValueType]
         let parameterConventions: [Bytecode.ParameterConvention]
@@ -25628,10 +26751,27 @@ public struct Lowerer: Sendable {
         let physicalResultExpectation: Bytecode.ValueType?
         if let expected {
             let physicalExpectations: [Bytecode.ValueType]
+            let bridgedValueSpellings: [String]
             switch abiAdapter {
             case .direct:
                 physicalExpectations = expected.parameters
                 physicalResultExpectation = expected.result
+                let projection = parameterProjection
+                    ?? .identity(parameterCount: expected.parameters.count)
+                guard projection.isValid(
+                    logicalParameterCount: expected.parameters.count
+                ), valueSpellings.count == Int(projection.physicalParameterCount)
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "physical function has \(valueSpellings.count) value parameters; "
+                            + "NativeImport projection expects "
+                            + "\(projection.physicalParameterCount) physical and "
+                            + "\(expected.parameters.count) logical parameters"
+                    )
+                }
+                bridgedValueSpellings = projection.logicalParameterIndices.map {
+                    valueSpellings[Int($0)]
+                }
             case .mutatingValueReceiver:
                 guard let receiver = expected.parameters.last,
                       expected.result == receiver
@@ -25643,6 +26783,7 @@ public struct Lowerer: Sendable {
                 physicalExpectations = Array(expected.parameters.dropLast())
                     + [.address(receiver)]
                 physicalResultExpectation = .void
+                bridgedValueSpellings = valueSpellings
             case .staticKeyPathProjection:
                 let rawKeyPath = valueSpellings.count == 2
                     ? valueSpellings[1].trimmingCharacters(in: .whitespaces)
@@ -25666,20 +26807,25 @@ public struct Lowerer: Sendable {
                 valueSpellings.removeLast()
                 physicalExpectations = expected.parameters
                 physicalResultExpectation = expected.result
+                bridgedValueSpellings = valueSpellings
             }
-            guard valueSpellings.count == physicalExpectations.count else {
+            guard bridgedValueSpellings.count == physicalExpectations.count else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "physical function parameters differ from its Swift NativeImport"
+                    "projected physical function parameters differ from its Swift NativeImport"
                 )
             }
-            let physicalParameters = try zip(valueSpellings, physicalExpectations).map {
+            let physicalParameters = try zip(
+                bridgedValueSpellings,
+                physicalExpectations
+            ).map {
                 try parsePhysicalType($0.0, bridgedTo: $0.1)
             }
             parameters = expected.parameters
             parameterConventions = self.parameterConventions(
-                rawParameters: valueSpellings,
+                rawParameters: bridgedValueSpellings,
                 parameterTypes: physicalParameters,
-                implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix)
+                implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix),
+                preservesClosureOwnership: preservingClosureOwnership
             )
         } else {
             parameters = try valueSpellings.map(parseStoredType)
@@ -25741,7 +26887,11 @@ public struct Lowerer: Sendable {
             expected?.result ?? parsedResult.type,
             parsedResult.isIndirect,
             indirectErrorType,
-            .init(mayThrow: mayThrow, isAsync: isAsync),
+            .init(
+                mayThrow: mayThrow,
+                requiresMainActor: requiresMainActor,
+                isAsync: isAsync
+            ),
             erasedMetatypes
         )
     }
@@ -25882,6 +27032,79 @@ public struct Lowerer: Sendable {
         }
     }
 
+    private func nativeBlockStorageClosureSignature(
+        _ raw: String
+    ) throws -> Bytecode.ClosureSignature? {
+        var spelling = raw.trimmingCharacters(in: .whitespaces)
+        guard spelling.hasPrefix("@block_storage ") else { return nil }
+        spelling.removeFirst("@block_storage ".count)
+        spelling = spelling.trimmingCharacters(in: .whitespaces)
+        guard case let .closure(signature) = try parseStoredType(spelling),
+              !signature.effects.mayThrow,
+              !signature.effects.isAsync
+        else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "native block storage has an unsupported callback ABI"
+            )
+        }
+        return signature
+    }
+
+    private func nativeBlockThunkSignature(
+        _ raw: String
+    ) throws -> Bytecode.ClosureSignature? {
+        let text = try CanonicalSIL.SubstitutedFunctionType.specialize(raw)
+        guard text.range(
+            of: #"^@convention\s*\(\s*c\s*\)"#,
+            options: .regularExpression
+        ) != nil, text.contains("@block_storage ")
+        else { return nil }
+        guard let arrow = outerFunctionArrow(in: text),
+              let result = try? parseType(
+                  String(text[arrow.upperBound...])
+              ), result == .void
+        else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "native block invoke thunk has a non-Void result: \(raw)"
+            )
+        }
+        let prefix = String(text[..<arrow.lowerBound])
+        guard let close = prefix.lastIndex(of: ")"),
+              let open = matchingOpeningParenthesis(for: close, in: prefix)
+        else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "native block invoke thunk has no parameter tuple"
+            )
+        }
+        let parameters = splitTopLevel(
+            String(prefix[prefix.index(after: open)..<close])
+        ).filter { !$0.isEmpty }
+        guard let storageParameter = parameters.first,
+              let marker = storageParameter.range(of: "@block_storage "),
+              let signature = try nativeBlockStorageClosureSignature(
+                  String(storageParameter[marker.lowerBound...])
+              ), parameters.count == signature.parameters.count + 1
+        else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "native block invoke thunk does not match its storage closure"
+            )
+        }
+        let invocationParameters = parameters.dropFirst()
+        for (physical, expected) in zip(
+            invocationParameters,
+            signature.parameters
+        ) {
+            guard (try? parsePhysicalType(physical, bridgedTo: expected))
+                    == expected
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "native block invoke thunk changes a callback parameter"
+                )
+            }
+        }
+        return signature
+    }
+
     private func isSupportedObjectiveCBridgeSpelling(
         _ raw: String,
         to expected: Bytecode.ValueType
@@ -25901,6 +27124,11 @@ public struct Lowerer: Sendable {
             }
         }
         switch expected {
+        case .closure:
+            return isSupportedBlockBridgeSpelling(
+                spelling,
+                to: expected
+            )
         case .string:
             let names = ["NSString", "Foundation.NSString", "__C.NSString"]
             if names.contains(spelling) { return true }
@@ -25932,6 +27160,9 @@ public struct Lowerer: Sendable {
             for prefix in ["Optional<", "Swift.Optional<"]
             where spelling.hasPrefix(prefix) && spelling.hasSuffix(">") {
                 let body = String(spelling.dropFirst(prefix.count).dropLast())
+                if wrapped.directClosureShape != nil {
+                    return isSupportedBlockBridgeSpelling(body, to: wrapped)
+                }
                 return isSupportedObjectiveCBridgeSpelling(body, to: wrapped)
             }
             return false
@@ -25940,10 +27171,126 @@ public struct Lowerer: Sendable {
         }
     }
 
+    private func isSupportedBlockBridgeSpelling(
+        _ raw: String,
+        to expected: Bytecode.ValueType
+    ) -> Bool {
+        guard case let .closure(expectedSignature) = expected else {
+            return false
+        }
+        var spelling = raw.trimmingCharacters(in: .whitespaces)
+        if spelling.hasPrefix("$") {
+            spelling.removeFirst()
+            spelling = spelling.trimmingCharacters(in: .whitespaces)
+        }
+        var foundBlockConvention = false
+        var requiresMainActor = false
+        var consumed = true
+        while consumed {
+            consumed = false
+            let fixedAttributes = [
+                "@owned ", "@guaranteed ", "@unowned ",
+                "@autoreleased ", "@in_guaranteed ",
+                "@noescape ", "@callee_guaranteed ", "@callee_owned ",
+                "@Sendable ",
+            ]
+            for attribute in fixedAttributes where spelling.hasPrefix(attribute) {
+                spelling.removeFirst(attribute.count)
+                spelling = spelling.trimmingCharacters(in: .whitespaces)
+                consumed = true
+                break
+            }
+            if consumed { continue }
+            if let convention = spelling.range(
+                of: #"^@convention\s*\(\s*block\s*\)\s*"#,
+                options: .regularExpression
+            ) {
+                spelling.removeSubrange(convention)
+                spelling = spelling.trimmingCharacters(in: .whitespaces)
+                foundBlockConvention = true
+                consumed = true
+                continue
+            }
+            if let actor = spelling.range(
+                of: #"^@[A-Za-z_][A-Za-z0-9_.]*Actor\b\s*"#,
+                options: .regularExpression
+            ) {
+                switch CanonicalSIL.FunctionIsolation.loweredTypeAnnotation(
+                    in: String(spelling[actor])
+                ) {
+                case .mainActor:
+                    requiresMainActor = true
+                case .none, .unsupported:
+                    return false
+                }
+                spelling.removeSubrange(actor)
+                spelling = spelling.trimmingCharacters(in: .whitespaces)
+                consumed = true
+            }
+        }
+        guard foundBlockConvention,
+              !spelling.contains(" @async "),
+              let parsed = try? parseType(spelling),
+              case var .closure(physicalSignature) = ValueRepresentation
+                .storable(parsed)
+        else { return false }
+        physicalSignature.effects.requiresMainActor = requiresMainActor
+        return closureBlockBoundaryABIMatches(
+            physicalSignature,
+            expectedSignature
+        )
+    }
+
+    private func closureBlockBoundaryABIMatches(
+        _ physical: Bytecode.ClosureSignature,
+        _ swift: Bytecode.ClosureSignature
+    ) -> Bool {
+        guard physical.parameters == swift.parameters,
+              physical.result == swift.result,
+              physical.effects.mayThrow == swift.effects.mayThrow,
+              physical.effects.isAsync == swift.effects.isAsync,
+              physical.parameterConventions.count
+                == swift.parameterConventions.count
+        else { return false }
+
+        return zip(
+            zip(
+                physical.parameterConventions,
+                swift.parameterConventions
+            ),
+            swift.parameters
+        ).allSatisfy { conventions, type in
+            if conventions.0 == conventions.1 { return true }
+            // An Objective-C block function type omits Swift's +0 spelling.
+            // The storage closure retains that borrowed convention for opaque
+            // native handles and reference-containing values.
+            return conventions.0 == .owned
+                && conventions.1 == .borrowed
+                && (type.requiresLinearOwnership
+                    || typeEnvironment.containsOwningReference(type))
+        }
+    }
+
+    private func closurePhysicalABIMatches(
+        _ lhs: Bytecode.ClosureSignature,
+        _ rhs: Bytecode.ClosureSignature
+    ) -> Bool {
+        // These are compiler-only aliases that retain the original logical VM
+        // closure type. Swift reabstraction may add or omit an actor spelling;
+        // direct and NativeImport call boundaries separately validate the
+        // authoritative executor requirement before invocation.
+        lhs.parameters == rhs.parameters
+            && lhs.parameterConventions == rhs.parameterConventions
+            && lhs.result == rhs.result
+            && lhs.effects.mayThrow == rhs.effects.mayThrow
+            && lhs.effects.isAsync == rhs.effects.isAsync
+    }
+
     private func parameterConventions(
         rawParameters: [String],
         parameterTypes: [Bytecode.ValueType],
-        implicitlyBorrowsLinearValues: Bool
+        implicitlyBorrowsLinearValues: Bool,
+        preservesClosureOwnership: Bool = false
     ) -> [Bytecode.ParameterConvention] {
         zip(rawParameters, parameterTypes).map {
             raw, type -> Bytecode.ParameterConvention in
@@ -25971,6 +27318,21 @@ public struct Lowerer: Sendable {
                 || value.hasPrefix("@unowned ")
                 || value.hasPrefix("@in_guaranteed ")
             let explicitlyOwned = value.hasPrefix("@owned ")
+            if preservesClosureOwnership,
+               type.directClosureShape != nil {
+                // Closure ownership is semantically relevant even though a
+                // closure is not a native reference value. Imported blocks
+                // are commonly +0; an explicit +1 spelling remains
+                // authoritative and is the consuming edge.
+                if explicitlyOwned { return .owned }
+                if explicitlyBorrowed { return .borrowed }
+                if value.range(
+                    of: #"@convention\s*\(\s*block\s*\)"#,
+                    options: .regularExpression
+                ) != nil, implicitlyBorrowsLinearValues {
+                    return .borrowed
+                }
+            }
             if (type.requiresLinearOwnership
                 || typeEnvironment.containsOwningReference(type)),
                explicitlyBorrowed
@@ -25981,6 +27343,17 @@ public struct Lowerer: Sendable {
             }
             return .owned
         }
+    }
+
+    /// Unlike the VM convention, the physical SIL convention remains
+    /// observable for copyable nontrivial values when a compiler-only default
+    /// expression is projected away and its trailing cleanup must be retired.
+    private func hasExplicitBorrowedValueConvention(_ raw: String) -> Bool {
+        let spelling = raw.trimmingCharacters(in: .whitespaces)
+            .trimmingPrefix("$")
+        return spelling.hasPrefix("@guaranteed ")
+            || spelling.hasPrefix("@unowned ")
+            || spelling.hasPrefix("@in_guaranteed ")
     }
 
     private func isObjectiveCMethodConvention(_ prefix: String) -> Bool {

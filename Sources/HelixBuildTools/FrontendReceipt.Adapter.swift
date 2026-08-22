@@ -30,6 +30,16 @@ public struct Adapter: Sendable {
             invocation: request.metadata.frontendInvocation
         )
         let silFile = try CanonicalSIL.File(text: canonicalSIL)
+        // Native-call discovery needs source-level default-argument
+        // provenance. Even at -Onone, mandatory SIL transforms may inline an
+        // imported default generator once nearby call shapes change.
+        let operationSILFile = try CanonicalSIL.File(
+            text: frontend.emitCanonicalSIL(
+                sourceFiles: orderedSources.map(\.url),
+                invocation: request.metadata.frontendInvocation,
+                purpose: .semanticLowering
+            )
+        )
         let moduleName = request.metadata.frontendInvocation.moduleName
         let configuredCallingSurface = try callingSurfaceConfiguration(
             request.configuration,
@@ -57,7 +67,7 @@ public struct Adapter: Sendable {
         let sourceNominalsByName = Dictionary(uniqueKeysWithValues: sourceNominals.map {
             ($0.canonicalName, $0)
         })
-        let importedReferences = try discoverImportedReferences(
+        let discoveredImportedTypes = try discoverImportedNativeTypes(
             documents: documents,
             sourcesByPhysicalPath: sourceByPhysicalPath,
             moduleName: moduleName,
@@ -68,10 +78,10 @@ public struct Adapter: Sendable {
             sourcesByPhysicalPath: sourceByPhysicalPath,
             moduleName: moduleName,
             demangled: demangled,
-            silFile: silFile
+            silFile: operationSILFile
         )
         var importedTypes = try mergeImportedNativeTypes(
-            references: importedReferences,
+            discoveredTypes: discoveredImportedTypes,
             operationTypes: importedOperationSurface.types
         )
         if request.callingSurfacePolicy == .managedDebugModule {
@@ -82,8 +92,28 @@ public struct Adapter: Sendable {
                 invocation: request.metadata.frontendInvocation
             )
             importedTypes = managedSurface.importedTypes
+            let observedCallbackSymbols = Set(
+                importedOperationSurface.operations.filter { operation in
+                    operation.parameterSwiftTypes.contains {
+                        FrontendReceipt.FunctionTypeSpelling
+                            .callbackBoundary(in: $0) != nil
+                    }
+                }.flatMap(\.silReferences)
+            )
+            let additiveManagedOperations = managedSurface.operations.compactMap {
+                operation -> FrontendReceipt.Adapter.ImportedOperation? in
+                var operation = operation
+                operation.silReferences.removeAll(
+                    where: observedCallbackSymbols.contains
+                )
+                return operation.silReferences.isEmpty ? nil : operation
+            }
+            // A measured probe may broaden ordinary value operations. For a
+            // callback symbol, the application call site is authoritative for
+            // lifetime and global-actor annotations that a synthetic argument
+            // expression cannot reconstruct.
             importedOperationSurface.operations = try mergeImportedOperations(
-                importedOperationSurface.operations + managedSurface.operations
+                importedOperationSurface.operations + additiveManagedOperations
             )
         }
         let provisionalNativeTypes = try makeNativeTypes(
@@ -704,10 +734,7 @@ extension FrontendReceipt.Adapter {
         }
         discovered.candidates = retained
         let records = explicit + retained.map(\.record)
-        guard Set(records.map(\.key)).count == records.count,
-              Set(records.flatMap(\.silMangledNames)).count
-                == records.reduce(0, { $0 + $1.silMangledNames.count })
-        else {
+        guard Set(records.map(\.key)).count == records.count else {
             throw FrontendReceipt.Error.invalidRequest(
                 "module \(moduleName) NativeImport discovery conflicts with explicit identities"
             )
@@ -1519,12 +1546,45 @@ extension FrontendReceipt.Adapter {
             baseName: baseName,
             labels: normalizedLabels
         )
-        let nativeImportSignatureSwiftTypes = parameterTypes
+        let nativeImportCanonicalParameterTypes = FrontendReceipt
+            .FunctionTypeSpelling.overlayCallbackParameters(
+                parameterTypes,
+                formalFunctionType: interfaceType
+            )
+        let nativeImportCallbackLifetimes = bridgedParameterTypes.contains(
+            where: \.containsClosureValue
+        ) ? try CanonicalSIL.Lowerer().parseNativeCallbackLifetimes(
+            sil.loweredType,
+            parameterTypes: bridgedParameterTypes
+        ) : [:]
+        let nativeImportDeclaredParameterTypes = FrontendReceipt
+            .FunctionTypeSpelling.applyingAuthoritativeLifetimes(
+                nativeImportCallbackLifetimes,
+                to: nativeImportCanonicalParameterTypes
+            ) ?? nativeImportCanonicalParameterTypes
+        let nativeImportGeneratedExplicitParameterTypes =
+            nativeImportDeclaredParameterTypes.map {
+                FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
+                    in: $0,
+                    aliases: importedSwiftTypeAliases
+                )
+            }
+        let nativeImportSignatureSwiftTypes = nativeImportDeclaredParameterTypes
             + (referenceReceiverID.flatMap { _ in context?.canonicalName }.map { [$0] } ?? [])
-        let nativeImportParameterSwiftTypes = generatedParameterTypes
+        let nativeImportParameterSwiftTypes = nativeImportGeneratedExplicitParameterTypes
             + (referenceReceiverID.flatMap { _ in context?.canonicalName }.map { [$0] } ?? [])
+        let nativeImportCallbacks = FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: nativeImportSignatureSwiftTypes,
+            parameterTypes: bridgedParameterTypes,
+            authoritativeLifetimes: nativeImportCallbackLifetimes
+        ) ?? []
+        let generatedNativeImportParameterSwiftTypes = FrontendReceipt
+            .NativeBridgeProfile.generatedParameterSpellings(
+                nativeImportParameterSwiftTypes,
+                parameterTypes: bridgedParameterTypes
+            ) ?? nativeImportParameterSwiftTypes
         let nativeImportModules = nativeImportSignatureSwiftTypes
-            == nativeImportParameterSwiftTypes
+            == generatedNativeImportParameterSwiftTypes
             && resultType == generatedResultType
             ? [] : imports
         let nativeImportSignature = Core.LoweredSignature(
@@ -1547,12 +1607,16 @@ extension FrontendReceipt.Adapter {
             ownerType: context?.canonicalName,
             baseName: baseName,
             argumentLabels: normalizedLabels,
-            parameterSwiftTypes: nativeImportParameterSwiftTypes,
+            parameterSwiftTypes: generatedNativeImportParameterSwiftTypes,
+            parameterProjection: .identity(
+                parameterCount: bridgedParameterTypes.count
+            ),
             resultSwiftType: generatedResultType,
             importedModules: nativeImportModules,
             parameterTypes: bridgedParameterTypes,
             resultType: valueResultType,
             signature: nativeImportSignature,
+            callbacks: nativeImportCallbacks,
             inferredEffects: effects,
             isGeneric: isGeneric,
             hasInOut: hasInOut,

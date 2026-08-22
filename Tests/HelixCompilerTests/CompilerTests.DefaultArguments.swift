@@ -1,6 +1,7 @@
 import Foundation
 import HelixBytecode
 import HelixCore
+import HelixInterface
 import HelixVerifier
 import HelixVM
 import Testing
@@ -9,6 +10,490 @@ import Testing
 extension CompilerTests {
 @Suite("Default argument lowering")
 struct DefaultArguments {
+    @Test("One physical native symbol selects default-argument variants per call")
+    func selectsPhysicalSymbolVariants() throws {
+        let symbol = "$s7Fixture6invokeyySi_SitF"
+        let helper = symbol + "fA_"
+        let effects = Core.Effects()
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        func requirement(
+            id: UInt32,
+            parameters: [String]
+        ) -> Bytecode.ImportRequirement {
+            .init(
+                id: .init(rawValue: id),
+                key: .init(rawValue: .sha256("default-variant-\(id)")),
+                signature: .init(parameters: parameters, result: "Swift.Void"),
+                effects: effects,
+                contract: contract
+            )
+        }
+        let omittedID = Core.NativeImportID(rawValue: 0)
+        let explicitID = Core.NativeImportID(rawValue: 1)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.int64],
+                parameterProjection: .init(
+                    physicalParameterCount: 2,
+                    logicalParameterIndices: [1],
+                    defaultArguments: [
+                        .externalGenerator(
+                            physicalParameterIndex: 0,
+                            symbol: helper
+                        ),
+                    ]
+                ),
+                resultType: .void,
+                target: .nativeImport(requirement(
+                    id: omittedID.rawValue,
+                    parameters: ["Swift.Int"]
+                ))
+            ),
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.int64, .int64],
+                resultType: .void,
+                target: .nativeImport(requirement(
+                    id: explicitID.rawValue,
+                    parameters: ["Swift.Int", "Swift.Int"]
+                ))
+            ),
+        ])
+        let ownerType = "@convention(thin) (Swift.Int, Swift.Int) -> ()"
+        let helperType = "@convention(thin) () -> Swift.Int"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture4rootyySi_SitF",
+            loweredType: "@convention(thin) (Swift.Int, Swift.Int) -> ()",
+            body: """
+            bb0(%0 : $Swift.Int, %1 : $Swift.Int):
+              %2 = function_ref @\(helper) : $\(helperType)
+              %3 = apply %2() : $\(helperType)
+              %4 = function_ref @\(symbol) : $\(ownerType)
+              %5 = apply %4(%3, %0) : $\(ownerType)
+              %6 = function_ref @\(symbol) : $\(ownerType)
+              %7 = apply %6(%1, %0) : $\(ownerType)
+              %8 = tuple ()
+              return %8
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer().lower(
+            function,
+            displayName: "root",
+            directCalls: calls
+        )
+        let imports = lowered.blocks.flatMap(\.instructions).compactMap {
+            instruction -> Core.NativeImportID? in
+            guard case let .nativeApply(_, id, _) = instruction else {
+                return nil
+            }
+            return id
+        }
+        #expect(imports == [omittedID, explicitID])
+    }
+
+    @Test("Projected indirect SDK defaults retain exact storage provenance")
+    func projectsIndirectExternalDefault() throws {
+        let payloadID = Core.TypeID(rawValue: .sha256("Fixture.Payload"))
+        let symbol = "$s7Fixture6invokeyyAA7PayloadV_SitF"
+        let helper = symbol + "fA_"
+        let importID = Core.NativeImportID(rawValue: 0)
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: importID,
+            key: .init(rawValue: .sha256("projected-indirect-default")),
+            signature: .init(
+                parameters: ["Swift.Int"],
+                result: "Swift.Void"
+            ),
+            effects: .init(),
+            contract: contract
+        )
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.int64],
+                parameterProjection: .init(
+                    physicalParameterCount: 2,
+                    logicalParameterIndices: [1],
+                    defaultArguments: [
+                        .externalGenerator(
+                            physicalParameterIndex: 0,
+                            symbol: helper
+                        ),
+                    ]
+                ),
+                resultType: .void,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["Payload": payloadID],
+                kinds: [payloadID: .value]
+            )
+        let ownerType = "@convention(thin) "
+            + "(@in_guaranteed Payload, Swift.Int) -> ()"
+        let helperType = "@convention(thin) () -> @out Payload"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture4rootyySiF",
+            loweredType: "@convention(thin) (Swift.Int) -> ()",
+            body: """
+            bb0(%0 : $Swift.Int):
+              %1 = alloc_stack $Payload
+              %2 = function_ref @\(helper) : $\(helperType)
+              %3 = apply %2(%1) : $\(helperType)
+              %4 = function_ref @\(symbol) : $\(ownerType)
+              %5 = apply %4(%1, %0) : $\(ownerType)
+              destroy_addr %1
+              dealloc_stack %1
+              %6 = tuple ()
+              return %6
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "root",
+            directCalls: calls
+        )
+        let invocation = try #require(
+            lowered.blocks.flatMap(\.instructions).compactMap {
+                instruction -> [Bytecode.Register]? in
+                guard case let .nativeApply(_, id, arguments) = instruction,
+                      id == importID
+                else { return nil }
+                return arguments
+            }.first
+        )
+        #expect(invocation.count == 1)
+        #expect(lowered.registerTypes[Int(invocation[0].rawValue)] == .int64)
+    }
+
+    @Test("Projected borrowed defaults retire value and closure releases")
+    func retiresBorrowedExternalDefaultValues() throws {
+        let stringOwner = "$s7Fixture13acceptStringyySSF"
+        let closureOwner = "$s7Fixture14acceptClosureyyyycF"
+        let stringHelper = stringOwner + "fA_"
+        let closureHelper = closureOwner + "fA_"
+        let effects = Core.Effects(mayAllocate: true)
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        func requirement(_ rawID: UInt32) -> Bytecode.ImportRequirement {
+            .init(
+                id: .init(rawValue: rawID),
+                key: .init(rawValue: .sha256("borrowed-default-\(rawID)")),
+                signature: .init(parameters: [], result: "Swift.Void"),
+                effects: effects,
+                contract: contract
+            )
+        }
+        func binding(
+            owner: String,
+            helper: String,
+            id: UInt32
+        ) -> CanonicalSIL.DirectCallBinding {
+            .init(
+                mangledName: owner,
+                parameterTypes: [],
+                parameterConventions: [],
+                parameterProjection: .init(
+                    physicalParameterCount: 1,
+                    logicalParameterIndices: [],
+                    defaultArguments: [
+                        .externalGenerator(
+                            physicalParameterIndex: 0,
+                            symbol: helper
+                        ),
+                    ]
+                ),
+                resultType: .void,
+                effects: effects,
+                target: .nativeImport(requirement(id))
+            )
+        }
+        let calls = try CanonicalSIL.DirectCallTable([
+            binding(owner: stringOwner, helper: stringHelper, id: 0),
+            binding(owner: closureOwner, helper: closureHelper, id: 1),
+        ])
+        let stringHelperType = "@convention(thin) () -> @owned String"
+        let stringOwnerType = "@convention(thin) (@guaranteed String) -> ()"
+        let closureHelperType = "@convention(thin) "
+            + "() -> @owned @callee_guaranteed () -> ()"
+        let closureOwnerType = "@convention(thin) "
+            + "(@guaranteed @callee_guaranteed () -> ()) -> ()"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture4rootyyF",
+            loweredType: "@convention(thin) () -> ()",
+            body: """
+            bb0:
+              %0 = function_ref @\(stringHelper) : $\(stringHelperType)
+              %1 = apply %0() : $\(stringHelperType)
+              %2 = function_ref @\(stringOwner) : $\(stringOwnerType)
+              %3 = apply %2(%1) : $\(stringOwnerType)
+              release_value %1
+              %4 = function_ref @\(closureHelper) : $\(closureHelperType)
+              %5 = apply %4() : $\(closureHelperType)
+              %6 = function_ref @\(closureOwner) : $\(closureOwnerType)
+              %7 = apply %6(%5) : $\(closureOwnerType)
+              strong_release %5
+              %8 = tuple ()
+              return %8
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer().lower(
+            function,
+            displayName: "root",
+            directCalls: calls,
+            expectedEffects: effects
+        )
+        let invocations = lowered.blocks.flatMap(\.instructions).compactMap {
+            instruction -> (Core.NativeImportID, [Bytecode.Register])? in
+            guard case let .nativeApply(_, id, arguments) = instruction else {
+                return nil
+            }
+            return (id, arguments)
+        }
+        #expect(invocations.map(\.0) == [
+            .init(rawValue: 0), .init(rawValue: 1),
+        ])
+        #expect(invocations.allSatisfy { $0.1.isEmpty })
+    }
+
+    @Test("Projected native Optional.none defaults close their erased owner")
+    func projectsInlineNativeOptionalDefault() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let symbol = "$s7Fixture6invokeyySo8NSObjectCSg_AEtF"
+        let importID = Core.NativeImportID(rawValue: 0)
+        let explicitImportID = Core.NativeImportID(rawValue: 1)
+        let effects = Core.Effects(mayAllocate: true)
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: importID,
+            key: .init(rawValue: .sha256("projected-native-default")),
+            signature: .init(
+                parameters: ["Foundation.NSObject"],
+                result: "Swift.Void"
+            ),
+            effects: effects,
+            contract: contract
+        )
+        let explicitRequirement = Bytecode.ImportRequirement(
+            id: explicitImportID,
+            key: .init(rawValue: .sha256("explicit-native-default")),
+            signature: .init(
+                parameters: [
+                    "Swift.Optional<Foundation.NSObject>",
+                    "Foundation.NSObject",
+                ],
+                result: "Swift.Void"
+            ),
+            effects: effects,
+            contract: contract
+        )
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.native(objectType)],
+                parameterConventions: [.owned],
+                parameterProjection: .init(
+                    physicalParameterCount: 2,
+                    logicalParameterIndices: [1],
+                    defaultArguments: [
+                        .optionalNone(physicalParameterIndex: 0),
+                    ]
+                ),
+                resultType: .void,
+                effects: effects,
+                target: .nativeImport(requirement)
+            ),
+            .init(
+                mangledName: symbol,
+                parameterTypes: [
+                    .optional(.native(objectType)),
+                    .native(objectType),
+                ],
+                parameterConventions: [.owned, .owned],
+                resultType: .void,
+                effects: effects,
+                target: .nativeImport(explicitRequirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let physicalType = "@convention(thin) "
+            + "(@owned Optional<NSObject>, @owned NSObject) -> ()"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture4rootyySo8NSObjectCF",
+            loweredType: "@convention(thin) (@owned NSObject) -> ()",
+            body: """
+            bb0(%0 : @owned $NSObject):
+              %1 = enum $Optional<NSObject>, #Optional.none!enumelt
+              %2 = copy_value %1
+              %3 = function_ref @\(symbol) : $\(physicalType)
+              %4 = apply %3(%2, %0) : $\(physicalType)
+              destroy_value %1
+              %5 = tuple ()
+              return %5
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "root",
+            directCalls: calls,
+            expectedEffects: effects
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let none = try #require(instructions.firstIndex {
+            if case .makeOptionalNone = $0 { true } else { false }
+        })
+        let destroy = try #require(instructions.firstIndex {
+            if case .destroyValue = $0 { true } else { false }
+        })
+        let apply = try #require(instructions.firstIndex {
+            if case let .nativeApply(_, id, _) = $0 { id == importID }
+            else { false }
+        })
+        #expect(none < destroy)
+        #expect(destroy < apply)
+
+        let mismatched = CanonicalSIL.Function(
+            mangledName: "$s7Fixture8mismatchyySo8NSObjectCF",
+            loweredType: "@convention(thin) (@owned NSObject) -> ()",
+            body: """
+            bb0(%0 : @owned $NSObject):
+              %1 = enum $Optional<String>, #Optional.none!enumelt
+              %2 = function_ref @\(symbol) : $\(physicalType)
+              %3 = apply %2(%1, %0) : $\(physicalType)
+              %4 = tuple ()
+              return %4
+            """
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+                mismatched,
+                displayName: "mismatch",
+                directCalls: calls,
+                expectedEffects: effects
+            )
+        }
+    }
+
+    @Test("Projected borrowed Optional.none defaults retire one erased owner")
+    func retiresBorrowedInlineNativeOptionalDefault() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let symbol = "$s7Fixture6invokeyySo8NSObjectCSg_AEtF"
+        let importID = Core.NativeImportID(rawValue: 0)
+        let effects = Core.Effects(mayAllocate: true)
+        let requirement = Bytecode.ImportRequirement(
+            id: importID,
+            key: .init(rawValue: .sha256("projected-borrowed-native-default")),
+            signature: .init(
+                parameters: ["Foundation.NSObject"],
+                result: "Swift.Void"
+            ),
+            effects: effects,
+            contract: .bounded(
+                kind: .globalFunction,
+                domain: .application,
+                access: .pure,
+                maximumDurationMicroseconds: 500,
+                allowsMainThread: true
+            )
+        )
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.native(objectType)],
+                parameterConventions: [.owned],
+                parameterProjection: .init(
+                    physicalParameterCount: 2,
+                    logicalParameterIndices: [1],
+                    defaultArguments: [
+                        .optionalNone(physicalParameterIndex: 0),
+                    ]
+                ),
+                resultType: .void,
+                effects: effects,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let physicalType = "@convention(thin) "
+            + "(@guaranteed Optional<NSObject>, @owned NSObject) -> ()"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture4rootyySo8NSObjectCF",
+            loweredType: "@convention(thin) (@owned NSObject) -> ()",
+            body: """
+            bb0(%0 : @owned $NSObject):
+              %1 = enum $Optional<NSObject>, #Optional.none!enumelt
+              %2 = begin_borrow %1
+              %3 = function_ref @\(symbol) : $\(physicalType)
+              %4 = apply %3(%2, %0) : $\(physicalType)
+              end_borrow %2
+              destroy_value %1
+              %5 = tuple ()
+              return %5
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "root",
+            directCalls: calls,
+            expectedEffects: effects
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let apply = try #require(instructions.firstIndex {
+            if case let .nativeApply(_, id, _) = $0 { id == importID }
+            else { false }
+        })
+        let destroys = instructions.indices.filter {
+            if case .destroyValue = instructions[$0] { true } else { false }
+        }
+        #expect(destroys.count == 1)
+        #expect(destroys[0] < apply)
+    }
+
     @Test("PatchCompiler links a reachable default argument generator into HLBC")
     func linksDefaultArgumentGenerator() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -176,7 +661,8 @@ struct DefaultArguments {
             moduleName: "DefaultOwnerFixture",
             purpose: .implementationIdentity
         )
-        let generators = try CanonicalSIL.File(text: canonicalSIL).functions.filter {
+        let silFile = try CanonicalSIL.File(text: canonicalSIL)
+        let generators = silFile.functions.filter {
             ReleaseCompiler.ImplementationFingerprint
                 .isDefaultArgumentGenerator($0.mangledName)
         }
@@ -184,6 +670,11 @@ struct DefaultArguments {
         #expect(generators.count == 4)
         #expect(generators.allSatisfy { $0.mangledName.last == "_" })
         #expect(generators.allSatisfy { !$0.body.isEmpty })
+        #expect(generators.allSatisfy { generator in
+            ReleaseCompiler.ImplementationFingerprint
+                .defaultArgumentOwners(of: generator.mangledName)
+                .contains { silFile.function(mangledName: $0) != nil }
+        })
     }
 
     private func functionKey(

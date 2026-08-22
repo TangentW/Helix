@@ -136,6 +136,23 @@ public final class Bridge: @unchecked Sendable {
         }
     }
 
+    /// Materializes arguments supplied by a native callback with the same
+    /// pre-allocation limits used by generated Shell entry bridges.
+    public func encodeNativeCallbackArguments(
+        for callback: VM.NativeCallback,
+        count: Int,
+        arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value]
+    ) throws -> [VM.Value] {
+        guard let runtime = installation.loadAcquire()?.runtime else {
+            throw Runtime.BridgeDispatchError.notInstalled
+        }
+        return try runtime.encodeNativeCallbackArguments(
+            for: callback,
+            count: count,
+            arguments: arguments
+        )
+    }
+
     /// Runs a generated replacement as an exact-ABI gateway to its lexical
     /// previous implementation. The entry-scoped thread-local depth prevents
     /// that gateway from routing back into the same VM entry.

@@ -19,20 +19,13 @@ extension FrontendReceipt.Adapter {
         var importedModules: [String]
         var requiresMainActor: Bool
     }
-    struct ImportedReference: Sendable {
-        var runtimeName: String
-        var sourceFileLogicalID: String
-        var importedModules: [String]
-        var requiresMainActor: Bool
-    }
-
-    func discoverImportedReferences(
+    func discoverImportedNativeTypes(
         documents: [FrontendReceipt.TypedAST.Object],
         sourcesByPhysicalPath: [String: SourceState],
         moduleName: String,
         demangled: [String: String]
-    ) throws -> [ImportedReference] {
-        var uses: [String: [ImportedReference]] = [:]
+    ) throws -> [ImportedNativeType] {
+        var uses: [ImportedNativeType] = []
 
         for document in documents {
             guard let filename = document["filename"] as? String,
@@ -48,8 +41,8 @@ extension FrontendReceipt.Adapter {
             }
             let modules = imports(in: items).filter { $0 != moduleName }
             guard !modules.isEmpty else { continue }
-            collectImportedReferences(
-                items: items,
+            collectImportedNativeTypes(
+                root: items,
                 inheritedMainActor: false,
                 source: source,
                 importedModules: modules,
@@ -57,77 +50,197 @@ extension FrontendReceipt.Adapter {
                 uses: &uses
             )
         }
-
-        return uses.keys.sorted().compactMap { runtimeName in
-            guard let values = uses[runtimeName],
-                  let sourceFileLogicalID = values.map(\.sourceFileLogicalID).min()
-            else { return nil }
-            return ImportedReference(
-                runtimeName: runtimeName,
-                sourceFileLogicalID: sourceFileLogicalID,
-                importedModules: Array(
-                    Set(values.flatMap(\.importedModules))
-                ).sorted(),
-                requiresMainActor: values.contains(where: \.requiresMainActor)
-            )
-        }
+        return try mergeImportedNativeTypes(
+            discoveredTypes: [],
+            operationTypes: uses
+        )
     }
 
-    private func collectImportedReferences(
-        items: [Any],
+    private func collectImportedNativeTypes(
+        root: Any,
         inheritedMainActor: Bool,
         source: SourceState,
         importedModules: [String],
         demangled: [String: String],
-        uses: inout [String: [ImportedReference]]
+        uses: inout [ImportedNativeType]
     ) {
-        for value in items {
-            guard let item = value as? [String: Any],
-                  let kind = item["_kind"] as? String
-            else { continue }
-            let requiresMainActor = inheritedMainActor
+        var pending: [(value: Any, requiresMainActor: Bool)] = [
+            (root, inheritedMainActor),
+        ]
+        while let next = pending.popLast() {
+            if let values = next.value as? [Any] {
+                pending.append(contentsOf: values.reversed().map {
+                    ($0, next.requiresMainActor)
+                })
+                continue
+            }
+            guard let item = next.value as? [String: Any] else { continue }
+            let requiresMainActor = next.requiresMainActor
                 || itemRequiresMainActor(item, demangled: demangled)
 
             func record(_ rawType: Any?) {
                 guard let mangled = rawType as? String else { return }
-                let runtimeNames = Self.objectiveCClassNames(
-                    inMangledType: mangled
+                let spelling = demangled[mangled].map(
+                    normalizeImportedTypeSpelling
                 )
-                for runtimeName in runtimeNames.sorted() {
-                    uses[runtimeName, default: []].append(
-                        .init(
-                            runtimeName: runtimeName,
-                            sourceFileLogicalID: source.logicalPath,
+                let unavailableGenericBase: String?
+                if let spelling, let open = spelling.firstIndex(of: "<") {
+                    unavailableGenericBase = spelling[..<open]
+                        .split(separator: ".").last.map(String.init)
+                } else {
+                    unavailableGenericBase = nil
+                }
+                for runtimeName in Self.objectiveCClassNames(
+                    inMangledType: mangled
+                ) where runtimeName != unavailableGenericBase {
+                    uses.append(
+                        importedType(
+                            canonicalName: runtimeName,
+                            swiftType: runtimeName,
+                            kind: .reference,
+                            representation: .reference,
+                            source: source,
                             importedModules: importedModules,
                             requiresMainActor: requiresMainActor
                         )
                     )
                 }
+                guard let spelling,
+                      let rootModule = spelling.split(separator: ".")
+                        .first.map(String.init),
+                      mangled.hasPrefix("$sSo")
+                        || importedModules.contains(rootModule),
+                      let type = importedNativeType(
+                          rawMangledType: mangled,
+                          spelling: spelling,
+                          source: source,
+                          importedModules: importedModules,
+                          requiresMainActor: requiresMainActor
+                      )
+                else { return }
+                uses.append(type)
             }
 
-            if kind == "var_decl", item["readImpl"] as? String == "stored" {
+            switch item["_kind"] as? String {
+            case "parameter":
                 record(item["interface_type"])
-            } else if kind == "func_decl" {
-                if let parameters = item["params"] as? [String: Any],
-                   let values = parameters["params"] as? [[String: Any]] {
-                    for parameter in values {
-                        record(parameter["interface_type"])
-                    }
-                }
+            case "var_decl" where item["readImpl"] as? String == "stored":
+                record(item["interface_type"])
+            case "func_decl":
                 record(item["result"])
+            default:
+                break
             }
 
-            if let members = item["members"] as? [Any] {
-                collectImportedReferences(
-                    items: members,
-                    inheritedMainActor: requiresMainActor,
-                    source: source,
-                    importedModules: importedModules,
-                    demangled: demangled,
-                    uses: &uses
-                )
+            for child in item.values {
+                if child is [Any] || child is [String: Any] {
+                    pending.append((child, requiresMainActor))
+                }
             }
         }
+    }
+
+    func importedNativeType(
+        rawMangledType: Any?,
+        spelling: String,
+        source: SourceState,
+        importedModules: [String],
+        requiresMainActor: Bool
+    ) -> ImportedNativeType? {
+        guard let discovered = importedNativeNominal(in: spelling),
+              let mangled = rawMangledType as? String
+        else { return nil }
+        let canonical = isSelectorType(discovered)
+            ? "ObjectiveC.Selector" : discovered
+        guard let representation = importedNominalRepresentation(
+            mangled,
+            spelling: canonical
+        ) else { return nil }
+        let kind: InterfaceArchive.TypeKind = representation == .reference
+            ? .reference : .value
+        return importedType(
+            canonicalName: canonical,
+            swiftType: canonical,
+            kind: kind,
+            representation: representation,
+            source: source,
+            importedModules: importedModules,
+            requiresMainActor: representation == .reference && requiresMainActor
+        )
+    }
+
+    func importedNominalRepresentation(
+        _ rawMangledType: String,
+        spelling: String
+    ) -> ImportedNativeType.Representation? {
+        var value = rawMangledType
+        guard value.hasPrefix("$s"), value.hasSuffix("D") else { return nil }
+        value.removeLast()
+        while value.hasSuffix("Sg") { value.removeLast(2) }
+        switch value.last {
+        case "C": return .reference
+        case "V", "O": return .opaqueValue
+        case "G" where rawMangledType.hasPrefix("$sSo") && spelling.contains("<"):
+            return .reference
+        default: return nil
+        }
+    }
+
+    func importedNativeNominal(in raw: String) -> String? {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while value.hasSuffix("?") { value.removeLast() }
+        for prefix in ["Swift.Optional<", "Optional<"]
+        where value.hasPrefix(prefix) && value.hasSuffix(">") {
+            let start = value.index(value.startIndex, offsetBy: prefix.count)
+            return importedNativeNominal(
+                in: String(value[start..<value.index(before: value.endIndex)])
+            )
+        }
+        if value.hasPrefix("["), value.hasSuffix("]")
+            || value.hasPrefix("Swift.Array<") || value.hasPrefix("Array<")
+            || value.hasPrefix("Swift.Dictionary<") || value.hasPrefix("Dictionary<") {
+            return nil
+        }
+        guard FrontendReceipt.ValueTypeParser.parse(
+            value,
+            allowVoid: true
+        ) == nil,
+              !value.contains(" -> "),
+              !value.isEmpty
+        else { return nil }
+        return value
+    }
+
+    func normalizeImportedTypeSpelling(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while value.hasPrefix("(extension in "),
+              let separator = value.range(of: "):") {
+            value = String(value[separator.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return value.replacingOccurrences(of: "__C.", with: "")
+    }
+
+    func importedType(
+        canonicalName: String,
+        swiftType: String,
+        kind: InterfaceArchive.TypeKind,
+        aliases: [String] = [],
+        representation: ImportedNativeType.Representation,
+        source: SourceState,
+        importedModules: [String],
+        requiresMainActor: Bool
+    ) -> ImportedNativeType {
+        .init(
+            canonicalName: canonicalName,
+            swiftType: swiftType,
+            kind: kind,
+            aliases: aliases,
+            representation: representation,
+            sourceFileLogicalID: source.logicalPath,
+            importedModules: importedModules,
+            requiresMainActor: requiresMainActor
+        )
     }
 
     func itemRequiresMainActor(
@@ -146,22 +259,10 @@ extension FrontendReceipt.Adapter {
     }
 
     func mergeImportedNativeTypes(
-        references: [ImportedReference],
+        discoveredTypes: [ImportedNativeType],
         operationTypes: [ImportedNativeType]
     ) throws -> [ImportedNativeType] {
-        var uses = operationTypes
-        uses.append(contentsOf: references.map {
-            ImportedNativeType(
-                canonicalName: $0.runtimeName,
-                swiftType: $0.runtimeName,
-                kind: .reference,
-                aliases: [],
-                representation: .reference,
-                sourceFileLogicalID: $0.sourceFileLogicalID,
-                importedModules: $0.importedModules,
-                requiresMainActor: $0.requiresMainActor
-            )
-        })
+        let uses = discoveredTypes + operationTypes
         var result: [String: ImportedNativeType] = [:]
         for use in uses.sorted(by: {
             ($0.canonicalName, $0.sourceFileLogicalID)

@@ -1,4 +1,29 @@
+extension Bytecode {
+/// A closure value stored directly or behind one Optional layer.
+public struct DirectClosureShape: Hashable, Sendable {
+    public var signature: Bytecode.ClosureSignature
+    public var isOptional: Bool
+
+    public init(signature: Bytecode.ClosureSignature, isOptional: Bool) {
+        self.signature = signature
+        self.isOptional = isOptional
+    }
+}
+}
+
 extension Bytecode.ValueType {
+    /// Resolves a direct closure value or an Optional wrapping exactly one closure.
+    public var directClosureShape: Bytecode.DirectClosureShape? {
+        switch self {
+        case let .closure(signature):
+            .init(signature: signature, isOptional: false)
+        case let .optional(.closure(signature)):
+            .init(signature: signature, isOptional: true)
+        default:
+            nil
+        }
+    }
+
     /// Whether this storage shape contains a first-class closure at any depth,
     /// including inside another closure's callable signature.
     public var containsClosureValue: Bool {

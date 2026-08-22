@@ -98,7 +98,7 @@ extension FrontendReceipt.ManagedDebugSurface {
             )
         }
         enrichedTypes = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
-            references: [],
+            discoveredTypes: [],
             operationTypes: enrichedTypes
         )
         candidates = Array(Set(candidates)).sorted(by: candidateOrdering)
@@ -602,7 +602,8 @@ extension FrontendReceipt.ManagedDebugSurface {
         let nativeSurface = placeholderNativeTypes(importedTypes)
         let swiftAliases = try FrontendReceipt.Adapter()
             .makeImportedSwiftTypeAliases(importedTypes)
-        return surface.operations.compactMap { operation in
+        return surface.operations.compactMap {
+            operation -> FrontendReceipt.Adapter.ImportedOperation? in
             let matching = Set(operation.witnessFunctions.compactMap {
                 candidatesByWitness[$0]
             })
@@ -621,6 +622,18 @@ extension FrontendReceipt.ManagedDebugSurface {
                     aliases: swiftAliases
                 )
             }
+            for index in candidate.parameterTypes.indices
+            where measured.parameterSwiftTypes.indices.contains(index) {
+                let formal = FrontendReceipt.SwiftTypeSpelling
+                    .replacingNominalAliases(
+                        in: candidate.parameterTypes[index],
+                        aliases: swiftAliases
+                    )
+                if let boundary = FrontendReceipt.FunctionTypeSpelling
+                    .callbackBoundary(in: formal) {
+                    measured.parameterSwiftTypes[index] = boundary.declaredSpelling
+                }
+            }
             measured.resultSwiftType = FrontendReceipt.SwiftTypeSpelling
                 .replacingNominalAliases(
                     in: operation.resultSwiftType,
@@ -634,13 +647,16 @@ extension FrontendReceipt.ManagedDebugSurface {
                 )
             }
             guard parameters.count == measured.parameterSwiftTypes.count,
-                  parameters.allSatisfy(isAutomaticallyBridgeable),
+                  FrontendReceipt.NativeBridgeProfile.callbacks(
+                      parameterSpellings: measured.parameterSwiftTypes,
+                      parameterTypes: parameters
+                  ) != nil,
                   let result = FrontendReceipt.ValueTypeParser.parse(
                       measured.resultSwiftType,
                       allowVoid: true,
                       nativeTypes: nativeSurface.types
                   ),
-                  result == .void || isAutomaticallyBridgeable(result)
+                  FrontendReceipt.NativeBridgeProfile.isResult(result)
             else { return nil }
             measured.sourceFileLogicalID = candidate.sourceFileLogicalID
             measured.importedModules = candidate.importedModules
@@ -708,29 +724,6 @@ extension FrontendReceipt.ManagedDebugSurface {
         return "\(isolation)private func helixManagedDebugProbe\(index)("
             + "\(parameters.joined(separator: ", ")))\(throwing) {"
             + "\(mutableReceiver)\n    _ = \(tryPrefix)\(call)\n}"
-    }
-
-    private static func isAutomaticallyBridgeable(
-        _ type: Bytecode.ValueType
-    ) -> Bool {
-        switch type {
-        case .bool, .integer, .float, .string, .any, .native:
-            true
-        case let .array(element), let .optional(element):
-            isAutomaticallyBridgeable(element)
-        case let .set(element):
-            element.isVMHashable && isAutomaticallyBridgeable(element)
-        case let .dictionary(key, value):
-            key.isVMHashable
-                && isAutomaticallyBridgeable(key)
-                && isAutomaticallyBridgeable(value)
-        case let .tuple(elements):
-            !elements.isEmpty && elements.allSatisfy(isAutomaticallyBridgeable)
-        case .void, .never, .local, .error, .address, .mutableCell,
-             .nonOwningReference,
-             .arrayState, .dictionaryState, .closure:
-            false
-        }
     }
 
     private static func isInstanceDispatch(

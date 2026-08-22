@@ -151,6 +151,28 @@ struct SubstitutedFunctionTypes {
         #expect(owned.parameterConventions == [.owned])
     }
 
+    @Test("Higher-order closure parameters use managed value ownership")
+    func normalizesClosureParameterConvention() throws {
+        guard case let .closure(signature) = try CanonicalSIL
+            .TypeEnvironment().resolve(
+                "@callee_guaranteed (@guaranteed @noescape "
+                    + "@callee_guaranteed (Int) -> Int) -> Int"
+            )
+        else {
+            Issue.record("expected a higher-order closure type")
+            return
+        }
+
+        #expect(signature.parameters == [
+            .closure(.init(
+                parameters: [.int64],
+                parameterConventions: [.owned],
+                result: .int64
+            )),
+        ])
+        #expect(signature.parameterConventions == [.owned])
+    }
+
     @Test("Concrete closure ABIs preserve inout address parameters")
     func preservesInoutClosureConvention() throws {
         guard case let .closure(signature) = try CanonicalSIL

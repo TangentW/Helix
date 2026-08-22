@@ -324,11 +324,23 @@ the closed hosted profile and cross into native code as that superclass. The
 current profile is limited to inherited no-argument initialization, no stored
 properties, and no-argument/Bool `Void` overrides.
 
+NativeImport also accepts exact direct or Optional callback parameters through
+one generated adapter family for Swift closures and Objective-C blocks. The v1
+profile is synchronous, nonthrowing, and `Void`-returning, preserves each
+callback's nonescaping/escaping and global-actor contract, and permits only
+recursively bridgeable callback arguments. Escaping handles retain their image
+and generation lease; callback execution is serialized until general Swift
+`Sendable` semantics exist. Checked source-default projection lets calls such as
+`UIView.animate`, `DispatchQueue.main.async(group:execute:)`, and
+`Timer.scheduledTimer` share this path without per-API VM implementations.
+
 It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch, a
 patch concrete Swift type identity visible to native code, function-local
 nominal declarations, hosted stored properties/custom initializers/arbitrary
-callback ABIs, changes to existing native stored layout, closure persistence or native/Shell boundary crossing,
-async closures, `unowned(unsafe)`, weak/unowned stored-property layouts,
+callback ABIs, changes to existing native stored layout, closure crossing a
+Shell Entry or a NativeImport position outside the exact callback profile,
+non-`Void`/throwing/async/higher-order callback ABIs, concurrent `Sendable`
+closure execution, async closures, `unowned(unsafe)`, weak/unowned stored-property layouts,
 escaping caller-owned `inout`
 capture, true `await`/continuations, actor-isolated `self`,
 custom global actors, unrestricted pointers, reflection-based field access, and

@@ -112,6 +112,7 @@ public struct NativeImportRecord: Codable, Hashable, Sendable {
     /// These stay server-side and never become runtime symbol lookup authority.
     public var silMangledNames: [String]
     public var parameterTypes: [Bytecode.ValueType]
+    public var parameterProjection: InterfaceArchive.NativeImportParameterProjection
     public var resultType: Bytecode.ValueType
     public var signature: Core.LoweredSignature
     public var effects: Core.Effects
@@ -126,6 +127,7 @@ public struct NativeImportRecord: Codable, Hashable, Sendable {
         canonicalCallee: String,
         silMangledNames: [String],
         parameterTypes: [Bytecode.ValueType],
+        parameterProjection: InterfaceArchive.NativeImportParameterProjection? = nil,
         resultType: Bytecode.ValueType,
         signature: Core.LoweredSignature,
         effects: Core.Effects,
@@ -139,6 +141,8 @@ public struct NativeImportRecord: Codable, Hashable, Sendable {
         self.canonicalCallee = canonicalCallee
         self.silMangledNames = silMangledNames.sorted()
         self.parameterTypes = parameterTypes
+        self.parameterProjection = parameterProjection
+            ?? .identity(parameterCount: parameterTypes.count)
         self.resultType = resultType
         self.signature = signature
         self.effects = effects
@@ -519,18 +523,107 @@ public struct Archive: Codable, Hashable, Sendable {
                       && !item.silMangledNames.isEmpty
                       && item.silMangledNames == Array(Set(item.silMangledNames)).sorted()
                       && item.silMangledNames.allSatisfy(Self.isValidSILSymbol)
-              }),
-              Set(nativeImports.flatMap(\.silMangledNames)).count
-                  == nativeImports.reduce(0, { $0 + $1.silMangledNames.count })
+              })
         else {
             throw InterfaceArchive.Error.invalidArchive("native import allocation is inconsistent")
         }
+        let nativeVariantsBySymbol = Dictionary(grouping: nativeImports.flatMap { item in
+            item.silMangledNames.map { ($0, item) }
+        }, by: { $0.0 })
+        for (symbol, pairs) in nativeVariantsBySymbol where pairs.count > 1 {
+            let variants = pairs.map(\.1)
+            guard let first = variants.first else { continue }
+            var baseContract = first.contract
+            baseContract.callbacks = []
+            var parameterTypeByPhysicalIndex: [UInt16: Bytecode.ValueType] = [:]
+            var defaultByPhysicalIndex: [
+                UInt16: InterfaceArchive.NativeImportDefaultArgument
+            ] = [:]
+            var projections = Set<[UInt16]>()
+            var callbackLifetimeByPhysicalIndex: [
+                UInt16: Core.NativeImportCallbackLifetime
+            ] = [:]
+            for variant in variants {
+                var variantBaseContract = variant.contract
+                variantBaseContract.callbacks = []
+                guard variant.parameterProjection.physicalParameterCount
+                        == first.parameterProjection.physicalParameterCount,
+                      variant.resultType == first.resultType,
+                      variant.effects == first.effects,
+                      variantBaseContract == baseContract,
+                      variant.capability == first.capability,
+                      variant.isEmittedToDevice == first.isEmittedToDevice,
+                      variant.abiAdapter == first.abiAdapter,
+                      projections.insert(
+                          variant.parameterProjection.logicalParameterIndices
+                      ).inserted
+                else {
+                    throw InterfaceArchive.Error.invalidArchive(
+                        "native import symbol \(symbol) has inconsistent physical variants"
+                    )
+                }
+                for (physicalIndex, type) in zip(
+                    variant.parameterProjection.logicalParameterIndices,
+                    variant.parameterTypes
+                ) {
+                    if let existing = parameterTypeByPhysicalIndex[physicalIndex],
+                       existing != type {
+                        throw InterfaceArchive.Error.invalidArchive(
+                            "native import symbol \(symbol) changes a physical parameter type"
+                        )
+                    }
+                    parameterTypeByPhysicalIndex[physicalIndex] = type
+                }
+                for defaultArgument in variant.parameterProjection.defaultArguments {
+                    let index = defaultArgument.physicalParameterIndex
+                    if let existing = defaultByPhysicalIndex[index],
+                       existing != defaultArgument {
+                        throw InterfaceArchive.Error.invalidArchive(
+                            "native import symbol \(symbol) changes default-argument provenance"
+                        )
+                    }
+                    defaultByPhysicalIndex[index] = defaultArgument
+                }
+                for callback in variant.contract.callbacks {
+                    let logicalIndex = Int(callback.parameterIndex)
+                    guard variant.parameterProjection.logicalParameterIndices.indices
+                        .contains(logicalIndex)
+                    else {
+                        throw InterfaceArchive.Error.invalidArchive(
+                            "native import symbol \(symbol) has an invalid callback projection"
+                        )
+                    }
+                    let physicalIndex = variant.parameterProjection
+                        .logicalParameterIndices[logicalIndex]
+                    if let existing = callbackLifetimeByPhysicalIndex[
+                        physicalIndex
+                    ], existing != callback.lifetime {
+                        throw InterfaceArchive.Error.invalidArchive(
+                            "native import symbol \(symbol) changes a physical callback lifetime"
+                        )
+                    }
+                    callbackLifetimeByPhysicalIndex[physicalIndex] =
+                        callback.lifetime
+                }
+            }
+        }
         for item in nativeImports {
-            guard item.signature.isThrowing == item.effects.mayThrow,
-                  item.signature.isAsync == item.effects.isAsync
+            let normalizedIsolation = item.signature.isolation.map {
+                $0 == "Swift.MainActor" ? "MainActor" : $0
+            }
+            guard item.signature.parameters.count == item.parameterTypes.count,
+                  !item.signature.result.isEmpty,
+                  item.signature.isThrowing == item.effects.mayThrow,
+                  item.signature.isAsync == item.effects.isAsync,
+                  normalizedIsolation == nil || normalizedIsolation == "MainActor",
+                  (normalizedIsolation == "MainActor")
+                    == item.effects.requiresMainActor,
+                  item.parameterProjection.isValid(
+                      logicalParameterCount: item.parameterTypes.count
+                  )
             else {
                 throw InterfaceArchive.Error.invalidArchive(
-                    "native import lowered signature and effects disagree"
+                    "native import signature, effects, or physical parameter projection disagree"
                 )
             }
             let expected = try Core.NativeImportKey.derive(
@@ -565,7 +658,7 @@ public struct Archive: Codable, Hashable, Sendable {
             )
             guard callbackByIndex.count == item.contract.callbacks.count,
                   callbackByIndex.keys.allSatisfy(item.parameterTypes.indices.contains),
-                  !item.resultType.containsClosure
+                  !item.resultType.containsClosureValue
             else {
                 throw InterfaceArchive.Error.invalidArchive(
                     "native import callback parameters are inconsistent"
@@ -576,19 +669,15 @@ public struct Archive: Codable, Hashable, Sendable {
                     guard capabilities.contains(.closureValuesV1),
                           callback.lifetime != .escaping
                             || capabilities.contains(.escapingClosureValuesV1),
-                          let shape = type.nativeCallbackShape,
-                          shape.signature.result == .void,
-                          !shape.signature.effects.mayThrow,
-                          !shape.signature.effects.isAsync,
-                          !shape.signature.parameterConventions.contains(.inout),
-                          !(callback.lifetime == .nonescaping && shape.isOptional),
-                          shape.signature.parameters.allSatisfy({ !$0.containsClosure })
+                          let shape = type.directClosureShape,
+                          shape.signature.isNativeBridgeCallback,
+                          !(callback.lifetime == .nonescaping && shape.isOptional)
                     else {
                         throw InterfaceArchive.Error.invalidArchive(
                             "native import has an unsupported callback signature"
                         )
                     }
-                } else if type.containsClosure {
+                } else if type.containsClosureValue {
                     throw InterfaceArchive.Error.invalidArchive(
                         "native import closure parameter has no callback lifetime contract"
                     )
@@ -757,7 +846,7 @@ public struct Archive: Codable, Hashable, Sendable {
             })
             for (index, type) in item.parameterTypes.enumerated() {
                 if callbackIndices.contains(index),
-                   let shape = type.nativeCallbackShape {
+                   let shape = type.directClosureShape {
                     for parameter in shape.signature.parameters {
                         try validateDeviceType(parameter)
                     }

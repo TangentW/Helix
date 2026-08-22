@@ -122,8 +122,9 @@ public struct NativeInvocationContext {
         }
         guard state.parameterTypes.indices.contains(parameterIndex),
               let expectedShape = state.parameterTypes[parameterIndex]
-                .nativeCallbackShape,
+                .directClosureShape,
               case let .closure(closure) = value,
+              closure.signature.hasCanonicalCallableEffects,
               closure.signature == expectedShape.signature,
               closure.signature.result == .void,
               !closure.signature.effects.mayThrow,

@@ -430,6 +430,34 @@ struct ClosureValueSemanticsMatrix {
         #expect(try invoke(fixture, [integer(5)]) == integer(7))
     }
 
+    @Test("Nested noescape scopes preserve the outer callback lifetime")
+    func lowersNestedWithoutActuallyEscaping() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            @inline(never)
+            func nestedScope(_ callback: () -> Int) -> (Int, Int) {
+                let first = withoutActuallyEscaping(callback) { outer in
+                    withoutActuallyEscaping(outer) { inner in
+                        inner()
+                    }
+                }
+                return (first, callback())
+            }
+
+            public func nestedScopedClosure(_ value: Int) -> (Int, Int) {
+                nestedScope { value + 2 }
+            }
+            """,
+            functionName: "nestedScopedClosure",
+            moduleName: "HelixNestedScopedClosureFixture"
+        )
+
+        #expect(
+            try invoke(fixture, [integer(5)])
+                == .tuple([try integer(7), try integer(7)])
+        )
+    }
+
     @Test("Dead aliases do not look like dynamically scoped closure escape")
     func releasesWithoutActuallyEscapingAliases() throws {
         let fixture = try FrontendExecutionHarness.compile(
@@ -586,6 +614,46 @@ struct ClosureValueSemanticsMatrix {
         )
 
         #expect(try invoke(fixture, [integer(13)]) == integer(-1))
+    }
+
+    @Test("Destroyed escaping closure values release strong captures in-frame")
+    func releasesStrongCapturesAtClosureLifetimeEnd() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Owner {
+                let value: Int
+
+                init(_ value: Int) {
+                    self.value = value
+                }
+            }
+
+            @inline(never)
+            private func invokeEscaping(_ callback: @escaping () -> Int) -> Int {
+                callback()
+            }
+
+            @inline(never)
+            private func makeObserver(_ owner: Owner) -> () -> Int {
+                { [weak owner] in owner?.value ?? -1 }
+            }
+
+            public func closureCaptureDiesInFrame(_ value: Int) -> Int {
+                let observe: () -> Int
+                do {
+                    let owner = Owner(value)
+                    observe = makeObserver(owner)
+                    let retaining = { owner.value }
+                    _ = invokeEscaping(retaining)
+                }
+                return observe()
+            }
+            """,
+            functionName: "closureCaptureDiesInFrame",
+            moduleName: "HelixClosureCaptureLifetimeFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(17)]) == integer(-1))
     }
 
     @Test("Weak captures observe release through patch-local value aggregates")

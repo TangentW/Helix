@@ -17,7 +17,7 @@ struct NativeCallback {
         let callbackImport = VM.ClosureNativeInvoker(
             id: fixture.exportID,
             key: fixture.exportKey,
-            parameterTypes: [.closure(fixture.callbackSignature)],
+            parameterTypes: [.closure(fixture.callbackBoundarySignature)],
             resultType: .void,
             effects: fixture.effects,
             contract: fixture.exportContract,
@@ -56,7 +56,8 @@ struct NativeCallback {
                     invoke: { _ in .returned(nil) }
                 ),
             ]),
-            nativeCatalog: .init([callbackImport, observationImport])
+            nativeCatalog: .init([callbackImport, observationImport]),
+            bridgeInputLimits: .init(maximumValueNodes: 1)
         )
         let generation = try fixture.generation(id: 1)
         _ = try runtime.activate(generation, expectedActiveID: nil)
@@ -64,6 +65,15 @@ struct NativeCallback {
         #expect(runtime.invoke(entry: fixture.entry, arguments: []) == .returned(nil))
         let callback = try #require(callbackBox.value)
         try runtime.rollback(expectedActiveID: generation.id, to: nil)
+
+        #expect(throws: Runtime.BridgeInputError.self) {
+            try runtime.encodeNativeCallbackArguments(
+                for: callback,
+                count: 2
+            ) { encoder in
+                [try encoder.encode(1), try encoder.encode(2)]
+            }
+        }
 
         callback.invokeVoid {
             [.integer(try VM.Integer(signed: 42, bitWidth: 64, isSigned: true))]
@@ -99,6 +109,7 @@ struct NativeCallback {
             mayAllocate: true,
             hasExternalSideEffects: true
         )
+        let callbackBoundarySignature: Bytecode.ClosureSignature
         let callbackSignature: Bytecode.ClosureSignature
         let exportContract: Core.NativeImportContract
         let observationContract: Core.NativeImportContract
@@ -107,11 +118,15 @@ struct NativeCallback {
         let entryKey: Core.FunctionKey
 
         init() throws {
+            callbackBoundarySignature = .init(
+                parameters: [.int64],
+                parameterConventions: [.owned],
+                result: .void
+            )
             callbackSignature = .init(
                 parameters: [.int64],
                 parameterConventions: [.owned],
-                result: .void,
-                effects: effects
+                result: .void
             )
             exportContract = .bounded(
                 kind: .globalFunction,
@@ -284,7 +299,7 @@ struct NativeCallback {
                     .init(
                         id: exportID,
                         key: exportKey,
-                        parameterTypes: [.closure(callbackSignature)],
+                        parameterTypes: [.closure(callbackBoundarySignature)],
                         resultType: .void,
                         signature: exportSignature,
                         effects: effects,

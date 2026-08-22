@@ -76,43 +76,24 @@ enum ValueTypeParser {
         allowVoid: Bool,
         nativeTypes: [String: Core.TypeID] = [:]
     ) -> Bytecode.ValueType? {
-        var value = spelling.trimmingCharacters(in: .whitespacesAndNewlines)
-        let isEscapingClosure = value.hasPrefix("@escaping ")
-        if isEscapingClosure {
-            value.removeFirst("@escaping ".count)
-            value = value.trimmingCharacters(in: .whitespaces)
-        }
-        if isEscapingClosure, topLevelFunctionArrow(in: value) == nil {
-            return nil
-        }
-        if ["()", "Void", "Swift.Void"].contains(value) {
-            return allowVoid ? .void : nil
-        }
-        if ["Never", "Swift.Never"].contains(value) { return .never }
-        if let arrow = topLevelFunctionArrow(in: value) {
-            guard !value.hasPrefix("@escaping "),
-                  !value.hasPrefix("@Sendable "),
-                  !value[..<arrow.lowerBound].contains(" async"),
-                  !value[..<arrow.lowerBound].contains(" throws"),
-                  !value[..<arrow.lowerBound].contains(" rethrows")
+        let value = spelling.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let function = FrontendReceipt.FunctionTypeSpelling.parse(value) {
+            let globalActor = function.attributes.globalActor
+            guard function.isSynchronousNonthrowing,
+                  globalActor == nil
+                    || globalActor == "MainActor"
+                    || globalActor == "Swift.MainActor"
             else { return nil }
-            let rawParameters = String(value[..<arrow.lowerBound])
-                .trimmingCharacters(in: .whitespaces)
-            guard rawParameters.first == "(", rawParameters.last == ")" else {
-                return nil
-            }
-            let body = String(rawParameters.dropFirst().dropLast())
-            let components = body.isEmpty ? [] : splitTopLevel(body)
-            let parameters = components.compactMap {
+            let parameters = function.parameters.compactMap {
                 parse(
                     removeTupleLabel($0),
                     allowVoid: false,
                     nativeTypes: nativeTypes
                 )
             }
-            guard parameters.count == components.count,
+            guard parameters.count == function.parameters.count,
                   let result = parse(
-                      String(value[arrow.upperBound...]),
+                      function.result,
                       allowVoid: true,
                       nativeTypes: nativeTypes
                   )
@@ -120,15 +101,22 @@ enum ValueTypeParser {
             return .closure(
                 .init(
                     parameters: parameters,
-                    parameterConventions: Array(
-                        repeating: .owned,
-                        count: parameters.count
+                    parameterConventions: parameters.map(
+                        \.nativeCallbackParameterConvention
                     ),
-                    result: result
+                    result: result,
+                    effects: .init(requiresMainActor: globalActor != nil)
                 )
             )
         }
-        if isEscapingClosure { return nil }
+        // A source annotation is valid here only as part of the function-type
+        // grammar above. Do not let an unknown annotation fall through to a
+        // nominal type lookup.
+        if value.hasPrefix("@") { return nil }
+        if ["()", "Void", "Swift.Void"].contains(value) {
+            return allowVoid ? .void : nil
+        }
+        if ["Never", "Swift.Never"].contains(value) { return .never }
         if let wrapped = optionalWrappedType(value) {
             return parse(
                 wrapped,
@@ -249,39 +237,6 @@ enum ValueTypeParser {
             default: break
             }
             guard depth >= 0 else { return nil }
-        }
-        return nil
-    }
-
-    private static func topLevelFunctionArrow(in value: String) -> Range<String.Index>? {
-        var angleDepth = 0
-        var parenthesisDepth = 0
-        var bracketDepth = 0
-        var index = value.startIndex
-        while index < value.endIndex {
-            switch value[index] {
-            case "<": angleDepth += 1
-            case ">":
-                let previous = index > value.startIndex
-                    ? value[value.index(before: index)]
-                    : nil
-                if previous != "-" { angleDepth -= 1 }
-            case "(": parenthesisDepth += 1
-            case ")": parenthesisDepth -= 1
-            case "[": bracketDepth += 1
-            case "]": bracketDepth -= 1
-            case "-" where angleDepth == 0 && parenthesisDepth == 0 && bracketDepth == 0:
-                let next = value.index(after: index)
-                if next < value.endIndex, value[next] == ">" {
-                    return index..<value.index(after: next)
-                }
-            default:
-                break
-            }
-            guard angleDepth >= 0, parenthesisDepth >= 0, bracketDepth >= 0 else {
-                return nil
-            }
-            index = value.index(after: index)
         }
         return nil
     }

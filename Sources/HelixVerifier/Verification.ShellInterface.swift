@@ -144,6 +144,24 @@ public struct ShellInterface: Sendable {
         for id in imports.keys.sorted() {
             guard let descriptor = imports[id] else { continue }
             let callbacks = descriptor.contract.callbacks
+            let normalizedIsolation = descriptor.signature.isolation.map {
+                $0 == "Swift.MainActor" ? "MainActor" : $0
+            }
+            guard descriptor.capability == .nativeImportsV1,
+                  capabilities.contains(descriptor.capability),
+                  descriptor.signature.parameters.count
+                    == descriptor.parameterTypes.count,
+                  !descriptor.signature.result.isEmpty,
+                  descriptor.signature.isThrowing == descriptor.effects.mayThrow,
+                  descriptor.signature.isAsync == descriptor.effects.isAsync,
+                  normalizedIsolation == nil || normalizedIsolation == "MainActor",
+                  (normalizedIsolation == "MainActor")
+                    == descriptor.effects.requiresMainActor
+            else {
+                throw Verification.Error.invalidShellInterface(
+                    "native import \(descriptor.id) has inconsistent signature, effects, isolation, or capability"
+                )
+            }
             do {
                 try descriptor.contract.validate(effects: descriptor.effects)
             } catch {
@@ -179,7 +197,7 @@ public struct ShellInterface: Sendable {
                     )
                 }
             }
-            guard !descriptor.resultType.containsClosure else {
+            guard !descriptor.resultType.containsClosureValue else {
                 throw Verification.Error.invalidShellInterface(
                     "native import \(descriptor.id) cannot return a callback"
                 )
@@ -201,11 +219,8 @@ public struct ShellInterface: Sendable {
         guard capabilities.contains(.closureValuesV1),
               callback.lifetime != .escaping
                 || capabilities.contains(.escapingClosureValuesV1),
-              let shape = type.nativeCallbackShape,
-              shape.signature.result == .void,
-              !shape.signature.effects.mayThrow,
-              !shape.signature.effects.isAsync,
-              !shape.signature.parameterConventions.contains(.inout),
+              let shape = type.directClosureShape,
+              shape.signature.isNativeBridgeCallback,
               !(callback.lifetime == .nonescaping && shape.isOptional)
         else {
             throw Verification.Error.invalidShellInterface(
@@ -213,9 +228,11 @@ public struct ShellInterface: Sendable {
             )
         }
         for parameter in shape.signature.parameters {
-            guard !parameter.containsClosure else {
+            guard !parameter.containsClosureValue,
+                  parameter.isNativeBridgeValue
+            else {
                 throw Verification.Error.invalidShellInterface(
-                    "\(owner) cannot accept a higher-order callback"
+                    "\(owner) cannot accept a higher-order or unbridgeable callback value"
                 )
             }
             try validateBoundaryType(

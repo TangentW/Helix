@@ -102,7 +102,7 @@ struct FrontendReceiptPipeline {
             FrontendReceipt.ValueTypeParser.parse(
                 "@escaping @Sendable (Int) -> Int",
                 allowVoid: false
-            ) == nil
+            ) == .closure(signature)
         )
         #expect(
             FrontendReceipt.ValueTypeParser.parse(

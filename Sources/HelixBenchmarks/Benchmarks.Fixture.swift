@@ -432,7 +432,8 @@ struct Fixture {
         let importID = Core.NativeImportID(rawValue: 0)
         let signature = Core.LoweredSignature(
             parameters: ["Swift.Int"],
-            result: "Swift.Int"
+            result: "Swift.Int",
+            isolation: "MainActor"
         )
         let effects = Core.Effects(requiresMainActor: true)
         let contract = Core.NativeImportContract.bounded(

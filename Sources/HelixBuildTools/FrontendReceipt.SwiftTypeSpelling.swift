@@ -51,6 +51,15 @@ enum SwiftTypeSpelling {
     }
 
     private static func isType(_ value: String) -> Bool {
+        if let function = FrontendReceipt.FunctionTypeSpelling.parse(value) {
+            guard function.isSynchronousNonthrowing,
+                  let parameters = FrontendReceipt.FunctionTypeSpelling
+                    .parameterSpellings(in: value)
+            else { return false }
+            return parameters.allSatisfy(isType)
+                && (isVoid(function.result) || isType(function.result))
+        }
+        if value.hasPrefix("@") { return false }
         if value.hasSuffix("?") {
             return isType(String(value.dropLast()))
         }
@@ -90,6 +99,12 @@ enum SwiftTypeSpelling {
         return isModulePath(value)
     }
 
+    private static func isVoid(_ value: String) -> Bool {
+        ["()", "Void", "Swift.Void"].contains(
+            value.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
     private static func splitTopLevel(
         _ raw: String,
         separator: Character
@@ -102,7 +117,10 @@ enum SwiftTypeSpelling {
         for index in raw.indices {
             switch raw[index] {
             case "<": angleDepth += 1
-            case ">": angleDepth -= 1
+            case ">":
+                let previous = index > raw.startIndex
+                    ? raw[raw.index(before: index)] : nil
+                if previous != "-" { angleDepth -= 1 }
             case "(": parenthesisDepth += 1
             case ")": parenthesisDepth -= 1
             case "[": bracketDepth += 1

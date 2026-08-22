@@ -17,10 +17,24 @@ struct NativeImportDiscoveryTests {
         #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
             "Swift.Dictionary<Swift.String, Swift.Array<Foundation.Date>>"
         ))
+        #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+            "@escaping @MainActor @Sendable (Swift.Bool, UIKit.UIView?) -> Swift.Void"
+        ))
+        #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+            "Swift.Optional<@Sendable (Swift.Int) -> ()>"
+        ))
+        #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+            "(@escaping (Swift.Int) -> Swift.Void) -> Swift.Void"
+        ))
         #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("(Foundation.Date, UIKit.UIView?)"))
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("UIKit.UIView; fatalError()"))
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("[Swift.String:]"))
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("Swift.Array<UIKit.UIView"))
+        #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("() async -> Swift.Void"))
+        #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("() throws -> Swift.Void"))
+        #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+            "@convention(c) () -> Swift.Void"
+        ))
         let aliases = [
             "NSBundle": "Bundle",
             "NSProcessInfo": "ProcessInfo",
@@ -38,6 +52,115 @@ struct NativeImportDiscoveryTests {
             in: "(__C.NSBundle.Type, NSBundle.Nested?)",
             aliases: aliases
         ) == "(Bundle.Type, Bundle.Nested?)")
+    }
+
+    @Test("Function spelling derives exact native callback lifetimes")
+    func derivesNativeCallbackProfiles() throws {
+        let direct = try #require(FrontendReceipt.ValueTypeParser.parse(
+            "@MainActor @Sendable @convention(block) (Swift.Bool) -> Swift.Void",
+            allowVoid: false
+        ))
+        let optional = try #require(FrontendReceipt.ValueTypeParser.parse(
+            "((Swift.Int, Swift.String?) -> ())?",
+            allowVoid: false
+        ))
+        #expect(direct.directClosureShape?.isOptional == false)
+        #expect(optional.directClosureShape?.isOptional == true)
+        #expect(FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: [
+                "() -> Swift.Void",
+                "@escaping @Sendable (Swift.Bool) -> Swift.Void",
+                "((Swift.Int, Swift.String?) -> ())?",
+            ],
+            parameterTypes: [
+                try #require(FrontendReceipt.ValueTypeParser.parse(
+                    "() -> Swift.Void",
+                    allowVoid: false
+                )),
+                direct,
+                optional,
+            ]
+        ) == [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+            .init(parameterIndex: 1, lifetime: .escaping),
+            .init(parameterIndex: 2, lifetime: .escaping),
+        ])
+        #expect(FrontendReceipt.ValueTypeParser.parse(
+            "() async -> Swift.Void",
+            allowVoid: false
+        ) == nil)
+        #expect(FrontendReceipt.ValueTypeParser.parse(
+            "() throws -> Swift.Void",
+            allowVoid: false
+        ) == nil)
+        #expect(FrontendReceipt.FunctionTypeSpelling.parse(
+            "() async async -> Swift.Void"
+        ) == nil)
+        #expect(FrontendReceipt.FunctionTypeSpelling.parse(
+            "() throws rethrows -> Swift.Void"
+        ) == nil)
+        #expect(FrontendReceipt.FunctionTypeSpelling.parse(
+            "@Sendable @Sendable () -> Swift.Void"
+        ) == nil)
+        #expect(FrontendReceipt.FunctionTypeSpelling.parse(
+            "@convention(swift) @convention(swift) () -> Swift.Void"
+        ) == nil)
+        #expect(FrontendReceipt.FunctionTypeSpelling.parse(
+            "@convention(swift) @convention(block) () -> Swift.Void"
+        ) == nil)
+        let returning = try #require(FrontendReceipt.ValueTypeParser.parse(
+            "(Swift.Int) -> Swift.Bool",
+            allowVoid: false
+        ))
+        #expect(FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: ["(Swift.Int) -> Swift.Bool"],
+            parameterTypes: [returning]
+        ) == nil)
+        let higherOrder = try #require(FrontendReceipt.ValueTypeParser.parse(
+            "(@escaping (Swift.Int) -> Swift.Void) -> Swift.Void",
+            allowVoid: false
+        ))
+        #expect(higherOrder.directClosureShape?.signature.parameters.first?
+            .directClosureShape != nil)
+        #expect(FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: [
+                "(@escaping (Swift.Int) -> Swift.Void) -> Swift.Void",
+            ],
+            parameterTypes: [higherOrder]
+        ) == nil)
+
+        let view = Core.TypeID(rawValue: .sha256("UIKit.UIView"))
+        let native = try #require(FrontendReceipt.ValueTypeParser.parse(
+            "@Sendable (UIKit.UIView, [UIKit.UIView?]) -> Swift.Void",
+            allowVoid: false,
+            nativeTypes: ["UIKit.UIView": view]
+        ))
+        #expect(native.directClosureShape?.signature.parameterConventions
+            == [.borrowed, .borrowed])
+        #expect(FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: [
+                "@escaping @Sendable (UIKit.UIView, [UIKit.UIView?]) -> Swift.Void",
+            ],
+            parameterTypes: [native]
+        ) == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+
+        let erased = try #require(FrontendReceipt.ValueTypeParser.parse(
+            "@escaping (Any, [Any]?, Swift.String, [Swift.Int]) -> Swift.Void",
+            allowVoid: false
+        ))
+        #expect(erased.directClosureShape?.signature.parameterConventions == [
+            .borrowed, .borrowed, .owned, .owned,
+        ])
+        #expect(FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: [
+                "@escaping (Any, [Any]?, Swift.String, [Swift.Int]) -> Swift.Void",
+            ],
+            parameterTypes: [erased]
+        ) == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
     }
 
     @Test("Managed SDK probing preserves NSError-backed Swift throws")
@@ -84,6 +207,7 @@ struct NativeImportDiscoveryTests {
         #expect(removals.first?.parameterSwiftTypes == ["Swift.String", "FileManager"])
         #expect(removals.first?.resultSwiftType == "()")
         #expect(removals.first?.mayThrow == true)
+        #expect(removals.first?.parameterProjection == .identity(parameterCount: 2))
     }
 
     @Test("Imported calls retain NSError-backed Swift throwing ABI")
@@ -155,6 +279,191 @@ struct NativeImportDiscoveryTests {
         #expect(operation.parameterSwiftTypes == ["Swift.String", "FileManager"])
         #expect(operation.resultSwiftType == "()")
         #expect(operation.mayThrow)
+        #expect(operation.parameterProjection == .identity(parameterCount: 2))
+    }
+
+    @Test("Imported UIKit and Dispatch calls retain native callback boundaries")
+    func discoversSDKCallbackCalls() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-sdk-callback-import-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Fixture.swift")
+        let source = """
+        import Dispatch
+        import Foundation
+        import UIKit
+
+        public func consumeNotification(
+            _ body: (Foundation.Notification) -> Void
+        ) {}
+
+        @MainActor
+        public final class CallbackOwner {
+            public func invokeCallbacks(_ view: UIView) {
+                consumeNotification { notification in
+                    _ = notification.name
+                }
+                UIView.performWithoutAnimation { view.alpha = 0.5 }
+                UIView.animate(
+                    withDuration: 0.2,
+                    animations: { view.alpha = 1 },
+                    completion: { finished in
+                        if finished { view.setNeedsDisplay() }
+                    }
+                )
+                DispatchQueue.main.async { view.setNeedsLayout() }
+                _ = Timer.scheduledTimer(
+                    withTimeInterval: 1,
+                    repeats: false
+                ) { timer in
+                    timer.invalidate()
+                }
+            }
+        }
+        """
+        let contents = Data(source.utf8)
+        try contents.write(to: sourceURL)
+
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: "SDKCallbackImportFixture",
+            targetTriple: "arm64-apple-ios15.0-simulator",
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library"]
+        )
+        let ast = try frontend.emitTypedAST(
+            sourceFiles: [sourceURL],
+            invocation: invocation
+        )
+        let documents = try FrontendReceipt.TypedAST.parseDocuments(ast)
+        let demangled = try FrontendReceipt.Demangler(
+            compilerURL: frontend.compilerURL
+        ).demangle(FrontendReceipt.TypedAST.mangledTypes(in: documents))
+        let sil = try CanonicalSIL.File(text: frontend.emitCanonicalSIL(
+            sourceFiles: [sourceURL],
+            invocation: invocation
+        ))
+        let state = FrontendReceipt.Adapter.SourceState(
+            logicalPath: "Sources/Fixture.swift",
+            url: sourceURL,
+            contents: contents,
+            contentHash: .sha256(contents)
+        )
+        let surface = try FrontendReceipt.Adapter().discoverImportedOperationSurface(
+            documents: documents,
+            sourcesByPhysicalPath: [
+                sourceURL.resolvingSymlinksInPath().standardizedFileURL.path: state,
+            ],
+            moduleName: invocation.moduleName,
+            demangled: demangled,
+            silFile: sil
+        )
+        let discoveredTypes = try FrontendReceipt.Adapter()
+            .discoverImportedNativeTypes(
+                documents: documents,
+                sourcesByPhysicalPath: [
+                    sourceURL.resolvingSymlinksInPath().standardizedFileURL.path: state,
+                ],
+                moduleName: invocation.moduleName,
+                demangled: demangled
+            )
+        let notification = try #require(discoveredTypes.first {
+            $0.canonicalName == "Foundation.Notification"
+        })
+        #expect(notification.kind == .value)
+        #expect(notification.representation == .opaqueValue)
+        #expect(!notification.requiresMainActor)
+        let callbacks = surface.operations.filter {
+            ["performWithoutAnimation", "animate", "async", "scheduledTimer"]
+                .contains($0.baseName)
+        }.sorted { $0.baseName < $1.baseName }
+        #expect(callbacks.map(\.baseName) == [
+            "animate", "async", "performWithoutAnimation", "scheduledTimer",
+        ])
+        let callbacksByName = Dictionary(uniqueKeysWithValues: callbacks.map {
+            ($0.baseName, $0)
+        })
+        #expect(callbacksByName["animate"]?.parameterSwiftTypes == [
+            "Swift.Double",
+            "@escaping @Swift.MainActor () -> ()",
+            "Swift.Optional<@Swift.MainActor (Swift.Bool) -> ()>",
+        ])
+        #expect(callbacksByName["async"]?.parameterSwiftTypes == [
+            "@escaping @Swift.MainActor @Sendable @convention(block) () -> ()",
+            "OS_dispatch_queue",
+        ])
+        let asyncProjection = try #require(
+            callbacksByName["async"]?.parameterProjection
+        )
+        #expect(asyncProjection.physicalParameterCount == 5)
+        #expect(asyncProjection.logicalParameterIndices == [3, 4])
+        #expect(asyncProjection.defaultArguments.map(\.origin) == [
+            .optionalNone, .externalGenerator, .externalGenerator,
+        ])
+        #expect(
+            asyncProjection.defaultArguments[1].generatorSymbol?
+                .hasSuffix("FfA0_") == true
+        )
+        #expect(
+            asyncProjection.defaultArguments[2].generatorSymbol?
+                .hasSuffix("FfA1_") == true
+        )
+        #expect(
+            callbacksByName["performWithoutAnimation"]?.parameterSwiftTypes
+                == ["@Swift.MainActor () -> ()"]
+        )
+        #expect(callbacksByName["scheduledTimer"]?.parameterSwiftTypes == [
+            "Swift.Double",
+            "Swift.Bool",
+            "@escaping @Sendable (NSTimer) -> ()",
+        ])
+        #expect(surface.operations.contains {
+            $0.baseName == "main" && $0.dispatch == .staticGetter
+        })
+        var nativeTypes: [String: Core.TypeID] = [:]
+        for type in surface.types {
+            let id = Core.TypeID(rawValue: .sha256(
+                "sdk-callback-fixture:\(type.canonicalName)"
+            ))
+            for name in Set([type.canonicalName, type.swiftType] + type.aliases) {
+                nativeTypes[name] = id
+            }
+        }
+        let declarations = try FrontendReceipt.Adapter()
+            .makeImportedOperationDeclarations(
+                surface.operations,
+                moduleName: invocation.moduleName,
+                nativeTypes: nativeTypes
+            )
+        let asyncDeclaration = try #require(declarations.first {
+            $0.baseName == "async"
+        })
+        #expect(asyncDeclaration.callbacks == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+        #expect(asyncDeclaration.parameterProjection == asyncProjection)
+        #expect(declarations.contains {
+            $0.baseName == "main" && $0.dispatch == .staticGetter
+        })
+        let timerDeclaration = try #require(declarations.first {
+            $0.baseName == "scheduledTimer"
+        })
+        #expect(timerDeclaration.callbacks == [
+            .init(parameterIndex: 2, lifetime: .escaping),
+        ])
+        #expect(timerDeclaration.parameterTypes[2].directClosureShape?
+            .signature.parameterConventions == [.borrowed])
     }
 
     @Test("Physical SIL aliases collapse to one deterministic logical import")
@@ -206,6 +515,7 @@ struct NativeImportDiscoveryTests {
             baseName: "alias",
             argumentLabels: ["_"],
             parameterSwiftTypes: ["Swift.Int"],
+            parameterProjection: .identity(parameterCount: 1),
             resultSwiftType: "Swift.Int",
             requiresMainActor: false
         )
@@ -276,6 +586,10 @@ struct NativeImportDiscoveryTests {
             public func copy(_ values: [String: Int]?) -> [String: Int]? { values }
             public func echo(_ value: Any) -> Any { value }
             public func keyword(_ value: Int, `repeat` count: Int) -> Int { value + count }
+            public func invokeNow(_ body: () -> Void) { body() }
+            public func invokeLater(_ body: @escaping (Bool) -> Void) { body(true) }
+            public func invokeOptional(_ body: ((Int) -> Void)?) { body?(1) }
+            public func invokeSendable(_ body: @escaping @Sendable () -> Void) { body() }
             public enum Math {
                 public static func doubled(_ value: Int) -> Int { value * 2 }
             }
@@ -356,6 +670,10 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
             "\(moduleName).echo(_:)",
+            "\(moduleName).invokeLater(_:)",
+            "\(moduleName).invokeNow(_:)",
+            "\(moduleName).invokeOptional(_:)",
+            "\(moduleName).invokeSendable(_:)",
             "\(moduleName).keyword(_:repeat:)",
             "\(moduleName).mainValue(_:)",
             "Swift.String.init(describing:)",
@@ -363,10 +681,27 @@ struct NativeImportDiscoveryTests {
             "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
-        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...13).map {
+        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...17).map {
             Core.NativeImportID(rawValue: UInt32($0))
         })
-        #expect(output.receipt.nativeImportBindings.count == 14)
+        let callbacks = Dictionary(uniqueKeysWithValues: output.receipt
+            .nativeImportCandidates.compactMap { record in
+                record.canonicalCallee.contains(".invoke")
+                    ? (record.canonicalCallee, record.contract.callbacks) : nil
+            })
+        #expect(callbacks["\(moduleName).invokeNow(_:)"] == [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+        ])
+        #expect(callbacks["\(moduleName).invokeLater(_:)"] == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+        #expect(callbacks["\(moduleName).invokeOptional(_:)"] == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+        #expect(callbacks["\(moduleName).invokeSendable(_:)"] == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+        #expect(output.receipt.nativeImportBindings.count == 18)
         #expect(output.receipt.nativeImportBindings.filter {
             $0.generated != nil
         }.allSatisfy {
@@ -374,7 +709,7 @@ struct NativeImportDiscoveryTests {
         })
         #expect(output.receipt.nativeImportBindings.filter {
             $0.generated != nil
-        }.count == 10)
+        }.count == 14)
         #expect(output.receipt.nativeImportBindings.contains {
             $0.generated == nil && $0.importedModules == ["HelixRuntime"]
         })
@@ -390,6 +725,10 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
             "\(moduleName).echo(_:)",
+            "\(moduleName).invokeLater(_:)",
+            "\(moduleName).invokeNow(_:)",
+            "\(moduleName).invokeOptional(_:)",
+            "\(moduleName).invokeSendable(_:)",
             "\(moduleName).keyword(_:repeat:)",
             "\(moduleName).mainValue(_:)",
             "Swift.String.init(describing:)",
@@ -478,6 +817,12 @@ struct NativeImportDiscoveryTests {
         #expect(generated.contains("BridgeValueCodec.decodeDictionary"))
         #expect(generated.contains("BridgeValueCodec.decodeAny"))
         #expect(generated.contains("BridgeValueCodec.encodeAny"))
+        #expect(generated.contains("context.makeCallback("))
+        #expect(generated.contains("nativeCallback"))
+        #expect(generated.contains("encodeNativeCallbackArguments("))
+        #expect(generated.contains("callbackEncoder.encode("))
+        #expect(generated.contains("BridgeValueCodec.decodeOptional"))
+        #expect(generated.contains("@Sendable () -> ()"))
         let bridge = try #require(
             shell.bridge.sourceFiles["Generated/\(moduleName)Bridge.swift"]
         )
@@ -723,6 +1068,7 @@ struct NativeImportDiscoveryTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let sourceURL = sourceDirectory.appendingPathComponent("Screen.swift")
         let baseline = """
+        import Dispatch
         import Foundation
         import UIKit
 
@@ -761,6 +1107,33 @@ struct NativeImportDiscoveryTests {
             public func currentSubviews() -> [UIView] {
                 if label.isHidden { return [] }
                 return label.subviews
+            }
+
+            public func runAnimations(on view: UIView) {
+                UIView.performWithoutAnimation {
+                    view.alpha = 0.25
+                }
+                UIView.animate(
+                    withDuration: 0.2,
+                    animations: {
+                        view.alpha = 1
+                    },
+                    completion: { finished in
+                        if finished { view.setNeedsDisplay() }
+                    }
+                )
+                DispatchQueue.main.async {
+                    view.setNeedsLayout()
+                }
+                DispatchQueue.main.async(group: nil) {
+                    view.setNeedsDisplay()
+                }
+                _ = Timer.scheduledTimer(
+                    withTimeInterval: 1,
+                    repeats: false
+                ) { timer in
+                    timer.invalidate()
+                }
             }
 
             public func constraints(
@@ -940,7 +1313,7 @@ struct NativeImportDiscoveryTests {
         #expect(generatedBridge.contains(".title ="))
         #expect(generatedBridge.contains("NSMaxRange(argument0)"))
         #expect(generatedBridge.contains(".subviews"))
-
+        #expect(generatedBridge.contains("scheduledTimer"))
         let changed = baseline
             .replacingOccurrences(of: "interval + 1", with: "interval + 2")
             .replacingOccurrences(of: "seed + 1", with: "seed + 2")
@@ -951,6 +1324,15 @@ struct NativeImportDiscoveryTests {
             .replacingOccurrences(
                 of: "if label.isHidden { return [] }",
                 with: "if !label.isHidden { return [] }"
+            )
+            .replacingOccurrences(of: "view.alpha = 0.25", with: "view.alpha = 0.5")
+            .replacingOccurrences(
+                of: "if finished { view.setNeedsDisplay() }",
+                with: "if finished { view.setNeedsLayout() }"
+            )
+            .replacingOccurrences(
+                of: "withTimeInterval: 1",
+                with: "withTimeInterval: 2"
             )
         try Data(changed.utf8).write(to: sourceURL)
         let patch = try ReleaseCompiler.Driver().build(
@@ -971,6 +1353,9 @@ struct NativeImportDiscoveryTests {
         })
         #expect(patch.changedFunctions.map(\.canonicalDeclaration).contains {
             $0.contains("maxRange")
+        })
+        #expect(patch.changedFunctions.map(\.canonicalDeclaration).contains {
+            $0.contains("runAnimations")
         })
         #expect(patch.module.imports.count >= 6)
         #expect(
@@ -1489,6 +1874,7 @@ struct NativeImportDiscoveryTests {
         )
         instance.parameterSwiftTypes = ["Swift.Int", "Counter"]
         instance.parameterTypes = [.int64, .native(counterType)]
+        instance.parameterProjection = .identity(parameterCount: 2)
         let declarations = [
             declaration(
                 canonicalCallee: "ScopeFixture.compute(_:)",
@@ -1667,6 +2053,7 @@ struct NativeImportDiscoveryTests {
                 } ?? "operation",
             argumentLabels: ["_"],
             parameterSwiftTypes: ["Swift.Int"],
+            parameterProjection: .identity(parameterCount: 1),
             resultSwiftType: "Swift.Int",
             parameterTypes: [.int64],
             resultType: .int64,
