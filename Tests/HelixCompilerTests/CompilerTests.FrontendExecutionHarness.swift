@@ -38,7 +38,7 @@ struct FrontendExecutionHarness {
             sourceFiles: [sourceURL],
             moduleName: moduleName,
             optimization: optimization,
-            additionalArguments: ["-Xfrontend", "-disable-sil-perf-optzns"],
+            additionalArguments: ["-parse-as-library"],
             purpose: .semanticLowering
         )
         let file = try CanonicalSIL.File(text: sil)
@@ -145,6 +145,9 @@ struct FrontendExecutionHarness {
         }
         let directCalls = try CanonicalSIL.DirectCallTable(directBindings)
         var rootEffects = signature.effects
+        if function.isolation.isMainActor {
+            rootEffects.requiresMainActor = true
+        }
         for descriptor in standardLibraryImports {
             rootEffects.mayThrow = rootEffects.mayThrow
                 || descriptor.effects.mayThrow
@@ -241,7 +244,8 @@ struct FrontendExecutionHarness {
                 acceptedCapabilities: compiled.module.capabilities,
                 allowedNativeImports: Set(
                     resolvedImports.map { $0.requirement.id }
-                )
+                ),
+                allowMainActorSynchronousEntries: rootEffects.requiresMainActor
             )
         )
         return .init(image: image, entry: entry)

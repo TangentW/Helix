@@ -465,7 +465,10 @@ callbacks valid. Closure values may also flow through Optional, tuple, Array,
 Dictionary, patch-local struct/enum/class fields, mutable callback variables,
 and higher-order function signatures. This covers capture lists, recursive
 callbacks, local/bound method references, multiple trailing closures,
-autoclosures, and strong `self` captures through one value model. On-stack
+autoclosures, operator/overload and unbound-method references, synchronous
+`@MainActor` closure values, common closure-variable forms, and strong `self`
+captures through one value model. A recursively called local helper can also
+form a closure value without splitting its callable identity. On-stack
 closures and `withoutActuallyEscaping` carry a verified dynamic lifetime; a
 nonescaping closure may borrow caller-owned `inout` storage, but must close
 before that modify access and cannot promote the borrow into an escaping

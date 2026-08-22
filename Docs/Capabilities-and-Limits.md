@@ -425,7 +425,13 @@ does not by itself certify a physical device or distribution channel.
   local and bound method references, patch-local enum-case constructors,
   concrete `Optional.some`/`Result.success` constructors, patch-local struct
   initializers and static factories, multiple trailing closures, and escaping
-  autoclosures all use this same value model. Concrete closure ABIs preserve
+  autoclosures all use this same value model. Contextually typed operator and
+  overload references, unbound instance methods, synchronous `@MainActor`
+  closure values, lazy/mutable/conditional closure locals, and frontend-folded
+  pure file/static closure constants use the same callable graph. A recursive
+  local helper may be both directly applied and converted to a closure without
+  creating competing image identities or capture ABIs. Concrete closure ABIs
+  preserve
   per-parameter owned/borrowed/inout conventions, including `@in_guaranteed`
   Optional and imported SDK reference values used by the supported higher-order
   operations, ordinary same-image inout closures on normal/throwing paths, and

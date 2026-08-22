@@ -318,6 +318,10 @@ nonescaping capture of caller-owned `inout`, fully concrete compiler
 specializations, reabstraction thunks, default-argument generators, first-class
 patch-local enum cases, concrete `Optional`/`Result` case constructors,
 patch-local struct initializers and static factories,
+contextually typed operator/overload and unbound-method references,
+synchronous `@MainActor` closure values, common lazy/mutable/conditional
+closure variables, and recursively direct local helpers that also form closure
+values,
 automatically frozen `Swift.print`, `Swift.debugPrint`, and fixed
 String-description NativeImports, and top-level non-suspending
 `async`, `async throws`, and `@MainActor async` entries. A new `final` class may

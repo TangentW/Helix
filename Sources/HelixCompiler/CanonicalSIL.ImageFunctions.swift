@@ -100,13 +100,26 @@ enum ImageFunctions {
             if let specialization = reference.genericSpecialization {
                 specializationBySymbol[symbol] = specialization
             }
-            if let existingKind = kindBySymbol[symbol], existingKind != reference.kind {
-                throw DiscoveryError.unsupported(
-                    symbol: symbol,
-                    reason: "different callers use it as incompatible function roles"
-                )
+            let kind: Bytecode.FunctionKind
+            if let existingKind = kindBySymbol[symbol] {
+                guard let merged = mergedFunctionKind(
+                    existingKind,
+                    reference.kind
+                ) else {
+                    throw DiscoveryError.unsupported(
+                        symbol: symbol,
+                        reason: "different callers use it as incompatible function roles"
+                    )
+                }
+                kind = merged
+            } else {
+                kind = reference.kind
             }
-            kindBySymbol[symbol] = reference.kind
+            kindBySymbol[symbol] = kind
+            // A later recursive/direct edge can reveal a second use of a body
+            // already discovered through partial_apply. Closure-body is the
+            // stronger role and remains a valid direct apply target.
+            result[symbol]?.kind = kind
             if let existingAdapter = adapterBySymbol[symbol],
                existingAdapter != reference.abiAdapter {
                 throw DiscoveryError.unsupported(
@@ -151,7 +164,7 @@ enum ImageFunctions {
             }
             result[symbol] = .init(
                 function: function,
-                kind: reference.kind,
+                kind: kind,
                 abiAdapter: reference.abiAdapter,
                 executionEffectEnvelope: mergedAuthority.effects,
                 bindingSymbol: reference.bindingSymbol,
@@ -165,6 +178,19 @@ enum ImageFunctions {
                 ).map { ($0, mergedAuthority) })
         }
         return result
+    }
+
+    private static func mergedFunctionKind(
+        _ lhs: Bytecode.FunctionKind,
+        _ rhs: Bytecode.FunctionKind
+    ) -> Bytecode.FunctionKind? {
+        if lhs == rhs { return lhs }
+        // Only closure-body changes the callable ABI role. Ordinary and
+        // concrete-specialization identities remain distinct classifications,
+        // but either may also be used through a closure when its exact body is
+        // the make_closure target.
+        if lhs == .closureBody || rhs == .closureBody { return .closureBody }
+        return nil
     }
 
     static func signature(

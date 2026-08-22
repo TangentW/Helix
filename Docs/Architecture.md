@@ -505,7 +505,10 @@ Both workflows depend on stable, build-specific identities:
   explicit-storage and semantically live aggregate escape without treating dead
   SSA aliases as roots. Direct-only closure and `defer` helpers retain
   their physical address ABI as concrete specializations; only a body actually
-  used by `partial_apply` receives the managed closure-capture ABI.
+  used by `partial_apply` receives the managed closure-capture ABI. If one
+  recursive local helper is both directly applied and used by `partial_apply`,
+  discovery assigns one closure-body role; direct application remains valid and
+  its capture storage is normalized exactly once.
   Semantic SIL generic helpers reached through concrete `apply`, `try_apply`,
   or `partial_apply` sites enter the same image-function graph. The compiler
   parses the declaration's outer generic clause, substitutes only complete

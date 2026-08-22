@@ -475,6 +475,219 @@ struct ClosureSyntaxMatrix {
         #expect(try invoke(fixture, [integer(5)]) == integer(8))
     }
 
+    @Test("Recursive local functions can also form closure values")
+    func lowersRecursiveLocalFunctionReferences() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            public func recursiveLocalFunctionReference(
+                _ value: Int,
+                _ seed: Int
+            ) -> Int {
+                var total = seed
+                func accumulate(_ remaining: Int) -> Int {
+                    total += remaining
+                    if remaining == 0 { return total }
+                    return accumulate(remaining - 1)
+                }
+                let transform: (Int) -> Int = accumulate
+                return accumulate(1) + transform(value) + total
+            }
+            """,
+            functionName: "recursiveLocalFunctionReference",
+            moduleName: "HelixRecursiveLocalFunctionReferenceFixture"
+        )
+
+        #expect(
+            try invoke(fixture, [integer(3), integer(2)]) == integer(21)
+        )
+    }
+
+    @Test("Synchronous MainActor closure values retain their isolation")
+    @MainActor
+    func lowersMainActorClosureValues() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            @MainActor
+            public func mainActorClosureValue(_ value: Int) -> Int {
+                let transform: @MainActor (Int) -> Int = { $0 + 1 }
+                return transform(value)
+            }
+            """,
+            functionName: "mainActorClosureValue",
+            moduleName: "HelixMainActorClosureValueFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(4)]) == integer(5))
+    }
+
+    @Test("Operators and overloads form contextually typed closure values")
+    func lowersOperatorAndOverloadedFunctionReferences() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private func convert(_ value: Int) -> Int { value + 2 }
+            private func convert(_ value: String) -> String { value + "!" }
+
+            public func operatorAndOverloadedReferences(
+                _ value: Int,
+                _ flag: Bool
+            ) -> Int {
+                let add: (Int, Int) -> Int = (+)
+                let negate: (Bool) -> Bool = (!)
+                let maximum: (Int, Int) -> Int = Swift.max
+                let transform: (Int) -> Int = convert
+                return add(transform(value), maximum(2, 3))
+                    + (negate(flag) ? 1 : 0)
+            }
+            """,
+            functionName: "operatorAndOverloadedReferences",
+            moduleName: "HelixOperatorFunctionReferenceFixture"
+        )
+
+        #expect(
+            try invoke(fixture, [integer(4), .bool(false)]) == integer(10)
+        )
+        #expect(
+            try invoke(fixture, [integer(4), .bool(true)]) == integer(9)
+        )
+    }
+
+    @Test("Lazy, inout, conditional, and if-expression closure variables compose")
+    func lowersClosureVariableForms() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            @inline(never)
+            private func replace(_ body: inout (Int) -> Int) {
+                body = { $0 * 2 }
+            }
+
+            public func closureVariableForms(
+                _ value: Int,
+                _ useIncrement: Bool
+            ) -> Int {
+                var seed = 2
+                lazy var lazyTransform: (Int) -> Int = { $0 + seed }
+                seed = 3
+
+                var mutable = { (input: Int) in input + 1 }
+                replace(&mutable)
+
+                let conditional: (Int) -> Int = useIncrement
+                    ? { $0 + 1 }
+                    : { $0 * 3 }
+                let expression: (Int) -> Int = if useIncrement {
+                    { $0 + 2 }
+                } else {
+                    { $0 - 2 }
+                }
+                return lazyTransform(value)
+                    + mutable(value)
+                    + conditional(value)
+                    + expression(value)
+            }
+            """,
+            functionName: "closureVariableForms",
+            moduleName: "HelixClosureVariableFormsFixture"
+        )
+
+        #expect(
+            try invoke(fixture, [integer(4), .bool(true)]) == integer(26)
+        )
+        #expect(
+            try invoke(fixture, [integer(4), .bool(false)]) == integer(29)
+        )
+    }
+
+    @Test("Unbound instance methods retain curried receiver semantics")
+    func lowersUnboundMethodReferences() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private struct Adder {
+                let offset: Int
+                func apply(_ value: Int) -> Int { value + offset }
+            }
+
+            public func unboundMethodReference(
+                _ value: Int,
+                _ offset: Int
+            ) -> Int {
+                let method: (Adder) -> (Int) -> Int = Adder.apply
+                return method(Adder(offset: offset))(value)
+            }
+            """,
+            functionName: "unboundMethodReference",
+            moduleName: "HelixUnboundMethodReferenceFixture"
+        )
+
+        #expect(
+            try invoke(fixture, [integer(3), integer(2)]) == integer(5)
+        )
+    }
+
+    @Test("Pure file and static closure constants retain callable identity")
+    func lowersImmutableClosureConstants() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private let fileTransform: (Int) -> Int = { $0 + 2 }
+
+            private enum Routes {
+                static let transform: (Int) -> Int = { $0 * 3 }
+            }
+
+            public func immutableClosureConstants(_ value: Int) -> Int {
+                fileTransform(value) + Routes.transform(value)
+            }
+            """,
+            functionName: "immutableClosureConstants",
+            moduleName: "HelixImmutableClosureConstantsFixture"
+        )
+
+        #expect(try invoke(fixture, [integer(4)]) == integer(18))
+    }
+
+    @Test("Lazy unowned closure properties follow native Swift lifetime semantics")
+    func lowersLazyUnownedClosureProperties() throws {
+        let fixture = try FrontendExecutionHarness.compile(
+            source: """
+            private final class Counter {
+                let offset: Int
+
+                init(offset: Int) {
+                    self.offset = offset
+                }
+
+                lazy var transform: (Int) -> Int = { [unowned self] in
+                    $0 + self.offset
+                }
+            }
+
+            public func lazyUnownedClosureProperty(
+                _ value: Int,
+                _ retainOwner: Bool
+            ) -> Int {
+                if retainOwner {
+                    let counter = Counter(offset: 2)
+                    let result = counter.transform(value)
+                    return result + counter.offset - counter.offset
+                }
+                return Counter(offset: 2).transform(value)
+            }
+            """,
+            functionName: "lazyUnownedClosureProperty",
+            moduleName: "HelixLazyUnownedClosurePropertyFixture"
+        )
+
+        #expect(
+            try invoke(fixture, [integer(3), .bool(true)]) == integer(5)
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: fixture.entry,
+                image: fixture.image,
+                arguments: [try integer(3), .bool(false)]
+            ) == .trapped(.danglingUnownedReference)
+        )
+    }
+
     private func invoke(
         _ fixture: FrontendExecutionHarness.Fixture,
         _ arguments: [VM.Value]
