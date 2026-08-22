@@ -52,6 +52,156 @@ struct NativeBlockBridge {
         }
     }
 
+    @Test("Swift callback ABI accepts actor erasure without weakening isolation")
+    func normalizesSwiftCallbackActorErasure() throws {
+        let mainActorSignature = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .void,
+            effects: .init(requiresMainActor: true)
+        )
+        let mainActorClosure = Bytecode.ValueType.closure(mainActorSignature)
+        let parsed = try CanonicalSIL.Lowerer().parseFunctionType(
+            "@convention(thin) (@callee_guaranteed () -> ()) -> ()",
+            bridgingTo: ([mainActorClosure], .void),
+            preservingClosureOwnership: true
+        )
+        #expect(parsed.parameters == [mainActorClosure])
+
+        let unisolatedClosure = Bytecode.ValueType.closure(.init(
+            parameters: [],
+            parameterConventions: [],
+            result: .void
+        ))
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer().parseFunctionType(
+                "@convention(thin) "
+                    + "(@callee_guaranteed @MainActor () -> ()) -> ()",
+                bridgingTo: ([unisolatedClosure], .void),
+                preservingClosureOwnership: true
+            )
+        }
+    }
+
+    @Test("Unmarked imported value callback parameters are borrowed")
+    func borrowsUnmarkedImportedValueParameters() throws {
+        let position = Core.TypeID(rawValue: .sha256("UIViewAnimatingPosition"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["UIViewAnimatingPosition": position],
+                kinds: [position: .enumeration]
+            )
+        let parsed = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).parseFunctionType(
+            "@convention(thin) (UIViewAnimatingPosition) -> ()"
+        )
+        #expect(parsed.parameters == [.native(position)])
+        #expect(parsed.parameterConventions == [.borrowed])
+        let resolved = try environment.resolve(
+            "@callee_guaranteed (UIViewAnimatingPosition) -> ()"
+        )
+        #expect(resolved.directClosureShape?.signature.parameterConventions
+            == [.borrowed])
+    }
+
+    @Test("Objective-C protocol existentials erase only at a foreign ABI")
+    func normalizesObjectiveCProtocolExistentials() throws {
+        let object = Core.TypeID(rawValue: .sha256("Swift.AnyObject"))
+        let date = Core.TypeID(rawValue: .sha256("Foundation.Date"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                [
+                    "Swift.AnyObject": object,
+                    "Foundation.Date": date,
+                ],
+                kinds: [object: .reference, date: .value]
+            )
+        let lowerer = CanonicalSIL.Lowerer(typeEnvironment: environment)
+        let type = "@convention(objc_method) () -> "
+            + "@autoreleased any NSObjectProtocol"
+        let parsed = try lowerer.parseFunctionType(
+            type,
+            bridgingTo: ([], .native(object)),
+            allowingForeignABIRepresentation: true
+        )
+        #expect(parsed.result == .native(object))
+
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try lowerer.parseFunctionType(
+                type,
+                bridgingTo: ([], .native(object))
+            )
+        }
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try lowerer.parseFunctionType(
+                "@convention(objc_method) () -> @autoreleased any Error",
+                bridgingTo: ([], .native(object)),
+                allowingForeignABIRepresentation: true
+            )
+        }
+
+        let bridgedError = "@convention(block) (@guaranteed NSError) -> ()"
+        #expect(try lowerer.parseFunctionType(
+            bridgedError,
+            bridgingTo: ([.error], .void),
+            allowingForeignABIRepresentation: true
+        ).parameters == [.error])
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try lowerer.parseFunctionType(
+                bridgedError,
+                bridgingTo: ([.error], .void)
+            )
+        }
+
+        let bridgedDate = "@convention(block) (@guaranteed NSDate) -> ()"
+        #expect(try lowerer.parseFunctionType(
+            bridgedDate,
+            bridgingTo: ([.native(date)], .void),
+            allowingForeignABIRepresentation: true
+        ).parameters == [.native(date)])
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try lowerer.parseFunctionType(
+                bridgedDate,
+                bridgingTo: ([.native(date)], .void)
+            )
+        }
+        let appValue = Core.TypeID(rawValue: .sha256("Fixture.Widget"))
+        let appLowerer = CanonicalSIL.Lowerer(
+            typeEnvironment: try CanonicalSIL.TypeEnvironment.empty
+                .includingNativeTypes(
+                    ["Fixture.Widget": appValue],
+                    kinds: [appValue: .value]
+                )
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try appLowerer.parseFunctionType(
+                "@convention(block) (@guaranteed NSWidget) -> ()",
+                bridgingTo: ([.native(appValue)], .void),
+                allowingForeignABIRepresentation: true
+            )
+        }
+
+        let measurement = Core.TypeID(rawValue: .sha256(
+            "Foundation.Measurement<Foundation.UnitLength>"
+        ))
+        let measurementLowerer = CanonicalSIL.Lowerer(
+            typeEnvironment: try CanonicalSIL.TypeEnvironment.empty
+                .includingNativeTypes(
+                    [
+                        "Foundation.Measurement<Foundation.UnitLength>":
+                            measurement,
+                    ],
+                    kinds: [measurement: .value]
+                )
+        )
+        #expect(try measurementLowerer.parseFunctionType(
+            "@convention(block) (@guaranteed NSMeasurement) -> ()",
+            bridgingTo: ([.native(measurement)], .void),
+            allowingForeignABIRepresentation: true
+        ).parameters == [.native(measurement)])
+    }
+
     @Test("Block headers cannot substitute a different invoke thunk ABI")
     func rejectsMismatchedBlockHeaderThunk() {
         let referenced = "@convention(c) "
@@ -76,6 +226,155 @@ struct NativeBlockBridge {
             try CanonicalSIL.Lowerer().lower(
                 function,
                 displayName: "Fixture.run"
+            )
+        }
+    }
+
+    @Test("Foundation callback thunks preserve logical value and Error parameters")
+    func recognizesFoundationCallbackParameterBridges() throws {
+        let boundaryEnvironment = try CanonicalSIL.TypeEnvironment(
+            text: "$@callee_guaranteed (Optional<any Error>) -> ()",
+            functions: []
+        )
+        #expect(try boundaryEnvironment.resolve("Optional<any Error>")
+            == .optional(.error))
+
+        let data = Core.TypeID(rawValue: .sha256("Foundation.Data"))
+        let response = Core.TypeID(rawValue: .sha256("Foundation.URLResponse"))
+        let environment = try boundaryEnvironment
+            .includingNativeTypes(
+                [
+                    "Data": data,
+                    "Foundation.Data": data,
+                    "URLResponse": response,
+                ],
+                kinds: [data: .value, response: .reference]
+            )
+        let thunkType = "@convention(c) ("
+            + "@inout_aliasable @block_storage @Sendable @callee_guaranteed "
+            + "(@guaranteed Optional<Data>, @guaranteed Optional<URLResponse>, "
+            + "@guaranteed Optional<any Error>) -> (), Optional<NSData>, "
+            + "Optional<URLResponse>, Optional<NSError>) -> ()"
+        let logicalClosure = "@Sendable @callee_guaranteed "
+            + "(@guaranteed Optional<Data>, @guaranteed Optional<URLResponse>, "
+            + "@guaranteed Optional<any Error>) -> ()"
+        let physicalBlock = "@convention(block) @Sendable "
+            + "(Optional<NSData>, Optional<URLResponse>, Optional<NSError>) -> ()"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture3runyyF",
+            loweredType: "@convention(thin) (@owned \(logicalClosure)) -> ()",
+            body: """
+            bb0(%0 : $@owned \(logicalClosure)):
+              %1 = alloc_stack $@block_storage \(logicalClosure)
+              %2 = project_block_storage %1
+              store %0 to %2
+              %3 = function_ref @$s7Fixture3runyyFy10Foundation4DataVSg_So13NSURLResponseCSgs5Error_pSgtYbcfU_ToTR : $\(thunkType)
+              %4 = init_block_storage_header %1, invoke %3 : $\(thunkType), type $\(physicalBlock)
+              %5 = copy_block %4
+              strong_release %5
+              dealloc_stack %1
+              %6 = tuple ()
+              return %6
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "Fixture.run"
+        )
+        #expect(lowered.blocks.flatMap(\.instructions).contains(where: {
+            if case .returnValue(nil) = $0 { return true }
+            return false
+        }))
+
+        let boolThunk = "@convention(c) ("
+            + "@inout_aliasable @block_storage @callee_guaranteed (Bool) -> (), "
+            + "Bool) -> ()"
+        let boolFunction = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7animateyySbcF",
+            loweredType: "@convention(thin) ("
+                + "@owned @callee_guaranteed (Bool) -> ()) -> ()",
+            body: """
+            bb0(%0 : $@owned @callee_guaranteed (Bool) -> ()):
+              %1 = alloc_stack $@block_storage @callee_guaranteed (Bool) -> ()
+              %2 = project_block_storage %1
+              store %0 to %2
+              %3 = function_ref @$sSbIegy_SbIeyBy_TR : $\(boolThunk)
+              %4 = init_block_storage_header %1, invoke %3 : $\(boolThunk), type $@convention(block) (Bool) -> ()
+              %5 = copy_block %4
+              %6 = enum $Optional<@convention(block) (Bool) -> ()>, #Optional.some!enumelt, %5
+              release_value %6
+              dealloc_stack %1
+              %7 = tuple ()
+              return %7
+            """
+        )
+        _ = try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+            boolFunction,
+            displayName: "Fixture.animate"
+        )
+
+        let callbackSignature = Bytecode.ClosureSignature(
+            parameters: [.bool],
+            parameterConventions: [.owned],
+            result: .void
+        )
+        let optionalCallback = Bytecode.ValueType.optional(
+            .closure(callbackSignature)
+        )
+        let acceptSymbol = "$s7Fixture6acceptyyyySbcSgF"
+        let acceptType = "@convention(thin) ("
+            + "@owned Optional<@convention(block) (Bool) -> ()>) -> ()"
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: acceptSymbol,
+                parameterTypes: [optionalCallback],
+                resultType: .void,
+                target: .function(.init(rawValue: 12))
+            ),
+        ])
+        let nilFunction = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7runNilyyF",
+            loweredType: "@convention(thin) () -> ()",
+            body: """
+            bb0:
+              %0 = enum $Optional<@convention(block) (Bool) -> ()>, #Optional.none!enumelt
+              %1 = function_ref @\(acceptSymbol) : $\(acceptType)
+              %2 = apply %1(%0) : $\(acceptType)
+              %3 = tuple ()
+              return %3
+            """
+        )
+        let nilLowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            nilFunction,
+            displayName: "Fixture.runNil",
+            directCalls: calls
+        )
+        #expect(nilLowered.registerTypes.contains(optionalCallback))
+
+        let mismatchedNilFunction = CanonicalSIL.Function(
+            mangledName: "$s7Fixture16runMismatchedNilyyF",
+            loweredType: "@convention(thin) () -> ()",
+            body: """
+            bb0:
+              %0 = enum $Optional<@convention(block) (String) -> ()>, #Optional.none!enumelt
+              %1 = function_ref @\(acceptSymbol) : $\(acceptType)
+              %2 = apply %1(%0) : $\(acceptType)
+              %3 = tuple ()
+              return %3
+            """
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer(
+                typeEnvironment: environment
+            ).lower(
+                mismatchedNilFunction,
+                displayName: "Fixture.runMismatchedNil",
+                directCalls: calls
             )
         }
     }
@@ -200,6 +499,39 @@ struct NativeBlockBridge {
             loweredType,
             parameterTypes: [.closure(signature)]
         ) == [0: .nonescaping])
+    }
+
+    @Test("Declaration ownership removes only implicit Swift method receivers")
+    func parsesDeclarationMethodReceivers() throws {
+        let lowerer = CanonicalSIL.Lowerer()
+        #expect(try lowerer.parseParameterConventions(
+            "@convention(method) (Int, Counter) -> Int",
+            parameterTypes: [.int64]
+        ) == [.owned])
+        #expect(try lowerer.parseParameterConventions(
+            "@convention(method) (Int, @thin Counter.Type) -> Int",
+            parameterTypes: [.int64]
+        ) == [.owned])
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try lowerer.parseParameterConventions(
+                "@convention(thin) (Int, String) -> Int",
+                parameterTypes: [.int64]
+            )
+        }
+    }
+
+    @Test("SIL ownership remains authoritative for erased value parameters")
+    func parsesErasedValueParameterOwnership() throws {
+        let lowerer = CanonicalSIL.Lowerer()
+        #expect(try lowerer.parseParameterConventions(
+            "$@convention(thin) (@in_guaranteed Any, "
+                + "@guaranteed Optional<any Error>, @guaranteed String) -> ()",
+            parameterTypes: [.any, .optional(.error), .string]
+        ) == [.borrowed, .borrowed, .owned])
+        #expect(try lowerer.parseParameterConventions(
+            "$@convention(thin) (@owned Any, @owned any Error) -> ()",
+            parameterTypes: [.any, .error]
+        ) == [.owned, .owned])
     }
 
     @Test("Nonescaping callbacks reject a consuming physical parameter ABI")

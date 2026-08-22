@@ -102,6 +102,10 @@ Both workflows depend on stable, build-specific identities:
   not claim general Swift `Sendable` semantics.
   Dynamic lexical scopes cannot enter an escaping handle;
   callback arguments are re-encoded and shape-checked at every invocation.
+  A Swift `Error` callback argument is reduced to a bounded textual dynamic-type
+  name and reified as an opaque proxy; native payload graphs, type metadata, and
+  semantic error identity do not enter HLBC. `Error` remains invalid in Shell
+  entry signatures and ordinary NativeImport parameters or results.
   Because a nonthrowing native closure has no error channel, the automatic
   profile currently accepts synchronous, nonthrowing, `Void` callbacks only:
   a synchronous failure becomes the containing NativeImport trap, while a
@@ -113,9 +117,9 @@ Both workflows depend on stable, build-specific identities:
   Objective-C block parameters without framework-specific callback code; the
   block-storage, copy, and noescape reabstraction thunks remain compiler-only
   ownership plumbing, while the original logical VM closure type is preserved.
-  Native calls such as `UIView.performWithoutAnimation`, `UIView.animate`, and
-  `DispatchQueue.main.async` use this same path. The last API schedules an
-  escaping callback but does not imply support for Swift `async` closure ABIs.
+  Native calls across UIKit, Dispatch, Foundation, and OperationQueue use this
+  same path. Scheduling an escaping callback does not imply support for Swift
+  `async` closure ABIs.
   If source syntax omits SDK defaults, HLXI records a checked physical-to-logical
   parameter projection: lowering proves each erased SIL value came from that
   declaration's default generator or an exact typed `Optional.none`, and the
@@ -131,6 +135,15 @@ Both workflows depend on stable, build-specific identities:
   signature—there is no effect-authority variance at those boundaries. Shell
   entry signatures and ordinary native value slots remain closure-free. These
   are v1 contract fields and do not introduce a compatibility version split.
+- Foreign ABI normalization preserves the frozen logical Swift type while
+  accepting proven compiler representations: Foundation value overlays may
+  use their Objective-C bridge classes inside block thunks, Objective-C
+  protocol existentials erase to the existing `AnyObject` identity only at a
+  foreign boundary, and Swift `Any` boxing uses one exact generated
+  `Any -> AnyObject` NativeImport. Imported trivial values remain borrowed in
+  physical SIL even though their HLBC native handles are managed owners; the
+  compiler materializes and retires those owners at generic value/address
+  lifetime edges rather than by SDK-type special cases.
 - Array, Dictionary, and Set are typed VM values rather than projections of
   private Swift runtime layouts. One bounded recursive value-semantics model
   supplies VM-defined Equatable and Hashable behavior for supported scalars and

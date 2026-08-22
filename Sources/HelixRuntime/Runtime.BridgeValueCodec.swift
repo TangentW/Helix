@@ -401,6 +401,22 @@ public enum BridgeValueCodec {
         return result
     }
 
+    /// Normalizes a Swift Error existential into the bounded VM Error value.
+    /// Only a textual dynamic-type name crosses; native metadata, payload, and
+    /// semantic identity do not. A VM-originated proxy preserves that text.
+    public static func encodeError(_ value: any Swift.Error) throws -> VM.Value {
+        .error(.init(message: errorBoundaryMessage(value)))
+    }
+
+    /// Reifies a VM Error as an opaque Swift Error proxy. The proxy can be
+    /// passed to native APIs or thrown, but does not claim the source dynamic type.
+    public static func decodeError(_ value: VM.Value) throws -> any Swift.Error {
+        guard case let .error(error) = value else {
+            throw VM.RuntimeTrap.typeMismatch(expected: .error, actual: value.type)
+        }
+        return ErrorProxy(message: error.message)
+    }
+
     /// Encodes `Void` as the absence of a VM result value.
     public static func encodeVoid(_ value: Void = ()) throws -> VM.Value? {
         nil
@@ -411,6 +427,23 @@ public enum BridgeValueCodec {
         guard value == nil else {
             throw VM.RuntimeTrap.typeMismatch(expected: .void, actual: value?.type)
         }
+    }
+
+    private struct ErrorProxy: Swift.Error, Sendable, CustomStringConvertible,
+        LocalizedError {
+        let message: String
+
+        var description: String { message }
+        var errorDescription: String? { message }
+    }
+
+    static func errorBoundaryMessage(
+        _ value: any Swift.Error
+    ) -> String {
+        if let proxy = value as? ErrorProxy { return proxy.message }
+        // Avoid invoking user-defined CustomStringConvertible code while a
+        // callback is crossing the Runtime's bounded input encoder.
+        return String(reflecting: Swift.type(of: value))
     }
 }
 }

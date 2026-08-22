@@ -22,6 +22,7 @@ enum SwiftCoreIntrinsic: Equatable {
     case defaultValue(CanonicalSIL.DefaultValueIntrinsic)
     case scalarText(CanonicalSIL.ScalarTextIntrinsic)
     case sourceFailure(CanonicalSIL.SourceFailureIntrinsic)
+    case anyObjectBridge
     /// Compiler notification emitted immediately before a concrete typed
     /// error unwinds. HLBC owns that unwind and therefore lowers it to no-op.
     case typedThrowNotification
@@ -97,6 +98,10 @@ enum SwiftCoreIntrinsic: Equatable {
     init?(mangledName: String) {
         if mangledName == "swift_willThrowTyped" {
             self = .typedThrowNotification
+            return
+        }
+        if mangledName == CanonicalSIL.AnyObjectBridge.silMangledName {
+            self = .anyObjectBridge
             return
         }
         if let mutation = CanonicalSIL.ValueMutationIntrinsic(

@@ -33,7 +33,7 @@ struct SemanticVerifier {
 
         #expect(
             throws: Verification.Error.invalidShellInterface(
-                "patch-local nominal, Error, internal storage, and closure values cannot appear in entry 0 signature"
+                "patch-local nominal, internal storage, and closure values cannot appear in entry 0 signature"
             )
         ) {
             try Verification.ShellInterface(
@@ -48,7 +48,7 @@ struct SemanticVerifier {
         mutatedShell.entries[index]?.resultType = .error
         #expect(
             throws: Verification.Error.invalidShellInterface(
-                "patch-local nominal, Error, internal storage, and closure values cannot appear in entry 0 signature"
+                "Error in entry 0 is supported only in a NativeImport callback parameter with structured-errors-1"
             )
         ) {
             try Verification.Engine().verify(

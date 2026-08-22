@@ -1,3 +1,4 @@
+import Foundation
 import HelixBytecode
 import HelixCore
 import HelixVM
@@ -406,6 +407,42 @@ struct BridgeInput {
         }
     }
 
+    @Test("Error existentials cross as bounded opaque proxies")
+    func errorBoundaryRoundTrip() throws {
+        let encoder = makeEncoder()
+        let encoded = try encoder.encodeError(DescribedError())
+        try encoder.finalize(arguments: [encoded])
+
+        let expectedIdentity = String(reflecting: DescribedError.self)
+        #expect(encoded == .error(.init(message: expectedIdentity)))
+        let decoded = try Runtime.BridgeValueCodec.decodeError(encoded)
+        #expect(String(describing: decoded) == expectedIdentity)
+        #expect((decoded as? LocalizedError)?.errorDescription == expectedIdentity)
+
+        let preserved = VM.Value.error(.init(message: "PatchError.failed"))
+        let proxy = try Runtime.BridgeValueCodec.decodeError(preserved)
+        #expect(
+            try Runtime.BridgeValueCodec.encodeError(proxy)
+                == .error(.init(message: "PatchError.failed"))
+        )
+
+        let limited = makeEncoder(
+            .init(
+                maximumEstimatedVMBytes: 1,
+                maximumValueNodes: 4,
+                maximumNestingDepth: 4,
+                maximumContainerElements: 4
+            )
+        )
+        #expect(
+            throws: Runtime.BridgeInputError.estimatedVMByteLimitExceeded(
+                maximum: 1
+            )
+        ) {
+            _ = try limited.encodeError(DescribedError())
+        }
+    }
+
     private func makeEncoder(
         _ limits: Runtime.BridgeInputLimits = .init()
     ) -> Runtime.BridgeValueCodec.Encoder {
@@ -414,6 +451,10 @@ struct BridgeInput {
 
     private enum SyntheticDeadline: Error, Equatable {
         case expired
+    }
+
+    private struct DescribedError: Error, CustomStringConvertible {
+        var description: String { "this description must not cross the boundary" }
     }
 
     private final class UIReference {}

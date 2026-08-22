@@ -80,6 +80,7 @@ public struct GeneratedNativeImport: Hashable, Sendable {
         case initializer
         case staticMethod
         case nativeUpcast
+        case anyObjectBridge
         case staticGetter
         case staticSetter
         case instanceMethod
@@ -1022,6 +1023,10 @@ public struct Generator: Sendable {
                 && ["Substring", "Swift.Substring"].contains(name)
         case let (.named(name), .any):
             return ["Any", "Swift.Any"].contains(name)
+        case let (.named(name), .error):
+            return [
+                "Error", "Swift.Error", "any Error", "any Swift.Error",
+            ].contains(name)
         case let (.named(name), .void):
             return ["Void", "Swift.Void", "()"].contains(name)
         default:
@@ -1525,7 +1530,9 @@ public struct Generator: Sendable {
         let target: String
         switch generated.dispatch {
         case .globalFunction:
-            target = escapedSwiftIdentifier(generated.baseName)
+            target = Core.SwiftName.isOperator(generated.baseName)
+                ? "(\(generated.baseName))"
+                : escapedSwiftIdentifier(generated.baseName)
         case .initializer:
             target = generated.ownerType!.split(separator: ".").map {
                 escapedSwiftIdentifier(String($0))
@@ -1536,6 +1543,11 @@ public struct Generator: Sendable {
             }.joined(separator: ".")
             target = owner + "." + escapedSwiftIdentifier(generated.baseName)
         case .nativeUpcast:
+            let owner = generated.ownerType!.split(separator: ".").map {
+                escapedSwiftIdentifier(String($0))
+            }.joined(separator: ".")
+            return "argument0 as \(owner)"
+        case .anyObjectBridge:
             let owner = generated.ownerType!.split(separator: ".").map {
                 escapedSwiftIdentifier(String($0))
             }.joined(separator: ".")
@@ -1650,6 +1662,11 @@ public struct Generator: Sendable {
             }
             return "try Runtime.BridgeValueCodec.encodeNative(\(expression), as: \(render(typeID)), "
                 + "catalog: \(nativeCatalog))"
+        case (.named, .error):
+            if let inputEncoder {
+                return "try \(inputEncoder).encodeError(\(expression))"
+            }
+            return "try Runtime.BridgeValueCodec.encodeError(\(expression))"
         case let (.optional(wrappedShape), .optional(wrappedType)):
             let encoded = renderEncode(
                 expression: "wrapped",
@@ -1757,6 +1774,8 @@ public struct Generator: Sendable {
         case let (.named(name), .native(typeID)):
             return "try Runtime.BridgeValueCodec.decodeNative(\(expression), as: \(name).self, "
                 + "typeID: \(render(typeID)))"
+        case (.named, .error):
+            return "try Runtime.BridgeValueCodec.decodeError(\(expression))"
         case let (.optional(wrappedShape), .optional(wrappedType)):
             return "try Runtime.BridgeValueCodec.decodeOptional(\(expression)) { wrapped in "
                 + "\(renderDecode(expression: "wrapped", shape: wrappedShape, type: wrappedType)) }"
@@ -1938,7 +1957,9 @@ public struct Generator: Sendable {
         guard binding.invokerExpression == expectedExpression,
               record.silMangledNames.contains(generated.declarationMangledName),
               isSafeLogicalPath(generated.sourceFileLogicalID),
-              isValidSwiftIdentifier(generated.baseName),
+              isValidSwiftIdentifier(generated.baseName)
+                || generated.dispatch == .globalFunction
+                    && Core.SwiftName.isOperator(generated.baseName),
               generated.parameterSwiftTypes.count == record.parameterTypes.count,
               !isReceiverDispatch(generated.dispatch) || !record.parameterTypes.isEmpty,
               generated.argumentLabels.count == record.parameterTypes.count
@@ -1996,6 +2017,18 @@ public struct Generator: Sendable {
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
             }
+        case .anyObjectBridge:
+            guard record.contract.kind == .staticMethod,
+                  let owner = generated.ownerType,
+                  generated.baseName == "bridge",
+                  isValidGeneratedSwiftTypeSpelling(owner),
+                  generated.argumentLabels == ["_"],
+                  record.parameterTypes == [.any],
+                  isNativeType(record.resultType),
+                  generated.resultSwiftType == owner
+            else {
+                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            }
         case .staticGetter:
             guard record.contract.kind == .staticGetter,
                   let owner = generated.ownerType,
@@ -2004,7 +2037,7 @@ public struct Generator: Sendable {
                   generated.parameterSwiftTypes.isEmpty,
                   record.parameterTypes.isEmpty,
                   record.resultType != .void,
-                  record.resultType.isNativeBridgeValue
+                  isGeneratedResultType(record.resultType)
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
             }
@@ -2038,7 +2071,7 @@ public struct Generator: Sendable {
                   isNativeType(record.parameterTypes[0]),
                   generated.parameterSwiftTypes == [owner],
                   record.resultType != .void,
-                  record.resultType.isNativeBridgeValue
+                  isGeneratedResultType(record.resultType)
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
             }
@@ -2091,6 +2124,7 @@ public struct Generator: Sendable {
         case .instanceMethod, .instanceGetter, .instanceSetter,
              .instanceValueSetter: true
         case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+             .anyObjectBridge,
              .staticGetter, .staticSetter: false
         }
     }
@@ -2116,13 +2150,12 @@ public struct Generator: Sendable {
                 }
                 return shape.signature.isNativeBridgeCallback
             }
-            return !types[index].containsClosureValue
-                && types[index].isNativeBridgeValue
+            return types[index].isOrdinaryNativeImportBridgeValue
         }
     }
 
     private func isGeneratedResultType(_ type: Bytecode.ValueType) -> Bool {
-        type == .void || type.isNativeBridgeValue
+        type.isNativeImportBridgeResult
     }
 
     private func isNativeType(_ type: Bytecode.ValueType) -> Bool {
@@ -2473,10 +2506,7 @@ public struct Generator: Sendable {
 }
 
 private static func isValidSwiftIdentifier(_ value: String) -> Bool {
-    guard let first = value.first, first == "_" || first.isLetter else {
-        return false
-    }
-    return value.dropFirst().allSatisfy { $0 == "_" || $0.isLetter || $0.isNumber }
+    Core.SwiftName.isIdentifier(value)
 }
 
 public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {

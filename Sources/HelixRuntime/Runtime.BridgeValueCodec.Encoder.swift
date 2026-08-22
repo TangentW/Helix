@@ -140,6 +140,19 @@ public final class Encoder {
         return .native(native)
     }
 
+    /// Encodes only a bounded textual dynamic-type name for a Swift Error.
+    /// Native payload graphs, metadata, and semantic identity remain outside
+    /// HLBC.
+    public func encodeError(_ value: any Swift.Error) throws -> VM.Value {
+        try requireActive()
+        try pollDeadline(force: true)
+        let message = Runtime.BridgeValueCodec.errorBoundaryMessage(value)
+        let byteCount = try count(message.utf8.count)
+        try reserveLeaf(estimatedVMBytes: byteCount)
+        try pollDeadline(force: true)
+        return .error(.init(message: message))
+    }
+
     /// Reserves and encodes an optional container with zero or one child.
     public func encodeOptional<Wrapped>(
         _ value: Wrapped?,
@@ -502,6 +515,18 @@ public final class Encoder {
                 try add(UInt64(string.utf8.count), toVMBytesOf: &result, limits: limits)
             case let .native(native):
                 try add(native.estimatedByteCount, toNativeBytesOf: &result, limits: limits)
+            case let .error(error):
+                guard error.concreteType == nil, error.payload == nil else {
+                    throw Runtime.BridgeInputError.encodedTypeMismatch(
+                        expected: "a boundary-normalized Error",
+                        actual: value.type.description
+                    )
+                }
+                try add(
+                    UInt64(error.message.utf8.count),
+                    toVMBytesOf: &result,
+                    limits: limits
+                )
             case let .any(erased):
                 try addAggregate(1, to: &result, limits: limits)
                 try append([erased.payload], below: depth, to: &pending, limits: limits)
@@ -542,7 +567,7 @@ public final class Encoder {
                 let elements = wrapped.map { [$0] } ?? []
                 try addAggregate(elements.count, to: &result, limits: limits)
                 try append(elements, below: depth, to: &pending, limits: limits)
-            case .structure, .enumeration, .object, .error, .address,
+            case .structure, .enumeration, .object, .address,
                  .mutableCell, .nonOwningReference,
                  .arrayBuilder, .arrayMutationState,
                  .dictionaryBuilder, .arraySortState, .arraySplitState,

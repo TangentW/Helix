@@ -3627,7 +3627,7 @@ struct Interpreter {
         )
         #expect(
             throws: Verification.Error.invalidShellInterface(
-                "patch-local nominal, Error, internal storage, and closure values "
+                "patch-local nominal, internal storage, and closure values "
                     + "cannot appear in entry 0 signature"
             )
         ) {

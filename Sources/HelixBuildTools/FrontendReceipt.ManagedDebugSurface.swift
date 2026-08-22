@@ -599,7 +599,7 @@ extension FrontendReceipt.ManagedDebugSurface {
             demangled: demangled,
             silFile: silFile
         )
-        let nativeSurface = placeholderNativeTypes(importedTypes)
+        let nativeTypes = placeholderNativeTypes(importedTypes)
         let swiftAliases = try FrontendReceipt.Adapter()
             .makeImportedSwiftTypeAliases(importedTypes)
         return surface.operations.compactMap {
@@ -643,7 +643,7 @@ extension FrontendReceipt.ManagedDebugSurface {
                 FrontendReceipt.ValueTypeParser.parse(
                     $0,
                     allowVoid: false,
-                    nativeTypes: nativeSurface.types
+                    nativeTypes: nativeTypes
                 )
             }
             guard parameters.count == measured.parameterSwiftTypes.count,
@@ -654,19 +654,16 @@ extension FrontendReceipt.ManagedDebugSurface {
                   let result = FrontendReceipt.ValueTypeParser.parse(
                       measured.resultSwiftType,
                       allowVoid: true,
-                      nativeTypes: nativeSurface.types
+                      nativeTypes: nativeTypes
                   ),
                   FrontendReceipt.NativeBridgeProfile.isResult(result)
             else { return nil }
             measured.sourceFileLogicalID = candidate.sourceFileLogicalID
             measured.importedModules = candidate.importedModules
+            // Isolation belongs to the imported declaration. A nonisolated
+            // member may accept or return an actor-isolated nominal value
+            // without making the call itself actor-isolated.
             measured.requiresMainActor = candidate.requiresMainActor
-                || (parameters + [result]).contains {
-                    containsNativeType(
-                        $0,
-                        in: nativeSurface.mainActorTypeIDs
-                    )
-                }
             measured.isolationEvidence = .importedDeclaration
             return measured
         }
@@ -716,7 +713,7 @@ extension FrontendReceipt.ManagedDebugSurface {
             "receiver.\(member) = argument0"
         case .instanceValueSetter:
             "mutableReceiver.\(member) = argument0"
-        case .globalFunction, .nativeUpcast:
+        case .globalFunction, .nativeUpcast, .anyObjectBridge:
             preconditionFailure("managed member probe has invalid dispatch")
         }
         let mutableReceiver = candidate.dispatch == .instanceValueSetter
@@ -733,25 +730,19 @@ extension FrontendReceipt.ManagedDebugSurface {
         case .instanceMethod, .instanceGetter, .instanceSetter,
              .instanceValueSetter: true
         case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+             .anyObjectBridge,
              .staticGetter, .staticSetter: false
         }
     }
 
-    private struct PlaceholderNativeSurface {
-        var types: [String: Core.TypeID]
-        var mainActorTypeIDs: Set<Core.TypeID>
-    }
-
     private static func placeholderNativeTypes(
         _ types: [FrontendReceipt.Adapter.ImportedNativeType]
-    ) -> PlaceholderNativeSurface {
+    ) -> [String: Core.TypeID] {
         var result: [String: Core.TypeID] = [:]
-        var mainActorTypeIDs = Set<Core.TypeID>()
         for type in types {
             let placeholder = Core.TypeID(rawValue: .sha256(
                 "managed-debug-type-probe:\(type.canonicalName)"
             ))
-            if type.requiresMainActor { mainActorTypeIDs.insert(placeholder) }
             for name in Set(
                 [type.canonicalName, type.swiftType, "__C.\(type.canonicalName)"]
                     + type.aliases
@@ -759,37 +750,7 @@ extension FrontendReceipt.ManagedDebugSurface {
                 result[name] = placeholder
             }
         }
-        return .init(types: result, mainActorTypeIDs: mainActorTypeIDs)
-    }
-
-    private static func containsNativeType(
-        _ type: Bytecode.ValueType,
-        in typeIDs: Set<Core.TypeID>
-    ) -> Bool {
-        switch type {
-        case let .native(typeID):
-            typeIDs.contains(typeID)
-        case let .array(element), let .optional(element), let .set(element),
-             let .address(element), let .mutableCell(element),
-             let .nonOwningReference(_, element),
-             let .arrayState(_, element):
-            containsNativeType(element, in: typeIDs)
-        case let .dictionary(key, value):
-            containsNativeType(key, in: typeIDs)
-                || containsNativeType(value, in: typeIDs)
-        case let .dictionaryState(key, value):
-            containsNativeType(key, in: typeIDs)
-                || containsNativeType(value, in: typeIDs)
-        case let .tuple(elements):
-            elements.contains { containsNativeType($0, in: typeIDs) }
-        case let .closure(signature):
-            signature.componentTypes.contains {
-                containsNativeType($0, in: typeIDs)
-            }
-        case .bool, .integer, .float, .string, .any, .void, .never,
-             .local, .error:
-            false
-        }
+        return result
     }
 
     private static func normalizedTypeName(

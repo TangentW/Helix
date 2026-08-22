@@ -728,6 +728,7 @@ public struct Archive: Codable, Hashable, Sendable {
         )
         func validateDeviceType(
             _ type: Bytecode.ValueType,
+            allowingError: Bool = false,
             depth: Int = 0
         ) throws {
             guard depth <= 32 else {
@@ -744,6 +745,14 @@ public struct Archive: Codable, Hashable, Sendable {
                 guard capabilities.contains(.anyValuesV1) else {
                     throw InterfaceArchive.Error.invalidArchive("Any capability is absent")
                 }
+            case .error:
+                guard allowingError,
+                      capabilities.contains(.structuredErrorsV1)
+                else {
+                    throw InterfaceArchive.Error.invalidArchive(
+                        "Error is supported only in a NativeImport callback parameter with the required capability"
+                    )
+                }
             case let .native(id):
                 guard capabilities.contains(.nativeTypesV1), emittedTypeIDs.contains(id) else {
                     throw InterfaceArchive.Error.invalidArchive("device signature references an un-emitted native type")
@@ -752,7 +761,11 @@ public struct Archive: Codable, Hashable, Sendable {
                 guard capabilities.contains(.collectionsV1) else {
                     throw InterfaceArchive.Error.invalidArchive("Array capability is absent")
                 }
-                try validateDeviceType(element, depth: depth + 1)
+                try validateDeviceType(
+                    element,
+                    allowingError: allowingError,
+                    depth: depth + 1
+                )
             case let .dictionary(key, value):
                 guard capabilities.contains(.collectionsV1) else {
                     throw InterfaceArchive.Error.invalidArchive("Dictionary capability is absent")
@@ -762,27 +775,47 @@ public struct Archive: Codable, Hashable, Sendable {
                         "Dictionary key lacks VM-defined Hashable semantics"
                     )
                 }
-                try validateDeviceType(key, depth: depth + 1)
-                try validateDeviceType(value, depth: depth + 1)
+                try validateDeviceType(
+                    key,
+                    allowingError: allowingError,
+                    depth: depth + 1
+                )
+                try validateDeviceType(
+                    value,
+                    allowingError: allowingError,
+                    depth: depth + 1
+                )
             case let .set(element):
                 guard capabilities.contains(.collectionsV1), element.isVMHashable else {
                     throw InterfaceArchive.Error.invalidArchive(
                         "Set requires collection capability and a VM-defined Hashable element"
                     )
                 }
-                try validateDeviceType(element, depth: depth + 1)
+                try validateDeviceType(
+                    element,
+                    allowingError: allowingError,
+                    depth: depth + 1
+                )
             case let .tuple(elements):
                 for element in elements {
-                    try validateDeviceType(element, depth: depth + 1)
+                    try validateDeviceType(
+                        element,
+                        allowingError: allowingError,
+                        depth: depth + 1
+                    )
                 }
             case let .optional(wrapped):
-                try validateDeviceType(wrapped, depth: depth + 1)
+                try validateDeviceType(
+                    wrapped,
+                    allowingError: allowingError,
+                    depth: depth + 1
+                )
             case .float:
                 break
-            case .local, .error, .address, .mutableCell,
+            case .local, .address, .mutableCell,
                  .nonOwningReference, .arrayState, .dictionaryState, .closure:
                 throw InterfaceArchive.Error.invalidArchive(
-                    "patch-local nominal, Error, internal storage, and closure values cannot appear in a Shell signature"
+                    "patch-local nominal, internal storage, and closure values cannot appear in a Shell signature"
                 )
             case .void, .never, .bool, .integer:
                 break
@@ -835,7 +868,7 @@ public struct Archive: Codable, Hashable, Sendable {
                     )
             else {
                 throw InterfaceArchive.Error.invalidArchive(
-                    "a function moves a MainActor native type off actor"
+                    "function \(function.canonicalDeclaration) moves a MainActor native type off actor"
                 )
             }
             try validateDeviceEffects(function.effects)
@@ -848,22 +881,32 @@ public struct Archive: Codable, Hashable, Sendable {
                 if callbackIndices.contains(index),
                    let shape = type.directClosureShape {
                     for parameter in shape.signature.parameters {
-                        try validateDeviceType(parameter)
+                        try validateDeviceType(
+                            parameter,
+                            allowingError: true
+                        )
                     }
                 } else {
+                    guard type.isOrdinaryNativeImportBridgeValue else {
+                        throw InterfaceArchive.Error.invalidArchive(
+                            "native import has an unsupported ordinary parameter"
+                        )
+                    }
                     try validateDeviceType(type)
                 }
             }
-            try validateDeviceType(item.resultType)
-            guard item.effects.requiresMainActor
-                    || !(item.parameterTypes + [item.resultType]).contains(
-                        where: usesMainActorType
-                    )
-            else {
+            guard item.resultType.isNativeImportBridgeResult else {
                 throw InterfaceArchive.Error.invalidArchive(
-                    "a native import moves a MainActor native type off actor"
+                    "native import has an unsupported result"
                 )
             }
+            try validateDeviceType(item.resultType)
+            // NativeImport effects describe the exact imported declaration,
+            // not the nominal isolation of its receiver or result. Swift SDKs
+            // can explicitly expose `nonisolated` members on MainActor types;
+            // the generated probe is the compiler-checked authority for that
+            // call. Shell entry functions remain subject to the stronger
+            // type-level isolation rule above.
             try validateDeviceEffects(item.effects)
         }
         guard UInt32(exactly: eligible.count) == bridgeRegistrationCount else {

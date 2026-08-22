@@ -100,7 +100,7 @@ public struct Adapter: Sendable {
                     }
                 }.flatMap(\.silReferences)
             )
-            let additiveManagedOperations = managedSurface.operations.compactMap {
+            let measuredManagedOperations = managedSurface.operations.compactMap {
                 operation -> FrontendReceipt.Adapter.ImportedOperation? in
                 var operation = operation
                 operation.silReferences.removeAll(
@@ -108,10 +108,14 @@ public struct Adapter: Sendable {
                 )
                 return operation.silReferences.isEmpty ? nil : operation
             }
-            // A measured probe may broaden ordinary value operations. For a
-            // callback symbol, the application call site is authoritative for
-            // lifetime and global-actor annotations that a synthetic argument
-            // expression cannot reconstruct.
+            let additiveManagedOperations = unambiguousAdditiveImportedOperations(
+                measuredManagedOperations,
+                authoritative: importedOperationSurface.operations
+            )
+            // A measured probe may broaden ordinary value operations. Source
+            // calls remain authoritative for callback metadata, and shared
+            // generic SDK symbols are excluded when their concrete operation
+            // cannot be selected from the SIL identity alone.
             importedOperationSurface.operations = try mergeImportedOperations(
                 importedOperationSurface.operations + additiveManagedOperations
             )
@@ -127,6 +131,16 @@ public struct Adapter: Sendable {
             records: provisionalNativeTypes,
             importedTypes: importedTypes,
             sourceNominals: sourceNominals
+        )
+        let resolvedNativeTypeIDs = Set(nativeTypeIDs.values)
+        let declarationTypeEnvironment = try silFile.typeEnvironment.includingNativeTypes(
+            nativeTypeIDs,
+            kinds: Dictionary(uniqueKeysWithValues: provisionalNativeTypes.compactMap {
+                resolvedNativeTypeIDs.contains($0.id) ? ($0.id, $0.kind) : nil
+            }),
+            requiresMainActor: Set(provisionalNativeTypes.compactMap {
+                $0.requiresMainActor && resolvedNativeTypeIDs.contains($0.id) ? $0.id : nil
+            })
         )
         let importedSwiftTypeAliases = try makeImportedSwiftTypeAliases(
             importedTypes
@@ -164,6 +178,7 @@ public struct Adapter: Sendable {
                 configuration: effectiveConfiguration,
                 demangled: demangled,
                 silFile: silFile,
+                typeEnvironment: declarationTypeEnvironment,
                 nativeTypes: nativeTypeIDs,
                 importedSwiftTypeAliases: importedSwiftTypeAliases,
                 sourceNominals: sourceNominalsByName,
@@ -814,6 +829,7 @@ extension FrontendReceipt.Adapter {
             case .initializer: .initializer
             case .staticMethod: .staticMethod
             case .nativeUpcast: .nativeUpcast
+            case .anyObjectBridge: .anyObjectBridge
             case .staticGetter: .staticGetter
             case .staticSetter: .staticSetter
             case .instanceMethod: .instanceMethod
@@ -1161,6 +1177,7 @@ extension FrontendReceipt.Adapter {
         configuration: PatchConfiguration.Document,
         demangled: [String: String],
         silFile: CanonicalSIL.File,
+        typeEnvironment: CanonicalSIL.TypeEnvironment,
         nativeTypes: [String: Core.TypeID],
         importedSwiftTypeAliases: [String: String],
         sourceNominals: [String: SourceNominal],
@@ -1181,6 +1198,7 @@ extension FrontendReceipt.Adapter {
                     configuration: configuration,
                     demangled: demangled,
                     silFile: silFile,
+                    typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
                     importedSwiftTypeAliases: importedSwiftTypeAliases
                 ) {
@@ -1222,6 +1240,7 @@ extension FrontendReceipt.Adapter {
                     configuration: configuration,
                     demangled: demangled,
                     silFile: silFile,
+                    typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
                     importedSwiftTypeAliases: importedSwiftTypeAliases,
                     sourceNominals: sourceNominals,
@@ -1254,6 +1273,7 @@ extension FrontendReceipt.Adapter {
                     configuration: configuration,
                     demangled: demangled,
                     silFile: silFile,
+                    typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
                     importedSwiftTypeAliases: importedSwiftTypeAliases,
                     sourceNominals: sourceNominals,
@@ -1274,6 +1294,7 @@ extension FrontendReceipt.Adapter {
         configuration: PatchConfiguration.Document,
         demangled: [String: String],
         silFile: CanonicalSIL.File,
+        typeEnvironment: CanonicalSIL.TypeEnvironment,
         nativeTypes: [String: Core.TypeID],
         importedSwiftTypeAliases: [String: String]
     ) throws -> Draft? {
@@ -1439,19 +1460,15 @@ extension FrontendReceipt.Adapter {
         }
         let bridgedParameterTypes = valueParameterTypes
             + (referenceReceiverID.map { [.native($0)] } ?? [])
-        let sourceParameterConventions: [Bytecode.ParameterConvention] = parameterItems.map {
-            $0["inout"] as? Bool == true ? .inout : .owned
-        } + (referenceReceiverID.map { _ in [.borrowed] } ?? [])
-        let bridgedParameterConventions = if bridgedParameterTypes.contains(
-            where: \.requiresLinearOwnership
-        ) {
-            try CanonicalSIL.Lowerer().parseParameterConventions(
-                sil.loweredType,
-                parameterTypes: bridgedParameterTypes
-            )
-        } else {
-            sourceParameterConventions
-        }
+        // Canonical SIL is the single ownership authority. In particular, `Any`
+        // and `Error` can carry reference identity despite not being linear VM
+        // handles, so source-level `inout` versus owned inference is incomplete.
+        let bridgedParameterConventions = try CanonicalSIL.Lowerer(
+            typeEnvironment: typeEnvironment
+        ).parseParameterConventions(
+            sil.loweredType,
+            parameterTypes: bridgedParameterTypes
+        )
         let effects = Core.Effects(
             mayThrow: mayThrow,
             requiresMainActor: mainActor,
@@ -1553,7 +1570,9 @@ extension FrontendReceipt.Adapter {
             )
         let nativeImportCallbackLifetimes = bridgedParameterTypes.contains(
             where: \.containsClosureValue
-        ) ? try CanonicalSIL.Lowerer().parseNativeCallbackLifetimes(
+        ) ? try CanonicalSIL.Lowerer(
+            typeEnvironment: typeEnvironment
+        ).parseNativeCallbackLifetimes(
             sil.loweredType,
             parameterTypes: bridgedParameterTypes
         ) : [:]
@@ -1746,8 +1765,7 @@ extension FrontendReceipt.Adapter {
 
 extension FrontendReceipt.Adapter {
     static func isSwiftIdentifier(_ value: String) -> Bool {
-        guard let first = value.first, first == "_" || first.isLetter else { return false }
-        return value.dropFirst().allSatisfy { $0 == "_" || $0.isLetter || $0.isNumber }
+        Core.SwiftName.isIdentifier(value)
     }
 
     struct FunctionToken {

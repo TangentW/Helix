@@ -16,6 +16,7 @@ extension FrontendReceipt.Adapter {
             case optionSetArrayLiteralInitializer
             case selectorInitializer
             case nativeUpcast
+            case anyObjectBridge
         }
 
         enum IsolationEvidence: Hashable, Sendable {
@@ -97,6 +98,11 @@ extension FrontendReceipt.Adapter {
         }
     }
 
+    private enum ImportedOperationSymbolConflict {
+        case physical
+        case logical
+    }
+
     func discoverImportedOperationSurface(
         documents: [FrontendReceipt.TypedAST.Object],
         sourcesByPhysicalPath: [String: SourceState],
@@ -121,7 +127,12 @@ extension FrontendReceipt.Adapter {
                 )
             }
             let modules = imports(in: items).filter { $0 != moduleName }
-            guard !modules.isEmpty else { continue }
+            types += sourceOverlayTypes(
+                in: items,
+                source: source,
+                importedModules: modules,
+                demangled: demangled
+            )
             try collectImportedOperations(
                 items: items,
                 inheritedMainActor: false,
@@ -226,6 +237,19 @@ extension FrontendReceipt.Adapter {
                     from: sourceType,
                     to: targetType
                 )]
+            case .anyObjectBridge:
+                guard parameterTypes == [.any],
+                      case let .native(targetType) = resultType
+                else {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "imported AnyObject bridge has an invalid frozen signature"
+                    )
+                }
+                silSymbols = [
+                    CanonicalSIL.NativeBridgeSymbols.anyObjectBridge(
+                        to: targetType
+                    ),
+                ]
             }
             guard let primarySymbol = silSymbols.first else {
                 throw FrontendReceipt.Error.invalidRequest(
@@ -275,6 +299,8 @@ extension FrontendReceipt.Adapter {
                 (prefix + [
                     "upcast(from:\(operation.parameterSwiftTypes[0]))"
                 ]).joined(separator: ".")
+            case .anyObjectBridge:
+                (prefix + ["bridge(from:Swift.Any)"]).joined(separator: ".")
             case .instanceGetter, .staticGetter:
                 (prefix + [operation.baseName, "get"]).joined(separator: ".")
             case .instanceSetter, .staticSetter:
@@ -329,8 +355,8 @@ extension FrontendReceipt.Adapter {
             }
         }
         for (symbol, values) in bySymbol where values.count > 1 {
-            let physicalSignatures = Set(values.map(ImportedOperationPhysicalABI.init))
-            guard physicalSignatures.count == 1 else {
+            switch importedOperationSymbolConflict(in: values) {
+            case .physical:
                 let logicalShapes = values.map {
                     "\($0.ownerType).\($0.baseName)("
                         + $0.parameterSwiftTypes.joined(separator: ", ")
@@ -340,19 +366,12 @@ extension FrontendReceipt.Adapter {
                     "imported SIL operation \(symbol) has conflicting logical ABIs: "
                         + logicalShapes
                 )
-            }
-            let byProjection = Dictionary(grouping: values) {
-                ($0.parameterProjection
-                    ?? .identity(parameterCount: $0.parameterSwiftTypes.count))
-                    .logicalParameterIndices
-            }
-            for projected in byProjection.values {
-                guard Set(projected.map(ImportedOperationLogicalABI.init)).count == 1
-                else {
-                    throw FrontendReceipt.Error.invalidRequest(
-                        "imported SIL operation \(symbol) has ambiguous logical variants"
-                    )
-                }
+            case .logical:
+                throw FrontendReceipt.Error.invalidRequest(
+                    "imported SIL operation \(symbol) has ambiguous logical variants"
+                )
+            case nil:
+                break
             }
         }
 
@@ -410,6 +429,58 @@ extension FrontendReceipt.Adapter {
         }.sorted(by: importedOperationOrdering)
     }
 
+    /// Managed Debug probes are additive. A generic SDK implementation may
+    /// reuse one SIL symbol for multiple concrete overlay types, which cannot
+    /// be selected by symbol alone. Discard only those speculative references;
+    /// source-observed operations remain authoritative and fail closed later.
+    func unambiguousAdditiveImportedOperations(
+        _ additions: [ImportedOperation],
+        authoritative: [ImportedOperation]
+    ) -> [ImportedOperation] {
+        let authoritativeIdentities = Set(
+            authoritative.map(ImportedOperationIdentity.init)
+        )
+        let refinements = additions.filter {
+            authoritativeIdentities.contains(ImportedOperationIdentity($0))
+        }
+        let speculative = additions.filter {
+            !authoritativeIdentities.contains(ImportedOperationIdentity($0))
+        }
+        var bySymbol: [String: [ImportedOperation]] = [:]
+        // An exact measured declaration refines contextual isolation for an
+        // already-observed operation. It is not a competing generic ABI.
+        // Only genuinely additive identities participate in symbol ambiguity.
+        for operation in authoritative + speculative {
+            for symbol in operation.silReferences {
+                bySymbol[symbol, default: []].append(operation)
+            }
+        }
+        let ambiguousSymbols = Set(bySymbol.compactMap { symbol, values in
+            importedOperationSymbolConflict(in: values) == nil ? nil : symbol
+        })
+        return refinements + speculative.compactMap { addition in
+            var addition = addition
+            addition.silReferences.removeAll(where: ambiguousSymbols.contains)
+            return addition.silReferences.isEmpty ? nil : addition
+        }
+    }
+
+    private func importedOperationSymbolConflict(
+        in values: [ImportedOperation]
+    ) -> ImportedOperationSymbolConflict? {
+        guard values.count > 1 else { return nil }
+        guard Set(values.map(ImportedOperationPhysicalABI.init)).count == 1
+        else { return .physical }
+        let byProjection = Dictionary(grouping: values) {
+            ($0.parameterProjection
+                ?? .identity(parameterCount: $0.parameterSwiftTypes.count))
+                .logicalParameterIndices
+        }
+        return byProjection.values.contains { projected in
+            Set(projected.map(ImportedOperationLogicalABI.init)).count != 1
+        } ? .logical : nil
+    }
+
     private func importedOperationOrdering(
         _ lhs: ImportedOperation,
         _ rhs: ImportedOperation
@@ -460,18 +531,28 @@ extension FrontendReceipt.Adapter {
                 else {
                     throw FrontendReceipt.Error.missingSILFunction(astSymbol)
                 }
-                try visitImportedExpression(
-                    body,
-                    role: .value,
+                // Swift compiler operations do not require an explicit module
+                // import; framework expression discovery does.
+                recordAnyObjectBridge(
                     function: sil,
-                    requiresMainActor: requiresMainActor,
                     source: source,
-                    importedModules: importedModules,
-                    moduleName: moduleName,
-                    demangled: demangled,
                     types: &types,
                     operations: &operations
                 )
+                if !importedModules.isEmpty {
+                    try visitImportedExpression(
+                        body,
+                        role: .value,
+                        function: sil,
+                        requiresMainActor: requiresMainActor,
+                        source: source,
+                        importedModules: importedModules,
+                        moduleName: moduleName,
+                        demangled: demangled,
+                        types: &types,
+                        operations: &operations
+                    )
+                }
             }
 
             if let members = item["members"] as? [Any] {
@@ -487,6 +568,100 @@ extension FrontendReceipt.Adapter {
                     operations: &operations
                 )
             }
+        }
+    }
+
+    /// Xcode 26's JSON AST can canonicalize a public Swift overlay such as
+    /// `FileManager` back to its unavailable Objective-C runtime spelling.
+    /// Preserve a different source spelling only when the mangling proves one
+    /// exact imported ABI nominal and all observed spellings name the same
+    /// overlay leaf. The generated-source validator remains the injection
+    /// boundary; ambiguous aliases deliberately fall back to the typed AST.
+    func sourceOverlayTypes(
+        in root: [Any],
+        source: SourceState,
+        importedModules: [String],
+        demangled: [String: String]
+    ) -> [ImportedNativeType] {
+        guard !importedModules.isEmpty else { return [] }
+        var candidates: [String: [(spelling: String, nominal: String)]] = [:]
+        var pending: [Any] = root.reversed()
+        while let value = pending.popLast() {
+            if let values = value as? [Any] {
+                pending.append(contentsOf: values.reversed())
+                continue
+            }
+            guard let item = value as? [String: Any] else { continue }
+            if let members = item["members"] as? [Any] {
+                pending.append(contentsOf: members.reversed())
+            }
+            guard item["_kind"] as? String == "func_decl",
+                  let parameters = item["params"] as? [String: Any],
+                  let parameterItems = parameters["params"] as? [[String: Any]],
+                  let range = sourceRange(in: parameters),
+                  range.start >= 0, range.end >= range.start,
+                  range.end < source.contents.count,
+                  range.end - range.start <= 512 * 1_024,
+                  let rawList = String(
+                      data: source.contents.subdata(
+                          in: range.start..<(range.end + 1)
+                      ),
+                      encoding: .utf8
+                  ),
+                  let spellings = FrontendReceipt.SourceParameterSpelling
+                    .types(in: rawList),
+                  spellings.count == parameterItems.count
+            else { continue }
+
+            for (parameter, sourceSpelling) in zip(parameterItems, spellings) {
+                guard let mangled = parameter["interface_type"] as? String,
+                      isImportedMangledType(
+                          mangled,
+                          importedModules: importedModules
+                      ),
+                      let runtimeName = Self.objectiveCNominalIdentity(
+                          inMangledType: mangled
+                      ),
+                      let typedSpelling = demangled[mangled].map(
+                          normalizeImportedTypeSpelling
+                      ),
+                      let typedNominal = importedNativeNominal(
+                          in: typedSpelling
+                      ),
+                      nominalBaseName(typedNominal) == runtimeName,
+                      importedNominalRepresentation(
+                          mangled,
+                          spelling: typedNominal
+                      ) == .reference,
+                      let sourceNominal = importedNativeNominal(
+                          in: sourceSpelling
+                      ),
+                      nominalBaseName(sourceNominal) != runtimeName,
+                      importedNominalRepresentation(
+                          mangled,
+                          spelling: sourceNominal
+                      ) == .reference
+                else { continue }
+                candidates[mangled, default: []].append(
+                    (sourceSpelling, sourceNominal)
+                )
+            }
+        }
+
+        return candidates.compactMap { mangled, values in
+            let overlayLeaves = Set(values.map { nominalBaseName($0.nominal) })
+            guard overlayLeaves.count == 1 else { return nil }
+            let spellings = Set(values.map(\.spelling))
+            guard let spelling = spellings.sorted(by: {
+                ($0.utf8.count, $0) < ($1.utf8.count, $1)
+            }).first else { return nil }
+            return importedNativeType(
+                rawMangledType: mangled,
+                spelling: spelling,
+                source: source,
+                importedModules: importedModules,
+                requiresMainActor: false
+            )
         }
     }
 
@@ -508,7 +683,10 @@ extension FrontendReceipt.Adapter {
         operations: inout [ImportedOperation]
     ) throws {
         let kind = item["_kind"] as? String
-        if kind == "call_expr" {
+        if [
+            "call_expr", "binary_expr", "prefix_unary_expr",
+            "postfix_unary_expr",
+        ].contains(kind) {
             try recordImportedSwiftCall(
                 item,
                 function: function,
@@ -692,8 +870,8 @@ extension FrontendReceipt.Adapter {
               expression["_kind"] as? String == "member_ref_expr",
               let declaration = expression["decl"] as? [String: Any],
               let usr = declaration["decl_usr"] as? String,
-              let baseName = declaration["base_name"] as? String,
-              Self.isSwiftIdentifier(baseName),
+              let rawBaseName = declaration["base_name"] as? String,
+              let baseName = Core.SwiftName.normalizedIdentifier(rawBaseName),
               let propertyType = importedSwiftType(
                   expression["type"],
                   demangled: demangled
@@ -838,8 +1016,9 @@ extension FrontendReceipt.Adapter {
               (usr.hasPrefix("s:") || usr.hasPrefix("c:")),
               !usr.hasPrefix("s:s"),
               !usr.hasPrefix("s:\(moduleName.utf8.count)\(moduleName)"),
-              let baseName = declaration["base_name"] as? String,
-              Self.isSwiftIdentifier(baseName),
+              let rawBaseName = declaration["base_name"] as? String,
+              let baseName = Core.SwiftName.normalizedIdentifier(rawBaseName)
+                ?? (Core.SwiftName.isOperator(rawBaseName) ? rawBaseName : nil),
               var resultType = importedSwiftType(
                   expression["type"],
                   demangled: demangled
@@ -919,6 +1098,10 @@ extension FrontendReceipt.Adapter {
             dispatch = .globalFunction
             ownerType = importedGlobalFunctionOwner(usr: usr)
         }
+        guard Self.isSwiftIdentifier(baseName)
+                || dispatch == .globalFunction
+                    && Core.SwiftName.isOperator(baseName)
+        else { return }
 
         let call: ImportedSILCall
         if usr.hasPrefix("s:") {
@@ -1039,10 +1222,34 @@ extension FrontendReceipt.Adapter {
         // Default argument values stay in the type environment so canonical
         // SIL can validate their compiler-only storage, but they do not cross
         // the NativeImport boundary or enter the generated invoker signature.
-        for (value, type) in zip(formalArgumentValues, formalParameterTypes) {
+        for (index, pair) in zip(
+            formalArgumentValues,
+            formalParameterTypes
+        ).enumerated() {
+            let (value, formalType) = pair
+            let rawMangledType = value["type"] as? String
+            let logicalType: String? = rawMangledType
+                .flatMap {
+                    Self.objectiveCNominalIdentity(inMangledType: $0)
+                } != nil
+                ? explicitParameterIndices.firstIndex(of: index)
+                    .flatMap { offset in
+                        guard parameterTypes.indices.contains(offset) else {
+                            return nil
+                        }
+                        if physicalParameters.indices.contains(index) {
+                            if let physicalSpelling = importedPhysicalNominalSpelling(
+                                physicalParameters[index]
+                            ) {
+                                return physicalSpelling
+                            }
+                        }
+                        return parameterTypes[offset]
+                    }
+                : nil
             recordImportedTypeSurface(
                 rawMangledType: value["type"],
-                spelling: type,
+                spelling: logicalType ?? formalType,
                 source: source,
                 importedModules: importedModules,
                 requiresMainActor: requiresMainActor,
@@ -1132,6 +1339,7 @@ extension FrontendReceipt.Adapter {
             // Objective-C error bridging inserts NSError** before the receiver.
             return Array(physical.prefix(explicitCount)) + [receiver]
         case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+             .anyObjectBridge,
              .staticGetter, .staticSetter, .instanceGetter, .instanceSetter,
              .instanceValueSetter:
             return Array(physical.prefix(logicalCount))
@@ -1532,6 +1740,12 @@ extension FrontendReceipt.Adapter {
             }
         }
         if physical == "()" { return "Swift.Void" }
+        if physical.hasPrefix("any ") {
+            // Objective-C protocol existentials are class-bound. Their dynamic
+            // conformance is not a frozen NativeImport ABI, so erase it to the
+            // existing identity-preserving AnyObject bridge.
+            return "Swift.AnyObject"
+        }
         for prefix in ["Optional<", "Swift.Optional<"]
         where physical.hasPrefix(prefix) && physical.hasSuffix(">") {
             let body = String(physical.dropFirst(prefix.count).dropLast())
@@ -1554,6 +1768,12 @@ extension FrontendReceipt.Adapter {
             return swiftType
         }
         if FrontendReceipt.ValueTypeParser.parse(swiftType, allowVoid: true) != nil {
+            return swiftType
+        }
+        if FrontendReceipt.SwiftTypeSpelling.isGeneratedType(swiftType) {
+            // Generated adapters call the source-level Swift overlay, so its
+            // safe logical spelling is authoritative even when canonical SIL
+            // uses an Objective-C bridge type such as NSURL.
             return swiftType
         }
         return normalizeImportedTypeSpelling(physical)
@@ -1682,7 +1902,10 @@ extension FrontendReceipt.Adapter {
                 let loweredType = debugMetadataStrippedSuffix(
                     String(line[loweredMarker.upperBound...])
                 )
-                let baseNameMatches = reference.contains(".\(baseName)!")
+                let baseNameMatches = Self.foreignReference(
+                    reference,
+                    hasBaseName: baseName
+                )
                     || (baseName == "init" && reference.contains(".init!"))
                 let ownerMatches = reference.hasPrefix("#\(owner).")
                 let sourceMatches = sourceLocation != nil
@@ -1859,8 +2082,8 @@ extension FrontendReceipt.Adapter {
               let declaration = functionExpression["decl"] as? [String: Any],
               let usr = declaration["decl_usr"] as? String,
               usr.hasPrefix("c:@E@"),
-              let caseName = declaration["base_name"] as? String,
-              Self.isSwiftIdentifier(caseName),
+              let rawCaseName = declaration["base_name"] as? String,
+              let caseName = Core.SwiftName.normalizedIdentifier(rawCaseName),
               let ownerType = importedSwiftType(
                   expression["type"],
                   demangled: demangled
@@ -1921,8 +2144,8 @@ extension FrontendReceipt.Adapter {
               usr.hasPrefix("c:@"),
               !usr.hasPrefix("c:@E@"),
               !usr.contains("(py)"),
-              let baseName = declaration["base_name"] as? String,
-              Self.isSwiftIdentifier(baseName),
+              let rawBaseName = declaration["base_name"] as? String,
+              let baseName = Core.SwiftName.normalizedIdentifier(rawBaseName),
               let symbol = usr.split(separator: "@").last.map(String.init),
               let physicalType = importedGlobalType(
                   symbol: symbol,
@@ -2249,6 +2472,47 @@ extension FrontendReceipt.Adapter {
         )
     }
 
+    private func recordAnyObjectBridge(
+        function: CanonicalSIL.Function,
+        source: SourceState,
+        types: inout [ImportedNativeType],
+        operations: inout [ImportedOperation]
+    ) {
+        guard function.body.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ).contains(where: {
+            CanonicalSIL.AnyObjectBridge.isReferenceInstruction(String($0))
+        }) else { return }
+        types.append(
+            importedType(
+                canonicalName: "Swift.AnyObject",
+                swiftType: "Swift.AnyObject",
+                kind: .reference,
+                aliases: ["AnyObject"],
+                representation: .reference,
+                source: source,
+                importedModules: ["Swift"],
+                requiresMainActor: false
+            )
+        )
+        operations.append(
+            .init(
+                silReferences: [],
+                sourceFileLogicalID: source.logicalPath,
+                importedModules: ["Swift"],
+                dispatch: .anyObjectBridge,
+                ownerType: "Swift.AnyObject",
+                baseName: "bridge",
+                argumentLabels: ["_"],
+                parameterSwiftTypes: ["Swift.Any"],
+                resultSwiftType: "Swift.AnyObject",
+                requiresMainActor: false,
+                compilerOperation: .anyObjectBridge
+            )
+        )
+    }
+
     private func recordSelectorSurface(
         source: SourceState,
         importedModules: [String],
@@ -2299,10 +2563,41 @@ extension FrontendReceipt.Adapter {
         types: inout [ImportedNativeType]
     ) {
         guard let mangled = rawMangledType as? String else { return }
-        let rootModule = spelling.split(separator: ".").first.map(String.init)
-        let isImportedRoot = mangled.hasPrefix("$sSo")
-            || rootModule.map(importedModules.contains) == true
-        if isImportedRoot {
+        let objectiveCClasses = Self.objectiveCClassNames(
+            inMangledType: mangled
+        )
+        let logicalNominal = importedNativeNominal(in: spelling)
+        let exactObjectiveCReference: ImportedNativeType? = {
+            guard objectiveCClasses.count == 1,
+                  let runtimeName = objectiveCClasses.first,
+                  let logicalNominal,
+                  !logicalNominal.contains("<"),
+                  importedNominalRepresentation(
+                      mangled,
+                      spelling: logicalNominal
+                  ) == .reference
+            else { return nil }
+            let moduleRelative = logicalNominal.split(separator: ".")
+                .last.map(String.init) ?? logicalNominal
+            return importedType(
+                canonicalName: runtimeName,
+                swiftType: logicalNominal,
+                kind: .reference,
+                aliases: Array(Set([
+                    runtimeName, "__C.\(runtimeName)", moduleRelative,
+                ])).sorted(),
+                representation: .reference,
+                source: source,
+                importedModules: importedModules,
+                requiresMainActor: requiresMainActor
+            )
+        }()
+        if let exactObjectiveCReference {
+            types.append(exactObjectiveCReference)
+        } else if isImportedMangledType(
+            mangled,
+            importedModules: importedModules
+        ) {
             _ = recordImportedNominalType(
                 rawMangledType: rawMangledType,
                 spelling: spelling,
@@ -2314,8 +2609,9 @@ extension FrontendReceipt.Adapter {
         }
         let unavailableGenericBase = spelling.contains("<")
             ? nominalBaseName(spelling) : nil
-        for name in Self.objectiveCClassNames(inMangledType: mangled)
-        where name != unavailableGenericBase {
+        for name in objectiveCClasses
+        where name != exactObjectiveCReference?.canonicalName
+                && name != unavailableGenericBase {
             types.append(
                 importedType(
                     canonicalName: name,
@@ -2424,23 +2720,63 @@ extension FrontendReceipt.Adapter {
         return value
     }
 
+    /// Accepts only a nominal imported type or Optional wrappers around one.
+    /// Ownership attributes, functions, collections, and arbitrary generic
+    /// surfaces cannot become source-level aliases through this path.
+    private func importedPhysicalNominalSpelling(_ raw: String) -> String? {
+        let spelling = normalizeImportedTypeSpelling(raw)
+        guard let nominal = importedNativeNominal(in: spelling) else {
+            return nil
+        }
+        let components = nominal.split(
+            separator: ".",
+            omittingEmptySubsequences: false
+        )
+        guard !components.isEmpty,
+              components.allSatisfy({
+                  Self.isSwiftIdentifier(String($0))
+              })
+        else { return nil }
+        return spelling
+    }
+
     private func normalizeImportedTypeAliases(
         in operations: [ImportedOperation],
         types: [ImportedNativeType]
     ) throws -> [ImportedOperation] {
-        var aliases: [String: String] = [:]
+        var aliases: [
+            String: (
+                swiftType: String,
+                canonicalName: String,
+                representation: ImportedNativeType.Representation,
+                aliases: [String]
+            )
+        ] = [:]
         for type in types {
             for alias in Set([type.canonicalName, type.swiftType] + type.aliases) {
-                if let existing = aliases[alias], existing != type.swiftType {
+                if let existing = aliases[alias],
+                   existing.swiftType != type.swiftType {
                     throw FrontendReceipt.Error.invalidRequest(
-                        "imported type alias \(alias) resolves to multiple Swift types"
+                        "imported type alias \(alias) resolves to both "
+                            + "\(existing.canonicalName) as \(existing.swiftType) "
+                            + "[\(existing.representation.rawValue); "
+                            + "aliases=\(existing.aliases)] and "
+                            + "\(type.canonicalName) as \(type.swiftType) "
+                            + "[\(type.representation.rawValue); "
+                            + "aliases=\(type.aliases)]"
                     )
                 }
-                aliases[alias] = type.swiftType
+                aliases[alias] = (
+                    type.swiftType,
+                    type.canonicalName,
+                    type.representation,
+                    type.aliases
+                )
             }
         }
+        let swiftTypes = aliases.mapValues(\.swiftType)
         return operations.map {
-            applyingSwiftTypeAliases($0, aliases: aliases)
+            applyingSwiftTypeAliases($0, aliases: swiftTypes)
         }
     }
 
@@ -2531,7 +2867,6 @@ extension FrontendReceipt.Adapter {
         baseName: String,
         marker: String
     ) -> [String] {
-        let expectedPrefix = "#\(ownerType).\(baseName)!"
         return Array(Set(body.split(separator: "\n").compactMap { rawLine -> String? in
             let line = String(rawLine)
             guard line.contains("_method "),
@@ -2540,7 +2875,8 @@ extension FrontendReceipt.Adapter {
                   let loweredMarker = line.range(of: ", $", options: .backwards)
             else { return nil }
             let reference = String(line[hash..<separator.lowerBound])
-            guard reference.hasPrefix(expectedPrefix),
+            guard reference.hasPrefix("#\(ownerType)."),
+                  foreignReference(reference, hasBaseName: baseName),
                   reference.contains("!\(marker)"),
                   reference.hasSuffix(".foreign")
             else { return nil }
@@ -2549,6 +2885,14 @@ extension FrontendReceipt.Adapter {
                 loweredType: String(line[loweredMarker.upperBound...])
             )
         })).sorted()
+    }
+
+    private static func foreignReference(
+        _ reference: String,
+        hasBaseName baseName: String
+    ) -> Bool {
+        reference.contains(".\(baseName)!")
+            || reference.contains(".`\(baseName)`!")
     }
 
     private func renamedForeignMemberReferences(
@@ -2572,7 +2916,7 @@ extension FrontendReceipt.Adapter {
                   let loweredMarker = line.range(of: ", $", options: .backwards)
             else { return nil }
             let reference = String(line[hash..<separator.lowerBound])
-            guard reference.contains(".\(baseName)!"),
+            guard Self.foreignReference(reference, hasBaseName: baseName),
                   reference.contains("!\(marker)"),
                   reference.hasSuffix(".foreign")
             else { return nil }

@@ -60,6 +60,13 @@ enum SwiftTypeSpelling {
                 && (isVoid(function.result) || isType(function.result))
         }
         if value.hasPrefix("@") { return false }
+        if value.hasPrefix("any ") {
+            let existential = value.dropFirst("any ".count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return !existential.isEmpty
+                && !existential.hasPrefix("any ")
+                && isType(existential)
+        }
         if value.hasSuffix("?") {
             return isType(String(value.dropLast()))
         }

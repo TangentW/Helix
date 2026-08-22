@@ -276,6 +276,50 @@ struct Archive {
         #expect(throws: InterfaceArchive.Error.self) {
             try unbridgeableCallback.validate()
         }
+
+        var errorCallback = decoded
+        errorCallback.capabilities.append(.structuredErrorsV1)
+        errorCallback.nativeImports[0].parameterTypes = [
+            .closure(.init(
+                parameters: [.optional(.error)],
+                parameterConventions: [.borrowed],
+                result: .void
+            )),
+        ]
+        errorCallback.nativeImports[0].signature.parameters = [
+            "@escaping ((any Swift.Error)?) -> Swift.Void",
+        ]
+        errorCallback.nativeImports[0].key = try Core.NativeImportKey.derive(
+            namespace: errorCallback.metadata.shellNamespaceID,
+            canonicalCallee: errorCallback.nativeImports[0].canonicalCallee,
+            signature: errorCallback.nativeImports[0].signature,
+            effects: errorCallback.nativeImports[0].effects,
+            contract: errorCallback.nativeImports[0].contract
+        )
+        errorCallback.shellInterfaceHash = try errorCallback
+            .computeShellInterfaceHash()
+        try errorCallback.validate()
+
+        var ordinaryError = errorCallback
+        ordinaryError.nativeImports[0].parameterTypes = [.optional(.error)]
+        ordinaryError.nativeImports[0].signature.parameters = [
+            "(any Swift.Error)?",
+        ]
+        ordinaryError.nativeImports[0].contract.callbacks = []
+        ordinaryError.nativeImports[0].key = try Core.NativeImportKey.derive(
+            namespace: ordinaryError.metadata.shellNamespaceID,
+            canonicalCallee: ordinaryError.nativeImports[0].canonicalCallee,
+            signature: ordinaryError.nativeImports[0].signature,
+            effects: ordinaryError.nativeImports[0].effects,
+            contract: ordinaryError.nativeImports[0].contract
+        )
+        ordinaryError.shellInterfaceHash = try ordinaryError
+            .computeShellInterfaceHash()
+        #expect(throws: InterfaceArchive.Error.invalidArchive(
+            "native import has an unsupported ordinary parameter"
+        )) {
+            try ordinaryError.validate()
+        }
     }
 
     @Test("Physical variants may omit an optional callback default")
@@ -363,6 +407,75 @@ struct Archive {
         archive.shellInterfaceHash = try archive.computeShellInterfaceHash()
 
         try archive.validate()
+    }
+
+    @Test("A nonisolated native declaration may use a MainActor nominal type")
+    func nonisolatedNativeImportWithMainActorNominal() throws {
+        var archive = try fixture()
+        let typeID = Core.TypeID.derive(
+            namespace: archive.metadata.shellNamespaceID,
+            canonicalType: "UIKit.UIApplication"
+        )
+        let signature = Core.LoweredSignature(
+            parameters: ["UIKit.UIApplication"],
+            result: "Swift.Double"
+        )
+        let effects = Core.Effects()
+        let contract = Core.NativeImportContract.bounded(
+            kind: .instanceGetter,
+            domain: .application,
+            access: .read,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let key = try Core.NativeImportKey.derive(
+            namespace: archive.metadata.shellNamespaceID,
+            canonicalCallee: "Fixture.HelixExternal.UIApplication."
+                + "backgroundTimeRemaining.get",
+            signature: signature,
+            effects: effects,
+            contract: contract
+        )
+        archive.capabilities += [.nativeImportsV1, .nativeTypesV1]
+        archive.nativeTypes = [
+            .init(
+                id: typeID,
+                canonicalName: "UIKit.UIApplication",
+                kind: .reference,
+                layoutFingerprint: .sha256("UIKit.UIApplication.reference.v1"),
+                isCopyable: true,
+                requiresMainActor: true,
+                isEmittedToDevice: true,
+                estimatedSize: 8
+            ),
+        ]
+        archive.nativeImports = [
+            .init(
+                id: .init(rawValue: 0),
+                key: key,
+                canonicalCallee: "Fixture.HelixExternal.UIApplication."
+                    + "backgroundTimeRemaining.get",
+                silMangledNames: ["$s7Fixture33backgroundTimeRemainingImportSdyF"],
+                parameterTypes: [.native(typeID)],
+                resultType: .float(bitWidth: 64),
+                signature: signature,
+                effects: effects,
+                contract: contract,
+                isEmittedToDevice: true
+            ),
+        ]
+        archive.shellInterfaceHash = try archive.computeShellInterfaceHash()
+
+        try archive.validate()
+
+        var unsafeEntry = archive
+        unsafeEntry.functions[0].parameterTypes = [.native(typeID)]
+        unsafeEntry.shellInterfaceHash = try unsafeEntry.computeShellInterfaceHash()
+        #expect(throws: InterfaceArchive.Error.invalidArchive(
+            "function func transform(_: Int) -> Int moves a MainActor native type off actor"
+        )) {
+            try unsafeEntry.validate()
+        }
     }
 
     private func fixture() throws -> InterfaceArchive.Archive {

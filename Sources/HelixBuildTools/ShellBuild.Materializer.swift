@@ -460,6 +460,7 @@ public struct Materializer: Sendable {
                         case .initializer: .initializer
                         case .staticMethod: .staticMethod
                         case .nativeUpcast: .nativeUpcast
+                        case .anyObjectBridge: .anyObjectBridge
                         case .staticGetter: .staticGetter
                         case .staticSetter: .staticSetter
                         case .instanceMethod: .instanceMethod

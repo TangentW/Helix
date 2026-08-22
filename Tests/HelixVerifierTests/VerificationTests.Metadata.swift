@@ -83,5 +83,86 @@ struct Metadata {
             )
         }
     }
+
+    @Test("Native Error callbacks require the structured Error capability")
+    func nativeErrorCallbackBoundary() throws {
+        let callback = Bytecode.ClosureSignature(
+            parameters: [.optional(.error)],
+            parameterConventions: [.borrowed],
+            result: .void
+        )
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true,
+            callbacks: [.init(parameterIndex: 0, lifetime: .escaping)]
+        )
+        let descriptor = Verification.ResolvedNativeImport(
+            id: .init(rawValue: 0),
+            key: .init(rawValue: .sha256("error-callback-import")),
+            parameterTypes: [.closure(callback)],
+            resultType: .void,
+            signature: .init(
+                parameters: ["@escaping ((any Swift.Error)?) -> Swift.Void"],
+                result: "Swift.Void"
+            ),
+            effects: .init(),
+            contract: contract
+        )
+        let compatibility = Core.Compatibility(
+            runtime: Core.Versions.runtime,
+            bytecode: Core.Versions.bytecode,
+            interfaceArchive: Core.Versions.interfaceArchive,
+            compilerFingerprint: "error-callback-shell"
+        )
+        let baseCapabilities: Set<Core.Capability> = [
+            .baselineV1, .nativeImportsV1, .closureValuesV1,
+            .escapingClosureValuesV1,
+        ]
+        #expect(throws: Verification.Error.self) {
+            try Verification.ShellInterface(
+                interfaceHash: .sha256("error-callback-shell"),
+                compatibility: compatibility,
+                capabilities: baseCapabilities,
+                imports: [descriptor]
+            )
+        }
+        _ = try Verification.ShellInterface(
+            interfaceHash: .sha256("error-callback-shell"),
+            compatibility: compatibility,
+            capabilities: baseCapabilities.union([.structuredErrorsV1]),
+            imports: [descriptor]
+        )
+
+        var ordinaryParameter = descriptor
+        ordinaryParameter.parameterTypes = [.optional(.error)]
+        ordinaryParameter.signature.parameters = ["(any Swift.Error)?"]
+        ordinaryParameter.contract.callbacks = []
+        #expect(throws: Verification.Error.self) {
+            try Verification.ShellInterface(
+                interfaceHash: .sha256("error-callback-shell"),
+                compatibility: compatibility,
+                capabilities: baseCapabilities.union([.structuredErrorsV1]),
+                imports: [ordinaryParameter]
+            )
+        }
+
+        var ordinaryResult = descriptor
+        ordinaryResult.parameterTypes = []
+        ordinaryResult.signature.parameters = []
+        ordinaryResult.contract.callbacks = []
+        ordinaryResult.resultType = .optional(.error)
+        ordinaryResult.signature.result = "(any Swift.Error)?"
+        #expect(throws: Verification.Error.self) {
+            try Verification.ShellInterface(
+                interfaceHash: .sha256("error-callback-shell"),
+                compatibility: compatibility,
+                capabilities: baseCapabilities.union([.structuredErrorsV1]),
+                imports: [ordinaryResult]
+            )
+        }
+    }
 }
 }

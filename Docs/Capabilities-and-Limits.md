@@ -467,7 +467,11 @@ does not by itself certify a physical device or distribution channel.
   reabstraction, ownership, and global-actor evidence. The current profile
   accepts direct or Optional synchronous, nonthrowing callbacks that return
   `Void`; callback parameters may recursively use the ordinary native bridge
-  value family, but cannot be `inout`, higher-order, or image-local values.
+  value family, including `Error` existentials (direct or Optional) represented
+  as bounded opaque proxies, but cannot be `inout`, higher-order, or image-local values.
+  Only a bounded textual dynamic-type name crosses; native payload, metadata,
+  and semantic error identity do not. `Error` is rejected in Shell entries and
+  ordinary NativeImport parameters or results.
   Nonescaping callbacks are valid only during the importing call. Escaping
   callbacks may be retained by that exact native parameter, outlive the
   originating VM invocation, and later re-enter the immutable image while
@@ -475,8 +479,10 @@ does not by itself certify a physical device or distribution channel.
   Runtime Engine until general `Sendable` semantics exist: same-thread recursion
   is allowed, an active import cannot hop callback execution to another thread,
   and overlapping cross-thread callbacks fail closed. This common path covers,
-  for example, `UIView.performWithoutAnimation`, `UIView.animate`,
-  `DispatchQueue.main.async`, and `Timer.scheduledTimer`; it is not a
+  for example, UIKit animation/transition/property-animator callbacks,
+  `DispatchQueue.async`/`asyncAfter`, `DispatchGroup.notify`,
+  `OperationQueue.addOperation`, `Timer.scheduledTimer`,
+  `URLSession.dataTask`, and `NotificationCenter.addObserver`; it is not a
   framework-specific list. Source defaults omitted beside a callback are
   represented by a checked physical-to-logical projection and are supplied by
   the generated Swift invocation after SIL provenance and ownership validation.
@@ -530,8 +536,9 @@ does not by itself certify a physical device or distribution channel.
   APIs can be frozen automatically when Typed AST semantics and canonical SIL
   physical ABI agree; current coverage includes references, raw enums,
   OptionSets, opaque copyable values, accessors, methods, global values and
-  functions, simple imported C values, Selector, upcasts, and validated
-  String/Array Objective-C bridges.
+  functions and operators, simple imported C values, Selector, upcasts,
+  Foundation value-overlay bridges, Objective-C protocol erasure, Swift
+  `Any -> AnyObject` boxing, and validated String/Array Objective-C bridges.
 
 ### Rejected or intentionally incomplete
 

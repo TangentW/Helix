@@ -186,7 +186,12 @@ enum ValueTypeParser {
                 )
             }
         }
-        let name = value.hasPrefix("Swift.") ? String(value.dropFirst(6)) : value
+        let existential = value.hasPrefix("any ")
+            ? String(value.dropFirst("any ".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            : value
+        let name = existential.hasPrefix("Swift.")
+            ? String(existential.dropFirst(6)) : existential
         if let id = nativeTypes[value] {
             return .native(id)
         }
@@ -207,6 +212,7 @@ enum ValueTypeParser {
         case "CGFloat", "CoreFoundation.CGFloat", "CoreGraphics.CGFloat": return .float(bitWidth: 64)
         case "String": return .string
         case "Any": return .any
+        case "Error": return .error
         default: return nil
         }
     }

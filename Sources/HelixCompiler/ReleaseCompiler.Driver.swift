@@ -67,7 +67,7 @@ extension ReleaseCompiler {
         case unknownFunction(Core.FunctionKey)
         case functionMissingFromSIL(Core.FunctionKey)
         case changedIneligibleFunction(Core.FunctionKey, reason: String)
-        case loweredSignatureChanged(Core.FunctionKey)
+        case loweredSignatureChanged(Core.FunctionKey, reason: String)
         case noSemanticChanges
         case generatedFunctionUnsupported(String, reason: String)
         case toolchainMismatch(expected: String, actual: String)
@@ -83,8 +83,8 @@ extension ReleaseCompiler {
             case let .functionMissingFromSIL(key): "frozen function \(key) is missing from current canonical SIL"
             case let .changedIneligibleFunction(key, reason):
                 "changed function \(key) requires a full build: \(reason)"
-            case let .loweredSignatureChanged(key):
-                "function \(key) changed its lowered Swift/SIL signature"
+            case let .loweredSignatureChanged(key, reason):
+                "function \(key) changed its lowered Swift/SIL signature: \(reason)"
             case .noSemanticChanges: "no selected function body differs from the HLXI baseline"
             case let .generatedFunctionUnsupported(symbol, reason):
                 "image-local function \(symbol) is outside the current HLBC profile: \(reason)"
@@ -652,7 +652,16 @@ extension ReleaseCompiler {
                       lowered.parameterConventions == conventions,
                       lowered.resultType == item.record.resultType
                 else {
-                    throw DriverError.loweredSignatureChanged(item.record.key)
+                    let details = [
+                        "declaration=\(item.record.canonicalDeclaration)",
+                        "parameters expected=\(expectedParameters) actual=\(actualParameters)",
+                        "conventions expected=\(conventions) actual=\(lowered.parameterConventions)",
+                        "result expected=\(item.record.resultType) actual=\(lowered.resultType)",
+                    ].joined(separator: "; ")
+                    throw DriverError.loweredSignatureChanged(
+                        item.record.key,
+                        reason: details
+                    )
                 }
                 changed.append(
                     (

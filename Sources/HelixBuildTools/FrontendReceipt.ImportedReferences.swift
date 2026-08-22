@@ -41,6 +41,12 @@ extension FrontendReceipt.Adapter {
             }
             let modules = imports(in: items).filter { $0 != moduleName }
             guard !modules.isEmpty else { continue }
+            uses += sourceOverlayTypes(
+                in: items,
+                source: source,
+                importedModules: modules,
+                demangled: demangled
+            )
             collectImportedNativeTypes(
                 root: items,
                 inheritedMainActor: false,
@@ -106,10 +112,10 @@ extension FrontendReceipt.Adapter {
                     )
                 }
                 guard let spelling,
-                      let rootModule = spelling.split(separator: ".")
-                        .first.map(String.init),
-                      mangled.hasPrefix("$sSo")
-                        || importedModules.contains(rootModule),
+                      isImportedMangledType(
+                          mangled,
+                          importedModules: importedModules
+                      ),
                       let type = importedNativeType(
                           rawMangledType: mangled,
                           spelling: spelling,
@@ -150,23 +156,45 @@ extension FrontendReceipt.Adapter {
         guard let discovered = importedNativeNominal(in: spelling),
               let mangled = rawMangledType as? String
         else { return nil }
-        let canonical = isSelectorType(discovered)
+        let importedTypealiases = Self.objectiveCTypealiasNames(
+            inMangledType: mangled
+        )
+        let clangTypealias = importedTypealiases.count == 1
+            && isImportedClangTypealias(mangled)
+            ? importedTypealiases.first : nil
+        let swiftType = isSelectorType(discovered)
             ? "ObjectiveC.Selector" : discovered
+        let canonical = Self.objectiveCNominalIdentity(
+            inMangledType: mangled
+        ) ?? clangTypealias ?? swiftType
         guard let representation = importedNominalRepresentation(
             mangled,
-            spelling: canonical
+            spelling: swiftType
         ) else { return nil }
         let kind: InterfaceArchive.TypeKind = representation == .reference
             ? .reference : .value
         return importedType(
             canonicalName: canonical,
-            swiftType: canonical,
+            swiftType: swiftType,
             kind: kind,
+            aliases: clangTypealias.map { ["__C.\($0)"] } ?? [],
             representation: representation,
             source: source,
             importedModules: importedModules,
             requiresMainActor: representation == .reference && requiresMainActor
         )
+    }
+
+    /// Uses the ABI identity rather than an often-aliased source spelling to
+    /// recognize nested Swift framework types such as `Notification.Name`.
+    func isImportedMangledType(
+        _ mangled: String,
+        importedModules: [String]
+    ) -> Bool {
+        if mangled.hasPrefix("$sSo") { return true }
+        return importedModules.contains { module in
+            mangled.hasPrefix("$s\(module.utf8.count)\(module)")
+        }
     }
 
     func importedNominalRepresentation(
@@ -180,10 +208,23 @@ extension FrontendReceipt.Adapter {
         switch value.last {
         case "C": return .reference
         case "V", "O": return .opaqueValue
+        case "a" where rawMangledType.hasPrefix("$sSo"):
+            // Imported Clang typedefs erase their underlying Swift layout in
+            // the mangling. Box the declared alias opaquely instead of guessing
+            // whether its C representation was a pointer or scalar.
+            return .opaqueValue
         case "G" where rawMangledType.hasPrefix("$sSo") && spelling.contains("<"):
             return .reference
         default: return nil
         }
+    }
+
+    func isImportedClangTypealias(_ rawMangledType: String) -> Bool {
+        var value = rawMangledType
+        guard value.hasPrefix("$s"), value.hasSuffix("D") else { return false }
+        value.removeLast()
+        while value.hasSuffix("Sg") { value.removeLast(2) }
+        return value.hasPrefix("$sSo") && value.hasSuffix("a")
     }
 
     func importedNativeNominal(in raw: String) -> String? {
@@ -262,12 +303,23 @@ extension FrontendReceipt.Adapter {
         discoveredTypes: [ImportedNativeType],
         operationTypes: [ImportedNativeType]
     ) throws -> [ImportedNativeType] {
-        let uses = discoveredTypes + operationTypes
+        let uses = try normalizeImportedNominalIdentities(
+            normalizeClangTypealiasIdentities(
+                discoveredTypes + operationTypes
+            )
+        )
         var result: [String: ImportedNativeType] = [:]
-        for use in uses.sorted(by: {
+        for originalUse in uses.sorted(by: {
             ($0.canonicalName, $0.sourceFileLogicalID)
                 < ($1.canonicalName, $1.sourceFileLogicalID)
         }) {
+            var use = originalUse
+            if use.canonicalName == "Swift.AnyObject" {
+                // AnyObject is a class existential, not an actor-isolated
+                // nominal type. Concrete UIKit references retain their own
+                // MainActor identity until an explicit erasure operation.
+                use.requiresMainActor = false
+            }
             guard !use.canonicalName.isEmpty,
                   !use.swiftType.isEmpty,
                   !use.importedModules.isEmpty
@@ -277,10 +329,17 @@ extension FrontendReceipt.Adapter {
                 )
             }
             if var existing = result[use.canonicalName] {
-                guard existing.swiftType == use.swiftType else {
-                    throw FrontendReceipt.Error.invalidRequest(
-                        "imported native type \(use.canonicalName) has conflicting Swift spellings"
-                    )
+                if existing.swiftType != use.swiftType {
+                    if existing.swiftType == use.canonicalName {
+                        existing.aliases.append(existing.swiftType)
+                        existing.swiftType = use.swiftType
+                    } else if use.swiftType == use.canonicalName {
+                        existing.aliases.append(use.swiftType)
+                    } else {
+                        throw FrontendReceipt.Error.invalidRequest(
+                            "imported native type \(use.canonicalName) has conflicting Swift spellings"
+                        )
+                    }
                 }
                 var mergeActorIsolation = true
                 if existing.representation == .opaqueValue,
@@ -335,7 +394,152 @@ extension FrontendReceipt.Adapter {
         }.sorted { $0.canonicalName < $1.canonicalName }
     }
 
+    /// Clang typedefs may surface under their ABI name in typed AST while SIL
+    /// uses the Swift overlay spelling. Only coalesce identities when the
+    /// runtime record and overlay record explicitly point at one another.
+    private func normalizeClangTypealiasIdentities(
+        _ uses: [ImportedNativeType]
+    ) throws -> [ImportedNativeType] {
+        let runtimeNames = Set(uses.compactMap { use -> String? in
+            use.aliases.contains("__C.\(use.canonicalName)")
+                ? use.canonicalName : nil
+        })
+        var overlaysByRuntime: [String: Set<String>] = [:]
+        for runtimeName in runtimeNames {
+            overlaysByRuntime[runtimeName] = Set(uses.compactMap { use in
+                use.canonicalName != runtimeName
+                    && use.aliases.contains(runtimeName)
+                    ? use.canonicalName : nil
+            })
+        }
+
+        var normalized = uses
+        for runtimeName in runtimeNames.sorted() {
+            guard let overlayNames = overlaysByRuntime[runtimeName],
+                  !overlayNames.isEmpty
+            else { continue }
+            guard overlayNames.count == 1,
+                  let overlayName = overlayNames.first
+            else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "Clang typealias \(runtimeName) has ambiguous Swift overlay identities"
+                )
+            }
+            let overlaySwiftTypes = Set(uses.compactMap { use in
+                use.canonicalName == overlayName ? use.swiftType : nil
+            })
+            guard overlaySwiftTypes.count == 1,
+                  let overlaySwiftType = overlaySwiftTypes.first
+            else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "Clang typealias \(runtimeName) has ambiguous Swift overlay identities"
+                )
+            }
+            for index in normalized.indices
+            where normalized[index].canonicalName == runtimeName {
+                normalized[index].aliases = Array(Set(
+                    normalized[index].aliases
+                        + [runtimeName, normalized[index].swiftType]
+                )).sorted()
+                normalized[index].canonicalName = overlayName
+                normalized[index].swiftType = overlaySwiftType
+            }
+        }
+        return normalized
+    }
+
+    /// Clang import may expose a flat ABI identity in mangling while canonical
+    /// SIL prints its nested Swift overlay name. Once one exact use proves that
+    /// mapping, normalize every record for that ABI identity before merging.
+    private func normalizeImportedNominalIdentities(
+        _ uses: [ImportedNativeType]
+    ) throws -> [ImportedNativeType] {
+        let usesByCanonicalName = Dictionary(grouping: uses, by: \.canonicalName)
+        var normalized = uses
+        for runtimeName in usesByCanonicalName.keys.sorted() {
+            guard let matchingUses = usesByCanonicalName[runtimeName] else {
+                continue
+            }
+            let overlayNames = Set(matchingUses.compactMap { use in
+                use.swiftType != runtimeName ? use.swiftType : nil
+            })
+            guard !overlayNames.isEmpty else { continue }
+            guard overlayNames.count == 1, let overlayName = overlayNames.first else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "imported nominal \(runtimeName) has ambiguous Swift overlay identities"
+                )
+            }
+            for index in normalized.indices
+            where normalized[index].canonicalName == runtimeName {
+                normalized[index].aliases = Array(Set(
+                    normalized[index].aliases
+                        + [runtimeName, normalized[index].swiftType]
+                )).sorted()
+                normalized[index].canonicalName = overlayName
+                normalized[index].swiftType = overlayName
+            }
+        }
+        return normalized
+    }
+
     static func objectiveCClassNames(inMangledType mangledType: String) -> [String] {
+        objectiveCNames(
+            inMangledType: mangledType,
+            terminator: UInt8(ascii: "C")
+        )
+    }
+
+    static func objectiveCTypealiasNames(
+        inMangledType mangledType: String
+    ) -> [String] {
+        objectiveCNames(
+            inMangledType: mangledType,
+            terminator: UInt8(ascii: "a")
+        )
+    }
+
+    /// Returns the exact Clang-imported nominal ABI identity. Unlike the
+    /// scanning helpers, this deliberately rejects containers and function
+    /// types so a nested imported type cannot be mistaken for the outer value.
+    static func objectiveCNominalIdentity(
+        inMangledType mangledType: String
+    ) -> String? {
+        var value = mangledType
+        guard value.hasPrefix("$s"), value.hasSuffix("D") else { return nil }
+        value.removeLast()
+        while value.hasSuffix("Sg") { value.removeLast(2) }
+        guard value.hasPrefix("$sSo") else { return nil }
+
+        let bytes = Array(value.utf8)
+        var cursor = 4
+        let lengthStart = cursor
+        while cursor < bytes.count,
+              bytes[cursor] >= UInt8(ascii: "0"),
+              bytes[cursor] <= UInt8(ascii: "9") {
+            cursor += 1
+        }
+        guard cursor > lengthStart,
+              let length = Int(String(
+                  decoding: bytes[lengthStart..<cursor],
+                  as: UTF8.self
+              )),
+              length > 0,
+              cursor + length + 1 == bytes.count,
+              [
+                  UInt8(ascii: "C"), UInt8(ascii: "V"),
+                  UInt8(ascii: "O"), UInt8(ascii: "a"),
+              ].contains(bytes[cursor + length])
+        else { return nil }
+        return String(
+            decoding: bytes[cursor..<(cursor + length)],
+            as: UTF8.self
+        )
+    }
+
+    private static func objectiveCNames(
+        inMangledType mangledType: String,
+        terminator: UInt8
+    ) -> [String] {
         let bytes = Array(mangledType.utf8)
         var names: Set<String> = []
         var index = 0
@@ -360,7 +564,7 @@ extension FrontendReceipt.Adapter {
                   )),
                   length > 0,
                   cursor + length < bytes.count,
-                  bytes[cursor + length] == UInt8(ascii: "C")
+                  bytes[cursor + length] == terminator
             else {
                 index += 2
                 continue

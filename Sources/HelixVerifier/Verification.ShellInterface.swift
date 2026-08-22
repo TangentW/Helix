@@ -190,6 +190,11 @@ public struct ShellInterface: Sendable {
                         capabilities: capabilities
                     )
                 } else {
+                    guard type.isOrdinaryNativeImportBridgeValue else {
+                        throw Verification.Error.invalidShellInterface(
+                            "native import \(descriptor.id) has an unsupported ordinary parameter"
+                        )
+                    }
                     try Self.validateBoundaryType(
                         type,
                         owner: "native import \(descriptor.id)",
@@ -200,6 +205,11 @@ public struct ShellInterface: Sendable {
             guard !descriptor.resultType.containsClosureValue else {
                 throw Verification.Error.invalidShellInterface(
                     "native import \(descriptor.id) cannot return a callback"
+                )
+            }
+            guard descriptor.resultType.isNativeImportBridgeResult else {
+                throw Verification.Error.invalidShellInterface(
+                    "native import \(descriptor.id) has an unsupported result"
                 )
             }
             try Self.validateBoundaryType(
@@ -238,7 +248,8 @@ public struct ShellInterface: Sendable {
             try validateBoundaryType(
                 parameter,
                 owner: owner,
-                capabilities: capabilities
+                capabilities: capabilities,
+                allowingError: true
             )
         }
     }
@@ -247,6 +258,7 @@ public struct ShellInterface: Sendable {
         _ type: Bytecode.ValueType,
         owner: String,
         capabilities: Set<Core.Capability>,
+        allowingError: Bool = false,
         depth: Int = 0
     ) throws {
         guard depth <= 32 else {
@@ -261,19 +273,28 @@ public struct ShellInterface: Sendable {
                     "Any in \(owner) signature requires \(Core.Capability.anyValuesV1)"
                 )
             }
-        case .local, .error, .address, .mutableCell, .nonOwningReference,
+        case .error:
+            guard allowingError,
+                  capabilities.contains(.structuredErrorsV1)
+            else {
+                throw Verification.Error.invalidShellInterface(
+                    "Error in \(owner) is supported only in a NativeImport callback parameter with \(Core.Capability.structuredErrorsV1)"
+                )
+            }
+        case .local, .address, .mutableCell, .nonOwningReference,
              .arrayState,
              .dictionaryState, .closure:
             // Local nominal identities exist only inside one verified image and
             // therefore cannot be frozen into a Shell ABI or NativeImport catalog.
             throw Verification.Error.invalidShellInterface(
-                "patch-local nominal, Error, internal storage, and closure values cannot appear in \(owner) signature"
+                "patch-local nominal, internal storage, and closure values cannot appear in \(owner) signature"
             )
         case let .optional(element):
             try validateBoundaryType(
                 element,
                 owner: owner,
                 capabilities: capabilities,
+                allowingError: allowingError,
                 depth: depth + 1
             )
         case let .array(element):
@@ -281,6 +302,7 @@ public struct ShellInterface: Sendable {
                 element,
                 owner: owner,
                 capabilities: capabilities,
+                allowingError: allowingError,
                 depth: depth + 1
             )
             guard capabilities.contains(.collectionsV1) else {
@@ -293,12 +315,14 @@ public struct ShellInterface: Sendable {
                 key,
                 owner: owner,
                 capabilities: capabilities,
+                allowingError: allowingError,
                 depth: depth + 1
             )
             try validateBoundaryType(
                 value,
                 owner: owner,
                 capabilities: capabilities,
+                allowingError: allowingError,
                 depth: depth + 1
             )
             guard capabilities.contains(.collectionsV1), key.isVMHashable else {
@@ -311,6 +335,7 @@ public struct ShellInterface: Sendable {
                 element,
                 owner: owner,
                 capabilities: capabilities,
+                allowingError: allowingError,
                 depth: depth + 1
             )
             guard capabilities.contains(.collectionsV1), element.isVMHashable else {
@@ -324,6 +349,7 @@ public struct ShellInterface: Sendable {
                     element,
                     owner: owner,
                     capabilities: capabilities,
+                    allowingError: allowingError,
                     depth: depth + 1
                 )
             }

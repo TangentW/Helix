@@ -161,6 +161,7 @@ public struct GeneratedNativeImport: Codable, Hashable, Sendable {
         case initializer
         case staticMethod
         case nativeUpcast
+        case anyObjectBridge
         case staticGetter
         case staticSetter
         case instanceMethod
@@ -606,6 +607,7 @@ public struct Document: Codable, Hashable, Sendable {
             && !importedModules.isEmpty
         let isCompilerOperation = generated.dispatch == .initializer
             || generated.dispatch == .nativeUpcast
+            || generated.dispatch == .anyObjectBridge
         let isFrozenImportedGlobal = generated.dispatch == .staticGetter
             && generated.declarationMangledName.hasPrefix("$hlx_native_global_")
         guard declaration != nil || isFrozenForeignReference
@@ -622,7 +624,9 @@ public struct Document: Codable, Hashable, Sendable {
         guard sourcePaths.contains(generated.sourceFileLogicalID),
               !requiresImportedType || !importedModules.isEmpty,
               isBoundText(generated.declarationMangledName),
-              isSwiftIdentifier(generated.baseName),
+              isSwiftIdentifier(generated.baseName)
+                || generated.dispatch == .globalFunction
+                    && Core.SwiftName.isOperator(generated.baseName),
               generated.argumentLabels.allSatisfy({
                   $0 == "_" || isSwiftIdentifier($0)
               }),
@@ -647,6 +651,12 @@ public struct Document: Codable, Hashable, Sendable {
             return generated.baseName == "upcast"
                 && generated.argumentLabels == ["_"]
                 && generated.parameterSwiftTypes.count == 1
+                && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(owner)
+        case .anyObjectBridge:
+            guard let owner = generated.ownerType else { return false }
+            return generated.baseName == "bridge"
+                && generated.argumentLabels == ["_"]
+                && generated.parameterSwiftTypes == ["Swift.Any"]
                 && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(owner)
         case .staticGetter:
             guard let owner = generated.ownerType else { return false }
@@ -731,10 +741,7 @@ public struct Document: Codable, Hashable, Sendable {
     }
 
     private static func isSwiftIdentifier(_ value: String) -> Bool {
-        guard let first = value.first, first == "_" || first.isLetter else { return false }
-        return value.dropFirst().allSatisfy {
-            $0 == "_" || $0.isLetter || $0.isNumber
-        }
+        Core.SwiftName.isIdentifier(value)
     }
 }
 

@@ -13,6 +13,10 @@ public enum NativeBridgeSymbols {
         "$hlx_native_upcast_\(source.rawValue.hex)_\(target.rawValue.hex)"
     }
 
+    public static func anyObjectBridge(to target: Core.TypeID) -> String {
+        "$hlx_native_any_object_bridge_\(target.rawValue.hex)"
+    }
+
     /// Identifies one exact imported Objective-C dispatch shape. A selector
     /// alone is insufficient because Clang importers may expose overloads with
     /// the same SIL member reference but different lowered ABI signatures.

@@ -467,9 +467,7 @@ enum NativeBridgeProfile {
                     )
                 )
             } else {
-                guard !type.containsClosureValue, type.isNativeBridgeValue else {
-                    return nil
-                }
+                guard type.isOrdinaryNativeImportBridgeValue else { return nil }
             }
         }
         guard authoritativeLifetimes.map({
@@ -496,7 +494,7 @@ enum NativeBridgeProfile {
     }
 
     static func isResult(_ type: Bytecode.ValueType) -> Bool {
-        type == .void || (!type.containsClosureValue && type.isNativeBridgeValue)
+        type.isNativeImportBridgeResult
     }
 }
 }

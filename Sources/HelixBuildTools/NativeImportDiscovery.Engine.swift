@@ -13,6 +13,7 @@ extension NativeImportDiscovery {
         case initializer
         case staticMethod
         case nativeUpcast
+        case anyObjectBridge
         case instanceMethod
         case staticGetter
         case staticSetter
@@ -196,6 +197,7 @@ extension NativeImportDiscovery {
         ) -> (code: String, reason: String)? {
             switch declaration.dispatch {
             case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+                 .anyObjectBridge,
                  .staticGetter, .staticSetter:
                 break
             case .instanceMethod, .instanceGetter, .instanceSetter:
@@ -238,7 +240,9 @@ extension NativeImportDiscovery {
                     "custom calling or isolation attributes require an explicit catalog factory"
                 )
             }
-            guard isSwiftIdentifier(declaration.baseName),
+            guard isSwiftIdentifier(declaration.baseName)
+                    || declaration.dispatch == .globalFunction
+                        && Core.SwiftName.isOperator(declaration.baseName),
                   declaration.argumentLabels.allSatisfy({
                       $0 == "_" || isSwiftIdentifier($0)
                   })
@@ -288,7 +292,7 @@ extension NativeImportDiscovery {
             switch dispatch {
             case .instanceGetter, .staticGetter: return .read
             case .instanceSetter, .instanceValueSetter, .staticSetter: return .write
-            case .nativeUpcast: return .pure
+            case .nativeUpcast, .anyObjectBridge: return .pure
             case .globalFunction, .initializer, .staticMethod, .instanceMethod: break
             }
             return switch profile {
@@ -304,7 +308,7 @@ extension NativeImportDiscovery {
             switch dispatch {
             case .globalFunction: .globalFunction
             case .initializer: .initializer
-            case .staticMethod, .nativeUpcast: .staticMethod
+            case .staticMethod, .nativeUpcast, .anyObjectBridge: .staticMethod
             case .staticGetter: .staticGetter
             case .staticSetter: .staticSetter
             case .instanceMethod: .instanceMethod
@@ -318,6 +322,7 @@ extension NativeImportDiscovery {
             case .instanceMethod, .instanceGetter, .instanceSetter,
                  .instanceValueSetter: true
             case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+                 .anyObjectBridge,
                  .staticGetter, .staticSetter: false
             }
         }
@@ -328,12 +333,7 @@ extension NativeImportDiscovery {
         }
 
         private func isSwiftIdentifier(_ value: String) -> Bool {
-            guard let first = value.first, first == "_" || first.isLetter else {
-                return false
-            }
-            return value.dropFirst().allSatisfy {
-                $0 == "_" || $0.isLetter || $0.isNumber
-            }
+            Core.SwiftName.isIdentifier(value)
         }
 
         private func declarationOrder(

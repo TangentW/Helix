@@ -289,9 +289,11 @@ public struct TypeEnvironment: Sendable {
         nativeTypeKinds = [:]
         mainActorNativeTypes = []
         // Payload-free throws use the lightweight String error representation.
-        // Typed storage is enabled only when SIL semantics or a local declaration needs it.
+        // Typed storage is enabled only when SIL semantics, a local declaration,
+        // or a closure boundary must preserve the Error existential identity.
         requiresTypedErrors = text.contains("checked_cast_addr_br")
             || text.contains("Result<")
+            || Self.hasClosureErrorBoundary(in: text)
             || rawDefinitions.values.contains(where: Self.hasStoredErrorPayload)
         // Native aliases arrive from the frozen Shell after textual SIL is
         // parsed. Build everything whose field graph is already resolvable,
@@ -302,7 +304,7 @@ public struct TypeEnvironment: Sendable {
     /// Returns an environment that resolves the exact native types frozen in
     /// the target Shell. Both module-qualified SIL spellings and their
     /// module-relative form are accepted; ambiguous aliases fail closed.
-    func includingNativeTypes(
+    public func includingNativeTypes(
         _ records: [String: Core.TypeID],
         kinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:],
         requiresMainActor: Set<Core.TypeID> = []
@@ -410,6 +412,21 @@ public struct TypeEnvironment: Sendable {
         }
     }
 
+    /// Clang-imported value types are physically passed without ARC ownership
+    /// markers even though the VM represents them with managed native handles.
+    /// An absent SIL marker therefore means +0, not a consuming transfer.
+    func isNonreferenceNativeValue(_ type: Bytecode.ValueType) -> Bool {
+        switch type {
+        case let .native(id):
+            guard let kind = nativeTypeKinds[id] else { return false }
+            return kind != .reference
+        case let .optional(wrapped):
+            return isNonreferenceNativeValue(wrapped)
+        default:
+            return false
+        }
+    }
+
     /// Whether a represented value can keep a strong class identity alive.
     /// This is separate from native-handle linearity: Swift-managed local and
     /// aggregate values are copyable, but their SIL ownership endpoints remain
@@ -494,8 +511,72 @@ public struct TypeEnvironment: Sendable {
         }
     }
 
+    /// Matches the conventional Foundation value-overlay to Objective-C
+    /// reference spelling used in compiler-generated block thunks. Exact
+    /// aliases are handled by ordinary type parsing before this fallback.
+    func matchesObjectiveCBridgeNativeType(
+        _ raw: String,
+        expected typeID: Core.TypeID
+    ) -> Bool {
+        var spelling = raw.trimmingCharacters(in: .whitespaces)
+        if spelling.hasPrefix("$") { spelling.removeFirst() }
+        let physicalName = spelling.split(separator: ".").last.map(String.init)
+            ?? spelling
+        guard !physicalName.isEmpty,
+              physicalName.allSatisfy({
+                  $0 == "_" || $0.isLetter || $0.isNumber
+              })
+        else { return false }
+
+        let exceptionalNames: [String: String] = [
+            "Decimal": "NSDecimalNumber",
+        ]
+        return nativeTypes.contains { alias, id in
+            // Conventional NS bridging is a Foundation overlay contract, not
+            // a spelling rule for arbitrary app or framework native types.
+            guard id == typeID, alias.hasPrefix("Foundation.") else {
+                return false
+            }
+            let foundationName = alias.dropFirst("Foundation.".count)
+            let swiftName: String
+            if let genericStart = foundationName.firstIndex(of: "<") {
+                guard foundationName.hasSuffix(">") else { return false }
+                swiftName = String(foundationName[..<genericStart])
+            } else {
+                swiftName = String(foundationName)
+            }
+            guard !swiftName.isEmpty,
+                  !swiftName.contains("."),
+                  swiftName.allSatisfy({
+                      $0 == "_" || $0.isLetter || $0.isNumber
+                  })
+            else { return false }
+            return physicalName == "NS\(swiftName)"
+                || exceptionalNames[swiftName] == physicalName
+        }
+    }
+
+    func isNativeType(_ typeID: Core.TypeID, named name: String) -> Bool {
+        nativeTypes[name] == typeID
+    }
+
     var preservesTypedErrors: Bool {
         requiresTypedErrors
+    }
+
+    private static func hasClosureErrorBoundary(in text: String) -> Bool {
+        text.range(
+            of: #"@(?:callee|block_storage)[^\n]*\b(?:any\s+)?(?:Swift\.)?Error\b"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    func resolvePreservingErrorExistentials(
+        _ raw: String
+    ) throws -> Bytecode.ValueType {
+        var environment = self
+        environment.requiresTypedErrors = true
+        return try environment.resolve(raw)
     }
 
     private static func hasStoredErrorPayload(_ definition: RawDefinition) -> Bool {
@@ -1118,8 +1199,12 @@ public struct TypeEnvironment: Sendable {
         let explicitlyBorrowed = spelling.hasPrefix("@guaranteed ")
             || spelling.hasPrefix("@unowned ")
             || spelling.hasPrefix("@in_guaranteed ")
+        let explicitlyOwned = spelling.hasPrefix("@owned ")
         return (parameter.requiresLinearOwnership
-            || containsOwningReference(parameter)) && explicitlyBorrowed
+            || containsOwningReference(parameter))
+            && (explicitlyBorrowed
+                || (!explicitlyOwned
+                    && isNonreferenceNativeValue(parameter)))
                 ? .borrowed
                 : .owned
     }

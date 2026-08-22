@@ -15,6 +15,7 @@ public struct Lowerer: Sendable {
         case stringFromObjectiveC
         case arrayToObjectiveC
         case arrayFromObjectiveC
+        case nativeValueToObjectiveC
 
         init?(mangledName: String, loweredType: String) {
             switch mangledName {
@@ -27,7 +28,10 @@ public struct Lowerer: Sendable {
             case "$sSa10FoundationE36_unconditionallyBridgeFromObjectiveCySayxGSo7NSArrayCSgFZ":
                 self = .arrayFromObjectiveC
             default:
-                return nil
+                guard mangledName.hasPrefix("$s10Foundation"),
+                      mangledName.contains("19_bridgeToObjectiveC")
+                else { return nil }
+                self = .nativeValueToObjectiveC
             }
             guard accepts(loweredType: loweredType) else { return nil }
         }
@@ -51,7 +55,70 @@ public struct Lowerer: Sendable {
                     && normalized.hasSuffix(
                         "(@guaranteedOptional<NSArray>,@thinArray<τ_0_0>.Type)->@ownedArray<τ_0_0>"
                     )
+            case .nativeValueToObjectiveC:
+                Self.acceptsNativeValueToObjectiveC(normalized)
             }
+        }
+
+        private static func acceptsNativeValueToObjectiveC(
+            _ normalized: String
+        ) -> Bool {
+            guard normalized.utf8.count <= 8_192 else { return false }
+            let convention = "@convention(method)"
+            let ownershipPrefixes = [
+                "(@in_guaranteed", "(@guaranteed",
+            ]
+            guard let ownership = ownershipPrefixes.compactMap({ prefix in
+                normalized.range(of: prefix).map { (prefix, $0) }
+            }).min(by: { $0.1.lowerBound < $1.1.lowerBound })
+            else { return false }
+            let functionPrefix = normalized[..<ownership.1.lowerBound]
+            guard functionPrefix == convention
+                    || functionPrefix.hasPrefix(convention + "<")
+                        && functionPrefix.hasSuffix(">")
+                        && hasBalancedAngles(
+                            functionPrefix.dropFirst(convention.count)
+                        )
+            else { return false }
+            let separator = ")->@owned"
+            guard let separatorRange = normalized.range(
+                of: separator,
+                options: .backwards
+            ),
+                  separatorRange.upperBound < normalized.endIndex
+            else { return false }
+            let sourceStart = ownership.1.upperBound
+            let source = normalized[sourceStart..<separatorRange.lowerBound]
+            let target = normalized[separatorRange.upperBound...]
+            return isNominalTypeSpelling(source)
+                && isNominalTypeSpelling(target)
+        }
+
+        private static func isNominalTypeSpelling(
+            _ value: Substring
+        ) -> Bool {
+            !value.isEmpty
+                && hasBalancedAngles(value)
+                && value.allSatisfy {
+                    $0 == "_" || $0 == "." || $0 == "," || $0 == ":"
+                        || $0 == "&" || $0 == "?" || $0 == "<" || $0 == ">"
+                        || $0.isLetter || $0.isNumber
+                }
+        }
+
+        private static func hasBalancedAngles(
+            _ value: Substring
+        ) -> Bool {
+            var depth = 0
+            for character in value {
+                if character == "<" {
+                    depth += 1
+                } else if character == ">" {
+                    depth -= 1
+                    if depth < 0 { return false }
+                }
+            }
+            return depth == 0
         }
     }
 
@@ -769,6 +836,7 @@ public struct Lowerer: Sendable {
             String: ExternalDefaultArgumentAddress
         ] = [:]
         var inlineOptionalNoneValues = Set<String>()
+        var deferredNativeBlockNoneTypes: [String: String] = [:]
         var projectedInlineOptionalNoneOwners = Set<Bytecode.Register>()
         var unboundedRangeFunctionReferences = Set<String>()
         var unboundedRangeClosureValues = Set<String>()
@@ -1384,6 +1452,27 @@ public struct Lowerer: Sendable {
                 clearBorrowedTemporaryClassification(for: token)
                 appendInstruction(.destroyValue(value))
             }
+        }
+
+        /// Clang-imported value types have no ARC cleanup in physical SIL,
+        /// while their frozen Native representation owns a VM handle. Track
+        /// that compiler-materialized owner until its final semantic use so a
+        /// +0 native call cannot leave the handle live at function exit.
+        func trackNonreferenceNativeTemporary(
+            token: String,
+            value: Bytecode.Register,
+            after lineIndex: Int
+        ) throws {
+            guard typeEnvironment.isNonreferenceNativeValue(
+                registerTypes[Int(value.rawValue)]
+            ) else { return }
+            if borrowedTemporaryValue(for: token) == nil {
+                try recordBorrowedTemporaryValue(value, for: token)
+            }
+            releaseBorrowedTemporariesAfterLastUse(
+                [token],
+                after: lineIndex
+            )
         }
 
         func closeBorrowedTemporaryLifetime(
@@ -2416,7 +2505,24 @@ public struct Lowerer: Sendable {
             }
             let value = try resolve(token, line: line)
             if let expectedType {
-                let actualType = registerTypes[Int(value.rawValue)]
+                let registerIndex = Int(value.rawValue)
+                let actualType = registerTypes[registerIndex]
+                if actualType != expectedType,
+                   inlineOptionalNoneValues.contains(token),
+                   case .optional(.never) = actualType,
+                   case let .optional(expectedWrapped) = expectedType,
+                   let physicalBlock = deferredNativeBlockNoneTypes[token],
+                   isSupportedBlockBridgeSpelling(
+                       physicalBlock,
+                       to: expectedWrapped
+                   ) {
+                    // A deferred Clang block has no standalone VM type, while
+                    // Optional.none has no payload. Rebind only that explicit
+                    // placeholder; a concrete Optional<T>.none must still
+                    // agree with the callee's frozen type.
+                    registerTypes[registerIndex] = expectedType
+                    return value
+                }
                 guard actualType == expectedType else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "stored value \(token) in \(displayName) at SIL line \(line) has type "
@@ -2532,8 +2638,16 @@ public struct Lowerer: Sendable {
                         )
                     }
                     value = boundaryConvention == .owned
-                        ? try prepareOwnedValue(token, line: line)
-                        : try resolveStorableValue(token, line: line)
+                        ? try prepareOwnedValue(
+                            token,
+                            expectedType: logicalType,
+                            line: line
+                        )
+                        : try resolveStorableValue(
+                            token,
+                            expectedType: logicalType,
+                            line: line
+                        )
                     let actual = registerTypes[Int(value.rawValue)]
                     guard actual == logicalType else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -2609,11 +2723,18 @@ public struct Lowerer: Sendable {
                 if convention == .inout {
                     value = try resolve(token, line: line)
                 } else if stackType(at: token) == logicalType {
-                    let consumes = storageInitializationPlan
-                        .consumesApplicationArgument(
-                            token,
-                            at: currentSILLineIndex
-                        )
+                    // The storage plan reflects physical SIL's `@in`
+                    // spelling. Imported trivial values use that spelling
+                    // without transferring a VM-native handle, so the
+                    // normalized physical convention remains authoritative.
+                    // Taking borrowed storage here would strand its original
+                    // owner after the NativeImport boundary consumes a copy.
+                    let consumes = convention == .owned
+                        && storageInitializationPlan
+                            .consumesApplicationArgument(
+                                token,
+                                at: currentSILLineIndex
+                            )
                     let stored: Bytecode.Register?
                     if consumes {
                         stored = try takeStoredValue(at: token, line: line)
@@ -2819,7 +2940,8 @@ public struct Lowerer: Sendable {
                     parameterProjection: binding.parameterProjection,
                     abiAdapter: binding.abiAdapter,
                     preservingClosureOwnership:
-                        preservesPhysicalClosureOwnership(for: binding)
+                        preservesPhysicalClosureOwnership(for: binding),
+                    allowingForeignABIRepresentation: usesObjectiveCBridge
                 )
                 guard callee.parameters == binding.parameterTypes,
                       acceptsPhysicalConventions(
@@ -3117,6 +3239,7 @@ public struct Lowerer: Sendable {
                             "NativeImport omitted physical parameter is not Optional.none"
                         )
                     }
+                    deferredNativeBlockNoneTypes.removeValue(forKey: token)
                     // Clang-imported Optional defaults such as `group: nil`
                     // are emitted directly rather than through an fA helper.
                     // Preserve the physical apply's ownership edge even
@@ -16893,6 +17016,84 @@ public struct Lowerer: Sendable {
             case let .sourceFailure(failure):
                 try lowerSourceFailure(failure)
 
+            case .anyObjectBridge:
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard !resultToken.isEmpty,
+                      specializations.count == 1,
+                      arguments.count == 1,
+                      case let .native(targetType) = try parseType(
+                        "Swift.AnyObject"
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Swift AnyObject bridge has an invalid specialization"
+                    )
+                }
+                let source = try materializeOwnedValue(
+                    at: arguments[0],
+                    line: line
+                )
+                let erased: Bytecode.Register
+                if CanonicalSIL.AnyObjectBridge.isOpenedAnyArchetype(
+                    specializations[0]
+                ) {
+                    guard registerTypes[Int(source.rawValue)] == .any else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "opened AnyObject bridge lost its enclosing Any value"
+                        )
+                    }
+                    erased = source
+                } else {
+                    let dynamicType = try parseDynamicAnyType(
+                        specializations[0]
+                    )
+                    guard dynamicType.isSwiftBridgeMaterializableV1,
+                          dynamicType.storageType
+                            == registerTypes[Int(source.rawValue)]
+                    else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "AnyObject bridge payload \(specializations[0])"
+                        )
+                    }
+                    if dynamicType == .any {
+                        erased = source
+                    } else {
+                        erased = try allocate(type: .any)
+                        appendInstruction(
+                            .eraseToAny(
+                                result: erased,
+                                value: source,
+                                dynamicType: dynamicType
+                            )
+                        )
+                    }
+                }
+                let symbol = CanonicalSIL.NativeBridgeSymbols
+                    .anyObjectBridge(to: targetType)
+                guard let binding = directCalls.binding(for: symbol),
+                      binding.parameterTypes == [.any],
+                      binding.parameterConventions == [.owned],
+                      binding.resultType == .native(targetType),
+                      binding.abiAdapter == .direct,
+                      !binding.effects.mayThrow,
+                      !binding.effects.isAsync,
+                      case let .nativeImport(requirement) = binding.target
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "Swift AnyObject bridge has no exact frozen NativeImport"
+                    )
+                }
+                let result = try allocate(type: .native(targetType))
+                values[resultToken] = result
+                appendInstruction(
+                    .nativeApply(
+                        result: result,
+                        importID: requirement.id,
+                        arguments: [erased]
+                    )
+                )
+
             case .typedThrowNotification:
                 let specializations = splitTopLevel(genericArguments)
                     .filter { !$0.isEmpty }
@@ -18817,6 +19018,47 @@ public struct Lowerer: Sendable {
                 )
             }
 
+            if intrinsic == .nativeValueToObjectiveC {
+                let substitutions: [String]
+                if genericArguments.isEmpty {
+                    substitutions = []
+                } else {
+                    do {
+                        substitutions = try CanonicalSIL.GenericFunction.arguments(
+                            in: genericArguments
+                        )
+                    } catch {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "native-value-to-Objective-C bridge has malformed specializations"
+                        )
+                    }
+                }
+                guard (genericArguments.isEmpty || !substitutions.isEmpty),
+                      substitutions.count <= 16,
+                      substitutions.allSatisfy({ substitution in
+                          substitution.utf8.count <= 4_096
+                              && !substitution.contains("τ_")
+                              && !substitution.contains("@opened")
+                      }),
+                      arguments.count == 1
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "native-value-to-Objective-C bridge has unsupported arguments"
+                    )
+                }
+                let source = try resolve(arguments[0], line: line)
+                guard case .native = registerTypes[Int(source.rawValue)] else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "native-value-to-Objective-C bridge payload is not a frozen native value"
+                    )
+                }
+                let type = registerTypes[Int(source.rawValue)]
+                let result = try allocate(type: type)
+                values[resultToken] = result
+                appendInstruction(.copyValue(result: result, source: source))
+                return
+            }
+
             if intrinsic == .arrayToObjectiveC || intrinsic == .arrayFromObjectiveC {
                 guard !genericArguments.isEmpty else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -18845,7 +19087,8 @@ public struct Lowerer: Sendable {
                         )
                     }
                     source = value
-                case .stringToObjectiveC, .stringFromObjectiveC:
+                case .stringToObjectiveC, .stringFromObjectiveC,
+                     .nativeValueToObjectiveC:
                     preconditionFailure("not an Array bridge")
                 }
                 guard registerTypes[Int(source.rawValue)] == .array(element) else {
@@ -18896,7 +19139,8 @@ public struct Lowerer: Sendable {
                         "Objective-C-to-String bridge is not proven by its frozen boundary"
                     )
                 }
-            case .arrayToObjectiveC, .arrayFromObjectiveC:
+            case .arrayToObjectiveC, .arrayFromObjectiveC,
+                 .nativeValueToObjectiveC:
                 preconditionFailure("handled before String bridge lowering")
             }
             guard registerTypes[Int(source.rawValue)] == .string else {
@@ -18917,6 +19161,7 @@ public struct Lowerer: Sendable {
             if unboundedRangeClosureValues.remove(token) != nil { return }
             borrowedValueTokens.remove(token)
             inlineOptionalNoneValues.remove(token)
+            deferredNativeBlockNoneTypes.removeValue(forKey: token)
             if let value = mutableCaptureState.temporaryBorrowOwners.removeValue(
                 forKey: token
             ), requiresManagedOwnership(registerTypes[Int(value.rawValue)]),
@@ -19838,6 +20083,25 @@ public struct Lowerer: Sendable {
                 continue
             }
 
+            if let opened = match(
+                line,
+                pattern: #"^(%[0-9]+) = open_existential_addr (immutable_access|mutable_access) (%[0-9]+) to \$\*(.+)$"#
+            ) {
+                guard opened[1] == "immutable_access",
+                      compilerAddressType(opened[2]) == .any,
+                      CanonicalSIL.AnyObjectBridge.isOpenedAnyArchetype(
+                        opened[3]
+                      )
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: line
+                    )
+                }
+                addressAliases[opened[0]] = addressBase(opened[2])
+                continue
+            }
+
             if let stack = match(
                 line,
                 pattern: #"^(%[0-9]+) = alloc_stack(?: \[[^\]]+\])* \$(.+?)(?:, (?:var|let),.*)?$"#
@@ -19847,6 +20111,12 @@ public struct Lowerer: Sendable {
                 ) {
                     stackAddressTypes[stack[0]] = .closure(signature)
                     nativeBlockStorageRoots.insert(stack[0])
+                    continue
+                }
+                if CanonicalSIL.AnyObjectBridge.isOpenedAnyArchetype(
+                    stack[1]
+                ) {
+                    stackAddressTypes[stack[0]] = .any
                     continue
                 }
                 let compilerEnumType = stack[1]
@@ -21413,6 +21683,11 @@ public struct Lowerer: Sendable {
                         arguments: [string]
                     )
                 )
+                try trackNonreferenceNativeTemporary(
+                    token: construction[0],
+                    value: result,
+                    after: lineIndex
+                )
                 continue
             }
 
@@ -21569,6 +21844,11 @@ public struct Lowerer: Sendable {
                         importID: requirement.id,
                         arguments: [try copyOwnedValue(operand)]
                     )
+                )
+                try trackNonreferenceNativeTemporary(
+                    token: construction[0],
+                    value: result,
+                    after: lineIndex
                 )
                 continue
             }
@@ -22356,7 +22636,9 @@ public struct Lowerer: Sendable {
                     parameterProjection: binding.parameterProjection,
                     abiAdapter: binding.abiAdapter,
                     preservingClosureOwnership:
-                        preservesPhysicalClosureOwnership(for: binding)
+                        preservesPhysicalClosureOwnership(for: binding),
+                    allowingForeignABIRepresentation:
+                        reference.usesObjectiveCBridge
                 )
                 guard physicalType.parameters == binding.parameterTypes,
                       physicalType.parameterConventions
@@ -22657,6 +22939,8 @@ public struct Lowerer: Sendable {
                     aliasBorrowedTemporary(borrowed[0], to: borrowed[1])
                     if inlineOptionalNoneValues.contains(borrowed[1]) {
                         inlineOptionalNoneValues.insert(borrowed[0])
+                        deferredNativeBlockNoneTypes[borrowed[0]] =
+                            deferredNativeBlockNoneTypes[borrowed[1]]
                     }
                     if let payload = knownOptionalSomePayloads[borrowed[1]] {
                         knownOptionalSomePayloads[borrowed[0]] = payload
@@ -23133,7 +23417,9 @@ public struct Lowerer: Sendable {
                     parameterProjection: binding.parameterProjection,
                     abiAdapter: binding.abiAdapter,
                     preservingClosureOwnership:
-                        preservesPhysicalClosureOwnership(for: binding)
+                        preservesPhysicalClosureOwnership(for: binding),
+                    allowingForeignABIRepresentation:
+                        reference.usesObjectiveCBridge
                 )
                 guard appliedType.parameters == binding.parameterTypes,
                       appliedType.parameterConventions
@@ -23757,7 +24043,9 @@ public struct Lowerer: Sendable {
                     parameterProjection: binding.parameterProjection,
                     abiAdapter: binding.abiAdapter,
                     preservingClosureOwnership:
-                        preservesPhysicalClosureOwnership(for: binding)
+                        preservesPhysicalClosureOwnership(for: binding),
+                    allowingForeignABIRepresentation:
+                        reference.usesObjectiveCBridge
                 )
                 guard appliedType.parameters == binding.parameterTypes,
                       appliedType.parameterConventions
@@ -23887,6 +24175,15 @@ public struct Lowerer: Sendable {
                     },
                     after: lineIndex
                 )
+                if indirectResultDestination == nil,
+                   let result,
+                   !call[0].isEmpty {
+                    try trackNonreferenceNativeTemporary(
+                        token: call[0],
+                        value: result,
+                        after: lineIndex
+                    )
+                }
                 continue
             }
 
@@ -24369,6 +24666,11 @@ public struct Lowerer: Sendable {
                         after: lineIndex
                     )
                 }
+                try trackNonreferenceNativeTemporary(
+                    token: optional[0],
+                    value: result,
+                    after: lineIndex
+                )
                 continue
             }
 
@@ -24377,6 +24679,7 @@ public struct Lowerer: Sendable {
                 pattern: #"^(%[0-9]+) = enum \$Optional<(.+)>, #Optional\.none!enumelt$"#
             ) {
                 let resolvedWrapped: Bytecode.ValueType
+                var deferredNativeBlock: String?
                 if let resolved = try? parseType(optional[1]) {
                     resolvedWrapped = resolved
                 } else if isSupportedObjectiveCBridgeSpelling(
@@ -24384,6 +24687,12 @@ public struct Lowerer: Sendable {
                     to: .string
                 ) {
                     resolvedWrapped = .string
+                } else if isDeferredNativeBlockType(optional[1]) {
+                    // The eventual NativeImport supplies the logical closure
+                    // type. `.never` is a payload-free placeholder that must
+                    // be contextually rebound before the value is consumed.
+                    resolvedWrapped = .never
+                    deferredNativeBlock = optional[1]
                 } else {
                     throw CanonicalSIL.LoweringError.unsupportedType(optional[1])
                 }
@@ -24391,7 +24700,13 @@ public struct Lowerer: Sendable {
                 let result = try allocate(type: .optional(wrapped))
                 values[optional[0]] = result
                 inlineOptionalNoneValues.insert(optional[0])
+                deferredNativeBlockNoneTypes[optional[0]] = deferredNativeBlock
                 appendInstruction(.makeOptionalNone(result: result))
+                try trackNonreferenceNativeTemporary(
+                    token: optional[0],
+                    value: result,
+                    after: lineIndex
+                )
                 continue
             }
 
@@ -24454,6 +24769,11 @@ public struct Lowerer: Sendable {
                         importID: requirement.id,
                         arguments: []
                     )
+                )
+                try trackNonreferenceNativeTemporary(
+                    token: enumeration[0],
+                    value: result,
+                    after: lineIndex
                 )
                 continue
             }
@@ -25082,6 +25402,13 @@ public struct Lowerer: Sendable {
                     borrowedLoadTokens.insert(load[0])
                     try recordBorrowedTemporaryValue(result, for: load[0])
                 }
+                if load[1] == "trivial" {
+                    try trackNonreferenceNativeTemporary(
+                        token: load[0],
+                        value: result,
+                        after: lineIndex
+                    )
+                }
                 continue
             }
 
@@ -25134,6 +25461,13 @@ public struct Lowerer: Sendable {
                        property.valueType.requiresLinearOwnership {
                         borrowedLoadTokens.insert(load[0])
                         try recordBorrowedTemporaryValue(result, for: load[0])
+                    }
+                    if mode == "trivial" {
+                        try trackNonreferenceNativeTemporary(
+                            token: load[0],
+                            value: result,
+                            after: lineIndex
+                        )
                     }
                     continue
                 }
@@ -25270,6 +25604,13 @@ public struct Lowerer: Sendable {
                         borrowedLoadTokens.insert(load[0])
                         try recordBorrowedTemporaryValue(result, for: load[0])
                     }
+                    if mode == "trivial" {
+                        try trackNonreferenceNativeTemporary(
+                            token: load[0],
+                            value: result,
+                            after: lineIndex
+                        )
+                    }
                     recordOptionalLoadCase(
                         from: load[2],
                         to: load[0],
@@ -25315,7 +25656,10 @@ public struct Lowerer: Sendable {
                             isKnownSome: true
                         )
                     }
-                } else if mode == "copy" {
+                } else if mode == "copy" || (
+                    mode == "trivial"
+                        && typeEnvironment.isNonreferenceNativeValue(addressType)
+                ) {
                     let copy = try allocate(type: addressType)
                     appendInstruction(.copyValue(result: copy, source: value))
                     values[load[0]] = copy
@@ -25327,6 +25671,13 @@ public struct Lowerer: Sendable {
                         // a distinct VM owner at the actual ownership edge.
                         borrowedLoadTokens.insert(load[0])
                     }
+                }
+                if isTakingLoad || mode == "trivial" {
+                    try trackNonreferenceNativeTemporary(
+                        token: load[0],
+                        value: try resolve(load[0], line: sourceLine),
+                        after: lineIndex
+                    )
                 }
                 if !isTakingLoad {
                     recordOptionalLoadCase(
@@ -25797,6 +26148,8 @@ public struct Lowerer: Sendable {
                 }
                 if inlineOptionalNoneValues.contains(copy[1]) {
                     inlineOptionalNoneValues.insert(copy[0])
+                    deferredNativeBlockNoneTypes[copy[0]] =
+                        deferredNativeBlockNoneTypes[copy[1]]
                 }
                 inheritKnownOptionalValueCase(
                     from: copy[1],
@@ -25910,6 +26263,10 @@ public struct Lowerer: Sendable {
                 }
                 if inlineOptionalNoneValues.remove(move[1]) != nil {
                     inlineOptionalNoneValues.insert(move[0])
+                    deferredNativeBlockNoneTypes[move[0]] =
+                        deferredNativeBlockNoneTypes.removeValue(
+                            forKey: move[1]
+                        )
                 }
                 inheritKnownOptionalValueCase(
                     from: move[1],
@@ -25978,6 +26335,7 @@ public struct Lowerer: Sendable {
                 }
                 if localFactoryReferences.removeValue(forKey: destroy[0]) != nil { continue }
                 inlineOptionalNoneValues.remove(destroy[0])
+                deferredNativeBlockNoneTypes.removeValue(forKey: destroy[0])
                 knownOptionalSomePayloads.removeValue(forKey: destroy[0])
                 optionalAddressSelectionConditions.removeValue(forKey: destroy[0])
                 let value = try resolve(destroy[0], line: sourceLine)
@@ -27013,7 +27371,8 @@ public struct Lowerer: Sendable {
         )
         let rawParameters = sourceValueParameterSpellings(
             physicalParameters,
-            logicalParameterCount: parameterTypes.count
+            logicalParameterCount: parameterTypes.count,
+            functionPrefix: prefix
         )
         guard rawParameters.count == parameterTypes.count else {
             throw CanonicalSIL.LoweringError.malformedSIL(
@@ -27036,10 +27395,13 @@ public struct Lowerer: Sendable {
         _ text: String,
         parameterTypes: [Bytecode.ValueType]
     ) throws -> [Int: Core.NativeImportCallbackLifetime] {
-        let (_, physicalParameters) = try functionParameterSpellings(in: text)
+        let (prefix, physicalParameters) = try functionParameterSpellings(
+            in: text
+        )
         let rawParameters = sourceValueParameterSpellings(
             physicalParameters,
-            logicalParameterCount: parameterTypes.count
+            logicalParameterCount: parameterTypes.count,
+            functionPrefix: prefix
         )
         guard rawParameters.count == parameterTypes.count else {
             throw CanonicalSIL.LoweringError.malformedSIL(
@@ -27094,10 +27456,21 @@ public struct Lowerer: Sendable {
 
     private func sourceValueParameterSpellings(
         _ physical: [String],
-        logicalParameterCount: Int
+        logicalParameterCount: Int,
+        functionPrefix: String
     ) -> [String] {
         guard physical.count != logicalParameterCount else { return physical }
-        return physical.filter { !isSyntacticMetatypeParameter($0) }
+        let withoutMetatypes = physical.filter {
+            !isSyntacticMetatypeParameter($0)
+        }
+        guard withoutMetatypes.count == logicalParameterCount + 1,
+              isSwiftMethodConvention(functionPrefix)
+        else { return withoutMetatypes }
+        // A Swift value-type instance method carries `self` as its final
+        // physical parameter. Source declarations do not expose that receiver,
+        // while reference receivers deliberately enter the logical Bridge ABI
+        // and therefore already made the original counts equal above.
+        return Array(withoutMetatypes.dropLast())
     }
 
     private func isSyntacticMetatypeParameter(_ raw: String) -> Bool {
@@ -27119,7 +27492,8 @@ public struct Lowerer: Sendable {
         )? = nil,
         parameterProjection: InterfaceArchive.NativeImportParameterProjection? = nil,
         abiAdapter: CanonicalSIL.DirectCallBinding.ABIAdapter = .direct,
-        preservingClosureOwnership: Bool = false
+        preservingClosureOwnership: Bool = false,
+        allowingForeignABIRepresentation: Bool = false
     ) throws -> (
         parameters: [Bytecode.ValueType],
         parameterConventions: [Bytecode.ParameterConvention],
@@ -27242,7 +27616,12 @@ public struct Lowerer: Sendable {
                 bridgedValueSpellings,
                 physicalExpectations
             ).map {
-                try parsePhysicalType($0.0, bridgedTo: $0.1)
+                try parsePhysicalType(
+                    $0.0,
+                    bridgedTo: $0.1,
+                    allowingForeignABIRepresentation:
+                        allowingForeignABIRepresentation
+                )
             }
             parameters = expected.parameters
             parameterConventions = self.parameterConventions(
@@ -27293,14 +27672,18 @@ public struct Lowerer: Sendable {
                 : "(" + normalComponents.joined(separator: ", ") + ")"
             parsedResult = try parseFunctionResult(
                 normalResult,
-                bridgedTo: physicalResultExpectation
+                bridgedTo: physicalResultExpectation,
+                allowingForeignABIRepresentation:
+                    allowingForeignABIRepresentation
             )
             thrownType = error.isPossible ? error.type : nil
             indirectErrorType = error.isIndirect ? error.type : nil
         } else {
             parsedResult = try parseFunctionResult(
                 resultText,
-                bridgedTo: physicalResultExpectation
+                bridgedTo: physicalResultExpectation,
+                allowingForeignABIRepresentation:
+                    allowingForeignABIRepresentation
             )
             thrownType = nil
             indirectErrorType = nil
@@ -27415,19 +27798,34 @@ public struct Lowerer: Sendable {
 
     private func parseFunctionResult(
         _ raw: String,
-        bridgedTo expected: Bytecode.ValueType? = nil
+        bridgedTo expected: Bytecode.ValueType? = nil,
+        allowingForeignABIRepresentation: Bool = false
     ) throws -> (type: Bytecode.ValueType, isIndirect: Bool) {
         let value = raw.trimmingCharacters(in: .whitespaces)
         if value.hasPrefix("@out ") {
             let spelling = String(value.dropFirst("@out ".count))
             return (
-                try expected.map { try parsePhysicalType(spelling, bridgedTo: $0) }
+                try expected.map {
+                    try parsePhysicalType(
+                        spelling,
+                        bridgedTo: $0,
+                        allowingForeignABIRepresentation:
+                            allowingForeignABIRepresentation
+                    )
+                }
                     ?? parseType(spelling),
                 true
             )
         }
         return (
-            try expected.map { try parsePhysicalType(value, bridgedTo: $0) }
+            try expected.map {
+                try parsePhysicalType(
+                    value,
+                    bridgedTo: $0,
+                    allowingForeignABIRepresentation:
+                        allowingForeignABIRepresentation
+                )
+            }
                 ?? parseType(value),
             false
         )
@@ -27435,7 +27833,8 @@ public struct Lowerer: Sendable {
 
     private func parsePhysicalType(
         _ raw: String,
-        bridgedTo expected: Bytecode.ValueType
+        bridgedTo expected: Bytecode.ValueType,
+        allowingForeignABIRepresentation: Bool = false
     ) throws -> Bytecode.ValueType {
         do {
             let parsed = try parseType(raw)
@@ -27450,6 +27849,9 @@ public struct Lowerer: Sendable {
                actual == .address(expected) {
                 return expected
             }
+            if closurePhysicalValueABIMatches(actual, expected) {
+                return expected
+            }
             guard actual == expected else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "foreign physical type \(actual) differs from Swift NativeImport type \(expected)"
@@ -27457,7 +27859,12 @@ public struct Lowerer: Sendable {
             }
             return actual
         } catch {
-            guard isSupportedObjectiveCBridgeSpelling(raw, to: expected) else {
+            guard isSupportedObjectiveCBridgeSpelling(
+                raw,
+                to: expected,
+                allowingForeignABIRepresentation:
+                    allowingForeignABIRepresentation
+            ) else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "foreign physical type \(raw) cannot bridge to frozen logical type \(expected)"
                 )
@@ -27473,7 +27880,9 @@ public struct Lowerer: Sendable {
         guard spelling.hasPrefix("@block_storage ") else { return nil }
         spelling.removeFirst("@block_storage ".count)
         spelling = spelling.trimmingCharacters(in: .whitespaces)
-        guard case let .closure(signature) = try parseStoredType(spelling),
+        guard case let .closure(signature) = ValueRepresentation.storable(
+            try typeEnvironment.resolvePreservingErrorExistentials(spelling)
+        ),
               !signature.effects.mayThrow,
               !signature.effects.isAsync
         else {
@@ -27528,11 +27937,16 @@ public struct Lowerer: Sendable {
             invocationParameters,
             signature.parameters
         ) {
-            guard (try? parsePhysicalType(physical, bridgedTo: expected))
+            guard (try? parsePhysicalType(
+                physical,
+                bridgedTo: expected,
+                allowingForeignABIRepresentation: true
+            ))
                     == expected
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "native block invoke thunk changes a callback parameter"
+                    "native block invoke thunk changes callback parameter "
+                        + "\(physical) away from \(expected)"
                 )
             }
         }
@@ -27541,7 +27955,8 @@ public struct Lowerer: Sendable {
 
     private func isSupportedObjectiveCBridgeSpelling(
         _ raw: String,
-        to expected: Bytecode.ValueType
+        to expected: Bytecode.ValueType,
+        allowingForeignABIRepresentation: Bool = false
     ) -> Bool {
         var spelling = raw.trimmingCharacters(in: .whitespaces)
         var removed = true
@@ -27586,10 +28001,28 @@ public struct Lowerer: Sendable {
             }
             return false
         case let .native(typeID):
-            return typeEnvironment.matchesPseudogenericNativeType(
-                spelling,
-                expected: typeID
+            return (
+                allowingForeignABIRepresentation
+                    && typeEnvironment.isNativeType(
+                        typeID,
+                        named: "Swift.AnyObject"
+                    )
+                    && CanonicalSIL.AnyObjectBridge
+                        .isObjectiveCProtocolExistential(spelling)
             )
+                || typeEnvironment.matchesPseudogenericNativeType(
+                    spelling,
+                    expected: typeID
+                )
+                || (allowingForeignABIRepresentation
+                    && typeEnvironment.matchesObjectiveCBridgeNativeType(
+                        spelling,
+                        expected: typeID
+                    ))
+        case .error:
+            return allowingForeignABIRepresentation
+                && ["NSError", "Foundation.NSError", "__C.NSError"]
+                    .contains(spelling)
         case let .optional(wrapped):
             for prefix in ["Optional<", "Swift.Optional<"]
             where spelling.hasPrefix(prefix) && spelling.hasSuffix(">") {
@@ -27597,7 +28030,12 @@ public struct Lowerer: Sendable {
                 if wrapped.directClosureShape != nil {
                     return isSupportedBlockBridgeSpelling(body, to: wrapped)
                 }
-                return isSupportedObjectiveCBridgeSpelling(body, to: wrapped)
+                return isSupportedObjectiveCBridgeSpelling(
+                    body,
+                    to: wrapped,
+                    allowingForeignABIRepresentation:
+                        allowingForeignABIRepresentation
+                )
             }
             return false
         default:
@@ -27664,15 +28102,57 @@ public struct Lowerer: Sendable {
         }
         guard foundBlockConvention,
               !spelling.contains(" @async "),
-              let parsed = try? parseType(spelling),
-              case var .closure(physicalSignature) = ValueRepresentation
-                .storable(parsed)
+              let parsed = try? parseFunctionType(
+                  spelling,
+                  bridgingTo: (
+                      expectedSignature.parameters,
+                      expectedSignature.result
+                  ),
+                  preservingClosureOwnership: true,
+                  allowingForeignABIRepresentation: true
+              ),
+              parsed.thrownType == nil,
+              !parsed.effects.isAsync
         else { return false }
-        physicalSignature.effects.requiresMainActor = requiresMainActor
+        var effects = parsed.effects
+        effects.requiresMainActor = requiresMainActor
+        let physicalSignature = Bytecode.ClosureSignature(
+            parameters: parsed.parameters,
+            parameterConventions: parsed.parameterConventions,
+            result: parsed.result,
+            thrownType: nil,
+            effects: effects
+        )
         return closureBlockBoundaryABIMatches(
             physicalSignature,
             expectedSignature
         )
+    }
+
+    private func isDeferredNativeBlockType(_ raw: String) -> Bool {
+        var spelling = raw.trimmingCharacters(in: .whitespaces)
+        if spelling.hasPrefix("$") {
+            spelling.removeFirst()
+            spelling = spelling.trimmingCharacters(in: .whitespaces)
+        }
+        guard let convention = spelling.range(
+            of: #"^@convention\s*\(\s*block\s*\)\s*"#,
+            options: .regularExpression
+        ) else { return false }
+        spelling.removeSubrange(convention)
+        spelling = spelling.trimmingCharacters(in: .whitespaces)
+        guard let arrow = outerFunctionArrow(in: spelling),
+              (try? parseType(String(spelling[arrow.upperBound...]))) == .void
+        else { return false }
+        let prefix = String(spelling[..<arrow.lowerBound])
+        guard let close = prefix.lastIndex(of: ")"),
+              let open = matchingOpeningParenthesis(for: close, in: prefix)
+        else { return false }
+        let parameters = splitTopLevel(
+            String(prefix[prefix.index(after: open)..<close])
+        ).filter { !$0.isEmpty }
+        return parameters.count <= 64
+            && parameters.allSatisfy { $0.utf8.count <= 4_096 }
     }
 
     private func closureBlockBoundaryABIMatches(
@@ -27720,6 +28200,27 @@ public struct Lowerer: Sendable {
             && lhs.thrownType == rhs.thrownType
             && lhs.effects.mayThrow == rhs.effects.mayThrow
             && lhs.effects.isAsync == rhs.effects.isAsync
+    }
+
+    private func closurePhysicalValueABIMatches(
+        _ physical: Bytecode.ValueType,
+        _ logical: Bytecode.ValueType
+    ) -> Bool {
+        switch (physical, logical) {
+        case let (.closure(physicalSignature), .closure(logicalSignature)):
+            return closurePhysicalABIMatches(
+                physicalSignature,
+                logicalSignature
+            ) && (!physicalSignature.effects.requiresMainActor
+                || logicalSignature.effects.requiresMainActor)
+        case let (.optional(physicalWrapped), .optional(logicalWrapped)):
+            return closurePhysicalValueABIMatches(
+                physicalWrapped,
+                logicalWrapped
+            )
+        default:
+            return false
+        }
     }
 
     private func parameterConventions(
@@ -27772,6 +28273,8 @@ public struct Lowerer: Sendable {
             if (type.requiresLinearOwnership
                 || typeEnvironment.containsOwningReference(type)),
                explicitlyBorrowed
+                || (!explicitlyOwned
+                    && typeEnvironment.isNonreferenceNativeValue(type))
                 || (implicitlyBorrowsLinearValues
                     && !explicitlyOwned
                     && typeEnvironment.containsReferenceNativeValue(type)) {
@@ -27795,6 +28298,13 @@ public struct Lowerer: Sendable {
     private func isObjectiveCMethodConvention(_ prefix: String) -> Bool {
         prefix.range(
             of: #"@convention\s*\(\s*objc_method\s*\)"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private func isSwiftMethodConvention(_ prefix: String) -> Bool {
+        prefix.range(
+            of: #"@convention\s*\(\s*method\s*\)"#,
             options: .regularExpression
         ) != nil
     }

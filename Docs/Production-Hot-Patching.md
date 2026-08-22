@@ -337,11 +337,19 @@ NativeImport also accepts exact direct or Optional callback parameters through
 one generated adapter family for Swift closures and Objective-C blocks. The v1
 profile is synchronous, nonthrowing, and `Void`-returning, preserves each
 callback's nonescaping/escaping and global-actor contract, and permits only
-recursively bridgeable callback arguments. Escaping handles retain their image
-and generation lease; callback execution is serialized until general Swift
-`Sendable` semantics exist. Checked source-default projection lets calls such as
-`UIView.animate`, `DispatchQueue.main.async(group:execute:)`, and
-`Timer.scheduledTimer` share this path without per-API VM implementations.
+recursively bridgeable callback arguments. Direct or Optional `Error` callback
+arguments cross as bounded opaque proxies carrying only a textual dynamic-type name;
+native payload, metadata, and semantic identity remain outside HLBC. `Error`
+is not admitted in Shell entries or ordinary NativeImport parameters/results.
+Escaping handles retain their image and generation lease; callback execution is
+serialized until general Swift `Sendable` semantics exist. Checked
+source-default projection lets UIKit animation/transition/property-animator,
+Dispatch queue/group, OperationQueue, Timer, URLSession, and NotificationCenter
+callbacks share this path without per-API VM implementations. Swift `Any`
+boxing, Objective-C protocol erasure, and Foundation value-overlay bridges are
+likewise frozen as exact generic NativeImport adapters rather than API-specific
+runtime behavior. All ABI, schema, capability, and product versions remain
+1/1.0.
 
 It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch, a
 patch concrete Swift type identity visible to native code, function-local
