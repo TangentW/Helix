@@ -228,6 +228,65 @@ struct SubstitutedFunctionTypes {
         #expect(try environment.resolve("(((String)))") == .string)
     }
 
+    @Test("Declaration closure syntax shares the exact SIL error ABI model")
+    func resolvesDeclarationClosureEffects() throws {
+        let environment = try CanonicalSIL.TypeEnvironment(
+            text: """
+            private enum Failure : Error {
+              case rejected(Int)
+            }
+            """,
+            functions: []
+        )
+
+        guard case let .closure(typed) = try environment.resolve(
+            "@escaping (Int) throws(Failure) -> String"
+        ), case let .local(errorKey)? = typed.thrownType else {
+            Issue.record("expected a concretely typed throwing closure")
+            return
+        }
+        #expect(typed.parameters == [.int64])
+        #expect(typed.result == .string)
+        #expect(errorKey.rawValue.hasSuffix("Failure"))
+        #expect(typed.effects.mayThrow)
+
+        guard case let .closure(untyped) = try environment.resolve(
+            "(Int) throws -> String"
+        ) else {
+            Issue.record("expected an untyped throwing closure")
+            return
+        }
+        #expect(untyped.thrownType == .error)
+        #expect(untyped.effects.mayThrow)
+
+        guard case let .closure(neverThrows) = try environment.resolve(
+            "(Int) throws(Never) -> String"
+        ) else {
+            Issue.record("expected a Never-throwing closure")
+            return
+        }
+        #expect(neverThrows.thrownType == nil)
+        #expect(!neverThrows.effects.mayThrow)
+
+        guard case let .optional(.closure(optional)) = try environment.resolve(
+            "((Int) throws(Failure) -> String)?"
+        ) else {
+            Issue.record("expected an Optional typed-throwing closure")
+            return
+        }
+        #expect(optional.thrownType == .local(errorKey))
+
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try environment.resolve("(Int) throws() -> String")
+        }
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try environment.resolve("(Int) throws(Int) -> String")
+        }
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try environment.resolve("(Int) async throws(Failure) -> String")
+        }
+    }
+
     @Test("Current Swift map and filter closure ABIs are discovered concretely")
     func discoversCurrentFrontendClosureABIs() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(

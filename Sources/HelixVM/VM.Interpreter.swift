@@ -182,7 +182,7 @@ public struct Interpreter: Sendable {
             )
             return .returned(value)
         } catch let business as VM.BusinessError {
-            return .businessError(business.error.message)
+            return .businessError(business.message)
         } catch let trap as VM.RuntimeTrap {
             trapObserver?(.init(trap: trap, programCounter: trace.programCounter))
             return .trapped(trap)
@@ -224,6 +224,9 @@ public struct Interpreter: Sendable {
                   function.kind == .closureBody,
                   function.resultType == closure.signature.result,
                   closure.signature.hasCanonicalCallableEffects,
+                  closure.signature.hasCanonicalThrownType,
+                  function.hasCanonicalThrownType,
+                  function.thrownType == closure.signature.thrownType,
                   Bytecode.ClosureSignature.callableEffects(
                       from: function.effects
                   ) == closure.signature.effects,
@@ -283,7 +286,7 @@ public struct Interpreter: Sendable {
             }
             return .returned(nil)
         } catch let business as VM.BusinessError {
-            return .businessError(business.error.message)
+            return .businessError(business.message)
         } catch let trap as VM.RuntimeTrap {
             trapObserver?(.init(trap: trap, programCounter: trace.programCounter))
             return .trapped(trap)
@@ -361,7 +364,7 @@ public struct Interpreter: Sendable {
                 visit(key)
                 visit(value)
             case let .closure(signature):
-                (signature.parameters + [signature.result]).forEach(visit)
+                signature.componentTypes.forEach(visit)
             case .void, .never, .bool, .integer, .float, .string, .any, .local,
                  .error:
                 break
@@ -433,6 +436,7 @@ public struct Interpreter: Sendable {
                             to: current.blocks[errorTarget]!,
                             function: current.function,
                             registers: &current.registers,
+                            localTypes: localTypes,
                             budget: budget
                         )
                         current.currentBlock = errorTarget
@@ -4543,6 +4547,7 @@ public struct Interpreter: Sendable {
                             to: frame.blocks[errorTarget]!,
                             function: function,
                             registers: &registers,
+                            localTypes: localTypes,
                             budget: budget
                         )
                         currentBlock = errorTarget
@@ -4608,6 +4613,7 @@ public struct Interpreter: Sendable {
                             to: frame.blocks[errorTarget]!,
                             function: function,
                             registers: &registers,
+                            localTypes: localTypes,
                             budget: budget
                         )
                         currentBlock = errorTarget
@@ -4625,20 +4631,10 @@ public struct Interpreter: Sendable {
                         localTypes: localTypes,
                         registers: &registers
                     )
-                    switch value {
-                    case let .string(message):
-                        throw VM.BusinessError(
-                            message: message,
-                            requiresBoundaryCharge: false
-                        )
-                    case let .error(error):
-                        throw VM.BusinessError(
-                            error: error,
-                            requiresBoundaryCharge: false
-                        )
-                    default:
-                        throw VM.RuntimeTrap.typeMismatch(expected: .error, actual: value.type)
-                    }
+                    throw VM.BusinessError(
+                        value: value,
+                        requiresBoundaryCharge: false
+                    )
                 case let .sourceFailure(prefix, detailRegister):
                     let detail = try read(detailRegister, registers: registers)
                     switch detail {
@@ -4653,9 +4649,19 @@ public struct Interpreter: Sendable {
                             detail: error.message
                         )
                     default:
-                        throw VM.RuntimeTrap.typeMismatch(
-                            expected: .string,
-                            actual: detail.type
+                        guard let diagnostic = localErrorDiagnostic(
+                            detail,
+                            localTypes: localTypes
+                        )
+                        else {
+                            throw VM.RuntimeTrap.typeMismatch(
+                                expected: .error,
+                                actual: detail.type
+                            )
+                        }
+                        throw VM.RuntimeTrap.sourceFailure(
+                            prefix: prefix,
+                            detail: diagnostic
                         )
                     }
                 case let .trap(reason):
@@ -6041,23 +6047,78 @@ public struct Interpreter: Sendable {
         to target: Bytecode.Block,
         function: Bytecode.Function,
         registers: inout [VM.Value?],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
         budget: VM.InvocationBudget
     ) throws {
         guard target.parameters.count == 1, let parameter = target.parameters.first else {
             throw VM.RuntimeTrap.invalidProgramCounter
         }
-        let value: VM.Value = switch function.type(of: parameter) {
-        case .string:
-            .string(error.error.message)
-        case .error:
-            .error(error.error)
-        default:
+        guard let expected = function.type(of: parameter) else {
             throw VM.RuntimeTrap.invalidProgramCounter
+        }
+        let value: VM.Value
+        switch error.payload {
+        case let .value(thrown):
+            guard thrown.matches(expected) else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: expected,
+                    actual: thrown.type
+                )
+            }
+            try chargeShapeValidation(thrown, budget: budget)
+            try validateRuntimeValue(
+                thrown,
+                expected: expected,
+                localTypes: localTypes
+            )
+            value = thrown
+        case let .boundaryMessage(message):
+            value = switch expected {
+            case .string:
+                .string(message)
+            case .error:
+                .error(.init(message: message))
+            default:
+                throw VM.RuntimeTrap.invalidProgramCounter
+            }
         }
         if error.requiresBoundaryCharge {
             try budget.consumeBoundaryValue(value)
         }
         try transferValues([value], to: target, registers: &registers)
+    }
+
+    /// Produces a bounded diagnostic identity without recursively rendering a
+    /// potentially large Error payload after execution has already failed.
+    private func localErrorDiagnostic(
+        _ value: VM.Value,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
+    ) -> String? {
+        switch value {
+        case let .enumeration(key, caseIndex, _):
+            guard let definition = localTypes[key],
+                  definition.conformsToError,
+                  case let .enumeration(cases) = definition.kind,
+                  let index = Int(exactly: caseIndex),
+                  cases.indices.contains(index)
+            else { return nil }
+            return "\(key).\(cases[index].name)"
+        case let .structure(key, _):
+            guard let definition = localTypes[key],
+                  definition.conformsToError,
+                  case .structure = definition.kind
+            else { return nil }
+            return key.rawValue
+        case let .object(object):
+            let key = object.typeKey
+            guard let definition = localTypes[key],
+                  definition.conformsToError,
+                  case .class = definition.kind
+            else { return nil }
+            return key.rawValue
+        default:
+            return nil
+        }
     }
 
     private func storeCallResult(
@@ -7088,16 +7149,32 @@ public struct Interpreter: Sendable {
 }
 
 private struct BusinessError: Error {
-    var error: VM.ErrorValue
+    enum Payload {
+        case value(VM.Value)
+        case boundaryMessage(String)
+    }
+
+    var payload: Payload
     var requiresBoundaryCharge: Bool
 
+    var message: String {
+        switch payload {
+        case let .boundaryMessage(message), let .value(.string(message)):
+            message
+        case let .value(.error(error)):
+            error.message
+        case let .value(value):
+            value.description
+        }
+    }
+
     init(message: String, requiresBoundaryCharge: Bool) {
-        error = .init(message: message)
+        payload = .boundaryMessage(message)
         self.requiresBoundaryCharge = requiresBoundaryCharge
     }
 
-    init(error: VM.ErrorValue, requiresBoundaryCharge: Bool) {
-        self.error = error
+    init(value: VM.Value, requiresBoundaryCharge: Bool) {
+        payload = .value(value)
         self.requiresBoundaryCharge = requiresBoundaryCharge
     }
 }

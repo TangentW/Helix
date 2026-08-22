@@ -241,7 +241,7 @@ public struct Document: Codable, Hashable, Sendable {
         case let .tuple(elements):
             elements.contains { containsNativeType($0, ids: ids) }
         case let .closure(signature):
-            (signature.parameters + [signature.result]).contains {
+            signature.componentTypes.contains {
                 containsNativeType($0, ids: ids)
             }
         case .void, .never, .bool, .integer, .float, .string, .any, .local,

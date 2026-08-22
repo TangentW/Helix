@@ -17,6 +17,7 @@ public struct Capability: RawRepresentable, Hashable, Codable, Sendable, Compara
     public static let untypedThrowsV1: Self = "untyped-throws-1"
     public static let localNominalsV1: Self = "local-nominals-1"
     public static let structuredErrorsV1: Self = "structured-errors-1"
+    public static let typedThrowsV1: Self = "typed-throws-1"
     public static let addressValuesV1: Self = "address-values-1"
     public static let borrowCallsV1: Self = "borrow-calls-1"
     public static let closureValuesV1: Self = "closure-values-1"

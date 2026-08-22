@@ -57,7 +57,7 @@ extension Bytecode.ValueType {
     public var containsNestedClosureValue: Bool {
         switch self {
         case let .closure(signature):
-            (signature.parameters + [signature.result]).contains(
+            signature.componentTypes.contains(
                 where: \.containsClosureValue
             )
         case let .optional(wrapped), let .array(wrapped), let .set(wrapped),

@@ -168,14 +168,17 @@ struct NativeBlockBridge {
         #expect(signature.parameterConventions == [
             .borrowed, .borrowed, .owned,
         ])
-        #expect(Bytecode.ClosureSignature(
+        var callback = Bytecode.ClosureSignature(
             parameters: signature.parameters,
             parameterConventions: signature.parameterConventions,
             result: signature.result,
             effects: Bytecode.ClosureSignature.callableEffects(
                 from: signature.effects
             )
-        ).isNativeBridgeCallback)
+        )
+        #expect(callback.isNativeBridgeCallback)
+        callback.thrownType = .error
+        #expect(!callback.isNativeBridgeCallback)
     }
 
     @Test("Static-method metatypes do not shift closure lifetime indices")

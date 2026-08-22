@@ -368,6 +368,32 @@ public struct Engine: Verification.ImageVerifying {
                         "local type closure signature cannot carry execution authority"
                     )
                 }
+                guard signature.hasCanonicalThrownType else {
+                    throw Verification.Error.invalidModule(
+                        "local type closure signature has inconsistent throwing ABI"
+                    )
+                }
+                if let thrownType = signature.thrownType {
+                    switch thrownType {
+                    case .string:
+                        guard capabilities.contains(.untypedThrowsV1) else {
+                            throw Verification.Error.capabilityDenied(.untypedThrowsV1)
+                        }
+                    case .error:
+                        guard capabilities.contains(.structuredErrorsV1) else {
+                            throw Verification.Error.capabilityDenied(.structuredErrorsV1)
+                        }
+                    case let .local(key)
+                    where result[key]?.conformsToError == true:
+                        guard capabilities.contains(.typedThrowsV1) else {
+                            throw Verification.Error.capabilityDenied(.typedThrowsV1)
+                        }
+                    default:
+                        throw Verification.Error.invalidModule(
+                            "local type closure has a non-Error thrown type"
+                        )
+                    }
+                }
                 guard signature.parameters.count <= 64,
                       signature.parameterConventions.count
                         == signature.parameters.count,
@@ -620,7 +646,7 @@ public struct Engine: Verification.ImageVerifying {
                  let .arrayState(_, pointee):
                 try visit(pointee)
             case let .closure(signature):
-                for component in signature.parameters + [signature.result] {
+                for component in signature.componentTypes {
                     try visit(component)
                 }
             case let .dictionary(key, value):
@@ -637,7 +663,10 @@ public struct Engine: Verification.ImageVerifying {
             }
         }
         for function in functions {
-            for type in function.registerTypes + function.stackSlotTypes + [function.resultType] {
+            let types = function.registerTypes + function.stackSlotTypes
+                + [function.resultType]
+                + (function.thrownType.map { [$0] } ?? [])
+            for type in types {
                 try visit(type)
             }
         }
@@ -834,6 +863,12 @@ public struct Engine: Verification.ImageVerifying {
             else {
                 throw Verification.Error.entrySignatureMismatch(entry.entryIndex)
             }
+            if case .local = function.thrownType {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "typed throws cannot cross a Shell entry"
+                )
+            }
             if shellEntry.effects.requiresMainActor {
                 guard policy.allowMainActorSynchronousEntries,
                       shell.capabilities.contains(.mainActorSyncV1),
@@ -911,11 +946,14 @@ public struct Engine: Verification.ImageVerifying {
 
     private func verifyNativeTypes(_ functions: [Bytecode.Function], shell: Verification.ShellInterface) throws {
         for function in functions {
-            for type in function.registerTypes + function.stackSlotTypes + [function.resultType] {
+            let types = function.registerTypes + function.stackSlotTypes
+                + [function.resultType]
+                + (function.thrownType.map { [$0] } ?? [])
+            for type in types {
                 try verifyNativeTypes(type, shell: shell)
             }
             if !function.effects.requiresMainActor,
-               (function.registerTypes + function.stackSlotTypes + [function.resultType])
+               types
                 .contains(where: { usesMainActorNativeType($0, shell: shell) }) {
                 throw Verification.Error.invalidFunction(
                     function: function.id,
@@ -945,7 +983,7 @@ public struct Engine: Verification.ImageVerifying {
         case let .tuple(elements):
             elements.contains { usesMainActorNativeType($0, shell: shell) }
         case let .closure(signature):
-            (signature.parameters + [signature.result]).contains {
+            signature.componentTypes.contains {
                 usesMainActorNativeType($0, shell: shell)
             }
         case .void, .never, .bool, .integer, .float, .string, .any, .local,
@@ -976,7 +1014,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyNativeTypes(key, shell: shell)
             try verifyNativeTypes(value, shell: shell)
         case let .closure(signature):
-            for component in signature.parameters + [signature.result] {
+            for component in signature.componentTypes {
                 try verifyNativeTypes(component, shell: shell)
             }
         case .void, .never, .bool, .integer, .float, .string, .any, .local,
@@ -1044,7 +1082,25 @@ public struct Engine: Verification.ImageVerifying {
                 guard capabilities.contains(.closureValuesV1) else {
                     throw Verification.Error.capabilityDenied(.closureValuesV1)
                 }
-                for component in signature.parameters + [signature.result] {
+                if let thrownType = signature.thrownType {
+                    switch thrownType {
+                    case .string:
+                        guard capabilities.contains(.untypedThrowsV1) else {
+                            throw Verification.Error.capabilityDenied(.untypedThrowsV1)
+                        }
+                    case .error:
+                        guard capabilities.contains(.structuredErrorsV1) else {
+                            throw Verification.Error.capabilityDenied(.structuredErrorsV1)
+                        }
+                    case .local:
+                        guard capabilities.contains(.typedThrowsV1) else {
+                            throw Verification.Error.capabilityDenied(.typedThrowsV1)
+                        }
+                    default:
+                        break
+                    }
+                }
+                for component in signature.componentTypes {
                     try visit(component)
                 }
             case let .array(element):
@@ -1083,7 +1139,10 @@ public struct Engine: Verification.ImageVerifying {
                     .escapingClosureValuesV1
                 )
             }
-            for type in function.registerTypes + function.stackSlotTypes + [function.resultType] {
+            let types = function.registerTypes + function.stackSlotTypes
+                + [function.resultType]
+                + (function.thrownType.map { [$0] } ?? [])
+            for type in types {
                 try visit(type)
             }
         }
@@ -1158,8 +1217,42 @@ public struct Engine: Verification.ImageVerifying {
         }
         if function.effects.mayThrow,
            !capabilities.contains(.untypedThrowsV1),
-           !capabilities.contains(.structuredErrorsV1) {
+           !capabilities.contains(.structuredErrorsV1),
+           !capabilities.contains(.typedThrowsV1) {
             throw Verification.Error.capabilityDenied(.untypedThrowsV1)
+        }
+        guard function.hasCanonicalThrownType else {
+            throw Verification.Error.invalidFunction(
+                function: function.id,
+                reason: "throwing effect and thrown type disagree"
+            )
+        }
+        if let thrownType = function.thrownType {
+            switch thrownType {
+            case .string:
+                guard capabilities.contains(.untypedThrowsV1) else {
+                    throw Verification.Error.capabilityDenied(.untypedThrowsV1)
+                }
+            case .error:
+                guard capabilities.contains(.structuredErrorsV1) else {
+                    throw Verification.Error.capabilityDenied(.structuredErrorsV1)
+                }
+            case let .local(key):
+                guard capabilities.contains(.typedThrowsV1) else {
+                    throw Verification.Error.capabilityDenied(.typedThrowsV1)
+                }
+                guard localTypes[key]?.conformsToError == true else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "typed throws requires a local Error-conforming nominal"
+                    )
+                }
+            default:
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "function has a non-Error thrown type"
+                )
+            }
         }
         if function.effects.requiresMainActor, !capabilities.contains(.mainActorSyncV1) {
             throw Verification.Error.capabilityDenied(.mainActorSyncV1)
@@ -1569,6 +1662,26 @@ public struct Engine: Verification.ImageVerifying {
                         function: function.id,
                         reason: "closure signature cannot carry execution authority"
                     )
+                }
+                guard signature.hasCanonicalThrownType else {
+                    throw Verification.Error.invalidFunction(
+                        function: function.id,
+                        reason: "closure signature has inconsistent throwing ABI"
+                    )
+                }
+                if let thrownType = signature.thrownType {
+                    switch thrownType {
+                    case .string, .error:
+                        break
+                    case let .local(key)
+                    where localTypes[key]?.conformsToError == true:
+                        break
+                    default:
+                        throw Verification.Error.invalidFunction(
+                            function: function.id,
+                            reason: "closure signature has a non-Error thrown type"
+                        )
+                    }
                 }
                 guard signature.parameterConventions.count
                         == signature.parameters.count,
@@ -3735,6 +3848,13 @@ public struct Engine: Verification.ImageVerifying {
                 operation: "hlbc_apply",
                 fail: fail
             )
+            try verifyExactErrorPropagation(
+                from: callee.thrownType,
+                ifThrowing: callee.effects.mayThrow,
+                to: function,
+                operation: "hlbc_apply",
+                fail: fail
+            )
             try verifyCall(
                 arguments: arguments,
                 result: result,
@@ -3749,6 +3869,12 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 descriptor.effects,
                 allowedBy: function.effects,
+                operation: "entry_apply",
+                fail: fail
+            )
+            try verifyBoundaryErrorPropagation(
+                ifThrowing: descriptor.effects.mayThrow,
+                to: function,
                 operation: "entry_apply",
                 fail: fail
             )
@@ -3772,6 +3898,12 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 descriptor.effects,
                 allowedBy: function.effects,
+                operation: "native_apply",
+                fail: fail
+            )
+            try verifyBoundaryErrorPropagation(
+                ifThrowing: descriptor.effects.mayThrow,
+                to: function,
                 operation: "native_apply",
                 fail: fail
             )
@@ -3799,12 +3931,14 @@ public struct Engine: Verification.ImageVerifying {
             }
             guard callee.resultType == signature.result,
                   signature.hasCanonicalCallableEffects,
+                  signature.hasCanonicalThrownType,
+                  callee.thrownType == signature.thrownType,
                   Bytecode.ClosureSignature.callableEffects(
                       from: callee.effects
                   ) == signature.effects
             else {
                 throw fail(
-                    "closure body result or callable effects do not match its closure signature"
+                    "closure body result, thrown type, or callable effects do not match its closure signature"
                 )
             }
             try verifyClosureTargetAuthority(
@@ -3889,6 +4023,13 @@ public struct Engine: Verification.ImageVerifying {
                 operation: "closure_apply",
                 fail: fail
             )
+            try verifyExactErrorPropagation(
+                from: signature.thrownType,
+                ifThrowing: signature.effects.mayThrow,
+                to: function,
+                operation: "closure_apply",
+                fail: fail
+            )
             try verifyCall(
                 arguments: arguments,
                 result: result,
@@ -3911,6 +4052,7 @@ public struct Engine: Verification.ImageVerifying {
             }
             guard capabilities.contains(.untypedThrowsV1)
                     || capabilities.contains(.structuredErrorsV1)
+                    || capabilities.contains(.typedThrowsV1)
             else {
                 throw fail("closure_try_apply requires an Error capability")
             }
@@ -3931,6 +4073,7 @@ public struct Engine: Verification.ImageVerifying {
                 arguments: arguments,
                 parameterTypes: signature.parameters,
                 resultType: signature.result,
+                thrownType: signature.thrownType,
                 normalTarget: normalTarget,
                 errorTarget: errorTarget,
                 function: function,
@@ -3942,6 +4085,7 @@ public struct Engine: Verification.ImageVerifying {
         case let .tryApply(calleeID, arguments, normalTarget, errorTarget):
             guard capabilities.contains(.untypedThrowsV1)
                     || capabilities.contains(.structuredErrorsV1)
+                    || capabilities.contains(.typedThrowsV1)
             else {
                 throw fail("try_apply requires an Error capability")
             }
@@ -3962,6 +4106,7 @@ public struct Engine: Verification.ImageVerifying {
                 arguments: arguments,
                 parameterTypes: try parameterTypes(of: callee),
                 resultType: callee.resultType,
+                thrownType: callee.thrownType,
                 normalTarget: normalTarget,
                 errorTarget: errorTarget,
                 function: function,
@@ -3993,6 +4138,7 @@ public struct Engine: Verification.ImageVerifying {
                 arguments: arguments,
                 parameterTypes: descriptor.parameterTypes,
                 resultType: descriptor.resultType,
+                thrownType: nil,
                 normalTarget: normalTarget,
                 errorTarget: errorTarget,
                 function: function,
@@ -4030,6 +4176,7 @@ public struct Engine: Verification.ImageVerifying {
                 arguments: arguments,
                 parameterTypes: descriptor.parameterTypes,
                 resultType: descriptor.resultType,
+                thrownType: nil,
                 normalTarget: normalTarget,
                 errorTarget: errorTarget,
                 function: function,
@@ -4047,28 +4194,28 @@ public struct Engine: Verification.ImageVerifying {
                 }
             }
         case let .throwError(error):
-            switch type(error) {
-            case .string:
-                guard capabilities.contains(.untypedThrowsV1), function.effects.mayThrow else {
-                    throw fail(
-                        "throw_error requires a throwing function and untyped-throws capability"
-                    )
-                }
-            case .error:
-                guard capabilities.contains(.structuredErrorsV1), function.effects.mayThrow else {
-                    throw fail(
-                        "throw_error requires a throwing function and structured-errors capability"
-                    )
-                }
-            default:
-                throw fail("throw_error payload does not match its declared Error capability")
+            guard function.effects.mayThrow,
+                  type(error) == function.thrownType else {
+                throw fail(
+                    "throw_error payload does not match the function's thrown type"
+                )
             }
         case let .sourceFailure(prefix, detail):
             guard !prefix.isEmpty else {
                 throw fail("source_failure requires a nonempty prefix")
             }
-            guard [.string, .error].contains(type(detail)) else {
-                throw fail("source_failure detail must be String or Error")
+            let detailIsRepresentedError: Bool = switch type(detail) {
+            case .string, .error:
+                true
+            case let .local(key):
+                localTypes[key]?.conformsToError == true
+            default:
+                false
+            }
+            guard detailIsRepresentedError else {
+                throw fail(
+                    "source_failure detail must be String or represented Error"
+                )
             }
         case .trap:
             break
@@ -4174,6 +4321,37 @@ public struct Engine: Verification.ImageVerifying {
         }
     }
 
+    private func verifyExactErrorPropagation(
+        from calleeThrownType: Bytecode.ValueType?,
+        ifThrowing mayThrow: Bool,
+        to caller: Bytecode.Function,
+        operation: String,
+        fail: (String) -> Verification.Error
+    ) throws {
+        guard mayThrow else { return }
+        guard calleeThrownType != nil,
+              calleeThrownType == caller.thrownType
+        else {
+            throw fail(
+                "\(operation) changes the propagated Error type without a concrete reabstraction"
+            )
+        }
+    }
+
+    private func verifyBoundaryErrorPropagation(
+        ifThrowing mayThrow: Bool,
+        to caller: Bytecode.Function,
+        operation: String,
+        fail: (String) -> Verification.Error
+    ) throws {
+        guard mayThrow else { return }
+        guard caller.thrownType == .string || caller.thrownType == .error else {
+            throw fail(
+                "\(operation) cannot propagate a boundary error through a typed-throws function"
+            )
+        }
+    }
+
     /// A closure is an image-local capability for its concrete target. Swift's
     /// function type carries callable ABI only, so target resource authority
     /// is checked once when that capability is constructed.
@@ -4199,6 +4377,7 @@ public struct Engine: Verification.ImageVerifying {
         arguments: [Bytecode.Register],
         parameterTypes: [Bytecode.ValueType],
         resultType: Bytecode.ValueType,
+        thrownType: Bytecode.ValueType?,
         normalTarget: Bytecode.BlockID,
         errorTarget: Bytecode.BlockID,
         function: Bytecode.Function,
@@ -4223,9 +4402,11 @@ public struct Engine: Verification.ImageVerifying {
         guard let normal = blocks[normalTarget] else {
             throw fail("unknown try_apply normal target \(normalTarget)")
         }
-        if resultType == .void {
+        if resultType == .void || resultType == .never {
             guard normal.parameters.isEmpty else {
-                throw fail("Void try_apply normal target must not accept a result")
+                throw fail(
+                    "Void/Never try_apply normal target must not accept a result"
+                )
             }
         } else {
             guard normal.parameters.count == 1,
@@ -4238,6 +4419,12 @@ public struct Engine: Verification.ImageVerifying {
               let errorType = failure.parameters.first.flatMap({ function.type(of: $0) })
         else {
             throw fail("try_apply error target must accept one Error value")
+        }
+        if let thrownType {
+            guard errorType == thrownType else {
+                throw fail("try_apply error target does not match the callee's thrown type")
+            }
+            return
         }
         switch errorType {
         case .string where capabilities.contains(.untypedThrowsV1):

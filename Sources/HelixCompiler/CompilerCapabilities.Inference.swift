@@ -19,7 +19,10 @@ extension CompilerCapabilities {
             case .concreteSpecialization:
                 capabilities.insert(.compilerSpecializationsV1)
             }
-            for type in function.registerTypes + function.stackSlotTypes + [function.resultType] {
+            let referencedTypes = function.registerTypes + function.stackSlotTypes
+                + [function.resultType]
+                + (function.thrownType.map { [$0] } ?? [])
+            for type in referencedTypes {
                 collect(type, into: &capabilities)
             }
             if function.registerTypes.contains(where: \.containsNestedClosureValue)
@@ -36,29 +39,8 @@ extension CompilerCapabilities {
             if function.parameterConventions.contains(.borrowed) {
                 capabilities.insert(.borrowCallsV1)
             }
-            if function.effects.mayThrow {
-                let thrownTypes = function.blocks.flatMap(\.instructions).compactMap {
-                    instruction -> Bytecode.ValueType? in
-                    guard case let .throwError(error) = instruction,
-                          function.registerTypes.indices.contains(Int(error.rawValue))
-                    else { return nil }
-                    return function.registerTypes[Int(error.rawValue)]
-                }
-                if thrownTypes.isEmpty {
-                    capabilities.insert(
-                        function.registerTypes.contains(.error)
-                            ? .structuredErrorsV1
-                            : .untypedThrowsV1
-                    )
-                } else {
-                    for type in thrownTypes {
-                        switch type {
-                        case .error: capabilities.insert(.structuredErrorsV1)
-                        case .string: capabilities.insert(.untypedThrowsV1)
-                        default: break
-                        }
-                    }
-                }
+            if let thrownType = function.thrownType {
+                collectThrownType(thrownType, into: &capabilities)
             }
             // Capability inference must remain total even for malformed IR; verification
             // owns the duplicate-block diagnostic instead of allowing a Dictionary trap.
@@ -98,6 +80,7 @@ extension CompilerCapabilities {
                 switch function.registerTypes[Int(parameter.rawValue)] {
                 case .error: capabilities.insert(.structuredErrorsV1)
                 case .string: capabilities.insert(.untypedThrowsV1)
+                case .local: capabilities.insert(.typedThrowsV1)
                 default: break
                 }
             }
@@ -159,7 +142,10 @@ extension CompilerCapabilities {
             capabilities.insert(.structuredErrorsV1)
         case let .closure(signature):
             capabilities.insert(.closureValuesV1)
-            for component in signature.parameters + [signature.result] {
+            if let thrownType = signature.thrownType {
+                collectThrownType(thrownType, into: &capabilities)
+            }
+            for component in signature.componentTypes {
                 collect(component, into: &capabilities)
             }
         case let .address(pointee):
@@ -193,6 +179,22 @@ extension CompilerCapabilities {
         case let .optional(wrapped):
             collect(wrapped, into: &capabilities)
         case .void, .never, .bool, .integer, .float:
+            break
+        }
+    }
+
+    private static func collectThrownType(
+        _ type: Bytecode.ValueType,
+        into capabilities: inout Set<Core.Capability>
+    ) {
+        switch type {
+        case .string:
+            capabilities.formUnion([.stringsV1, .untypedThrowsV1])
+        case .error:
+            capabilities.insert(.structuredErrorsV1)
+        case .local:
+            capabilities.formUnion([.localNominalsV1, .typedThrowsV1])
+        default:
             break
         }
     }

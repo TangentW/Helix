@@ -56,6 +56,7 @@ extension Bytecode.ClosureSignature {
     /// cross this synchronous boundary.
     public var isNativeBridgeCallback: Bool {
         hasCanonicalCallableEffects
+            && hasCanonicalThrownType
             && result == .void
             && !effects.mayThrow
             && !effects.isAsync

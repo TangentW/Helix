@@ -2405,10 +2405,15 @@ public struct Generator: Sendable {
                 + "\(renderValueTypes(signature.parameters)), parameterConventions: "
                 + "\(renderParameterConventions(signature.parameterConventions)), "
                 + "result: \(render(signature.result)), "
+                + "thrownType: \(render(signature.thrownType)), "
                 + "effects: \(render(signature.effects))))"
         case let .tuple(elements): ".tuple(\(renderValueTypes(elements)))"
         case let .optional(wrapped): ".optional(\(render(wrapped)))"
         }
+    }
+
+    private func render(_ type: Bytecode.ValueType?) -> String {
+        type.map(render) ?? "nil"
     }
 
     private func renderValueTypes(_ types: [Bytecode.ValueType]) -> String {

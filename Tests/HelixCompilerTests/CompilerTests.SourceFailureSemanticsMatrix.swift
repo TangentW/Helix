@@ -31,6 +31,7 @@ struct SourceFailureSemanticsMatrix {
                 .debugAssertion
             ),
             ("swift_unexpectedError", .unexpectedError),
+            ("swift_unexpectedErrorTyped", .typedUnexpectedError),
         ]
 
         for (symbol, expected) in cases {

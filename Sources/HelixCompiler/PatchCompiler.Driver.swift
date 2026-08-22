@@ -131,6 +131,7 @@ public struct Driver: Sendable {
                   actualParameters == item.signature.parameters,
                   lowered.parameterConventions == item.signature.parameterConventions,
                   lowered.resultType == item.signature.result,
+                  lowered.thrownType == item.signature.thrownType,
                   lowered.effects == item.signature.effects
             else {
                 throw PatchCompiler.CompilationError.generatedFunctionUnsupported(

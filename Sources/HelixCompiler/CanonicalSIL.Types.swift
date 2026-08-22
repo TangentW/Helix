@@ -1031,13 +1031,17 @@ public struct TypeEnvironment: Sendable {
         else {
             throw CanonicalSIL.LoweringError.unsupportedType(raw)
         }
-        let parameterTuple = String(type[..<arrow.lowerBound])
+        let prefix = String(type[..<arrow.lowerBound])
             .trimmingCharacters(in: .whitespaces)
-        guard parameterTuple.first == "(", parameterTuple.last == ")" else {
-            throw CanonicalSIL.LoweringError.malformedSIL(
-                "closure type has no parameter tuple: \(raw)"
-            )
-        }
+        let clauses = try closureParameterAndEffectClauses(
+            prefix,
+            original: raw
+        )
+        let parameterTuple = clauses.parameters
+        let sourceError = try sourceClosureErrorChannel(
+            clauses.effects,
+            relativeTo: parentScope
+        )
         let components = splitTopLevelTuple(parameterTuple)
         let parameters: [Bytecode.ValueType]
         let parameterConventions: [Bytecode.ParameterConvention]
@@ -1063,14 +1067,14 @@ public struct TypeEnvironment: Sendable {
             .trimmingCharacters(in: .whitespaces)
         let resultComponents = splitTopLevelTuple(resultText)
         let result: Bytecode.ValueType
-        let mayThrow: Bool
+        let silError: ClosureErrorChannel?
         if resultComponents.count == 1,
            let error = try closureErrorChannel(
             resultComponents[0],
             relativeTo: parentScope
            ) {
             result = .void
-            mayThrow = error
+            silError = error
         } else if resultComponents.count == 2,
                   let error = try closureErrorChannel(
                     resultComponents[1],
@@ -1080,17 +1084,25 @@ public struct TypeEnvironment: Sendable {
                 resultComponents[0],
                 relativeTo: parentScope
             )
-            mayThrow = error
+            silError = error
         } else {
             result = try resolve(resultText, relativeTo: parentScope)
-            mayThrow = false
+            silError = nil
         }
+        guard !sourceError.isPresent || silError == nil else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "closure type encodes its error channel twice: \(raw)"
+            )
+        }
+        let thrownType = sourceError.isPresent
+            ? sourceError.thrownType : silError?.thrownType
         return .init(
             parameters: parameters,
             parameterConventions: parameterConventions,
             result: result,
+            thrownType: thrownType,
             effects: .init(
-                mayThrow: mayThrow,
+                mayThrow: thrownType != nil,
                 requiresMainActor: requiresMainActor
             )
         )
@@ -1112,10 +1124,101 @@ public struct TypeEnvironment: Sendable {
                 : .owned
     }
 
+    private struct ClosureErrorChannel {
+        var thrownType: Bytecode.ValueType?
+    }
+
+    private struct SourceClosureErrorChannel {
+        var isPresent: Bool
+        var thrownType: Bytecode.ValueType?
+    }
+
+    private func closureParameterAndEffectClauses(
+        _ prefix: String,
+        original: String
+    ) throws -> (parameters: String, effects: String) {
+        guard prefix.first == "(" else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "closure type has no parameter tuple: \(original)"
+            )
+        }
+        var depth = 0
+        for index in prefix.indices {
+            switch prefix[index] {
+            case "(": depth += 1
+            case ")":
+                depth -= 1
+                if depth == 0 {
+                    let end = prefix.index(after: index)
+                    return (
+                        String(prefix[..<end]),
+                        String(prefix[end...])
+                            .trimmingCharacters(in: .whitespaces)
+                    )
+                }
+            default:
+                break
+            }
+            guard depth >= 0 else { break }
+        }
+        throw CanonicalSIL.LoweringError.malformedSIL(
+            "closure type has an unbalanced parameter tuple: \(original)"
+        )
+    }
+
+    private func sourceClosureErrorChannel(
+        _ raw: String,
+        relativeTo parentScope: String?
+    ) throws -> SourceClosureErrorChannel {
+        let value = raw.trimmingCharacters(in: .whitespaces)
+        guard !value.isEmpty else {
+            return .init(isPresent: false, thrownType: nil)
+        }
+        guard !value.contains("async") else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "async closure"
+            )
+        }
+        guard value.hasPrefix("throws") else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "closure effect clause \(value)"
+            )
+        }
+        let errorSpelling = String(value.dropFirst("throws".count))
+            .trimmingCharacters(in: .whitespaces)
+        let errorType: Bytecode.ValueType
+        if errorSpelling.isEmpty {
+            errorType = try resolve(
+                "any Error",
+                relativeTo: parentScope
+            )
+        } else {
+            guard errorSpelling.first == "(",
+                  errorSpelling.last == ")"
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "typed closure throws clause is malformed"
+                )
+            }
+            let spelling = String(errorSpelling.dropFirst().dropLast())
+                .trimmingCharacters(in: .whitespaces)
+            guard !spelling.isEmpty else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "typed closure throws clause has no error type"
+                )
+            }
+            errorType = try resolve(spelling, relativeTo: parentScope)
+        }
+        return .init(
+            isPresent: true,
+            thrownType: try validatedClosureThrownType(errorType)
+        )
+    }
+
     private func closureErrorChannel(
         _ raw: String,
         relativeTo parentScope: String?
-    ) throws -> Bool? {
+    ) throws -> ClosureErrorChannel? {
         let value = raw.trimmingCharacters(in: .whitespaces)
         let prefixes = ["@error_indirect ", "@error "]
         guard let prefix = prefixes.first(where: value.hasPrefix) else {
@@ -1125,11 +1228,19 @@ public struct TypeEnvironment: Sendable {
             String(value.dropFirst(prefix.count)),
             relativeTo: parentScope
         )
+        return .init(thrownType: try validatedClosureThrownType(type))
+    }
+
+    private func validatedClosureThrownType(
+        _ type: Bytecode.ValueType
+    ) throws -> Bytecode.ValueType? {
         switch type {
         case .never:
-            return false
+            return nil
         case .string, .error:
-            return true
+            return type
+        case let .local(key) where try definition(for: key).conformsToError:
+            return type
         default:
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "closure has a non-Error error result"
@@ -1356,14 +1467,18 @@ public struct TypeEnvironment: Sendable {
             case let .tuple(elements):
                 elements.forEach(collect)
             case let .closure(signature):
-                (signature.parameters + [signature.result]).forEach(collect)
+                signature.componentTypes.forEach(collect)
             case .void, .never, .bool, .integer, .float, .string, .any, .native,
                  .error:
                 break
             }
         }
         for function in functions {
-            for type in function.registerTypes + function.stackSlotTypes + [function.resultType] {
+            let functionTypes = function.registerTypes
+                + function.stackSlotTypes
+                + [function.resultType]
+                + (function.thrownType.map { [$0] } ?? [])
+            for type in functionTypes {
                 collect(type)
             }
         }

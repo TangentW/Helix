@@ -180,6 +180,7 @@ public struct Lowerer: Sendable {
         var physicalParameterConventions: [Bytecode.ParameterConvention]
         var physicalValueParameterSpellings: [String]
         var hasIndirectResult: Bool
+        var thrownType: Bytecode.ValueType?
         var indirectErrorType: Bytecode.ValueType?
         var erasedMetatypes: [ErasedMetatype]
         var usesObjectiveCBridge: Bool
@@ -533,6 +534,7 @@ public struct Lowerer: Sendable {
             parameterConventions: [Bytecode.ParameterConvention],
             result: Bytecode.ValueType,
             hasIndirectResult: Bool,
+            thrownType: Bytecode.ValueType?,
             indirectErrorType: Bytecode.ValueType?,
             effects: Core.Effects,
             erasedMetatypes: [ErasedMetatype]
@@ -961,7 +963,9 @@ public struct Lowerer: Sendable {
         var compilerAddressMergeRegisters: [
             Bytecode.BlockID: [String: Bytecode.Register]
         ] = [:]
-        var suppressedVoidTryNormalBlocks = Set<Bytecode.BlockID>()
+        var suppressedTryNormalParameterTypes: [
+            Bytecode.BlockID: Bytecode.ValueType
+        ] = [:]
         var blocks: [IntermediateRepresentation.Block] = []
         var current: IntermediateRepresentation.Block?
         var unreachableTrapReasons: [Bytecode.BlockID: Bytecode.TrapReason] = [:]
@@ -2845,6 +2849,7 @@ public struct Lowerer: Sendable {
                     physicalParameterConventions: callee.parameterConventions,
                     physicalValueParameterSpellings: physicalSpellings,
                     hasIndirectResult: callee.hasIndirectResult,
+                    thrownType: callee.thrownType,
                     indirectErrorType: callee.indirectErrorType,
                     erasedMetatypes: callee.erasedMetatypes,
                     usesObjectiveCBridge: usesObjectiveCBridge
@@ -3881,12 +3886,19 @@ public struct Lowerer: Sendable {
             normalTarget: Bytecode.BlockID,
             errorTarget: Bytecode.BlockID
         ) throws {
-            if destinations.result != nil || resultType == .void {
+            if destinations.result != nil
+                || resultType == .void
+                || resultType == .never {
+                let suppressedType: Bytecode.ValueType = resultType == .never
+                    ? .never : .void
                 guard implicitStackValues[normalTarget] == nil,
-                      suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
+                      suppressedTryNormalParameterTypes.updateValue(
+                        suppressedType,
+                        forKey: normalTarget
+                      ) == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Void or indirect call normal continuation is shared"
+                        "uninhabited or indirect call normal continuation is shared"
                     )
                 }
                 if let destination = destinations.result,
@@ -3897,9 +3909,8 @@ public struct Lowerer: Sendable {
             }
 
             if let destination = destinations.error {
-                let runtimeErrorType: Bytecode.ValueType = typeEnvironment
-                    .preservesTypedErrors ? .error : .string
-                guard indirectErrorType == runtimeErrorType,
+                guard let runtimeErrorType = indirectErrorType,
+                      runtimeErrorType != .never,
                       implicitStackValues[errorTarget] == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -4327,22 +4338,76 @@ public struct Lowerer: Sendable {
             try storeVMValue(value, at: token, requestedMode: mode)
         }
 
-        func materializeErrorValue(
-            from token: String
-        ) throws -> Bytecode.Register? {
-            if let value = values[token],
-               [.string, .error].contains(
-                   registerTypes[Int(value.rawValue)]
-               ) {
-                return value
+        func isRepresentedErrorType(
+            _ type: Bytecode.ValueType
+        ) throws -> Bool {
+            switch type {
+            case .string, .error:
+                true
+            case let .local(key):
+                try typeEnvironment.definition(for: key).conformsToError
+            default:
+                false
             }
-            guard let message = errorMessageByBox[token] else { return nil }
+        }
+
+        func materializeErrorValue(
+            from token: String,
+            expectedType: Bytecode.ValueType? = nil
+        ) throws -> Bytecode.Register? {
+            if let value = values[token] {
+                let type = registerTypes[Int(value.rawValue)]
+                if try isRepresentedErrorType(type),
+                   expectedType == nil || type == expectedType {
+                    return value
+                }
+            }
+            guard expectedType == nil || expectedType == .string,
+                  let message = errorMessageByBox[token]
+            else { return nil }
             let value = try allocate(type: .string)
             appendInstruction(
                 .constantString(result: value, value: message)
             )
             values[token] = value
             return value
+        }
+
+        func closureThrownType(
+            _ signature: Bytecode.ClosureSignature,
+            context: String
+        ) throws -> Bytecode.ValueType? {
+            guard signature.hasCanonicalThrownType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) has an inconsistent throwing ABI"
+                )
+            }
+            guard let thrownType = signature.thrownType else { return nil }
+            guard try isRepresentedErrorType(thrownType) else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) has a non-Error thrown type"
+                )
+            }
+            return thrownType
+        }
+
+        func closureThrownType(
+            _ signature: Bytecode.ClosureSignature,
+            matching physicalErrorType: Bytecode.ValueType,
+            context: String
+        ) throws -> Bytecode.ValueType? {
+            let thrownType = try closureThrownType(
+                signature,
+                context: context
+            )
+            let normalizedPhysicalType: Bytecode.ValueType? =
+                physicalErrorType == .never ? nil : physicalErrorType
+            guard thrownType == normalizedPhysicalType else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) changes its concrete error-result type"
+                )
+            }
+            return thrownType
         }
 
         func applyStrongReferenceOperation(
@@ -4391,7 +4456,10 @@ public struct Lowerer: Sendable {
         ) throws {
             guard let destinationType = compilerAddressType(destination),
                   [.string, .error].contains(destinationType),
-                  let materialized = try materializeErrorValue(from: box),
+                  let materialized = try materializeErrorValue(
+                    from: box,
+                    expectedType: destinationType
+                  ),
                   registerTypes[Int(materialized.rawValue)] == destinationType
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
@@ -4940,7 +5008,10 @@ public struct Lowerer: Sendable {
                 guard plan.source.managedCollectionType == arrayType,
                       compilerAddressType(plan.sourceToken) == arrayType,
                       implicitStackValues[normalTarget] == nil,
-                      suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
+                      suppressedTryNormalParameterTypes.updateValue(
+                        .void,
+                        forKey: normalTarget
+                      ) == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "sort(by:) requires one mutable Array continuation"
@@ -5003,8 +5074,15 @@ public struct Lowerer: Sendable {
                 normalTarget: normalTarget
             )
 
-            let errorType: Bytecode.ValueType = typeEnvironment
-                .preservesTypedErrors ? .error : .string
+            guard let errorType = try closureThrownType(
+                closureSignature,
+                context: "Sequence ordering closure"
+            ) else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<Sequence ordering closure>"
+                )
+            }
             let errorParameter = try allocate(type: errorType)
             let stateType = Bytecode.ValueType.arrayState(
                 kind: .stableSort,
@@ -5145,7 +5223,10 @@ public struct Lowerer: Sendable {
                   registerTypes[Int(source.rawValue)] == arrayType,
                   implicitStackValues[normalTarget] == nil,
                   implicitStackValues[errorTarget] == nil,
-                  suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
+                  suppressedTryNormalParameterTypes.updateValue(
+                    .void,
+                    forKey: normalTarget
+                  ) == nil
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "predicate mutation requires one mutable Array continuation"
@@ -5229,14 +5310,22 @@ public struct Lowerer: Sendable {
                 appendInstruction(.destroyValue(source))
                 traversalSource = nil
             }
+            guard let errorType = try closureThrownType(
+                signature,
+                context: "Array predicate mutation closure"
+            ) else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<Array predicate mutation closure>"
+                )
+            }
             return .init(
                 arrayType: arrayType,
                 closure: closure,
                 closureSignature: signature,
                 state: state,
                 count: count,
-                errorType: typeEnvironment.preservesTypedErrors
-                    ? .error : .string,
+                errorType: errorType,
                 traversalSource: traversalSource,
                 indexBase: indexBase
             )
@@ -6092,8 +6181,15 @@ public struct Lowerer: Sendable {
                 )
             }
 
-            let errorType: Bytecode.ValueType = typeEnvironment
-                .preservesTypedErrors ? .error : .string
+            guard let errorType = try closureThrownType(
+                signature,
+                context: "Array split predicate"
+            ) else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<Array split predicate>"
+                )
+            }
             let error = try allocate(type: errorType)
             let state = try allocate(
                 type: .arrayState(kind: .split, element: plan.elementType)
@@ -6288,8 +6384,10 @@ public struct Lowerer: Sendable {
                         == plan.dictionaryType,
                       implicitStackValues[normalTarget] == nil,
                       implicitStackValues[errorTarget] == nil,
-                      suppressedVoidTryNormalBlocks
-                        .insert(normalTarget).inserted
+                      suppressedTryNormalParameterTypes.updateValue(
+                        .void,
+                        forKey: normalTarget
+                      ) == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Dictionary accumulation inout seed cannot be written back"
@@ -6341,8 +6439,15 @@ public struct Lowerer: Sendable {
                 )
             )
 
-            let errorType: Bytecode.ValueType = typeEnvironment
-                .preservesTypedErrors ? .error : .string
+            guard let errorType = try closureThrownType(
+                closureSignature,
+                context: "Dictionary accumulation closure"
+            ) else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<Dictionary accumulation closure>"
+                )
+            }
             let error = try allocate(type: errorType)
             let completedDictionary = try allocate(
                 type: plan.dictionaryType
@@ -6614,7 +6719,10 @@ public struct Lowerer: Sendable {
             guard compilerAddressType(resultDestination)
                     == plan.callResultType,
                   implicitStackValues[normalTarget] == nil,
-                  suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
+                  suppressedTryNormalParameterTypes.updateValue(
+                    .void,
+                    forKey: normalTarget
+                  ) == nil
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "reduce(into:_:) indirect result destination is invalid"
@@ -6625,8 +6733,15 @@ public struct Lowerer: Sendable {
                 .init(resultDestination, propagatedResult),
             ]
 
-            let errorValueType: Bytecode.ValueType = typeEnvironment
-                .preservesTypedErrors ? .error : .string
+            guard let errorValueType = try closureThrownType(
+                closureSignature,
+                context: "reduce(into:) closure"
+            ) else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "<reduce(into:) closure>"
+                )
+            }
             let errorParameter = try allocate(type: errorValueType)
             if let errorDestination = plan.errorDestination {
                 guard compilerAddressType(errorDestination) == errorValueType,
@@ -6892,7 +7007,11 @@ public struct Lowerer: Sendable {
                 )
             }
 
-            let isThrowing = closureSignature.effects.mayThrow
+            let closureErrorType = try closureThrownType(
+                closureSignature,
+                context: "higher-order closure"
+            )
+            let isThrowing = closureErrorType != nil
             if let errorGenericIndex = plan.operation.explicitErrorGenericIndex {
                 let genericSpellings = splitTopLevel(genericArguments)
                     .filter { !$0.isEmpty }
@@ -6906,7 +7025,11 @@ public struct Lowerer: Sendable {
                 let errorType = try parseType(
                     genericSpellings[errorGenericIndex]
                 )
-                guard (errorType == .never) == !isThrowing,
+                guard try closureThrownType(
+                    closureSignature,
+                    matching: errorType,
+                    context: "typed-throws Sequence operation"
+                ) == closureErrorType,
                       plan.errorDestination.map({
                         compilerAddressType($0) == errorType
                       }) == true
@@ -6916,17 +7039,27 @@ public struct Lowerer: Sendable {
                     )
                 }
             } else {
-                guard isThrowing else {
+                guard let closureErrorType else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "higher-order rethrows ABI lost its Error channel"
                     )
+                }
+                if let destination = plan.errorDestination {
+                    guard compilerAddressType(destination) == closureErrorType else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "higher-order rethrows Error does not match its closure"
+                        )
+                    }
                 }
             }
 
             if let destination = plan.resultDestination {
                 guard compilerAddressType(destination) == plan.callResultType,
                       implicitStackValues[normalTarget] == nil,
-                      suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
+                      suppressedTryNormalParameterTypes.updateValue(
+                        .void,
+                        forKey: normalTarget
+                      ) == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "higher-order indirect result destination is invalid"
@@ -6935,8 +7068,10 @@ public struct Lowerer: Sendable {
                 let parameter = try allocate(type: plan.callResultType)
                 implicitStackValues[normalTarget] = [.init(destination, parameter)]
             } else if plan.callResultType == .void {
-                guard suppressedVoidTryNormalBlocks
-                    .insert(normalTarget).inserted
+                guard suppressedTryNormalParameterTypes.updateValue(
+                    .void,
+                    forKey: normalTarget
+                ) == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "higher-order Void continuation is shared"
@@ -6944,11 +7079,14 @@ public struct Lowerer: Sendable {
                 }
             }
 
-            let errorValueType: Bytecode.ValueType = typeEnvironment
-                .preservesTypedErrors ? .error : .string
             let errorCleanup = try allocateSyntheticBlockID()
             let errorParameter: Bytecode.Register?
             if isThrowing {
+                guard let errorValueType = closureErrorType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "higher-order closure lost its Error channel"
+                    )
+                }
                 errorParameter = try allocate(type: errorValueType)
                 if let destination = plan.errorDestination {
                     guard compilerAddressType(destination) == errorValueType,
@@ -8872,6 +9010,16 @@ public struct Lowerer: Sendable {
                     mangledName: "Result(catching:)"
                 )
             }
+            guard try closureThrownType(
+                signature,
+                matching: plan.errorType,
+                context: "Result(catching:) closure"
+            ) != nil else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "Result(catching:)"
+                )
+            }
 
             let successTarget = try allocateSyntheticBlockID()
             let failureTarget = try allocateSyntheticBlockID()
@@ -9043,9 +9191,13 @@ public struct Lowerer: Sendable {
             let completionTarget: Bytecode.BlockID
             let directResultToken: String?
             let errorTarget: Bytecode.BlockID?
+            let closureErrorType = try closureThrownType(
+                signature,
+                context: "algebraic transform closure"
+            )
             switch invocation {
             case let .direct(resultToken):
-                guard !signature.effects.mayThrow,
+                guard closureErrorType == nil,
                       plan.errorDestination == nil,
                       plan.errorType == nil
                 else {
@@ -9061,9 +9213,16 @@ public struct Lowerer: Sendable {
             case let .branching(normalTarget, branchErrorTarget):
                 guard let errorType = plan.errorType,
                       plan.errorDestination != nil,
-                      signature.effects.mayThrow == (errorType != .never),
+                      try closureThrownType(
+                        signature,
+                        matching: errorType,
+                        context: "algebraic transform closure"
+                      ) == closureErrorType,
                       implicitStackValues[normalTarget] == nil,
-                      suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
+                      suppressedTryNormalParameterTypes.updateValue(
+                        .void,
+                        forKey: normalTarget
+                      ) == nil
                 else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
                         line: line,
@@ -9079,16 +9238,15 @@ public struct Lowerer: Sendable {
                 errorTarget = branchErrorTarget
             }
 
-            let isThrowing = signature.effects.mayThrow
+            let isThrowing = closureErrorType != nil
             let errorCleanup: Bytecode.BlockID?
             let errorParameter: Bytecode.Register?
             if let errorTarget {
                 let cleanup = try allocateSyntheticBlockID()
                 errorCleanup = cleanup
                 if isThrowing {
-                    let expectedErrorType: Bytecode.ValueType = typeEnvironment
-                        .preservesTypedErrors ? .error : .string
-                    guard plan.errorType == expectedErrorType,
+                    guard let expectedErrorType = closureErrorType,
+                          plan.errorType == expectedErrorType,
                           let errorDestination = plan.errorDestination,
                           implicitStackValues[errorTarget] == nil
                     else {
@@ -9366,7 +9524,10 @@ public struct Lowerer: Sendable {
                   compilerAddressType(plan.errorDestination) == failureType,
                   implicitStackValues[normalTarget] == nil,
                   implicitStackValues[errorTarget] == nil,
-                  suppressedVoidTryNormalBlocks.insert(normalTarget).inserted
+                  suppressedTryNormalParameterTypes.updateValue(
+                    .void,
+                    forKey: normalTarget
+                  ) == nil
             else {
                 throw CanonicalSIL.LoweringError.callSignatureMismatch(
                     line: line,
@@ -15770,7 +15931,7 @@ public struct Lowerer: Sendable {
                 detail: Bytecode.Register
             ) throws {
                 guard !prefix.isEmpty,
-                      [.string, .error].contains(
+                      try isRepresentedErrorType(
                         registerTypes[Int(detail.rawValue)]
                       )
                 else {
@@ -15820,10 +15981,24 @@ public struct Lowerer: Sendable {
                     bitWidth: 64,
                     signed: false
                 )
-                guard genericArguments.isEmpty else {
+                if failure != .typedUnexpectedError,
+                   !genericArguments.isEmpty {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Swift source failure unexpectedly has generic arguments"
                     )
+                }
+
+                func hasUnexpectedErrorMetadata() -> Bool {
+                    guard arguments.count == 5,
+                          let filename = stringLiterals[arguments[1]],
+                          let filenameLength = wordLiterals[arguments[2]],
+                          let filenameIsASCII = boolLiterals[arguments[3]],
+                          let sourceLine = wordLiterals[arguments[4]]
+                    else { return false }
+                    return UInt64(filename.utf8.count) == filenameLength
+                        && filename.utf8.allSatisfy({ $0 < 0x80 })
+                            == filenameIsASCII
+                        && sourceLine > 0
                 }
 
                 switch failure {
@@ -15922,21 +16097,41 @@ public struct Lowerer: Sendable {
                     )
 
                 case .unexpectedError:
-                    guard arguments.count == 5,
-                          let filename = stringLiterals[arguments[1]],
-                          let filenameLength = wordLiterals[arguments[2]],
-                          let filenameIsASCII = boolLiterals[arguments[3]],
-                          let sourceLine = wordLiterals[arguments[4]],
-                          UInt64(filename.utf8.count) == filenameLength,
-                          filename.utf8.allSatisfy({ $0 < 0x80 })
-                            == filenameIsASCII,
-                          sourceLine > 0,
+                    guard hasUnexpectedErrorMetadata(),
                           let detail = try materializeErrorValue(
                             from: arguments[0]
                           )
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "Swift unexpected-error trap has unsupported metadata"
+                        )
+                    }
+                    try emitSourceFailure(
+                        prefix: "try! expression unexpectedly raised an error",
+                        detail: detail
+                    )
+
+                case .typedUnexpectedError:
+                    let specializations = splitTopLevel(genericArguments)
+                        .filter { !$0.isEmpty }
+                    guard specializations.count == 1,
+                          hasUnexpectedErrorMetadata()
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Swift typed unexpected-error trap has unsupported metadata"
+                        )
+                    }
+                    let errorType = try parseStoredType(specializations[0])
+                    guard try isRepresentedErrorType(errorType),
+                          compilerAddressType(arguments[0]) == errorType,
+                          let detail = try copyStoredValue(
+                            at: arguments[0],
+                            line: line
+                          ),
+                          registerTypes[Int(detail.rawValue)] == errorType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Swift typed unexpected-error payload does not match its Error type"
                         )
                     }
                     try emitSourceFailure(
@@ -16697,6 +16892,25 @@ public struct Lowerer: Sendable {
 
             case let .sourceFailure(failure):
                 try lowerSourceFailure(failure)
+
+            case .typedThrowNotification:
+                let specializations = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard !resultToken.isEmpty,
+                      specializations.count == 1,
+                      let thrownType = signature.thrownType,
+                      try parseStoredType(specializations[0]) == thrownType,
+                      arguments.count == 1,
+                      compilerAddressType(arguments[0])
+                        == thrownType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "swift_willThrowTyped does not match the enclosing typed-throws ABI"
+                    )
+                }
+                // The native hook only observes an imminent unwind. HLBC owns
+                // the verified unwind path and has no corresponding side effect.
+                voidValues.insert(resultToken)
 
             case .unsafeOptionalUnwrap:
                 try lowerUnsafeOptionalUnwrap()
@@ -19047,26 +19261,30 @@ public struct Lowerer: Sendable {
                 indirectErrorType: entryBlock == nil
                     ? signature.indirectErrorType
                     : nil,
-                suppressVoidParameter: parseBlockNumber(line).map {
-                    suppressedVoidTryNormalBlocks.contains(.init(rawValue: $0))
-                } ?? false,
+                suppressedParameterType: parseBlockNumber(line).flatMap {
+                    suppressedTryNormalParameterTypes[
+                        .init(rawValue: $0)
+                    ]
+                },
                 allocate: allocate
             ) {
                 finishCurrent()
                 var loweredBlock = block.block
                 let explicitParameters = block.parameters
-                if suppressedVoidTryNormalBlocks.remove(block.block.id) != nil {
+                if let suppressedType = suppressedTryNormalParameterTypes
+                    .removeValue(forKey: block.block.id) {
                     guard explicitParameters.isEmpty else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "try_apply normal block carries a non-Void SIL parameter"
+                            "try_apply normal block carries a represented SIL parameter"
                         )
                     }
-                    if let parameter = block.suppressedVoidParameter {
+                    if suppressedType == .void,
+                       let parameter = block.suppressedParameter {
                         voidValues.insert(parameter)
                     }
-                } else if block.suppressedVoidParameter != nil {
+                } else if block.suppressedParameter != nil {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "block unexpectedly suppresses a Void SIL parameter"
+                        "block unexpectedly suppresses an unrepresented SIL parameter"
                     )
                 }
                 if let inherited = inheritedCompilerAddressValues[block.block.id] {
@@ -21817,6 +22035,12 @@ public struct Lowerer: Sendable {
                     unboundedRangeFunctionReferences.insert(reference[0])
                     continue
                 }
+                if let intrinsic = SwiftCoreIntrinsic(
+                    mangledName: reference[1]
+                ), intrinsic.prefersCanonicalLoweringOverImageBody {
+                    swiftCoreReferences[reference[0]] = intrinsic
+                    continue
+                }
                 let boundCalls = directCalls.bindings(for: reference[1])
                 let hasImageBody = boundCalls.contains { binding in
                     if case .function = binding.target { true } else { false }
@@ -21992,6 +22216,7 @@ public struct Lowerer: Sendable {
                       signature.parameterConventions
                         == binding.parameterConventions,
                       signature.result == binding.resultType,
+                      signature.thrownType == reference.thrownType,
                       signature.effects.mayThrow == binding.effects.mayThrow,
                       signature.effects.isAsync == binding.effects.isAsync,
                       physicalActorIsolationIsCompatible(
@@ -22015,6 +22240,7 @@ public struct Lowerer: Sendable {
                     parameters: binding.parameterTypes,
                     parameterConventions: binding.parameterConventions,
                     result: binding.resultType,
+                    thrownType: signature.thrownType,
                     effects: Bytecode.ClosureSignature.callableEffects(
                         from: binding.effects
                     )
@@ -22137,6 +22363,7 @@ public struct Lowerer: Sendable {
                         == reference.physicalParameterConventions,
                       physicalType.result == binding.resultType,
                       physicalType.hasIndirectResult == reference.hasIndirectResult,
+                      physicalType.thrownType == reference.thrownType,
                       physicalType.indirectErrorType
                         == reference.indirectErrorType,
                       physicalType.effects.mayThrow == binding.effects.mayThrow,
@@ -22250,6 +22477,7 @@ public struct Lowerer: Sendable {
                         binding.parameterConventions.prefix(invocationCount)
                     ),
                     result: binding.resultType,
+                    thrownType: physicalType.thrownType,
                     effects: Bytecode.ClosureSignature.callableEffects(
                         from: binding.effects
                     )
@@ -22626,6 +22854,7 @@ public struct Lowerer: Sendable {
                           appliedType.parameterConventions
                             == signature.parameterConventions,
                           appliedType.result == signature.result,
+                          appliedType.thrownType == signature.thrownType,
                           appliedType.effects.mayThrow,
                           !appliedType.effects.isAsync,
                           physicalActorIsolationIsCompatible(
@@ -22911,6 +23140,7 @@ public struct Lowerer: Sendable {
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
                       appliedType.hasIndirectResult == reference.hasIndirectResult,
+                      appliedType.thrownType == reference.thrownType,
                       appliedType.indirectErrorType
                         == reference.indirectErrorType,
                       appliedType.erasedMetatypes == reference.erasedMetatypes,
@@ -23113,6 +23343,7 @@ public struct Lowerer: Sendable {
                           appliedType.parameterConventions
                             == signature.parameterConventions,
                           appliedType.result == signature.result,
+                          appliedType.thrownType == signature.thrownType,
                           appliedType.effects.mayThrow == signature.effects.mayThrow,
                           appliedType.effects.isAsync == signature.effects.isAsync,
                           physicalActorIsolationIsCompatible(
@@ -23463,8 +23694,9 @@ public struct Lowerer: Sendable {
                             physicalValueParameterSpellings:
                                 try physicalValueParameterSpellings(
                                     in: specializedReferenceType
-                                ),
+                            ),
                             hasIndirectResult: callee.hasIndirectResult,
+                            thrownType: callee.thrownType,
                             indirectErrorType: callee.indirectErrorType,
                             erasedMetatypes: callee.erasedMetatypes,
                             usesObjectiveCBridge: false
@@ -23532,6 +23764,7 @@ public struct Lowerer: Sendable {
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
                       appliedType.hasIndirectResult == reference.hasIndirectResult,
+                      appliedType.thrownType == reference.thrownType,
                       appliedType.indirectErrorType
                         == reference.indirectErrorType,
                       appliedType.erasedMetatypes == reference.erasedMetatypes,
@@ -26449,12 +26682,16 @@ public struct Lowerer: Sendable {
                 continue
             }
             if let thrown = match(line, pattern: #"^throw (%[0-9]+)$"#) {
-                guard signature.effects.mayThrow else {
+                guard signature.effects.mayThrow,
+                      signature.thrownType != nil else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "non-throwing function contains throw"
                     )
                 }
-                if let error = try materializeErrorValue(from: thrown[0]) {
+                if let error = try materializeErrorValue(
+                    from: thrown[0],
+                    expectedType: signature.thrownType
+                ) {
                     appendInstruction(.throwError(error))
                 } else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -26470,9 +26707,8 @@ public struct Lowerer: Sendable {
                         at: address,
                         line: sourceLine
                       ),
-                      [.string, .error].contains(
-                        registerTypes[Int(error.rawValue)]
-                      )
+                      registerTypes[Int(error.rawValue)]
+                        == signature.thrownType
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "throw_addr has no initialized indirect Error value"
@@ -26753,6 +26989,7 @@ public struct Lowerer: Sendable {
             parameterRegisters: parameterRegisters,
             parameterConventions: signature.parameterConventions,
             resultType: signature.result,
+            thrownType: signature.thrownType,
             registerTypes: registerTypes,
             entryBlock: entryBlock,
             blocks: blocks,
@@ -26888,6 +27125,7 @@ public struct Lowerer: Sendable {
         parameterConventions: [Bytecode.ParameterConvention],
         result: Bytecode.ValueType,
         hasIndirectResult: Bool,
+        thrownType: Bytecode.ValueType?,
         indirectErrorType: Bytecode.ValueType?,
         effects: Core.Effects,
         erasedMetatypes: [ErasedMetatype]
@@ -27028,7 +27266,7 @@ public struct Lowerer: Sendable {
         ) != nil
         let resultComponents = splitTopLevelTuple(resultText)
         let parsedResult: (type: Bytecode.ValueType, isIndirect: Bool)
-        let mayThrow: Bool
+        let thrownType: Bytecode.ValueType?
         let indirectErrorType: Bytecode.ValueType?
         if resultComponents.count == 1,
            let error = try supportedErrorResult(resultComponents[0]) {
@@ -27041,7 +27279,7 @@ public struct Lowerer: Sendable {
                 )
             }
             parsedResult = (.void, false)
-            mayThrow = error.isPossible
+            thrownType = error.isPossible ? error.type : nil
             indirectErrorType = error.isIndirect ? error.type : nil
         } else if resultComponents.count >= 2,
                   let errorComponent = resultComponents.last,
@@ -27057,14 +27295,14 @@ public struct Lowerer: Sendable {
                 normalResult,
                 bridgedTo: physicalResultExpectation
             )
-            mayThrow = error.isPossible
+            thrownType = error.isPossible ? error.type : nil
             indirectErrorType = error.isIndirect ? error.type : nil
         } else {
             parsedResult = try parseFunctionResult(
                 resultText,
                 bridgedTo: physicalResultExpectation
             )
-            mayThrow = false
+            thrownType = nil
             indirectErrorType = nil
         }
         return (
@@ -27072,9 +27310,10 @@ public struct Lowerer: Sendable {
             parameterConventions,
             expected?.result ?? parsedResult.type,
             parsedResult.isIndirect,
+            thrownType,
             indirectErrorType,
             .init(
-                mayThrow: mayThrow,
+                mayThrow: thrownType != nil,
                 requiresMainActor: requiresMainActor,
                 isAsync: isAsync
             ),
@@ -27108,7 +27347,16 @@ public struct Lowerer: Sendable {
         if type == .never {
             return .init(type: type, isIndirect: prefix.isIndirect)
         }
-        guard [.string, .error].contains(type) else {
+        switch type {
+        case .string, .error:
+            break
+        case let .local(key):
+            guard try typeEnvironment.definition(for: key).conformsToError else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "throwing function has a non-Error error result"
+                )
+            }
+        default:
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "throwing function has a non-Error error result"
             )
@@ -27433,6 +27681,7 @@ public struct Lowerer: Sendable {
     ) -> Bool {
         guard physical.parameters == swift.parameters,
               physical.result == swift.result,
+              physical.thrownType == swift.thrownType,
               physical.effects.mayThrow == swift.effects.mayThrow,
               physical.effects.isAsync == swift.effects.isAsync,
               physical.parameterConventions.count
@@ -27468,6 +27717,7 @@ public struct Lowerer: Sendable {
         lhs.parameters == rhs.parameters
             && lhs.parameterConventions == rhs.parameterConventions
             && lhs.result == rhs.result
+            && lhs.thrownType == rhs.thrownType
             && lhs.effects.mayThrow == rhs.effects.mayThrow
             && lhs.effects.isAsync == rhs.effects.isAsync
     }
@@ -27811,7 +28061,7 @@ public struct Lowerer: Sendable {
         bridgedParameterTypes: [Bytecode.ValueType]?,
         indirectResultType: Bytecode.ValueType?,
         indirectErrorType: Bytecode.ValueType?,
-        suppressVoidParameter: Bool,
+        suppressedParameterType: Bytecode.ValueType?,
         allocate: (Bytecode.ValueType) throws -> Bytecode.Register
     ) throws -> (
         block: IntermediateRepresentation.Block,
@@ -27820,7 +28070,7 @@ public struct Lowerer: Sendable {
         indirectErrorAddress: String?,
         indirectValueParameters: [String: Bytecode.ValueType],
         mutableCellParameters: [String: Bytecode.ValueType],
-        suppressedVoidParameter: String?,
+        suppressedParameter: String?,
         erasedMetatypeParameters: [(String, MetatypeIdentity)]
     )? {
         guard let match = match(line, pattern: #"^bb([0-9]+)(?:\((.*)\))?:$"#) else { return nil }
@@ -27831,7 +28081,7 @@ public struct Lowerer: Sendable {
         var indirectErrorAddress: String?
         var indirectValueParameters: [String: Bytecode.ValueType] = [:]
         var mutableCellParameters: [String: Bytecode.ValueType] = [:]
-        var suppressedVoidParameter: String?
+        var suppressedParameter: String?
         var erasedMetatypeParameters: [(String, MetatypeIdentity)] = []
         let erasedByIndex = Dictionary(
             uniqueKeysWithValues: erasedMetatypes.map {
@@ -27855,7 +28105,7 @@ public struct Lowerer: Sendable {
                     "bridged block parameter count differs from its Optional payload"
                 )
             }
-            if suppressVoidParameter, components.count != 1 {
+            if suppressedParameterType != nil, components.count != 1 {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "try_apply normal block has unexpected SIL parameters"
                 )
@@ -27915,17 +28165,19 @@ public struct Lowerer: Sendable {
                     )
                 } else {
                     let parsed = try parseType(value[1])
-                    physicalType = suppressVoidParameter
+                    physicalType = suppressedParameterType != nil
                         ? parsed
                         : ValueRepresentation.storable(parsed)
                 }
-                if suppressVoidParameter {
-                    guard physicalIndex == 0, physicalType == .void else {
+                if let suppressedParameterType {
+                    guard physicalIndex == 0,
+                          physicalType == suppressedParameterType
+                    else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "try_apply normal block parameter is not Void"
+                            "try_apply normal block parameter does not match its unrepresented type"
                         )
                     }
-                    suppressedVoidParameter = value[0]
+                    suppressedParameter = value[0]
                     continue
                 }
                 let logicalIndex = parameters.count
@@ -27955,7 +28207,7 @@ public struct Lowerer: Sendable {
             indirectErrorAddress,
             indirectValueParameters,
             mutableCellParameters,
-            suppressedVoidParameter,
+            suppressedParameter,
             erasedMetatypeParameters
         )
     }

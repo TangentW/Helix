@@ -48,7 +48,7 @@ public enum Disassembler {
                 return "\(register): \(prefix)\(function.type(of: register)?.description ?? "<invalid>")"
             }.joined(separator: ", ")
             lines.append("")
-            let throwing = function.effects.mayThrow ? " throws" : ""
+            let throwing = function.thrownType.map { " throws(\($0))" } ?? ""
             let kind = function.kind == .ordinary ? "" : " @\(function.kind.rawValue)"
             let declarationLocation = function.sourceLocation.map { " @ \($0)" } ?? ""
             lines.append("func\(kind) @\(function.id)(\(parameters))\(throwing) -> \(function.resultType) { // \(function.name)\(declarationLocation)")

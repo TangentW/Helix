@@ -15,6 +15,9 @@ enum SourceFailureIntrinsic: Equatable {
     case debugAssertion
     /// The Swift runtime sink emitted for a failed `try!` expression.
     case unexpectedError
+    /// The generic runtime sink emitted when `try!` consumes a concrete
+    /// `throws(Failure)` error result.
+    case typedUnexpectedError
 
     init?(mangledName: String) {
         switch mangledName {
@@ -29,6 +32,8 @@ enum SourceFailureIntrinsic: Equatable {
             self = .debugAssertion
         case "swift_unexpectedError":
             self = .unexpectedError
+        case "swift_unexpectedErrorTyped":
+            self = .typedUnexpectedError
         default:
             return nil
         }

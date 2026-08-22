@@ -324,6 +324,15 @@ the closed hosted profile and cross into native code as that superclass. The
 current profile is limited to inherited no-argument initialization, no stored
 properties, and no-argument/Bool `Void` overrides.
 
+Within one verified image, a concrete `throws(Failure)` callable preserves the
+exact Error-conforming patch-local nominal through direct and closure calls,
+escaping aggregate storage, concrete generic forwarding, supported concrete
+higher-order standard-library calls, and catch continuations. This current v1
+ABI is gated by `typed-throws-1`; its thrown payload is not reduced to a String,
+and conversion to `throws(any Error)` is
+accepted only through a concrete compiler reabstraction thunk. Typed-throws
+Shell roots and throwing NativeImport callbacks remain outside the profile.
+
 NativeImport also accepts exact direct or Optional callback parameters through
 one generated adapter family for Swift closures and Objective-C blocks. The v1
 profile is synchronous, nonthrowing, and `Void`-returning, preserves each

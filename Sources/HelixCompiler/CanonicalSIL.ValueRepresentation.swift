@@ -39,6 +39,7 @@ enum ValueRepresentation {
                     parameters: signature.parameters.map(storable),
                     parameterConventions: signature.parameterConventions,
                     result: signature.result,
+                    thrownType: signature.thrownType.map(storable),
                     effects: signature.effects
                 )
             )

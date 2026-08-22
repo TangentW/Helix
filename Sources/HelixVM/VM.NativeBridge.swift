@@ -124,11 +124,8 @@ public struct NativeInvocationContext {
               let expectedShape = state.parameterTypes[parameterIndex]
                 .directClosureShape,
               case let .closure(closure) = value,
-              closure.signature.hasCanonicalCallableEffects,
               closure.signature == expectedShape.signature,
-              closure.signature.result == .void,
-              !closure.signature.effects.mayThrow,
-              !closure.signature.effects.isAsync
+              closure.signature.isNativeBridgeCallback
         else {
             throw VM.RuntimeTrap.nativeFailure(
                 "native callback export received an unsupported closure value"

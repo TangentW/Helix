@@ -619,6 +619,7 @@ enum StaticKeyPath {
             parameterConventions: [Bytecode.ParameterConvention],
             result: Bytecode.ValueType,
             hasIndirectResult: Bool,
+            thrownType: Bytecode.ValueType?,
             indirectErrorType: Bytecode.ValueType?,
             effects: Core.Effects,
             erasedMetatypes: [CanonicalSIL.Lowerer.ErasedMetatype]

@@ -811,7 +811,7 @@ public struct Archive: Codable, Hashable, Sendable {
             case let .tuple(elements):
                 elements.contains(where: usesMainActorType)
             case let .closure(signature):
-                (signature.parameters + [signature.result]).contains(where: usesMainActorType)
+                signature.componentTypes.contains(where: usesMainActorType)
             case let .mutableCell(pointee):
                 usesMainActorType(pointee)
             case let .nonOwningReference(_, pointee):

@@ -43,6 +43,7 @@ public struct Function: Hashable, Sendable {
     public var parameterRegisters: [IntermediateRepresentation.Register]
     public var parameterConventions: [Bytecode.ParameterConvention]
     public var resultType: IntermediateRepresentation.ValueType
+    public var thrownType: IntermediateRepresentation.ValueType?
     public var registerTypes: [IntermediateRepresentation.ValueType]
     public var stackSlotTypes: [IntermediateRepresentation.ValueType]
     public var effects: Core.Effects
@@ -57,6 +58,7 @@ public struct Function: Hashable, Sendable {
         parameterRegisters: [IntermediateRepresentation.Register],
         parameterConventions: [Bytecode.ParameterConvention]? = nil,
         resultType: IntermediateRepresentation.ValueType,
+        thrownType: IntermediateRepresentation.ValueType?,
         registerTypes: [IntermediateRepresentation.ValueType],
         entryBlock: Bytecode.BlockID,
         blocks: [IntermediateRepresentation.Block],
@@ -75,6 +77,7 @@ public struct Function: Hashable, Sendable {
             return .inout
         }
         self.resultType = resultType
+        self.thrownType = thrownType
         self.registerTypes = registerTypes
         self.stackSlotTypes = stackSlotTypes
         self.effects = effects
@@ -82,6 +85,37 @@ public struct Function: Hashable, Sendable {
         self.blocks = blocks
         self.sourceLocation = sourceLocation
         self.sourceMap = sourceMap
+    }
+
+    public init(
+        name: String,
+        kind: Bytecode.FunctionKind = .ordinary,
+        parameterRegisters: [IntermediateRepresentation.Register],
+        parameterConventions: [Bytecode.ParameterConvention]? = nil,
+        resultType: IntermediateRepresentation.ValueType,
+        registerTypes: [IntermediateRepresentation.ValueType],
+        entryBlock: Bytecode.BlockID,
+        blocks: [IntermediateRepresentation.Block],
+        stackSlotTypes: [IntermediateRepresentation.ValueType] = [],
+        effects: Core.Effects = .init(),
+        sourceLocation: Core.SourceLocation? = nil,
+        sourceMap: [IntermediateRepresentation.SourceMapEntry] = []
+    ) {
+        self.init(
+            name: name,
+            kind: kind,
+            parameterRegisters: parameterRegisters,
+            parameterConventions: parameterConventions,
+            resultType: resultType,
+            thrownType: effects.mayThrow ? .string : nil,
+            registerTypes: registerTypes,
+            entryBlock: entryBlock,
+            blocks: blocks,
+            stackSlotTypes: stackSlotTypes,
+            effects: effects,
+            sourceLocation: sourceLocation,
+            sourceMap: sourceMap
+        )
     }
 }
 
@@ -94,6 +128,7 @@ public enum ToBytecode {
             parameterRegisters: function.parameterRegisters,
             parameterConventions: function.parameterConventions,
             resultType: function.resultType,
+            thrownType: function.thrownType,
             registerTypes: function.registerTypes,
             entryBlock: function.entryBlock,
             blocks: function.blocks.map {

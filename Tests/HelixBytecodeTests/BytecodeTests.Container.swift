@@ -14,6 +14,29 @@ enum BytecodeTests {}
 extension BytecodeTests {
 @Suite("HLBC container")
 struct Container {
+    private struct FunctionBlockLayout: Codable {
+        var id: Bytecode.BlockID
+        var parameters: [Bytecode.Register]
+        var instructionStart: UInt32
+        var instructionCount: UInt32
+    }
+
+    private struct FunctionLayout: Codable {
+        var id: Bytecode.FunctionID
+        var name: String
+        var kind: Bytecode.FunctionKind
+        var parameterRegisters: [Bytecode.Register]
+        var parameterConventions: [Bytecode.ParameterConvention]
+        var resultTypeIndex: UInt32
+        var thrownTypeIndex: UInt32?
+        var registerTypeIndices: [UInt32]
+        var stackSlotTypeIndices: [UInt32]
+        var effects: Core.Effects
+        var entryBlock: Bytecode.BlockID
+        var blocks: [FunctionBlockLayout]
+        var sourceLocation: Core.SourceLocation?
+    }
+
     @Test("A typed CFG survives an encode/decode round trip")
     func roundTrip() throws {
         let module = try makeAddModule()
@@ -50,6 +73,7 @@ struct Container {
         var module = try makeAddModule()
         module.functions[0].stackSlotTypes = [.optional(.string)]
         module.functions[0].effects = .init(mayThrow: true)
+        module.functions[0].thrownType = .string
 
         let decoded = try Bytecode.Decoder.decode(Bytecode.Encoder.encode(module)).module
 
@@ -931,6 +955,69 @@ struct Container {
         #expect(text.contains("end_closure_scope"))
     }
 
+    @Test("HLBC 1.0 preserves exact typed throws ABIs recursively")
+    func typedThrowsWireFormat() throws {
+        let errorKey = Bytecode.LocalTypeKey(rawValue: "Fixture.CodecFailure")
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64,
+            thrownType: .local(errorKey),
+            effects: .init(mayThrow: true)
+        )
+        var module = try makeAddModule()
+        module.capabilities.formUnion([
+            .closureValuesV1,
+            .localNominalsV1,
+            .typedThrowsV1,
+        ])
+        module.localTypes = [
+            .init(
+                key: errorKey,
+                kind: .enumeration(cases: [.init(name: "rejected")]),
+                conformsToError: true
+            ),
+        ]
+        module.functions[0].thrownType = .local(errorKey)
+        module.functions[0].effects.mayThrow = true
+        module.functions[0].registerTypes.append(.closure(signature))
+
+        let bytes = try Bytecode.Encoder.encode(module)
+        let decoded = try Bytecode.Decoder.decode(bytes).module
+        let text = Bytecode.Disassembler.disassemble(decoded)
+
+        #expect(decoded == module)
+        #expect(decoded.functions[0].thrownType == .local(errorKey))
+        #expect(decoded.functions[0].registerTypes.last == .closure(signature))
+        #expect(try Bytecode.Encoder.encode(decoded) == bytes)
+        #expect(text.contains("throws("))
+        #expect(text.contains(errorKey.rawValue))
+    }
+
+    @Test("The decoder rejects an out-of-range thrown type index")
+    func rejectsInvalidThrownTypeIndex() throws {
+        let encoded = try Bytecode.Encoder.encode(makeAddModule())
+        let decoded = try Bytecode.Decoder.decode(encoded)
+        let functions = try #require(decoded.sections[.functions])
+        var layouts = try JSONDecoder().decode(
+            [FunctionLayout].self,
+            from: functions
+        )
+        layouts[0].thrownTypeIndex = UInt32.max
+        let invalidFunctions = try Core.CanonicalJSON.encode(layouts)
+        let rebuilt = try rebuild(encoded) { sections in
+            sections[.functions] = invalidFunctions
+        }
+
+        #expect(
+            throws: Bytecode.CodecError.malformedFunctionLayout(
+                "invalid thrown type index for function 0"
+            )
+        ) {
+            try Bytecode.Decoder.decode(rebuilt)
+        }
+    }
+
     @Test("Closure descriptions preserve ownership and expose malformed ABI")
     func closureSignatureDescription() {
         var signature = Bytecode.ClosureSignature(
@@ -1090,6 +1177,7 @@ struct Container {
         module.name = "Fixture\"\nPatch"
         module.functions[0].stackSlotTypes = [.int64]
         module.functions[0].effects = .init(mayThrow: true)
+        module.functions[0].thrownType = .string
         let text = Bytecode.Disassembler.disassemble(module)
         #expect(text.contains("checked_add"))
         #expect(text.contains("cond_br"))

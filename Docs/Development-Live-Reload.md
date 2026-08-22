@@ -195,7 +195,8 @@ Swift failure helpers are normalized at that boundary as well. The current
 frontend forms behind `precondition`, `fatalError`, active assertions, and
 `try!` become verified terminal control flow rather than calls to private Swift
 runtime symbols. Static diagnostics use an ordinary trap; dynamic String or
-represented Error details use one `source_failure` terminator. Direct
+represented Error details, including bounded identities for concrete
+`throws(Failure)` errors, use one `source_failure` terminator. Direct
 `assertionFailure` evaluates its autoclosure on the failing path, while
 `Optional.unsafelyUnwrapped` reuses the generic Optional projection and nil
 trap. Logical source-map coordinates supply the file and line without
@@ -454,7 +455,13 @@ visibility alone does not create a VM capability: every native operation must
 also resolve through an eligible Entry or exact NativeImport. Supported local
 closures and already indexed same-image helpers may use synchronous `@escaping`
 parameters, internal closure returns, nested closure captures, and synchronous
-throwing paths. Closure values may also flow through Optional, tuple, Array,
+throwing paths. Concrete `throws(Failure)` channels remain exact through
+nonescaping and escaping closure values, stored aggregates, concrete generic
+forwarding, supported higher-order standard-library specializations, and catch
+continuations; `typed-throws-1` gates the patch-local
+Error nominal, and only a concrete Swift reabstraction thunk may erase it to
+`any Error`. This does not make typed-throws roots or throwing NativeImport
+callbacks valid. Closure values may also flow through Optional, tuple, Array,
 Dictionary, patch-local struct/enum/class fields, mutable callback variables,
 and higher-order function signatures. This covers capture lists, recursive
 callbacks, local/bound method references, multiple trailing closures,

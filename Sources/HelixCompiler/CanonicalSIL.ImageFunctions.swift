@@ -21,6 +21,7 @@ enum ImageFunctions {
         var parameters: [Bytecode.ValueType]
         var parameterConventions: [Bytecode.ParameterConvention]
         var result: Bytecode.ValueType
+        var thrownType: Bytecode.ValueType?
         var effects: Core.Effects
     }
 
@@ -236,6 +237,7 @@ enum ImageFunctions {
                 parameters: normalized.parameters,
                 parameterConventions: normalized.parameterConventions,
                 result: parsed.result,
+                thrownType: parsed.thrownType,
                 effects: effects
             )
         } catch let error as DiscoveryError {

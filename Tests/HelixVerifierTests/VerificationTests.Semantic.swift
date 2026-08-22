@@ -811,7 +811,7 @@ struct SemanticVerifier {
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
                 offset: 0,
-                reason: "source_failure detail must be String or Error"
+                reason: "source_failure detail must be String or represented Error"
             )
         ) {
             try Verification.Engine().verify(
@@ -843,6 +843,59 @@ struct SemanticVerifier {
                 bytes: Bytecode.Encoder.encode(emptyPrefix.module),
                 shell: emptyPrefix.shell,
                 policy: emptyPrefix.policy
+            )
+        }
+    }
+
+    @Test("Source failures accept only Error-conforming local diagnostics")
+    func validatesLocalSourceFailureDiagnostics() throws {
+        let errorKey = Bytecode.LocalTypeKey(
+            rawValue: "Fixture.SourceFailureError"
+        )
+        var fixture = try makeFixture { function in
+            function.registerTypes.append(.local(errorKey))
+            function.blocks[0].instructions = [
+                .makeEnum(
+                    result: .init(rawValue: 1),
+                    caseIndex: 0,
+                    payload: nil
+                ),
+                .sourceFailure(
+                    prefix: "Forced try failed",
+                    detail: .init(rawValue: 1)
+                ),
+            ]
+        }
+        fixture.module.localTypes = [
+            .init(
+                key: errorKey,
+                kind: .enumeration(cases: [.init(name: "rejected")]),
+                conformsToError: true
+            ),
+        ]
+        fixture.module.capabilities.insert(.localNominalsV1)
+        fixture.shell.capabilities.insert(.localNominalsV1)
+        fixture.policy.acceptedCapabilities.insert(.localNominalsV1)
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        fixture.module.localTypes[0].conformsToError = false
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "source_failure detail must be String or represented Error"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: fixture.shell,
+                policy: fixture.policy
             )
         }
     }
@@ -1907,7 +1960,7 @@ struct SemanticVerifier {
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
                 offset: 1,
-                reason: "throw_error requires a throwing function and untyped-throws capability"
+                reason: "throw_error payload does not match the function's thrown type"
             )
         ) {
             try Verification.Engine().verify(
@@ -2379,6 +2432,7 @@ struct SemanticVerifier {
             ),
         ]
         fixture.module.functions[1].effects = .init(mayThrow: true)
+        fixture.module.functions[1].thrownType = .string
         fixture.module.capabilities.formUnion([.untypedThrowsV1, .stringsV1])
         fixture.shell.capabilities.formUnion([.untypedThrowsV1, .stringsV1])
         fixture.policy.acceptedCapabilities.formUnion([
@@ -2401,6 +2455,7 @@ struct SemanticVerifier {
             nonthrowingSignature
         )
         nonthrowing.functions[1].effects = .init()
+        nonthrowing.functions[1].thrownType = nil
         #expect(
             throws: Verification.Error.invalidInstruction(
                 function: .init(rawValue: 0),
@@ -2413,6 +2468,315 @@ struct SemanticVerifier {
                 bytes: Bytecode.Encoder.encode(nonthrowing),
                 shell: fixture.shell,
                 policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("Typed throwing closures require one exact Error ABI end to end")
+    func validatesTypedThrowingClosureABI() throws {
+        let typed = try makeTypedThrowingClosureFixture()
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(typed.fixture.module),
+            shell: typed.fixture.shell,
+            policy: typed.fixture.policy
+        )
+
+        var typedRoot = typed.fixture
+        typedRoot.module.functions[0].effects.mayThrow = true
+        typedRoot.module.functions[0].thrownType = .local(typed.errorKey)
+        typedRoot.shell.entries[.init(rawValue: 0)]?.effects.mayThrow = true
+        typedRoot.module.capabilities.formUnion([
+            .stringsV1, .untypedThrowsV1,
+        ])
+        typedRoot.shell.capabilities.formUnion([
+            .stringsV1, .untypedThrowsV1,
+        ])
+        typedRoot.policy.acceptedCapabilities.formUnion([
+            .stringsV1, .untypedThrowsV1,
+        ])
+        #expect(
+            throws: Verification.Error.invalidFunction(
+                function: .init(rawValue: 0),
+                reason: "typed throws cannot cross a Shell entry"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(typedRoot.module),
+                shell: typedRoot.shell,
+                policy: typedRoot.policy
+            )
+        }
+
+        var mismatchedDirectPropagation = typed.fixture
+        mismatchedDirectPropagation.module.functions[0].effects.mayThrow = true
+        mismatchedDirectPropagation.module.functions[0].thrownType = .error
+        mismatchedDirectPropagation.module.functions[0].blocks = [
+            .init(
+                id: .init(rawValue: 0),
+                parameters: [.init(rawValue: 0)],
+                instructions: [
+                    .apply(
+                        result: .init(rawValue: 2),
+                        function: .init(rawValue: 1),
+                        arguments: [
+                            .init(rawValue: 0), .init(rawValue: 0),
+                        ]
+                    ),
+                    .returnValue(.init(rawValue: 2)),
+                ]
+            ),
+        ]
+        mismatchedDirectPropagation.shell.entries[
+            .init(rawValue: 0)
+        ]?.effects.mayThrow = true
+        mismatchedDirectPropagation.module.capabilities.insert(
+            .structuredErrorsV1
+        )
+        mismatchedDirectPropagation.shell.capabilities.insert(
+            .structuredErrorsV1
+        )
+        mismatchedDirectPropagation.policy.acceptedCapabilities.insert(
+            .structuredErrorsV1
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "hlbc_apply changes the propagated Error type without a concrete reabstraction"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(
+                    mismatchedDirectPropagation.module
+                ),
+                shell: mismatchedDirectPropagation.shell,
+                policy: mismatchedDirectPropagation.policy
+            )
+        }
+
+        var mismatchedClosurePropagation = typed.fixture
+        mismatchedClosurePropagation.module.functions[0].effects.mayThrow = true
+        mismatchedClosurePropagation.module.functions[0].thrownType = .error
+        mismatchedClosurePropagation.module.functions[0].blocks = [
+            .init(
+                id: .init(rawValue: 0),
+                parameters: [.init(rawValue: 0)],
+                instructions: [
+                    .makeClosure(
+                        result: .init(rawValue: 1),
+                        function: .init(rawValue: 1),
+                        captures: [.init(rawValue: 0)]
+                    ),
+                    .closureApply(
+                        result: .init(rawValue: 2),
+                        closure: .init(rawValue: 1),
+                        arguments: [.init(rawValue: 0)]
+                    ),
+                    .returnValue(.init(rawValue: 2)),
+                ]
+            ),
+        ]
+        mismatchedClosurePropagation.shell.entries[
+            .init(rawValue: 0)
+        ]?.effects.mayThrow = true
+        mismatchedClosurePropagation.module.capabilities.insert(
+            .structuredErrorsV1
+        )
+        mismatchedClosurePropagation.shell.capabilities.insert(
+            .structuredErrorsV1
+        )
+        mismatchedClosurePropagation.policy.acceptedCapabilities.insert(
+            .structuredErrorsV1
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "closure_apply changes the propagated Error type without a concrete reabstraction"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(
+                    mismatchedClosurePropagation.module
+                ),
+                shell: mismatchedClosurePropagation.shell,
+                policy: mismatchedClosurePropagation.policy
+            )
+        }
+
+        var boundaryPropagation = typed.fixture
+        boundaryPropagation.module.functions[0].blocks[0].instructions = [
+            .tryApply(
+                function: .init(rawValue: 1),
+                arguments: [.init(rawValue: 0)],
+                normalTarget: .init(rawValue: 1),
+                errorTarget: .init(rawValue: 2)
+            ),
+        ]
+        boundaryPropagation.module.functions[1] = .init(
+            id: .init(rawValue: 1),
+            name: "typedBoundaryPropagation",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            thrownType: .local(typed.errorKey),
+            registerTypes: [.int64, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .entryApply(
+                            result: .init(rawValue: 1),
+                            entry: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ],
+            effects: .init(mayThrow: true)
+        )
+        let rootEntry = try #require(
+            boundaryPropagation.shell.entries[.init(rawValue: 0)]
+        )
+        boundaryPropagation.shell.entries[.init(rawValue: 1)] = .init(
+            index: .init(rawValue: 1),
+            key: rootEntry.key,
+            parameterTypes: [.int64],
+            resultType: .int64,
+            effects: .init(mayThrow: true)
+        )
+        boundaryPropagation.module.capabilities.formUnion([
+            .stringsV1, .untypedThrowsV1,
+        ])
+        boundaryPropagation.shell.capabilities.formUnion([
+            .stringsV1, .untypedThrowsV1,
+        ])
+        boundaryPropagation.policy.acceptedCapabilities.formUnion([
+            .stringsV1, .untypedThrowsV1,
+        ])
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 1),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "entry_apply cannot propagate a boundary error through a typed-throws function"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(boundaryPropagation.module),
+                shell: boundaryPropagation.shell,
+                policy: boundaryPropagation.policy
+            )
+        }
+
+        var missingCapability = typed.fixture
+        missingCapability.module.capabilities.remove(.typedThrowsV1)
+        missingCapability.shell.capabilities.remove(.typedThrowsV1)
+        missingCapability.policy.acceptedCapabilities.remove(.typedThrowsV1)
+        #expect(throws: Verification.Error.capabilityDenied(.typedThrowsV1)) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(missingCapability.module),
+                shell: missingCapability.shell,
+                policy: missingCapability.policy
+            )
+        }
+
+        var nonErrorNominal = typed.fixture
+        nonErrorNominal.module.localTypes[0].conformsToError = false
+        #expect(
+            throws: Verification.Error.invalidFunction(
+                function: .init(rawValue: 0),
+                reason: "closure signature has a non-Error thrown type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(nonErrorNominal.module),
+                shell: nonErrorNominal.shell,
+                policy: nonErrorNominal.policy
+            )
+        }
+
+        var inconsistentSignature = typed.fixture
+        if case var .closure(signature) = inconsistentSignature.module
+            .functions[0].registerTypes[1] {
+            signature.thrownType = nil
+            inconsistentSignature.module.functions[0].registerTypes[1] =
+                .closure(signature)
+        }
+        #expect(
+            throws: Verification.Error.invalidFunction(
+                function: .init(rawValue: 0),
+                reason: "closure signature has inconsistent throwing ABI"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(inconsistentSignature.module),
+                shell: inconsistentSignature.shell,
+                policy: inconsistentSignature.policy
+            )
+        }
+
+        var mismatchedBody = typed.fixture
+        mismatchedBody.module.functions[1].thrownType = .error
+        mismatchedBody.module.capabilities.insert(.structuredErrorsV1)
+        mismatchedBody.shell.capabilities.insert(.structuredErrorsV1)
+        mismatchedBody.policy.acceptedCapabilities.insert(.structuredErrorsV1)
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "closure body result, thrown type, or callable effects do not match its closure signature"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(mismatchedBody.module),
+                shell: mismatchedBody.shell,
+                policy: mismatchedBody.policy
+            )
+        }
+
+        var wrongContinuation = typed.fixture
+        wrongContinuation.module.functions[0].registerTypes[3] = .error
+        wrongContinuation.module.capabilities.insert(.structuredErrorsV1)
+        wrongContinuation.shell.capabilities.insert(.structuredErrorsV1)
+        wrongContinuation.policy.acceptedCapabilities.insert(
+            .structuredErrorsV1
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "try_apply error target does not match the callee's thrown type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(wrongContinuation.module),
+                shell: wrongContinuation.shell,
+                policy: wrongContinuation.policy
+            )
+        }
+
+        var wrongPayload = typed.fixture
+        wrongPayload.module.functions[1].blocks[0].instructions[1] =
+            .throwError(.init(rawValue: 0))
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 1),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "throw_error payload does not match the function's thrown type"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(wrongPayload.module),
+                shell: wrongPayload.shell,
+                policy: wrongPayload.policy
             )
         }
     }
@@ -4933,6 +5297,112 @@ struct SemanticVerifier {
         fixture.shell.capabilities.insert(.closureValuesV1)
         fixture.policy.acceptedCapabilities.insert(.closureValuesV1)
         return fixture
+    }
+
+    private func makeTypedThrowingClosureFixture() throws -> (
+        fixture: Fixture,
+        errorKey: Bytecode.LocalTypeKey
+    ) {
+        let errorKey = Bytecode.LocalTypeKey(
+            rawValue: "Fixture.TypedClosureError"
+        )
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64,
+            thrownType: .local(errorKey),
+            effects: .init(mayThrow: true)
+        )
+        var fixture = try makeClosureFixture()
+        fixture.module.functions[0].registerTypes = [
+            .int64,
+            .closure(signature),
+            .int64,
+            .local(errorKey),
+        ]
+        fixture.module.functions[0].blocks = [
+            .init(
+                id: .init(rawValue: 0),
+                parameters: [.init(rawValue: 0)],
+                instructions: [
+                    .makeClosure(
+                        result: .init(rawValue: 1),
+                        function: .init(rawValue: 1),
+                        captures: [.init(rawValue: 0)]
+                    ),
+                    .closureTryApply(
+                        closure: .init(rawValue: 1),
+                        arguments: [.init(rawValue: 0)],
+                        normalTarget: .init(rawValue: 1),
+                        errorTarget: .init(rawValue: 2)
+                    ),
+                ]
+            ),
+            .init(
+                id: .init(rawValue: 1),
+                parameters: [.init(rawValue: 2)],
+                instructions: [.returnValue(.init(rawValue: 2))]
+            ),
+            .init(
+                id: .init(rawValue: 2),
+                parameters: [.init(rawValue: 3)],
+                instructions: [.returnValue(.init(rawValue: 0))]
+            ),
+        ]
+        fixture.module.functions[1] = .init(
+            id: .init(rawValue: 1),
+            name: "typedClosureBody",
+            kind: .closureBody,
+            parameterRegisters: [
+                .init(rawValue: 0),
+                .init(rawValue: 1),
+            ],
+            resultType: .int64,
+            thrownType: .local(errorKey),
+            registerTypes: [
+                .int64,
+                .int64,
+                .local(errorKey),
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0),
+                        .init(rawValue: 1),
+                    ],
+                    instructions: [
+                        .makeEnum(
+                            result: .init(rawValue: 2),
+                            caseIndex: 0,
+                            payload: .init(rawValue: 0)
+                        ),
+                        .throwError(.init(rawValue: 2)),
+                    ]
+                ),
+            ],
+            effects: .init(mayThrow: true)
+        )
+        fixture.module.localTypes = [
+            .init(
+                key: errorKey,
+                kind: .enumeration(
+                    cases: [
+                        .init(name: "rejected", payloadType: .int64),
+                    ]
+                ),
+                conformsToError: true
+            ),
+        ]
+        let capabilities: Set<Core.Capability> = [
+            .localNominalsV1,
+            .typedThrowsV1,
+        ]
+        fixture.module.capabilities.formUnion(capabilities)
+        fixture.shell.capabilities.formUnion(capabilities)
+        fixture.policy.acceptedCapabilities.formUnion(capabilities)
+        return (fixture, errorKey)
     }
 }
 }

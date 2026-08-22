@@ -783,9 +783,9 @@ extension FrontendReceipt.ManagedDebugSurface {
         case let .tuple(elements):
             elements.contains { containsNativeType($0, in: typeIDs) }
         case let .closure(signature):
-            signature.parameters.contains {
+            signature.componentTypes.contains {
                 containsNativeType($0, in: typeIDs)
-            } || containsNativeType(signature.result, in: typeIDs)
+            }
         case .bool, .integer, .float, .string, .any, .void, .never,
              .local, .error:
             false

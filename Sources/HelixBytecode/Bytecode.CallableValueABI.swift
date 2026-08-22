@@ -19,4 +19,17 @@ extension Bytecode.ClosureSignature {
     public var hasCanonicalCallableEffects: Bool {
         effects == Self.callableEffects(from: effects)
     }
+
+    /// Callable effects and the concrete error-result channel are redundant
+    /// by design so policy checks can inspect effects without importing a
+    /// bytecode type. Verification requires both views to agree.
+    public var hasCanonicalThrownType: Bool {
+        effects.mayThrow == (thrownType != nil)
+    }
+}
+
+extension Bytecode.Function {
+    public var hasCanonicalThrownType: Bool {
+        effects.mayThrow == (thrownType != nil)
+    }
 }

@@ -26,7 +26,7 @@ enum VMTests {}
 extension VMTests {
 @Suite("HLVM typed-register interpreter")
 struct Interpreter {
-    @Test("Local enums preserve associated values across a typed Error edge")
+    @Test("Local enums preserve associated values across a typed throws edge")
     func executesTypedLocalErrorCatch() throws {
         let errorKey = Bytecode.LocalTypeKey(rawValue: "Fixture.DetailedError")
         let localTypes = [
@@ -49,9 +49,8 @@ struct Interpreter {
             registerTypes: [
                 .int64,
                 .int64,
-                .error,
-                .optional(.local(errorKey)),
                 .local(errorKey),
+                .int64,
                 .int64,
             ],
             entryBlock: .init(rawValue: 0),
@@ -77,28 +76,32 @@ struct Interpreter {
                     id: .init(rawValue: 2),
                     parameters: [.init(rawValue: 2)],
                     instructions: [
-                        .castError(
-                            result: .init(rawValue: 3),
-                            error: .init(rawValue: 2),
-                            expectedType: errorKey
-                        ),
-                        .switchOptional(
-                            optional: .init(rawValue: 3),
-                            someTarget: .init(rawValue: 3),
-                            noneTarget: .init(rawValue: 4)
+                        .switchEnum(
+                            enumeration: .init(rawValue: 2),
+                            cases: [
+                                .init(
+                                    caseIndex: 0,
+                                    target: .init(rawValue: 3)
+                                ),
+                                .init(
+                                    caseIndex: 1,
+                                    target: .init(rawValue: 4)
+                                ),
+                            ],
+                            defaultTarget: nil
                         ),
                     ]
                 ),
                 .init(
                     id: .init(rawValue: 3),
-                    parameters: [.init(rawValue: 4)],
-                    instructions: [.returnValue(.init(rawValue: 0))]
+                    parameters: [.init(rawValue: 3)],
+                    instructions: [.returnValue(.init(rawValue: 3))]
                 ),
                 .init(
                     id: .init(rawValue: 4),
                     instructions: [
-                        .constantInteger(result: .init(rawValue: 5), bitPattern: UInt64.max),
-                        .returnValue(.init(rawValue: 5)),
+                        .constantInteger(result: .init(rawValue: 4), bitPattern: UInt64.max),
+                        .returnValue(.init(rawValue: 4)),
                     ]
                 ),
             ]
@@ -108,7 +111,8 @@ struct Interpreter {
             name: "throwTypedError",
             parameterRegisters: [.init(rawValue: 0)],
             resultType: .int64,
-            registerTypes: [.int64, .local(errorKey), .error],
+            thrownType: .local(errorKey),
+            registerTypes: [.int64, .local(errorKey)],
             entryBlock: .init(rawValue: 0),
             blocks: [
                 .init(
@@ -120,11 +124,7 @@ struct Interpreter {
                             caseIndex: 0,
                             payload: .init(rawValue: 0)
                         ),
-                        .makeError(
-                            result: .init(rawValue: 2),
-                            payload: .init(rawValue: 1)
-                        ),
-                        .throwError(.init(rawValue: 2)),
+                        .throwError(.init(rawValue: 1)),
                     ]
                 ),
             ],
@@ -132,7 +132,7 @@ struct Interpreter {
         )
         let image = try makeVerified(
             function: root,
-            capabilities: [.baselineV1, .localNominalsV1, .structuredErrorsV1],
+            capabilities: [.baselineV1, .localNominalsV1, .typedThrowsV1],
             localTypes: localTypes,
             additionalFunctions: [throwing]
         )

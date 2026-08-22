@@ -22,6 +22,9 @@ enum SwiftCoreIntrinsic: Equatable {
     case defaultValue(CanonicalSIL.DefaultValueIntrinsic)
     case scalarText(CanonicalSIL.ScalarTextIntrinsic)
     case sourceFailure(CanonicalSIL.SourceFailureIntrinsic)
+    /// Compiler notification emitted immediately before a concrete typed
+    /// error unwinds. HLBC owns that unwind and therefore lowers it to no-op.
+    case typedThrowNotification
     case text(CanonicalSIL.TextIntrinsic)
     case minimum
     case maximum
@@ -78,7 +81,24 @@ enum SwiftCoreIntrinsic: Equatable {
     case unexpectedNilOptional
     case unsafeOptionalUnwrap
 
+    /// Some Swift runtime helpers arrive with serialized bodies. Their exact
+    /// frontend-facing semantics are still safer and smaller to represent as
+    /// verified HLBC operations than as generic runtime implementation code.
+    var prefersCanonicalLoweringOverImageBody: Bool {
+        switch self {
+        case .typedThrowNotification,
+             .sourceFailure(.typedUnexpectedError):
+            true
+        default:
+            false
+        }
+    }
+
     init?(mangledName: String) {
+        if mangledName == "swift_willThrowTyped" {
+            self = .typedThrowNotification
+            return
+        }
         if let mutation = CanonicalSIL.ValueMutationIntrinsic(
             mangledName: mangledName
         ) {

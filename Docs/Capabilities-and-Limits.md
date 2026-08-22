@@ -121,7 +121,9 @@ does not by itself certify a physical device or distribution channel.
   `preconditionFailure`, `fatalError`, active `assert`/`assertionFailure`, and
   the error edge of `try!`. Current frontend variants with static diagnostics
   use the existing trap terminator; dynamic String and represented Error
-  details share one `source_failure` terminator. Message autoclosures retain
+  details, including bounded identities for concrete `throws(Failure)` errors,
+  share one
+  `source_failure` terminator. Message autoclosures retain
   their source evaluation timing, source locations come from the HLBC source
   map, and no Swift runtime failure symbol is exposed as a NativeImport.
 - Array value semantics and equality, single-element append, `+`, `+=`,
@@ -399,8 +401,17 @@ does not by itself certify a physical device or distribution channel.
   includes the `@inout_aliasable`/`@closureCapture $*T` physical conventions
   emitted for mutable locals captured by compiler-generated `defer` helpers.
 - Synchronous patch-local closure values with copyable represented captures,
-  including nonthrowing and throwing invocation paths. Mutable local values
-  are promoted through one type-independent VM cell model, covering scalar,
+  including nonthrowing and throwing invocation paths. Concrete
+  `throws(Failure)` functions and closures retain the exact
+  Error-conforming patch-local nominal across nonescaping calls, escaping
+  storage, aggregates, concrete generic forwarding, concretely specialized
+  standard-library higher-order calls, and error continuations.
+  The `typed-throws-1` capability gates this raw typed channel. A conversion to
+  `throws(any Error)` must be represented by a concrete Swift reabstraction
+  thunk; error-type covariance is not inferred by the VM. `throws(Never)` is
+  normalized to nonthrowing, and an impossible `Never` normal continuation has
+  no register payload. Mutable local values are promoted through one
+  type-independent VM cell model, covering scalar,
   String, Optional, Array, Dictionary, Set, tuple, and patch-local struct storage,
   projected fields, nested captures, and the `{ var T }` boxes emitted for
   escaping Swift closures. Field-sensitive definite/possible initialization

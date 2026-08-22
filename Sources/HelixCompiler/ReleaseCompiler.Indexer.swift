@@ -248,6 +248,7 @@ public struct Indexer: Sendable {
             .collectionsV1,
             .localNominalsV1,
             .structuredErrorsV1,
+            .typedThrowsV1,
             .addressValuesV1,
             .borrowCallsV1,
             .closureValuesV1,
@@ -351,7 +352,10 @@ public struct Indexer: Sendable {
             return .rejected("HLXIDX008", explanation: "noncopyable values are not supported in HLBC v1")
         }
         if candidate.hasTypedThrows {
-            return .rejected("HLXIDX009", explanation: "typed throws/rethrows are not supported in HLBC v1")
+            return .rejected(
+                "HLXIDX009",
+                explanation: "typed throws/rethrows Shell roots are not supported in HLBC v1"
+            )
         }
         if !candidate.hasCompleteDynamicCoverage {
             return .rejected("HLXIDX010", explanation: "one or more call sites contain an inlined copy")
@@ -398,7 +402,7 @@ public struct Indexer: Sendable {
         case let .tuple(elements):
             elements.contains { containsNativeType($0, ids: ids) }
         case let .closure(signature):
-            (signature.parameters + [signature.result]).contains {
+            signature.componentTypes.contains {
                 containsNativeType($0, ids: ids)
             }
         case .void, .never, .bool, .integer, .float, .string, .any, .local,

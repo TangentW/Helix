@@ -17,6 +17,7 @@ public enum Metadata {
         .untypedThrowsV1,
         .localNominalsV1,
         .structuredErrorsV1,
+        .typedThrowsV1,
         .mainActorSyncV1,
         .addressValuesV1,
         .borrowCallsV1,

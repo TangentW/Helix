@@ -418,7 +418,17 @@ Both workflows depend on stable, build-specific identities:
   parameter, including an address type paired with `inout`. The compiler
   preserves concrete Swift `@in_guaranteed` inputs as borrowed VM values,
   materializes copies only at owned boundaries, and the Verifier requires the
-  signature to match the closure-body prefix exactly. Dynamic calls may carry
+  signature to match the closure-body prefix exactly. The callable ABI also
+  carries its exact error-result type. A concrete `throws(Failure)` therefore
+  moves the raw Error-conforming patch-local value across direct, closure,
+  generic-forwarding, stored-closure, and concretely specialized
+  higher-order standard-library continuations; conversion to
+  `throws(any Error)` is admitted only through the compiler's concrete
+  reabstraction thunk. The Verifier requires the function, closure signature,
+  thrown payload, and error block parameter to name the same type, while the VM
+  never boxes that internal typed channel into a message. `throws(Never)` and
+  the impossible normal result of a `Never` call remain unrepresented control
+  flow rather than VM registers. Dynamic calls may carry
   a live inout scope across normal/error continuations, but every continuation
   must close the same scope and overlapping arguments remain invalid.
   This rule is type-directed and also covers linear imported SDK values; it is

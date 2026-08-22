@@ -31,6 +31,7 @@ private struct WireFunctionLayout: Codable {
     var parameterRegisters: [Bytecode.Register]
     var parameterConventions: [Bytecode.ParameterConvention]
     var resultTypeIndex: UInt32
+    var thrownTypeIndex: UInt32?
     var registerTypeIndices: [UInt32]
     var stackSlotTypeIndices: [UInt32]
     var effects: Core.Effects
@@ -128,6 +129,7 @@ public enum Encoder {
         var layouts: [Bytecode.WireFunctionLayout] = []
         for function in module.functions {
             let resultTypeIndex = try intern(function.resultType)
+            let thrownTypeIndex = try function.thrownType.map(intern)
             let registerTypeIndices = try function.registerTypes.map(intern)
             let stackSlotTypeIndices = try function.stackSlotTypes.map(intern)
             var blockLayouts: [Bytecode.WireBlockLayout] = []
@@ -155,6 +157,7 @@ public enum Encoder {
                     parameterRegisters: function.parameterRegisters,
                     parameterConventions: function.parameterConventions,
                     resultTypeIndex: resultTypeIndex,
+                    thrownTypeIndex: thrownTypeIndex,
                     registerTypeIndices: registerTypeIndices,
                     stackSlotTypeIndices: stackSlotTypeIndices,
                     effects: function.effects,
@@ -372,6 +375,17 @@ public enum Decoder {
             guard let resultIndex = Int(exactly: layout.resultTypeIndex), types.indices.contains(resultIndex) else {
                 throw Bytecode.CodecError.malformedFunctionLayout("invalid result type index for function \(layout.id)")
             }
+            let thrownType: Bytecode.ValueType?
+            if let rawIndex = layout.thrownTypeIndex {
+                guard let index = Int(exactly: rawIndex), types.indices.contains(index) else {
+                    throw Bytecode.CodecError.malformedFunctionLayout(
+                        "invalid thrown type index for function \(layout.id)"
+                    )
+                }
+                thrownType = types[index]
+            } else {
+                thrownType = nil
+            }
             let registerTypes = try layout.registerTypeIndices.map { rawIndex -> Bytecode.ValueType in
                 guard let index = Int(exactly: rawIndex), types.indices.contains(index) else {
                     throw Bytecode.CodecError.malformedFunctionLayout("invalid register type index for function \(layout.id)")
@@ -413,6 +427,7 @@ public enum Decoder {
                     parameterRegisters: layout.parameterRegisters,
                     parameterConventions: layout.parameterConventions,
                     resultType: types[resultIndex],
+                    thrownType: thrownType,
                     registerTypes: registerTypes,
                     entryBlock: layout.entryBlock,
                     blocks: blocks,

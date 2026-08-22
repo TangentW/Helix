@@ -59,7 +59,25 @@ public struct ClosureSignature: Codable, Hashable, Sendable, CustomStringConvert
     /// callbacks or force type-specific copies in each higher-order lowering.
     public var parameterConventions: [Bytecode.ParameterConvention]
     public var result: Bytecode.ValueType
+    /// The concrete SIL error-result value. `nil` is the nonthrowing ABI;
+    /// `.error` is `any Error`, while a local Error-conforming nominal keeps a
+    /// Swift `throws(Failure)` channel precise inside one verified image.
+    public var thrownType: Bytecode.ValueType?
     public var effects: Core.Effects
+
+    public init(
+        parameters: [Bytecode.ValueType],
+        parameterConventions: [Bytecode.ParameterConvention],
+        result: Bytecode.ValueType,
+        thrownType: Bytecode.ValueType?,
+        effects: Core.Effects = .init()
+    ) {
+        self.parameters = parameters
+        self.parameterConventions = parameterConventions
+        self.result = result
+        self.thrownType = thrownType
+        self.effects = effects
+    }
 
     public init(
         parameters: [Bytecode.ValueType],
@@ -67,10 +85,13 @@ public struct ClosureSignature: Codable, Hashable, Sendable, CustomStringConvert
         result: Bytecode.ValueType,
         effects: Core.Effects = .init()
     ) {
-        self.parameters = parameters
-        self.parameterConventions = parameterConventions
-        self.result = result
-        self.effects = effects
+        self.init(
+            parameters: parameters,
+            parameterConventions: parameterConventions,
+            result: result,
+            thrownType: effects.mayThrow ? .string : nil,
+            effects: effects
+        )
     }
 
     public var description: String {
@@ -79,7 +100,7 @@ public struct ClosureSignature: Codable, Hashable, Sendable, CustomStringConvert
                 + "\(parameterConventions.count) conventions>"
         }
         var effectNames: [String] = []
-        if effects.mayThrow { effectNames.append("throws") }
+        if let thrownType { effectNames.append("throws(\(thrownType))") }
         if effects.mayAllocate { effectNames.append("allocates") }
         if effects.hasExternalSideEffects { effectNames.append("external") }
         if effects.requiresMainActor { effectNames.append("MainActor") }
@@ -97,6 +118,12 @@ public struct ClosureSignature: Codable, Hashable, Sendable, CustomStringConvert
             return prefix + parameter.description
         }.joined(separator: ", ")
         return "\(effectPrefix)(\(arguments)) -> \(result)"
+    }
+
+    /// Every value type referenced by the callable ABI, including the error
+    /// result that ordinary parameter/result-only traversals used to miss.
+    public var componentTypes: [Bytecode.ValueType] {
+        parameters + [result] + (thrownType.map { [$0] } ?? [])
     }
 }
 
@@ -1566,6 +1593,8 @@ public struct Function: Codable, Hashable, Sendable {
     public var parameterRegisters: [Bytecode.Register]
     public var parameterConventions: [Bytecode.ParameterConvention]
     public var resultType: Bytecode.ValueType
+    /// Exact error-result ABI for direct calls to this function.
+    public var thrownType: Bytecode.ValueType?
     public var registerTypes: [Bytecode.ValueType]
     public var stackSlotTypes: [Bytecode.ValueType]
     public var effects: Core.Effects
@@ -1580,6 +1609,7 @@ public struct Function: Codable, Hashable, Sendable {
         parameterRegisters: [Bytecode.Register],
         parameterConventions: [Bytecode.ParameterConvention]? = nil,
         resultType: Bytecode.ValueType,
+        thrownType: Bytecode.ValueType?,
         registerTypes: [Bytecode.ValueType],
         entryBlock: Bytecode.BlockID,
         blocks: [Bytecode.Block],
@@ -1598,12 +1628,44 @@ public struct Function: Codable, Hashable, Sendable {
             return .inout
         }
         self.resultType = resultType
+        self.thrownType = thrownType
         self.registerTypes = registerTypes
         self.stackSlotTypes = stackSlotTypes
         self.effects = effects
         self.entryBlock = entryBlock
         self.blocks = blocks
         self.sourceLocation = sourceLocation
+    }
+
+    public init(
+        id: Bytecode.FunctionID,
+        name: String,
+        kind: Bytecode.FunctionKind = .ordinary,
+        parameterRegisters: [Bytecode.Register],
+        parameterConventions: [Bytecode.ParameterConvention]? = nil,
+        resultType: Bytecode.ValueType,
+        registerTypes: [Bytecode.ValueType],
+        entryBlock: Bytecode.BlockID,
+        blocks: [Bytecode.Block],
+        stackSlotTypes: [Bytecode.ValueType] = [],
+        effects: Core.Effects = .init(),
+        sourceLocation: Core.SourceLocation? = nil
+    ) {
+        self.init(
+            id: id,
+            name: name,
+            kind: kind,
+            parameterRegisters: parameterRegisters,
+            parameterConventions: parameterConventions,
+            resultType: resultType,
+            thrownType: effects.mayThrow ? .string : nil,
+            registerTypes: registerTypes,
+            entryBlock: entryBlock,
+            blocks: blocks,
+            stackSlotTypes: stackSlotTypes,
+            effects: effects,
+            sourceLocation: sourceLocation
+        )
     }
 
     public func type(of register: Bytecode.Register) -> Bytecode.ValueType? {
