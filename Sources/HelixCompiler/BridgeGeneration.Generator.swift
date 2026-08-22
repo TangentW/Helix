@@ -627,7 +627,9 @@ public struct Generator: Sendable {
         }
         if value.hasPrefix("("), value.hasSuffix(")"), value != "()" {
             let inner = String(value.dropFirst().dropLast())
-            let elements = try splitTopLevel(inner).map(parseSwiftType)
+            let elements = try splitTopLevel(inner).map {
+                try parseSwiftType(removingSwiftTupleLabel($0))
+            }
             guard elements.count >= 2 else {
                 throw BridgeGeneration.Error.invalidSwiftType(raw)
             }
@@ -1442,11 +1444,15 @@ public struct Generator: Sendable {
         type: Bytecode.ValueType
     ) throws -> String {
         switch (shape, type) {
-        case let (.function(_, parameterShapes, _), .closure(signature)):
+        case let (
+            .function(_, parameterShapes, resultShape),
+            .closure(signature)
+        ):
             let callbackName = "nativeCallback\(offset)"
             let wrapper = try renderGeneratedNativeCallbackWrapper(
                 callbackName: callbackName,
                 parameterShapes: parameterShapes,
+                resultShape: resultShape,
                 signature: signature
             )
             return """
@@ -1457,13 +1463,14 @@ public struct Generator: Sendable {
             let argument\(offset): \(shape.rendered) = \(wrapper)
             """
         case let (
-            .optional(.function(_, parameterShapes, _)),
+            .optional(.function(_, parameterShapes, resultShape)),
             .optional(.closure(signature))
         ):
             let callbackName = "nativeCallback\(offset)"
             let wrapper = try renderGeneratedNativeCallbackWrapper(
                 callbackName: callbackName,
                 parameterShapes: parameterShapes,
+                resultShape: resultShape,
                 signature: signature
             )
             return """
@@ -1485,9 +1492,12 @@ public struct Generator: Sendable {
     private func renderGeneratedNativeCallbackWrapper(
         callbackName: String,
         parameterShapes: [SwiftTypeShape],
+        resultShape: SwiftTypeShape,
         signature: Bytecode.ClosureSignature
     ) throws -> String {
-        guard parameterShapes.count == signature.parameters.count else {
+        guard parameterShapes.count == signature.parameters.count,
+              signature.result.isNativeBridgeCallbackResult
+        else {
             throw BridgeGeneration.Error.invalidSwiftType(
                 "native callback parameter shape"
             )
@@ -1509,18 +1519,94 @@ public struct Generator: Sendable {
             ? "[]"
             : "[\n\(indent(encoded.joined(separator: ",\n"), spaces: 12))\n        ]"
         let opening = parameters.isEmpty ? "{" : "{ (\(parameters)) in"
-        return """
-        \(opening)
-            \(callbackName).invokeVoid {
-                try Runtime.Bridge.shared.encodeNativeCallbackArguments(
-                    for: \(callbackName),
-                    count: \(signature.parameters.count)
-                ) { callbackEncoder in
-                    \(arguments)
-                }
-            }
+        let encodedArguments = """
+        try Runtime.Bridge.shared.encodeNativeCallbackArguments(
+            for: \(callbackName),
+            count: \(signature.parameters.count)
+        ) { callbackEncoder in
+            \(arguments)
         }
         """
+        if signature.result == .void {
+            return """
+            \(opening)
+                \(callbackName).invokeVoid {
+            \(indent(encodedArguments, spaces: 12))
+                }
+            }
+            """
+        }
+        guard let failureResult = renderNativeCallbackFailureResult(
+            shape: resultShape,
+            type: signature.result
+        ) else {
+            throw BridgeGeneration.Error.invalidSwiftType(
+                "native callback result shape"
+            )
+        }
+        let decoded = renderDecode(
+            expression: "callbackResult",
+            shape: resultShape,
+            type: signature.result
+        )
+        return """
+        \(opening)
+            \(callbackName).invokeResult(
+                arguments: {
+        \(indent(encodedArguments, spaces: 20))
+                },
+                decodeResult: { callbackResult in
+                    \(decoded)
+                },
+                failureResult: {
+                    \(failureResult)
+                }
+            )
+        }
+        """
+    }
+
+    /// Renders the deterministic value returned only after a nonthrowing
+    /// native callback fails. Eligibility is derived from the logical value
+    /// shape; no SDK declaration or native nominal receives a special case.
+    private func renderNativeCallbackFailureResult(
+        shape: SwiftTypeShape,
+        type: Bytecode.ValueType
+    ) -> String? {
+        switch (shape, type) {
+        case (.named, .bool):
+            return "false"
+        case (.named, .integer), (.named, .float):
+            return "0"
+        case let (.named(name), .string):
+            if ["Character", "Swift.Character"].contains(name) {
+                return "\(name)(\(String(reflecting: "\0")))"
+            }
+            return "\(name)()"
+        case let (.named(name), .array(element))
+        where element == .string
+                && ["Substring", "Swift.Substring"].contains(name):
+            return "\(name)()"
+        case (.named, .any):
+            return "false as Swift.Bool"
+        case (.optional, .optional):
+            return "nil"
+        case (.array, .array), (.set, .set):
+            return "[]"
+        case (.dictionary, .dictionary):
+            return "[:]"
+        case let (.tuple(shapes), .tuple(types)):
+            guard shapes.count == types.count else { return nil }
+            let elements = zip(shapes, types).map {
+                renderNativeCallbackFailureResult(shape: $0.0, type: $0.1)
+            }
+            guard elements.allSatisfy({ $0 != nil }) else { return nil }
+            return "(\(elements.compactMap { $0 }.joined(separator: ", ")))"
+        case (.named, .void):
+            return "()"
+        default:
+            return nil
+        }
     }
 
     private func renderGeneratedNativeImportCall(

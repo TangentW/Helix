@@ -379,6 +379,90 @@ struct NativeBlockBridge {
         }
     }
 
+    @Test("Native block thunks preserve bridgeable callback results")
+    func recognizesNativeBlockResults() throws {
+        let logicalPredicate = "@callee_guaranteed ("
+            + "@in_guaranteed Optional<Any>, "
+            + "@guaranteed Optional<Dictionary<String, Any>>) -> Bool"
+        let predicateThunk = "@convention(c) ("
+            + "@inout_aliasable @block_storage \(logicalPredicate), "
+            + "Optional<AnyObject>, Optional<NSDictionary>) -> Bool"
+        let predicateBlock = "@convention(block) ("
+            + "Optional<AnyObject>, Optional<NSDictionary>) -> Bool"
+        let predicate = CanonicalSIL.Function(
+            mangledName: "$s7Fixture9predicateyySbypSg_SDySSypGSgtccF",
+            loweredType: "$@convention(thin) (@owned \(logicalPredicate)) -> ()",
+            body: """
+            bb0(%0 : $@owned \(logicalPredicate)):
+              %1 = alloc_stack $@block_storage \(logicalPredicate)
+              %2 = project_block_storage %1
+              store %0 to %2
+              %3 = function_ref @$sPredicateThunkTR : $\(predicateThunk)
+              %4 = init_block_storage_header %1, invoke %3 : $\(predicateThunk), type $\(predicateBlock)
+              %5 = copy_block %4
+              strong_release %5
+              dealloc_stack %1
+              %6 = tuple ()
+              return %6
+            """
+        )
+        _ = try CanonicalSIL.Lowerer().lower(
+            predicate,
+            displayName: "Fixture.predicate"
+        )
+
+        let logicalString = "@callee_guaranteed () -> @owned String"
+        let stringThunk = "@convention(c) ("
+            + "@inout_aliasable @block_storage \(logicalString)) "
+            + "-> @autoreleased NSString"
+        let stringBlock = "@convention(block) () -> @autoreleased NSString"
+        let stringProvider = CanonicalSIL.Function(
+            mangledName: "$s7Fixture14stringProvideryySSyccF",
+            loweredType: "$@convention(thin) (@owned \(logicalString)) -> ()",
+            body: """
+            bb0(%0 : $@owned \(logicalString)):
+              %1 = alloc_stack $@block_storage \(logicalString)
+              %2 = project_block_storage %1
+              store %0 to %2
+              %3 = function_ref @$sStringThunkTR : $\(stringThunk)
+              %4 = init_block_storage_header %1, invoke %3 : $\(stringThunk), type $\(stringBlock)
+              %5 = copy_block %4
+              strong_release %5
+              dealloc_stack %1
+              %6 = tuple ()
+              return %6
+            """
+        )
+        _ = try CanonicalSIL.Lowerer().lower(
+            stringProvider,
+            displayName: "Fixture.stringProvider"
+        )
+
+        let mismatchedThunk = "@convention(c) ("
+            + "@inout_aliasable @block_storage \(logicalPredicate), "
+            + "Optional<AnyObject>, Optional<NSDictionary>) -> Int"
+        let mismatch = CanonicalSIL.Function(
+            mangledName: "$s7Fixture8mismatchyySbypSg_SDySSypGSgtccF",
+            loweredType: "$@convention(thin) (@owned \(logicalPredicate)) -> ()",
+            body: """
+            bb0(%0 : $@owned \(logicalPredicate)):
+              %1 = alloc_stack $@block_storage \(logicalPredicate)
+              %2 = project_block_storage %1
+              store %0 to %2
+              %3 = function_ref @$sMismatchedThunkTR : $\(mismatchedThunk)
+              %4 = init_block_storage_header %1, invoke %3 : $\(mismatchedThunk), type $\(predicateBlock)
+              %5 = tuple ()
+              return %5
+            """
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer().lower(
+                mismatch,
+                displayName: "Fixture.mismatch"
+            )
+        }
+    }
+
     @Test("Read-only indirect callback parameters use one logical borrowed ABI")
     func normalizesIndirectCallbackParameters() throws {
         let notification = Core.TypeID(

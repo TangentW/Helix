@@ -278,13 +278,24 @@ public struct Interpreter: Sendable {
                 budget: budget,
                 trace: trace
             )
-            guard value == nil, closure.signature.result == .void else {
-                throw VM.RuntimeTrap.typeMismatch(
-                    expected: .void,
-                    actual: value?.type
-                )
+            if closure.signature.result == .void {
+                guard value == nil else {
+                    throw VM.RuntimeTrap.typeMismatch(
+                        expected: .void,
+                        actual: value?.type
+                    )
+                }
+            } else {
+                guard let value,
+                      value.matches(closure.signature.result)
+                else {
+                    throw VM.RuntimeTrap.typeMismatch(
+                        expected: closure.signature.result,
+                        actual: value?.type
+                    )
+                }
             }
-            return .returned(nil)
+            return .returned(value)
         } catch let business as VM.BusinessError {
             return .businessError(business.message)
         } catch let trap as VM.RuntimeTrap {

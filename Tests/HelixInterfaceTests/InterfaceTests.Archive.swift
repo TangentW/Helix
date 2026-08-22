@@ -210,6 +210,48 @@ struct Archive {
         #expect(decoded.schemaVersion == 1)
         #expect(decoded.compatibility.interfaceArchive == .init(1, 0, 0))
 
+        var returning = archive
+        var returningCallback = callback
+        returningCallback.result = .bool
+        returning.nativeImports[0].parameterTypes = [
+            .closure(returningCallback),
+        ]
+        returning.nativeImports[0].signature.parameters = [
+            "@escaping (Swift.Bool) -> Swift.Bool",
+        ]
+        returning.nativeImports[0].key = try Core.NativeImportKey.derive(
+            namespace: returning.metadata.shellNamespaceID,
+            canonicalCallee: returning.nativeImports[0].canonicalCallee,
+            signature: returning.nativeImports[0].signature,
+            effects: returning.nativeImports[0].effects,
+            contract: returning.nativeImports[0].contract
+        )
+        returning.shellInterfaceHash = try returning.computeShellInterfaceHash()
+        try returning.validate()
+
+        returningCallback.result = .native(
+            .init(rawValue: .sha256("unsupported-native-callback-result"))
+        )
+        returning.nativeImports[0].parameterTypes = [
+            .closure(returningCallback),
+        ]
+        returning.nativeImports[0].signature.parameters = [
+            "@escaping (Swift.Bool) -> UnsupportedNativeResult",
+        ]
+        returning.nativeImports[0].key = try Core.NativeImportKey.derive(
+            namespace: returning.metadata.shellNamespaceID,
+            canonicalCallee: returning.nativeImports[0].canonicalCallee,
+            signature: returning.nativeImports[0].signature,
+            effects: returning.nativeImports[0].effects,
+            contract: returning.nativeImports[0].contract
+        )
+        returning.shellInterfaceHash = try returning.computeShellInterfaceHash()
+        #expect(throws: InterfaceArchive.Error.invalidArchive(
+            "native import has an unsupported callback signature"
+        )) {
+            try returning.validate()
+        }
+
         for invalid in [
             InterfaceArchive.NativeImportParameterProjection(
                 physicalParameterCount: 3,

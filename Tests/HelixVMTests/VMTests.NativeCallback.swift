@@ -183,6 +183,168 @@ struct NativeCallback {
         }
     }
 
+    @Test("A result-producing callback decodes its exact VM result")
+    func resultRoundTrip() throws {
+        let signature = closure(result: .int64).signature
+        let returned = try VM.Integer(
+            signed: 42,
+            bitWidth: 64,
+            isSigned: true
+        )
+        let budget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let context = try budget.beginNativeInvocation(
+            id: .init(rawValue: 0),
+            effects: .init(),
+            contract: contract(lifetime: .nonescaping),
+            parameterTypes: [.closure(signature)],
+            callbackHost: .init(invoke: { _, _, _ in
+                .returned(.integer(returned))
+            }),
+            isMainThread: false
+        )
+        let callback = try context.makeCallback(
+            parameterIndex: 0,
+            from: .closure(closure(result: .int64))
+        )
+
+        let value: Int64 = callback.invokeResult(
+            arguments: { [.bool(true)] },
+            decodeResult: { value in
+                guard case let .integer(integer) = value else {
+                    throw VM.RuntimeTrap.typeMismatch(
+                        expected: .int64,
+                        actual: value.type
+                    )
+                }
+                return integer.signedValue
+            },
+            failureResult: { -1 }
+        )
+
+        #expect(value == 42)
+        try context.finish(requireCooperation: true)
+    }
+
+    @Test("A synchronous result failure returns fallback and fails its importer")
+    func synchronousResultFailure() throws {
+        let signature = closure(result: .bool).signature
+        let budget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let context = try budget.beginNativeInvocation(
+            id: .init(rawValue: 0),
+            effects: .init(),
+            contract: contract(lifetime: .nonescaping),
+            parameterTypes: [.closure(signature)],
+            callbackHost: .init(invoke: { _, _, _ in
+                .trapped(.explicit("result callback failed"))
+            }),
+            isMainThread: false
+        )
+        let callback = try context.makeCallback(
+            parameterIndex: 0,
+            from: .closure(closure(result: .bool))
+        )
+
+        let value: Bool = callback.invokeResult(
+            arguments: { [.bool(true)] },
+            decodeResult: { _ in true },
+            failureResult: { false }
+        )
+
+        #expect(!value)
+        #expect(throws: VM.RuntimeTrap.explicit("result callback failed")) {
+            try context.finish(requireCooperation: true)
+        }
+    }
+
+    @Test("A synchronous result decoding failure is retained by its importer")
+    func synchronousResultDecodeFailure() throws {
+        let signature = closure(result: .bool).signature
+        let budget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let context = try budget.beginNativeInvocation(
+            id: .init(rawValue: 0),
+            effects: .init(),
+            contract: contract(lifetime: .nonescaping),
+            parameterTypes: [.closure(signature)],
+            callbackHost: .init(invoke: { _, _, _ in
+                .returned(.bool(true))
+            }),
+            isMainThread: false
+        )
+        let callback = try context.makeCallback(
+            parameterIndex: 0,
+            from: .closure(closure(result: .bool))
+        )
+
+        let value: Bool = callback.invokeResult(
+            arguments: { [.bool(true)] },
+            decodeResult: { _ in
+                throw VM.RuntimeTrap.explicit("result decode failed")
+            },
+            failureResult: { false }
+        )
+
+        #expect(!value)
+        #expect(throws: VM.RuntimeTrap.explicit("result decode failed")) {
+            try context.finish(requireCooperation: true)
+        }
+    }
+
+    @Test("Detached result decoding failures return fallback and report telemetry")
+    func detachedResultDecodeFailure() throws {
+        let box = InvocationBox()
+        let signature = closure(result: .bool).signature
+        let budget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let context = try budget.beginNativeInvocation(
+            id: .init(rawValue: 0),
+            effects: .init(),
+            contract: contract(lifetime: .escaping),
+            parameterTypes: [.closure(signature)],
+            callbackHost: .init(
+                invoke: { _, arguments, callbackBudget in
+                    box.record(arguments: arguments, budget: callbackBudget)
+                    return .returned(.bool(true))
+                },
+                reportFailure: { box.record(failure: $0) }
+            ),
+            isMainThread: false
+        )
+        let callback = try context.makeCallback(
+            parameterIndex: 0,
+            from: .closure(closure(result: .bool))
+        )
+        try context.finish(requireCooperation: true)
+
+        let value: Bool = callback.invokeResult(
+            arguments: { [.bool(true)] },
+            decodeResult: { _ in
+                throw VM.RuntimeTrap.explicit("result decode failed")
+            },
+            failureResult: { false }
+        )
+
+        #expect(!value)
+        #expect(box.arguments == [[.bool(true)]])
+        #expect(box.budgets.count == 1)
+        #expect(box.budgets[0] == nil)
+        #expect(box.failures == [.explicit("result decode failed")])
+    }
+
     @Test("Same-thread recursive invocation is admitted by one callback handle")
     func sameThreadRecursion() throws {
         let box = InvocationBox()
@@ -310,6 +472,69 @@ struct NativeCallback {
         ])
     }
 
+    @Test("Result decoding remains inside the serialized callback admission")
+    func serializesResultDecoding() throws {
+        let box = InvocationBox()
+        let decoding = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let signature = closure(result: .bool).signature
+        let budget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let context = try budget.beginNativeInvocation(
+            id: .init(rawValue: 0),
+            effects: .init(),
+            contract: contract(lifetime: .escaping),
+            parameterTypes: [.closure(signature)],
+            callbackHost: .init(
+                invoke: { _, arguments, callbackBudget in
+                    box.record(arguments: arguments, budget: callbackBudget)
+                    return .returned(.bool(true))
+                },
+                reportFailure: { box.record(failure: $0) }
+            ),
+            isMainThread: false
+        )
+        let callback = try context.makeCallback(
+            parameterIndex: 0,
+            from: .closure(closure(result: .bool))
+        )
+        try context.finish(requireCooperation: true)
+
+        let worker = Thread {
+            let _: Bool = callback.invokeResult(
+                arguments: { [.bool(true)] },
+                decodeResult: { _ in
+                    decoding.signal()
+                    _ = release.wait(timeout: .now() + 10)
+                    return true
+                },
+                failureResult: { false }
+            )
+            finished.signal()
+        }
+        worker.start()
+        try #require(decoding.wait(timeout: .now() + 10) == .success)
+        let overlapping: Bool = callback.invokeResult(
+            arguments: { [.bool(false)] },
+            decodeResult: { _ in true },
+            failureResult: { false }
+        )
+        release.signal()
+        try #require(finished.wait(timeout: .now() + 10) == .success)
+
+        #expect(!overlapping)
+        #expect(box.arguments == [[.bool(true)]])
+        #expect(box.failures == [
+            .nativeFailure(
+                "concurrent invocation of a non-Sendable native callback is unsupported"
+            ),
+        ])
+    }
+
     @Test("Distinct escaping handles share one non-Sendable execution domain")
     func rejectsConcurrentInvocationAcrossHandles() throws {
         let box = InvocationBox()
@@ -381,13 +606,13 @@ struct NativeCallback {
         )
     }
 
-    private func closure() -> VM.Closure {
+    private func closure(result: Bytecode.ValueType = .void) -> VM.Closure {
         .init(
             functionID: .init(rawValue: 7),
             signature: .init(
                 parameters: [.bool],
                 parameterConventions: [.owned],
-                result: .void
+                result: result
             ),
             captures: []
         )

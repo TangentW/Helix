@@ -465,13 +465,18 @@ does not by itself certify a physical device or distribution channel.
   bridge profile. Typed AST supplies the source closure spelling; canonical SIL
   supplies the physical `@noescape`/escaping lifetime, Objective-C block
   reabstraction, ownership, and global-actor evidence. The current profile
-  accepts direct or Optional synchronous, nonthrowing callbacks that return
-  `Void`; callback parameters may recursively use the ordinary native bridge
-  value family, including `Error` existentials (direct or Optional) represented
-  as bounded opaque proxies, but cannot be `inout`, higher-order, or image-local values.
+  accepts direct or Optional synchronous, nonthrowing callbacks. Callback
+  parameters may recursively use the ordinary native bridge value family,
+  including `Error` existentials (direct or Optional) represented as bounded
+  opaque proxies, but cannot be `inout`, higher-order, or image-local values.
+  Results may be `Void` or ordinary recursive bridge values with deterministic
+  failure values: scalars, text, `Any`, Optional, empty collections, and
+  recursively defaultable tuples. Direct native results are rejected because
+  there is no framework-neutral instance to return on failure; Optional native
+  results are admitted because `nil` is valid.
   Only a bounded textual dynamic-type name crosses; native payload, metadata,
   and semantic error identity do not. `Error` is rejected in Shell entries and
-  ordinary NativeImport parameters or results.
+  ordinary NativeImport parameters/results, and as a callback result.
   Nonescaping callbacks are valid only during the importing call. Escaping
   callbacks may be retained by that exact native parameter, outlive the
   originating VM invocation, and later re-enter the immutable image while
@@ -482,8 +487,12 @@ does not by itself certify a physical device or distribution channel.
   for example, UIKit animation/transition/property-animator callbacks,
   `DispatchQueue.async`/`asyncAfter`, `DispatchGroup.notify`,
   `OperationQueue.addOperation`, `Timer.scheduledTimer`,
-  `URLSession.dataTask`, and `NotificationCenter.addObserver`; it is not a
-  framework-specific list. Source defaults omitted beside a callback are
+  `URLSession.dataTask`, `NotificationCenter.addObserver`, `NSPredicate`, and
+  `FileManager` enumeration; it is not a framework-specific list. If callback
+  execution or result decoding fails, the wrapper returns its deterministic
+  ABI value. An active importer retains the error and traps after the native
+  frame returns; a detached escaping invocation reports Runtime telemetry.
+  Source defaults omitted beside a callback are
   represented by a checked physical-to-logical projection and are supplied by
   the generated Swift invocation after SIL provenance and ownership validation.
 - Top-level non-suspending `async`, `async throws`, and `@MainActor async`
@@ -555,9 +564,9 @@ does not by itself certify a physical device or distribution channel.
   callback-parameter profile above. Ordinary native values, native properties,
   native results, and the general boundary codec cannot contain closures; only
   an exact escaping callback parameter may retain its pinned handle. Callback
-  results other than `Void`, throwing or async callback ABIs, `inout` callback
-  parameters, higher-order callback parameters, and concurrent `Sendable`
-  execution semantics remain unsupported.
+  results without a framework-neutral failure value, throwing or async callback
+  ABIs, `inout` callback parameters, higher-order callback parameters, and
+  concurrent `Sendable` execution semantics remain unsupported.
   `unowned(unsafe)` is rejected because its dangling reference cannot be made
   safe, and weak/unowned stored properties are not yet a patch-local nominal
   layout feature. A caller-owned `inout` value may be captured only by the
@@ -612,7 +621,7 @@ machine code.
 | Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM |
 | Change an existing Shell struct/enum/actor instance root or existing native static/class method | Rejected until Shell value writeback, executor, and native metatype ABI are implemented; this does not restrict image-local value-type accessors/helpers |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
-| First use a public SDK member in a managed Debug body | Supported for a uniquely measured synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. Closure-bearing methods are supported when every callback fits the exact synchronous `Void` profile above; unfamiliar error bridges, async/generic callbacks or declarations, subscripts, and unrepresentable signatures require a full build |
+| First use a public SDK member in a managed Debug body | Supported for a uniquely measured synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. Closure-bearing methods are supported when every callback fits the exact synchronous, nonthrowing bridge-and-failure-value profile above; unfamiliar error bridges, async/generic callbacks or declarations, subscripts, and unrepresentable signatures require a full build |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |

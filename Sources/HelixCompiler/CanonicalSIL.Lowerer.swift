@@ -842,6 +842,7 @@ public struct Lowerer: Sendable {
         var unboundedRangeClosureValues = Set<String>()
         var staticKeyPathValues: [String: CanonicalSIL.StaticKeyPath.Capture] = [:]
         var frozenObjectiveCBridgeResults = Set<Bytecode.Register>()
+        var objectiveCBridgeDynamicTypes: [Bytecode.Register: Bytecode.DynamicType] = [:]
         var hostedAllocatorReferences: [String: Core.TypeID] = [:]
         var hostedSuperReferences: [String: HostedSuperReference] = [:]
         var deferredForeignReferences: [String: (reference: String, loweredType: String)] = [:]
@@ -913,7 +914,10 @@ public struct Lowerer: Sendable {
         var pendingRetainedValues: [String: [Bytecode.Register]] = [:]
         var retainedValueAliasRoots: [String: String] = [:]
         var borrowedTemporaryValues: [String: Bytecode.Register] = [:]
-        var borrowedTemporaryAliasRoots: [String: String] = [:]
+        var compilerOwnedTemporaryValues: [String: Bytecode.Register] = [:]
+        // Both provenance kinds cross the same ownership-neutral SIL aliases;
+        // separate owner maps preserve their distinct +0/+1 semantics.
+        var compilerTemporaryAliasRoots: [String: String] = [:]
         var addressAliases: [String: String] = [:]
         var nativePropertyAddresses: [String: NativePropertyAddress] = [:]
         var pendingArrayIteratorTypes: [String: Bytecode.ValueType] = [:]
@@ -1160,43 +1164,51 @@ public struct Lowerer: Sendable {
             return retained
         }
 
-        func borrowedTemporaryAliasRoot(for token: String) -> String {
+        func compilerTemporaryAliasRoot(for token: String) -> String {
             var current = token
             var visited = Set<String>()
-            while let next = borrowedTemporaryAliasRoots[current],
+            while let next = compilerTemporaryAliasRoots[current],
                   visited.insert(current).inserted {
                 current = next
             }
             return current
         }
 
-        func aliasBorrowedTemporary(
+        func aliasCompilerTemporary(
             _ resultToken: String,
             to sourceToken: String
         ) {
-            let sourceRoot = borrowedTemporaryAliasRoot(for: sourceToken)
-            let resultRoot = borrowedTemporaryAliasRoot(for: resultToken)
+            let sourceRoot = compilerTemporaryAliasRoot(for: sourceToken)
+            let resultRoot = compilerTemporaryAliasRoot(for: resultToken)
             guard resultRoot != sourceRoot else { return }
-            borrowedTemporaryAliasRoots[resultRoot] = sourceRoot
-            borrowedTemporaryAliasRoots[resultToken] = sourceRoot
+            compilerTemporaryAliasRoots[resultRoot] = sourceRoot
+            compilerTemporaryAliasRoots[resultToken] = sourceRoot
         }
 
         func borrowedTemporaryValue(for token: String) -> Bytecode.Register? {
-            borrowedTemporaryValues[borrowedTemporaryAliasRoot(for: token)]
+            borrowedTemporaryValues[compilerTemporaryAliasRoot(for: token)]
         }
 
-        func borrowedTemporaryAliasTokens(for token: String) -> Set<String> {
-            let root = borrowedTemporaryAliasRoot(for: token)
+        func compilerOwnedTemporaryValue(
+            for token: String
+        ) -> Bytecode.Register? {
+            compilerOwnedTemporaryValues[
+                compilerTemporaryAliasRoot(for: token)
+            ]
+        }
+
+        func compilerTemporaryAliasTokens(for token: String) -> Set<String> {
+            let root = compilerTemporaryAliasRoot(for: token)
             var aliases: Set<String> = [root, token]
-            for candidate in borrowedTemporaryAliasRoots.keys
-            where borrowedTemporaryAliasRoot(for: candidate) == root {
+            for candidate in compilerTemporaryAliasRoots.keys
+            where compilerTemporaryAliasRoot(for: candidate) == root {
                 aliases.insert(candidate)
             }
             return aliases
         }
 
         func clearBorrowedTemporaryClassification(for token: String) {
-            for alias in borrowedTemporaryAliasTokens(for: token) {
+            for alias in compilerTemporaryAliasTokens(for: token) {
                 borrowedValueTokens.remove(alias)
                 borrowedLoadTokens.remove(alias)
             }
@@ -1206,8 +1218,10 @@ public struct Lowerer: Sendable {
             _ value: Bytecode.Register,
             for token: String
         ) throws {
-            let root = borrowedTemporaryAliasRoot(for: token)
-            guard borrowedTemporaryValues[root] == nil else {
+            let root = compilerTemporaryAliasRoot(for: token)
+            guard borrowedTemporaryValues[root] == nil,
+                  compilerOwnedTemporaryValues[root] == nil
+            else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "borrowed temporary token already owns a VM value"
                 )
@@ -1220,7 +1234,31 @@ public struct Lowerer: Sendable {
             for token: String
         ) -> Bytecode.Register? {
             borrowedTemporaryValues.removeValue(
-                forKey: borrowedTemporaryAliasRoot(for: token)
+                forKey: compilerTemporaryAliasRoot(for: token)
+            )
+        }
+
+        func recordCompilerOwnedTemporaryValue(
+            _ value: Bytecode.Register,
+            for token: String
+        ) throws {
+            let root = compilerTemporaryAliasRoot(for: token)
+            guard borrowedTemporaryValues[root] == nil,
+                  compilerOwnedTemporaryValues[root] == nil
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "compiler-owned temporary token already owns a VM value"
+                )
+            }
+            compilerOwnedTemporaryValues[root] = value
+        }
+
+        @discardableResult
+        func removeCompilerOwnedTemporaryValue(
+            for token: String
+        ) -> Bytecode.Register? {
+            compilerOwnedTemporaryValues.removeValue(
+                forKey: compilerTemporaryAliasRoot(for: token)
             )
         }
 
@@ -1252,7 +1290,7 @@ public struct Lowerer: Sendable {
                 }
                 let owned = try copyOwnedValue(value)
                 if !hasFutureSemanticUse(
-                    ofBorrowedTemporaryAliasedTo: token,
+                    ofCompilerTemporaryAliasedTo: token,
                     after: currentSILLineIndex
                 ) {
                     removeBorrowedTemporaryValue(for: token)
@@ -1261,12 +1299,27 @@ public struct Lowerer: Sendable {
                 }
                 return owned
             }
-            let preservesSource = isBorrowedValue(token: token, register: value)
-                || hasFutureSemanticUse(
+            let hasFutureUse = compilerOwnedTemporaryValue(for: token) != nil
+                ? hasFutureSemanticUse(
+                    ofCompilerTemporaryAliasedTo: token,
+                    after: currentSILLineIndex
+                )
+                : hasFutureSemanticUse(
                     of: token,
                     after: currentSILLineIndex
                 )
-            guard preservesSource else { return value }
+            let preservesSource = isBorrowedValue(token: token, register: value)
+                || hasFutureUse
+            guard preservesSource else {
+                if let temporary = removeCompilerOwnedTemporaryValue(
+                    for: token
+                ), temporary != value {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "compiler-owned temporary does not match its SIL value"
+                    )
+                }
+                return value
+            }
             // Every HLBC aggregate/call/return ownership edge is explicit.
             // Canonical SIL may express that edge as ARC traffic around a
             // borrowed or subsequently reused SSA value, so materialize a VM
@@ -1307,7 +1360,7 @@ public struct Lowerer: Sendable {
                     )
                 }
                 removeBorrowedTemporaryValue(for: token)
-                for alias in borrowedTemporaryAliasTokens(for: token)
+                for alias in compilerTemporaryAliasTokens(for: token)
                 where values[alias] == temporary {
                     values[alias] = retained
                 }
@@ -1383,10 +1436,10 @@ public struct Lowerer: Sendable {
         }
 
         func hasFutureSemanticUse(
-            ofBorrowedTemporaryAliasedTo token: String,
+            ofCompilerTemporaryAliasedTo token: String,
             after lineIndex: Int
         ) -> Bool {
-            borrowedTemporaryAliasTokens(for: token).contains {
+            compilerTemporaryAliasTokens(for: token).contains {
                 hasFutureSemanticUse(of: $0, after: lineIndex)
             }
         }
@@ -1439,25 +1492,53 @@ public struct Lowerer: Sendable {
             )
         }
 
-        func releaseBorrowedTemporariesAfterLastUse(
+        func releaseCompilerTemporariesAfterLastUse(
             _ tokens: some Sequence<String>,
             after lineIndex: Int
         ) {
             for token in Set(tokens) where !hasFutureSemanticUse(
-                ofBorrowedTemporaryAliasedTo: token,
+                ofCompilerTemporaryAliasedTo: token,
                 after: lineIndex
             ) {
-                guard let value = removeBorrowedTemporaryValue(for: token)
-                else { continue }
-                clearBorrowedTemporaryClassification(for: token)
-                appendInstruction(.destroyValue(value))
+                if let value = removeBorrowedTemporaryValue(for: token) {
+                    clearBorrowedTemporaryClassification(for: token)
+                    appendInstruction(.destroyValue(value))
+                } else if let value = removeCompilerOwnedTemporaryValue(
+                    for: token
+                ) {
+                    appendInstruction(.destroyValue(value))
+                }
             }
         }
 
+        /// Track a VM owner introduced for a physical SIL value that has no
+        /// corresponding SIL cleanup. The compiler must end this synthetic
+        /// lifetime after the value's last semantic use.
+        func trackCompilerTemporaryOwner(
+            token: String,
+            value: Bytecode.Register,
+            after lineIndex: Int
+        ) throws {
+            guard requiresManagedOwnership(
+                registerTypes[Int(value.rawValue)]
+            ) else { return }
+            if let tracked = compilerOwnedTemporaryValue(for: token) {
+                guard tracked == value else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "compiler-owned temporary does not match its SIL value"
+                    )
+                }
+            } else if borrowedTemporaryValue(for: token) == nil {
+                try recordCompilerOwnedTemporaryValue(value, for: token)
+            }
+            releaseCompilerTemporariesAfterLastUse(
+                [token],
+                after: lineIndex
+            )
+        }
+
         /// Clang-imported value types have no ARC cleanup in physical SIL,
-        /// while their frozen Native representation owns a VM handle. Track
-        /// that compiler-materialized owner until its final semantic use so a
-        /// +0 native call cannot leave the handle live at function exit.
+        /// while their frozen Native representation owns a VM handle.
         func trackNonreferenceNativeTemporary(
             token: String,
             value: Bytecode.Register,
@@ -1466,10 +1547,16 @@ public struct Lowerer: Sendable {
             guard typeEnvironment.isNonreferenceNativeValue(
                 registerTypes[Int(value.rawValue)]
             ) else { return }
-            if borrowedTemporaryValue(for: token) == nil {
+            if let tracked = borrowedTemporaryValue(for: token) {
+                guard tracked == value else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "borrowed temporary ownership does not match its SIL value"
+                    )
+                }
+            } else if compilerOwnedTemporaryValue(for: token) == nil {
                 try recordBorrowedTemporaryValue(value, for: token)
             }
-            releaseBorrowedTemporariesAfterLastUse(
+            releaseCompilerTemporariesAfterLastUse(
                 [token],
                 after: lineIndex
             )
@@ -1489,6 +1576,19 @@ public struct Lowerer: Sendable {
             clearBorrowedTemporaryClassification(for: token)
         }
 
+        func closeCompilerOwnedTemporaryLifetime(
+            for token: String,
+            resolved value: Bytecode.Register
+        ) throws {
+            guard let tracked = removeCompilerOwnedTemporaryValue(for: token)
+            else { return }
+            guard tracked == value else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "compiler-owned temporary does not match its SIL value"
+                )
+            }
+        }
+
         func transferBorrowedTemporaryLifetime(
             from sourceToken: String,
             resolved source: Bytecode.Register,
@@ -1504,6 +1604,54 @@ public struct Lowerer: Sendable {
             }
             clearBorrowedTemporaryClassification(for: sourceToken)
             try recordBorrowedTemporaryValue(result, for: resultToken)
+        }
+
+        func transferCompilerOwnedTemporaryLifetime(
+            from sourceToken: String,
+            resolved source: Bytecode.Register,
+            to resultToken: String,
+            result: Bytecode.Register
+        ) throws {
+            guard let tracked = removeCompilerOwnedTemporaryValue(
+                for: sourceToken
+            ) else { return }
+            guard tracked == source else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "compiler-owned temporary cannot transfer into a different owner"
+                )
+            }
+            try recordCompilerOwnedTemporaryValue(result, for: resultToken)
+        }
+
+        func transferCompilerTemporaryOwnersIntoControlFlow(
+            tokens: [String],
+            arguments: [Bytecode.Register]
+        ) throws {
+            guard tokens.count == arguments.count else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "branch owner transfer has inconsistent arity"
+                )
+            }
+            for (token, argument) in zip(tokens, arguments) {
+                if let tracked = borrowedTemporaryValue(for: token) {
+                    guard tracked == argument else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "branch owner transfer does not match its SIL value"
+                        )
+                    }
+                    removeBorrowedTemporaryValue(for: token)
+                    clearBorrowedTemporaryClassification(for: token)
+                } else if let tracked = compilerOwnedTemporaryValue(
+                    for: token
+                ) {
+                    guard tracked == argument else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "branch owner transfer does not match its SIL value"
+                        )
+                    }
+                    removeCompilerOwnedTemporaryValue(for: token)
+                }
+            }
         }
 
         func addressBase(_ token: String) -> String {
@@ -3261,6 +3409,14 @@ public struct Lowerer: Sendable {
                         // passed that owner +0 or +1. Any later destroy/release
                         // is compiler ownership plumbing for this same erased
                         // SSA value and must not release it twice.
+                        try closeBorrowedTemporaryLifetime(
+                            for: token,
+                            resolved: value
+                        )
+                        try closeCompilerOwnedTemporaryLifetime(
+                            for: token,
+                            resolved: value
+                        )
                         appendInstruction(.destroyValue(value))
                         projectedInlineOptionalNoneOwners.insert(value)
                     }
@@ -4541,6 +4697,10 @@ public struct Lowerer: Sendable {
             if operation == .release,
                let retained = takePendingRetainedValue(for: token) {
                 appendInstruction(.destroyValue(retained))
+                releaseCompilerTemporariesAfterLastUse(
+                    [token],
+                    after: currentSILLineIndex
+                )
                 return
             }
             let type = registerTypes[Int(value.rawValue)]
@@ -4562,8 +4722,13 @@ public struct Lowerer: Sendable {
             if operation == .retain {
                 try materializeRetain(of: token, value: value)
             } else if borrowedTemporaryValue(for: token) != nil
+                || compilerOwnedTemporaryValue(for: token) != nil
                 || !isBorrowedValue(token: token, register: value) {
                 try closeBorrowedTemporaryLifetime(
+                    for: token,
+                    resolved: value
+                )
+                try closeCompilerOwnedTemporaryLifetime(
                     for: token,
                     resolved: value
                 )
@@ -17021,10 +17186,7 @@ public struct Lowerer: Sendable {
                     .filter { !$0.isEmpty }
                 guard !resultToken.isEmpty,
                       specializations.count == 1,
-                      arguments.count == 1,
-                      case let .native(targetType) = try parseType(
-                        "Swift.AnyObject"
-                      )
+                      arguments.count == 1
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "Swift AnyObject bridge has an invalid specialization"
@@ -17034,7 +17196,7 @@ public struct Lowerer: Sendable {
                     at: arguments[0],
                     line: line
                 )
-                let erased: Bytecode.Register
+                let dynamicType: Bytecode.DynamicType
                 if CanonicalSIL.AnyObjectBridge.isOpenedAnyArchetype(
                     specializations[0]
                 ) {
@@ -17043,55 +17205,17 @@ public struct Lowerer: Sendable {
                             "opened AnyObject bridge lost its enclosing Any value"
                         )
                     }
-                    erased = source
+                    dynamicType = .any
                 } else {
-                    let dynamicType = try parseDynamicAnyType(
+                    dynamicType = try parseDynamicAnyType(
                         specializations[0]
                     )
-                    guard dynamicType.isSwiftBridgeMaterializableV1,
-                          dynamicType.storageType
-                            == registerTypes[Int(source.rawValue)]
-                    else {
-                        throw CanonicalSIL.LoweringError.unsupportedType(
-                            "AnyObject bridge payload \(specializations[0])"
-                        )
-                    }
-                    if dynamicType == .any {
-                        erased = source
-                    } else {
-                        erased = try allocate(type: .any)
-                        appendInstruction(
-                            .eraseToAny(
-                                result: erased,
-                                value: source,
-                                dynamicType: dynamicType
-                            )
-                        )
-                    }
                 }
-                let symbol = CanonicalSIL.NativeBridgeSymbols
-                    .anyObjectBridge(to: targetType)
-                guard let binding = directCalls.binding(for: symbol),
-                      binding.parameterTypes == [.any],
-                      binding.parameterConventions == [.owned],
-                      binding.resultType == .native(targetType),
-                      binding.abiAdapter == .direct,
-                      !binding.effects.mayThrow,
-                      !binding.effects.isAsync,
-                      case let .nativeImport(requirement) = binding.target
-                else {
-                    throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "Swift AnyObject bridge has no exact frozen NativeImport"
-                    )
-                }
-                let result = try allocate(type: .native(targetType))
-                values[resultToken] = result
-                appendInstruction(
-                    .nativeApply(
-                        result: result,
-                        importID: requirement.id,
-                        arguments: [erased]
-                    )
+                try lowerSwiftValueAnyObjectBridge(
+                    resultToken: resultToken,
+                    source: source,
+                    dynamicType: dynamicType,
+                    context: "Swift AnyObject bridge"
                 )
 
             case .typedThrowNotification:
@@ -19099,6 +19223,17 @@ public struct Lowerer: Sendable {
                 let result = try allocate(type: .array(element))
                 values[resultToken] = result
                 appendInstruction(.copyValue(result: result, source: source))
+                if let elementDynamicType = try? parseDynamicAnyType(
+                    genericArguments
+                ) {
+                    let dynamicType = Bytecode.DynamicType.array(
+                        elementDynamicType
+                    )
+                    if dynamicType.isSwiftBridgeMaterializableV1,
+                       dynamicType.storageType == .array(element) {
+                        objectiveCBridgeDynamicTypes[result] = dynamicType
+                    }
+                }
                 return
             }
             guard genericArguments.isEmpty else {
@@ -19151,6 +19286,66 @@ public struct Lowerer: Sendable {
             let result = try allocate(type: .string)
             values[resultToken] = result
             appendInstruction(.copyValue(result: result, source: source))
+            objectiveCBridgeDynamicTypes[result] = .string
+        }
+
+        func lowerSwiftValueAnyObjectBridge(
+            resultToken: String,
+            source: Bytecode.Register,
+            dynamicType: Bytecode.DynamicType,
+            context: String
+        ) throws {
+            guard !resultToken.isEmpty,
+                  dynamicType.isSwiftBridgeMaterializableV1,
+                  dynamicType.storageType == registerTypes[Int(source.rawValue)]
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) payload does not have an exact bridgeable Swift type"
+                )
+            }
+            let erased: Bytecode.Register
+            if dynamicType == .any {
+                erased = source
+            } else {
+                erased = try allocate(type: .any)
+                appendInstruction(
+                    .eraseToAny(
+                        result: erased,
+                        value: source,
+                        dynamicType: dynamicType
+                    )
+                )
+            }
+            guard case let .native(targetType) = try parseType("Swift.AnyObject")
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) has no frozen Swift.AnyObject type"
+                )
+            }
+            let symbol = CanonicalSIL.NativeBridgeSymbols
+                .anyObjectBridge(to: targetType)
+            guard let binding = directCalls.binding(for: symbol),
+                  binding.parameterTypes == [.any],
+                  binding.parameterConventions == [.owned],
+                  binding.resultType == .native(targetType),
+                  binding.abiAdapter == .direct,
+                  !binding.effects.mayThrow,
+                  !binding.effects.isAsync,
+                  case let .nativeImport(requirement) = binding.target
+            else {
+                throw CanonicalSIL.LoweringError.invalidCallTable(
+                    "\(context) has no exact frozen NativeImport"
+                )
+            }
+            let result = try allocate(type: .native(targetType))
+            values[resultToken] = result
+            appendInstruction(
+                .nativeApply(
+                    result: result,
+                    importID: requirement.id,
+                    arguments: [erased]
+                )
+            )
         }
 
         func lowerBorrowEnd(
@@ -20314,7 +20509,7 @@ public struct Lowerer: Sendable {
                 // responsible for keeping the boundary borrowed.
                 values[copy[0]] = source
                 aliasRetainedValue(copy[0], to: copy[1])
-                aliasBorrowedTemporary(copy[0], to: copy[1])
+                aliasCompilerTemporary(copy[0], to: copy[1])
                 continue
             }
 
@@ -20420,6 +20615,10 @@ public struct Lowerer: Sendable {
                     for token in [box, store[2]] {
                         values[token] = reference
                     }
+                    releaseCompilerTemporariesAfterLastUse(
+                        [store[0]],
+                        after: lineIndex
+                    )
                     continue
                 }
                 guard let reference = nonOwningReference(at: store[2]),
@@ -20437,6 +20636,10 @@ public struct Lowerer: Sendable {
                         source: source,
                         mode: mode
                     )
+                )
+                releaseCompilerTemporariesAfterLastUse(
+                    [store[0]],
+                    after: lineIndex
                 )
                 continue
             }
@@ -21857,55 +22060,79 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = init_existential_ref (%[0-9]+) : \$(.+) : \$.+, \$(?:Swift\.)?AnyObject$"#
             ) {
-                let source = try resolve(cast[1], line: sourceLine)
-                guard case let .native(sourceType) = registerTypes[Int(source.rawValue)],
-                      case let .native(targetType) = try parseType("Swift.AnyObject"),
-                      sourceType != targetType
+                let borrowedSource = try resolve(cast[1], line: sourceLine)
+                let sourceValueType = registerTypes[Int(borrowedSource.rawValue)]
+                if case let .native(sourceType) = sourceValueType {
+                    guard case let .native(targetType) = try parseType("Swift.AnyObject"),
+                          sourceType != targetType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "AnyObject erasure source is not an exact frozen reference"
+                        )
+                    }
+                    let symbol = CanonicalSIL.NativeBridgeSymbols.upcast(
+                        from: sourceType,
+                        to: targetType
+                    )
+                    guard let binding = directCalls.binding(for: symbol),
+                          binding.parameterTypes == [.native(sourceType)],
+                          binding.parameterConventions == [.owned],
+                          binding.resultType == .native(targetType),
+                          !binding.effects.mayThrow,
+                          !binding.effects.isAsync,
+                          case let .nativeImport(requirement) = binding.target
+                    else {
+                        throw CanonicalSIL.LoweringError.invalidCallTable(
+                            "AnyObject erasure has no exact frozen bridge"
+                        )
+                    }
+                    let conversion = try prepareNativeReferenceConversion(
+                        sourceToken: cast[1],
+                        source: borrowedSource,
+                        lineIndex: lineIndex
+                    )
+                    let result = try allocate(type: .native(targetType))
+                    values[cast[0]] = result
+                    aliasRetainedValue(cast[0], to: cast[1])
+                    if conversion.forwardsExplicitOwner {
+                        recordPendingRetainedValue(result, for: cast[0])
+                    }
+                    if conversion.tracksCompilerTemporary {
+                        try recordBorrowedTemporaryValue(result, for: cast[0])
+                    }
+                    appendInstruction(
+                        .nativeApply(
+                            result: result,
+                            importID: requirement.id,
+                            arguments: [conversion.argument]
+                        )
+                    )
+                    releaseCompilerTemporariesAfterLastUse(
+                        [cast[1]],
+                        after: lineIndex
+                    )
+                    continue
+                }
+                guard let dynamicType = objectiveCBridgeDynamicTypes[borrowedSource],
+                      isSupportedObjectiveCBridgeSpelling(
+                          cast[2],
+                          to: sourceValueType,
+                          allowingForeignABIRepresentation: true
+                      )
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "AnyObject erasure source is not an exact frozen reference"
+                        "AnyObject erasure source has no exact Swift-to-Objective-C bridge"
                     )
                 }
-                let symbol = CanonicalSIL.NativeBridgeSymbols.upcast(
-                    from: sourceType,
-                    to: targetType
+                let source = try materializeOwnedValue(
+                    at: cast[1],
+                    line: sourceLine
                 )
-                guard let binding = directCalls.binding(for: symbol),
-                      binding.parameterTypes == [.native(sourceType)],
-                      binding.parameterConventions == [.owned],
-                      binding.resultType == .native(targetType),
-                      !binding.effects.mayThrow,
-                      !binding.effects.isAsync,
-                      case let .nativeImport(requirement) = binding.target
-                else {
-                    throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "AnyObject erasure has no exact frozen bridge"
-                    )
-                }
-                let conversion = try prepareNativeReferenceConversion(
-                    sourceToken: cast[1],
+                try lowerSwiftValueAnyObjectBridge(
+                    resultToken: cast[0],
                     source: source,
-                    lineIndex: lineIndex
-                )
-                let result = try allocate(type: .native(targetType))
-                values[cast[0]] = result
-                aliasRetainedValue(cast[0], to: cast[1])
-                if conversion.forwardsExplicitOwner {
-                    recordPendingRetainedValue(result, for: cast[0])
-                }
-                if conversion.tracksCompilerTemporary {
-                    try recordBorrowedTemporaryValue(result, for: cast[0])
-                }
-                appendInstruction(
-                    .nativeApply(
-                        result: result,
-                        importID: requirement.id,
-                        arguments: [conversion.argument]
-                    )
-                )
-                releaseBorrowedTemporariesAfterLastUse(
-                    [cast[1]],
-                    after: lineIndex
+                    dynamicType: dynamicType,
+                    context: "Swift value AnyObject erasure"
                 )
                 continue
             }
@@ -21992,7 +22219,7 @@ public struct Lowerer: Sendable {
                         arguments: [conversion.argument]
                     )
                 )
-                releaseBorrowedTemporariesAfterLastUse(
+                releaseCompilerTemporariesAfterLastUse(
                     [cast[1]],
                     after: lineIndex
                 )
@@ -22573,7 +22800,7 @@ public struct Lowerer: Sendable {
                     // borrows it according to the frozen NativeImport contract.
                     values[closure[0]] = source
                     aliasRetainedValue(closure[0], to: captureTokens[0])
-                    aliasBorrowedTemporary(closure[0], to: captureTokens[0])
+                    aliasCompilerTemporary(closure[0], to: captureTokens[0])
                     continue
                 }
                 let reference: ResolvedFunctionReference
@@ -22819,7 +23046,7 @@ public struct Lowerer: Sendable {
                 } else {
                     values[dependence[0]] = source
                     aliasRetainedValue(dependence[0], to: dependence[1])
-                    aliasBorrowedTemporary(dependence[0], to: dependence[1])
+                    aliasCompilerTemporary(dependence[0], to: dependence[1])
                 }
                 continue
             }
@@ -22881,7 +23108,7 @@ public struct Lowerer: Sendable {
                 // signature is therefore an ownership-neutral closure alias.
                 values[conversion[0]] = source
                 aliasRetainedValue(conversion[0], to: conversion[1])
-                aliasBorrowedTemporary(conversion[0], to: conversion[1])
+                aliasCompilerTemporary(conversion[0], to: conversion[1])
                 continue
             }
 
@@ -22902,7 +23129,7 @@ public struct Lowerer: Sendable {
                 }
                 values[conversion[0]] = source
                 aliasRetainedValue(conversion[0], to: conversion[1])
-                aliasBorrowedTemporary(conversion[0], to: conversion[1])
+                aliasCompilerTemporary(conversion[0], to: conversion[1])
                 continue
             }
 
@@ -22936,7 +23163,7 @@ public struct Lowerer: Sendable {
                     values[borrowed[0]] = try resolve(borrowed[1], line: sourceLine)
                     borrowedValueTokens.insert(borrowed[0])
                     aliasRetainedValue(borrowed[0], to: borrowed[1])
-                    aliasBorrowedTemporary(borrowed[0], to: borrowed[1])
+                    aliasCompilerTemporary(borrowed[0], to: borrowed[1])
                     if inlineOptionalNoneValues.contains(borrowed[1]) {
                         inlineOptionalNoneValues.insert(borrowed[0])
                         deferredNativeBlockNoneTypes[borrowed[0]] =
@@ -24166,7 +24393,7 @@ public struct Lowerer: Sendable {
                     }
                 }
                 try finishPreparedAccessesAndWritebacks(prepared)
-                releaseBorrowedTemporariesAfterLastUse(
+                releaseCompilerTemporariesAfterLastUse(
                     zip(
                         argumentTokens,
                         reference.physicalParameterConventions
@@ -24281,7 +24508,7 @@ public struct Lowerer: Sendable {
                    typeEnvironment.containsReferenceNativeValue(sourceType) {
                     values[cast[0]] = source
                     aliasRetainedValue(cast[0], to: cast[1])
-                    aliasBorrowedTemporary(cast[0], to: cast[1])
+                    aliasCompilerTemporary(cast[0], to: cast[1])
                     continue
                 }
             }
@@ -24315,8 +24542,14 @@ public struct Lowerer: Sendable {
                         to: cast[0],
                         result: result
                     )
+                    try transferCompilerOwnedTemporaryLifetime(
+                        from: cast[1],
+                        resolved: source,
+                        to: cast[0],
+                        result: result
+                    )
                 } else {
-                    releaseBorrowedTemporariesAfterLastUse(
+                    releaseCompilerTemporariesAfterLastUse(
                         [cast[1]],
                         after: lineIndex
                     )
@@ -24660,8 +24893,14 @@ public struct Lowerer: Sendable {
                         to: optional[0],
                         result: result
                     )
+                    try transferCompilerOwnedTemporaryLifetime(
+                        from: optional[2],
+                        resolved: source,
+                        to: optional[0],
+                        result: result
+                    )
                 } else {
-                    releaseBorrowedTemporariesAfterLastUse(
+                    releaseCompilerTemporariesAfterLastUse(
                         [optional[2]],
                         after: lineIndex
                     )
@@ -24702,7 +24941,11 @@ public struct Lowerer: Sendable {
                 inlineOptionalNoneValues.insert(optional[0])
                 deferredNativeBlockNoneTypes[optional[0]] = deferredNativeBlock
                 appendInstruction(.makeOptionalNone(result: result))
-                try trackNonreferenceNativeTemporary(
+                // Optional.none has no Swift payload cleanup even when its
+                // static VM type is linear. Keep the verifier's conservative
+                // type-level ownership model and synthesize the no-op owner
+                // endpoint after the value's final semantic use.
+                try trackCompilerTemporaryOwner(
                     token: optional[0],
                     value: result,
                     after: lineIndex
@@ -26143,6 +26386,9 @@ public struct Lowerer: Sendable {
                 if frozenObjectiveCBridgeResults.contains(source) {
                     frozenObjectiveCBridgeResults.insert(result)
                 }
+                if let dynamicType = objectiveCBridgeDynamicTypes[source] {
+                    objectiveCBridgeDynamicTypes[result] = dynamicType
+                }
                 if let payload = knownOptionalSomePayloads[copy[1]] {
                     knownOptionalSomePayloads[copy[0]] = payload
                 }
@@ -26159,7 +26405,20 @@ public struct Lowerer: Sendable {
                     optionalAddressSelectionConditions[copy[0]] = selection
                 }
                 appendInstruction(.copyValue(result: result, source: source))
-                releaseBorrowedTemporariesAfterLastUse(
+                if inlineOptionalNoneValues.contains(copy[0]) {
+                    try trackCompilerTemporaryOwner(
+                        token: copy[0],
+                        value: result,
+                        after: lineIndex
+                    )
+                } else {
+                    try trackNonreferenceNativeTemporary(
+                        token: copy[0],
+                        value: result,
+                        after: lineIndex
+                    )
+                }
+                releaseCompilerTemporariesAfterLastUse(
                     [copy[1]],
                     after: lineIndex
                 )
@@ -26258,6 +26517,11 @@ public struct Lowerer: Sendable {
                 if frozenObjectiveCBridgeResults.remove(source) != nil {
                     frozenObjectiveCBridgeResults.insert(result)
                 }
+                if let dynamicType = objectiveCBridgeDynamicTypes.removeValue(
+                    forKey: source
+                ) {
+                    objectiveCBridgeDynamicTypes[result] = dynamicType
+                }
                 if let payload = knownOptionalSomePayloads.removeValue(forKey: move[1]) {
                     knownOptionalSomePayloads[move[0]] = payload
                 }
@@ -26278,6 +26542,22 @@ public struct Lowerer: Sendable {
                     optionalAddressSelectionConditions[move[0]] = selection
                 }
                 appendInstruction(.moveValue(result: result, source: source))
+                try transferBorrowedTemporaryLifetime(
+                    from: move[1],
+                    resolved: source,
+                    to: move[0],
+                    result: result
+                )
+                try transferCompilerOwnedTemporaryLifetime(
+                    from: move[1],
+                    resolved: source,
+                    to: move[0],
+                    result: result
+                )
+                releaseCompilerTemporariesAfterLastUse(
+                    [move[0]],
+                    after: lineIndex
+                )
                 continue
             }
             if let destroy = match(line, pattern: #"^destroy_value (%[0-9]+)$"#) {
@@ -26346,6 +26626,10 @@ public struct Lowerer: Sendable {
                     for: destroy[0],
                     resolved: value
                 )
+                try closeCompilerOwnedTemporaryLifetime(
+                    for: destroy[0],
+                    resolved: value
+                )
                 appendInstruction(.destroyValue(value))
                 continue
             }
@@ -26408,6 +26692,10 @@ public struct Lowerer: Sendable {
                     for: ownership[1]
                    ) {
                     appendInstruction(.destroyValue(retained))
+                    releaseCompilerTemporariesAfterLastUse(
+                        [ownership[1]],
+                        after: currentSILLineIndex
+                    )
                     continue
                 }
                 let value = try resolve(ownership[1], line: sourceLine)
@@ -26431,11 +26719,18 @@ public struct Lowerer: Sendable {
                     if ownership[0] == "retain_value" {
                         try materializeRetain(of: ownership[1], value: value)
                     } else if borrowedTemporaryValue(for: ownership[1]) != nil
+                        || compilerOwnedTemporaryValue(
+                            for: ownership[1]
+                        ) != nil
                         || !isBorrowedValue(
                             token: ownership[1],
                             register: value
                         ) {
                         try closeBorrowedTemporaryLifetime(
+                            for: ownership[1],
+                            resolved: value
+                        )
+                        try closeCompilerOwnedTemporaryLifetime(
                             for: ownership[1],
                             resolved: value
                         )
@@ -26918,12 +27213,19 @@ public struct Lowerer: Sendable {
 
             if let branch = match(line, pattern: #"^br bb([0-9]+)(?:\((.*)\))?$"#) {
                 let target = try parseBlockID(branch[0])
+                let argumentTokens = parseBranchValueTokens(
+                    branch.count > 1 ? branch[1] : ""
+                )
                 var arguments = try parseBranchArguments(
                     branch.count > 1 ? branch[1] : "",
                     line: sourceLine,
                     resolve: { token, line in
                         try resolveStorableValue(token, line: line)
                     }
+                )
+                try transferCompilerTemporaryOwnersIntoControlFlow(
+                    tokens: argumentTokens,
+                    arguments: arguments
                 )
                 try appendCompilerAddressMergeArguments(
                     target: target,
@@ -26998,6 +27300,8 @@ public struct Lowerer: Sendable {
             ) {
                 let trueTarget = try parseBlockID(branch[1])
                 let falseTarget = try parseBlockID(branch[3])
+                let trueArgumentTokens = parseBranchValueTokens(branch[2])
+                let falseArgumentTokens = parseBranchValueTokens(branch[4])
                 var trueArguments = try parseBranchArguments(
                     branch[2],
                     line: sourceLine,
@@ -27011,6 +27315,10 @@ public struct Lowerer: Sendable {
                     resolve: { token, line in
                         try resolveStorableValue(token, line: line)
                     }
+                )
+                try transferCompilerTemporaryOwnersIntoControlFlow(
+                    tokens: trueArgumentTokens + falseArgumentTokens,
+                    arguments: trueArguments + falseArguments
                 )
                 try appendCompilerAddressMergeArguments(
                     target: trueTarget,
@@ -27282,6 +27590,12 @@ public struct Lowerer: Sendable {
         recordIncompleteLifetime(
             "borrowed-temporary[\(borrowedTemporaryTokens.joined(separator: "|"))]",
             count: borrowedTemporaryTokens.count
+        )
+        let compilerOwnedTemporaryTokens = compilerOwnedTemporaryValues.keys
+            .sorted()
+        recordIncompleteLifetime(
+            "compiler-owned-temporary[\(compilerOwnedTemporaryTokens.joined(separator: "|"))]",
+            count: compilerOwnedTemporaryTokens.count
         )
         guard incompleteCompilerLifetimes.isEmpty else {
             throw CanonicalSIL.LoweringError.malformedSIL(
@@ -27902,15 +28216,12 @@ public struct Lowerer: Sendable {
             options: .regularExpression
         ) != nil, text.contains("@block_storage ")
         else { return nil }
-        guard let arrow = outerFunctionArrow(in: text),
-              let result = try? parseType(
-                  String(text[arrow.upperBound...])
-              ), result == .void
-        else {
+        guard let arrow = outerFunctionArrow(in: text) else {
             throw CanonicalSIL.LoweringError.malformedSIL(
-                "native block invoke thunk has a non-Void result: \(raw)"
+                "native block invoke thunk has no result: \(raw)"
             )
         }
+        let physicalResult = String(text[arrow.upperBound...])
         let prefix = String(text[..<arrow.lowerBound])
         guard let close = prefix.lastIndex(of: ")"),
               let open = matchingOpeningParenthesis(for: close, in: prefix)
@@ -27930,6 +28241,16 @@ public struct Lowerer: Sendable {
         else {
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "native block invoke thunk does not match its storage closure"
+            )
+        }
+        guard (try? parseFunctionResult(
+            physicalResult,
+            bridgedTo: signature.result,
+            allowingForeignABIRepresentation: true
+        ).type) == signature.result else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "native block invoke thunk changes callback result "
+                    + "\(physicalResult) away from \(signature.result)"
             )
         }
         let invocationParameters = parameters.dropFirst()
@@ -27973,6 +28294,9 @@ public struct Lowerer: Sendable {
             }
         }
         switch expected {
+        case .any:
+            return allowingForeignABIRepresentation
+                && ["AnyObject", "Swift.AnyObject"].contains(spelling)
         case .closure:
             return isSupportedBlockBridgeSpelling(
                 spelling,
@@ -28000,6 +28324,16 @@ public struct Lowerer: Sendable {
                     .contains(body)
             }
             return false
+        case .dictionary:
+            return allowingForeignABIRepresentation
+                && [
+                    "NSDictionary", "Foundation.NSDictionary",
+                    "__C.NSDictionary",
+                ].contains(spelling)
+        case .set:
+            return allowingForeignABIRepresentation
+                && ["NSSet", "Foundation.NSSet", "__C.NSSet"]
+                    .contains(spelling)
         case let .native(typeID):
             return (
                 allowingForeignABIRepresentation
@@ -28141,8 +28475,11 @@ public struct Lowerer: Sendable {
         ) else { return false }
         spelling.removeSubrange(convention)
         spelling = spelling.trimmingCharacters(in: .whitespaces)
-        guard let arrow = outerFunctionArrow(in: spelling),
-              (try? parseType(String(spelling[arrow.upperBound...]))) == .void
+        guard let arrow = outerFunctionArrow(in: spelling) else { return false }
+        let result = spelling[arrow.upperBound...]
+            .trimmingCharacters(in: .whitespaces)
+        guard !result.isEmpty, result.utf8.count <= 4_096,
+              !result.contains("@error"), !result.contains("@async")
         else { return false }
         let prefix = String(spelling[..<arrow.lowerBound])
         guard let close = prefix.lastIndex(of: ")"),
@@ -28727,10 +29064,18 @@ public struct Lowerer: Sendable {
         line: Int,
         resolve: (String, Int) throws -> Bytecode.Register
     ) throws -> [Bytecode.Register] {
-        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return [] }
-        return try splitTopLevel(text).map { component in
-            let token = component.split(separator: ":", maxSplits: 1)[0].trimmingCharacters(in: .whitespaces)
+        try parseBranchValueTokens(text).map { token in
             return try resolve(token, line)
+        }
+    }
+
+    private func parseBranchValueTokens(_ text: String) -> [String] {
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return []
+        }
+        return splitTopLevel(text).map { component in
+            component.split(separator: ":", maxSplits: 1)[0]
+                .trimmingCharacters(in: .whitespaces)
         }
     }
 

@@ -124,15 +124,126 @@ public final class NativeCallback: @unchecked Sendable {
     public func invokeVoid(
         arguments encodeArguments: () throws -> [VM.Value]
     ) {
+        _ = withInvocation(arguments: encodeArguments) { result, admitted in
+            guard signature.result == .void else {
+                record(
+                    .nativeFailure(
+                        "Void native callback wrapper received a result-producing signature"
+                    ),
+                    admittedDuringNativeInvocation: admitted
+                )
+                return
+            }
+            switch result {
+            case .returned(nil):
+                break
+            case .returned(.some(let value)):
+                record(
+                    .typeMismatch(expected: .void, actual: value.type),
+                    admittedDuringNativeInvocation: admitted
+                )
+            case let .businessError(message):
+                record(
+                    .nativeFailure(
+                        "nonthrowing native callback raised an error: \(message)"
+                    ),
+                    admittedDuringNativeInvocation: admitted
+                )
+            case let .trapped(trap):
+                recordInterpreterTrap(
+                    trap,
+                    admittedDuringNativeInvocation: admitted
+                )
+            }
+        }
+    }
+
+    /// Invokes a callback with a frozen, non-Void result.
+    ///
+    /// A native nonthrowing closure cannot propagate VM or decoding failures.
+    /// The failure is retained by the active importer or reported to Runtime
+    /// telemetry, while `failureResult` supplies the deterministic value that
+    /// lets the native frame return without fabricating an arbitrary object.
+    public func invokeResult<Result>(
+        arguments encodeArguments: () throws -> [VM.Value],
+        decodeResult: (VM.Value) throws -> Result,
+        failureResult: () -> Result
+    ) -> Result {
+        withInvocation(arguments: encodeArguments) { result, admitted in
+            guard signature.result != .void,
+                  signature.result.isNativeBridgeCallbackResult
+            else {
+                record(
+                    .nativeFailure(
+                        "result-producing native callback wrapper received an unsupported signature"
+                    ),
+                    admittedDuringNativeInvocation: admitted
+                )
+                return failureResult()
+            }
+            switch result {
+            case let .returned(.some(value)):
+                guard value.matches(signature.result) else {
+                    record(
+                        .typeMismatch(
+                            expected: signature.result,
+                            actual: value.type
+                        ),
+                        admittedDuringNativeInvocation: admitted
+                    )
+                    return failureResult()
+                }
+                do {
+                    return try decodeResult(value)
+                } catch let trap as VM.RuntimeTrap {
+                    record(trap, admittedDuringNativeInvocation: admitted)
+                } catch {
+                    record(
+                        .nativeFailure(
+                            "native callback result decoding failed: \(error)"
+                        ),
+                        admittedDuringNativeInvocation: admitted
+                    )
+                }
+            case .returned(nil):
+                record(
+                    .typeMismatch(expected: signature.result, actual: nil),
+                    admittedDuringNativeInvocation: admitted
+                )
+            case let .businessError(message):
+                record(
+                    .nativeFailure(
+                        "nonthrowing native callback raised an error: \(message)"
+                    ),
+                    admittedDuringNativeInvocation: admitted
+                )
+            case let .trapped(trap):
+                recordInterpreterTrap(
+                    trap,
+                    admittedDuringNativeInvocation: admitted
+                )
+            }
+            return failureResult()
+        } ?? failureResult()
+    }
+
+    /// Keeps argument encoding, VM execution, result decoding, and failure
+    /// recording inside one serialized callback admission. Generated result
+    /// decoders may materialize non-Sendable native values, so releasing the
+    /// gate before `consumeResult` would permit overlapping callback work.
+    private func withInvocation<Result>(
+        arguments encodeArguments: () throws -> [VM.Value],
+        consumeResult: (VM.ExecutionResult, Bool) -> Result
+    ) -> Result? {
         let admission: VM.NativeCallbackEpoch.Admission
         do {
             admission = try epoch.begin(lifetime: lifetime)
         } catch let trap as VM.RuntimeTrap {
             if !epoch.recordFailure(trap) { host.reportFailure(trap) }
-            return
+            return nil
         } catch {
             host.reportFailure(.nativeFailure(String(describing: error)))
-            return
+            return nil
         }
         defer { epoch.end(admission) }
         guard host.tryEnterExecution() else {
@@ -142,7 +253,7 @@ public final class NativeCallback: @unchecked Sendable {
                 ),
                 admittedDuringNativeInvocation: admission.wasActive
             )
-            return
+            return nil
         }
         defer { host.leaveExecution() }
 
@@ -151,13 +262,13 @@ public final class NativeCallback: @unchecked Sendable {
             arguments = try encodeArguments()
         } catch let trap as VM.RuntimeTrap {
             record(trap, admittedDuringNativeInvocation: admission.wasActive)
-            return
+            return nil
         } catch {
             record(
                 .nativeFailure("native callback argument encoding failed: \(error)"),
                 admittedDuringNativeInvocation: admission.wasActive
             )
-            return
+            return nil
         }
         guard arguments.count == signature.parameters.count,
               zip(arguments, signature.parameters).allSatisfy({
@@ -171,32 +282,17 @@ public final class NativeCallback: @unchecked Sendable {
                 ),
                 admittedDuringNativeInvocation: admission.wasActive
             )
-            return
+            return nil
         }
 
-        let result = host.invoke(
-            closure: closure,
-            arguments: arguments,
-            preferredBudget: admission.budget
+        return consumeResult(
+            host.invoke(
+                closure: closure,
+                arguments: arguments,
+                preferredBudget: admission.budget
+            ),
+            admission.wasActive
         )
-        switch result {
-        case .returned(nil):
-            break
-        case .returned(.some(let value)):
-            record(
-                .typeMismatch(expected: .void, actual: value.type),
-                admittedDuringNativeInvocation: admission.wasActive
-            )
-        case let .businessError(message):
-            record(
-                .nativeFailure("nonthrowing native callback raised an error: \(message)"),
-                admittedDuringNativeInvocation: admission.wasActive
-            )
-        case let .trapped(trap):
-            // The host reports interpreter traps with their deepest program
-            // counter. Only retain the failure for a still-active importer.
-            if admission.wasActive { epoch.recordFailure(trap) }
-        }
     }
 
     /// Polls the originating invocation deadline while it is still active.
@@ -215,6 +311,16 @@ public final class NativeCallback: @unchecked Sendable {
         } else {
             host.reportFailure(trap)
         }
+    }
+
+    private func recordInterpreterTrap(
+        _ trap: VM.RuntimeTrap,
+        admittedDuringNativeInvocation: Bool
+    ) {
+        // The detached Runtime host already reports interpreter traps with
+        // their deepest program counter. An active importer instead retains
+        // the trap so its NativeImport fails after the native frame returns.
+        if admittedDuringNativeInvocation { epoch.recordFailure(trap) }
     }
 }
 }

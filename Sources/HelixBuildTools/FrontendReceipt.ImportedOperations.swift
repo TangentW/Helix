@@ -230,7 +230,9 @@ extension FrontendReceipt.Adapter {
                       sourceType != targetType
                 else {
                     throw FrontendReceipt.Error.invalidRequest(
-                        "imported native upcast has an invalid frozen signature"
+                        "imported native upcast \(operation.ownerType)."
+                            + "\(operation.baseName) has an invalid frozen signature: "
+                            + "\(parameterTypes) -> \(resultType)"
                     )
                 }
                 silSymbols = [CanonicalSIL.NativeBridgeSymbols.upcast(
@@ -2443,6 +2445,14 @@ extension FrontendReceipt.Adapter {
               function.body.contains("init_existential_ref"),
               function.body.contains("$AnyObject")
         else { return }
+        let swiftValueType = FrontendReceipt.ValueTypeParser.parse(
+            sourceType,
+            allowVoid: false,
+            nativeTypes: [:]
+        )
+        let boxesSwiftValue = swiftValueType?
+            .isOrdinaryNativeImportBridgeValue == true
+        let operationModules = boxesSwiftValue ? ["Swift"] : importedModules
         types.append(
             importedType(
                 canonicalName: "Swift.AnyObject",
@@ -2451,23 +2461,23 @@ extension FrontendReceipt.Adapter {
                 aliases: ["AnyObject"],
                 representation: .reference,
                 source: source,
-                importedModules: importedModules,
-                requiresMainActor: requiresMainActor
+                importedModules: operationModules,
+                requiresMainActor: boxesSwiftValue ? false : requiresMainActor
             )
         )
         operations.append(
             .init(
                 silReferences: [],
                 sourceFileLogicalID: source.logicalPath,
-                importedModules: importedModules,
-                dispatch: .nativeUpcast,
+                importedModules: operationModules,
+                dispatch: boxesSwiftValue ? .anyObjectBridge : .nativeUpcast,
                 ownerType: "Swift.AnyObject",
-                baseName: "upcast",
+                baseName: boxesSwiftValue ? "bridge" : "upcast",
                 argumentLabels: ["_"],
-                parameterSwiftTypes: [sourceType],
+                parameterSwiftTypes: [boxesSwiftValue ? "Swift.Any" : sourceType],
                 resultSwiftType: "Swift.AnyObject",
-                requiresMainActor: requiresMainActor,
-                compilerOperation: .nativeUpcast
+                requiresMainActor: boxesSwiftValue ? false : requiresMainActor,
+                compilerOperation: boxesSwiftValue ? .anyObjectBridge : .nativeUpcast
             )
         )
     }
@@ -2563,6 +2573,11 @@ extension FrontendReceipt.Adapter {
         types: inout [ImportedNativeType]
     ) {
         guard let mangled = rawMangledType as? String else { return }
+        types += importedClangTypealiasTypes(
+            inMangledType: mangled,
+            source: source,
+            importedModules: importedModules
+        )
         let objectiveCClasses = Self.objectiveCClassNames(
             inMangledType: mangled
         )

@@ -183,6 +183,58 @@ struct NativeImportDiscoveryTests {
         #expect(FrontendReceipt.NativeBridgeProfile.callbacks(
             parameterSpellings: ["(Swift.Int) -> Swift.Bool"],
             parameterTypes: [returning]
+        ) == [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+        ])
+        let textResults = try ["Swift.Character", "Swift.Substring"].map {
+            try #require(FrontendReceipt.ValueTypeParser.parse(
+                "() -> \($0)",
+                allowVoid: false
+            ))
+        }
+        #expect(textResults[0].directClosureShape?.signature.result == .string)
+        #expect(textResults[1].directClosureShape?.signature.result
+            == .array(.string))
+        #expect(textResults.allSatisfy { $0.directClosureShape?
+            .signature.isNativeBridgeCallback == true })
+        let actorPredicateSpelling = "@escaping @Swift.MainActor "
+            + "(Any?, [Swift.String : Any]?) -> Swift.Bool"
+        let parsedActorPredicate = try #require(
+            FrontendReceipt.FunctionTypeSpelling.parse(actorPredicateSpelling)
+        )
+        #expect(parsedActorPredicate.parameters == [
+            "Any?", "[Swift.String : Any]?",
+        ])
+        #expect(parsedActorPredicate.attributes.globalActor == "Swift.MainActor")
+        #expect(parsedActorPredicate.isSynchronousNonthrowing)
+        #expect(FrontendReceipt.ValueTypeParser.parse(
+            parsedActorPredicate.parameters[0],
+            allowVoid: false
+        ) == .optional(.any))
+        #expect(FrontendReceipt.ValueTypeParser.parse(
+            parsedActorPredicate.parameters[1],
+            allowVoid: false
+        ) == .optional(.dictionary(key: .string, value: .any)))
+        #expect(FrontendReceipt.ValueTypeParser.parse(
+            parsedActorPredicate.result,
+            allowVoid: true
+        ) == .bool)
+        let actorPredicate = try #require(FrontendReceipt.ValueTypeParser.parse(
+            actorPredicateSpelling,
+            allowVoid: false
+        ))
+        #expect(actorPredicate.directClosureShape?.signature.result == .bool)
+        let nativeResult = Core.TypeID(
+            rawValue: .sha256("NativeCallbackResult")
+        )
+        let unsupportedResult = Bytecode.ValueType.closure(.init(
+            parameters: [],
+            parameterConventions: [],
+            result: .native(nativeResult)
+        ))
+        #expect(FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: ["() -> NativeCallbackResult"],
+            parameterTypes: [unsupportedResult]
         ) == nil)
         let higherOrder = try #require(FrontendReceipt.ValueTypeParser.parse(
             "(@escaping (Swift.Int) -> Swift.Void) -> Swift.Void",
@@ -462,6 +514,20 @@ struct NativeImportDiscoveryTests {
                 ) { notification in
                     _ = notification.name
                 }
+                let predicate = NSPredicate { value, bindings in
+                    _ = value
+                    _ = bindings
+                    return true
+                }
+                _ = predicate
+                _ = FileManager.default.enumerator(
+                    at: url,
+                    includingPropertiesForKeys: nil
+                ) { failedURL, error in
+                    _ = failedURL
+                    _ = error
+                    return false
+                }
             }
         }
         """
@@ -531,6 +597,12 @@ struct NativeImportDiscoveryTests {
             $0.canonicalName == "NSNotification.Name"
         })
         #expect(notificationName.aliases.contains("NSNotificationName"))
+        let resourceKey = try #require(surface.types.first {
+            $0.canonicalName == "NSURLResourceKey"
+                || $0.aliases.contains("NSURLResourceKey")
+        })
+        #expect(resourceKey.aliases.contains("__C.NSURLResourceKey"))
+        #expect(resourceKey.representation == .opaqueValue)
         let dispatchTimeAddition = try #require(surface.operations.first {
             $0.baseName == "+"
         })
@@ -696,6 +768,52 @@ struct NativeImportDiscoveryTests {
         #expect(observer.resultType == nativeTypes["Swift.AnyObject"].map {
             .native($0)
         })
+
+        let predicateOperation = try #require(surface.operations.first {
+            $0.baseName == "init"
+                && $0.ownerType.contains("NSPredicate")
+                && $0.parameterSwiftTypes.contains { $0.contains("-> Swift.Bool") }
+        })
+        let enumeratorOperation = try #require(surface.operations.first {
+            $0.baseName == "enumerator"
+                && $0.ownerType.contains("FileManager")
+        })
+        let resultOperations = try FrontendReceipt.Adapter()
+            .makeImportedOperationDeclarations(
+                [predicateOperation, enumeratorOperation],
+                moduleName: invocation.moduleName,
+                nativeTypes: nativeTypes
+            )
+        let predicateDeclaration = try #require(resultOperations.first {
+            $0.baseName == "init"
+        })
+        #expect(predicateDeclaration.callbacks == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+        #expect(predicateDeclaration.parameterTypes[0].directClosureShape?
+            .signature.result == .bool)
+        let enumeratorDeclaration = try #require(resultOperations.first {
+            $0.baseName == "enumerator"
+        })
+        let errorHandlerIndex = try #require(
+            enumeratorDeclaration.parameterTypes.firstIndex {
+                $0.directClosureShape != nil
+            }
+        )
+        #expect(enumeratorDeclaration.callbacks == [
+            .init(
+                parameterIndex: UInt16(errorHandlerIndex),
+                lifetime: .escaping
+            ),
+        ])
+        let errorHandler = try #require(
+            enumeratorDeclaration.parameterTypes[errorHandlerIndex]
+                .directClosureShape
+        )
+        #expect(errorHandler.isOptional)
+        #expect(errorHandler.signature.parameters.last == .error)
+        #expect(errorHandler.signature.result == .bool)
+        #expect(errorHandler.signature.isNativeBridgeCallback)
     }
 
     @Test("Physical SIL aliases collapse to one deterministic logical import")
@@ -961,6 +1079,20 @@ struct NativeImportDiscoveryTests {
             public func invokeLater(_ body: @escaping (Bool) -> Void) { body(true) }
             public func invokeOptional(_ body: ((Int) -> Void)?) { body?(1) }
             public func invokeSendable(_ body: @escaping @Sendable () -> Void) { body() }
+            public func invokePredicate(_ value: Int, _ body: (Int) -> Bool) -> Bool {
+                body(value)
+            }
+            public func invokeCharacter(_ body: () -> Character) -> Character {
+                body()
+            }
+            public func invokeTuple(
+                _ body: () -> (value: Int, accepted: Bool)
+            ) -> (value: Int, accepted: Bool) {
+                body()
+            }
+            public func invokeProvider(_ body: @escaping () -> Counter?) -> Counter? {
+                body()
+            }
             public enum Math {
                 public static func doubled(_ value: Int) -> Int { value * 2 }
             }
@@ -1041,11 +1173,15 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
             "\(moduleName).echo(_:)",
+            "\(moduleName).invokeCharacter(_:)",
             "\(moduleName).invokeError(_:)",
             "\(moduleName).invokeLater(_:)",
             "\(moduleName).invokeNow(_:)",
             "\(moduleName).invokeOptional(_:)",
+            "\(moduleName).invokePredicate(_:_:)",
+            "\(moduleName).invokeProvider(_:)",
             "\(moduleName).invokeSendable(_:)",
+            "\(moduleName).invokeTuple(_:)",
             "\(moduleName).keyword(_:repeat:)",
             "\(moduleName).mainValue(_:)",
             "Swift.String.init(describing:)",
@@ -1053,7 +1189,7 @@ struct NativeImportDiscoveryTests {
             "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
-        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...18).map {
+        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...22).map {
             Core.NativeImportID(rawValue: UInt32($0))
         })
         let callbacks = Dictionary(uniqueKeysWithValues: output.receipt
@@ -1076,7 +1212,19 @@ struct NativeImportDiscoveryTests {
         #expect(callbacks["\(moduleName).invokeSendable(_:)"] == [
             .init(parameterIndex: 0, lifetime: .escaping),
         ])
-        #expect(output.receipt.nativeImportBindings.count == 19)
+        #expect(callbacks["\(moduleName).invokePredicate(_:_:)"] == [
+            .init(parameterIndex: 1, lifetime: .nonescaping),
+        ])
+        #expect(callbacks["\(moduleName).invokeCharacter(_:)"] == [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+        ])
+        #expect(callbacks["\(moduleName).invokeTuple(_:)"] == [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+        ])
+        #expect(callbacks["\(moduleName).invokeProvider(_:)"] == [
+            .init(parameterIndex: 0, lifetime: .escaping),
+        ])
+        #expect(output.receipt.nativeImportBindings.count == 23)
         #expect(output.receipt.nativeImportBindings.filter {
             $0.generated != nil
         }.allSatisfy {
@@ -1084,7 +1232,7 @@ struct NativeImportDiscoveryTests {
         })
         #expect(output.receipt.nativeImportBindings.filter {
             $0.generated != nil
-        }.count == 15)
+        }.count == 19)
         #expect(output.receipt.nativeImportBindings.contains {
             $0.generated == nil && $0.importedModules == ["HelixRuntime"]
         })
@@ -1100,11 +1248,15 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
             "\(moduleName).echo(_:)",
+            "\(moduleName).invokeCharacter(_:)",
             "\(moduleName).invokeError(_:)",
             "\(moduleName).invokeLater(_:)",
             "\(moduleName).invokeNow(_:)",
             "\(moduleName).invokeOptional(_:)",
+            "\(moduleName).invokePredicate(_:_:)",
+            "\(moduleName).invokeProvider(_:)",
             "\(moduleName).invokeSendable(_:)",
+            "\(moduleName).invokeTuple(_:)",
             "\(moduleName).keyword(_:repeat:)",
             "\(moduleName).mainValue(_:)",
             "Swift.String.init(describing:)",
@@ -1200,6 +1352,10 @@ struct NativeImportDiscoveryTests {
         #expect(generated.contains("callbackEncoder.encodeError("))
         #expect(generated.contains("BridgeValueCodec.decodeOptional"))
         #expect(generated.contains("@Sendable () -> ()"))
+        #expect(generated.contains(".invokeResult("))
+        #expect(generated.contains("failureResult: {"))
+        #expect(generated.contains("Swift.Character(\"\\0\")"))
+        #expect(generated.contains("(0, false)"))
         let bridge = try #require(
             shell.bridge.sourceFiles["Generated/\(moduleName)Bridge.swift"]
         )
@@ -1554,6 +1710,20 @@ struct NativeImportDiscoveryTests {
                 ) { notification in
                     _ = notification.name
                 }
+                let predicate = NSPredicate { value, bindings in
+                    _ = value
+                    _ = bindings
+                    return true
+                }
+                _ = predicate.evaluate(with: "value")
+                _ = FileManager.default.enumerator(
+                    at: url,
+                    includingPropertiesForKeys: nil
+                ) { failedURL, error in
+                    _ = failedURL
+                    _ = error
+                    return false
+                }
             }
 
             public func constraints(
@@ -1630,6 +1800,15 @@ struct NativeImportDiscoveryTests {
             $0.generated?.dispatch == .instanceGetter
         })
         #expect(labelGetterBinding.importedModules.contains("UIKit"))
+        let resourceKeyType = try #require(output.receipt.nativeTypes.first {
+            $0.canonicalName == "URLResourceKey"
+        })
+        let resourceKeyBinding = try #require(
+            output.receipt.nativeTypeBindings.first {
+                $0.canonicalName == resourceKeyType.canonicalName
+            }
+        )
+        #expect(resourceKeyBinding.generated?.swiftType == "URLResourceKey")
 
         var missingTypeImport = output.receipt
         let labelTypeBindingIndex = try #require(
@@ -1745,6 +1924,10 @@ struct NativeImportDiscoveryTests {
         #expect(generatedBridge.contains("addCompletion"))
         #expect(generatedBridge.contains("animateKeyframes"))
         #expect(generatedBridge.contains("callbackEncoder.encodeError("))
+        #expect(generatedBridge.contains("NSPredicate"))
+        #expect(generatedBridge.contains("enumerator"))
+        #expect(generatedBridge.contains(".invokeResult("))
+        #expect(generatedBridge.contains("failureResult: {"))
         let changed = baseline
             .replacingOccurrences(of: "interval + 1", with: "interval + 2")
             .replacingOccurrences(of: "seed + 1", with: "seed + 2")

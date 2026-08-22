@@ -111,6 +111,11 @@ extension FrontendReceipt.Adapter {
                         )
                     )
                 }
+                uses += importedClangTypealiasTypes(
+                    inMangledType: mangled,
+                    source: source,
+                    importedModules: importedModules
+                )
                 guard let spelling,
                       isImportedMangledType(
                           mangled,
@@ -496,6 +501,34 @@ extension FrontendReceipt.Adapter {
             inMangledType: mangledType,
             terminator: UInt8(ascii: "a")
         )
+    }
+
+    /// Records Clang typedefs even when they are nested inside Optional,
+    /// collection, tuple, or callback spellings. Their exact `So...a`
+    /// mangling is ABI evidence; known VM scalar aliases remain represented by
+    /// their scalar value type instead of becoming opaque native handles.
+    func importedClangTypealiasTypes(
+        inMangledType mangledType: String,
+        source: SourceState,
+        importedModules: [String]
+    ) -> [ImportedNativeType] {
+        Self.objectiveCTypealiasNames(inMangledType: mangledType).compactMap {
+            runtimeName in
+            guard FrontendReceipt.ValueTypeParser.parse(
+                runtimeName,
+                allowVoid: false
+            ) == nil else { return nil }
+            return importedType(
+                canonicalName: runtimeName,
+                swiftType: runtimeName,
+                kind: .value,
+                aliases: ["__C.\(runtimeName)"],
+                representation: .opaqueValue,
+                source: source,
+                importedModules: importedModules,
+                requiresMainActor: false
+            )
+        }
     }
 
     /// Returns the exact Clang-imported nominal ABI identity. Unlike the

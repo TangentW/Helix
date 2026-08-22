@@ -210,7 +210,8 @@ enum ValueTypeParser {
         case "Float": return .float(bitWidth: 32)
         case "Double": return .float(bitWidth: 64)
         case "CGFloat", "CoreFoundation.CGFloat", "CoreGraphics.CGFloat": return .float(bitWidth: 64)
-        case "String": return .string
+        case "String", "Character": return .string
+        case "Substring": return .array(.string)
         case "Any": return .any
         case "Error": return .error
         default: return nil
@@ -276,13 +277,20 @@ enum ValueTypeParser {
     private static func removeTupleLabel(_ value: String) -> String {
         var angleDepth = 0
         var parenthesisDepth = 0
+        var bracketDepth = 0
         for index in value.indices {
             switch value[index] {
             case "<": angleDepth += 1
-            case ">": angleDepth -= 1
+            case ">":
+                let previous = index > value.startIndex
+                    ? value[value.index(before: index)] : nil
+                if previous != "-" { angleDepth -= 1 }
             case "(": parenthesisDepth += 1
             case ")": parenthesisDepth -= 1
-            case ":" where angleDepth == 0 && parenthesisDepth == 0:
+            case "[": bracketDepth += 1
+            case "]": bracketDepth -= 1
+            case ":" where angleDepth == 0 && parenthesisDepth == 0
+                    && bracketDepth == 0:
                 return String(value[value.index(after: index)...])
                     .trimmingCharacters(in: .whitespaces)
             default: break

@@ -53,6 +53,44 @@ struct Metadata {
             imports: [descriptor]
         )
 
+        var returning = descriptor
+        var returningSignature = callbackSignature
+        returningSignature.result = .bool
+        returning.parameterTypes = [
+            .optional(.closure(returningSignature)),
+        ]
+        returning.signature.parameters = ["((Swift.Bool) -> Swift.Bool)?"]
+        _ = try Verification.ShellInterface(
+            interfaceHash: .sha256("callback-shell"),
+            compatibility: compatibility,
+            capabilities: [
+                .baselineV1, .nativeImportsV1, .closureValuesV1,
+                .escapingClosureValuesV1,
+            ],
+            imports: [returning]
+        )
+
+        returningSignature.result = .native(
+            .init(rawValue: .sha256("unsupported-native-callback-result"))
+        )
+        returning.parameterTypes = [
+            .optional(.closure(returningSignature)),
+        ]
+        returning.signature.parameters = [
+            "((Swift.Bool) -> UnsupportedNativeResult)?",
+        ]
+        #expect(throws: Verification.Error.self) {
+            try Verification.ShellInterface(
+                interfaceHash: .sha256("callback-shell"),
+                compatibility: compatibility,
+                capabilities: [
+                    .baselineV1, .nativeImportsV1, .closureValuesV1,
+                    .escapingClosureValuesV1,
+                ],
+                imports: [returning]
+            )
+        }
+
         var missingLifetime = descriptor
         missingLifetime.contract.callbacks = []
         #expect(throws: Verification.Error.self) {

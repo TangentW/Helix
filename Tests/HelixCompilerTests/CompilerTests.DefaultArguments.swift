@@ -494,6 +494,222 @@ struct DefaultArguments {
         #expect(destroys[0] < apply)
     }
 
+    @Test("Borrowed explicit Optional.none closes its synthetic linear owner")
+    func retiresBorrowedExplicitLinearOptionalNone() throws {
+        let keyType = Core.TypeID(
+            rawValue: .sha256("Foundation.URLResourceKey")
+        )
+        let symbol = "$s7Fixture6invokeyySaySo16NSURLResourceKeyaGSgF"
+        let importID = Core.NativeImportID(rawValue: 0)
+        let effects = Core.Effects(mayAllocate: true)
+        let requirement = Bytecode.ImportRequirement(
+            id: importID,
+            key: .init(rawValue: .sha256("explicit-linear-optional-none")),
+            signature: .init(
+                parameters: [
+                    "Swift.Optional<Swift.Array<Foundation.URLResourceKey>>",
+                ],
+                result: "Swift.Void"
+            ),
+            effects: effects,
+            contract: .bounded(
+                kind: .globalFunction,
+                domain: .application,
+                access: .pure,
+                maximumDurationMicroseconds: 500,
+                allowsMainThread: true
+            )
+        )
+        let logicalType = Bytecode.ValueType.optional(
+            .array(.native(keyType))
+        )
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [logicalType],
+                parameterConventions: [.owned],
+                resultType: .void,
+                effects: effects,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["URLResourceKey": keyType],
+                kinds: [keyType: .value]
+            )
+        let physicalType = "@convention(thin) "
+            + "(@guaranteed Optional<Array<URLResourceKey>>) -> ()"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture4rootyyF",
+            loweredType: "@convention(thin) () -> ()",
+            body: """
+            bb0:
+              %0 = enum $Optional<Array<URLResourceKey>>, #Optional.none!enumelt
+              %1 = function_ref @\(symbol) : $\(physicalType)
+              %2 = apply %1(%0) : $\(physicalType)
+              %3 = tuple ()
+              return %3
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "root",
+            directCalls: calls,
+            expectedEffects: effects
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let none = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .makeOptionalNone(result) = instruction else {
+                return nil
+            }
+            return result
+        }.first)
+        let boundaryCopy = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .copyValue(result, source) = instruction,
+                  source == none
+            else { return nil }
+            return result
+        }.first)
+        let applyIndex = try #require(instructions.firstIndex { instruction in
+            guard case let .nativeApply(_, id, arguments) = instruction else {
+                return false
+            }
+            return id == importID && arguments == [boundaryCopy]
+        })
+        let destroyIndex = try #require(
+            instructions.firstIndex(of: .destroyValue(none))
+        )
+        #expect(applyIndex < destroyIndex)
+        #expect(instructions.count { $0 == .destroyValue(none) } == 1)
+    }
+
+    @Test("Payload-free linear Optional copies and moves retain exact lifetimes")
+    func tracksCopiedAndMovedLinearOptionalNone() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture4rootyyF",
+            loweredType: "@convention(thin) () -> ()",
+            body: """
+            bb0:
+              %0 = enum $Optional<NSObject>, #Optional.none!enumelt
+              %1 = copy_value %0
+              %2 = move_value %1
+              %3 = tuple ()
+              return %3
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(function, displayName: "root")
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let none = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .makeOptionalNone(result) = instruction else {
+                return nil
+            }
+            return result
+        }.first)
+        let copied = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .copyValue(result, source) = instruction,
+                  source == none
+            else { return nil }
+            return result
+        }.first)
+        let moved = try #require(instructions.compactMap { instruction
+            -> Bytecode.Register? in
+            guard case let .moveValue(result, source) = instruction,
+                  source == copied
+            else { return nil }
+            return result
+        }.first)
+        #expect(instructions.count { $0 == .destroyValue(none) } == 1)
+        #expect(instructions.count { $0 == .destroyValue(copied) } == 0)
+        #expect(instructions.count { $0 == .destroyValue(moved) } == 1)
+    }
+
+    @Test("Payload-free linear Optional ownership transfers through block arguments")
+    func transfersLinearOptionalNoneThroughBranch() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture4rootyyF",
+            loweredType: "@convention(thin) () -> ()",
+            body: """
+            bb0:
+              %0 = enum $Optional<NSObject>, #Optional.none!enumelt
+              br bb1(%0 : $Optional<NSObject>)
+            bb1(%1 : $Optional<NSObject>):
+              release_value %1
+              %2 = tuple ()
+              return %2
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(function, displayName: "root")
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let blockParameter = try #require(lowered.blocks.first {
+            $0.id == .init(rawValue: 1)
+        }?.parameters.first)
+        #expect(instructions.contains(.destroyValue(blockParameter)))
+    }
+
+    @Test("Payload-free linear Optional ownership follows either conditional edge")
+    func transfersLinearOptionalNoneThroughConditionalBranch() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture4rootyySbF",
+            loweredType: "@convention(thin) (Bool) -> ()",
+            body: """
+            bb0(%0 : $Bool):
+              %1 = enum $Optional<NSObject>, #Optional.none!enumelt
+              cond_br %0, bb1(%1 : $Optional<NSObject>), bb2(%1 : $Optional<NSObject>)
+            bb1(%2 : $Optional<NSObject>):
+              release_value %2
+              %3 = tuple ()
+              return %3
+            bb2(%4 : $Optional<NSObject>):
+              release_value %4
+              %5 = tuple ()
+              return %5
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(function, displayName: "root")
+        for blockID: Bytecode.BlockID in [
+            .init(rawValue: 1), .init(rawValue: 2),
+        ] {
+            let block = try #require(lowered.blocks.first { $0.id == blockID })
+            let parameter = try #require(block.parameters.first)
+            #expect(block.instructions.contains(.destroyValue(parameter)))
+        }
+    }
+
     @Test("PatchCompiler links a reachable default argument generator into HLBC")
     func linksDefaultArgumentGenerator() throws {
         let directory = FileManager.default.temporaryDirectory

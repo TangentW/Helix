@@ -1019,6 +1019,86 @@ struct ImportedFrameworks {
         } == 1)
     }
 
+    @Test("Objective-C value bridges reuse the frozen AnyObject boxing import")
+    func bridgesStringValueToAnyObject() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Swift.AnyObject"))
+        let requirement = importRequirement(id: 29, kind: .staticMethod)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: CanonicalSIL.NativeBridgeSymbols.anyObjectBridge(
+                    to: objectType
+                ),
+                parameterTypes: [.any],
+                parameterConventions: [.owned],
+                resultType: .native(objectType),
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["Swift.AnyObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let bridgeType = "@convention(method) (@guaranteed String) "
+            + "-> @owned NSString"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture6bridgeyXlSSF",
+            loweredType: "@convention(thin) (@guaranteed String) "
+                + "-> @owned AnyObject",
+            body: """
+            bb0(%0 : @guaranteed $String):
+              %1 = function_ref @$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF : $\(bridgeType)
+              %2 = apply %1(%0) : $\(bridgeType)
+              %3 = init_existential_ref %2 : $NSString : $NSString, $AnyObject
+              return %3
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "Fixture.bridge",
+            directCalls: calls
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let erased = try #require(instructions.compactMap { instruction
+            -> (Bytecode.Register, Bytecode.DynamicType)? in
+            guard case let .eraseToAny(result, _, dynamicType) = instruction else {
+                return nil
+            }
+            return (result, dynamicType)
+        }.first)
+        #expect(erased.1 == .string)
+        #expect(instructions.contains { instruction in
+            guard case let .nativeApply(result, id, arguments) = instruction else {
+                return false
+            }
+            return result != nil
+                && id == requirement.id
+                && arguments == [erased.0]
+        })
+
+        let unproven = CanonicalSIL.Function(
+            mangledName: "$s7Fixture8unprovenyXlSSF",
+            loweredType: function.loweredType,
+            body: """
+            bb0(%0 : @guaranteed $String):
+              %1 = init_existential_ref %0 : $NSString : $NSString, $AnyObject
+              return %1
+            """
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer(
+                typeEnvironment: environment
+            ).lower(
+                unproven,
+                displayName: "Fixture.unproven",
+                directCalls: calls
+            )
+        }
+    }
+
     @Test("Opened Any values use the frozen Objective-C boxing import")
     func bridgesOpenedAnyToAnyObject() throws {
         let objectType = Core.TypeID(rawValue: .sha256("Swift.AnyObject"))

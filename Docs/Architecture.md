@@ -107,9 +107,14 @@ Both workflows depend on stable, build-specific identities:
   semantic error identity do not enter HLBC. `Error` remains invalid in Shell
   entry signatures and ordinary NativeImport parameters or results.
   Because a nonthrowing native closure has no error channel, the automatic
-  profile currently accepts synchronous, nonthrowing, `Void` callbacks only:
-  a synchronous failure becomes the containing NativeImport trap, while a
-  later escaping failure is reported through pinned Runtime telemetry.
+  profile accepts only synchronous, nonthrowing callbacks whose result is
+  either `Void` or a recursively bridgeable value with a deterministic failure
+  value. Scalars, text, `Any`, Optional, empty collections, and recursively
+  defaultable tuples qualify. A direct native value does not, while an Optional
+  native value can use `nil`. On failure the generated wrapper first returns
+  that deterministic value to satisfy the native ABI. An active importer then
+  traps after the native frame returns; a detached escaping failure is instead
+  reported through pinned Runtime telemetry.
   Discovery derives the callback's source spelling from typed AST, its
   `@noescape`/escaping authority from canonical SIL, and its global-actor
   requirement from both the applied expression and the closure body's SIL
@@ -117,9 +122,10 @@ Both workflows depend on stable, build-specific identities:
   Objective-C block parameters without framework-specific callback code; the
   block-storage, copy, and noescape reabstraction thunks remain compiler-only
   ownership plumbing, while the original logical VM closure type is preserved.
-  Native calls across UIKit, Dispatch, Foundation, and OperationQueue use this
-  same path. Scheduling an escaping callback does not imply support for Swift
-  `async` closure ABIs.
+  Native calls across UIKit, Dispatch, Foundation, and OperationQueue—including
+  result-producing `NSPredicate` and `FileManager` enumeration callbacks—use
+  this same path. Scheduling an escaping callback does not imply support for
+  Swift `async` closure ABIs.
   If source syntax omits SDK defaults, HLXI records a checked physical-to-logical
   parameter projection: lowering proves each erased SIL value came from that
   declaration's default generator or an exact typed `Optional.none`, and the

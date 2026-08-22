@@ -60,6 +60,38 @@ extension Bytecode.ValueType {
         self == .void || isOrdinaryNativeImportBridgeValue
     }
 
+    /// Whether a nonthrowing native callback can return a deterministic value
+    /// after its VM body fails. The failure is still retained by the active
+    /// NativeImport or reported to Runtime telemetry; this value only satisfies
+    /// the native ABI while control unwinds back to the importing call.
+    ///
+    /// Empty containers and `nil` do not require a fallback for their element
+    /// type. A direct native value has no universally valid Swift instance and
+    /// therefore remains unsupported unless it is wrapped in Optional or an
+    /// empty container.
+    public var hasNativeCallbackFailureValue: Bool {
+        switch self {
+        case .void, .bool, .integer, .float, .string, .any,
+             .optional, .array, .dictionary, .set:
+            true
+        case let .tuple(elements):
+            !elements.isEmpty
+                && elements.allSatisfy(\.hasNativeCallbackFailureValue)
+        case .never, .native, .error, .local, .address, .mutableCell,
+             .nonOwningReference, .arrayState, .dictionaryState, .closure:
+            false
+        }
+    }
+
+    /// Results admitted by generated nonthrowing NativeImport callbacks. A
+    /// bridgeable result must also have a deterministic failure value because
+    /// Swift's nonthrowing native closure ABI has no error channel.
+    public var isNativeBridgeCallbackResult: Bool {
+        self == .void
+            || (isOrdinaryNativeImportBridgeValue
+                && hasNativeCallbackFailureValue)
+    }
+
     /// Swift closure calls borrow values whose VM representation can carry a
     /// managed identity. This includes opaque native handles, type-erased
     /// payloads, and aggregates that contain either. Other copyable VM values
@@ -91,12 +123,13 @@ extension Bytecode.ValueType {
 extension Bytecode.ClosureSignature {
     /// The callback surface supported by generated NativeImport adapters.
     /// Executor isolation remains part of the callable signature; coroutine,
-    /// throwing, inout, higher-order, and result-producing callbacks do not
-    /// cross this synchronous boundary.
+    /// throwing, inout, and higher-order callbacks do not cross this
+    /// synchronous boundary. Result-producing callbacks additionally require
+    /// a bridgeable result with a deterministic native failure value.
     public var isNativeBridgeCallback: Bool {
         hasCanonicalCallableEffects
             && hasCanonicalThrownType
-            && result == .void
+            && result.isNativeBridgeCallbackResult
             && !effects.mayThrow
             && !effects.isAsync
             && parameterConventions

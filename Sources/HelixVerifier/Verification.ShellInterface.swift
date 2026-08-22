@@ -234,7 +234,7 @@ public struct ShellInterface: Sendable {
               !(callback.lifetime == .nonescaping && shape.isOptional)
         else {
             throw Verification.Error.invalidShellInterface(
-                "\(owner) must be a synchronous, nonthrowing, Void callback with a valid lifetime"
+                "\(owner) must be a synchronous, nonthrowing callback with a bridgeable result and valid lifetime"
             )
         }
         for parameter in shape.signature.parameters {

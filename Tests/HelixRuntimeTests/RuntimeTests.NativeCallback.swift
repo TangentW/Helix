@@ -81,6 +81,84 @@ struct NativeCallback {
         #expect(observed.values == [42])
     }
 
+    @Test("A result callback re-enters its pinned image and returns its VM value")
+    func resultCallbackPinsGeneration() throws {
+        let fixture = try Fixture(callbackResult: .int64)
+        let callbackBox = CallbackBox()
+        let observed = IntegerBox()
+        let callbackImport = VM.ClosureNativeInvoker(
+            id: fixture.exportID,
+            key: fixture.exportKey,
+            parameterTypes: [.closure(fixture.callbackBoundarySignature)],
+            resultType: .void,
+            effects: fixture.effects,
+            contract: fixture.exportContract,
+            invoke: { arguments, context in
+                callbackBox.value = try context.makeCallback(
+                    parameterIndex: 0,
+                    from: arguments[0]
+                )
+                return .returned(nil)
+            }
+        )
+        let observationImport = VM.ClosureNativeInvoker(
+            id: fixture.observationID,
+            key: fixture.observationKey,
+            parameterTypes: [.int64],
+            resultType: .void,
+            effects: fixture.effects,
+            contract: fixture.observationContract,
+            invoke: { arguments, _ in
+                guard case let .integer(value) = arguments[0] else {
+                    throw VM.RuntimeTrap.typeMismatch(
+                        expected: .int64,
+                        actual: arguments[0].type
+                    )
+                }
+                observed.append(value.signedValue)
+                return .returned(nil)
+            }
+        )
+        let runtime = try Runtime.Engine(
+            originals: .init([
+                .init(
+                    index: fixture.entry,
+                    parameterTypes: [],
+                    resultType: .void,
+                    invoke: { _ in .returned(nil) }
+                ),
+            ]),
+            nativeCatalog: .init([callbackImport, observationImport])
+        )
+        let generation = try fixture.generation(id: 1)
+        _ = try runtime.activate(generation, expectedActiveID: nil)
+        #expect(runtime.invoke(entry: fixture.entry, arguments: []) == .returned(nil))
+        let callback = try #require(callbackBox.value)
+        try runtime.rollback(expectedActiveID: generation.id, to: nil)
+
+        let result: Int64 = callback.invokeResult(
+            arguments: {
+                [.integer(try VM.Integer(
+                    signed: 42,
+                    bitWidth: 64,
+                    isSigned: true
+                ))]
+            },
+            decodeResult: { value in
+                guard case let .integer(integer) = value else {
+                    throw VM.RuntimeTrap.typeMismatch(
+                        expected: .int64,
+                        actual: value.type
+                    )
+                }
+                return integer.signedValue
+            },
+            failureResult: { -1 }
+        )
+        #expect(result == 42)
+        #expect(observed.values == [42])
+    }
+
     @Test("Verifier rejects a lexical closure at an escaping callback boundary")
     func lexicalClosureCannotEscape() throws {
         let fixture = try Fixture()
@@ -113,20 +191,26 @@ struct NativeCallback {
         let callbackSignature: Bytecode.ClosureSignature
         let exportContract: Core.NativeImportContract
         let observationContract: Core.NativeImportContract
+        let exportSignature: Core.LoweredSignature
         let exportKey: Core.NativeImportKey
         let observationKey: Core.NativeImportKey
         let entryKey: Core.FunctionKey
 
-        init() throws {
+        init(callbackResult: Bytecode.ValueType = .void) throws {
+            guard callbackResult == .void || callbackResult == .int64 else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "Runtime callback fixture received an unsupported result"
+                )
+            }
             callbackBoundarySignature = .init(
                 parameters: [.int64],
                 parameterConventions: [.owned],
-                result: .void
+                result: callbackResult
             )
             callbackSignature = .init(
                 parameters: [.int64],
                 parameterConventions: [.owned],
-                result: .void
+                result: callbackResult
             )
             exportContract = .bounded(
                 kind: .globalFunction,
@@ -143,13 +227,18 @@ struct NativeCallback {
                 maximumDurationMicroseconds: 500,
                 allowsMainThread: true
             )
+            let callbackResultSpelling = callbackResult == .void
+                ? "Swift.Void" : "Swift.Int"
+            exportSignature = .init(
+                parameters: [
+                    "@escaping (Swift.Int) -> \(callbackResultSpelling)",
+                ],
+                result: "Swift.Void"
+            )
             exportKey = try Core.NativeImportKey.derive(
                 namespace: namespace,
                 canonicalCallee: "Fixture.retainCallback(_:)",
-                signature: .init(
-                    parameters: ["@escaping (Swift.Int) -> Swift.Void"],
-                    result: "Swift.Void"
-                ),
+                signature: exportSignature,
                 effects: effects,
                 contract: exportContract
             )
@@ -218,7 +307,7 @@ struct NativeCallback {
                 kind: .closureBody,
                 parameterRegisters: [.init(rawValue: 0)],
                 parameterConventions: [.owned],
-                resultType: .void,
+                resultType: callbackSignature.result,
                 registerTypes: [.int64],
                 entryBlock: .init(rawValue: 0),
                 blocks: [
@@ -231,15 +320,14 @@ struct NativeCallback {
                                 importID: observationID,
                                 arguments: [.init(rawValue: 0)]
                             ),
-                            .returnValue(nil),
+                            .returnValue(
+                                callbackSignature.result == .void
+                                    ? nil : .init(rawValue: 0)
+                            ),
                         ]
                     ),
                 ],
                 effects: effects
-            )
-            let exportSignature = Core.LoweredSignature(
-                parameters: ["@escaping (Swift.Int) -> Swift.Void"],
-                result: "Swift.Void"
             )
             let observationSignature = Core.LoweredSignature(
                 parameters: ["Swift.Int"],

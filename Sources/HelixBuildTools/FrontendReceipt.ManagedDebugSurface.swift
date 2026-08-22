@@ -183,7 +183,7 @@ extension FrontendReceipt.ManagedDebugSurface {
                 moduleName: graph.module.name,
                 preciseIdentifier: precise,
                 swiftPath: owner.pathComponents.joined(separator: "."),
-                runtimeName: objectiveCRuntimeName(precise),
+                runtimeName: clangRuntimeName(precise),
                 requiresMainActor: requiresMainActor(owner),
                 members: members.sorted {
                     ($0.pathComponents.joined(separator: "\u{0}"),
@@ -769,8 +769,11 @@ extension FrontendReceipt.ManagedDebugSurface {
         return value
     }
 
-    private static func objectiveCRuntimeName(_ preciseIdentifier: String) -> String? {
-        for marker in ["c:objc(cs)", "c:objc(pl)"]
+    private static func clangRuntimeName(_ preciseIdentifier: String) -> String? {
+        for marker in [
+            "c:objc(cs)", "c:objc(pl)",
+            "c:@T@", "c:@E@", "c:@S@", "c:@U@",
+        ]
         where preciseIdentifier.hasPrefix(marker) {
             let name = String(preciseIdentifier.dropFirst(marker.count))
             return isProbeIdentifier(name) ? name : nil
