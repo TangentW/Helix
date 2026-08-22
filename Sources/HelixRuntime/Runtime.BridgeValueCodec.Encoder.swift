@@ -153,6 +153,41 @@ public final class Encoder {
         return .error(.init(message: message))
     }
 
+    /// Encodes one escaping, native-origin callable as a typed VM closure.
+    /// Generated adapters own the Swift ABI-specific decode/call/encode body;
+    /// the Runtime owns identity, resource accounting, result validation, and
+    /// the current invocation deadline.
+    public func encodeNativeClosure(
+        signature: Bytecode.ClosureSignature,
+        invoke: @escaping (
+            [VM.Value],
+            Runtime.BridgeValueCodec.Encoder
+        ) throws -> VM.Value?
+    ) throws -> VM.Value {
+        guard signature.isNativeBridgeCallableArgument else {
+            throw Runtime.BridgeInputError.encodedTypeMismatch(
+                expected: "a synchronous nonthrowing native callable ABI",
+                actual: signature.description
+            )
+        }
+        try reserveLeaf(
+            estimatedVMBytes: VM.NativeClosure.estimatedVMByteCount
+        )
+        let resultLimits = limits
+        let nativeClosure = VM.NativeClosure(signature: signature) {
+            arguments,
+            budget in
+            let resultEncoder = Runtime.BridgeValueCodec.Encoder(
+                limits: resultLimits,
+                checkDeadline: { try budget.checkDeadline() }
+            )
+            let result = try invoke(arguments, resultEncoder)
+            try resultEncoder.finalize(arguments: result.map { [$0] } ?? [])
+            return result
+        }
+        return .closure(.init(nativeClosure: nativeClosure))
+    }
+
     /// Reserves and encodes an optional container with zero or one child.
     public func encodeOptional<Wrapped>(
         _ value: Wrapped?,
@@ -567,11 +602,26 @@ public final class Encoder {
                 let elements = wrapped.map { [$0] } ?? []
                 try addAggregate(elements.count, to: &result, limits: limits)
                 try append(elements, below: depth, to: &pending, limits: limits)
+            case let .closure(closure):
+                guard let target = closure.nativeTarget,
+                      target.signature == closure.signature,
+                      closure.signature.isNativeBridgeCallableArgument,
+                      closure.captures.isEmpty
+                else {
+                    throw Runtime.BridgeInputError.encodedTypeMismatch(
+                        expected: "a bridge-created native closure",
+                        actual: value.type.description
+                    )
+                }
+                try add(
+                    VM.NativeClosure.estimatedVMByteCount,
+                    toVMBytesOf: &result,
+                    limits: limits
+                )
             case .structure, .enumeration, .object, .address,
                  .mutableCell, .nonOwningReference,
                  .arrayBuilder, .arrayMutationState,
-                 .dictionaryBuilder, .arraySortState, .arraySplitState,
-                 .closure:
+                 .dictionaryBuilder, .arraySortState, .arraySplitState:
                 throw Runtime.BridgeInputError.encodedTypeMismatch(
                     expected: "Shell boundary value",
                     actual: value.type.description

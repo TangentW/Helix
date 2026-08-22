@@ -247,7 +247,17 @@ struct NativeImportDiscoveryTests {
                 "(@escaping (Swift.Int) -> Swift.Void) -> Swift.Void",
             ],
             parameterTypes: [higherOrder]
-        ) == nil)
+        ) == [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+        ])
+        #expect(FrontendReceipt.NativeBridgeProfile.callbacks(
+            parameterSpellings: [
+                "((Swift.Int) -> Swift.Void) -> Swift.Void",
+            ],
+            parameterTypes: [higherOrder]
+        ) == [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+        ])
 
         let view = Core.TypeID(rawValue: .sha256("UIKit.UIView"))
         let native = try #require(FrontendReceipt.ValueTypeParser.parse(
@@ -331,6 +341,55 @@ struct NativeImportDiscoveryTests {
         #expect(!FrontendReceipt.NativeBridgeProfile.isResult(
             .optional(.error)
         ))
+    }
+
+    @Test("Swift type checking proves nested callable escaping authority")
+    func provesNestedCallableEscapingAuthority() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-nested-callable-lifetime-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let safeURL = directory.appendingPathComponent("Safe.swift")
+        let unsafeURL = directory.appendingPathComponent("Unsafe.swift")
+        let wrapper = """
+        let strengthened: (@escaping () -> Void) -> Void = { callback in
+            callback()
+        }
+        """
+        try Data("""
+        func acceptsEscaping(_ body: (@escaping () -> Void) -> Void) {}
+        func probe() {
+            \(wrapper)
+            acceptsEscaping(strengthened)
+        }
+        """.utf8).write(to: safeURL)
+        try Data("""
+        func acceptsNonescaping(_ body: (() -> Void) -> Void) {}
+        func probe() {
+            \(wrapper)
+            acceptsNonescaping(strengthened)
+        }
+        """.utf8).write(to: unsafeURL)
+
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let safe = try frontend.run(
+            arguments: [safeURL.path, "-typecheck", "-parse-as-library"],
+            workingDirectory: directory
+        )
+        let unsafe = try frontend.run(
+            arguments: [unsafeURL.path, "-typecheck", "-parse-as-library"],
+            workingDirectory: directory
+        )
+        #expect(safe.terminationStatus == 0)
+        #expect(unsafe.terminationStatus != 0)
     }
 
     @Test("Closure values stored by setters always use escaping authority")
@@ -619,6 +678,14 @@ struct NativeImportDiscoveryTests {
                 ) { action in
                     _ = action
                 }
+                _ = UIContextualAction(
+                    style: .normal,
+                    title: "Complete"
+                ) { action, sourceView, completion in
+                    _ = action
+                    _ = sourceView
+                    completion(true)
+                }
                 controller.present(
                     UIViewController(),
                     animated: true
@@ -805,6 +872,17 @@ struct NativeImportDiscoveryTests {
                 && $0.ownerType == "UIAlertAction"
                 && $0.parameterSwiftTypes.contains { $0.contains("->") }
         })
+        let contextualActionInitializer = try #require(
+            surface.operations.first {
+                $0.baseName == "init"
+                    && $0.ownerType == "UIContextualAction"
+                    && $0.parameterSwiftTypes.contains { spelling in
+                        spelling.contains("UIContextualAction")
+                            && spelling.contains("Bool")
+                            && spelling.contains("->")
+                    }
+            }
+        )
         #expect(surface.operations.contains {
             $0.baseName == "default"
                 && $0.ownerType == "UIAlertAction.Style"
@@ -930,12 +1008,16 @@ struct NativeImportDiscoveryTests {
                     predicateOperation, enumeratorOperation,
                     configurationSetter, operationCompletionSetter,
                     presentation, actionInitializer, alertInitializer,
+                    contextualActionInitializer,
                 ],
                 moduleName: invocation.moduleName,
                 nativeTypes: nativeTypes
             )
         let predicateDeclaration = try #require(resultOperations.first {
             $0.baseName == "init"
+                && $0.parameterTypes.contains { type in
+                    type.directClosureShape?.signature.result == .bool
+                }
         })
         #expect(predicateDeclaration.callbacks == [
             .init(parameterIndex: 0, lifetime: .escaping),
@@ -989,11 +1071,35 @@ struct NativeImportDiscoveryTests {
         let initializerCallbacks = resultOperations.filter {
             $0.baseName == "init" && !$0.callbacks.isEmpty
         }
-        #expect(initializerCallbacks.count == 3)
+        #expect(initializerCallbacks.count == 4)
         #expect(initializerCallbacks.allSatisfy {
             $0.callbacks.count == 1
                 && $0.callbacks[0].lifetime == .escaping
         })
+        let higherOrderInitializer = try #require(
+            initializerCallbacks.first { declaration in
+                declaration.parameterTypes.contains { type in
+                    type.directClosureShape?.signature.parameters.contains(
+                        where: \.containsClosureValue
+                    ) == true
+                }
+            }
+        )
+        let outerCallback = try #require(
+            higherOrderInitializer.parameterTypes.compactMap(
+                \.directClosureShape
+            ).first
+        )
+        let completionSignatures = outerCallback.signature.parameters.compactMap {
+            $0.directClosureShape?.signature
+        }
+        let completion = try #require(completionSignatures.first)
+        #expect(outerCallback.signature.isNativeBridgeCallback)
+        #expect(outerCallback.signature.parameterConventions.last == .owned)
+        #expect(completion.parameters == [.bool])
+        #expect(completion.parameterConventions == [.owned])
+        #expect(completion.result == .void)
+        #expect(completion.isNativeBridgeCallableArgument)
     }
 
     @Test("Physical SIL aliases collapse to one deterministic logical import")
@@ -1265,6 +1371,19 @@ struct NativeImportDiscoveryTests {
             public func invokeCharacter(_ body: () -> Character) -> Character {
                 body()
             }
+            public func invokeCompletion(
+                _ body: (@escaping (Bool) -> Void) -> Void
+            ) {
+                body { _ in }
+            }
+            public func invokeCallableValues(
+                _ body: (
+                    @escaping (Bool) -> Bool,
+                    ((Int) -> Int)?
+                ) -> Bool
+            ) -> Bool {
+                body({ !$0 }, { $0 + 1 })
+            }
             public func invokeTuple(
                 _ body: () -> (value: Int, accepted: Bool)
             ) -> (value: Int, accepted: Bool) {
@@ -1353,7 +1472,9 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
             "\(moduleName).echo(_:)",
+            "\(moduleName).invokeCallableValues(_:)",
             "\(moduleName).invokeCharacter(_:)",
+            "\(moduleName).invokeCompletion(_:)",
             "\(moduleName).invokeError(_:)",
             "\(moduleName).invokeLater(_:)",
             "\(moduleName).invokeNow(_:)",
@@ -1369,7 +1490,7 @@ struct NativeImportDiscoveryTests {
             "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
-        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...22).map {
+        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...24).map {
             Core.NativeImportID(rawValue: UInt32($0))
         })
         let callbacks = Dictionary(uniqueKeysWithValues: output.receipt
@@ -1398,13 +1519,19 @@ struct NativeImportDiscoveryTests {
         #expect(callbacks["\(moduleName).invokeCharacter(_:)"] == [
             .init(parameterIndex: 0, lifetime: .nonescaping),
         ])
+        #expect(callbacks["\(moduleName).invokeCompletion(_:)"] == [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+        ])
+        #expect(callbacks["\(moduleName).invokeCallableValues(_:)"] == [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+        ])
         #expect(callbacks["\(moduleName).invokeTuple(_:)"] == [
             .init(parameterIndex: 0, lifetime: .nonescaping),
         ])
         #expect(callbacks["\(moduleName).invokeProvider(_:)"] == [
             .init(parameterIndex: 0, lifetime: .escaping),
         ])
-        #expect(output.receipt.nativeImportBindings.count == 23)
+        #expect(output.receipt.nativeImportBindings.count == 25)
         #expect(output.receipt.nativeImportBindings.filter {
             $0.generated != nil
         }.allSatisfy {
@@ -1412,7 +1539,7 @@ struct NativeImportDiscoveryTests {
         })
         #expect(output.receipt.nativeImportBindings.filter {
             $0.generated != nil
-        }.count == 19)
+        }.count == 21)
         #expect(output.receipt.nativeImportBindings.contains {
             $0.generated == nil && $0.importedModules == ["HelixRuntime"]
         })
@@ -1428,7 +1555,9 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
             "\(moduleName).echo(_:)",
+            "\(moduleName).invokeCallableValues(_:)",
             "\(moduleName).invokeCharacter(_:)",
+            "\(moduleName).invokeCompletion(_:)",
             "\(moduleName).invokeError(_:)",
             "\(moduleName).invokeLater(_:)",
             "\(moduleName).invokeNow(_:)",
@@ -1528,6 +1657,11 @@ struct NativeImportDiscoveryTests {
         #expect(generated.contains("context.makeCallback("))
         #expect(generated.contains("nativeCallback"))
         #expect(generated.contains("encodeNativeCallbackArguments("))
+        #expect(generated.contains("encodeNativeClosure("))
+        #expect(generated.contains("@escaping (Swift.Bool) ->"))
+        #expect(generated.contains("(callbackArgument0)(nativeArgument0)"))
+        #expect(generated.contains("(wrapped)(nativeArgument0)"))
+        #expect(generated.contains("let nativeResult ="))
         #expect(generated.contains("callbackEncoder.encode("))
         #expect(generated.contains("callbackEncoder.encodeError("))
         #expect(generated.contains("BridgeValueCodec.decodeOptional"))
@@ -1547,7 +1681,18 @@ struct NativeImportDiscoveryTests {
         )
 
         try Data(
-            "public func transform(_ value: Int) -> Int { adjust(value, by: 1) + 3 }\n".utf8
+            """
+            public func transform(_ value: Int) -> Int {
+                invokeCompletion { completion in
+                    completion(value > 0)
+                }
+                let accepted = invokeCallableValues { predicate, transform in
+                    let next = transform?(value) ?? value
+                    return predicate(value <= 0) && next > value
+                }
+                return adjust(value, by: 1) + (accepted ? 3 : 4)
+            }
+            """.utf8
         ).write(to: patchURL)
         let patch = try ReleaseCompiler.Driver().build(
             .init(
@@ -1557,6 +1702,7 @@ struct NativeImportDiscoveryTests {
             )
         )
         #expect(patch.disassembly.contains("native_apply"))
+        #expect(patch.disassembly.contains("closure_apply"))
         _ = try Verification.Engine().verify(
             bytes: patch.bytecode,
             shell: Verification.ShellInterface(archive: shell.archive),
@@ -1901,6 +2047,14 @@ struct NativeImportDiscoveryTests {
                 ) { action in
                     _ = action
                 }
+                _ = UIContextualAction(
+                    style: .normal,
+                    title: "Complete"
+                ) { action, sourceView, completion in
+                    _ = action
+                    _ = sourceView
+                    completion(true)
+                }
                 present(UIViewController(), animated: true) {
                     view.setNeedsLayout()
                 }
@@ -2128,7 +2282,9 @@ struct NativeImportDiscoveryTests {
         #expect(generatedBridge.contains(".completionBlock ="))
         #expect(generatedBridge.contains("UIAction("))
         #expect(generatedBridge.contains("UIAlertAction("))
+        #expect(generatedBridge.contains("UIContextualAction("))
         #expect(generatedBridge.contains(".present("))
+        #expect(generatedBridge.contains("encodeNativeClosure("))
         #expect(generatedBridge.contains("callbackEncoder.encodeError("))
         #expect(generatedBridge.contains("NSPredicate"))
         #expect(generatedBridge.contains("enumerator"))

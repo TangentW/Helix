@@ -575,6 +575,43 @@ struct NativeBlockBridge {
         #expect(!callback.isNativeBridgeCallback)
     }
 
+    @Test("Native callback ownership does not rewrite image-local higher-order ABI")
+    func keepsImageHigherOrderOwnershipIndependent() throws {
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture9transformyySbcXEfU_",
+            loweredType: "$@convention(thin) "
+                + "(@guaranteed @callee_guaranteed (Bool) -> (), Int) -> ()",
+            body: """
+            bb0(%0 : @guaranteed $@callee_guaranteed (Bool) -> (), %1 : @closureCapture $Int):
+              %2 = tuple ()
+              return %2
+            """
+        )
+
+        let signature = try CanonicalSIL.ImageFunctions.signature(
+            of: function,
+            environment: .empty,
+            symbol: function.mangledName,
+            kind: .closureBody
+        )
+        #expect(signature.parameters.count == 2)
+        #expect(signature.parameterConventions == [.owned, .owned])
+        guard case let .closure(completion) = signature.parameters.first else {
+            Issue.record("expected a callable closure-body parameter")
+            return
+        }
+        #expect(completion.parameters == [.bool])
+        #expect(completion.parameterConventions == [.owned])
+
+        let aggregate = try CanonicalSIL.Lowerer().parseFunctionType(
+            "@convention(thin) (@guaranteed Array<"
+                + "@callee_guaranteed (Bool) -> ()>) -> ()",
+            preservingClosureOwnership: true
+        )
+        #expect(aggregate.parameterConventions == [.owned])
+        #expect(aggregate.parameters.first?.containsClosureValue == true)
+    }
+
     @Test("Static-method metatypes do not shift closure lifetime indices")
     func erasesStaticMethodMetatype() throws {
         let signature = Bytecode.ClosureSignature(

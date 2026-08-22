@@ -3499,6 +3499,224 @@ struct Interpreter {
         )
     }
 
+    @Test("SDK callbacks can invoke one typed native-origin callable layer")
+    func executesNativeOriginClosureArgument() throws {
+        let completion = Bytecode.ClosureSignature(
+            parameters: [.bool],
+            parameterConventions: [.owned],
+            result: .int64
+        )
+        let handler = Bytecode.ClosureSignature(
+            parameters: [.closure(completion)],
+            parameterConventions: [.owned],
+            result: .int64
+        )
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "nativeClosureFixtureRoot",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
+        let body = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "nativeClosureHandler",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            parameterConventions: [.owned],
+            resultType: .int64,
+            registerTypes: [.closure(completion), .bool, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantBool(
+                            result: .init(rawValue: 1),
+                            value: true
+                        ),
+                        .closureApply(
+                            result: .init(rawValue: 2),
+                            closure: .init(rawValue: 0),
+                            arguments: [.init(rawValue: 1)]
+                        ),
+                        .returnValue(.init(rawValue: 2)),
+                    ]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [
+                .baselineV1,
+                .borrowCallsV1,
+                .closureValuesV1,
+                .escapingClosureValuesV1,
+            ],
+            additionalFunctions: [body]
+        )
+        let nativeClosure = VM.NativeClosure(
+            signature: completion
+        ) { arguments, _ in
+            guard case let .bool(value) = arguments.first else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: .bool,
+                    actual: arguments.first?.type
+                )
+            }
+            return .integer(
+                try .init(
+                    signed: value ? 42 : 0,
+                    bitWidth: 64,
+                    isSigned: true
+                )
+            )
+        }
+        let budget = VM.InvocationBudget(limits: .init())
+        let result = VM.Interpreter().invokeNativeCallback(
+            .init(
+                functionID: body.id,
+                signature: handler,
+                captures: []
+            ),
+            image: image,
+            arguments: [.closure(.init(nativeClosure: nativeClosure))],
+            budget: budget
+        )
+        #expect(
+            result == .returned(
+                .integer(
+                    try .init(
+                        signed: 42,
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
+            )
+        )
+        #expect(budget.sideEffectsCommitted)
+
+        let optionalNativeClosure = VM.Value.optional(
+            .closure(.init(nativeClosure: nativeClosure))
+        )
+        try VM.InvocationBudget(limits: .init())
+            .consumeNativeCallbackBoundaryValue(optionalNativeClosure)
+
+        let imageOrigin = VM.Value.closure(
+            .init(
+                functionID: body.id,
+                signature: completion,
+                captures: []
+            )
+        )
+        #expect(
+            VM.Interpreter().invokeNativeCallback(
+                .init(
+                    functionID: body.id,
+                    signature: handler,
+                    captures: []
+                ),
+                image: image,
+                arguments: [imageOrigin],
+                budget: .init(limits: .init())
+            ) == .trapped(
+                .explicit("closure values cannot cross a VM boundary")
+            )
+        )
+        #expect(throws: VM.RuntimeTrap.explicit(
+            "closure values cannot cross a VM boundary"
+        )) {
+            try VM.InvocationBudget(limits: .init())
+                .consumeNativeCallbackBoundaryValue(.optional(imageOrigin))
+        }
+
+        let hiddenNativeClosure = VM.Value.array(
+            [.closure(.init(nativeClosure: nativeClosure))],
+            elementType: .closure(completion)
+        )
+        #expect(throws: VM.RuntimeTrap.explicit(
+            "closure values cannot cross a VM boundary"
+        )) {
+            try VM.InvocationBudget(limits: .init())
+                .consumeNativeCallbackBoundaryValue(hiddenNativeClosure)
+        }
+    }
+
+    @Test("Native-origin callables allow same-thread recursive invocation")
+    func nativeOriginClosureAllowsSameThreadReentry() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.bool],
+            parameterConventions: [.owned],
+            result: .bool
+        )
+        weak var recursiveTarget: VM.NativeClosure?
+        let nativeClosure = VM.NativeClosure(signature: signature) {
+            arguments,
+            budget in
+            guard case let .bool(shouldReenter) = arguments.first else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: .bool,
+                    actual: arguments.first?.type
+                )
+            }
+            guard shouldReenter else { return .bool(true) }
+            guard let recursiveTarget else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "recursive native closure target was released"
+                )
+            }
+            return try recursiveTarget.invoke(
+                arguments: [.bool(false)],
+                budget: budget
+            )
+        }
+        recursiveTarget = nativeClosure
+
+        let result = try nativeClosure.invoke(
+            arguments: [.bool(true)],
+            budget: .init(limits: .init())
+        )
+        #expect(result == .bool(true))
+    }
+
+    @Test("Native-origin callables recheck the invocation deadline after return")
+    func nativeOriginClosureRechecksDeadline() throws {
+        let limits = Core.ResourceLimits(
+            maxWallTimeMainThreadMilliseconds: 1
+        )
+        let clock = SequenceClock(values: [0, 0, 2_000_000])
+        let budget = VM.InvocationBudget(
+            limits: limits,
+            isMainThread: true,
+            nowNanoseconds: { clock.now() }
+        )
+        var invoked = false
+        let nativeClosure = VM.NativeClosure(
+            signature: .init(
+                parameters: [],
+                parameterConventions: [],
+                result: .void
+            )
+        ) { _, _ in
+            invoked = true
+            return nil
+        }
+
+        #expect(throws: VM.RuntimeTrap.wallTimeExceeded) {
+            _ = try nativeClosure.invoke(arguments: [], budget: budget)
+        }
+        #expect(invoked)
+    }
+
     @Test("Canonical closures compose in aggregates and remain excluded from entries")
     func validatesNestedClosureStorageAndEntryBoundary() throws {
         let formal = Bytecode.ClosureSignature(

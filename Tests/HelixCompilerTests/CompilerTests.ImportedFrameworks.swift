@@ -6,6 +6,32 @@ import Testing
 extension CompilerTests {
 @Suite("Imported framework SIL lowering")
 struct ImportedFrameworks {
+    @Test("Native shorthand resolves only when its identity is unambiguous")
+    func resolvesOnlyUnambiguousNativeShorthand() throws {
+        let alertStyle = Core.TypeID(rawValue: .sha256("UIAlertAction.Style"))
+        let contextualStyle = Core.TypeID(
+            rawValue: .sha256("UIContextualAction.Style")
+        )
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes([
+                "UIAlertAction.Style": alertStyle,
+                "UIContextualAction.Style": contextualStyle,
+            ])
+
+        #expect(try environment.resolve("UIAlertAction.Style") == .native(alertStyle))
+        #expect(try environment.resolve("UIContextualAction.Style")
+            == .native(contextualStyle))
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try environment.resolve("Style")
+        }
+
+        let notification = Core.TypeID(rawValue: .sha256("Foundation.Notification"))
+        let extended = try environment.includingNativeTypes([
+            "Foundation.Notification": notification,
+        ])
+        #expect(try extended.resolve("Notification") == .native(notification))
+    }
+
     @Test("AnyObject bridge discovery requires an exact SIL instruction")
     func validatesAnyObjectBridgeReferenceInstruction() {
         let symbol = CanonicalSIL.AnyObjectBridge.silMangledName

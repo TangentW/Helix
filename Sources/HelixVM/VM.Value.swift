@@ -181,7 +181,12 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
 }
 
 public struct Closure: Hashable, Sendable, CustomStringConvertible {
-    public var functionID: Bytecode.FunctionID
+    package enum Target: Hashable, Sendable {
+        case image(Bytecode.FunctionID)
+        case native(VM.NativeClosure)
+    }
+
+    package var target: Target
     public var signature: Bytecode.ClosureSignature
     public var captures: [VM.Value]
     var dynamicScope: VM.ClosureScope?
@@ -191,26 +196,47 @@ public struct Closure: Hashable, Sendable, CustomStringConvertible {
         signature: Bytecode.ClosureSignature,
         captures: [VM.Value]
     ) {
-        self.functionID = functionID
+        target = .image(functionID)
         self.signature = signature
         self.captures = captures
         dynamicScope = nil
     }
 
     init(
-        functionID: Bytecode.FunctionID,
+        target: Target,
         signature: Bytecode.ClosureSignature,
         captures: [VM.Value],
         dynamicScope: VM.ClosureScope?
     ) {
-        self.functionID = functionID
+        self.target = target
         self.signature = signature
         self.captures = captures
         self.dynamicScope = dynamicScope
     }
 
+    package init(nativeClosure: VM.NativeClosure) {
+        target = .native(nativeClosure)
+        signature = nativeClosure.signature
+        captures = []
+        dynamicScope = nil
+    }
+
+    package var imageFunctionID: Bytecode.FunctionID? {
+        guard case let .image(functionID) = target else { return nil }
+        return functionID
+    }
+
+    package var nativeTarget: VM.NativeClosure? {
+        guard case let .native(closure) = target else { return nil }
+        return closure
+    }
+
     public var description: String {
-        "Closure<@\(functionID), \(signature), captures: \(captures.count)>"
+        let identity = switch target {
+        case let .image(functionID): "@\(functionID)"
+        case .native: "native"
+        }
+        return "Closure<\(identity), \(signature), captures: \(captures.count)>"
     }
 }
 

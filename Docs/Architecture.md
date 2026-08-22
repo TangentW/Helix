@@ -58,7 +58,9 @@ Both workflows depend on stable, build-specific identities:
   when an eligible entry's frozen native signature does not mention those
   types, so a later body-only patch can use represented local text and
   collections. Native types and imports remain limited to the exact generated
-  Shell surface.
+  Shell surface. Exact native type names are authoritative; a derived
+  module-relative shorthand is installed only when it resolves to one unique
+  frozen identity, so sibling nested types cannot overwrite each other.
 - Verified debug metadata maps HLBC function/block/instruction coordinates to
   logical Swift file, line, and column. Production artifacts redact build-host
   absolute paths; traps add the exact VM program counter and pinned generation.
@@ -102,6 +104,16 @@ Both workflows depend on stable, build-specific identities:
   not claim general Swift `Sendable` semantics.
   Dynamic lexical scopes cannot enter an escaping handle;
   callback arguments are re-encoded and shape-checked at every invocation.
+  One controlled higher-order edge is part of the same profile: an SDK may
+  supply a direct or Optional synchronous, nonthrowing callable as an outer
+  callback argument when the generated Swift call proves that nested callable
+  is escaping. The adapter represents it as an identity-bearing native closure
+  target, and ordinary `closure_apply` dispatches back to Swift with exact
+  ownership, result, MainActor, deadline, and resource checks. Only this one
+  callable layer is admitted; it cannot be hidden in `Any` or another
+  aggregate, and its own parameters and result cannot contain closures.
+  Same-thread re-entry is allowed, while overlapping invocation of the same
+  non-Sendable native callable fails closed.
   A Swift `Error` callback argument is reduced to a bounded textual dynamic-type
   name and reified as an opaque proxy; native payload graphs, type metadata, and
   semantic error identity do not enter HLBC. `Error` remains invalid in Shell

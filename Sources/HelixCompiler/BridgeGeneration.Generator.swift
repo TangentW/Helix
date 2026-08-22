@@ -453,6 +453,7 @@ public struct Generator: Sendable {
 
     private indirect enum SwiftTypeShape {
         struct FunctionAttributes {
+            var isEscaping: Bool
             var isSendable: Bool
             var globalActor: String?
         }
@@ -481,6 +482,7 @@ public struct Generator: Sendable {
                 return "(\(elements.map(\.rendered).joined(separator: ", ")))"
             case let .function(attributes, parameters, result):
                 var annotations: [String] = []
+                if attributes.isEscaping { annotations.append("@escaping") }
                 if let actor = attributes.globalActor {
                     annotations.append("@\(actor)")
                 }
@@ -490,6 +492,47 @@ public struct Generator: Sendable {
                 return prefix + "(\(parameters.map(\.rendered).joined(separator: ", ")))"
                     + " -> \(result.rendered)"
             }
+        }
+
+        /// Renders an outer SDK callback while strengthening each direct
+        /// callable argument to `@escaping`. Swift's type checker then proves
+        /// that the imported API really supplies that lifetime; attempting to
+        /// pass this wrapper to a nonescaping nested parameter is rejected.
+        var nativeCallbackRendered: String {
+            switch self {
+            case let .function(attributes, parameters, result):
+                return SwiftTypeShape.function(
+                    attributes: attributes,
+                    parameters: parameters.map(\.requiringStoredCallable),
+                    result: result
+                ).rendered
+            case let .optional(.function(attributes, parameters, result)):
+                return SwiftTypeShape.optional(
+                    .function(
+                        attributes: attributes,
+                        parameters: parameters.map(\.requiringStoredCallable),
+                        result: result
+                    )
+                ).rendered
+            default:
+                return rendered
+            }
+        }
+
+        private var requiringStoredCallable: SwiftTypeShape {
+            guard case let .function(attributes, parameters, result) = self
+            else {
+                // Optional function values are already escaping storage and do
+                // not permit an `@escaping` annotation inside Optional.
+                return self
+            }
+            var storedAttributes = attributes
+            storedAttributes.isEscaping = true
+            return .function(
+                attributes: storedAttributes,
+                parameters: parameters,
+                result: result
+            )
         }
     }
 
@@ -676,6 +719,7 @@ public struct Generator: Sendable {
         guard let arrow = topLevelSwiftFunctionArrow(in: value) else {
             if let unwrapped = removingSwiftTypeParentheses(value) {
                 var annotations: [String] = []
+                if hasEscaping { annotations.append("@escaping") }
                 if let globalActor { annotations.append("@\(globalActor)") }
                 if isSendable { annotations.append("@Sendable") }
                 let prefix = annotations.isEmpty
@@ -708,6 +752,7 @@ public struct Generator: Sendable {
         }
         return .function(
             attributes: .init(
+                isEscaping: hasEscaping,
                 isSendable: isSendable,
                 globalActor: globalActor
             ),
@@ -1005,7 +1050,10 @@ public struct Generator: Sendable {
             }
             return signature.effects.requiresMainActor == requiresMainActor
                 && parameterShapes.count == signature.parameters.count
-                && signature.isNativeBridgeCallback
+                && signature.hasCanonicalCallableEffects
+                && signature.hasCanonicalThrownType
+                && !signature.effects.mayThrow
+                && !signature.effects.isAsync
                 && zip(parameterShapes, signature.parameters).allSatisfy {
                     swiftTypeMatches($0.0, type: $0.1, archive: archive)
                 }
@@ -1460,7 +1508,7 @@ public struct Generator: Sendable {
                 parameterIndex: \(offset),
                 from: arguments[\(offset)]
             )
-            let argument\(offset): \(shape.rendered) = \(wrapper)
+            let argument\(offset): \(shape.nativeCallbackRendered) = \(wrapper)
             """
         case let (
             .optional(.function(_, parameterShapes, resultShape)),
@@ -1474,7 +1522,7 @@ public struct Generator: Sendable {
                 signature: signature
             )
             return """
-            let argument\(offset): \(shape.rendered) = try Runtime.BridgeValueCodec.decodeOptional(
+            let argument\(offset): \(shape.nativeCallbackRendered) = try Runtime.BridgeValueCodec.decodeOptional(
                 arguments[\(offset)]
             ) { callbackValue in
                 let \(callbackName) = try context.makeCallback(
@@ -1502,8 +1550,36 @@ public struct Generator: Sendable {
                 "native callback parameter shape"
             )
         }
-        let parameters = parameterShapes.enumerated().map { index, shape in
-            "callbackArgument\(index): \(shape.rendered)"
+        guard let unsafeParameter = zip(
+            parameterShapes,
+            signature.parameters
+        ).first(where: {
+            !isSafeNativeCallbackArgumentSpelling(
+                shape: $0.0,
+                type: $0.1
+            )
+        }) else {
+            return try renderValidatedNativeCallbackWrapper(
+                callbackName: callbackName,
+                parameterShapes: parameterShapes,
+                resultShape: resultShape,
+                signature: signature
+            )
+        }
+        throw BridgeGeneration.Error.invalidSwiftType(
+            "unsafe native callback argument \(unsafeParameter.0.rendered) "
+                + "for \(unsafeParameter.1)"
+        )
+    }
+
+    private func renderValidatedNativeCallbackWrapper(
+        callbackName: String,
+        parameterShapes: [SwiftTypeShape],
+        resultShape: SwiftTypeShape,
+        signature: Bytecode.ClosureSignature
+    ) throws -> String {
+        let parameters = parameterShapes.indices.map { index in
+            "callbackArgument\(index)"
         }.joined(separator: ", ")
         let encoded = zip(parameterShapes, signature.parameters).enumerated().map {
             index, pair in
@@ -1518,7 +1594,7 @@ public struct Generator: Sendable {
         let arguments = encoded.isEmpty
             ? "[]"
             : "[\n\(indent(encoded.joined(separator: ",\n"), spaces: 12))\n        ]"
-        let opening = parameters.isEmpty ? "{" : "{ (\(parameters)) in"
+        let opening = parameters.isEmpty ? "{" : "{ \(parameters) in"
         let encodedArguments = """
         try Runtime.Bridge.shared.encodeNativeCallbackArguments(
             for: \(callbackName),
@@ -1606,6 +1682,27 @@ public struct Generator: Sendable {
             return "()"
         default:
             return nil
+        }
+    }
+
+    /// A direct callable is strengthened to `@escaping` in the generated outer
+    /// callback type. The final generated call is the lifetime proof: Swift
+    /// rejects the adapter if the imported API can supply only a nonescaping
+    /// nested value. Optional function values are escaping by construction.
+    private func isSafeNativeCallbackArgumentSpelling(
+        shape: SwiftTypeShape,
+        type: Bytecode.ValueType
+    ) -> Bool {
+        switch (shape, type) {
+        case let (.function(_, _, _), .closure(signature)):
+            return signature.isNativeBridgeCallableArgument
+        case let (
+            .optional(.function(_, _, _)),
+            .optional(.closure(signature))
+        ):
+            return signature.isNativeBridgeCallableArgument
+        default:
+            return !type.containsClosureValue && type.isNativeBridgeValue
         }
     }
 
@@ -1753,6 +1850,27 @@ public struct Generator: Sendable {
                 return "try \(inputEncoder).encodeError(\(expression))"
             }
             return "try Runtime.BridgeValueCodec.encodeError(\(expression))"
+        case let (
+            .optional(.function(_, parameterShapes, resultShape)),
+            .optional(.closure(signature))
+        ):
+            guard let inputEncoder,
+                  signature.isNativeBridgeCallableArgument
+            else {
+                preconditionFailure(
+                    "validated optional native callable requires a callback encoder"
+                )
+            }
+            let encoded = renderEncodeNativeClosure(
+                expression: "wrapped",
+                parameterShapes: parameterShapes,
+                resultShape: resultShape,
+                signature: signature,
+                nativeCatalog: nativeCatalog,
+                inputEncoder: inputEncoder
+            )
+            return "try \(inputEncoder).encodeOptional(\(expression)) { wrapped in "
+                + "\(encoded) }"
         case let (.optional(wrappedShape), .optional(wrappedType)):
             let encoded = renderEncode(
                 expression: "wrapped",
@@ -1835,11 +1953,77 @@ public struct Generator: Sendable {
                     + "\(renderArray(values, indentation: 8)) }"
             }
             return "try Runtime.BridgeValueCodec.encodeTuple(\(renderArray(values, indentation: 8)))"
+        case let (
+            .function(_, parameterShapes, resultShape),
+            .closure(signature)
+        ):
+            guard let inputEncoder,
+                  signature.isNativeBridgeCallableArgument
+            else {
+                preconditionFailure(
+                    "validated native callable requires an escaping callback encoder"
+                )
+            }
+            return renderEncodeNativeClosure(
+                expression: expression,
+                parameterShapes: parameterShapes,
+                resultShape: resultShape,
+                signature: signature,
+                nativeCatalog: nativeCatalog,
+                inputEncoder: inputEncoder
+            )
         case (.named, .void):
             return "try Runtime.BridgeValueCodec.encodeVoid(\(expression))"
         default:
             preconditionFailure("validated bridge type cannot reach an unsupported encoder")
         }
+    }
+
+    private func renderEncodeNativeClosure(
+        expression: String,
+        parameterShapes: [SwiftTypeShape],
+        resultShape: SwiftTypeShape,
+        signature: Bytecode.ClosureSignature,
+        nativeCatalog: String,
+        inputEncoder: String
+    ) -> String {
+        precondition(parameterShapes.count == signature.parameters.count)
+        let decoded = zip(parameterShapes, signature.parameters).enumerated().map {
+            index, pair in
+            "let nativeArgument\(index) = " + renderDecode(
+                expression: "nativeArguments[\(index)]",
+                shape: pair.0,
+                type: pair.1
+            )
+        }
+        let arguments = parameterShapes.indices.map {
+            "nativeArgument\($0)"
+        }.joined(separator: ", ")
+        let call = "(\(expression))(\(arguments))"
+        let isolatedCall = signature.effects.requiresMainActor
+            ? "MainActor.assumeIsolated { \(call) }"
+            : call
+        let invocation: String
+        if signature.result == .void {
+            invocation = "\(isolatedCall)\nreturn nil"
+        } else {
+            let encoded = renderEncode(
+                expression: "nativeResult",
+                shape: resultShape,
+                type: signature.result,
+                nativeCatalog: nativeCatalog,
+                inputEncoder: "nativeResultEncoder"
+            )
+            invocation = "let nativeResult = \(isolatedCall)\nreturn \(encoded)"
+        }
+        let body = (decoded + [invocation]).joined(separator: "\n")
+        return """
+        try \(inputEncoder).encodeNativeClosure(
+            signature: \(render(signature))
+        ) { nativeArguments, nativeResultEncoder in
+        \(indent(body, spaces: 4))
+        }
+        """
     }
 
     private func renderDecode(
@@ -2493,6 +2677,15 @@ public struct Generator: Sendable {
             + "isAsync: \(effects.isAsync))"
     }
 
+    private func render(_ signature: Bytecode.ClosureSignature) -> String {
+        "Bytecode.ClosureSignature(parameters: "
+            + "\(renderValueTypes(signature.parameters)), parameterConventions: "
+            + "\(renderParameterConventions(signature.parameterConventions)), "
+            + "result: \(render(signature.result)), "
+            + "thrownType: \(render(signature.thrownType)), "
+            + "effects: \(render(signature.effects)))"
+    }
+
     private func render(_ type: Bytecode.ValueType) -> String {
         switch type {
         case .void: ".void"
@@ -2520,12 +2713,7 @@ public struct Generator: Sendable {
         case let .dictionaryState(key, value):
             ".dictionaryState(key: \(render(key)), value: \(render(value)))"
         case let .closure(signature):
-            ".closure(Bytecode.ClosureSignature(parameters: "
-                + "\(renderValueTypes(signature.parameters)), parameterConventions: "
-                + "\(renderParameterConventions(signature.parameterConventions)), "
-                + "result: \(render(signature.result)), "
-                + "thrownType: \(render(signature.thrownType)), "
-                + "effects: \(render(signature.effects))))"
+            ".closure(\(render(signature)))"
         case let .tuple(elements): ".tuple(\(renderValueTypes(elements)))"
         case let .optional(wrapped): ".optional(\(render(wrapped)))"
         }

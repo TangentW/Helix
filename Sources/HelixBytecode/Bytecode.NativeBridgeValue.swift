@@ -118,14 +118,47 @@ extension Bytecode.ValueType {
             false
         }
     }
+
+    /// A value admitted as one argument of an SDK callback. In addition to
+    /// ordinary bridge values, the callback may hand Helix direct native
+    /// callables (optionally wrapped). Containers of callables remain excluded:
+    /// they require recursive lifetime metadata that the v1 Shell contract
+    /// intentionally does not infer.
+    public var isNativeBridgeCallbackArgument: Bool {
+        if isNativeBridgeValue { return true }
+        guard let shape = directClosureShape else { return false }
+        return shape.signature.isNativeBridgeCallableArgument
+    }
 }
 
 extension Bytecode.ClosureSignature {
+    /// A native-origin callable that an SDK callback may lend to the VM.
+    ///
+    /// Invocation travels from VM to Swift, so bridge failures have a VM trap
+    /// channel and the native result does not need the deterministic fallback
+    /// required by a Swift callback that returns into an SDK frame. A second
+    /// callable layer is deliberately rejected until its independent lifetime
+    /// can be represented and enforced.
+    public var isNativeBridgeCallableArgument: Bool {
+        hasCanonicalCallableEffects
+            && hasCanonicalThrownType
+            && (result == .void
+                || (!result.containsClosureValue && result.isNativeBridgeValue))
+            && !effects.mayThrow
+            && !effects.isAsync
+            && parameterConventions
+                == parameters.map(\.nativeCallbackParameterConvention)
+            && parameters.allSatisfy {
+                !$0.containsClosureValue && $0.isNativeBridgeValue
+            }
+    }
+
     /// The callback surface supported by generated NativeImport adapters.
     /// Executor isolation remains part of the callable signature; coroutine,
-    /// throwing, inout, and higher-order callbacks do not cross this
-    /// synchronous boundary. Result-producing callbacks additionally require
-    /// a bridgeable result with a deterministic native failure value.
+    /// throwing, and inout callbacks do not cross this synchronous boundary.
+    /// One native-origin callable argument is supported generically; its Swift
+    /// spelling must independently prove an escaping lifetime. Result-producing
+    /// callbacks additionally require a deterministic native failure value.
     public var isNativeBridgeCallback: Bool {
         hasCanonicalCallableEffects
             && hasCanonicalThrownType
@@ -134,8 +167,6 @@ extension Bytecode.ClosureSignature {
             && !effects.isAsync
             && parameterConventions
                 == parameters.map(\.nativeCallbackParameterConvention)
-            && parameters.allSatisfy {
-                !$0.containsClosureValue && $0.isNativeBridgeValue
-            }
+            && parameters.allSatisfy(\.isNativeBridgeCallbackArgument)
     }
 }

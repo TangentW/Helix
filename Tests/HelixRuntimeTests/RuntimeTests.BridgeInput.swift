@@ -8,6 +8,19 @@ import Testing
 extension RuntimeTests {
 @Suite("Bridge input encoding limits")
 struct BridgeInput {
+    private final class InvocationResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: VM.RuntimeTrap?
+
+        var trap: VM.RuntimeTrap? {
+            lock.withLock { storage }
+        }
+
+        func record(_ trap: VM.RuntimeTrap?) {
+            lock.withLock { storage = trap }
+        }
+    }
+
     @Test("Scoped encoding preserves nested aggregate shapes")
     func aggregateRoundTrip() throws {
         let encoder = makeEncoder()
@@ -241,6 +254,187 @@ struct BridgeInput {
         ) {
             _ = try encoder.encodeNative(Int64(9), as: typeID, catalog: catalog)
         }
+    }
+
+    @Test("Native callables are identity-bearing leaves with bounded results")
+    func nativeClosureRoundTrip() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .bool
+        )
+        let encoder = makeEncoder()
+        let encoded = try encoder.encodeNativeClosure(
+            signature: signature
+        ) { arguments, resultEncoder in
+            guard case let .integer(value) = arguments.first else {
+                throw VM.RuntimeTrap.typeMismatch(
+                    expected: .int64,
+                    actual: arguments.first?.type
+                )
+            }
+            return try resultEncoder.encode(value.signedValue == 42)
+        }
+        try encoder.finalize(arguments: [encoded])
+
+        guard case let .closure(closure) = encoded,
+              let nativeClosure = closure.nativeTarget
+        else {
+            Issue.record("expected a native-origin VM closure")
+            return
+        }
+        let result = try nativeClosure.invoke(
+            arguments: [
+                .integer(
+                    try .init(signed: 42, bitWidth: 64, isSigned: true)
+                ),
+            ],
+            budget: .init(limits: .init())
+        )
+        #expect(result == .bool(true))
+
+        let mismatchedEncoder = makeEncoder()
+        let mismatched = try mismatchedEncoder.encodeNativeClosure(
+            signature: signature
+        ) { _, resultEncoder in
+            try resultEncoder.encode(Int64(1))
+        }
+        try mismatchedEncoder.finalize(arguments: [mismatched])
+        guard case let .closure(mismatchedValue) = mismatched,
+              let mismatchedClosure = mismatchedValue.nativeTarget
+        else {
+            Issue.record("expected a mismatched native-origin VM closure")
+            return
+        }
+        #expect(throws: VM.RuntimeTrap.typeMismatch(
+            expected: .bool,
+            actual: .int64
+        )) {
+            _ = try mismatchedClosure.invoke(
+                arguments: [
+                    .integer(
+                        try .init(signed: 42, bitWidth: 64, isSigned: true)
+                    ),
+                ],
+                budget: .init(limits: .init())
+            )
+        }
+
+        let substituted = makeEncoder()
+        _ = try substituted.encodeNativeClosure(
+            signature: signature
+        ) { _, resultEncoder in
+            try resultEncoder.encode(false)
+        }
+        let imageClosure = VM.Value.closure(
+            .init(
+                functionID: .init(rawValue: 7),
+                signature: signature,
+                captures: []
+            )
+        )
+        #expect(
+            throws: Runtime.BridgeInputError.encodedTypeMismatch(
+                expected: "a bridge-created native closure",
+                actual: imageClosure.type.description
+            )
+        ) {
+            try substituted.finalize(arguments: [imageClosure])
+        }
+    }
+
+    @Test("Native callables enforce actor isolation")
+    func nativeClosureEnforcesActorIsolation() async throws {
+        let mainActorSignature = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .void,
+            effects: .init(requiresMainActor: true)
+        )
+        let actorEncoder = makeEncoder()
+        let actorValue = try actorEncoder.encodeNativeClosure(
+            signature: mainActorSignature
+        ) { _, _ in nil }
+        try actorEncoder.finalize(arguments: [actorValue])
+        guard case let .closure(actorVMClosure) = actorValue,
+              let actorClosure = actorVMClosure.nativeTarget
+        else {
+            Issue.record("expected a MainActor native-origin VM closure")
+            return
+        }
+        let actorTrap = await Task.detached { () -> VM.RuntimeTrap? in
+            do {
+                _ = try actorClosure.invoke(
+                    arguments: [],
+                    budget: .init(limits: .init(), isMainThread: false)
+                )
+                return nil
+            } catch let trap as VM.RuntimeTrap {
+                return trap
+            } catch {
+                return .nativeFailure(String(describing: error))
+            }
+        }.value
+        #expect(actorTrap == .mainActorViolation)
+    }
+
+    @Test("Native callables reject overlapping non-Sendable invocation")
+    func nativeClosureRejectsOverlap() throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let firstResult = InvocationResult()
+        let overlapEncoder = makeEncoder()
+        let overlapValue = try overlapEncoder.encodeNativeClosure(
+            signature: .init(
+                parameters: [],
+                parameterConventions: [],
+                result: .void
+            )
+        ) { _, _ in
+            entered.signal()
+            _ = release.wait(timeout: .now() + 10)
+            return nil
+        }
+        try overlapEncoder.finalize(arguments: [overlapValue])
+        guard case let .closure(overlapVMClosure) = overlapValue,
+              let overlapClosure = overlapVMClosure.nativeTarget
+        else {
+            Issue.record("expected an overlap-guarded native-origin VM closure")
+            return
+        }
+        let worker = Thread {
+            defer { finished.signal() }
+            do {
+                _ = try overlapClosure.invoke(
+                    arguments: [],
+                    budget: .init(limits: .init(), isMainThread: false)
+                )
+                firstResult.record(nil)
+            } catch let trap as VM.RuntimeTrap {
+                firstResult.record(trap)
+            } catch {
+                firstResult.record(.nativeFailure(String(describing: error)))
+            }
+        }
+        worker.start()
+        guard entered.wait(timeout: .now() + 10) == .success else {
+            release.signal()
+            Issue.record("first native callable invocation did not enter")
+            _ = finished.wait(timeout: .now() + 10)
+            return
+        }
+        #expect(throws: VM.RuntimeTrap.nativeFailure(
+            "concurrent invocation of a non-Sendable native closure is unsupported"
+        )) {
+            _ = try overlapClosure.invoke(
+                arguments: [],
+                budget: .init(limits: .init())
+            )
+        }
+        release.signal()
+        try #require(finished.wait(timeout: .now() + 10) == .success)
+        #expect(firstResult.trap == nil)
     }
 
     @Test("Bridge can box explicitly cataloged non-Sendable UI references")

@@ -220,7 +220,8 @@ public struct Interpreter: Sendable {
                 uniqueKeysWithValues: image.module.localTypes.map { ($0.key, $0) }
             )
             try budget.checkDeadline()
-            guard let function = functions[closure.functionID],
+            guard let functionID = closure.imageFunctionID,
+                  let function = functions[functionID],
                   function.kind == .closureBody,
                   function.resultType == closure.signature.result,
                   closure.signature.hasCanonicalCallableEffects,
@@ -246,7 +247,7 @@ public struct Interpreter: Sendable {
                 throw VM.RuntimeTrap.mainActorViolation
             }
             for (value, expected) in zip(arguments, closure.signature.parameters) {
-                try budget.consumeBoundaryValue(value)
+                try budget.consumeNativeCallbackBoundaryValue(value)
                 try validateRuntimeValue(
                     value,
                     expected: expected,
@@ -271,7 +272,7 @@ public struct Interpreter: Sendable {
             let callValues = arguments + closure.captures
             try chargeCallShape(callValues, budget: budget)
             let value = try execute(
-                functionID: closure.functionID,
+                functionID: functionID,
                 functions: functions,
                 arguments: callValues,
                 localTypes: localTypes,
@@ -4314,7 +4315,7 @@ public struct Interpreter: Sendable {
                     try initialize(
                         .closure(
                             .init(
-                                functionID: callee,
+                                target: .image(callee),
                                 signature: signature,
                                 captures: capturedValues,
                                 dynamicScope: lifetime == .lexical
@@ -4341,7 +4342,7 @@ public struct Interpreter: Sendable {
                     try initialize(
                         .closure(
                             .init(
-                                functionID: closure.functionID,
+                                target: closure.target,
                                 signature: closure.signature,
                                 captures: closure.captures,
                                 dynamicScope: .init(
@@ -4397,41 +4398,92 @@ public struct Interpreter: Sendable {
                         )
                     }
                     try closure.dynamicScope?.requireActive()
-                    guard let calleeFunction = functions[closure.functionID],
-                          calleeFunction.parameterConventions.count >= arguments.count
-                    else {
-                        throw VM.RuntimeTrap.unknownFunction(closure.functionID)
-                    }
                     let values = try arguments.map { try read($0, registers: registers) }
-                    let callValues = values + closure.captures
-                    try chargeCallShape(callValues, budget: budget)
-                    try consumeOwnedCallArguments(
-                        arguments,
-                        conventions: Array(
-                            calleeFunction.parameterConventions.prefix(arguments.count)
-                        ),
-                        function: function,
-                        localTypes: localTypes,
-                        registers: &registers
-                    )
-                    persist(
-                        frame,
-                        registers: registers,
-                        stackSlots: stackSlots,
-                        currentBlock: currentBlock,
-                        nextInstruction: instructionIndex + 1
-                    )
-                    try budget.checkDeadline()
-                    return .call(
-                        FrameCall(
-                            functionID: closure.functionID,
-                            arguments: callValues,
-                            continuation: .returning(
-                                result: result,
-                                programCounter: programCounter
+                    switch closure.target {
+                    case let .image(functionID):
+                        guard let calleeFunction = functions[functionID],
+                              calleeFunction.parameterConventions.count
+                                >= arguments.count
+                        else {
+                            throw VM.RuntimeTrap.unknownFunction(functionID)
+                        }
+                        let callValues = values + closure.captures
+                        try chargeCallShape(callValues, budget: budget)
+                        try consumeOwnedCallArguments(
+                            arguments,
+                            conventions: Array(
+                                calleeFunction.parameterConventions.prefix(
+                                    arguments.count
+                                )
+                            ),
+                            function: function,
+                            localTypes: localTypes,
+                            registers: &registers
+                        )
+                        persist(
+                            frame,
+                            registers: registers,
+                            stackSlots: stackSlots,
+                            currentBlock: currentBlock,
+                            nextInstruction: instructionIndex + 1
+                        )
+                        try budget.checkDeadline()
+                        return .call(
+                            FrameCall(
+                                functionID: functionID,
+                                arguments: callValues,
+                                continuation: .returning(
+                                    result: result,
+                                    programCounter: programCounter
+                                )
                             )
                         )
-                    )
+                    case let .native(nativeClosure):
+                        guard closure.captures.isEmpty,
+                              nativeClosure.signature == closure.signature,
+                              closure.signature.isNativeBridgeCallableArgument,
+                              arguments.count == closure.signature.parameters.count
+                        else {
+                            throw VM.RuntimeTrap.nativeFailure(
+                                "native closure value disagrees with its callable ABI"
+                            )
+                        }
+                        try chargeCallShape(values, budget: budget)
+                        try consumeOwnedCallArguments(
+                            arguments,
+                            conventions: closure.signature.parameterConventions,
+                            function: function,
+                            localTypes: localTypes,
+                            registers: &registers
+                        )
+                        // Calling an SDK-provided closure is an externally
+                        // observable native action even when its Swift function
+                        // type carries no explicit effect annotation.
+                        try budget.consumeNativeCall(hasSideEffects: true)
+                        try budget.checkDeadline()
+                        let value = try nativeClosure.invoke(
+                            arguments: values,
+                            budget: budget
+                        )
+                        try budget.checkDeadline()
+                        if let value {
+                            try budget.consumeBoundaryValue(value)
+                            try validateRuntimeValue(
+                                value,
+                                expected: closure.signature.result,
+                                localTypes: localTypes,
+                                budget: budget
+                            )
+                        }
+                        try storeCallResult(
+                            value,
+                            in: result,
+                            function: function,
+                            registers: &registers,
+                            localTypes: localTypes,
+                            budget: budget
+                        )
+                    }
                 case let .closureTryApply(
                     closureRegister,
                     arguments,
@@ -4457,11 +4509,16 @@ public struct Interpreter: Sendable {
                         )
                     }
                     try closure.dynamicScope?.requireActive()
-                    guard let calleeFunction = functions[closure.functionID],
+                    guard let functionID = closure.imageFunctionID else {
+                        throw VM.RuntimeTrap.nativeFailure(
+                            "closure_try_apply requires an image closure body"
+                        )
+                    }
+                    guard let calleeFunction = functions[functionID],
                           calleeFunction.parameterConventions.count
                             >= arguments.count
                     else {
-                        throw VM.RuntimeTrap.unknownFunction(closure.functionID)
+                        throw VM.RuntimeTrap.unknownFunction(functionID)
                     }
                     let values = try arguments.map {
                         try read($0, registers: registers)
@@ -4489,7 +4546,7 @@ public struct Interpreter: Sendable {
                     try budget.checkDeadline()
                     return .call(
                         FrameCall(
-                            functionID: closure.functionID,
+                            functionID: functionID,
                             arguments: callValues,
                             continuation: .throwing(
                                 normalTarget: normalTarget,
@@ -5402,7 +5459,7 @@ public struct Interpreter: Sendable {
         case let .closure(closure):
             .closure(
                 .init(
-                    functionID: closure.functionID,
+                    target: closure.target,
                     signature: closure.signature,
                     captures: try closure.captures.map(copy),
                     dynamicScope: closure.dynamicScope

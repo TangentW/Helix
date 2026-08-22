@@ -476,7 +476,13 @@ does not by itself certify a physical device or distribution channel.
   accepts direct or Optional synchronous, nonthrowing callbacks. Callback
   parameters may recursively use the ordinary native bridge value family,
   including `Error` existentials (direct or Optional) represented as bounded
-  opaque proxies, but cannot be `inout`, higher-order, or image-local values.
+  opaque proxies, but cannot be `inout` or image-local values. One direct or
+  Optional native-origin callable argument layer is also accepted when the
+  generated Swift call proves it escaping. Its own signature is synchronous,
+  nonthrowing, and closure-free, and uses callback bridge values, including
+  bounded `Error` proxies; the VM keeps its native identity, exact ownership
+  and MainActor requirements, resource accounting, and a non-Sendable overlap
+  gate when invoking it.
   Results may be `Void` or ordinary recursive bridge values with deterministic
   failure values: scalars, text, `Any`, Optional, empty collections, and
   recursively defaultable tuples. Direct native results are rejected because
@@ -577,7 +583,8 @@ does not by itself certify a physical device or distribution channel.
   native results, and the general boundary codec cannot contain closures; only
   an exact escaping callback parameter may retain its pinned handle. Callback
   results without a framework-neutral failure value, throwing or async callback
-  ABIs, `inout` callback parameters, higher-order callback parameters, and
+  ABIs, `inout` callback parameters, recursive/nonescaping nested callable
+  parameters or callable containers, and
   concurrent `Sendable` execution semantics remain unsupported.
   `unowned(unsafe)` is rejected because its dangling reference cannot be made
   safe, and weak/unowned stored properties are not yet a patch-local nominal

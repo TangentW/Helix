@@ -28111,7 +28111,8 @@ public struct Lowerer: Sendable {
             parameterConventions = self.parameterConventions(
                 rawParameters: valueSpellings,
                 parameterTypes: parameters,
-                implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix)
+                implicitlyBorrowsLinearValues: isObjectiveCMethodConvention(prefix),
+                preservesClosureOwnership: preservingClosureOwnership
             )
             physicalResultExpectation = nil
         }

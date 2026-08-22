@@ -70,6 +70,44 @@ struct Metadata {
             imports: [returning]
         )
 
+        let nativeCallable = Bytecode.ClosureSignature(
+            parameters: [.bool],
+            parameterConventions: [.owned],
+            result: .void
+        )
+        let higherOrderCallback = Bytecode.ClosureSignature(
+            parameters: [.closure(nativeCallable)],
+            parameterConventions: [.owned],
+            result: .void
+        )
+        var higherOrder = descriptor
+        higherOrder.parameterTypes = [.closure(higherOrderCallback)]
+        higherOrder.signature.parameters = [
+            "(@escaping (Swift.Bool) -> Swift.Void) -> Swift.Void",
+        ]
+        higherOrder.contract.callbacks = [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+        ]
+        _ = try Verification.ShellInterface(
+            interfaceHash: .sha256("callback-shell"),
+            compatibility: compatibility,
+            capabilities: [
+                .baselineV1, .nativeImportsV1, .closureValuesV1,
+                .escapingClosureValuesV1,
+            ],
+            imports: [higherOrder]
+        )
+        #expect(throws: Verification.Error.self) {
+            try Verification.ShellInterface(
+                interfaceHash: .sha256("callback-shell"),
+                compatibility: compatibility,
+                capabilities: [
+                    .baselineV1, .nativeImportsV1, .closureValuesV1,
+                ],
+                imports: [higherOrder]
+            )
+        }
+
         returningSignature.result = .native(
             .init(rawValue: .sha256("unsupported-native-callback-result"))
         )

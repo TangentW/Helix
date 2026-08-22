@@ -248,6 +248,7 @@ public struct TypeEnvironment: Sendable {
     private var classAllocators: [String: Bytecode.LocalTypeKey]
     private var requiresTypedErrors: Bool
     private var nativeTypes: [String: Core.TypeID]
+    private var canonicalNativeTypes: [String: Core.TypeID]
     private var nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind]
     private var mainActorNativeTypes: Set<Core.TypeID>
 
@@ -276,6 +277,7 @@ public struct TypeEnvironment: Sendable {
         classAllocators = [:]
         requiresTypedErrors = false
         nativeTypes = [:]
+        canonicalNativeTypes = [:]
         nativeTypeKinds = [:]
         mainActorNativeTypes = []
     }
@@ -286,6 +288,7 @@ public struct TypeEnvironment: Sendable {
         structFactories = [:]
         classAllocators = [:]
         nativeTypes = [:]
+        canonicalNativeTypes = [:]
         nativeTypeKinds = [:]
         mainActorNativeTypes = []
         // Payload-free throws use the lightweight String error representation.
@@ -302,8 +305,9 @@ public struct TypeEnvironment: Sendable {
     }
 
     /// Returns an environment that resolves the exact native types frozen in
-    /// the target Shell. Both module-qualified SIL spellings and their
-    /// module-relative form are accepted; ambiguous aliases fail closed.
+    /// the target Shell. Both exact SIL spellings and an unambiguous
+    /// module-relative form are accepted. Ambiguous shorthand is omitted so
+    /// nested SDK types with the same terminal name retain their identities.
     public func includingNativeTypes(
         _ records: [String: Core.TypeID],
         kinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:],
@@ -341,26 +345,44 @@ public struct TypeEnvironment: Sendable {
                 }
                 result.classAllocators = result.classAllocators.filter { $0.value != local }
             }
-            var aliases = [canonicalName]
-            if let separator = canonicalName.firstIndex(of: ".") {
-                aliases.append(String(canonicalName[canonicalName.index(after: separator)...]))
+            guard !canonicalName.isEmpty,
+                  result.localKey(for: canonicalName) == nil
+            else {
+                throw CanonicalSIL.LoweringError.invalidCallTable(
+                    "native type \(canonicalName) conflicts with a local type"
+                )
             }
-            for alias in aliases {
-                guard !alias.isEmpty, result.localKey(for: alias) == nil else {
-                    throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "native type \(canonicalName) conflicts with local type \(alias)"
-                    )
-                }
-                if let existing = result.nativeTypes[alias], existing != id {
-                    throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "native type alias \(alias) resolves to multiple TypeIDs"
-                    )
-                }
-                result.nativeTypes[alias] = id
+            if let existing = result.canonicalNativeTypes[canonicalName],
+               existing != id {
+                throw CanonicalSIL.LoweringError.invalidCallTable(
+                    "native type \(canonicalName) resolves to multiple TypeIDs"
+                )
             }
+            result.canonicalNativeTypes[canonicalName] = id
         }
+        result.rebuildNativeTypeAliases()
         try result.rebuildFactoryTables(allowingUnresolvedTypes: false)
         return result
+    }
+
+    private mutating func rebuildNativeTypeAliases() {
+        nativeTypes = canonicalNativeTypes
+        var candidates: [String: Set<Core.TypeID>] = [:]
+        for (canonicalName, id) in canonicalNativeTypes {
+            guard let separator = canonicalName.firstIndex(of: ".") else {
+                continue
+            }
+            let alias = String(canonicalName[canonicalName.index(after: separator)...])
+            guard !alias.isEmpty, alias != canonicalName else { continue }
+            candidates[alias, default: []].insert(id)
+        }
+        for (alias, ids) in candidates where ids.count == 1 {
+            guard let id = ids.first,
+                  localKey(for: alias) == nil,
+                  nativeTypes[alias].map({ $0 == id }) ?? true
+            else { continue }
+            nativeTypes[alias] = id
+        }
     }
 
     private mutating func rebuildFactoryTables(

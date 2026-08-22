@@ -612,7 +612,9 @@ throwing compiler-only projections without symmetric writeback still fail
 closed. Ordinary closure values cannot cross the Shell/Native boundary or
 survive the current pinned VM invocation. Exact NativeImport callback
 parameters are the sole exception: their checked nonescaping/escaping handle
-lifetimes follow the generated callback contract described above.
+lifetimes follow the generated callback contract described above, and one
+source-proven escaping native callable argument layer may enter through that
+callback and be invoked by ordinary typed closure control flow.
 
 The current generator collects reachable ordinary functions, private class
 instance methods, computed accessors, and their non-exported patch-local types

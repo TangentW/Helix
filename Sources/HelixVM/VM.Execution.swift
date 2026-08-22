@@ -565,6 +565,42 @@ public final class InvocationBudget: @unchecked Sendable {
         try consumeBoundaryValue(value, depth: 0)
     }
 
+    /// Charges an SDK callback argument graph. Unlike an ordinary Shell
+    /// boundary, this path admits one direct bridge-created native closure or
+    /// one Optional containing it. Other aggregates retain the ordinary rule,
+    /// so a callable cannot be smuggled through Any or collection storage.
+    package func consumeNativeCallbackBoundaryValue(
+        _ value: VM.Value
+    ) throws {
+        switch value {
+        case let .closure(closure):
+            try consumeNativeClosureBoundaryValue(closure)
+        case let .optional(.some(.closure(closure))):
+            try consumeWork(units: 1)
+            try consumeAggregateStorage(elementCount: 1)
+            try consumeNativeClosureBoundaryValue(closure)
+        default:
+            try consumeBoundaryValue(value)
+        }
+    }
+
+    private func consumeNativeClosureBoundaryValue(
+        _ closure: VM.Closure
+    ) throws {
+        try consumeWork(units: 1)
+        guard let target = closure.nativeTarget,
+              target.signature == closure.signature,
+              closure.signature.isNativeBridgeCallableArgument,
+              closure.captures.isEmpty,
+              closure.dynamicScope == nil
+        else {
+            throw VM.RuntimeTrap.explicit(
+                "closure values cannot cross a VM boundary"
+            )
+        }
+        try consumeVMHeap(bytes: VM.NativeClosure.estimatedVMByteCount)
+    }
+
     private func consumeBoundaryValue(_ value: VM.Value, depth: Int) throws {
         guard depth <= VM.ValueLimits.maximumNestingDepth else {
             throw VM.RuntimeTrap.valueNestingDepthExceeded(
@@ -609,10 +645,14 @@ public final class InvocationBudget: @unchecked Sendable {
             try consumeAggregateStorage(elementCount: 0)
         case let .structure(_, fields):
             try consumeAggregateStorage(elementCount: fields.count)
-            for field in fields { try consumeBoundaryValue(field, depth: depth + 1) }
+            for field in fields {
+                try consumeBoundaryValue(field, depth: depth + 1)
+            }
         case let .enumeration(_, _, payload):
             try consumeAggregateStorage(elementCount: payload == nil ? 0 : 1)
-            if let payload { try consumeBoundaryValue(payload, depth: depth + 1) }
+            if let payload {
+                try consumeBoundaryValue(payload, depth: depth + 1)
+            }
         case .object:
             throw VM.RuntimeTrap.explicit(
                 "patch-local class values cannot cross a VM boundary"

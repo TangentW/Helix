@@ -671,6 +671,9 @@ public struct Archive: Codable, Hashable, Sendable {
                             || capabilities.contains(.escapingClosureValuesV1),
                           let shape = type.directClosureShape,
                           shape.signature.isNativeBridgeCallback,
+                          !shape.signature.parameters.contains(
+                              where: \.containsClosureValue
+                          ) || capabilities.contains(.escapingClosureValuesV1),
                           !(callback.lifetime == .nonescaping && shape.isOptional)
                     else {
                         throw InterfaceArchive.Error.invalidArchive(
@@ -834,6 +837,21 @@ public struct Archive: Codable, Hashable, Sendable {
                 throw InterfaceArchive.Error.invalidArchive("async leaf-entry capability is absent")
             }
         }
+        func validateNativeCallableArgument(
+            _ signature: Bytecode.ClosureSignature
+        ) throws {
+            guard capabilities.contains(.escapingClosureValuesV1),
+                  signature.isNativeBridgeCallableArgument
+            else {
+                throw InterfaceArchive.Error.invalidArchive(
+                    "native import callback has an unsupported callable argument"
+                )
+            }
+            for parameter in signature.parameters {
+                try validateDeviceType(parameter, allowingError: true)
+            }
+            try validateDeviceType(signature.result, allowingError: true)
+        }
         func usesMainActorType(_ type: Bytecode.ValueType) -> Bool {
             switch type {
             case let .native(id): mainActorTypeIDs.contains(id)
@@ -881,11 +899,18 @@ public struct Archive: Codable, Hashable, Sendable {
                 if callbackIndices.contains(index),
                    let shape = type.directClosureShape {
                     for parameter in shape.signature.parameters {
-                        try validateDeviceType(
-                            parameter,
-                            allowingError: true
-                        )
+                        if let callable = parameter.directClosureShape {
+                            try validateNativeCallableArgument(
+                                callable.signature
+                            )
+                        } else {
+                            try validateDeviceType(
+                                parameter,
+                                allowingError: true
+                            )
+                        }
                     }
+                    try validateDeviceType(shape.signature.result)
                 } else {
                     guard type.isOrdinaryNativeImportBridgeValue else {
                         throw InterfaceArchive.Error.invalidArchive(

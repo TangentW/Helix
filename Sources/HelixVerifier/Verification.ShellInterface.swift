@@ -231,6 +231,8 @@ public struct ShellInterface: Sendable {
                 || capabilities.contains(.escapingClosureValuesV1),
               let shape = type.directClosureShape,
               shape.signature.isNativeBridgeCallback,
+              !shape.signature.parameters.contains(where: \.containsClosureValue)
+                || capabilities.contains(.escapingClosureValuesV1),
               !(callback.lifetime == .nonescaping && shape.isOptional)
         else {
             throw Verification.Error.invalidShellInterface(
@@ -238,13 +240,46 @@ public struct ShellInterface: Sendable {
             )
         }
         for parameter in shape.signature.parameters {
-            guard !parameter.containsClosureValue,
-                  parameter.isNativeBridgeValue
-            else {
-                throw Verification.Error.invalidShellInterface(
-                    "\(owner) cannot accept a higher-order or unbridgeable callback value"
+            if let callable = parameter.directClosureShape {
+                try validateNativeCallableArgument(
+                    callable.signature,
+                    owner: owner,
+                    capabilities: capabilities
+                )
+            } else {
+                guard parameter.isNativeBridgeValue else {
+                    throw Verification.Error.invalidShellInterface(
+                        "\(owner) has an unbridgeable callback argument"
+                    )
+                }
+                try validateBoundaryType(
+                    parameter,
+                    owner: owner,
+                    capabilities: capabilities,
+                    allowingError: true
                 )
             }
+        }
+        try validateBoundaryType(
+            shape.signature.result,
+            owner: owner,
+            capabilities: capabilities
+        )
+    }
+
+    private static func validateNativeCallableArgument(
+        _ signature: Bytecode.ClosureSignature,
+        owner: String,
+        capabilities: Set<Core.Capability>
+    ) throws {
+        guard capabilities.contains(.escapingClosureValuesV1),
+              signature.isNativeBridgeCallableArgument
+        else {
+            throw Verification.Error.invalidShellInterface(
+                "\(owner) has an unsupported native callable argument"
+            )
+        }
+        for parameter in signature.parameters {
             try validateBoundaryType(
                 parameter,
                 owner: owner,
@@ -252,6 +287,12 @@ public struct ShellInterface: Sendable {
                 allowingError: true
             )
         }
+        try validateBoundaryType(
+            signature.result,
+            owner: owner,
+            capabilities: capabilities,
+            allowingError: true
+        )
     }
 
     private static func validateBoundaryType(

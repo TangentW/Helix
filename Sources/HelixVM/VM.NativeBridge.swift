@@ -124,6 +124,7 @@ public struct NativeInvocationContext {
               let expectedShape = state.parameterTypes[parameterIndex]
                 .directClosureShape,
               case let .closure(closure) = value,
+              closure.imageFunctionID != nil,
               closure.signature == expectedShape.signature,
               closure.signature.isNativeBridgeCallback
         else {
