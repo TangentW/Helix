@@ -2,7 +2,7 @@ import Foundation
 
 extension CanonicalSIL.ProtocolConformance {
 enum StaticDispatch {
-    private struct WitnessReference {
+    struct WitnessReference {
         var result: String
         var conformingType: String
         var requirement: String
@@ -280,7 +280,7 @@ enum StaticDispatch {
         pattern: #"(?<![A-Za-z0-9_τ])Self(?![A-Za-z0-9_])"#
     )
 
-    private static func witnessReference(
+    static func witnessReference(
         in line: String
     ) -> WitnessReference? {
         guard let assignment = line.range(of: " = witness_method $"),

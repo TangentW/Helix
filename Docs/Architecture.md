@@ -584,10 +584,22 @@ Both workflows depend on stable, build-specific identities:
   parses every successive outer generic clause and proves concrete conformance,
   same-type, superclass/`AnyObject`, and dependent associated-type requirements
   before token substitution. Exact complete frontend records are authoritative.
-  For standard value families already represented by Helix, a closed
-  toolchain-checked `Sequence`/`Collection` hierarchy supplies only the
-  conformance and associated-type identities that the value model proves; it
-  never infers a custom conformance from a similar storage shape. A conditional
+  For standard value families already represented by Helix, closed
+  toolchain-checked evidence supplies only conformances and associated-type
+  identities whose execution semantics the value model proves. Besides the
+  `Sequence`/`Collection` hierarchy, this covers common scalar and recursive
+  `Equatable`/`Hashable` constraints, scalar `Comparable`, numeric and literal
+  hierarchies, `Strideable`, `CustomStringConvertible`, and
+  `LosslessStringConvertible`. Exact standard witness references lower to
+  verifier-visible operations for comparison, arithmetic, mutation, magnitude,
+  integer division/remainder/bitwise/shift, fixed-width bounds, bit properties,
+  wrapping/reporting-overflow arithmetic and full-width multiplication,
+  floating division/remainder, distance/advance, literal construction,
+  description, and lossless parsing.
+  Compiler-only literal payloads are validated and eliminated before HLBC.
+  Direct `Hasher` execution is not synthesized, and imported native conformers
+  still require a separately frozen concrete NativeImport operation. Similar
+  storage never creates a custom or imported conformance. A conditional
   conformance is usable only when its instantiated requirements recursively
   prove in the same closed environment. Each argument list receives
   a deterministic specialization identity bound to the original Swift symbol,

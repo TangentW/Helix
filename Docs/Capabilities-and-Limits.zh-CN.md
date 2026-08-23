@@ -64,7 +64,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 
 - NativeImport callback 的通用发现与生成路径还覆盖带 closure 的原生 initializer、completion 参数和 callback 属性 setter，例如 `UIAction`/`UIAlertAction`、`UIViewController.present`、cell configuration handler 与 `Operation.completionBlock`。属性赋值是存储行为，因此合同会将其 closure 生命周期固定为 escaping，并保留表达式上的 actor isolation；这不是 UIKit 或 Foundation 的逐 API 特例。
 
-- 上述泛型证明对用户 conformance 以精确完整的 frontend witness record 为准；已表示的标准值族另使用经过当前 toolchain 校验的闭合 `Sequence`/`Collection` 层级，并只暴露 `Element` 等现有值模型确切证明的 associated identity，不能从相似 storage 推断 conformance。
+- 上述泛型证明对用户 conformance 以精确完整的 frontend witness record 为准；已表示的标准值族只使用经过当前 toolchain 校验、且 VM 已有语义的集合、相等/比较、数值、`Strideable`、字面量、description 与无损解析闭合证据。受支持的精确 witness 包括比较、加减乘与原地修改、magnitude、整数除法/余数/位运算/独立整数 RHS 的移位、定宽整数边界与位属性、multiple/quotient 查询、wrapping/reporting-overflow 算术与 full-width 乘法、浮点除法/余数、distance/advance，以及 Bool、整数、浮点、String、扩展字形簇和 Unicode scalar 字面量。Compiler 会具体求解字面量 associated type 及 `Magnitude`/`Stride`/`Exponent` identity，协议操作也可复用普通 image-local closure 值。递归 `Hashable` 证据仅用于约束证明，不会伪造直接 Swift `Hasher` 执行；imported conformer 必须走具体已冻结 NativeImport，也不能从相似 storage 推断 conformance。
 
 ### 同步 closure 能力矩阵
 

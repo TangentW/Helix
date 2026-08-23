@@ -492,10 +492,20 @@ closure helpers from semantic SIL, including direct, throwing, recursive,
 rethrowing, returning, and escaping function-value forms; each concrete type
 argument list receives a deterministic image target. Successive clauses prove
 same-type, protocol, superclass/`AnyObject`, and dependent associated-type
-requirements from exact frontend evidence. Represented standard values use a
-closed, toolchain-checked `Sequence`/`Collection` hierarchy for the exact
-conformance and associated identities Helix already executes; custom values do
-not inherit those protocols from their storage shape. This also covers constrained generic
+requirements from exact frontend evidence. Represented standard values use
+closed, toolchain-checked evidence only where Helix already executes the exact
+semantics. In addition to `Sequence`/`Collection`, concrete generic helpers can
+use common `Equatable`/`Comparable`, numeric, `Strideable`, literal,
+description, and lossless-parsing requirements. Their exact witness references
+become verifier-visible comparison, arithmetic, mutation, shift, fixed-width
+bounds/bit/query/overflow operations, distance, conversion, or text operations;
+compiler-only literal payloads are validated and erased before HLBC. Recursive
+values contribute `Hashable` only as a closed
+constraint for VM-defined hashing—Helix does not synthesize Swift `Hasher`
+execution. Imported conformers are not inferred from native storage and still
+need a concrete operation already frozen as an exact NativeImport. Custom
+values likewise do not inherit protocols from their storage shape. This also
+covers constrained generic
 extension methods, reachable concrete instances of file/module-scope generic
 structs, enums, and final classes, and concrete opaque results—including outer-
 generic and ordered multiple results—whose entry buffers reveal the underlying

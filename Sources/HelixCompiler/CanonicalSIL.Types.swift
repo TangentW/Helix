@@ -2391,7 +2391,8 @@ public struct TypeEnvironment: Sendable {
         concrete raw: String,
         protocolName: String
     ) -> [String: String]? {
-        let name = protocolName.hasPrefix("Swift.")
+        let name =
+            protocolName.hasPrefix("Swift.")
             ? String(protocolName.dropFirst("Swift.".count))
             : protocolName
         // Progressions such as Range<Int> have a compiler-owned Sequence
@@ -2399,24 +2400,26 @@ public struct TypeEnvironment: Sendable {
         // Validate every standard Sequence family through the shared semantic
         // classifier before consulting its closed conformance hierarchy.
         if (try? representedSequenceElement(raw, relativeTo: nil)) != nil,
-           let evidence = CanonicalSIL.StandardConformance.associatedTypes(
-            concrete: raw,
-            protocolName: protocolName
-        ) {
+            let evidence = CanonicalSIL.StandardConformance.associatedTypes(
+                concrete: raw,
+                protocolName: protocolName
+            )
+        {
             return evidence
         }
         guard let type = try? resolve(raw) else { return nil }
+        if let evidence = CanonicalSIL.StandardConformance.associatedTypes(
+            concrete: raw,
+            protocolName: protocolName,
+            representedType: type
+        ) {
+            return evidence
+        }
         switch name {
-        case "Equatable" where type.isVMEquatable:
-            return [:]
-        case "Hashable" where type.isVMHashable:
-            return [:]
-        case "Comparable" where type.isVMComparable:
-            return [:]
         case "Error":
             if type == .never { return [:] }
-            guard case let .local(key) = type,
-                  (try? definition(for: key).conformsToError) == true
+            guard case .local(let key) = type,
+                (try? definition(for: key).conformsToError) == true
             else { return nil }
             return [:]
         default:

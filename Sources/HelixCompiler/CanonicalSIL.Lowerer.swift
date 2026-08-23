@@ -961,6 +961,9 @@ public struct Lowerer: Sendable {
         var deferredGenericFunctionReferences: [
             String: DeferredGenericFunctionReference
         ] = [:]
+        var standardProtocolWitnessReferences: [
+            String: CanonicalSIL.StandardProtocolWitness.Reference
+        ] = [:]
         var swiftCoreReferences: [String: SwiftCoreIntrinsic] = [:]
         var objectiveCBridgeReferences: [String: ObjectiveCBridgeIntrinsic] = [:]
         var optionSetArrayLiteralReferences: [String: String] = [:]
@@ -974,6 +977,7 @@ public struct Lowerer: Sendable {
         var staticStringValues: [String: String] = [:]
         var wordLiterals: [String: UInt64] = [:]
         var integerLiterals: [String: (bitWidth: UInt16, bitPattern: UInt64)] = [:]
+        var compilerIntegerLiterals: [String: String] = [:]
         var retypedIntegerOperands: [String: [Bytecode.ValueType: Bytecode.Register]] = [:]
         var boolLiterals: [String: Bool] = [:]
         var metatypeValues = Set<String>()
@@ -3744,6 +3748,1451 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func emitStandardProtocolBinary(
+            type: Bytecode.ValueType,
+            operation: Bytecode.BinaryOperation,
+            lhs: Bytecode.Register,
+            rhs: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            switch type {
+            case .integer:
+                if operation == .divide || operation == .remainder {
+                    let zero = try allocate(type: type)
+                    appendInstruction(
+                        .constantInteger(result: zero, bitPattern: 0)
+                    )
+                    let dividesByZero = try allocate(type: .bool)
+                    appendInstruction(
+                        .compare(
+                            result: dividesByZero,
+                            predicate: .equal,
+                            lhs: rhs,
+                            rhs: zero
+                        )
+                    )
+                    try appendConditionalTrap(
+                        condition: dividesByZero,
+                        reason: .divisionByZero
+                    )
+                }
+                let result = try allocate(type: type)
+                let overflow = try allocate(type: .bool)
+                appendInstruction(
+                    .checkedBinary(
+                        result: result,
+                        overflow: overflow,
+                        operation: operation,
+                        lhs: lhs,
+                        rhs: rhs
+                    )
+                )
+                try appendConditionalTrap(
+                    condition: overflow,
+                    reason: .integerOverflow
+                )
+                return result
+
+            case .float:
+                let floatingOperation: Bytecode.FloatBinaryOperation =
+                    switch operation {
+                    case .add: .add
+                    case .subtract: .subtract
+                    case .multiply: .multiply
+                    case .divide: .divide
+                    case .remainder: .remainder
+                    case .bitAnd, .bitOr, .bitXor, .shiftLeft, .shiftRight:
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "floating standard witness has an integer-only operation"
+                        )
+                    }
+                let result = try allocate(type: type)
+                appendInstruction(
+                    .floatingBinary(
+                        result: result,
+                        operation: floatingOperation,
+                        lhs: lhs,
+                        rhs: rhs
+                    )
+                )
+                return result
+
+            default:
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "standard binary witness for \(type)"
+                )
+            }
+        }
+
+        func emitStandardProtocolNegation(
+            type: Bytecode.ValueType,
+            operand: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            let result = try allocate(type: type)
+            switch type {
+            case .integer(_, true):
+                let zero = try allocate(type: type)
+                let overflow = try allocate(type: .bool)
+                appendInstruction(
+                    .constantInteger(result: zero, bitPattern: 0)
+                )
+                appendInstruction(
+                    .checkedBinary(
+                        result: result,
+                        overflow: overflow,
+                        operation: .subtract,
+                        lhs: zero,
+                        rhs: operand
+                    )
+                )
+                try appendConditionalTrap(
+                    condition: overflow,
+                    reason: .integerOverflow
+                )
+            case .float:
+                appendInstruction(
+                    .floatingUnary(
+                        result: result,
+                        operation: .negate,
+                        operand: operand
+                    )
+                )
+            default:
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "standard negation witness for \(type)"
+                )
+            }
+            return result
+        }
+
+        func emitStandardProtocolConversion(
+            source: Bytecode.ValueType,
+            resultType: Bytecode.ValueType,
+            operand: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            guard registerTypes[Int(operand.rawValue)] == source else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "standard literal conversion operand has the wrong type"
+                )
+            }
+            if source == resultType {
+                return try copyOwnedValue(operand)
+            }
+            let result = try allocate(type: resultType)
+            switch (source, resultType) {
+            case (.integer(_, true), .float):
+                appendInstruction(
+                    .floatingConvert(
+                        result: result,
+                        operation: .signedIntegerToFloat,
+                        value: operand
+                    )
+                )
+            case (.float(let sourceWidth), .float(let resultWidth)):
+                guard sourceWidth != resultWidth else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "equal floating literal representations were not elided"
+                    )
+                }
+                appendInstruction(
+                    .floatingConvert(
+                        result: result,
+                        operation: sourceWidth > resultWidth
+                            ? .truncate : .extend,
+                        value: operand
+                    )
+                )
+            default:
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "standard literal conversion from \(source) to \(resultType)"
+                )
+            }
+            return result
+        }
+
+        func materializeStandardCompilerLiteralArguments(
+            _ tokens: [String],
+            witness: CanonicalSIL.StandardProtocolWitness,
+            line: Int
+        ) throws -> [String] {
+            func bind(
+                _ value: Bytecode.Register,
+                index: Int
+            ) -> String {
+                let token = "%standard_literal_\(line)_\(index)"
+                values[token] = value
+                return token
+            }
+
+            switch witness {
+            case .compilerIntegerLiteral(let type):
+                guard tokens.count == 1,
+                    let spelling = compilerIntegerLiterals[tokens[0]],
+                    let bitPattern = Self.compilerIntegerLiteralBitPattern(
+                        spelling,
+                        target: type
+                    )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "compiler integer literal is outside its concrete standard type"
+                    )
+                }
+                let result = try allocate(type: type)
+                appendInstruction(
+                    .constantInteger(result: result, bitPattern: bitPattern)
+                )
+                return [bind(result, index: 0)]
+
+            case .compilerUTF8Literal(let type, let kind):
+                guard type == .string,
+                    tokens.count == 3,
+                    let literal = stringLiterals[tokens[0]],
+                    let expectedByteCount = wordLiterals[tokens[1]],
+                    let expectedASCII = boolLiterals[tokens[2]],
+                    UInt64(literal.utf8.count) == expectedByteCount,
+                    literal.utf8.allSatisfy({ $0 < 0x80 }) == expectedASCII,
+                    kind != .extendedGraphemeCluster || literal.count == 1
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "compiler UTF-8 literal metadata does not match its payload"
+                    )
+                }
+                let string = try allocate(type: .string)
+                appendInstruction(.constantString(result: string, value: literal))
+                let countType = Bytecode.ValueType.integer(
+                    bitWidth: 64,
+                    signed: false
+                )
+                let count = try allocate(type: countType)
+                appendInstruction(
+                    .constantInteger(result: count, bitPattern: expectedByteCount)
+                )
+                return [
+                    bind(string, index: 0),
+                    bind(count, index: 1),
+                    tokens[2],
+                ]
+
+            case .compilerUnicodeScalarLiteral(let type):
+                guard type == .string,
+                    tokens.count == 1,
+                    let literal = integerLiterals[tokens[0]],
+                    literal.bitWidth == 32,
+                    let scalar = Unicode.Scalar(
+                        UInt32(truncatingIfNeeded: literal.bitPattern)
+                    )
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "compiler Unicode scalar literal is invalid"
+                    )
+                }
+                let result = try allocate(type: .string)
+                appendInstruction(
+                    .constantString(result: result, value: String(scalar))
+                )
+                return [bind(result, index: 0)]
+
+            default:
+                return tokens
+            }
+        }
+
+        func emitStandardIntegerConversion(
+            _ operand: Bytecode.Register,
+            to resultType: Bytecode.ValueType
+        ) throws -> Bytecode.Register {
+            let sourceType = registerTypes[Int(operand.rawValue)]
+            guard case .integer(let sourceWidth, let sourceSigned) = sourceType,
+                case .integer(let resultWidth, _) = resultType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "standard integer conversion has non-integer storage"
+                )
+            }
+            if sourceType == resultType { return operand }
+            let operation: Bytecode.IntegerConversionOperation
+            if sourceWidth == resultWidth {
+                operation = .reinterpret
+            } else if sourceWidth < resultWidth {
+                operation = sourceSigned ? .signExtend : .zeroExtend
+            } else {
+                operation = .truncate
+            }
+            let result = try allocate(type: resultType)
+            appendInstruction(
+                .integerConvert(
+                    result: result,
+                    operation: operation,
+                    value: operand
+                )
+            )
+            return result
+        }
+
+        func emitStandardIntegerConstant(
+            type: Bytecode.ValueType,
+            bitPattern: UInt64
+        ) throws -> Bytecode.Register {
+            guard case .integer = type else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "standard integer constant has non-integer storage"
+                )
+            }
+            let result = try allocate(type: type)
+            appendInstruction(
+                .constantInteger(result: result, bitPattern: bitPattern)
+            )
+            return result
+        }
+
+        func emitStandardComparison(
+            _ predicate: Bytecode.ComparisonPredicate,
+            _ lhs: Bytecode.Register,
+            _ rhs: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            guard
+                registerTypes[Int(lhs.rawValue)]
+                    == registerTypes[Int(rhs.rawValue)]
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "standard comparison operands have different types"
+                )
+            }
+            let result = try allocate(type: .bool)
+            appendInstruction(
+                .compare(
+                    result: result,
+                    predicate: predicate,
+                    lhs: lhs,
+                    rhs: rhs
+                )
+            )
+            return result
+        }
+
+        func emitStandardSelect(
+            condition: Bytecode.Register,
+            trueValue: Bytecode.Register,
+            falseValue: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            let type = registerTypes[Int(trueValue.rawValue)]
+            guard registerTypes[Int(condition.rawValue)] == .bool,
+                registerTypes[Int(falseValue.rawValue)] == type
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "standard select operands have different types"
+                )
+            }
+            let result = try allocate(type: type)
+            appendInstruction(
+                .select(
+                    result: result,
+                    condition: condition,
+                    trueValue: trueValue,
+                    falseValue: falseValue
+                )
+            )
+            return result
+        }
+
+        func emitStandardCheckedIntegerBinary(
+            operation: Bytecode.BinaryOperation,
+            lhs: Bytecode.Register,
+            rhs: Bytecode.Register
+        ) throws -> (result: Bytecode.Register, overflow: Bytecode.Register) {
+            let type = registerTypes[Int(lhs.rawValue)]
+            guard case .integer = type,
+                registerTypes[Int(rhs.rawValue)] == type
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "standard checked operation has invalid integer operands"
+                )
+            }
+            let result = try allocate(type: type)
+            let overflow = try allocate(type: .bool)
+            appendInstruction(
+                .checkedBinary(
+                    result: result,
+                    overflow: overflow,
+                    operation: operation,
+                    lhs: lhs,
+                    rhs: rhs
+                )
+            )
+            return (result, overflow)
+        }
+
+        func emitStandardProtocolShift(
+            type: Bytecode.ValueType,
+            rhsType: Bytecode.ValueType,
+            operation: Bytecode.BinaryOperation,
+            lhs: Bytecode.Register,
+            rhs: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            guard case .integer(let lhsWidth, _) = type,
+                case .integer(let rhsWidth, let rhsSigned) = rhsType,
+                registerTypes[Int(lhs.rawValue)] == type,
+                registerTypes[Int(rhs.rawValue)] == rhsType,
+                operation == .shiftLeft || operation == .shiftRight
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "standard shift witness has invalid integer operands"
+                )
+            }
+            let unsignedRHS = Bytecode.ValueType.integer(
+                bitWidth: rhsWidth,
+                signed: false
+            )
+            let isNegative: Bytecode.Register
+            let magnitude: Bytecode.Register
+            if rhsSigned {
+                let zero = try emitStandardIntegerConstant(
+                    type: rhsType,
+                    bitPattern: 0
+                )
+                isNegative = try emitStandardComparison(.lessThan, rhs, zero)
+                magnitude = try allocate(type: unsignedRHS)
+                appendInstruction(
+                    .integerUnary(
+                        result: magnitude,
+                        operation: .magnitude,
+                        operand: rhs
+                    )
+                )
+            } else {
+                isNegative = try allocate(type: .bool)
+                appendInstruction(
+                    .constantBool(result: isNegative, value: false)
+                )
+                magnitude = rhs
+            }
+
+            let width = try emitStandardIntegerConstant(
+                type: unsignedRHS,
+                bitPattern: UInt64(lhsWidth)
+            )
+            let isOversized = try emitStandardComparison(
+                .greaterThanOrEqual,
+                magnitude,
+                width
+            )
+            let boundedMagnitude = try emitStandardSelect(
+                condition: isOversized,
+                trueValue: width,
+                falseValue: magnitude
+            )
+            let amount = try emitStandardIntegerConversion(
+                boundedMagnitude,
+                to: type
+            )
+            let left = try emitStandardCheckedIntegerBinary(
+                operation: .shiftLeft,
+                lhs: lhs,
+                rhs: amount
+            )
+            let right = try emitStandardCheckedIntegerBinary(
+                operation: .shiftRight,
+                lhs: lhs,
+                rhs: amount
+            )
+            let unexpectedOverflow = try allocate(type: .bool)
+            appendInstruction(
+                .booleanBinary(
+                    result: unexpectedOverflow,
+                    operation: .or,
+                    lhs: left.overflow,
+                    rhs: right.overflow
+                )
+            )
+            try appendConditionalTrap(
+                condition: unexpectedOverflow,
+                reason: .integerOverflow
+            )
+            let forward = operation == .shiftLeft ? left.result : right.result
+            let reversed = operation == .shiftLeft ? right.result : left.result
+            return try emitStandardSelect(
+                condition: isNegative,
+                trueValue: reversed,
+                falseValue: forward
+            )
+        }
+
+        func emitStandardStrideDistance(
+            type: Bytecode.ValueType,
+            stride: Bytecode.ValueType,
+            destination: Bytecode.Register,
+            receiver: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            if case .float = type {
+                guard stride == type else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating Strideable witness changes its Stride type"
+                    )
+                }
+                return try emitStandardProtocolBinary(
+                    type: type,
+                    operation: .subtract,
+                    lhs: destination,
+                    rhs: receiver
+                )
+            }
+            let signedStride = Bytecode.ValueType.integer(
+                bitWidth: 64,
+                signed: true
+            )
+            guard stride == signedStride,
+                case .integer(_, let signed) = type
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "integer Strideable witness has an invalid Stride type"
+                )
+            }
+            if signed {
+                let lhs = try emitStandardIntegerConversion(
+                    destination,
+                    to: signedStride
+                )
+                let rhs = try emitStandardIntegerConversion(
+                    receiver,
+                    to: signedStride
+                )
+                let difference = try emitStandardCheckedIntegerBinary(
+                    operation: .subtract,
+                    lhs: lhs,
+                    rhs: rhs
+                )
+                try appendConditionalTrap(
+                    condition: difference.overflow,
+                    reason: .integerOverflow
+                )
+                return difference.result
+            }
+
+            let unsigned64 = Bytecode.ValueType.integer(
+                bitWidth: 64,
+                signed: false
+            )
+            let lhs = try emitStandardIntegerConversion(
+                destination,
+                to: unsigned64
+            )
+            let rhs = try emitStandardIntegerConversion(receiver, to: unsigned64)
+            let isForward = try emitStandardComparison(
+                .greaterThanOrEqual,
+                lhs,
+                rhs
+            )
+            let high = try emitStandardSelect(
+                condition: isForward,
+                trueValue: lhs,
+                falseValue: rhs
+            )
+            let low = try emitStandardSelect(
+                condition: isForward,
+                trueValue: rhs,
+                falseValue: lhs
+            )
+            let magnitude = try emitStandardCheckedIntegerBinary(
+                operation: .subtract,
+                lhs: high,
+                rhs: low
+            )
+            try appendConditionalTrap(
+                condition: magnitude.overflow,
+                reason: .integerOverflow
+            )
+            let positiveLimit = try emitStandardIntegerConstant(
+                type: unsigned64,
+                bitPattern: UInt64(Int64.max)
+            )
+            let negativeLimit = try emitStandardIntegerConstant(
+                type: unsigned64,
+                bitPattern: UInt64(1) << 63
+            )
+            let limit = try emitStandardSelect(
+                condition: isForward,
+                trueValue: positiveLimit,
+                falseValue: negativeLimit
+            )
+            let isUnrepresentable = try emitStandardComparison(
+                .greaterThan,
+                magnitude.result,
+                limit
+            )
+            try appendConditionalTrap(
+                condition: isUnrepresentable,
+                reason: .integerOverflow
+            )
+
+            let rawSigned = try emitStandardIntegerConversion(
+                magnitude.result,
+                to: signedStride
+            )
+            let isMinimum = try emitStandardComparison(
+                .equal,
+                magnitude.result,
+                negativeLimit
+            )
+            let zero = try emitStandardIntegerConstant(
+                type: signedStride,
+                bitPattern: 0
+            )
+            let safeMagnitude = try emitStandardSelect(
+                condition: isMinimum,
+                trueValue: zero,
+                falseValue: rawSigned
+            )
+            let negative = try emitStandardProtocolNegation(
+                type: signedStride,
+                operand: safeMagnitude
+            )
+            let signedNegative = try emitStandardSelect(
+                condition: isMinimum,
+                trueValue: rawSigned,
+                falseValue: negative
+            )
+            return try emitStandardSelect(
+                condition: isForward,
+                trueValue: rawSigned,
+                falseValue: signedNegative
+            )
+        }
+
+        func emitStandardStrideAdvanced(
+            type: Bytecode.ValueType,
+            stride: Bytecode.ValueType,
+            offset: Bytecode.Register,
+            receiver: Bytecode.Register
+        ) throws -> Bytecode.Register {
+            if case .float = type {
+                guard stride == type else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "floating Strideable witness changes its Stride type"
+                    )
+                }
+                return try emitStandardProtocolBinary(
+                    type: type,
+                    operation: .add,
+                    lhs: receiver,
+                    rhs: offset
+                )
+            }
+            let signedStride = Bytecode.ValueType.integer(
+                bitWidth: 64,
+                signed: true
+            )
+            guard stride == signedStride,
+                case .integer(let bitWidth, let signed) = type
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "integer Strideable witness has an invalid Stride type"
+                )
+            }
+            if signed {
+                let widened = try emitStandardIntegerConversion(
+                    receiver,
+                    to: signedStride
+                )
+                let sum = try emitStandardCheckedIntegerBinary(
+                    operation: .add,
+                    lhs: widened,
+                    rhs: offset
+                )
+                try appendConditionalTrap(
+                    condition: sum.overflow,
+                    reason: .integerOverflow
+                )
+                guard bitWidth < 64 else { return sum.result }
+                let minimum = -(Int64(1) << (bitWidth - 1))
+                let maximum = (Int64(1) << (bitWidth - 1)) - 1
+                let minimumValue = try emitStandardIntegerConstant(
+                    type: signedStride,
+                    bitPattern: UInt64(bitPattern: minimum)
+                )
+                let maximumValue = try emitStandardIntegerConstant(
+                    type: signedStride,
+                    bitPattern: UInt64(maximum)
+                )
+                let below = try emitStandardComparison(
+                    .lessThan,
+                    sum.result,
+                    minimumValue
+                )
+                let above = try emitStandardComparison(
+                    .greaterThan,
+                    sum.result,
+                    maximumValue
+                )
+                let outside = try allocate(type: .bool)
+                appendInstruction(
+                    .booleanBinary(
+                        result: outside,
+                        operation: .or,
+                        lhs: below,
+                        rhs: above
+                    )
+                )
+                try appendConditionalTrap(
+                    condition: outside,
+                    reason: .integerOverflow
+                )
+                return try emitStandardIntegerConversion(sum.result, to: type)
+            }
+
+            let unsigned64 = Bytecode.ValueType.integer(
+                bitWidth: 64,
+                signed: false
+            )
+            let widened = try emitStandardIntegerConversion(receiver, to: unsigned64)
+            let zero = try emitStandardIntegerConstant(
+                type: signedStride,
+                bitPattern: 0
+            )
+            let isNegative = try emitStandardComparison(.lessThan, offset, zero)
+            let magnitude = try allocate(type: unsigned64)
+            appendInstruction(
+                .integerUnary(
+                    result: magnitude,
+                    operation: .magnitude,
+                    operand: offset
+                )
+            )
+            let positive = try emitStandardIntegerConversion(offset, to: unsigned64)
+            let added = try emitStandardCheckedIntegerBinary(
+                operation: .add,
+                lhs: widened,
+                rhs: positive
+            )
+            let subtracted = try emitStandardCheckedIntegerBinary(
+                operation: .subtract,
+                lhs: widened,
+                rhs: magnitude
+            )
+            let overflow = try emitStandardSelect(
+                condition: isNegative,
+                trueValue: subtracted.overflow,
+                falseValue: added.overflow
+            )
+            try appendConditionalTrap(
+                condition: overflow,
+                reason: .integerOverflow
+            )
+            let result = try emitStandardSelect(
+                condition: isNegative,
+                trueValue: subtracted.result,
+                falseValue: added.result
+            )
+            guard bitWidth < 64 else { return result }
+            let maximum = (UInt64(1) << bitWidth) - 1
+            let maximumValue = try emitStandardIntegerConstant(
+                type: unsigned64,
+                bitPattern: maximum
+            )
+            let outside = try emitStandardComparison(
+                .greaterThan,
+                result,
+                maximumValue
+            )
+            try appendConditionalTrap(
+                condition: outside,
+                reason: .integerOverflow
+            )
+            return try emitStandardIntegerConversion(result, to: type)
+        }
+
+        func lowerStandardProtocolOperation(
+            _ witness: CanonicalSIL.StandardProtocolWitness,
+            arguments: [Bytecode.Register],
+            line: Int
+        ) throws -> Bytecode.Register? {
+            guard
+                arguments.map({ registerTypes[Int($0.rawValue)] })
+                    == witness.parameterTypes
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "standard protocol witness"
+                )
+            }
+
+            switch witness {
+            case .comparison(_, let predicate):
+                let result = try allocate(type: .bool)
+                appendInstruction(
+                    .compare(
+                        result: result,
+                        predicate: predicate,
+                        lhs: arguments[0],
+                        rhs: arguments[1]
+                    )
+                )
+                return result
+
+            case .binary(let type, let operation, let order):
+                let operands =
+                    switch order {
+                    case .forward: (arguments[0], arguments[1])
+                    case .receiverLast: (arguments[1], arguments[0])
+                    }
+                return try emitStandardProtocolBinary(
+                    type: type,
+                    operation: operation,
+                    lhs: operands.0,
+                    rhs: operands.1
+                )
+
+            case .shift(let type, let rhsType, let operation):
+                guard let rhsType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "standard shift witness was not concretized"
+                    )
+                }
+                return try emitStandardProtocolShift(
+                    type: type,
+                    rhsType: rhsType,
+                    operation: operation,
+                    lhs: arguments[0],
+                    rhs: arguments[1]
+                )
+
+            case .integerStaticValue(let type, let value):
+                guard case .integer(let bitWidth, let signed) = type else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "fixed-width static witness has non-integer storage"
+                    )
+                }
+                switch value {
+                case .minimum:
+                    return try emitStandardIntegerConstant(
+                        type: type,
+                        bitPattern: signed ? UInt64(1) << (bitWidth - 1) : 0
+                    )
+                case .maximum:
+                    let mask = bitWidth == 64
+                        ? UInt64.max
+                        : (UInt64(1) << bitWidth) - 1
+                    return try emitStandardIntegerConstant(
+                        type: type,
+                        bitPattern: signed ? mask >> 1 : mask
+                    )
+                case .bitWidth:
+                    return try emitStandardIntegerConstant(
+                        type: .int64,
+                        bitPattern: UInt64(bitWidth)
+                    )
+                case .isSigned:
+                    let result = try allocate(type: .bool)
+                    appendInstruction(
+                        .constantBool(result: result, value: signed)
+                    )
+                    return result
+                }
+
+            case .integerUnary(_, _, let operation):
+                return try emitIntegerUnary(
+                    operation,
+                    operand: arguments[0]
+                )
+
+            case .integerSignum(let type):
+                guard case .integer(_, let signed) = type else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "BinaryInteger.signum witness has non-integer storage"
+                    )
+                }
+                if signed {
+                    return try emitIntegerUnary(
+                        .signum,
+                        operand: arguments[0]
+                    )
+                }
+                let zero = try emitStandardIntegerConstant(
+                    type: type,
+                    bitPattern: 0
+                )
+                let one = try emitStandardIntegerConstant(
+                    type: type,
+                    bitPattern: 1
+                )
+                let isZero = try emitStandardComparison(
+                    .equal,
+                    arguments[0],
+                    zero
+                )
+                return try emitStandardSelect(
+                    condition: isZero,
+                    trueValue: zero,
+                    falseValue: one
+                )
+
+            case .integerIsMultiple(let type):
+                let remainder = try emitStandardCheckedIntegerBinary(
+                    operation: .remainder,
+                    lhs: arguments[1],
+                    rhs: arguments[0]
+                )
+                let zero = try emitStandardIntegerConstant(
+                    type: type,
+                    bitPattern: 0
+                )
+                return try emitStandardComparison(
+                    .equal,
+                    remainder.result,
+                    zero
+                )
+
+            case .integerQuotientAndRemainder(let type):
+                let zero = try emitStandardIntegerConstant(
+                    type: type,
+                    bitPattern: 0
+                )
+                let dividesByZero = try emitStandardComparison(
+                    .equal,
+                    arguments[0],
+                    zero
+                )
+                try appendConditionalTrap(
+                    condition: dividesByZero,
+                    reason: .divisionByZero
+                )
+                let quotient = try emitStandardCheckedIntegerBinary(
+                    operation: .divide,
+                    lhs: arguments[1],
+                    rhs: arguments[0]
+                )
+                try appendConditionalTrap(
+                    condition: quotient.overflow,
+                    reason: .integerOverflow
+                )
+                let remainder = try emitStandardCheckedIntegerBinary(
+                    operation: .remainder,
+                    lhs: arguments[1],
+                    rhs: arguments[0]
+                )
+                try appendConditionalTrap(
+                    condition: remainder.overflow,
+                    reason: .integerOverflow
+                )
+                let result = try allocate(type: .tuple([type, type]))
+                appendInstruction(
+                    .makeTuple(
+                        result: result,
+                        elements: [quotient.result, remainder.result]
+                    )
+                )
+                return result
+
+            case .integerReportingOverflow:
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "mixed-result reporting-overflow witness used the ordinary apply path"
+                )
+
+            case .integerWrappingBinary(_, let operation):
+                return try emitStandardCheckedIntegerBinary(
+                    operation: operation,
+                    lhs: arguments[0],
+                    rhs: arguments[1]
+                ).result
+
+            case .integerFullWidthMultiply(let type, let magnitude):
+                let high = try allocate(type: type)
+                let low = try allocate(type: magnitude)
+                appendInstruction(
+                    .integerFullWidthMultiply(
+                        high: high,
+                        low: low,
+                        lhs: arguments[1],
+                        rhs: arguments[0]
+                    )
+                )
+                let result = try allocate(
+                    type: .tuple([type, magnitude])
+                )
+                appendInstruction(
+                    .makeTuple(result: result, elements: [high, low])
+                )
+                return result
+
+            case .mutatingBinary(let type, let operation):
+                let value = try allocate(type: type)
+                appendInstruction(
+                    .loadAddress(
+                        result: value,
+                        address: arguments[0],
+                        mode: .copy
+                    )
+                )
+                let result = try emitStandardProtocolBinary(
+                    type: type,
+                    operation: operation,
+                    lhs: value,
+                    rhs: arguments[1]
+                )
+                appendInstruction(
+                    .storeAddress(
+                        address: arguments[0],
+                        source: result,
+                        mode: .assign
+                    )
+                )
+                return nil
+
+            case .zero(let type):
+                let result = try allocate(type: type)
+                switch type {
+                case .integer:
+                    appendInstruction(
+                        .constantInteger(result: result, bitPattern: 0)
+                    )
+                case .float:
+                    appendInstruction(
+                        .constantFloat(result: result, bitPattern: 0)
+                    )
+                default:
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "standard additive identity for \(type)"
+                    )
+                }
+                return result
+
+            case .negate(let type):
+                return try emitStandardProtocolNegation(
+                    type: type,
+                    operand: arguments[0]
+                )
+
+            case .negateInPlace(let type):
+                let value = try allocate(type: type)
+                appendInstruction(
+                    .loadAddress(
+                        result: value,
+                        address: arguments[0],
+                        mode: .copy
+                    )
+                )
+                let result = try emitStandardProtocolNegation(
+                    type: type,
+                    operand: value
+                )
+                appendInstruction(
+                    .storeAddress(
+                        address: arguments[0],
+                        source: result,
+                        mode: .assign
+                    )
+                )
+                return nil
+
+            case .magnitude(let source, let resultType):
+                let result = try allocate(type: resultType)
+                switch source {
+                case .integer:
+                    appendInstruction(
+                        .integerUnary(
+                            result: result,
+                            operation: .magnitude,
+                            operand: arguments[0]
+                        )
+                    )
+                case .float:
+                    appendInstruction(
+                        .floatingUnary(
+                            result: result,
+                            operation: .absolute,
+                            operand: arguments[0]
+                        )
+                    )
+                default:
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "standard magnitude witness for \(source)"
+                    )
+                }
+                return result
+
+            case .distance(let type, let stride):
+                return try emitStandardStrideDistance(
+                    type: type,
+                    stride: stride,
+                    destination: arguments[0],
+                    receiver: arguments[1]
+                )
+
+            case .advanced(let type, let stride):
+                return try emitStandardStrideAdvanced(
+                    type: type,
+                    stride: stride,
+                    offset: arguments[0],
+                    receiver: arguments[1]
+                )
+
+            case .conversion(let source, let resultType):
+                return try emitStandardProtocolConversion(
+                    source: source,
+                    resultType: resultType,
+                    operand: arguments[0]
+                )
+
+            case .compilerIntegerLiteral(let type):
+                return try emitStandardProtocolConversion(
+                    source: type,
+                    resultType: type,
+                    operand: arguments[0]
+                )
+
+            case .compilerUTF8Literal:
+                // Byte count and ASCII metadata were checked while the
+                // compiler-only payload was materialized above.
+                return try copyOwnedValue(arguments[0])
+
+            case .compilerUnicodeScalarLiteral(let type):
+                return try emitStandardProtocolConversion(
+                    source: type,
+                    resultType: type,
+                    operand: arguments[0]
+                )
+
+            case .description:
+                let result = try allocate(type: .string)
+                appendInstruction(
+                    .stringify(result: result, value: arguments[0])
+                )
+                return result
+
+            case .losslessStringInitializer(let type):
+                let result = try allocate(type: .optional(type))
+                if type == .string {
+                    appendInstruction(
+                        .makeOptionalSome(result: result, value: arguments[0])
+                    )
+                } else {
+                    appendInstruction(
+                        .scalarFromString(
+                            result: result,
+                            string: arguments[0],
+                            radix: nil
+                        )
+                    )
+                }
+                return result
+            }
+        }
+
+        /// Reporting-overflow witnesses return one indirect partial value and
+        /// one direct Bool. Keep that physical split exact instead of
+        /// pretending the mixed SIL result is one ordinary tuple result.
+        func lowerStandardIntegerReportingOverflowApply(
+            resultToken: String,
+            type: Bytecode.ValueType,
+            operation: Bytecode.BinaryOperation,
+            argumentText: String,
+            concreteFunctionType: String,
+            line: Int
+        ) throws {
+            guard case .integer = type,
+                let arrow = CanonicalSIL.FunctionTypeSyntax.outerArrow(
+                    in: concreteFunctionType
+                )
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "FixedWidthInteger reporting overflow"
+                )
+            }
+            let resultText = String(
+                concreteFunctionType[arrow.upperBound...]
+            ).trimmingCharacters(in: .whitespaces)
+            let resultComponents = splitTopLevelTuple(resultText)
+            guard resultComponents.count == 2 else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "FixedWidthInteger reporting overflow",
+                    detail: "physical result is not (@out Self, Bool)"
+                )
+            }
+            let partial = try parseFunctionResult(
+                resultComponents[0],
+                bridgedTo: type
+            )
+            let overflow = try parseFunctionResult(
+                resultComponents[1],
+                bridgedTo: .bool
+            )
+            guard partial.type == type,
+                partial.isIndirect,
+                overflow.type == .bool,
+                !overflow.isIndirect
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "FixedWidthInteger reporting overflow",
+                    detail: "physical result changes the mixed result ABI"
+                )
+            }
+
+            let parameterOnlyType =
+                String(concreteFunctionType[..<arrow.lowerBound])
+                + " -> ()"
+            let applied = try parseFunctionType(
+                parameterOnlyType,
+                bridgingTo: ([type, type], .void)
+            )
+            guard applied.parameters == [type, type],
+                applied.parameterConventions.count == 2,
+                applied.result == .void,
+                applied.indirectResultTypes.isEmpty,
+                applied.thrownType == nil,
+                applied.indirectErrorType == nil,
+                !applied.effects.mayThrow,
+                !applied.effects.isAsync
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "FixedWidthInteger reporting overflow",
+                    detail: "physical parameters change the concrete ABI"
+                )
+            }
+
+            var argumentTokens = try parseApplyValueTokens(
+                argumentText,
+                line: line
+            )
+            let physicalArgumentCount = applied.parameters.count
+                .addingReportingOverflow(applied.erasedMetatypes.count)
+            guard !physicalArgumentCount.overflow else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "reporting-overflow argument count exceeds host limits"
+                )
+            }
+            let expectedArgumentCount = physicalArgumentCount.partialValue
+                .addingReportingOverflow(1)
+            guard !expectedArgumentCount.overflow,
+                argumentTokens.count == expectedArgumentCount.partialValue
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "reporting-overflow call has the wrong physical argument count"
+                )
+            }
+            let destination = argumentTokens.removeFirst()
+            guard compilerAddressType(destination) == type else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "reporting-overflow partial result has the wrong storage"
+                )
+            }
+            argumentTokens = try eraseMetatypeValues(
+                argumentTokens,
+                physicalRange: 0..<physicalArgumentCount.partialValue,
+                erasedMetatypes: applied.erasedMetatypes,
+                line: line,
+                context: "reporting-overflow witness"
+            )
+            let prepared = try prepareDirectCallArguments(
+                argumentTokens,
+                physicalConventions: applied.parameterConventions,
+                logicalTypes: applied.parameters,
+                line: line,
+                allowsCompilerInoutWriteback: false
+            )
+            let result = try emitStandardCheckedIntegerBinary(
+                operation: operation,
+                lhs: prepared.arguments[1],
+                rhs: prepared.arguments[0]
+            )
+            try storeConstructedValue(result.result, at: destination)
+            guard !resultToken.isEmpty else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "reporting-overflow call has no direct Bool result"
+                )
+            }
+            values[resultToken] = result.overflow
+            try transferOwnedCompilerAddressArguments(
+                tokens: argumentTokens,
+                resolvedArguments: prepared.arguments,
+                conventions: applied.parameterConventions
+            )
+            appendPreparedOwnerCleanups(prepared)
+            try finishPreparedAccessesAndWritebacks(prepared)
+        }
+
+        func lowerStandardProtocolApply(
+            resultToken: String,
+            reference: CanonicalSIL.StandardProtocolWitness.Reference,
+            genericArguments rawGenericArguments: String,
+            argumentText: String,
+            appliedFunctionType: String,
+            line: Int
+        ) throws {
+            let genericArguments: [String]
+            do {
+                genericArguments = try CanonicalSIL.GenericFunction.arguments(
+                    in: rawGenericArguments
+                )
+            } catch let error
+                as CanonicalSIL.GenericFunction
+                .SpecializationError
+            {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "#\(reference.requirement)",
+                    detail: error.description
+                )
+            }
+            guard let firstGenericArgument = genericArguments.first,
+                CanonicalSIL.GenericSignature.equivalentType(
+                    firstGenericArgument,
+                    reference.conformingType
+                ),
+                let witness = reference.witness.concretized(
+                    genericArguments: genericArguments,
+                    typeEnvironment: typeEnvironment
+                ),
+                CanonicalSIL.GenericFunction.validatesCallType(
+                    appliedFunctionType,
+                    against: reference.functionType
+                )
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "#\(reference.requirement)",
+                    detail: "standard witness specialization does not match its concrete conformer"
+                )
+            }
+
+            let concreteFunctionType: String
+            do {
+                guard let sourceFile else {
+                    throw CanonicalSIL.GenericFunction.SpecializationError
+                        .invalidArguments(
+                            "standard witness specialization has no conformance inventory"
+                        )
+                }
+                concreteFunctionType =
+                    try sourceFile
+                    .specializeGenericFunctionType(
+                        appliedFunctionType,
+                        arguments: rawGenericArguments,
+                        typeEnvironment: typeEnvironment
+                    )
+            } catch let error
+                as CanonicalSIL.GenericFunction
+                .SpecializationError
+            {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "#\(reference.requirement)",
+                    detail: error.description
+                )
+            }
+            if case let .integerReportingOverflow(type, operation) = witness {
+                try lowerStandardIntegerReportingOverflowApply(
+                    resultToken: resultToken,
+                    type: type,
+                    operation: operation,
+                    argumentText: argumentText,
+                    concreteFunctionType: concreteFunctionType,
+                    line: line
+                )
+                return
+            }
+            let loweringFunctionType = witness.normalizingCompilerLiteralABI(
+                in: concreteFunctionType
+            )
+            let applied = try parseFunctionType(
+                loweringFunctionType,
+                bridgingTo: (witness.parameterTypes, witness.resultType)
+            )
+            guard applied.parameters == witness.parameterTypes,
+                applied.parameterConventions.count == applied.parameters.count,
+                applied.result == witness.resultType,
+                applied.thrownType == nil,
+                applied.indirectErrorType == nil,
+                !applied.effects.mayThrow,
+                !applied.effects.isAsync
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "#\(reference.requirement)",
+                    detail: "standard witness application changes its concrete ABI"
+                )
+            }
+
+            var argumentTokens = try parseApplyValueTokens(
+                argumentText,
+                line: line
+            )
+            let physicalArgumentCount = applied.parameters.count
+                .addingReportingOverflow(applied.erasedMetatypes.count)
+            guard !physicalArgumentCount.overflow else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "standard witness argument count exceeds host limits"
+                )
+            }
+            let destinations = try consumeIndirectCallDestinations(
+                from: &argumentTokens,
+                resultType: applied.result,
+                indirectResultTypes: applied.indirectResultTypes,
+                indirectErrorType: applied.indirectErrorType,
+                physicalArgumentCount: physicalArgumentCount.partialValue
+            )
+            argumentTokens = try eraseMetatypeValues(
+                argumentTokens,
+                physicalRange: 0..<physicalArgumentCount.partialValue,
+                erasedMetatypes: applied.erasedMetatypes,
+                line: line,
+                context: "standard protocol witness"
+            )
+            argumentTokens = try materializeStandardCompilerLiteralArguments(
+                argumentTokens,
+                witness: witness,
+                line: line
+            )
+            let prepared = try prepareDirectCallArguments(
+                argumentTokens,
+                physicalConventions: applied.parameterConventions,
+                logicalTypes: applied.parameters,
+                line: line,
+                allowsCompilerInoutWriteback: witness.mutatesAddress
+            )
+            let result = try lowerStandardProtocolOperation(
+                witness,
+                arguments: prepared.arguments,
+                line: line
+            )
+            try transferOwnedCompilerAddressArguments(
+                tokens: argumentTokens,
+                resolvedArguments: prepared.arguments,
+                conventions: applied.parameterConventions
+            )
+            appendPreparedOwnerCleanups(prepared)
+
+            if destinations.hasResult {
+                guard !resultToken.isEmpty, let result else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "indirect standard witness apply has no Void SIL result"
+                    )
+                }
+                voidValues.insert(resultToken)
+                try storeIndirectCallResult(
+                    result,
+                    destinations: destinations,
+                    logicalType: applied.result
+                )
+            } else if applied.result == .void {
+                guard result == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Void standard witness unexpectedly produced a value"
+                    )
+                }
+                if !resultToken.isEmpty { voidValues.insert(resultToken) }
+            } else {
+                guard !resultToken.isEmpty, let result else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "standard witness apply has no result value"
+                    )
+                }
+                values[resultToken] = result
+            }
+            try finishPreparedAccessesAndWritebacks(prepared)
+        }
+
         func validateExistentialDispatch(
             _ candidates: [ResolvedExistentialCandidate],
             receiverIndex: Int,
@@ -4264,8 +5713,24 @@ public struct Lowerer: Sendable {
             line: Int,
             context: String
         ) throws -> [String] {
+            try eraseMetatypeValues(
+                tokens,
+                physicalRange: physicalRange,
+                erasedMetatypes: reference.erasedMetatypes,
+                line: line,
+                context: context
+            )
+        }
+
+        func eraseMetatypeValues(
+            _ tokens: [String],
+            physicalRange: Range<Int>,
+            erasedMetatypes: [ErasedMetatype],
+            line: Int,
+            context: String
+        ) throws -> [String] {
             let erasedByIndex = Dictionary(
-                uniqueKeysWithValues: reference.erasedMetatypes.map {
+                uniqueKeysWithValues: erasedMetatypes.map {
                     ($0.physicalIndex, $0.identity)
                 }
             )
@@ -21803,6 +23268,17 @@ public struct Lowerer: Sendable {
                 continue
             }
 
+            if let parsed = CanonicalSIL.ProtocolConformance.StaticDispatch
+                .witnessReference(in: line),
+                let witness = CanonicalSIL.StandardProtocolWitness.resolve(
+                    parsed,
+                    typeEnvironment: typeEnvironment
+                )
+            {
+                standardProtocolWitnessReferences[parsed.result] = witness
+                continue
+            }
+
             if let witness = match(
                 line,
                 pattern: #"^(%[0-9]+) = witness_method \$@opened\(.+$"#
@@ -22601,6 +24077,14 @@ public struct Lowerer: Sendable {
                 } else {
                     removeAccessMetadata(token)
                 }
+                continue
+            }
+
+            if let literal = match(
+                line,
+                pattern: #"^(%[0-9]+) = integer_literal \$Builtin\.IntLiteral, (-?[0-9]+)$"#
+            ) {
+                compilerIntegerLiterals[literal[0]] = literal[1]
                 continue
             }
 
@@ -24827,6 +26311,10 @@ public struct Lowerer: Sendable {
                     borrowed[1]
                 ] {
                     deferredGenericFunctionReferences[borrowed[0]] = reference
+                } else if let reference = standardProtocolWitnessReferences[
+                    borrowed[1]
+                ] {
+                    standardProtocolWitnessReferences[borrowed[0]] = reference
                 } else if let reference = deferredForeignReferences[borrowed[1]] {
                     deferredForeignReferences[borrowed[0]] = reference
                 } else if let reference = hostedSuperReferences[borrowed[1]] {
@@ -25454,6 +26942,17 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(?:(%[0-9]+) = )?apply (%[0-9]+)(?:<(.+)>)?\((.*)\) : \$(.+)$"#
             ) {
+                if let reference = standardProtocolWitnessReferences[call[1]] {
+                    try lowerStandardProtocolApply(
+                        resultToken: call[0],
+                        reference: reference,
+                        genericArguments: call[2],
+                        argumentText: call[3],
+                        appliedFunctionType: call[4],
+                        line: sourceLine
+                    )
+                    continue
+                }
                 if let witness = dynamicWitnessReferences[call[1]] {
                     try lowerExistentialApply(
                         resultToken: call[0],
@@ -28320,6 +29819,10 @@ public struct Lowerer: Sendable {
                     deferredGenericFunctionReferences[copy[0]] = reference
                     continue
                 }
+                if let reference = standardProtocolWitnessReferences[copy[1]] {
+                    standardProtocolWitnessReferences[copy[0]] = reference
+                    continue
+                }
                 if let reference = deferredForeignReferences[copy[1]] {
                     deferredForeignReferences[copy[0]] = reference
                     continue
@@ -28458,6 +29961,13 @@ public struct Lowerer: Sendable {
                 if let reference = deferredGenericFunctionReferences
                     .removeValue(forKey: move[1]) {
                     deferredGenericFunctionReferences[move[0]] = reference
+                    continue
+                }
+                if let reference =
+                    standardProtocolWitnessReferences
+                    .removeValue(forKey: move[1])
+                {
+                    standardProtocolWitnessReferences[move[0]] = reference
                     continue
                 }
                 if let reference = deferredForeignReferences.removeValue(forKey: move[1]) {
@@ -32773,6 +34283,44 @@ public struct Lowerer: Sendable {
         }
         guard let value = UInt64(spelling), value <= mask else { return nil }
         return value
+    }
+
+    /// `Builtin.IntLiteral` is arbitrary precision, but every scalar integer
+    /// represented by HLBC is at most 64 bits. Reject rather than truncate when
+    /// the selected concrete standard-library literal type cannot hold it.
+    private static func compilerIntegerLiteralBitPattern(
+        _ spelling: String,
+        target: Bytecode.ValueType
+    ) -> UInt64? {
+        guard case .integer(let bitWidth, let signed) = target,
+            [8, 16, 32, 64].contains(bitWidth)
+        else { return nil }
+        if signed {
+            guard let value = Int64(spelling) else { return nil }
+            let minimum: Int64
+            let maximum: Int64
+            if bitWidth == 64 {
+                minimum = .min
+                maximum = .max
+            } else {
+                minimum = -(Int64(1) << (bitWidth - 1))
+                maximum = (Int64(1) << (bitWidth - 1)) - 1
+            }
+            guard (minimum...maximum).contains(value) else { return nil }
+            let mask =
+                bitWidth == 64
+                ? UInt64.max
+                : (UInt64(1) << bitWidth) - 1
+            return UInt64(bitPattern: value) & mask
+        }
+        guard !spelling.hasPrefix("-"), let value = UInt64(spelling) else {
+            return nil
+        }
+        let maximum =
+            bitWidth == 64
+            ? UInt64.max
+            : (UInt64(1) << bitWidth) - 1
+        return value <= maximum ? value : nil
     }
 
     private func splitTopLevel(_ text: String) -> [String] {

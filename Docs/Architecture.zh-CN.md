@@ -83,7 +83,7 @@ flowchart TB
 - 调用的地址效果来自特化后的物理 SIL function type，而不是 API allowlist：`@in` 消费已初始化 storage，`@inout`/`@inout_aliasable` 要求并保持初始化，indirect result 只在其声明的 continuation 上完成初始化。同样，`unchecked_take_enum_data_addr` 不会因指令名被机械地视为立即消费，而是按实际消费者分类：只读 load 保留父 Optional，消费型使用会 take，修改则重建发生变化的 Tuple/补丁内 struct 路径后写回 Optional。非 throwing 的 compiler-only `inout` 会物化为经过验证的临时 address storage，调用完成后再走同一写回路径；重叠 projection 会被拒绝。Compiler 已证明的 frame-local aggregate static access 会收窄到最终操作或字段 projection，因此互不重叠的兄弟字段 `inout` 仍使用独立的 VM exclusivity scope。破坏性消费与修改生命周期混用会 fail closed；在 normal/error 两条 continuation 都具备写回模型之前，throwing compiler-only `inout` 也会 fail closed。
 - 激活时会把继承路由物化成自包含 snapshot。Registry 默认只强保留当前 snapshot 与其直接回滚前代；更旧 snapshot 只会在仍有 lease 固定时存活。全进程 generation ID 高水位不会因压缩而回退。普通激活不能复用旧 ID；经过验证的持久化恢复可以重新挂载完全相同的历史 package/ID，但不会降低高水位。
 
-- 具体泛型约束的证据边界分为两类：用户 conformance 以精确完整的 frontend record 为准；Helix 已表示的标准值族使用经过当前 toolchain 校验的闭合 `Sequence`/`Collection` 层级，只提供值模型确切证明的 conformance 与 associated-type identity，绝不会因 storage 形状相似而推断自定义 conformance。
+- 具体泛型约束的证据边界分为两类：用户 conformance 以精确完整的 frontend record 为准；Helix 已表示的标准值族只使用经过当前 toolchain 校验、且值模型已有执行语义的闭合证据。除 `Sequence`/`Collection` 层级外，它覆盖常用标量与递归值的 `Equatable`/`Hashable` 约束、标量 `Comparable`、数值与字面量协议层级、`Strideable`、`CustomStringConvertible` 和 `LosslessStringConvertible`。精确 standard witness 会降低为 Verifier 可见的比较、算术、原地修改、magnitude、整数除法/余数/位运算/移位、定宽整数边界与位属性、multiple/quotient 查询、wrapping/reporting-overflow 算术与 full-width 乘法、浮点除法/余数、distance/advance、字面量构造、description 与无损解析操作；compiler-only 字面量 payload 会先校验并在进入 HLBC 前消除。Compiler 不会伪造直接 `Hasher` 执行，imported native conformer 仍必须使用另行冻结的具体 NativeImport 操作，也绝不会因 storage 形状相似而推断自定义或 imported conformance。
 
 这些身份有意绑定具体 build。Helix 不试图让不同 App 版本之间的私有 Swift ABI 自动兼容。
 

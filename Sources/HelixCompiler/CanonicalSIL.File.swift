@@ -150,6 +150,19 @@ public struct File: Sendable {
         return materialized
     }
 
+    func specializeGenericFunctionType(
+        _ loweredType: String,
+        arguments: String,
+        typeEnvironment: CanonicalSIL.TypeEnvironment
+    ) throws -> String {
+        try CanonicalSIL.GenericFunction.specializeLoweredType(
+            loweredType,
+            arguments: arguments,
+            conformances: protocolConformances,
+            typeEnvironment: typeEnvironment
+        )
+    }
+
     /// Resolves closed witness lookups against the compilation environment in
     /// effect at the call site. Native type identity and kind metadata arrive
     /// after canonical SIL parsing, so an environment-bound rewriter must not

@@ -292,9 +292,16 @@ Concrete same-image generic execution is compile-time-only. Successive generic
 clauses are solved against exact complete frontend conformance evidence,
 including same-type, superclass/`AnyObject`, dependent associated-type, and
 recursively proven conditional-conformance requirements. Represented standard
-values additionally use a closed, toolchain-checked `Sequence`/`Collection`
-hierarchy that contributes only proven associated identities; it never treats
-matching storage as a custom conformance. Reachable generic
+values additionally use closed, toolchain-checked evidence for the common
+collection, equality/comparison, numeric, `Strideable`, literal, description,
+and lossless-parsing semantics the VM already defines, including fixed-width
+bounds, bit/query operations, wrapping/reporting-overflow arithmetic, and
+full-width multiplication. Exact witness references become verifier-visible
+operations and compiler-only literal payloads are removed before serialization.
+Recursive `Hashable` evidence does not synthesize
+Swift `Hasher`, and imported native conformers still require separately frozen
+concrete NativeImports; matching storage is never treated as a custom or
+imported conformance. Reachable generic
 helpers and constrained extension methods are monomorphized; file/module-scope
 generic struct, enum, and final-class templates materialize only concrete image
 instances. Exact frontend entry result buffers similarly replace single,

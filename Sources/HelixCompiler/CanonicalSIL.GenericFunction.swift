@@ -13,6 +13,13 @@ enum GenericFunction {
         var function: CanonicalSIL.Function
     }
 
+    private struct ConcreteSignature {
+        var arguments: [String]
+        var parameters: [String]
+        var substitutions: [String: String]
+        var loweredType: String
+    }
+
     enum SpecializationError: Error, Equatable, Sendable,
         CustomStringConvertible {
         case malformedSignature(String)
@@ -98,65 +105,24 @@ enum GenericFunction {
         conformances: CanonicalSIL.ProtocolConformance.Environment? = nil,
         typeEnvironment: CanonicalSIL.TypeEnvironment? = nil
     ) throws -> Materialized {
-        let clause = try genericClause(in: function.loweredType)
-        let arguments = try arguments(in: rawArguments)
-        guard clause.parameters.count == arguments.count else {
-            throw SpecializationError.invalidArguments(
-                "the declaration has \(clause.parameters.count) type parameters "
-                    + "but the call supplies \(arguments.count)"
-            )
-        }
-
-        let typeWithoutClause = String(
-            function.loweredType[..<clause.range.lowerBound]
-        ) + String(function.loweredType[clause.range.upperBound...])
-        var substitutions = Dictionary(
-            uniqueKeysWithValues: zip(clause.parameters, arguments).map {
-                ($0.0, $0.1)
-            }
+        let concrete = try concreteSignature(
+            loweredType: function.loweredType,
+            rawArguments: rawArguments,
+            conformances: conformances,
+            typeEnvironment: typeEnvironment
         )
-        if !clause.requirements.isEmpty {
-            guard let conformances, let typeEnvironment else {
-                throw SpecializationError.invalidArguments(
-                    "its generic requirements have no concrete conformance environment"
-                )
-            }
-            do {
-                guard let signature = try CanonicalSIL.GenericSignature
-                    .functionSignature(in: function.loweredType) else {
-                    throw SpecializationError.malformedSignature(
-                        "it is not a generic SIL function type"
-                    )
-                }
-                substitutions = try CanonicalSIL.GenericSignature.resolve(
-                    signature,
-                    arguments: arguments,
-                    conformances: conformances,
-                    typeEnvironment: typeEnvironment
-                ).substitutions
-            } catch let error as CanonicalSIL.GenericSignature.ParseError {
-                throw SpecializationError.malformedSignature(error.description)
-            } catch let error as CanonicalSIL.GenericSignature.ResolutionError {
-                throw SpecializationError.invalidArguments(error.description)
-            }
-        }
-        let concreteType: String
         let concreteBody: String
         do {
-            concreteType = try CanonicalSIL.GenericSignature.substituting(
-                substitutions,
-                in: typeWithoutClause
-            )
             concreteBody = try CanonicalSIL.GenericSignature.substituting(
-                substitutions,
+                concrete.substitutions,
                 in: function.body
             )
         } catch let error as CanonicalSIL.GenericSignature.ParseError {
             throw SpecializationError.malformedSignature(error.description)
         }
-        for parameter in clause.parameters {
+        for parameter in concrete.parameters {
             let typeRetainsParameter = try CanonicalSIL.GenericSignature
-                .containsAny(of: [parameter], in: concreteType)
+                .containsAny(of: [parameter], in: concrete.loweredType)
             let bodyRetainsParameter = try CanonicalSIL.GenericSignature
                 .containsAny(of: [parameter], in: concreteBody)
             guard !typeRetainsParameter, !bodyRetainsParameter
@@ -168,19 +134,19 @@ enum GenericFunction {
         }
 
         let descriptor = Specialization(
-            arguments: arguments,
-            concreteLoweredType: concreteType
+            arguments: concrete.arguments,
+            concreteLoweredType: concrete.loweredType
         )
         let symbol = syntheticSymbol(
             for: function.mangledName,
             originalLoweredType: function.loweredType,
-            arguments: arguments
+            arguments: concrete.arguments
         )
         return .init(
             descriptor: descriptor,
             function: .init(
                 mangledName: symbol,
-                loweredType: concreteType,
+                loweredType: concrete.loweredType,
                 body: concreteBody,
                 isolation: function.isolation,
                 declarationLocation: function.declarationLocation,
@@ -188,6 +154,24 @@ enum GenericFunction {
                 isExternalDefinition: function.isExternalDefinition
             )
         )
+    }
+
+    /// Concretizes a generic SIL function type without manufacturing a
+    /// callable function body. Witness references use the same constraint
+    /// solver as ordinary image-local generic specializations so dependent
+    /// results such as `Self.Magnitude` cannot diverge between the two paths.
+    static func specializeLoweredType(
+        _ loweredType: String,
+        arguments rawArguments: String,
+        conformances: CanonicalSIL.ProtocolConformance.Environment? = nil,
+        typeEnvironment: CanonicalSIL.TypeEnvironment? = nil
+    ) throws -> String {
+        try concreteSignature(
+            loweredType: loweredType,
+            rawArguments: rawArguments,
+            conformances: conformances,
+            typeEnvironment: typeEnvironment
+        ).loweredType
     }
 
     static func validatesCallType(
@@ -204,6 +188,83 @@ enum GenericFunction {
         var range: Range<String.Index>
         var parameters: [String]
         var requirements: [CanonicalSIL.GenericSignature.Requirement]
+    }
+
+    private static func concreteSignature(
+        loweredType: String,
+        rawArguments: String,
+        conformances: CanonicalSIL.ProtocolConformance.Environment?,
+        typeEnvironment: CanonicalSIL.TypeEnvironment?
+    ) throws -> ConcreteSignature {
+        let clause = try genericClause(in: loweredType)
+        let arguments = try arguments(in: rawArguments)
+        guard clause.parameters.count == arguments.count else {
+            throw SpecializationError.invalidArguments(
+                "the declaration has \(clause.parameters.count) type parameters "
+                    + "but the call supplies \(arguments.count)"
+            )
+        }
+
+        var substitutions = Dictionary(
+            uniqueKeysWithValues: zip(clause.parameters, arguments).map {
+                ($0.0, $0.1)
+            }
+        )
+        if !clause.requirements.isEmpty {
+            guard let conformances, let typeEnvironment else {
+                throw SpecializationError.invalidArguments(
+                    "its generic requirements have no concrete conformance environment"
+                )
+            }
+            do {
+                guard
+                    let signature = try CanonicalSIL.GenericSignature
+                        .functionSignature(in: loweredType)
+                else {
+                    throw SpecializationError.malformedSignature(
+                        "it is not a generic SIL function type"
+                    )
+                }
+                substitutions = try CanonicalSIL.GenericSignature.resolve(
+                    signature,
+                    arguments: arguments,
+                    conformances: conformances,
+                    typeEnvironment: typeEnvironment
+                ).substitutions
+            } catch let error as CanonicalSIL.GenericSignature.ParseError {
+                throw SpecializationError.malformedSignature(error.description)
+            } catch let error as CanonicalSIL.GenericSignature.ResolutionError {
+                throw SpecializationError.invalidArguments(error.description)
+            }
+        }
+
+        let typeWithoutClause =
+            String(loweredType[..<clause.range.lowerBound])
+            + String(loweredType[clause.range.upperBound...])
+        let concreteType: String
+        do {
+            concreteType = try CanonicalSIL.GenericSignature.substituting(
+                substitutions,
+                in: typeWithoutClause
+            )
+        } catch let error as CanonicalSIL.GenericSignature.ParseError {
+            throw SpecializationError.malformedSignature(error.description)
+        }
+        for parameter in clause.parameters
+        where
+            try CanonicalSIL
+            .GenericSignature.containsAny(of: [parameter], in: concreteType)
+        {
+            throw SpecializationError.invalidArguments(
+                "the concrete function type retains generic parameter \(parameter)"
+            )
+        }
+        return .init(
+            arguments: arguments,
+            parameters: clause.parameters,
+            substitutions: substitutions,
+            loweredType: concreteType
+        )
     }
 
     private static func genericClause(in raw: String) throws -> Clause {

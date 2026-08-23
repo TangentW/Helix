@@ -503,10 +503,22 @@ does not by itself certify a physical device or distribution channel.
   also monomorphized from semantic SIL. Successive generic clauses support
   concretely proven protocol/composition, same-type, `AnyObject`/superclass, and
   dependent associated-type requirements. Exact complete frontend witness
-  records drive user conformances. Represented standard value families use a
-  closed, toolchain-checked `Sequence`/`Collection` hierarchy that exposes only
-  proven associated identities such as `Element`; storage similarity alone is
-  never conformance. Conditional conformances are accepted only when their
+  records drive user conformances. Represented standard value families use
+  closed, toolchain-checked evidence for collection, equality/comparison,
+  numeric, `Strideable`, literal, description, and lossless-parsing semantics
+  already defined by the VM. Supported exact witnesses include comparison;
+  additive/multiplicative mutation; magnitude; integer division, remainder,
+  bitwise operations, shifts with an independently typed integer RHS,
+  fixed-width bounds and bit properties, multiple/quotient queries,
+  wrapping/reporting-overflow arithmetic, and full-width multiplication;
+  floating division/remainder; distance/advance; and Bool, integer, float,
+  String, grapheme-cluster, and Unicode-scalar literals. Literal-associated
+  types and `Magnitude`/`Stride`/`Exponent` identities are solved concretely,
+  and protocol operations compose through ordinary image-local closure values.
+  Recursive `Hashable` evidence is constraint-only—direct Swift `Hasher`
+  execution is not synthesized. Imported conformers require a concrete frozen
+  NativeImport operation, and storage similarity alone is never conformance.
+  Conditional conformances are accepted only when their
   concrete requirements recursively prove. Distinct argument lists
   receive deterministic image identities while call bindings retain the
   original Swift symbol; constrained extension methods, recursive, rethrowing,
