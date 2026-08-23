@@ -1073,6 +1073,14 @@ public enum Instruction: Codable, Hashable, Sendable {
         captures: [Bytecode.Register],
         lifetime: Bytecode.ClosureLifetime = .invocation
     )
+    /// Creates a closure that routes through one frozen Shell entry. Captures
+    /// are the bound suffix of the entry ABI, matching Swift partial_apply.
+    case makeEntryClosure(
+        result: Bytecode.Register,
+        entry: Core.EntryIndex,
+        captures: [Bytecode.Register],
+        lifetime: Bytecode.ClosureLifetime = .invocation
+    )
     /// Creates a dynamically scoped escaping view of a nonescaping closure.
     /// The verifier requires every normal and throwing CFG path to close it;
     /// runtime traps if another live value still reaches the scoped view.
@@ -1227,6 +1235,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .setRelation(result, _, _, _),
              let .compare(result, _, _, _),
              let .makeClosure(result, _, _, _),
+             let .makeEntryClosure(result, _, _, _),
              let .beginClosureScope(result, _):
             [result]
         case let .unpackTuple(results, _):
@@ -1524,7 +1533,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .entryApply(_, _, arguments),
              let .nativeApply(_, _, arguments):
             arguments
-        case let .makeClosure(_, _, captures, _):
+        case let .makeClosure(_, _, captures, _),
+             let .makeEntryClosure(_, _, captures, _):
             captures
         case let .beginClosureScope(_, closure),
              let .endClosureScope(closure):

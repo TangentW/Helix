@@ -857,6 +857,8 @@ public struct Engine: Verification.ImageVerifying {
                 return type
             }
             guard parameterTypes == shellEntry.parameterTypes,
+                  function.parameterConventions
+                    == shellEntry.parameterConventions,
                   !function.parameterConventions.contains(.inout),
                   function.resultType == shellEntry.resultType,
                   function.effects == shellEntry.effects
@@ -1861,8 +1863,8 @@ public struct Engine: Verification.ImageVerifying {
                     switch instruction {
                     case let .beginClosureScope(result, _):
                         result
-                    case let .makeClosure(result, _, _, lifetime)
-                        where lifetime == .lexical:
+                    case let .makeClosure(result, _, _, .lexical),
+                         let .makeEntryClosure(result, _, _, .lexical):
                         result
                     default:
                         nil
@@ -1946,8 +1948,8 @@ public struct Engine: Verification.ImageVerifying {
                 switch instruction {
                 case let .beginClosureScope(result, _):
                     blockDefinitions.insert(result)
-                case let .makeClosure(result, _, _, lifetime)
-                    where lifetime == .lexical:
+                case let .makeClosure(result, _, _, .lexical),
+                     let .makeEntryClosure(result, _, _, .lexical):
                     blockDefinitions.insert(result)
                 default:
                     break
@@ -2022,8 +2024,8 @@ public struct Engine: Verification.ImageVerifying {
                     }
                     state.closed.remove(result)
                     state.open.insert(result)
-                case let .makeClosure(result, _, _, lifetime)
-                    where lifetime == .lexical:
+                case let .makeClosure(result, _, _, .lexical),
+                     let .makeEntryClosure(result, _, _, .lexical):
                     guard !state.open.contains(result) else {
                         throw fail(
                             "a lexical closure scope is reentered before it closes"
@@ -2164,19 +2166,25 @@ public struct Engine: Verification.ImageVerifying {
 
         for block in function.blocks {
             for instruction in block.instructions {
-                guard case let .makeClosure(
-                    result,
-                    _,
-                    captures,
-                    lifetime
-                ) = instruction,
-                    lifetime == .lexical
+                let construction: (
+                    result: Bytecode.Register,
+                    captures: [Bytecode.Register],
+                    lifetime: Bytecode.ClosureLifetime
+                )? = switch instruction {
+                case let .makeClosure(result, _, captures, lifetime),
+                     let .makeEntryClosure(result, _, captures, lifetime):
+                    (result, captures, lifetime)
+                default:
+                    nil
+                }
+                guard let construction,
+                      construction.lifetime == .lexical
                 else { continue }
-                let sources = try Set(captures.compactMap { capture in
+                let sources = try Set(construction.captures.compactMap { capture in
                     try sourceAddress(of: capture)
                 })
                 if !sources.isEmpty {
-                    facts.sourceAddressesByClosure[result] = sources
+                    facts.sourceAddressesByClosure[construction.result] = sources
                 }
             }
         }
@@ -2204,7 +2212,8 @@ public struct Engine: Verification.ImageVerifying {
                      .projectMutableCell, .loadMutableCell,
                      .storeMutableCell:
                     true
-                case let .makeClosure(_, _, captures, lifetime):
+                case let .makeClosure(_, _, captures, lifetime),
+                     let .makeEntryClosure(_, _, captures, lifetime):
                     lifetime == .lexical
                         && borrowedOperands.allSatisfy(captures.contains)
                 default:
@@ -3913,6 +3922,10 @@ public struct Engine: Verification.ImageVerifying {
             )
         case let .entryApply(result, entry, arguments):
             guard let descriptor = shell.entries[entry] else { throw fail("unknown Shell entry \(entry)") }
+            try verifyBorrowedCallCapability(
+                descriptor.parameterConventions,
+                capabilities: capabilities
+            )
             try verifyEffects(
                 descriptor.effects,
                 allowedBy: function.effects,
@@ -3976,64 +3989,45 @@ public struct Engine: Verification.ImageVerifying {
             guard callee.kind == .closureBody else {
                 throw fail("make_closure target must be a closure body")
             }
-            guard callee.resultType == signature.result,
-                  signature.hasCanonicalCallableEffects,
-                  signature.hasCanonicalThrownType,
-                  callee.thrownType == signature.thrownType,
-                  signature.safelyRestricts(targetEffects: callee.effects)
-            else {
-                throw fail(
-                    "closure body result, thrown type, or callable effects do not match its closure signature"
-                )
-            }
-            try verifyClosureTargetAuthority(
-                callee.effects,
-                allowedBy: function.effects,
+            try verifyClosureConstruction(
+                target: .imageBody(thrownType: callee.thrownType),
+                signature: signature,
+                captureTypes: captures.map(type),
+                targetParameterTypes: try parameterTypes(of: callee),
+                targetParameterConventions: callee.parameterConventions,
+                targetResultType: callee.resultType,
+                targetEffects: callee.effects,
+                creatorEffects: function.effects,
+                shell: shell,
+                capabilities: capabilities,
                 fail: fail
             )
-            let calleeParameters = try parameterTypes(of: callee)
-            let captureTypes = captures.map(type)
-            guard calleeParameters == signature.parameters + captureTypes else {
-                throw fail("closure body parameters must equal invocation parameters followed by captures")
-            }
-            guard Array(
-                callee.parameterConventions.prefix(signature.parameters.count)
-            ) == signature.parameterConventions else {
+        case let .makeEntryClosure(result, entry, captures, _):
+            guard capabilities.contains(.closureValuesV1) else {
                 throw fail(
-                    "closure body invocation ownership does not match its closure signature"
+                    "make_entry_closure requires "
+                        + "\(Core.Capability.closureValuesV1)"
                 )
             }
-            guard callee.parameterConventions.dropFirst(
-                signature.parameters.count
-            ).allSatisfy({ $0 != .inout }) else {
-                throw fail("closure captures cannot carry inout parameters")
+            guard case let .closure(signature) = type(result) else {
+                throw fail("make_entry_closure result must have a closure type")
             }
-            let captureConventions = Array(
-                callee.parameterConventions.suffix(captureTypes.count)
+            guard let descriptor = shell.entries[entry] else {
+                throw fail("unknown Shell entry \(entry)")
+            }
+            try verifyClosureConstruction(
+                target: .shellEntry,
+                signature: signature,
+                captureTypes: captures.map(type),
+                targetParameterTypes: descriptor.parameterTypes,
+                targetParameterConventions: descriptor.parameterConventions,
+                targetResultType: descriptor.resultType,
+                targetEffects: descriptor.effects,
+                creatorEffects: function.effects,
+                shell: shell,
+                capabilities: capabilities,
+                fail: fail
             )
-            for (captureType, convention) in zip(
-                captureTypes,
-                captureConventions
-            ) {
-                if case .address = captureType {
-                    throw fail("closure captures cannot contain address values")
-                }
-                if case .closure = captureType,
-                   !capabilities.contains(.escapingClosureValuesV1) {
-                    throw Verification.Error.capabilityDenied(
-                        .escapingClosureValuesV1
-                    )
-                }
-                guard isCopyable(captureType, shell: shell) else {
-                    throw fail("closure captures must be copyable")
-                }
-                if captureType.requiresLinearOwnership,
-                   convention != .borrowed {
-                    throw fail(
-                        "linear closure captures require a borrowed capture ABI"
-                    )
-                }
-            }
         case let .beginClosureScope(result, closure):
             guard capabilities.contains(.closureValuesV1) else {
                 throw fail(
@@ -4169,6 +4163,10 @@ public struct Engine: Verification.ImageVerifying {
             guard let descriptor = shell.entries[entry] else {
                 throw fail("unknown Shell entry \(entry)")
             }
+            try verifyBorrowedCallCapability(
+                descriptor.parameterConventions,
+                capabilities: capabilities
+            )
             guard descriptor.effects.mayThrow else {
                 throw fail("entry_try_apply requires a throwing Shell entry")
             }
@@ -4397,23 +4395,160 @@ public struct Engine: Verification.ImageVerifying {
         }
     }
 
-    /// A closure is an image-local capability for its concrete target. Swift's
-    /// function type carries callable ABI only, so target resource authority
-    /// is checked once when that capability is constructed.
+    private enum ClosureConstructionTarget {
+        case imageBody(thrownType: Bytecode.ValueType?)
+        case shellEntry
+
+        var operation: String {
+            switch self {
+            case .imageBody: "make_closure"
+            case .shellEntry: "make_entry_closure"
+            }
+        }
+
+        var parameterSubject: String {
+            switch self {
+            case .imageBody: "closure body"
+            case .shellEntry: "Shell entry closure target"
+            }
+        }
+
+        var signatureMismatchReason: String {
+            switch self {
+            case .imageBody:
+                "closure body result, thrown type, or callable effects do not "
+                    + "match its closure signature"
+            case .shellEntry:
+                "make_entry_closure target result, boundary error type, or "
+                    + "callable effects do not match its closure signature"
+            }
+        }
+
+        func accepts(
+            thrownType: Bytecode.ValueType?,
+            effects: Core.Effects
+        ) -> Bool {
+            switch self {
+            case let .imageBody(targetThrownType):
+                targetThrownType == thrownType
+            case .shellEntry:
+                !effects.mayThrow
+                    || thrownType == .string
+                    || thrownType == .error
+            }
+        }
+    }
+
+    private func verifyClosureConstruction(
+        target: ClosureConstructionTarget,
+        signature: Bytecode.ClosureSignature,
+        captureTypes: [Bytecode.ValueType],
+        targetParameterTypes: [Bytecode.ValueType],
+        targetParameterConventions: [Bytecode.ParameterConvention],
+        targetResultType: Bytecode.ValueType,
+        targetEffects: Core.Effects,
+        creatorEffects: Core.Effects,
+        shell: Verification.ShellInterface,
+        capabilities: Set<Core.Capability>,
+        fail: (String) -> Verification.Error
+    ) throws {
+        try verifyBorrowedCallCapability(
+            targetParameterConventions,
+            capabilities: capabilities
+        )
+        guard targetResultType == signature.result,
+              signature.hasCanonicalCallableEffects,
+              signature.hasCanonicalThrownType,
+              target.accepts(
+                thrownType: signature.thrownType,
+                effects: targetEffects
+              ),
+              signature.safelyRestricts(targetEffects: targetEffects)
+        else {
+            throw fail(target.signatureMismatchReason)
+        }
+        try verifyClosureTargetAuthority(
+            targetEffects,
+            allowedBy: creatorEffects,
+            operation: target.operation,
+            fail: fail
+        )
+        guard targetParameterConventions.count
+                == targetParameterTypes.count,
+              targetParameterTypes
+                == signature.parameters + captureTypes
+        else {
+            throw fail(
+                "\(target.parameterSubject) parameters must equal invocation parameters "
+                    + "followed by captures"
+            )
+        }
+        guard Array(
+            targetParameterConventions.prefix(signature.parameters.count)
+        ) == signature.parameterConventions else {
+            throw fail(
+                "\(target.parameterSubject) invocation ownership does not match its closure signature"
+            )
+        }
+        let captureConventions = Array(
+            targetParameterConventions.suffix(captureTypes.count)
+        )
+        guard captureConventions.allSatisfy({ $0 != .inout }) else {
+            throw fail("closure captures cannot carry inout parameters")
+        }
+        for (captureType, convention) in zip(
+            captureTypes,
+            captureConventions
+        ) {
+            if case .address = captureType {
+                throw fail("closure captures cannot contain address values")
+            }
+            if case .closure = captureType,
+               !capabilities.contains(.escapingClosureValuesV1) {
+                throw Verification.Error.capabilityDenied(
+                    .escapingClosureValuesV1
+                )
+            }
+            guard isCopyable(captureType, shell: shell) else {
+                throw fail("closure captures must be copyable")
+            }
+            if captureType.requiresLinearOwnership,
+                convention != .borrowed {
+                throw fail(
+                    "linear closure captures require a borrowed capture ABI"
+                )
+            }
+        }
+    }
+
+    private func verifyBorrowedCallCapability(
+        _ conventions: [Bytecode.ParameterConvention],
+        capabilities: Set<Core.Capability>
+    ) throws {
+        if conventions.contains(.borrowed),
+           !capabilities.contains(.borrowCallsV1) {
+            throw Verification.Error.capabilityDenied(.borrowCallsV1)
+        }
+    }
+
+    /// A closure is a capability for its concrete image or frozen Shell target.
+    /// Swift's function type carries callable ABI only, so target resource
+    /// authority is checked once when that capability is constructed.
     private func verifyClosureTargetAuthority(
         _ target: Core.Effects,
         allowedBy creator: Core.Effects,
+        operation: String,
         fail: (String) -> Verification.Error
     ) throws {
         if target.mayAllocate, !creator.mayAllocate {
             throw fail(
-                "make_closure captures allocating target authority in a nonallocating function"
+                "\(operation) captures allocating target authority in a nonallocating function"
             )
         }
         if target.hasExternalSideEffects,
            !creator.hasExternalSideEffects {
             throw fail(
-                "make_closure captures external-side-effect authority in a pure function"
+                "\(operation) captures external-side-effect authority in a pure function"
             )
         }
     }
@@ -4895,16 +5030,18 @@ public struct Engine: Verification.ImageVerifying {
                         live.insert(result)
                     }
                 case let .entryApply(result, entry, arguments):
+                    guard let descriptor = shell.entries[entry] else {
+                        throw fail("unknown Shell entry \(entry)")
+                    }
                     try consumeOwnedCallArguments(
                         arguments,
-                        conventions: Array(repeating: .owned, count: arguments.count),
+                        conventions: descriptor.parameterConventions,
                         live: &live,
                         function: function,
                         fail: fail
                     )
                     if let result,
-                       let type = shell.entries[entry]?.resultType,
-                       type.requiresLinearOwnership {
+                       descriptor.resultType.requiresLinearOwnership {
                         live.insert(result)
                     }
                 case let .nativeApply(result, importID, arguments):
@@ -4921,7 +5058,7 @@ public struct Engine: Verification.ImageVerifying {
                        type.requiresLinearOwnership {
                         live.insert(result)
                     }
-                case .makeClosure:
+                case .makeClosure, .makeEntryClosure:
                     // Captures are copied into a VM-managed closure context.
                     // Type validation rejects addresses, noncopyable values,
                     // and linear captures without a borrowed capture ABI.
@@ -4970,10 +5107,13 @@ public struct Engine: Verification.ImageVerifying {
                     )
                     try forward(live, to: normalTarget)
                     try forward(live, to: errorTarget)
-                case let .entryTryApply(_, arguments, normalTarget, errorTarget):
+                case let .entryTryApply(entry, arguments, normalTarget, errorTarget):
+                    guard let descriptor = shell.entries[entry] else {
+                        throw fail("unknown Shell entry \(entry)")
+                    }
                     try consumeOwnedCallArguments(
                         arguments,
-                        conventions: Array(repeating: .owned, count: arguments.count),
+                        conventions: descriptor.parameterConventions,
                         live: &live,
                         function: function,
                         fail: fail

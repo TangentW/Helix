@@ -243,6 +243,118 @@ struct ReleaseDriver {
         )
     }
 
+    @Test("An unchanged Shell function can be used as a Swift closure value")
+    func lowersUnchangedEntryClosureValue() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-entry-closure-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        @inline(never) public func helper(_ x: Int) -> Int { x + 1 }
+        @inline(never) public func transform(_ x: Int) -> Int { helper(x) }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            optimization: "-Onone"
+        )
+        let helper = try #require(
+            archive.functions.first {
+                $0.canonicalDeclaration.contains("helper")
+            }
+        )
+        let transform = try #require(
+            archive.functions.first {
+                $0.canonicalDeclaration.contains("transform")
+            }
+        )
+        let helperEntry = try #require(helper.entryIndex)
+        let transformEntry = try #require(transform.entryIndex)
+
+        try Data(
+            """
+            @inline(never) public func helper(_ x: Int) -> Int { x + 1 }
+            @inline(never) private func invoke(
+                _ value: Int,
+                operation: (Int) -> Int
+            ) -> Int {
+                operation(value)
+            }
+            @inline(never) public func transform(_ x: Int) -> Int {
+                let operation: (Int) -> Int = helper
+                return invoke(x, operation: operation) + 3
+            }
+            """.utf8
+        ).write(to: sourceURL)
+        let result = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+
+        #expect(result.changedFunctions.map(\.key) == [transform.key])
+        #expect(
+            result.disassembly.contains(
+                "make_entry_closure.invocation #\(helperEntry.rawValue)"
+            )
+        )
+        #expect(result.disassembly.contains("closure_apply"))
+        #expect(result.disassembly.contains("hlbc_apply"))
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        let interpreter = VM.Interpreter(
+            entryInvocation: { entry, arguments, _ in
+                guard entry == helperEntry,
+                      arguments.count == 1,
+                      case let .integer(value) = arguments[0]
+                else { return .trapped(.unknownEntry(entry)) }
+                return .returned(
+                    .integer(
+                        try! VM.Integer(
+                            signed: value.signedValue + 1,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    )
+                )
+            }
+        )
+        #expect(
+            interpreter.invoke(
+                entry: transformEntry,
+                image: image,
+                arguments: [
+                    .integer(
+                        try VM.Integer(
+                            signed: 4,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    ),
+                ]
+            ) == .returned(
+                .integer(
+                    try VM.Integer(
+                        signed: 8,
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
+            )
+        )
+    }
+
     @Test("Changing a default value links its compiler-generated thunk into the patch")
     func linksChangedDefaultArgumentGenerator() throws {
         let directory = FileManager.default.temporaryDirectory

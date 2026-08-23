@@ -233,6 +233,12 @@ struct BusinessCorpus {
                 $0.location.file == logicalPath
             }
         )
+        let compiledEntry = try #require(compiled.module.entries.first)
+        let compiledRoot = try #require(
+            compiled.module.functions.first {
+                $0.id == compiledEntry.functionID
+            }
+        )
         let shell = try Verification.ShellInterface(
             interfaceHash: shellHash,
             compatibility: compatibility,
@@ -242,6 +248,7 @@ struct BusinessCorpus {
                     index: entry,
                     key: key,
                     parameterTypes: parameterTypes,
+                    parameterConventions: compiledRoot.parameterConventions,
                     resultType: resultType
                 ),
             ]

@@ -366,6 +366,46 @@ public struct DirectCallTable: Sendable {
         return byID.values.sorted { $0.id < $1.id }
     }
 
+    func entryParameterConventions(
+        referencedBy functions: [IntermediateRepresentation.Function]
+    ) throws -> [Core.EntryIndex: [Bytecode.ParameterConvention]] {
+        let referencedEntries = Set(functions.flatMap { function in
+            function.blocks.flatMap { block in
+                block.instructions.compactMap { instruction -> Core.EntryIndex? in
+                    switch instruction {
+                    case let .entryApply(_, entry, _),
+                         let .entryTryApply(entry, _, _, _),
+                         let .makeEntryClosure(_, entry, _, _):
+                        entry
+                    default:
+                        nil
+                    }
+                }
+            }
+        })
+        var byEntry: [
+            Core.EntryIndex: [Bytecode.ParameterConvention]
+        ] = [:]
+        for binding in bindings.values.flatMap({ $0 }) {
+            guard case let .entry(entry) = binding.target,
+                  referencedEntries.contains(entry)
+            else { continue }
+            if let existing = byEntry[entry],
+               existing != binding.parameterConventions {
+                throw CanonicalSIL.LoweringError.invalidCallTable(
+                    "Shell entry \(entry) has conflicting parameter conventions"
+                )
+            }
+            byEntry[entry] = binding.parameterConventions
+        }
+        guard Set(byEntry.keys) == referencedEntries else {
+            throw CanonicalSIL.LoweringError.invalidCallTable(
+                "a lowered Shell entry call has no frozen ownership ABI"
+            )
+        }
+        return byEntry
+    }
+
     private init(
         unchecked bindings: [String: [CanonicalSIL.DirectCallBinding]],
         unavailableCalls: [String: CanonicalSIL.UnavailableDirectCall]

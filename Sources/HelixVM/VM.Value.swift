@@ -183,6 +183,7 @@ public indirect enum Value: Hashable, Sendable, CustomStringConvertible {
 public struct Closure: Hashable, Sendable, CustomStringConvertible {
     package enum Target: Hashable, Sendable {
         case image(Bytecode.FunctionID)
+        case entry(Core.EntryIndex)
         case native(VM.NativeClosure)
     }
 
@@ -221,9 +222,11 @@ public struct Closure: Hashable, Sendable, CustomStringConvertible {
         dynamicScope = nil
     }
 
-    package var imageFunctionID: Bytecode.FunctionID? {
-        guard case let .image(functionID) = target else { return nil }
-        return functionID
+    package var isNativeCallbackTarget: Bool {
+        switch target {
+        case .image, .entry: true
+        case .native: false
+        }
     }
 
     package var nativeTarget: VM.NativeClosure? {
@@ -234,6 +237,7 @@ public struct Closure: Hashable, Sendable, CustomStringConvertible {
     public var description: String {
         let identity = switch target {
         case let .image(functionID): "@\(functionID)"
+        case let .entry(entry): "#\(entry)"
         case .native: "native"
         }
         return "Closure<\(identity), \(signature), captures: \(captures.count)>"

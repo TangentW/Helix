@@ -1411,6 +1411,7 @@ struct AddressSemantics {
                     index: .init(rawValue: 0),
                     key: key,
                     parameterTypes: [.int64],
+                    parameterConventions: root.parameterConventions,
                     resultType: .int64
                 ),
             ]

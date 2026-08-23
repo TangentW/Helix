@@ -48,14 +48,7 @@ struct NativeCallback {
             }
         )
         let runtime = try Runtime.Engine(
-            originals: .init([
-                .init(
-                    index: fixture.entry,
-                    parameterTypes: [],
-                    resultType: .void,
-                    invoke: { _ in .returned(nil) }
-                ),
-            ]),
+            originals: fixture.originals(observed: observed),
             nativeCatalog: .init([callbackImport, observationImport]),
             bridgeInputLimits: .init(maximumValueNodes: 1)
         )
@@ -81,8 +74,8 @@ struct NativeCallback {
         #expect(observed.values == [42])
     }
 
-    @Test("A result callback re-enters its pinned image and returns its VM value")
-    func resultCallbackPinsGeneration() throws {
+    @Test("A result callback routes its pinned frozen entry after rollback")
+    func resultCallbackPinsFrozenEntryGeneration() throws {
         let fixture = try Fixture(callbackResult: .int64)
         let callbackBox = CallbackBox()
         let observed = IntegerBox()
@@ -120,17 +113,13 @@ struct NativeCallback {
             }
         )
         let runtime = try Runtime.Engine(
-            originals: .init([
-                .init(
-                    index: fixture.entry,
-                    parameterTypes: [],
-                    resultType: .void,
-                    invoke: { _ in .returned(nil) }
-                ),
-            ]),
+            originals: fixture.originals(observed: observed),
             nativeCatalog: .init([callbackImport, observationImport])
         )
-        let generation = try fixture.generation(id: 1)
+        let generation = try fixture.generation(
+            id: 1,
+            usesShellEntryTarget: true
+        )
         _ = try runtime.activate(generation, expectedActiveID: nil)
         #expect(runtime.invoke(entry: fixture.entry, arguments: []) == .returned(nil))
         let callback = try #require(callbackBox.value)
@@ -188,6 +177,7 @@ struct NativeCallback {
 
     private struct Fixture {
         let entry = Core.EntryIndex(rawValue: 0)
+        let callbackEntry = Core.EntryIndex(rawValue: 1)
         let exportID = Core.NativeImportID(rawValue: 0)
         let observationID = Core.NativeImportID(rawValue: 1)
         let namespace = Core.ShellNamespaceID.derive(
@@ -214,6 +204,7 @@ struct NativeCallback {
         let exportKey: Core.NativeImportKey
         let observationKey: Core.NativeImportKey
         let entryKey: Core.FunctionKey
+        let callbackEntryKey: Core.FunctionKey
 
         init(callbackResult: Bytecode.ValueType = .void) throws {
             guard callbackResult == .void || callbackResult == .int64 else {
@@ -279,12 +270,57 @@ struct NativeCallback {
                 loweredSignature: .init(parameters: [], result: "Swift.Void"),
                 role: .function
             )
+            callbackEntryKey = try Core.FunctionKey.derive(
+                namespace: namespace,
+                module: "Fixture",
+                sourceFileLogicalID: "Sources/Fixture.swift",
+                canonicalDeclaration: "func originalCallback(_: Int)",
+                loweredSignature: .init(
+                    parameters: ["Swift.Int"],
+                    result: callbackResultSpelling
+                ),
+                role: .function
+            )
+        }
+
+        func originals(observed: IntegerBox) throws -> Runtime.OriginalCatalog {
+            try .init([
+                .init(
+                    index: entry,
+                    parameterTypes: [],
+                    resultType: .void,
+                    invoke: { _ in .returned(nil) }
+                ),
+                .init(
+                    index: callbackEntry,
+                    parameterTypes: [.int64],
+                    resultType: callbackSignature.result,
+                    invoke: { arguments in
+                        guard arguments.count == 1,
+                              case let .integer(value) = arguments[0]
+                        else {
+                            return .trapped(
+                                .typeMismatch(
+                                    expected: .int64,
+                                    actual: arguments.first?.type
+                                )
+                            )
+                        }
+                        observed.append(value.signedValue)
+                        return .returned(
+                            callbackSignature.result == .void
+                                ? nil : arguments[0]
+                        )
+                    }
+                ),
+            ])
         }
 
         func generation(
             id: UInt64,
             closureLifetime: Bytecode.ClosureLifetime = .invocation,
-            restrictCallbackToMainActor: Bool = false
+            restrictCallbackToMainActor: Bool = false,
+            usesShellEntryTarget: Bool = false
         ) throws -> Runtime.Generation {
             let closureType = Bytecode.ValueType.closure(callbackSignature)
             var boundarySignature = callbackBoundarySignature
@@ -294,12 +330,19 @@ struct NativeCallback {
                 rawValue: restrictCallbackToMainActor ? 1 : 0
             )
             var entryInstructions: [Bytecode.Instruction] = [
-                .makeClosure(
-                    result: .init(rawValue: 0),
-                    function: .init(rawValue: 1),
-                    captures: [],
-                    lifetime: closureLifetime
-                ),
+                usesShellEntryTarget
+                    ? .makeEntryClosure(
+                        result: .init(rawValue: 0),
+                        entry: callbackEntry,
+                        captures: [],
+                        lifetime: closureLifetime
+                    )
+                    : .makeClosure(
+                        result: .init(rawValue: 0),
+                        function: .init(rawValue: 1),
+                        captures: [],
+                        lifetime: closureLifetime
+                    ),
             ]
             var entryRegisterTypes = [closureType]
             if restrictCallbackToMainActor {
@@ -386,7 +429,8 @@ struct NativeCallback {
                 requestedResources: .init(
                     maxWallTimeMainThreadMilliseconds: 1_000
                 ),
-                functions: [entryFunction, callbackFunction],
+                functions: usesShellEntryTarget
+                    ? [entryFunction] : [entryFunction, callbackFunction],
                 entries: [
                     .init(
                         entryIndex: entry,
@@ -420,7 +464,16 @@ struct NativeCallback {
                         index: entry,
                         key: entryKey,
                         parameterTypes: [],
+                        parameterConventions: entryFunction.parameterConventions,
                         resultType: .void,
+                        effects: effects
+                    ),
+                    .init(
+                        index: callbackEntry,
+                        key: callbackEntryKey,
+                        parameterTypes: [.int64],
+                        parameterConventions: [.owned],
+                        resultType: callbackSignature.result,
                         effects: effects
                     ),
                 ],

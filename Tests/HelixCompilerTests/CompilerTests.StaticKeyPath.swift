@@ -437,6 +437,12 @@ struct StaticKeyPath {
                 }
                 return false
             })
+        let compiledEntry = try #require(compiled.module.entries.first)
+        let compiledRoot = try #require(
+            compiled.module.functions.first {
+                $0.id == compiledEntry.functionID
+            }
+        )
         let shell = try Verification.ShellInterface(
             interfaceHash: shellHash,
             compatibility: compatibility,
@@ -446,6 +452,7 @@ struct StaticKeyPath {
                     index: entry,
                     key: key,
                     parameterTypes: [.array(.native(typeID))],
+                    parameterConventions: compiledRoot.parameterConventions,
                     resultType: .array(.string),
                     effects: .init()
                 ),

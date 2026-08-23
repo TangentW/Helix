@@ -59,6 +59,57 @@ struct SemanticVerifier {
         }
     }
 
+    @Test("Shell entries freeze one exact non-inout ownership ABI")
+    func rejectsInvalidShellEntryOwnership() throws {
+        let fixture = try makeFixture()
+        let index = Core.EntryIndex(rawValue: 0)
+        var entry = try #require(fixture.shell.entries[index])
+        entry.parameterConventions = []
+
+        #expect(
+            throws: Verification.Error.invalidShellInterface(
+                "entry 0 has invalid parameter ownership"
+            )
+        ) {
+            try Verification.ShellInterface(
+                interfaceHash: fixture.shell.interfaceHash,
+                compatibility: fixture.shell.compatibility,
+                capabilities: fixture.shell.capabilities,
+                entries: [entry]
+            )
+        }
+
+        entry.parameterConventions = [.inout]
+        #expect(
+            throws: Verification.Error.invalidShellInterface(
+                "entry 0 has invalid parameter ownership"
+            )
+        ) {
+            try Verification.ShellInterface(
+                interfaceHash: fixture.shell.interfaceHash,
+                compatibility: fixture.shell.compatibility,
+                capabilities: fixture.shell.capabilities,
+                entries: [entry]
+            )
+        }
+
+        entry.parameterConventions = [.borrowed]
+        var capabilities = fixture.shell.capabilities
+        capabilities.remove(.borrowCallsV1)
+        #expect(
+            throws: Verification.Error.invalidShellInterface(
+                "entry 0 uses borrowed ownership without borrow-calls-1"
+            )
+        ) {
+            try Verification.ShellInterface(
+                interfaceHash: fixture.shell.interfaceHash,
+                compatibility: fixture.shell.compatibility,
+                capabilities: capabilities,
+                entries: [entry]
+            )
+        }
+    }
+
     @Test("Shell NativeImports require one current logical callback contract")
     func rejectsInconsistentNativeImportSignature() throws {
         let fixture = try makeFixture()
@@ -1465,6 +1516,7 @@ struct SemanticVerifier {
             index: entry.index,
             key: entry.key,
             parameterTypes: [.native(typeID)],
+            parameterConventions: entry.parameterConventions,
             resultType: .native(typeID),
             effects: entry.effects
         )
@@ -1513,6 +1565,7 @@ struct SemanticVerifier {
         let entryIndex = Core.EntryIndex(rawValue: 0)
         var entry = try #require(fixture.shell.entries[entryIndex])
         entry.parameterTypes = [.native(typeID)]
+        entry.parameterConventions = [.borrowed]
         fixture.shell.entries[entryIndex] = entry
 
         let image = try Verification.Engine().verify(
@@ -1590,6 +1643,7 @@ struct SemanticVerifier {
         let entryIndex = Core.EntryIndex(rawValue: 0)
         var entry = try #require(fixture.shell.entries[entryIndex])
         entry.parameterTypes = [.native(typeID), .optional(.int64)]
+        entry.parameterConventions = [.owned, .owned]
         fixture.shell.entries[entryIndex] = entry
 
         _ = try Verification.Engine().verify(
@@ -1665,6 +1719,7 @@ struct SemanticVerifier {
         let entryIndex = Core.EntryIndex(rawValue: 0)
         var entry = try #require(fixture.shell.entries[entryIndex])
         entry.parameterTypes = [.native(typeID), .bool]
+        entry.parameterConventions = [.owned, .owned]
         fixture.shell.entries[entryIndex] = entry
 
         #expect(
@@ -1737,6 +1792,7 @@ struct SemanticVerifier {
             index: entry.index,
             key: entry.key,
             parameterTypes: [.native(typeID)],
+            parameterConventions: entry.parameterConventions,
             resultType: .native(typeID),
             effects: entry.effects
         )
@@ -2011,6 +2067,7 @@ struct SemanticVerifier {
             index: entry.index,
             key: entry.key,
             parameterTypes: [.optional(.int64)],
+            parameterConventions: entry.parameterConventions,
             resultType: .int64,
             effects: entry.effects
         )
@@ -2074,6 +2131,7 @@ struct SemanticVerifier {
             index: entry.index,
             key: entry.key,
             parameterTypes: [.native(typeID)],
+            parameterConventions: entry.parameterConventions,
             resultType: .native(typeID),
             effects: entry.effects
         )
@@ -2113,6 +2171,7 @@ struct SemanticVerifier {
             index: .init(rawValue: 1),
             key: root.key,
             parameterTypes: [.int64],
+            parameterConventions: root.parameterConventions,
             resultType: .int64,
             effects: .init(hasExternalSideEffects: true)
         )
@@ -2131,6 +2190,48 @@ struct SemanticVerifier {
                 policy: fixture.policy
             )
         }
+    }
+
+    @Test("Borrowed Shell entry calls require their explicit capability")
+    func gatesBorrowedShellEntryCalls() throws {
+        var fixture = try makeFixture { function in
+            function.registerTypes.append(.int64)
+            function.blocks[0].instructions = [
+                .entryApply(
+                    result: .init(rawValue: 1),
+                    entry: .init(rawValue: 1),
+                    arguments: [.init(rawValue: 0)]
+                ),
+                .returnValue(.init(rawValue: 1)),
+            ]
+        }
+        let root = try #require(
+            fixture.shell.entries[.init(rawValue: 0)]
+        )
+        fixture.shell.entries[.init(rawValue: 1)] = .init(
+            index: .init(rawValue: 1),
+            key: root.key,
+            parameterTypes: [.int64],
+            parameterConventions: [.borrowed],
+            resultType: .int64
+        )
+        fixture.shell.capabilities.insert(.borrowCallsV1)
+
+        #expect(throws: Verification.Error.capabilityDenied(.borrowCallsV1)) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        fixture.module.capabilities.insert(.borrowCallsV1)
+        fixture.policy.acceptedCapabilities.insert(.borrowCallsV1)
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
     }
 
     @Test("try_apply accepts handled throws and rejects malformed error edges")
@@ -2170,6 +2271,7 @@ struct SemanticVerifier {
             index: .init(rawValue: 1),
             key: root.key,
             parameterTypes: [.int64],
+            parameterConventions: root.parameterConventions,
             resultType: .int64,
             effects: .init(mayThrow: true)
         )
@@ -2558,6 +2660,42 @@ struct SemanticVerifier {
             policy: typed.fixture.policy
         )
 
+        var typedBoundaryClosure = typed.fixture
+        let boundaryEntry = Core.EntryIndex(rawValue: 1)
+        typedBoundaryClosure.module.functions[0].blocks[0].instructions[0] =
+            .makeEntryClosure(
+                result: .init(rawValue: 1),
+                entry: boundaryEntry,
+                captures: [.init(rawValue: 0)]
+            )
+        let rootDescriptor = try #require(
+            typedBoundaryClosure.shell.entries[.init(rawValue: 0)]
+        )
+        typedBoundaryClosure.shell.entries[boundaryEntry] = .init(
+            index: boundaryEntry,
+            key: rootDescriptor.key,
+            parameterTypes: [.int64, .int64],
+            parameterConventions: [.owned, .owned],
+            resultType: .int64,
+            effects: .init(mayThrow: true)
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "make_entry_closure target result, boundary error type, or callable effects do not match its closure signature"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(
+                    typedBoundaryClosure.module
+                ),
+                shell: typedBoundaryClosure.shell,
+                policy: typedBoundaryClosure.policy
+            )
+        }
+
         var typedRoot = typed.fixture
         typedRoot.module.functions[0].effects.mayThrow = true
         typedRoot.module.functions[0].thrownType = .local(typed.errorKey)
@@ -2723,6 +2861,7 @@ struct SemanticVerifier {
             index: .init(rawValue: 1),
             key: rootEntry.key,
             parameterTypes: [.int64],
+            parameterConventions: rootEntry.parameterConventions,
             resultType: .int64,
             effects: .init(mayThrow: true)
         )
@@ -3088,6 +3227,7 @@ struct SemanticVerifier {
             index: entry.index,
             key: entry.key,
             parameterTypes: entry.parameterTypes,
+            parameterConventions: entry.parameterConventions,
             resultType: .array(.int64),
             effects: entry.effects
         )
@@ -3294,6 +3434,7 @@ struct SemanticVerifier {
             index: entry.index,
             key: entry.key,
             parameterTypes: entry.parameterTypes,
+            parameterConventions: entry.parameterConventions,
             resultType: dictionaryType,
             effects: entry.effects
         )
@@ -3346,6 +3487,7 @@ struct SemanticVerifier {
             index: groupedEntry.index,
             key: groupedEntry.key,
             parameterTypes: groupedEntry.parameterTypes,
+            parameterConventions: groupedEntry.parameterConventions,
             resultType: groupedDictionaryType,
             effects: groupedEntry.effects
         )
@@ -3495,6 +3637,7 @@ struct SemanticVerifier {
             index: entry.index,
             key: entry.key,
             parameterTypes: entry.parameterTypes,
+            parameterConventions: entry.parameterConventions,
             resultType: arrayType,
             effects: entry.effects
         )
@@ -3736,6 +3879,7 @@ struct SemanticVerifier {
             index: entry.index,
             key: entry.key,
             parameterTypes: entry.parameterTypes,
+            parameterConventions: entry.parameterConventions,
             resultType: arrayType,
             effects: entry.effects
         )
@@ -3947,6 +4091,7 @@ struct SemanticVerifier {
             index: entry.index,
             key: entry.key,
             parameterTypes: entry.parameterTypes,
+            parameterConventions: entry.parameterConventions,
             resultType: resultType,
             effects: entry.effects
         )
@@ -4164,6 +4309,7 @@ struct SemanticVerifier {
             index: entry.index,
             key: entry.key,
             parameterTypes: [.native(typeID)],
+            parameterConventions: entry.parameterConventions,
             resultType: entry.resultType,
             effects: entry.effects
         )
@@ -4277,6 +4423,7 @@ struct SemanticVerifier {
             index: entry.index,
             key: entry.key,
             parameterTypes: [.native(typeID)],
+            parameterConventions: entry.parameterConventions,
             resultType: entry.resultType,
             effects: entry.effects
         )
@@ -4355,6 +4502,85 @@ struct SemanticVerifier {
                 bytes: Bytecode.Encoder.encode(wrongCapture.module),
                 shell: wrongCapture.shell,
                 policy: wrongCapture.policy
+            )
+        }
+    }
+
+    @Test("Frozen Shell entry closures require one exact callable ABI")
+    func validatesFrozenEntryClosureContract() throws {
+        var fixture = try makeClosureFixture()
+        let targetEntry = Core.EntryIndex(rawValue: 1)
+        fixture.module.functions[0].blocks[0].instructions[0] =
+            .makeEntryClosure(
+                result: .init(rawValue: 1),
+                entry: targetEntry,
+                captures: [.init(rawValue: 0)]
+            )
+        let rootEntry = try #require(
+            fixture.shell.entries[.init(rawValue: 0)]
+        )
+        fixture.shell.entries[targetEntry] = .init(
+            index: targetEntry,
+            key: rootEntry.key,
+            parameterTypes: [.int64, .int64],
+            parameterConventions: [.owned, .borrowed],
+            resultType: .int64
+        )
+        fixture.shell.capabilities.insert(.borrowCallsV1)
+
+        #expect(throws: Verification.Error.capabilityDenied(.borrowCallsV1)) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+        fixture.module.capabilities.insert(.borrowCallsV1)
+        fixture.policy.acceptedCapabilities.insert(.borrowCallsV1)
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var missing = fixture.module
+        missing.functions[0].blocks[0].instructions[0] = .makeEntryClosure(
+            result: .init(rawValue: 1),
+            entry: .init(rawValue: 99),
+            captures: [.init(rawValue: 0)]
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "unknown Shell entry 99"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(missing),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var mismatchedOwnership = fixture.shell
+        mismatchedOwnership.entries[targetEntry]?.parameterConventions = [
+            .borrowed, .borrowed,
+        ]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "Shell entry closure target invocation ownership does not match its closure signature"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: mismatchedOwnership,
+                policy: fixture.policy
             )
         }
     }
@@ -5434,6 +5660,7 @@ struct SemanticVerifier {
                     index: .init(rawValue: 0),
                     key: key,
                     parameterTypes: [.int64],
+                    parameterConventions: [.owned],
                     resultType: .int64
                 ),
             ]

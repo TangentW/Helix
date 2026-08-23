@@ -264,6 +264,7 @@ struct NonOwningReferences {
                     index: .init(rawValue: 0),
                     key: key,
                     parameterTypes: [.int64],
+                    parameterConventions: function.parameterConventions,
                     resultType: .int64
                 ),
             ],

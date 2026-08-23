@@ -801,12 +801,14 @@ struct DefaultArguments {
                     index: rootEntry,
                     key: rootKey,
                     parameterTypes: [.int64],
+                    parameterConventions: [.owned],
                     resultType: .int64
                 ),
                 .init(
                     index: suppliedEntry,
                     key: suppliedKey,
                     parameterTypes: [.int64],
+                    parameterConventions: [.owned],
                     resultType: .int64
                 ),
             ]

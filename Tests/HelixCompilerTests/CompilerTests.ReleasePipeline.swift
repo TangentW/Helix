@@ -484,6 +484,7 @@ struct ReleasePipeline {
         #expect(generatedBridge.contains(decoded.shellInterfaceHash.hex))
         #expect(generatedBridge.contains("makeShellInterface()"))
         #expect(generatedBridge.contains("Verification.ResolvedEntry("))
+        #expect(generatedBridge.contains("parameterConventions: [.owned]"))
         #expect(generatedBridge.contains("Verification.ResolvedNativeImport("))
         #expect(generatedBridge.contains("Verification.ResolvedNativeType("))
         #expect(generatedBridge.contains("makeNativeCatalog()"))

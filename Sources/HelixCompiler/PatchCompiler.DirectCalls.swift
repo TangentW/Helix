@@ -53,6 +53,7 @@ enum DirectCalls {
             bindings.append(.init(
                 mangledName: function.mangledName,
                 parameterTypes: function.parameterTypes,
+                parameterConventions: function.parameterConventions,
                 resultType: function.resultType,
                 effects: function.effects,
                 target: .entry(entry)

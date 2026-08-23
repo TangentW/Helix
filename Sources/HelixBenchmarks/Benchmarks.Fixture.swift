@@ -60,6 +60,7 @@ struct Fixture {
                     index: entry,
                     key: key,
                     parameterTypes: [.int64],
+                    parameterConventions: function.parameterConventions,
                     resultType: .int64
                 ),
             ]
@@ -406,6 +407,7 @@ struct Fixture {
                     index: entry,
                     key: key,
                     parameterTypes: [.int64],
+                    parameterConventions: root.parameterConventions,
                     resultType: .int64
                 ),
             ]
@@ -525,6 +527,7 @@ struct Fixture {
                     index: entry,
                     key: functionKey,
                     parameterTypes: [.int64],
+                    parameterConventions: function.parameterConventions,
                     resultType: .int64,
                     effects: effects
                 ),

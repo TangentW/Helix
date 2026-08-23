@@ -271,6 +271,7 @@ struct Routing {
                     index: entry,
                     key: key,
                     parameterTypes: [.int64],
+                    parameterConventions: function.parameterConventions,
                     resultType: .int64,
                     effects: effects
                 ),
@@ -1028,6 +1029,7 @@ struct Routing {
                     index: outerEntry,
                     key: outerKey,
                     parameterTypes: [.int64],
+                    parameterConventions: function.parameterConventions,
                     resultType: .int64,
                     effects: effects,
                     fallbackAllowed: true
@@ -1036,6 +1038,7 @@ struct Routing {
                     index: innerEntry,
                     key: innerKey,
                     parameterTypes: [.int64],
+                    parameterConventions: [.owned],
                     resultType: .void,
                     effects: .init(hasExternalSideEffects: true)
                 ),
@@ -1303,6 +1306,7 @@ struct Routing {
                         index: entry,
                         key: key,
                         parameterTypes: [.int64],
+                        parameterConventions: function.parameterConventions,
                         resultType: .int64,
                         fallbackAllowed: fallbackAllowed
                     ),

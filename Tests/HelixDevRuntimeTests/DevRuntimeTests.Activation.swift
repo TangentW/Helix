@@ -608,6 +608,7 @@ private struct DevRuntimeFixture {
                     index: entry,
                     key: functionKey,
                     parameterTypes: [.int64],
+                    parameterConventions: function.parameterConventions,
                     resultType: .int64
                 ),
             ]

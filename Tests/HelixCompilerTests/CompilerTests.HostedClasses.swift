@@ -134,6 +134,7 @@ struct HostedClasses {
                     index: entry,
                     key: functionKey,
                     parameterTypes: [],
+                    parameterConventions: [],
                     resultType: .native(controllerType),
                     effects: .init(requiresMainActor: true)
                 ),
@@ -336,6 +337,7 @@ struct HostedClasses {
                     index: entry,
                     key: functionKey,
                     parameterTypes: [],
+                    parameterConventions: [],
                     resultType: .native(baseType)
                 ),
             ],

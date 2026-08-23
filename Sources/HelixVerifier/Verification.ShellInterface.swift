@@ -9,6 +9,7 @@ public struct ResolvedEntry: Hashable, Sendable {
     public var index: Core.EntryIndex
     public var key: Core.FunctionKey
     public var parameterTypes: [Bytecode.ValueType]
+    public var parameterConventions: [Bytecode.ParameterConvention]
     public var resultType: Bytecode.ValueType
     public var effects: Core.Effects
     public var fallbackAllowed: Bool
@@ -17,6 +18,7 @@ public struct ResolvedEntry: Hashable, Sendable {
         index: Core.EntryIndex,
         key: Core.FunctionKey,
         parameterTypes: [Bytecode.ValueType],
+        parameterConventions: [Bytecode.ParameterConvention],
         resultType: Bytecode.ValueType,
         effects: Core.Effects = .init(),
         fallbackAllowed: Bool = false
@@ -24,6 +26,7 @@ public struct ResolvedEntry: Hashable, Sendable {
         self.index = index
         self.key = key
         self.parameterTypes = parameterTypes
+        self.parameterConventions = parameterConventions
         self.resultType = resultType
         self.effects = effects
         self.fallbackAllowed = fallbackAllowed
@@ -133,6 +136,21 @@ public struct ShellInterface: Sendable {
     func validateBoundarySignatures() throws {
         for index in entries.keys.sorted() {
             guard let entry = entries[index] else { continue }
+            guard entry.parameterConventions.count
+                    == entry.parameterTypes.count,
+                  !entry.parameterConventions.contains(.inout)
+            else {
+                throw Verification.Error.invalidShellInterface(
+                    "entry \(entry.index) has invalid parameter ownership"
+                )
+            }
+            if entry.parameterConventions.contains(.borrowed),
+               !capabilities.contains(.borrowCallsV1) {
+                throw Verification.Error.invalidShellInterface(
+                    "entry \(entry.index) uses borrowed ownership without "
+                        + "\(Core.Capability.borrowCallsV1)"
+                )
+            }
             for type in entry.parameterTypes + [entry.resultType] {
                 try Self.validateBoundaryType(
                     type,

@@ -245,6 +245,12 @@ struct StandardLibraryImports {
             $0.kind == .concreteSpecialization && $0.name.contains("fA")
         }.count == 2)
         #expect(compiled.disassembly.contains("native_apply #\(importID.rawValue)"))
+        let compiledEntry = try #require(compiled.module.entries.first)
+        let compiledRoot = try #require(
+            compiled.module.functions.first {
+                $0.id == compiledEntry.functionID
+            }
+        )
         let shell = try Verification.ShellInterface(
             interfaceHash: shellHash,
             compatibility: compatibility,
@@ -254,6 +260,7 @@ struct StandardLibraryImports {
                     index: entry,
                     key: functionKey,
                     parameterTypes: [.int64],
+                    parameterConventions: compiledRoot.parameterConventions,
                     resultType: .int64,
                     effects: descriptor.effects
                 ),

@@ -176,6 +176,7 @@ public struct Interpreter: Sendable {
                 functionID: function,
                 functions: functions,
                 arguments: arguments,
+                entries: image.shell.entries,
                 localTypes: localTypes,
                 budget: resolvedBudget,
                 trace: trace
@@ -220,27 +221,76 @@ public struct Interpreter: Sendable {
                 uniqueKeysWithValues: image.module.localTypes.map { ($0.key, $0) }
             )
             try budget.checkDeadline()
-            guard let functionID = closure.imageFunctionID,
-                  let function = functions[functionID],
-                  function.kind == .closureBody,
-                  function.resultType == closure.signature.result,
-                  closure.signature.hasCanonicalCallableEffects,
+            guard closure.signature.hasCanonicalCallableEffects,
                   closure.signature.hasCanonicalThrownType,
-                  function.hasCanonicalThrownType,
-                  function.thrownType == closure.signature.thrownType,
-                  closure.signature.safelyRestricts(
-                      targetEffects: function.effects
-                  ),
-                  !function.effects.isAsync,
-                  !function.effects.mayThrow,
-                  function.parameterRegisters.count
-                    == arguments.count + closure.captures.count,
                   arguments.count == closure.signature.parameters.count,
-                  Array(function.parameterConventions.prefix(arguments.count))
-                    == closure.signature.parameterConventions
+                  !closure.signature.effects.isAsync,
+                  !closure.signature.effects.mayThrow
             else {
                 throw VM.RuntimeTrap.nativeFailure(
                     "native callback closure disagrees with its verified body ABI"
+                )
+            }
+            let targetParameterTypes: [Bytecode.ValueType]
+            let targetParameterConventions: [Bytecode.ParameterConvention]
+            let targetResult: Bytecode.ValueType
+            let targetEffects: Core.Effects
+            let entryDescriptor: Verification.ResolvedEntry?
+            switch closure.target {
+            case let .image(functionID):
+                guard let target = functions[functionID],
+                      target.kind == .closureBody,
+                      target.hasCanonicalThrownType,
+                      target.thrownType == closure.signature.thrownType
+                else {
+                    throw VM.RuntimeTrap.nativeFailure(
+                        "native callback image target is invalid"
+                    )
+                }
+                targetParameterTypes = try target.parameterRegisters.map {
+                    guard let type = target.type(of: $0) else {
+                        throw VM.RuntimeTrap.invalidProgramCounter
+                    }
+                    return type
+                }
+                targetParameterConventions = target.parameterConventions
+                targetResult = target.resultType
+                targetEffects = target.effects
+                entryDescriptor = nil
+            case let .entry(entry):
+                let target = try validatedEntryClosureTarget(
+                    entry,
+                    closure: closure,
+                    entries: image.shell.entries,
+                    requiresThrowing: false,
+                    operation: "native callback Shell entry closure"
+                )
+                targetParameterTypes = target.parameterTypes
+                targetParameterConventions = target.parameterConventions
+                targetResult = target.resultType
+                targetEffects = target.effects
+                entryDescriptor = target
+            case .native:
+                throw VM.RuntimeTrap.nativeFailure(
+                    "a native callable cannot be exported as a VM callback"
+                )
+            }
+            let captureTypes = closure.captures.map(\.type)
+            guard targetResult == closure.signature.result,
+                  closure.signature.safelyRestricts(
+                      targetEffects: targetEffects
+                  ),
+                  !targetEffects.isAsync,
+                  !targetEffects.mayThrow,
+                  targetParameterTypes
+                    == closure.signature.parameters + captureTypes,
+                  Array(targetParameterConventions.prefix(arguments.count))
+                    == closure.signature.parameterConventions,
+                  targetParameterConventions.count
+                    == targetParameterTypes.count
+            else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "native callback closure disagrees with its verified target ABI"
                 )
             }
             guard !closure.signature.effects.requiresMainActor
@@ -257,13 +307,10 @@ public struct Interpreter: Sendable {
                     budget: budget
                 )
             }
-            let captureRegisters = function.parameterRegisters.suffix(
-                closure.captures.count
-            )
-            for (value, register) in zip(closure.captures, captureRegisters) {
-                guard let expected = function.type(of: register) else {
-                    throw VM.RuntimeTrap.invalidProgramCounter
-                }
+            for (value, expected) in zip(
+                closure.captures,
+                targetParameterTypes.suffix(closure.captures.count)
+            ) {
                 try validateRuntimeValue(
                     value,
                     expected: expected,
@@ -273,14 +320,35 @@ public struct Interpreter: Sendable {
             }
             let callValues = arguments + closure.captures
             try chargeCallShape(callValues, budget: budget)
-            let value = try execute(
-                functionID: functionID,
-                functions: functions,
-                arguments: callValues,
-                localTypes: localTypes,
-                budget: budget,
-                trace: trace
-            )
+            let outcome: VM.ExecutionResult
+            switch closure.target {
+            case let .image(functionID):
+                outcome = .returned(try execute(
+                    functionID: functionID,
+                    functions: functions,
+                    arguments: callValues,
+                    entries: image.shell.entries,
+                    localTypes: localTypes,
+                    budget: budget,
+                    trace: trace
+                ))
+            case let .entry(entry):
+                guard let entryInvocation, let entryDescriptor else {
+                    throw VM.RuntimeTrap.unknownEntry(entry)
+                }
+                outcome = try invokeShellEntry(
+                    entryInvocation,
+                    entry: entry,
+                    arguments: callValues,
+                    descriptor: entryDescriptor,
+                    budget: budget
+                )
+            case .native:
+                throw VM.RuntimeTrap.nativeFailure(
+                    "a native callable cannot be exported as a VM callback"
+                )
+            }
+            guard case let .returned(value) = outcome else { return outcome }
             if closure.signature.result == .void {
                 guard value == nil else {
                     throw VM.RuntimeTrap.typeMismatch(
@@ -401,6 +469,7 @@ public struct Interpreter: Sendable {
         functionID: Bytecode.FunctionID,
         functions: [Bytecode.FunctionID: Bytecode.Function],
         arguments: [VM.Value],
+        entries: [Core.EntryIndex: Verification.ResolvedEntry],
         localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
         budget: VM.InvocationBudget,
         trace: ExecutionTrace
@@ -427,6 +496,7 @@ public struct Interpreter: Sendable {
                 outcome = try executeFrame(
                     current,
                     functions: functions,
+                    entries: entries,
                     localTypes: localTypes,
                     budget: budget,
                     trace: trace
@@ -576,6 +646,7 @@ public struct Interpreter: Sendable {
     private func executeFrame(
         _ frame: ExecutionFrame,
         functions: [Bytecode.FunctionID: Bytecode.Function],
+        entries: [Core.EntryIndex: Verification.ResolvedEntry],
         localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
         budget: VM.InvocationBudget,
         trace: ExecutionTrace
@@ -4248,17 +4319,25 @@ public struct Interpreter: Sendable {
                         )
                     )
                 case let .entryApply(result, entry, arguments):
-                    guard let entryInvocation else { throw VM.RuntimeTrap.unknownEntry(entry) }
+                    guard let entryInvocation,
+                          let descriptor = entries[entry]
+                    else { throw VM.RuntimeTrap.unknownEntry(entry) }
                     let values = try arguments.map { try read($0, registers: registers) }
                     try chargeCallShape(values, budget: budget)
                     try consumeOwnedCallArguments(
                         arguments,
-                        conventions: Array(repeating: .owned, count: arguments.count),
+                        conventions: descriptor.parameterConventions,
                         function: function,
                         localTypes: localTypes,
                         registers: &registers
                     )
-                    switch entryInvocation(entry, values, budget) {
+                    switch try invokeShellEntry(
+                        entryInvocation,
+                        entry: entry,
+                        arguments: values,
+                        descriptor: descriptor,
+                        budget: budget
+                    ) {
                     case let .returned(value):
                         try storeCallResult(
                             value,
@@ -4357,6 +4436,42 @@ public struct Interpreter: Sendable {
                         register: result,
                         registers: &registers
                     )
+                case let .makeEntryClosure(result, entry, captures, lifetime):
+                    guard case let .closure(signature) = function.type(of: result) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .closure(
+                                .init(
+                                    parameters: [],
+                                    parameterConventions: [],
+                                    result: .void
+                                )
+                            ),
+                            actual: function.type(of: result)
+                        )
+                    }
+                    let capturedValues = try captures.map { register in
+                        try copyCharging(
+                            try read(register, registers: registers),
+                            budget: budget
+                        )
+                    }
+                    try chargeAggregate(
+                        elementCount: capturedValues.count,
+                        budget: budget
+                    )
+                    try initialize(
+                        .closure(
+                            .init(
+                                target: .entry(entry),
+                                signature: signature,
+                                captures: capturedValues,
+                                dynamicScope: lifetime == .lexical
+                                    ? .init() : nil
+                            )
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .beginClosureScope(result, closureRegister):
                     guard case let .closure(closure) = try read(
                         closureRegister,
@@ -4431,6 +4546,11 @@ public struct Interpreter: Sendable {
                     }
                     try closure.dynamicScope?.requireActive()
                     let values = try arguments.map { try read($0, registers: registers) }
+                    guard !closure.signature.effects.requiresMainActor
+                            || Thread.isMainThread
+                    else {
+                        throw VM.RuntimeTrap.mainActorViolation
+                    }
                     switch closure.target {
                     case let .image(functionID):
                         guard let calleeFunction = functions[functionID],
@@ -4470,6 +4590,51 @@ public struct Interpreter: Sendable {
                                 )
                             )
                         )
+                    case let .entry(entry):
+                        guard let entryInvocation else {
+                            throw VM.RuntimeTrap.unknownEntry(entry)
+                        }
+                        let descriptor = try validatedEntryClosureTarget(
+                            entry,
+                            closure: closure,
+                            entries: entries,
+                            operation: "Shell entry closure"
+                        )
+                        let callValues = values + closure.captures
+                        try chargeCallShape(callValues, budget: budget)
+                        try consumeOwnedCallArguments(
+                            arguments,
+                            conventions: closure.signature
+                                .parameterConventions,
+                            function: function,
+                            localTypes: localTypes,
+                            registers: &registers
+                        )
+                        try budget.checkDeadline()
+                        switch try invokeShellEntry(
+                            entryInvocation,
+                            entry: entry,
+                            arguments: callValues,
+                            descriptor: descriptor,
+                            budget: budget
+                        ) {
+                        case let .returned(value):
+                            try storeCallResult(
+                                value,
+                                in: result,
+                                function: function,
+                                registers: &registers,
+                                localTypes: localTypes,
+                                budget: budget
+                            )
+                        case let .businessError(message):
+                            throw VM.BusinessError(
+                                message: message,
+                                requiresBoundaryCharge: true
+                            )
+                        case let .trapped(trap):
+                            throw trap
+                        }
                     case let .native(nativeClosure):
                         guard closure.captures.isEmpty,
                               (nativeClosure.signature == closure.signature
@@ -4482,11 +4647,6 @@ public struct Interpreter: Sendable {
                             throw VM.RuntimeTrap.nativeFailure(
                                 "native closure value disagrees with its callable ABI"
                             )
-                        }
-                        guard !closure.signature.effects.requiresMainActor
-                                || Thread.isMainThread
-                        else {
-                            throw VM.RuntimeTrap.mainActorViolation
                         }
                         try chargeCallShape(values, budget: budget)
                         try consumeOwnedCallArguments(
@@ -4552,52 +4712,113 @@ public struct Interpreter: Sendable {
                         )
                     }
                     try closure.dynamicScope?.requireActive()
-                    guard let functionID = closure.imageFunctionID else {
-                        throw VM.RuntimeTrap.nativeFailure(
-                            "closure_try_apply requires an image closure body"
-                        )
-                    }
-                    guard let calleeFunction = functions[functionID],
-                          calleeFunction.parameterConventions.count
-                            >= arguments.count
+                    guard !closure.signature.effects.requiresMainActor
+                            || Thread.isMainThread
                     else {
-                        throw VM.RuntimeTrap.unknownFunction(functionID)
+                        throw VM.RuntimeTrap.mainActorViolation
                     }
                     let values = try arguments.map {
                         try read($0, registers: registers)
                     }
                     let callValues = values + closure.captures
                     try chargeCallShape(callValues, budget: budget)
-                    try consumeOwnedCallArguments(
-                        arguments,
-                        conventions: Array(
-                            calleeFunction.parameterConventions.prefix(
-                                arguments.count
-                            )
-                        ),
-                        function: function,
-                        localTypes: localTypes,
-                        registers: &registers
-                    )
-                    persist(
-                        frame,
-                        registers: registers,
-                        stackSlots: stackSlots,
-                        currentBlock: currentBlock,
-                        nextInstruction: instructionIndex + 1
-                    )
-                    try budget.checkDeadline()
-                    return .call(
-                        FrameCall(
-                            functionID: functionID,
-                            arguments: callValues,
-                            continuation: .throwing(
-                                normalTarget: normalTarget,
-                                errorTarget: errorTarget,
-                                programCounter: programCounter
+                    switch closure.target {
+                    case let .image(functionID):
+                        guard let calleeFunction = functions[functionID],
+                              calleeFunction.parameterConventions.count
+                                >= arguments.count
+                        else {
+                            throw VM.RuntimeTrap.unknownFunction(functionID)
+                        }
+                        try consumeOwnedCallArguments(
+                            arguments,
+                            conventions: Array(
+                                calleeFunction.parameterConventions.prefix(
+                                    arguments.count
+                                )
+                            ),
+                            function: function,
+                            localTypes: localTypes,
+                            registers: &registers
+                        )
+                        persist(
+                            frame,
+                            registers: registers,
+                            stackSlots: stackSlots,
+                            currentBlock: currentBlock,
+                            nextInstruction: instructionIndex + 1
+                        )
+                        try budget.checkDeadline()
+                        return .call(
+                            FrameCall(
+                                functionID: functionID,
+                                arguments: callValues,
+                                continuation: .throwing(
+                                    normalTarget: normalTarget,
+                                    errorTarget: errorTarget,
+                                    programCounter: programCounter
+                                )
                             )
                         )
-                    )
+                    case let .entry(entry):
+                        guard let entryInvocation else {
+                            throw VM.RuntimeTrap.unknownEntry(entry)
+                        }
+                        let descriptor = try validatedEntryClosureTarget(
+                            entry,
+                            closure: closure,
+                            entries: entries,
+                            requiresThrowing: true,
+                            operation: "throwing Shell entry closure"
+                        )
+                        try consumeOwnedCallArguments(
+                            arguments,
+                            conventions: closure.signature
+                                .parameterConventions,
+                            function: function,
+                            localTypes: localTypes,
+                            registers: &registers
+                        )
+                        try budget.checkDeadline()
+                        switch try invokeShellEntry(
+                            entryInvocation,
+                            entry: entry,
+                            arguments: callValues,
+                            descriptor: descriptor,
+                            budget: budget
+                        ) {
+                        case let .returned(value):
+                            try transferCallOutcome(
+                                value,
+                                to: frame.blocks[normalTarget]!,
+                                function: function,
+                                registers: &registers,
+                                localTypes: localTypes,
+                                budget: budget
+                            )
+                            currentBlock = normalTarget
+                        case let .businessError(message):
+                            try transferBusinessError(
+                                VM.BusinessError(
+                                    message: message,
+                                    requiresBoundaryCharge: true
+                                ),
+                                to: frame.blocks[errorTarget]!,
+                                function: function,
+                                registers: &registers,
+                                localTypes: localTypes,
+                                budget: budget
+                            )
+                            currentBlock = errorTarget
+                        case let .trapped(trap):
+                            throw trap
+                        }
+                        advancedToNextBlock = true
+                    case .native:
+                        throw VM.RuntimeTrap.nativeFailure(
+                            "closure_try_apply requires an image or Shell entry target"
+                        )
+                    }
                 case let .tryApply(callee, arguments, normalTarget, errorTarget):
                     guard let calleeFunction = functions[callee] else {
                         throw VM.RuntimeTrap.unknownFunction(callee)
@@ -4631,17 +4852,25 @@ public struct Interpreter: Sendable {
                         )
                     )
                 case let .entryTryApply(entry, arguments, normalTarget, errorTarget):
-                    guard let entryInvocation else { throw VM.RuntimeTrap.unknownEntry(entry) }
+                    guard let entryInvocation,
+                          let descriptor = entries[entry]
+                    else { throw VM.RuntimeTrap.unknownEntry(entry) }
                     let values = try arguments.map { try read($0, registers: registers) }
                     try chargeCallShape(values, budget: budget)
                     try consumeOwnedCallArguments(
                         arguments,
-                        conventions: Array(repeating: .owned, count: arguments.count),
+                        conventions: descriptor.parameterConventions,
                         function: function,
                         localTypes: localTypes,
                         registers: &registers
                     )
-                    switch entryInvocation(entry, values, budget) {
+                    switch try invokeShellEntry(
+                        entryInvocation,
+                        entry: entry,
+                        arguments: values,
+                        descriptor: descriptor,
+                        budget: budget
+                    ) {
                     case let .returned(value):
                         try transferCallOutcome(
                             value,
@@ -4827,6 +5056,67 @@ public struct Interpreter: Sendable {
                 _ = try take(argument, registers: &registers)
             }
         }
+    }
+
+    /// Shell entry closures cross back into code outside the verified image.
+    /// Keep their callable, ownership, capture, and boundary-error ABI checks
+    /// identical for ordinary calls, throwing calls, and native callbacks.
+    private func validatedEntryClosureTarget(
+        _ entry: Core.EntryIndex,
+        closure: VM.Closure,
+        entries: [Core.EntryIndex: Verification.ResolvedEntry],
+        requiresThrowing: Bool? = nil,
+        operation: String
+    ) throws -> Verification.ResolvedEntry {
+        guard let descriptor = entries[entry] else {
+            throw VM.RuntimeTrap.unknownEntry(entry)
+        }
+        let signature = closure.signature
+        let throwingRequirementMatches = requiresThrowing.map {
+            descriptor.effects.mayThrow == $0
+        } ?? true
+        let boundaryErrorMatches = !descriptor.effects.mayThrow
+            || signature.thrownType == .string
+            || signature.thrownType == .error
+        guard signature.hasCanonicalCallableEffects,
+              signature.hasCanonicalThrownType,
+              !descriptor.effects.isAsync,
+              throwingRequirementMatches,
+              boundaryErrorMatches,
+              descriptor.parameterTypes
+                == signature.parameters + closure.captures.map(\.type),
+              descriptor.parameterConventions.count
+                == descriptor.parameterTypes.count,
+              Array(descriptor.parameterConventions.prefix(
+                signature.parameters.count
+              )) == signature.parameterConventions,
+              descriptor.resultType == signature.result,
+              signature.safelyRestricts(targetEffects: descriptor.effects)
+        else {
+            throw VM.RuntimeTrap.nativeFailure(
+                "\(operation) disagrees with its callable ABI"
+            )
+        }
+        return descriptor
+    }
+
+    private func invokeShellEntry(
+        _ invocation: VM.EntryInvocation,
+        entry: Core.EntryIndex,
+        arguments: [VM.Value],
+        descriptor: Verification.ResolvedEntry,
+        budget: VM.InvocationBudget
+    ) throws -> VM.ExecutionResult {
+        try budget.checkDeadline()
+        let outcome = invocation(entry, arguments, budget)
+        try budget.checkDeadline()
+        if case .businessError = outcome,
+           !descriptor.effects.mayThrow {
+            throw VM.RuntimeTrap.nativeFailure(
+                "nonthrowing Shell entry \(entry) returned a business error"
+            )
+        }
+        return outcome
     }
 
     private func validateRuntimeValue(

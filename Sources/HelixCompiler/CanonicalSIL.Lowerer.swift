@@ -1114,6 +1114,42 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func appendClosureConstruction(
+            result: Bytecode.Register,
+            target: CanonicalSIL.DirectCallBinding.Target,
+            captures: [Bytecode.Register],
+            lifetime: Bytecode.ClosureLifetime = .invocation,
+            line: Int,
+            source: String
+        ) throws {
+            switch target {
+            case let .function(function):
+                appendInstruction(
+                    .makeClosure(
+                        result: result,
+                        function: function,
+                        captures: captures,
+                        lifetime: lifetime
+                    )
+                )
+            case let .entry(entry):
+                appendInstruction(
+                    .makeEntryClosure(
+                        result: result,
+                        entry: entry,
+                        captures: captures,
+                        lifetime: lifetime
+                    )
+                )
+            case .nativeImport:
+                throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                    line: line,
+                    text: source
+                        + " (a NativeImport function cannot yet become a Swift closure value)"
+                )
+            }
+        }
+
         func allocate(type: Bytecode.ValueType) throws -> Bytecode.Register {
             guard let raw = UInt32(exactly: registerTypes.count) else {
                 throw CanonicalSIL.LoweringError.malformedSIL("register table exceeds UInt32")
@@ -23218,13 +23254,6 @@ public struct Lowerer: Sendable {
                             + "candidate function bindings"
                     )
                 }
-                guard case let .function(functionID) = reference.binding.target
-                else {
-                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
-                        line: sourceLine,
-                        text: line + " (target is not an image-local function)"
-                    )
-                }
                 let binding = reference.binding
                 let convertedType = try parseType(conversion[2])
                 guard case let .closure(signature) = convertedType else {
@@ -23270,8 +23299,12 @@ public struct Lowerer: Sendable {
                 )
                 let result = try allocate(type: .closure(logicalSignature))
                 values[conversion[0]] = result
-                appendInstruction(
-                    .makeClosure(result: result, function: functionID, captures: [])
+                try appendClosureConstruction(
+                    result: result,
+                    target: binding.target,
+                    captures: [],
+                    line: sourceLine,
+                    source: line
                 )
                 continue
             }
@@ -23353,14 +23386,6 @@ public struct Lowerer: Sendable {
                         text: line
                     )
                 }
-                guard
-                      case let .function(functionID) = reference.binding.target
-                else {
-                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
-                        line: sourceLine,
-                        text: line
-                    )
-                }
                 let binding = reference.binding
                 guard
                       !binding.effects.isAsync
@@ -23408,7 +23433,8 @@ public struct Lowerer: Sendable {
                     line: sourceLine
                 )
                 if case let .staticKeyPathProjection(identity) = binding.abiAdapter {
-                    guard physicalCaptureTokens.count == 1,
+                    guard case let .function(functionID) = binding.target,
+                          physicalCaptureTokens.count == 1,
                           let keyPath = staticKeyPathValues[
                             physicalCaptureTokens[0]
                           ],
@@ -23522,13 +23548,13 @@ public struct Lowerer: Sendable {
                 if lifetime == .lexical {
                     onStackClosureValues[closure[0]] = result
                 }
-                appendInstruction(
-                    .makeClosure(
-                        result: result,
-                        function: functionID,
-                        captures: captures,
-                        lifetime: lifetime
-                    )
+                try appendClosureConstruction(
+                    result: result,
+                    target: binding.target,
+                    captures: captures,
+                    lifetime: lifetime,
+                    line: sourceLine,
+                    source: line
                 )
                 for owner in captureTemporaryOwners
                 where requiresManagedOwnership(

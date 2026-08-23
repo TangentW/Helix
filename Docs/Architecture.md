@@ -67,6 +67,12 @@ Both workflows depend on stable, build-specific identities:
 - An immutable `Runtime.Generation` makes all routes in one activation visible
   atomically. A call chain pins one generation so it cannot observe a mixture
   during concurrent activation or rollback.
+- A frozen Shell entry includes its parameter ownership conventions as well as
+  types, result, and effects. An unchanged callable used as a Swift closure is
+  represented by its `EntryIndex`, not by a copied archived body or a process
+  pointer. The closure stores only verified suffix captures; ordinary,
+  throwing, and NativeImport-callback invocation all re-enter through the same
+  pinned-generation routing path.
 - Closure captures and collection transforms use verifier-private storage
   values rather than Swift runtime layout. Mutable captures share managed cells;
   `weak` and checked `unowned` captures share non-retaining handles whose

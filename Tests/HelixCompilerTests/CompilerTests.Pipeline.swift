@@ -67,6 +67,8 @@ struct Pipeline {
                     index: entry,
                     key: key,
                     parameterTypes: [.int64],
+                    parameterConventions: compiled.module.functions[0]
+                        .parameterConventions,
                     resultType: .int64
                 ),
             ]
@@ -1184,6 +1186,8 @@ struct Pipeline {
                     index: entry,
                     key: functionKey,
                     parameterTypes: [.int64],
+                    parameterConventions: module.functions[0]
+                        .parameterConventions,
                     resultType: .int64
                 ),
             ]
@@ -3688,6 +3692,8 @@ struct Pipeline {
                     index: .init(rawValue: 0),
                     key: functionKey,
                     parameterTypes: [.int64],
+                    parameterConventions: module.functions[0]
+                        .parameterConventions,
                     resultType: .int64
                 ),
             ]
@@ -4182,6 +4188,8 @@ struct Pipeline {
                     index: .init(rawValue: 0),
                     key: functionKey,
                     parameterTypes: [.int64],
+                    parameterConventions: module.functions[0]
+                        .parameterConventions,
                     resultType: .int64
                 ),
             ]
@@ -4389,6 +4397,8 @@ struct Pipeline {
                         index: .init(rawValue: 0),
                         key: key,
                         parameterTypes: [.int64],
+                        parameterConventions: entryFunction
+                            .parameterConventions,
                         resultType: .int64
                     ),
                 ]
@@ -4470,6 +4480,8 @@ struct Pipeline {
                     index: entry,
                     key: key,
                     parameterTypes: parameterTypes,
+                    parameterConventions: compiled.module.functions[0]
+                        .parameterConventions,
                     resultType: resultType,
                     effects: effects
                 ),

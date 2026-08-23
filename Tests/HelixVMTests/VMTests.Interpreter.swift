@@ -3471,6 +3471,131 @@ struct Interpreter {
         )
     }
 
+    @Test("Throwing frozen-entry closures resume through both continuations")
+    func executesThrowingEntryClosureControlFlow() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.bool],
+            parameterConventions: [.owned],
+            result: .int64,
+            effects: .init(mayThrow: true)
+        )
+        let targetEntry = Core.EntryIndex(rawValue: 1)
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "throwingEntryClosureRoot",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .bool, .int64, .closure(signature), .int64, .string, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            bitPattern: 7
+                        ),
+                        .makeEntryClosure(
+                            result: .init(rawValue: 2),
+                            entry: targetEntry,
+                            captures: [.init(rawValue: 1)]
+                        ),
+                        .closureTryApply(
+                            closure: .init(rawValue: 2),
+                            arguments: [.init(rawValue: 0)],
+                            normalTarget: .init(rawValue: 1),
+                            errorTarget: .init(rawValue: 2)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 3)],
+                    instructions: [.returnValue(.init(rawValue: 3))]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 4)],
+                    instructions: [
+                        .destroyValue(.init(rawValue: 4)),
+                        .constantInteger(
+                            result: .init(rawValue: 5),
+                            bitPattern: UInt64.max
+                        ),
+                        .returnValue(.init(rawValue: 5)),
+                    ]
+                ),
+            ]
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .stringsV1, .borrowCallsV1, .closureValuesV1,
+            .untypedThrowsV1,
+        ]
+        let target = Verification.ResolvedEntry(
+            index: targetEntry,
+            key: .init(rawValue: .sha256("throwing-entry-closure")),
+            parameterTypes: [.bool, .int64],
+            parameterConventions: [.owned, .borrowed],
+            resultType: .int64,
+            effects: .init(mayThrow: true)
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: capabilities,
+            signature: .init(
+                parameters: ["Swift.Bool"],
+                result: "Swift.Int"
+            ),
+            parameterTypes: [.bool],
+            additionalShellEntries: [target]
+        )
+        let interpreter = VM.Interpreter(
+            entryInvocation: { entry, arguments, _ in
+                guard entry == targetEntry,
+                      arguments.count == 2,
+                      case let .bool(succeeds) = arguments[0]
+                else { return .trapped(.unknownEntry(entry)) }
+                return succeeds
+                    ? .returned(arguments[1])
+                    : .businessError("entry closure failure")
+            }
+        )
+
+        #expect(
+            interpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.bool(true)]
+            ) == .returned(
+                .integer(
+                    try VM.Integer(
+                        signed: 7,
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
+            )
+        )
+        #expect(
+            interpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [.bool(false)]
+            ) == .returned(
+                .integer(
+                    try VM.Integer(
+                        signed: -1,
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
+            )
+        )
+    }
+
     @Test("Internal higher-order calls preserve target authority as a capability")
     func executesClosureTargetAuthority() throws {
         let formal = Bytecode.ClosureSignature(
@@ -6026,6 +6151,136 @@ struct Interpreter {
         )
     }
 
+    @Test("Frozen-entry closures preserve captures across repeated invocation")
+    func executesCapturedEntryClosure() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [.int64],
+            parameterConventions: [.owned],
+            result: .int64
+        )
+        let targetEntry = Core.EntryIndex(rawValue: 1)
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "entryClosureRoot",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64, .int64, .closure(signature), .int64, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            bitPattern: 3
+                        ),
+                        .makeEntryClosure(
+                            result: .init(rawValue: 2),
+                            entry: targetEntry,
+                            captures: [.init(rawValue: 1)]
+                        ),
+                        .closureApply(
+                            result: .init(rawValue: 3),
+                            closure: .init(rawValue: 2),
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .closureApply(
+                            result: .init(rawValue: 4),
+                            closure: .init(rawValue: 2),
+                            arguments: [.init(rawValue: 3)]
+                        ),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ]
+        )
+        let target = Verification.ResolvedEntry(
+            index: targetEntry,
+            key: .init(rawValue: .sha256("captured-entry-closure")),
+            parameterTypes: [.int64, .int64],
+            parameterConventions: [.owned, .borrowed],
+            resultType: .int64
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .borrowCallsV1, .closureValuesV1,
+        ]
+        let image = try makeVerified(
+            function: root,
+            capabilities: capabilities,
+            additionalShellEntries: [target]
+        )
+        let interpreter = VM.Interpreter(
+            entryInvocation: { entry, arguments, _ in
+                guard entry == targetEntry,
+                      arguments.count == 2,
+                      case let .integer(value) = arguments[0],
+                      case let .integer(capture) = arguments[1]
+                else { return .trapped(.unknownEntry(entry)) }
+                return .returned(
+                    .integer(
+                        try! VM.Integer(
+                            signed: value.signedValue + capture.signedValue,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    )
+                )
+            }
+        )
+
+        #expect(
+            interpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    .integer(
+                        try VM.Integer(
+                            signed: 4,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    ),
+                ]
+            ) == .returned(
+                .integer(
+                    try VM.Integer(
+                        signed: 10,
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
+            )
+        )
+
+        let contractViolatingInterpreter = VM.Interpreter(
+            entryInvocation: { _, _, _ in
+                .businessError("undeclared failure")
+            }
+        )
+        #expect(
+            contractViolatingInterpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [
+                    .integer(
+                        try VM.Integer(
+                            signed: 4,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    ),
+                ]
+            ) == .trapped(
+                .nativeFailure(
+                    "nonthrowing Shell entry 1 returned a business error"
+                )
+            )
+        )
+    }
+
     @MainActor
     @Test("Closure conversion preserves captures while adding MainActor isolation")
     func convertsClosureActorRestriction() throws {
@@ -7036,6 +7291,7 @@ struct Interpreter {
         parameterTypes: [Bytecode.ValueType] = [.int64],
         resultType: Bytecode.ValueType = .int64,
         shellTypes: [Verification.ResolvedNativeType] = [],
+        additionalShellEntries: [Verification.ResolvedEntry] = [],
         localTypes: [Bytecode.LocalTypeDefinition] = [],
         additionalFunctions: [Bytecode.Function] = []
     ) throws -> Verification.Image {
@@ -7074,10 +7330,11 @@ struct Interpreter {
                     index: .init(rawValue: 0),
                     key: key,
                     parameterTypes: parameterTypes,
+                    parameterConventions: function.parameterConventions,
                     resultType: resultType,
                     effects: function.effects
                 ),
-            ],
+            ] + additionalShellEntries,
             imports: shellImports,
             types: shellTypes
         )

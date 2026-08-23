@@ -280,6 +280,7 @@ struct SetSemantics {
                     index: .init(rawValue: 0),
                     key: try functionKey(),
                     parameterTypes: [parameterType],
+                    parameterConventions: [.owned],
                     resultType: .optional(.int64)
                 ),
             ]

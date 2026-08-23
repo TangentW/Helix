@@ -327,6 +327,7 @@ struct Progression {
                     index: .init(rawValue: 0),
                     key: key,
                     parameterTypes: [],
+                    parameterConventions: function.parameterConventions,
                     resultType: resultType
                 ),
             ]

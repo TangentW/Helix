@@ -15,6 +15,7 @@ extension Verification.ShellInterface {
                     index: index,
                     key: function.key,
                     parameterTypes: function.parameterTypes,
+                    parameterConventions: function.parameterConventions,
                     resultType: function.resultType,
                     effects: function.effects,
                     fallbackAllowed: function.fallbackAllowed

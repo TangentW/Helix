@@ -1567,6 +1567,7 @@ struct Properties {
                     index: .init(rawValue: 0),
                     key: key,
                     parameterTypes: parameterTypes,
+                    parameterConventions: function.parameterConventions,
                     resultType: resultType
                 ),
             ]
@@ -1709,6 +1710,7 @@ struct Properties {
                     index: .init(rawValue: 0),
                     key: key,
                     parameterTypes: [.int64],
+                    parameterConventions: function.parameterConventions,
                     resultType: .int64
                 ),
             ]

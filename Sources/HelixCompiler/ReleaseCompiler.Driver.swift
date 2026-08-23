@@ -811,6 +811,8 @@ extension ReleaseCompiler {
             let imports = try directCalls.importRequirements(
                 referencedBy: reachableIR
             )
+            let entryParameterConventions = try directCalls
+                .entryParameterConventions(referencedBy: reachableIR)
             let localTypes = try mergedLocalTypeDefinitions(
                 optimized: silTypeEnvironment,
                 semantic: loweringTypeEnvironment,
@@ -820,6 +822,7 @@ extension ReleaseCompiler {
             let capabilities = CompilerCapabilities.infer(
                 for: reachableIR,
                 imports: imports,
+                entryParameterConventions: entryParameterConventions,
                 localTypes: localTypes
             )
             let functions = reachable.map {

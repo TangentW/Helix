@@ -151,6 +151,8 @@ public struct Driver: Sendable {
         let imports = try imagePlan.directCalls.importRequirements(
             referencedBy: loweredFunctions
         )
+        let entryParameterConventions = try imagePlan.directCalls
+            .entryParameterConventions(referencedBy: loweredFunctions)
         let localTypes = try typeEnvironment.definitions(
             referencedBy: loweredFunctions,
             hostedMethods: imagePlan.hostedMethods
@@ -165,6 +167,7 @@ public struct Driver: Sendable {
             capabilities: CompilerCapabilities.infer(
                 for: loweredFunctions,
                 imports: imports,
+                entryParameterConventions: entryParameterConventions,
                 localTypes: localTypes
             ),
             requestedResources: request.requestedResources,

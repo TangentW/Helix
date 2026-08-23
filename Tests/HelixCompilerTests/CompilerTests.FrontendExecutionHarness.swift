@@ -204,6 +204,7 @@ struct FrontendExecutionHarness {
                     index: entry,
                     key: key,
                     parameterTypes: signature.parameters,
+                    parameterConventions: signature.parameterConventions,
                     resultType: signature.result,
                     effects: rootEffects
                 ),

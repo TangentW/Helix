@@ -443,6 +443,18 @@ does not by itself certify a physical device or distribution channel.
   compiler-generated functions, using the closure-body role only when partially
   applied; direct-only closure and `defer` helpers retain their physical capture
   ABI as concrete specializations. They are never resolved through NativeImport.
+  An unchanged eligible Swift callable may also become a closure value without
+  copying its archived implementation into the patch. `make_entry_closure`
+  freezes its `EntryIndex`; invocation parameters are the prefix of the frozen
+  Shell ABI and `partial_apply` captures are its suffix, with exact ownership,
+  result, callable effects, and boundary-error checks shared with image-local
+  closures. A referenced entry with any borrowed parameter requires the same
+  `borrow-calls-1` declaration for direct, throwing, and closure-target calls.
+  Normal and throwing calls route through the invocation's pinned generation.
+  The same target can therefore enter a declared nonescaping or
+  escaping NativeImport callback, and a retained callback continues to route to
+  that pinned original entry after activation or rollback. Typed patch-local
+  errors cannot be exposed through this Shell boundary.
   Concrete nominal metatypes carried by those Swift callables remain validated
   compiler facts at their physical parameter positions and are erased before
   direct or partial application enters HLBC. Custom value initializers may build

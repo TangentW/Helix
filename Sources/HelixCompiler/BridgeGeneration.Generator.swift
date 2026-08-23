@@ -2610,6 +2610,7 @@ public struct Generator: Sendable {
             index: .init(rawValue: \(record.entryIndex!.rawValue)),
             key: Core.FunctionKey(rawValue: \(render(record.key.rawValue))),
             parameterTypes: \(renderValueTypes(record.parameterTypes)),
+            parameterConventions: \(renderParameterConventions(record.parameterConventions)),
             resultType: \(render(record.resultType)),
             effects: \(render(record.effects)),
             fallbackAllowed: \(record.fallbackAllowed)

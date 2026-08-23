@@ -148,6 +148,7 @@ struct AnyVerifier {
             index: .init(rawValue: 0),
             key: key,
             parameterTypes: [.any],
+            parameterConventions: [.owned],
             resultType: .any,
             effects: .init()
         )
@@ -254,6 +255,7 @@ struct AnyVerifier {
                     index: .init(rawValue: 0),
                     key: key,
                     parameterTypes: [.int64],
+                    parameterConventions: function.parameterConventions,
                     resultType: .int64,
                     effects: function.effects
                 ),

@@ -725,6 +725,7 @@ struct AnyExecution {
                     index: .init(rawValue: 0),
                     key: key,
                     parameterTypes: parameterTypes,
+                    parameterConventions: function.parameterConventions,
                     resultType: resultType,
                     effects: function.effects
                 ),

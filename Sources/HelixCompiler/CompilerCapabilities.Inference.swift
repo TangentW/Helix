@@ -7,9 +7,17 @@ extension CompilerCapabilities {
     static func infer(
         for functions: [IntermediateRepresentation.Function],
         imports: [Bytecode.ImportRequirement] = [],
+        entryParameterConventions: [
+            Core.EntryIndex: [Bytecode.ParameterConvention]
+        ] = [:],
         localTypes: [Bytecode.LocalTypeDefinition] = []
     ) -> Set<Core.Capability> {
         var capabilities: Set<Core.Capability> = [.baselineV1]
+        if entryParameterConventions.values.contains(where: {
+            $0.contains(.borrowed)
+        }) {
+            capabilities.insert(.borrowCallsV1)
+        }
         for function in functions {
             switch function.kind {
             case .ordinary:
@@ -52,8 +60,14 @@ extension CompilerCapabilities {
                 if case .progressionNext = instruction {
                     capabilities.insert(.collectionsV1)
                 }
-                if case let .makeClosure(_, _, captures, _) = instruction,
-                   captures.contains(where: { register in
+                let closureCaptures: [Bytecode.Register]? = switch instruction {
+                case let .makeClosure(_, _, captures, _),
+                     let .makeEntryClosure(_, _, captures, _):
+                    captures
+                default:
+                    nil
+                }
+                if closureCaptures?.contains(where: { register in
                        guard function.registerTypes.indices.contains(
                            Int(register.rawValue)
                        ) else { return false }
@@ -61,7 +75,7 @@ extension CompilerCapabilities {
                            return true
                        }
                        return false
-                   }) {
+                   }) == true {
                     capabilities.insert(.escapingClosureValuesV1)
                 }
                 let errorTarget: Bytecode.BlockID? = switch instruction {

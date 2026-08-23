@@ -286,6 +286,7 @@ struct HostedClasses {
                         index: entry,
                         key: functionKey,
                         parameterTypes: [],
+                        parameterConventions: root.parameterConventions,
                         resultType: .native(nativeTypeID),
                         effects: .init(mayAllocate: true)
                     ),

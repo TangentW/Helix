@@ -308,6 +308,7 @@ struct StandardLibraryImports {
                     index: entry,
                     key: functionKey,
                     parameterTypes: descriptor.parameterTypes,
+                    parameterConventions: function.parameterConventions,
                     resultType: descriptor.resultType,
                     effects: descriptor.effects
                 ),

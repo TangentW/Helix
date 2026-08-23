@@ -704,6 +704,7 @@ struct AddressExecution {
                     index: .init(rawValue: 0),
                     key: key,
                     parameterTypes: parameterTypes,
+                    parameterConventions: root.parameterConventions,
                     resultType: resultType
                 ),
             ],
