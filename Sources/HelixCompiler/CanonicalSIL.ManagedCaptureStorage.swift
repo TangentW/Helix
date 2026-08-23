@@ -31,10 +31,11 @@ enum ManagedCaptureStorage {
         parameters: [Bytecode.ValueType],
         parameterConventions: [Bytecode.ParameterConvention],
         erasedPhysicalIndices: Set<Int>,
-        hasIndirectResult: Bool,
+        indirectResultCount: Int,
         hasIndirectError: Bool
     ) throws -> Signature {
-        guard parameters.count == parameterConventions.count else {
+        guard indirectResultCount >= 0,
+              parameters.count == parameterConventions.count else {
             throw CanonicalSIL.LoweringError.malformedSIL(
                 "function parameter ownership count is inconsistent"
             )
@@ -60,7 +61,7 @@ enum ManagedCaptureStorage {
             )
         }
 
-        let leadingAddressCount = (hasIndirectResult ? 1 : 0)
+        let leadingAddressCount = indirectResultCount
             + (hasIndirectError ? 1 : 0)
         guard components.count
                 == leadingAddressCount + erasedPhysicalIndices.count

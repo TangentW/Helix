@@ -21,6 +21,7 @@ struct SubstitutedFunctionTypes {
         #expect(signature.parameterConventions == [.owned])
         #expect(signature.result == .string)
         #expect(signature.hasIndirectResult)
+        #expect(signature.indirectResultTypes == [.string])
         #expect(!signature.effects.mayThrow)
     }
 
@@ -83,8 +84,28 @@ struct SubstitutedFunctionTypes {
 
         #expect(signature.result == .tuple([.int64, .bool]))
         #expect(signature.hasIndirectResult)
+        #expect(signature.indirectResultTypes == [
+            .tuple([.int64, .bool]),
+        ])
         #expect(signature.indirectErrorType == .string)
         #expect(signature.effects.mayThrow)
+    }
+
+    @Test("Multiple indirect results form one ordered logical tuple")
+    func resolvesMultipleIndirectResults() throws {
+        let signature = try CanonicalSIL.Lowerer().parseFunctionType(
+            "$@convention(thin) () -> (@out Int, @out String)"
+        )
+
+        #expect(signature.result == .tuple([.int64, .string]))
+        #expect(signature.hasIndirectResult)
+        #expect(signature.indirectResultTypes == [.int64, .string])
+
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer().parseFunctionType(
+                "$@convention(thin) () -> (@out Int, String)"
+            )
+        }
     }
 
     @Test("The SIL error result must be the sole trailing component")

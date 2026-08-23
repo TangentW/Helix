@@ -257,7 +257,7 @@ enum ImageFunctions {
                 erasedPhysicalIndices: Set(
                     parsed.erasedMetatypes.map(\.physicalIndex)
                 ),
-                hasIndirectResult: parsed.hasIndirectResult,
+                indirectResultCount: parsed.indirectResultTypes.count,
                 hasIndirectError: parsed.indirectErrorType != nil
             )
             let result = file.map {
@@ -406,6 +406,10 @@ enum ImageFunctions {
         environment: CanonicalSIL.TypeEnvironment,
         kindForSymbol: (String) -> Bytecode.FunctionKind?
     ) throws -> [Reference] {
+        let function = file.rewritingClosedProtocolDispatch(
+            in: function,
+            typeEnvironment: environment
+        )
         let rewrites: [String: CanonicalSIL.StaticKeyPath.Rewrite]
         do {
             rewrites = try CanonicalSIL.StaticKeyPath.rewrites(
@@ -497,7 +501,8 @@ enum ImageFunctions {
             do {
                 materialized = try file.materializeGenericFunction(
                     declaration,
-                    arguments: rawArguments
+                    arguments: rawArguments,
+                    typeEnvironment: environment
                 )
             } catch let error as CanonicalSIL.GenericFunction.SpecializationError {
                 throw DiscoveryError.unsupported(

@@ -577,7 +577,7 @@ struct StorageInitialization {
             """,
             directCalls: .empty,
             typeEnvironment: .empty,
-            indirectResultType: .tuple([.int64, .string])
+            indirectResultTypes: [.tuple([.int64, .string])]
         )
 
         let writes = plan.storeModes.sorted { $0.key < $1.key }
@@ -593,6 +593,27 @@ struct StorageInitialization {
         #expect(plan.addressTargets["%5"]?.root == "%0")
     }
 
+    @Test("Independent entry out parameters retain independent lifetimes")
+    func classifiesMultipleEntryIndirectResults() throws {
+        let plan = try CanonicalSIL.StorageInitialization.analyze(
+            body: """
+            bb0(%0 : $*Int, %1 : $*String, %2 : $Int, %3 : $String):
+              store %2 to [init] %0
+              store %3 to [init] %1
+              %4 = tuple ()
+              return %4
+            """,
+            directCalls: .empty,
+            typeEnvironment: .empty,
+            indirectResultTypes: [.int64, .string]
+        )
+
+        #expect(plan.addressTargets["%0"]?.root == "%0")
+        #expect(plan.addressTargets["%1"]?.root == "%1")
+        #expect(plan.storeMode(at: 1, address: "%0") == .initialize)
+        #expect(plan.storeMode(at: 2, address: "%1") == .initialize)
+    }
+
     @Test("Malformed indirect output parameters fail closed")
     func rejectsMalformedIndirectOutputParameters() {
         #expect(throws: CanonicalSIL.LoweringError.self) {
@@ -603,7 +624,7 @@ struct StorageInitialization {
                 """,
                 directCalls: .empty,
                 typeEnvironment: .empty,
-                indirectResultType: .int64
+                indirectResultTypes: [.int64]
             )
         }
     }

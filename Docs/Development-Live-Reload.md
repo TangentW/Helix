@@ -490,12 +490,22 @@ reabstraction thunks are linked into the image rather than treated as
 NativeImports. Concrete same-image calls can also monomorphize source generic
 closure helpers from semantic SIL, including direct, throwing, recursive,
 rethrowing, returning, and escaping function-value forms; each concrete type
-argument list receives a deterministic image target. This path does not invent
-runtime metadata. A fully concrete patch-local protocol conformance can resolve
-one exact witness to a static image thunk, including bound method formation;
-conditional, open-world, missing, or ambiguous witness dispatch still fails
-closed. Immutable local protocol existentials also use the conformance
-inventory when their complete current-module conformer set is finite. Local
+argument list receives a deterministic image target. Successive clauses prove
+same-type, protocol, superclass/`AnyObject`, and dependent associated-type
+requirements from exact frontend evidence. Represented standard values use a
+closed, toolchain-checked `Sequence`/`Collection` hierarchy for the exact
+conformance and associated identities Helix already executes; custom values do
+not inherit those protocols from their storage shape. This also covers constrained generic
+extension methods, reachable concrete instances of file/module-scope generic
+structs, enums, and final classes, and concrete opaque results—including outer-
+generic and ordered multiple results—whose entry buffers reveal the underlying
+type. This path does not invent runtime generic, opaque, or witness metadata. A
+fully concrete patch-local conformance, including a conditional conformance
+whose instantiated requirements recursively prove, can resolve one exact
+witness to a static image thunk and form a bound method; unproven conditional,
+open-world, missing, or ambiguous dispatch still fails closed. Immutable local
+protocol existentials also use the conformance inventory when their complete,
+nonconditional current-module conformer set is finite. Local
 `any P`, compositions, inherited and class-bound requirements, erasure/opening,
 closed narrowing or widening, bound methods, closure results, synchronous
 throwing calls, and checked/forced protocol casts lower to exact represented

@@ -1,4 +1,5 @@
 import HelixBytecode
+import HelixCore
 import HelixVM
 import Testing
 @testable import HelixCompiler
@@ -361,6 +362,135 @@ struct ProtocolDispatchTests {
         #expect(!rewritten.body.contains("%6<Value>"))
     }
 
+    @Test("Proven conditional witnesses specialize conformer arguments")
+    func rewritesProvenConditionalWitness() throws {
+        let requirementType = "<Self where Self : Feature> "
+            + "(Self) -> () -> Int"
+        let callerType = "@convention(witness_method: Feature) "
+            + "<T where T : Feature> (@in_guaranteed T) -> Int"
+        let targetType = "@convention(witness_method: Feature) "
+            + "<Element where Element : Equatable> "
+            + "(@in_guaranteed Box<Element>) -> Int"
+        let targetSymbol = "$s7Fixture3BoxV5valueSiyFTW"
+        let evidence = """
+        struct Box<Element> {
+          @_hasStorage var value: Element
+        }
+        sil_witness_table <Element where Element : Equatable> Box<Element>: Feature module Fixture {
+          method #Fixture.Feature.value: \(requirementType) : @\(targetSymbol)
+        }
+        """
+        let conformances = try CanonicalSIL.ProtocolConformance.Environment(
+            text: evidence
+        )
+        let typeEnvironment = try CanonicalSIL.TypeEnvironment(
+            text: evidence,
+            functions: [],
+            protocolConformances: conformances
+        )
+        let body = """
+        bb0(%0 : $*Box<Int>):
+          %1 = witness_method $Box<Int>, #Fixture.Feature.value : \(requirementType) : $\(callerType)
+          %2 = apply %1<Box<Int>>(%0) : $\(callerType)
+          return %2
+        """
+        let caller = CanonicalSIL.Function(
+            mangledName: "$s7Fixture6calleryyF",
+            loweredType: "@convention(thin) (@in_guaranteed Box<Int>) -> Int",
+            body: body
+        )
+        let target = CanonicalSIL.Function(
+            mangledName: targetSymbol,
+            loweredType: targetType,
+            body: "bb0:\n  unreachable"
+        )
+
+        let rewritten = CanonicalSIL.ProtocolConformance.StaticDispatch.rewrite(
+            caller,
+            conformances: conformances,
+            availableFunctions: [target],
+            typeEnvironment: typeEnvironment
+        )
+        #expect(rewritten.body.contains(
+            "%1 = function_ref @\(targetSymbol) : $\(targetType)"
+        ))
+        #expect(rewritten.body.contains(
+            "%2 = apply %1<Int>(%0) : $\(targetType)"
+        ))
+
+        let unprovenBody = body.replacingOccurrences(
+            of: "Box<Int>",
+            with: "Box<(Int, Int)>"
+        )
+        let unproven = CanonicalSIL.Function(
+            mangledName: caller.mangledName,
+            loweredType: caller.loweredType.replacingOccurrences(
+                of: "Box<Int>",
+                with: "Box<(Int, Int)>"
+            ),
+            body: unprovenBody
+        )
+        #expect(CanonicalSIL.ProtocolConformance.StaticDispatch.rewrite(
+            unproven,
+            conformances: conformances,
+            availableFunctions: [target],
+            typeEnvironment: typeEnvironment
+        ).body == unprovenBody)
+    }
+
+    @Test("Conditional dispatch uses native type evidence injected after parsing")
+    func rewritesConditionalWitnessUsingInjectedNativeTypeKind() throws {
+        let requirementType = "<Self where Self : Feature> "
+            + "(Self) -> () -> Int"
+        let callerType = "@convention(witness_method: Feature) "
+            + "<T where T : Feature> (@in_guaranteed T) -> Int"
+        let targetType = "@convention(witness_method: Feature) "
+            + "<Element where Element : AnyObject> "
+            + "(@in_guaranteed Box<Element>) -> Int"
+        let callerSymbol = "$s7Fixture6calleryyF"
+        let targetSymbol = "$s7Fixture3BoxV5valueSiyFTW"
+        let file = try CanonicalSIL.File(text: """
+        struct Box<Element> {
+          @_hasStorage var value: Element
+        }
+        sil_witness_table <Element where Element : AnyObject> Box<Element>: Feature module Fixture {
+          method #Fixture.Feature.value: \(requirementType) : @\(targetSymbol)
+        }
+        sil hidden @\(callerSymbol) : $@convention(thin) (@in_guaranteed Box<Fixture.Reference>) -> Int {
+        bb0(%0 : $*Box<Fixture.Reference>):
+          %1 = witness_method $Box<Fixture.Reference>, #Fixture.Feature.value : \(requirementType) : $\(callerType)
+          %2 = apply %1<Box<Fixture.Reference>>(%0) : $\(callerType)
+          return %2 : $Int
+        } // end sil function '\(callerSymbol)'
+        sil private [transparent] @\(targetSymbol) : $\(targetType) {
+        bb0:
+          unreachable
+        } // end sil function '\(targetSymbol)'
+        """)
+        let caller = try #require(file.function(mangledName: callerSymbol))
+        #expect(caller.body.contains(" = witness_method $"))
+
+        let referenceID = Core.TypeID(
+            rawValue: .sha256("Fixture.Reference")
+        )
+        let environment = try file.typeEnvironment.includingNativeTypes(
+            ["Fixture.Reference": referenceID],
+            kinds: [referenceID: .reference]
+        )
+        let rewritten = file.rewritingClosedProtocolDispatch(
+            in: caller,
+            typeEnvironment: environment
+        )
+
+        #expect(rewritten.body.contains(
+            "%1 = function_ref @\(targetSymbol) : $\(targetType)"
+        ))
+        #expect(rewritten.body.contains(
+            "%2 = apply %1<Fixture.Reference>(%0) : $\(targetType)"
+        ))
+        #expect(!rewritten.body.contains(" = witness_method $"))
+    }
+
     @Test("Ambiguous textual witness evidence remains dynamic")
     func rejectsAmbiguousStaticResolution() throws {
         let witnessType = "<Self where Self : Feature> "
@@ -410,7 +540,7 @@ struct ProtocolDispatchTests {
         #expect(rewritten.body.contains("witness_method"))
     }
 
-    @Test("Dynamic, conditional, missing, and external evidence stays unresolved")
+    @Test("Dynamic, unproven, missing, and external evidence stays unresolved")
     func rejectsUnsafeStaticResolutionBoundaries() throws {
         let requirementType = "<Self where Self : Feature> "
             + "(Self) -> () -> Int"

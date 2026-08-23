@@ -61,17 +61,66 @@ public struct TypeEnvironment: Sendable {
         var conformsToError: Bool
     }
 
+    private struct RawGenericDefinition: Sendable {
+        var key: Bytecode.LocalTypeKey
+        var parentScope: String?
+        var parameters: [String]
+        var requirements: [CanonicalSIL.GenericSignature.Requirement]
+        var kind: RawKind
+        var conformsToError: Bool
+    }
+
+    private struct NominalHeader {
+        var isFinal: Bool
+        var kind: String
+        var name: String
+        var conformances: [String]
+        var requirements: String?
+    }
+
+    private struct DefinitionInventory {
+        var concrete: [Bytecode.LocalTypeKey: RawDefinition]
+        var generic: [Bytecode.LocalTypeKey: RawGenericDefinition]
+    }
+
     private struct DefinitionParser {
         let lines: [String]
         var index = 0
         var definitions: [Bytecode.LocalTypeKey: RawDefinition] = [:]
+        var genericDefinitions: [
+            Bytecode.LocalTypeKey: RawGenericDefinition
+        ] = [:]
 
         // Canonical SIL starts with a declaration summary before function
         // bodies. Walk that brace tree so nested namespace identities remain
         // exact without treating arbitrary SIL text as a Swift type parser.
-        mutating func parse() throws -> [Bytecode.LocalTypeKey: RawDefinition] {
+        mutating func parse() throws -> DefinitionInventory {
             try scanScope(parentScope: nil, stopsAtClosingBrace: false)
-            return definitions
+            removeDefinitionsWithImplicitOuterArchetypes()
+            return .init(
+                concrete: definitions,
+                generic: genericDefinitions
+            )
+        }
+
+        private mutating func removeDefinitionsWithImplicitOuterArchetypes() {
+            let genericScopes = Set(
+                genericDefinitions.keys.map(\.rawValue)
+            )
+            func hasGenericAncestor(_ rawParent: String?) -> Bool {
+                var parent = rawParent
+                while let current = parent {
+                    if genericScopes.contains(current) { return true }
+                    parent = TypeEnvironment.parentScope(of: current)
+                }
+                return false
+            }
+            definitions = definitions.filter {
+                !hasGenericAncestor($0.value.parentScope)
+            }
+            genericDefinitions = genericDefinitions.filter {
+                !hasGenericAncestor($0.value.parentScope)
+            }
         }
 
         private mutating func scanScope(
@@ -100,10 +149,7 @@ public struct TypeEnvironment: Sendable {
                     try scanScope(parentScope: scope, stopsAtClosingBrace: true)
                     continue
                 }
-                if let header = TypeEnvironment.captures(
-                    line,
-                    pattern: TypeEnvironment.nominalHeaderPattern
-                ) {
+                if let header = try TypeEnvironment.nominalHeader(in: line) {
                     try parseNominal(header, parentScope: parentScope)
                     continue
                 }
@@ -121,16 +167,25 @@ public struct TypeEnvironment: Sendable {
         }
 
         private mutating func parseNominal(
-            _ header: [String],
+            _ header: NominalHeader,
             parentScope: String?
         ) throws {
-            let shortName = header[2]
-            guard !shortName.contains("<") else {
-                try skipBracedDeclaration()
-                return
+            let shortName = header.name
+            let declarationRequirements = header.requirements
+            let generic = CanonicalSIL.SwiftTypeIdentity.genericType(
+                CanonicalSIL.SwiftTypeIdentity.normalized(shortName)
+            )
+            let unqualifiedName = generic?.name ?? shortName
+            let genericParameters = generic?.arguments ?? []
+            guard genericParameters.allSatisfy(
+                CanonicalSIL.GenericSignature.isParameter
+            ), Set(genericParameters).count == genericParameters.count else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "nominal type \(shortName) has unsupported generic parameters"
+                )
             }
             let name = TypeEnvironment.qualified(
-                shortName,
+                unqualifiedName,
                 relativeTo: parentScope
             )
             let key = Bytecode.LocalTypeKey(rawValue: name)
@@ -144,18 +199,16 @@ public struct TypeEnvironment: Sendable {
                 let member = lines[index].trimmingCharacters(in: .whitespaces)
                 if member == "}" {
                     index += 1
-                    let conformances = header[3]
-                        .split(separator: ",")
-                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                    let conformances = header.conformances
                     // Existing non-final classes belong to the frozen Shell. A
                     // downloaded image can add only final logical classes, so
                     // do not accidentally reinterpret an ordinary app class as
                     // patch-local while the Shell is still being indexed.
-                    if header[1] == "class", header[0].isEmpty {
+                    if header.kind == "class", !header.isFinal {
                         return
                     }
                     let kind: RawKind
-                    switch header[1] {
+                    switch header.kind {
                     case "struct":
                         kind = .structure(fields)
                     case "enum":
@@ -165,47 +218,88 @@ public struct TypeEnvironment: Sendable {
                         kind = .class(
                             fields: fields,
                             superclass: inherited,
-                            isFinal: !header[0].isEmpty,
+                            isFinal: header.isFinal,
                             hostedMethods: hostedMethods
                         )
                     default:
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "unknown nominal declaration kind \(header[1])"
+                            "unknown nominal declaration kind \(header.kind)"
                         )
                     }
-                    let definition = RawDefinition(
-                        key: key,
-                        parentScope: TypeEnvironment.parentScope(of: name),
-                        kind: kind,
-                        conformsToError: conformances.contains("Error")
-                            || conformances.contains("Swift.Error")
-                    )
-                    guard definitions.updateValue(definition, forKey: key) == nil else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "duplicate nominal type \(name)"
+                    let conformsToError = conformances.contains("Error")
+                        || conformances.contains("Swift.Error")
+                    if genericParameters.isEmpty {
+                        let definition = RawDefinition(
+                            key: key,
+                            parentScope: TypeEnvironment.parentScope(of: name),
+                            kind: kind,
+                            conformsToError: conformsToError
                         )
+                        guard definitions.updateValue(
+                            definition,
+                            forKey: key
+                        ) == nil, genericDefinitions[key] == nil else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "duplicate nominal type \(name)"
+                            )
+                        }
+                    } else {
+                        let clauseText = "<" + genericParameters.joined(
+                            separator: ", "
+                        ) + (declarationRequirements.map {
+                            " where " + $0
+                        } ?? "") + ">"
+                        let clause: CanonicalSIL.GenericSignature.Clause
+                        do {
+                            clause = try CanonicalSIL.GenericSignature
+                                .standaloneClause(clauseText)
+                        } catch {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "generic nominal \(name) has an invalid signature"
+                            )
+                        }
+                        let definition = RawGenericDefinition(
+                            key: key,
+                            parentScope: TypeEnvironment.parentScope(of: name),
+                            parameters: clause.parameters,
+                            requirements: clause.requirements,
+                            kind: kind,
+                            conformsToError: conformsToError
+                        )
+                        guard genericDefinitions.updateValue(
+                            definition,
+                            forKey: key
+                        ) == nil, definitions[key] == nil else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "duplicate generic nominal type \(name)"
+                            )
+                        }
                     }
                     return
                 }
-                if let nested = TypeEnvironment.captures(
-                    member,
-                    pattern: TypeEnvironment.nominalHeaderPattern
-                ) {
-                    try parseNominal(nested, parentScope: name)
+                if let nested = try TypeEnvironment.nominalHeader(in: member) {
+                    if genericParameters.isEmpty {
+                        try parseNominal(nested, parentScope: name)
+                    } else {
+                        // Nested types of a generic context implicitly carry
+                        // outer archetypes. Keep that distinct shape closed
+                        // until it has an explicit frontend-backed model.
+                        try skipBracedDeclaration()
+                    }
                     continue
                 }
-                if header[1] == "struct" || header[1] == "class",
+                if header.kind == "struct" || header.kind == "class",
                    let field = TypeEnvironment.captures(
                     member,
                     pattern: TypeEnvironment.storedFieldPattern
                    ) {
                     fields.append(.init(name: field[0], type: field[1]))
-                } else if header[1] == "class",
+                } else if header.kind == "class",
                           let method = TypeEnvironment.hostedMethodDeclaration(
                             in: member
                           ) {
                     hostedMethods.append(method)
-                } else if header[1] == "enum",
+                } else if header.kind == "enum",
                           let declarations = try TypeEnvironment
                             .enumCaseDeclarations(in: member) {
                     for declaration in declarations {
@@ -243,6 +337,11 @@ public struct TypeEnvironment: Sendable {
     }
 
     private var rawDefinitions: [Bytecode.LocalTypeKey: RawDefinition]
+    private var rawGenericDefinitions: [
+        Bytecode.LocalTypeKey: RawGenericDefinition
+    ]
+    private var protocolConformances: CanonicalSIL.ProtocolConformance
+        .Environment?
     private var factoryCandidates: [CanonicalSIL.Function]
     private var structFactories: [String: StructFactory]
     private var classAllocators: [String: Bytecode.LocalTypeKey]
@@ -272,6 +371,8 @@ public struct TypeEnvironment: Sendable {
 
     public init() {
         rawDefinitions = [:]
+        rawGenericDefinitions = [:]
+        protocolConformances = nil
         factoryCandidates = []
         structFactories = [:]
         classAllocators = [:]
@@ -282,8 +383,17 @@ public struct TypeEnvironment: Sendable {
         mainActorNativeTypes = []
     }
 
-    init(text: String, functions: [CanonicalSIL.Function]) throws {
-        rawDefinitions = try Self.extractDefinitions(text)
+    init(
+        text: String,
+        functions: [CanonicalSIL.Function],
+        protocolConformances: CanonicalSIL.ProtocolConformance.Environment?
+            = nil
+    ) throws {
+        let inventory = try Self.extractDefinitions(text)
+        rawDefinitions = inventory.concrete
+        rawGenericDefinitions = inventory.generic
+        self.protocolConformances = try protocolConformances
+            ?? CanonicalSIL.ProtocolConformance.Environment(text: text)
         factoryCandidates = functions
         structFactories = [:]
         classAllocators = [:]
@@ -298,6 +408,9 @@ public struct TypeEnvironment: Sendable {
             || text.contains("Result<")
             || Self.hasClosureErrorBoundary(in: text)
             || rawDefinitions.values.contains(where: Self.hasStoredErrorPayload)
+            || rawGenericDefinitions.values.contains(
+                where: Self.hasStoredErrorPayload
+            )
         // Native aliases arrive from the frozen Shell after textual SIL is
         // parsed. Build everything whose field graph is already resolvable,
         // then rebuild strictly once those aliases have been injected.
@@ -340,6 +453,7 @@ public struct TypeEnvironment: Sendable {
             }
             if let local = localMatches.first {
                 result.rawDefinitions.removeValue(forKey: local)
+                result.rawGenericDefinitions.removeValue(forKey: local)
                 result.structFactories = result.structFactories.filter {
                     $0.value.key != local
                 }
@@ -644,6 +758,20 @@ public struct TypeEnvironment: Sendable {
     }
 
     private static func hasStoredErrorPayload(_ definition: RawDefinition) -> Bool {
+        guard definition.conformsToError else { return false }
+        switch definition.kind {
+        case let .structure(fields):
+            return !fields.isEmpty
+        case let .enumeration(cases):
+            return cases.contains { !$0.associatedTypes.isEmpty }
+        case let .class(fields, _, _, _):
+            return !fields.isEmpty
+        }
+    }
+
+    private static func hasStoredErrorPayload(
+        _ definition: RawGenericDefinition
+    ) -> Bool {
         guard definition.conformsToError else { return false }
         switch definition.kind {
         case let .structure(fields):
@@ -1080,6 +1208,47 @@ public struct TypeEnvironment: Sendable {
         localKey(for: raw, relativeTo: nil)
     }
 
+    /// Returns whether a SIL member owner names one declaration in the local
+    /// nominal inventory. Generic member syntax names the declaration without
+    /// concrete arguments, so it cannot be resolved to a `LocalTypeKey` yet.
+    func containsLocalDeclaration(_ raw: String) -> Bool {
+        let declaration = raw.trimmingCharacters(in: .whitespaces)
+        let exact = Bytecode.LocalTypeKey(rawValue: declaration)
+        if rawDefinitions[exact] != nil || rawGenericDefinitions[exact] != nil {
+            return true
+        }
+        let suffix = "." + declaration
+        let matches = Set(
+            rawDefinitions.keys.filter { $0.rawValue.hasSuffix(suffix) }
+                + rawGenericDefinitions.keys.filter {
+                    $0.rawValue.hasSuffix(suffix)
+                }
+        )
+        return matches.count == 1
+    }
+
+    /// SIL member references name the generic declaration (`#Box.value`),
+    /// while operand types name a concrete instance (`Box<Int>`). This is the
+    /// sole declaration/instance equivalence rule used by aggregate lowering.
+    func matchesLocalDeclaration(
+        _ rawDeclaration: String,
+        concrete key: Bytecode.LocalTypeKey
+    ) -> Bool {
+        if localKey(for: rawDeclaration) == key { return true }
+        guard let instance = genericInstantiation(
+            for: key.rawValue,
+            relativeTo: nil
+        ), instance.key == key else { return false }
+        let declaration = rawDeclaration.trimmingCharacters(in: .whitespaces)
+        let expected = instance.definition.key.rawValue
+        if declaration == expected { return true }
+        let suffix = "." + declaration
+        let matches = rawGenericDefinitions.keys.filter {
+            $0.rawValue.hasSuffix(suffix)
+        }
+        return matches.count == 1 && matches.first == instance.definition.key
+    }
+
     private func localKey(
         for raw: String,
         relativeTo parentScope: String?
@@ -1093,6 +1262,12 @@ public struct TypeEnvironment: Sendable {
             )
             if rawDefinitions[relative] != nil { return relative }
         }
+        if let generic = genericInstantiation(
+            for: type,
+            relativeTo: parentScope
+        ) {
+            return generic.key
+        }
         if let separator = type.firstIndex(of: ".") {
             let withoutModule = Bytecode.LocalTypeKey(
                 rawValue: String(type[type.index(after: separator)...])
@@ -1104,6 +1279,81 @@ public struct TypeEnvironment: Sendable {
         return matches.count == 1 ? matches[0] : nil
     }
 
+    private struct GenericInstantiation {
+        var definition: RawGenericDefinition
+        var arguments: [String]
+        var key: Bytecode.LocalTypeKey
+    }
+
+    private func genericInstantiation(
+        for raw: String,
+        relativeTo parentScope: String?
+    ) -> GenericInstantiation? {
+        let normalized = CanonicalSIL.SwiftTypeIdentity.normalized(raw)
+        guard let application = CanonicalSIL.SwiftTypeIdentity.genericType(
+            normalized
+        ) else { return nil }
+
+        let definition: RawGenericDefinition
+        if let exact = rawGenericDefinitions[
+            .init(rawValue: application.name)
+        ] {
+            // A declaration-qualified identity is authoritative. Do not also
+            // reinterpret its first component as a module shorthand.
+            definition = exact
+        } else if let parentScope,
+                  let relative = rawGenericDefinitions[
+                    .init(rawValue: parentScope + "." + application.name)
+                  ] {
+            definition = relative
+        } else {
+            var lookupNames = [application.name]
+            if let separator = application.name.firstIndex(of: ".") {
+                lookupNames.append(
+                    String(application.name[
+                        application.name.index(after: separator)...
+                    ])
+                )
+            }
+            var candidates = lookupNames.compactMap {
+                rawGenericDefinitions[.init(rawValue: $0)]
+            }
+            for lookupName in lookupNames {
+                let suffix = "." + lookupName
+                candidates += rawGenericDefinitions.values.filter {
+                    $0.key.rawValue.hasSuffix(suffix)
+                }
+            }
+            let matches = Dictionary(
+                grouping: candidates,
+                by: { $0.key }
+            ).compactMap(\.value.first)
+            guard matches.count == 1, let match = matches.first else {
+                return nil
+            }
+            definition = match
+        }
+        guard
+              definition.parameters.count == application.arguments.count,
+              (try? CanonicalSIL.GenericSignature.containsAny(
+                of: definition.parameters,
+                in: application.arguments.joined(separator: ",")
+              )) == false,
+              application.arguments.allSatisfy({
+                (try? resolve($0, relativeTo: parentScope)) != nil
+              })
+        else { return nil }
+        let key = Bytecode.LocalTypeKey(
+            rawValue: definition.key.rawValue + "<"
+                + application.arguments.joined(separator: ", ") + ">"
+        )
+        return .init(
+            definition: definition,
+            arguments: application.arguments,
+            key: key
+        )
+    }
+
     private func localKeys(
         matchingNativeName canonicalName: String
     ) -> [Bytecode.LocalTypeKey] {
@@ -1111,7 +1361,22 @@ public struct TypeEnvironment: Sendable {
         if let separator = canonicalName.firstIndex(of: ".") {
             spellings.insert(String(canonicalName[canonicalName.index(after: separator)...]))
         }
-        return rawDefinitions.keys.filter { spellings.contains($0.rawValue) }.sorted()
+        if let generic = CanonicalSIL.SwiftTypeIdentity.genericType(
+            CanonicalSIL.SwiftTypeIdentity.normalized(canonicalName)
+        ) {
+            spellings.insert(generic.name)
+            if let separator = generic.name.firstIndex(of: ".") {
+                spellings.insert(
+                    String(generic.name[generic.name.index(after: separator)...])
+                )
+            }
+        }
+        return Set(
+            rawDefinitions.keys.filter { spellings.contains($0.rawValue) }
+                + rawGenericDefinitions.keys.filter {
+                    spellings.contains($0.rawValue)
+                }
+        ).sorted()
     }
 
     private func explicitAddressPointee(in type: String) -> String? {
@@ -1525,103 +1790,56 @@ public struct TypeEnvironment: Sendable {
 
     func definition(for key: Bytecode.LocalTypeKey) throws -> Bytecode.LocalTypeDefinition {
         if let raw = rawDefinitions[key] {
-            let kind: Bytecode.LocalTypeKind
-            switch raw.kind {
-            case let .structure(fields):
-                kind = .structure(
-                    fields: try fields.map {
-                        .init(
-                            name: $0.name,
-                            type: ValueRepresentation.storable(
-                                try resolve(
-                                    $0.type,
-                                    relativeTo: raw.parentScope
-                                )
-                            )
-                        )
-                    }
-                )
-            case let .enumeration(cases):
-                kind = .enumeration(
-                    cases: try cases.map { item in
-                        let payload: Bytecode.ValueType?
-                        switch item.associatedTypes.count {
-                        case 0:
-                            payload = nil
-                        case 1:
-                            let value = ValueRepresentation.storable(
-                                try resolve(
-                                    removeTupleLabel(item.associatedTypes[0]),
-                                    relativeTo: raw.parentScope
-                                )
-                            )
-                            // Swift represents a single labeled associated
-                            // value as a one-element tuple in canonical SIL;
-                            // an unlabeled single value remains scalar.
-                            payload = splitTopLevelKeyValue(
-                                item.associatedTypes[0]
-                            ) == nil ? value : .tuple([value])
-                        default:
-                            payload = .tuple(
-                                try item.associatedTypes.map {
-                                    ValueRepresentation.storable(
-                                        try resolve(
-                                            removeTupleLabel($0),
-                                            relativeTo: raw.parentScope
-                                        )
-                                    )
-                                }
-                            )
-                        }
-                        return .init(name: item.name, payloadType: payload)
-                    }
-                )
-            case let .class(fields, superclass, isFinal, _):
-                guard isFinal else {
+            return try materializeDefinition(
+                key: key,
+                parentScope: raw.parentScope,
+                kind: raw.kind,
+                conformsToError: raw.conformsToError,
+                substitutions: [:]
+            )
+        }
+        if let generic = genericInstantiation(
+            for: key.rawValue,
+            relativeTo: nil
+        ), generic.key == key {
+            let bindings = Dictionary(
+                uniqueKeysWithValues: zip(
+                    generic.definition.parameters,
+                    generic.arguments
+                ).map { ($0.0, $0.1) }
+            )
+            let substitutions: [String: String]
+            if generic.definition.requirements.isEmpty {
+                substitutions = bindings
+            } else {
+                guard let protocolConformances else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
-                        "non-final patch-local class \(key)"
+                        "generic nominal \(key) has no conformance environment"
                     )
                 }
-                let hostedSuperclass: Bytecode.HostedSuperclass?
-                if let superclass {
-                    switch try? resolve(superclass, relativeTo: raw.parentScope) {
-                    case let .native(typeID):
-                        hostedSuperclass = .init(typeID: typeID)
-                    case let .local(parentKey):
-                        throw CanonicalSIL.LoweringError.unsupportedType(
-                            "patch-local class inheritance \(key): \(parentKey)"
-                        )
-                    case nil:
-                        // Protocol-only inheritance does not affect object layout.
-                        hostedSuperclass = nil
-                    default:
-                        throw CanonicalSIL.LoweringError.unsupportedType(
-                            "class superclass \(superclass)"
-                        )
-                    }
-                } else {
-                    hostedSuperclass = nil
-                }
-                kind = .class(
-                    fields: try fields.map {
-                        .init(
-                            name: $0.name,
-                            type: ValueRepresentation.storable(
-                                try resolve(
-                                    $0.type,
-                                    relativeTo: raw.parentScope
-                                )
-                            )
-                        )
-                    },
-                    hostedSuperclass: hostedSuperclass,
-                    hostedMethods: []
+                let clause = CanonicalSIL.GenericSignature.Clause(
+                    parameters: generic.definition.parameters,
+                    requirements: generic.definition.requirements
                 )
+                do {
+                    substitutions = try CanonicalSIL.GenericSignature.resolve(
+                        clause,
+                        bindings: bindings,
+                        conformances: protocolConformances,
+                        typeEnvironment: self
+                    ).substitutions
+                } catch {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "generic nominal \(key) does not satisfy its constraints: \(error)"
+                    )
+                }
             }
-            return .init(
+            return try materializeDefinition(
                 key: key,
-                kind: kind,
-                conformsToError: raw.conformsToError
+                parentScope: generic.definition.parentScope,
+                kind: generic.definition.kind,
+                conformsToError: generic.definition.conformsToError,
+                substitutions: substitutions
             )
         }
         // A concrete Result is represented as a patch-local enum; no Swift metadata
@@ -1651,6 +1869,121 @@ public struct TypeEnvironment: Sendable {
             )
         }
         throw CanonicalSIL.LoweringError.unsupportedType(key.rawValue)
+    }
+
+    private func materializeDefinition(
+        key: Bytecode.LocalTypeKey,
+        parentScope: String?,
+        kind rawKind: RawKind,
+        conformsToError: Bool,
+        substitutions: [String: String]
+    ) throws -> Bytecode.LocalTypeDefinition {
+        func concrete(_ raw: String) throws -> String {
+            try CanonicalSIL.GenericSignature.substituting(
+                substitutions,
+                in: raw,
+                preservesQuotedSpellings: false
+            )
+        }
+
+        let kind: Bytecode.LocalTypeKind
+        switch rawKind {
+        case let .structure(fields):
+            kind = .structure(
+                fields: try fields.map {
+                    .init(
+                        name: $0.name,
+                        type: ValueRepresentation.storable(
+                            try resolve(
+                                concrete($0.type),
+                                relativeTo: parentScope
+                            )
+                        )
+                    )
+                }
+            )
+        case let .enumeration(cases):
+            kind = .enumeration(
+                cases: try cases.map { item in
+                    let concreteTypes = try item.associatedTypes.map(concrete)
+                    let payload: Bytecode.ValueType?
+                    switch concreteTypes.count {
+                    case 0:
+                        payload = nil
+                    case 1:
+                        let value = ValueRepresentation.storable(
+                            try resolve(
+                                removeTupleLabel(concreteTypes[0]),
+                                relativeTo: parentScope
+                            )
+                        )
+                        // Swift represents a single labeled associated value
+                        // as a one-element tuple in canonical SIL.
+                        payload = splitTopLevelKeyValue(concreteTypes[0]) == nil
+                            ? value : .tuple([value])
+                    default:
+                        payload = .tuple(
+                            try concreteTypes.map {
+                                ValueRepresentation.storable(
+                                    try resolve(
+                                        removeTupleLabel($0),
+                                        relativeTo: parentScope
+                                    )
+                                )
+                            }
+                        )
+                    }
+                    return .init(name: item.name, payloadType: payload)
+                }
+            )
+        case let .class(fields, rawSuperclass, isFinal, _):
+            guard isFinal else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "non-final patch-local class \(key)"
+                )
+            }
+            let hostedSuperclass: Bytecode.HostedSuperclass?
+            if let rawSuperclass {
+                let superclass = try concrete(rawSuperclass)
+                switch try? resolve(superclass, relativeTo: parentScope) {
+                case let .native(typeID):
+                    hostedSuperclass = .init(typeID: typeID)
+                case let .local(parentKey):
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "patch-local class inheritance \(key): \(parentKey)"
+                    )
+                case nil:
+                    // Protocol-only inheritance does not affect object layout.
+                    hostedSuperclass = nil
+                default:
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "class superclass \(superclass)"
+                    )
+                }
+            } else {
+                hostedSuperclass = nil
+            }
+            kind = .class(
+                fields: try fields.map {
+                    .init(
+                        name: $0.name,
+                        type: ValueRepresentation.storable(
+                            try resolve(
+                                concrete($0.type),
+                                relativeTo: parentScope
+                            )
+                        )
+                    )
+                },
+                hostedSuperclass: hostedSuperclass,
+                hostedMethods: []
+            )
+        }
+        return .init(
+            key: key,
+            kind: kind,
+            conformsToError: conformsToError
+        )
     }
 
     func definitions(
@@ -2010,9 +2343,85 @@ public struct TypeEnvironment: Sendable {
     }
 
     func isClass(_ key: Bytecode.LocalTypeKey) -> Bool {
-        guard let raw = rawDefinitions[key] else { return false }
-        if case .class = raw.kind { return true }
+        if let raw = rawDefinitions[key], case .class = raw.kind {
+            return true
+        }
+        if let generic = genericInstantiation(
+            for: key.rawValue,
+            relativeTo: nil
+        ), generic.key == key, case .class = generic.definition.kind {
+            return true
+        }
         return false
+    }
+
+    func isReferenceType(_ raw: String) -> Bool {
+        guard let type = try? resolve(raw) else { return false }
+        switch type {
+        case let .local(key):
+            return isClass(key)
+        case let .native(typeID):
+            return nativeTypeKinds[typeID] == .reference
+        default:
+            return false
+        }
+    }
+
+    func satisfiesSuperclassConstraint(
+        concrete: String,
+        superclass: String
+    ) -> Bool {
+        guard isReferenceType(superclass),
+              let concreteType = try? resolve(concrete),
+              let superclassType = try? resolve(superclass)
+        else { return false }
+        if concreteType == superclassType { return true }
+        guard case let .local(key) = concreteType,
+              case let .native(superclassID) = superclassType,
+              let hosted = try? hostedSuperclass(for: key)
+        else { return false }
+        return hosted.typeID == superclassID
+    }
+
+    /// Supplies only Swift conformances whose semantics are already defined by
+    /// the portable value model. User and framework conformances must come
+    /// from exact frontend witness evidence instead of being inferred from a
+    /// coincidentally similar storage representation.
+    func standardConformanceAssociatedTypes(
+        concrete raw: String,
+        protocolName: String
+    ) -> [String: String]? {
+        let name = protocolName.hasPrefix("Swift.")
+            ? String(protocolName.dropFirst("Swift.".count))
+            : protocolName
+        // Progressions such as Range<Int> have a compiler-owned Sequence
+        // representation but are not ordinary storable collection values.
+        // Validate every standard Sequence family through the shared semantic
+        // classifier before consulting its closed conformance hierarchy.
+        if (try? representedSequenceElement(raw, relativeTo: nil)) != nil,
+           let evidence = CanonicalSIL.StandardConformance.associatedTypes(
+            concrete: raw,
+            protocolName: protocolName
+        ) {
+            return evidence
+        }
+        guard let type = try? resolve(raw) else { return nil }
+        switch name {
+        case "Equatable" where type.isVMEquatable:
+            return [:]
+        case "Hashable" where type.isVMHashable:
+            return [:]
+        case "Comparable" where type.isVMComparable:
+            return [:]
+        case "Error":
+            if type == .never { return [:] }
+            guard case let .local(key) = type,
+                  (try? definition(for: key).conformsToError) == true
+            else { return nil }
+            return [:]
+        default:
+            return nil
+        }
     }
 
     func storedFieldIndex(
@@ -2198,7 +2607,8 @@ public struct TypeEnvironment: Sendable {
             if let projection = captures(
                 line,
                 pattern: #"^(%[0-9]+) = struct_element_addr (%[0-9]+), #(.+)\.([^.]+)$"#
-            ), projection[1] == "%0", localKey(for: projection[2]) == key,
+            ), projection[1] == "%0",
+               matchesLocalDeclaration(projection[2], concrete: key),
                let fieldIndex = fields.firstIndex(where: {
                    $0.name == projection[3]
                }) {
@@ -2344,14 +2754,94 @@ public struct TypeEnvironment: Sendable {
 
     private static func extractDefinitions(
         _ text: String
-    ) throws -> [Bytecode.LocalTypeKey: RawDefinition] {
+    ) throws -> DefinitionInventory {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         var parser = DefinitionParser(lines: lines)
         return try parser.parse()
     }
 
+    private static func nominalHeader(
+        in line: String
+    ) throws -> NominalHeader? {
+        guard let captures = captures(
+            line,
+            pattern: nominalHeaderPattern
+        ) else { return nil }
+        var declaration = captures[2]
+            .trimmingCharacters(in: .whitespaces)
+        let requirements: String?
+        let wherePartition: (before: String, after: String)?
+        do {
+            wherePartition = try CanonicalSIL.GenericSignature
+                .partitionTopLevel(declaration, at: " where ")
+        } catch {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "nominal declaration has unbalanced generic syntax"
+            )
+        }
+        if let partition = wherePartition {
+            guard !partition.before.isEmpty, !partition.after.isEmpty else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "nominal declaration has an empty where clause"
+                )
+            }
+            declaration = partition.before
+            requirements = partition.after
+        } else {
+            requirements = nil
+        }
+
+        let name: String
+        let conformances: [String]
+        let inheritancePartition: (before: String, after: String)?
+        do {
+            inheritancePartition = try CanonicalSIL.GenericSignature
+                .partitionTopLevel(declaration, at: ":")
+        } catch {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "nominal declaration has unbalanced inheritance syntax"
+            )
+        }
+        if let partition = inheritancePartition {
+            guard !partition.before.isEmpty, !partition.after.isEmpty else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "nominal declaration has an empty inheritance clause"
+                )
+            }
+            name = partition.before
+            do {
+                conformances = try CanonicalSIL.GenericSignature
+                    .splitTopLevel(partition.after)
+            } catch {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "nominal inheritance clause is malformed"
+                )
+            }
+            guard conformances.allSatisfy({ !$0.isEmpty }) else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "nominal inheritance clause contains an empty type"
+                )
+            }
+        } else {
+            name = declaration
+            conformances = []
+        }
+        guard !name.isEmpty else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "nominal declaration has no name"
+            )
+        }
+        return .init(
+            isFinal: !captures[0].isEmpty,
+            kind: captures[1],
+            name: name,
+            conformances: conformances,
+            requirements: requirements
+        )
+    }
+
     private static let nominalHeaderPattern =
-        #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate)\s+)*(?:(final)\s+)?(?:indirect )?(struct|enum|class)\s+([^\s:{]+)(?:\s*:\s*([^\{]+))?\s*\{$"#
+        #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate)\s+)*(?:(final)\s+)?(?:indirect )?(struct|enum|class)\s+(.+?)\s*\{$"#
     private static let extensionHeaderPattern =
         #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate)\s+)*extension\s+([^\s:{]+)(?:\s*:\s*[^\{]+)?(?:\s+where\s+[^\{]+)?\s*\{$"#
     private static let storedFieldPattern =

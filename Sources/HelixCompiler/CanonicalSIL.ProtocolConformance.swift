@@ -11,6 +11,11 @@ extension CanonicalSIL.ProtocolConformance {
         var symbol: String?
     }
 
+    struct ConditionalConformance: Hashable, Sendable {
+        var requirement: String
+        var evidence: String
+    }
+
     struct Record: Hashable, Sendable {
         var conformingType: String
         var protocolName: String
@@ -18,6 +23,7 @@ extension CanonicalSIL.ProtocolConformance {
         var genericClause: String?
         var associatedTypes: [String: String]
         var associatedConformances: [String: String]
+        var conditionalConformances: [ConditionalConformance]
         var baseProtocols: [String]
         var witnesses: [Witness]
         var unsupportedMembers: [String]
@@ -84,6 +90,7 @@ extension CanonicalSIL.ProtocolConformance {
                 guard hasBody else { continue }
                 var associatedTypes: [String: String] = [:]
                 var associatedConformances: [String: String] = [:]
+                var conditionalConformances: [ConditionalConformance] = []
                 var baseProtocols = Set<String>()
                 var witnesses: [Witness] = []
                 var unsupportedMembers: [String] = []
@@ -139,6 +146,18 @@ extension CanonicalSIL.ProtocolConformance {
                                     + "\(header.conformingType): \(header.protocolName)"
                             )
                         }
+                    } else if let conformance = try Self
+                        .conditionalConformance(in: member) {
+                        guard !conditionalConformances.contains(
+                            where: { $0.requirement == conformance.requirement }
+                        ) else {
+                            throw Self.malformed(
+                                "duplicate conditional conformance "
+                                    + "\(conformance.requirement) in "
+                                    + "\(header.conformingType): \(header.protocolName)"
+                            )
+                        }
+                        conditionalConformances.append(conformance)
                     } else if let witness = try Self.witness(in: member) {
                         // SILDeclRef text can erase argument labels. Consequently,
                         // distinct protocol requirements may have the same printed
@@ -157,6 +176,14 @@ extension CanonicalSIL.ProtocolConformance {
                             + "\(header.conformingType): \(header.protocolName)"
                     )
                 }
+                if !Self.conditionalConformancesAreCovered(
+                    conditionalConformances,
+                    by: header.genericClause
+                ) {
+                    unsupportedMembers.append(
+                        "inconsistent conditional conformance evidence"
+                    )
+                }
                 parsed.append(
                     .init(
                         conformingType: header.conformingType,
@@ -165,6 +192,7 @@ extension CanonicalSIL.ProtocolConformance {
                         genericClause: header.genericClause,
                         associatedTypes: associatedTypes,
                         associatedConformances: associatedConformances,
+                        conditionalConformances: conditionalConformances,
                         baseProtocols: baseProtocols.sorted(),
                         witnesses: witnesses,
                         unsupportedMembers: unsupportedMembers
@@ -345,6 +373,90 @@ extension CanonicalSIL.ProtocolConformance {
                 throw malformed("base protocol has an invalid identity")
             }
             return name
+        }
+
+        private static func conditionalConformance(
+            in line: String
+        ) throws -> ConditionalConformance? {
+            let prefix = "conditional_conformance "
+            guard line.hasPrefix(prefix) else { return nil }
+            let body = String(line.dropFirst(prefix.count))
+            guard let separator = topLevelSeparator(":", in: body) else {
+                throw malformed("conditional conformance has no evidence")
+            }
+            var requirement = body[..<separator]
+                .trimmingCharacters(in: .whitespaces)
+            let evidence = body[body.index(after: separator)...]
+                .trimmingCharacters(in: .whitespaces)
+            if requirement.first == "(", requirement.last == ")" {
+                requirement.removeFirst()
+                requirement.removeLast()
+                requirement = requirement.trimmingCharacters(in: .whitespaces)
+            }
+            guard !requirement.isEmpty, !evidence.isEmpty,
+                  requirement.rangeOfCharacter(from: .newlines) == nil,
+                  evidence.rangeOfCharacter(from: .newlines) == nil
+            else {
+                throw malformed("conditional conformance is malformed")
+            }
+            return .init(requirement: requirement, evidence: evidence)
+        }
+
+        private static func conditionalConformancesAreCovered(
+            _ values: [ConditionalConformance],
+            by rawClause: String?
+        ) -> Bool {
+            guard !values.isEmpty else { return true }
+            guard let rawClause,
+                  let clause = try? CanonicalSIL.GenericSignature
+                    .standaloneClause(rawClause)
+            else { return false }
+
+            var declared = Set<String>()
+            for requirement in clause.requirements
+            where requirement.relation == .conformance {
+                guard let constraints = try? CanonicalSIL.GenericSignature
+                    .splitComposition(requirement.right)
+                else { return false }
+                for constraint in constraints {
+                    declared.insert(
+                        normalizedRequirement(
+                            left: requirement.left,
+                            right: constraint
+                        )
+                    )
+                }
+            }
+
+            var seen = Set<String>()
+            for value in values {
+                guard let partition = try? CanonicalSIL.GenericSignature
+                    .partitionTopLevel(value.requirement, at: ":"),
+                      !partition.before.isEmpty,
+                      !partition.after.isEmpty,
+                      let constraints = try? CanonicalSIL.GenericSignature
+                        .splitComposition(partition.after),
+                      !constraints.isEmpty
+                else { return false }
+                for constraint in constraints {
+                    let key = normalizedRequirement(
+                        left: partition.before,
+                        right: constraint
+                    )
+                    guard declared.contains(key), seen.insert(key).inserted else {
+                        return false
+                    }
+                }
+            }
+            return true
+        }
+
+        private static func normalizedRequirement(
+            left: String,
+            right: String
+        ) -> String {
+            left.filter { !$0.isWhitespace }
+                + ":" + right.filter { !$0.isWhitespace }
         }
 
         private static func witness(in line: String) throws -> Witness? {

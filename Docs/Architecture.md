@@ -581,20 +581,34 @@ Both workflows depend on stable, build-specific identities:
   its capture storage is normalized exactly once.
   Semantic SIL generic helpers reached through concrete `apply`, `try_apply`,
   or `partial_apply` sites enter the same image-function graph. The compiler
-  parses the declaration's outer generic clause, substitutes only complete
-  type tokens, assigns a deterministic specialization identity, and binds the
-  concrete image body back to the original Swift symbol plus its exact argument
-  list. Multiple concrete instantiations and recursive calls therefore remain
-  distinct, statically typed targets without depending on optimizer-private
-  symbols. Once a body is concrete, closed protocol dispatch matches the exact
-  conforming nominal, full requirement ABI, and one complete witness record,
-  then rewrites `apply`, `try_apply`, and `partial_apply` to the concrete
-  frontend-emitted thunk. Getter/setter, static, mutating, throwing, inherited,
-  and default-implementation chains for patch-local struct, enum, and class
-  conformers therefore remain ordinary statically typed image calls; witness
-  metadata never enters HLBC. Unresolved archetypes, packs, unstable declaration
-  parameters, conditional conformances, unavailable targets, and textually
-  ambiguous requirements fail before lowering.
+  parses every successive outer generic clause and proves concrete conformance,
+  same-type, superclass/`AnyObject`, and dependent associated-type requirements
+  before token substitution. Exact complete frontend records are authoritative.
+  For standard value families already represented by Helix, a closed
+  toolchain-checked `Sequence`/`Collection` hierarchy supplies only the
+  conformance and associated-type identities that the value model proves; it
+  never infers a custom conformance from a similar storage shape. A conditional
+  conformance is usable only when its instantiated requirements recursively
+  prove in the same closed environment. Each argument list receives
+  a deterministic specialization identity bound to the original Swift symbol,
+  so multiple instantiations, constrained extension methods, and recursive calls
+  remain distinct statically typed targets without optimizer-private symbols.
+  File/module-scope generic struct, enum, and final-class declarations are kept
+  as templates and materialized only for reachable concrete argument lists;
+  their fields, cases, superclass projection, and methods use the same solved
+  substitutions. Concrete opaque results are similarly replaced from the exact
+  frontend entry result buffers, including outer-generic and ordered multiple
+  opaque results, before ordinary specialization. No opaque identity, generic
+  metadata, or witness table enters HLBC. Once a body is concrete, closed
+  protocol dispatch matches the exact conforming nominal, full requirement ABI,
+  and one complete witness record, then rewrites `apply`, `try_apply`, and
+  `partial_apply` to the concrete frontend-emitted thunk. Getter/setter, static,
+  mutating, throwing, inherited, and default-implementation chains therefore
+  remain ordinary image calls. Unresolved archetypes, packs, unproven or
+  recursive conditional evidence, unavailable targets, ambiguous requirements,
+  and generic-context nested nominals fail before lowering. Mixed direct/
+  indirect physical multi-results and throwing calls with several indirect
+  normal results also remain fail-closed rather than inventing a Swift ABI.
   Immutable protocol existentials use the same inventory through a separate
   closed-world plan. The compiler retains the source `any P` identity—including
   compositions, inherited requirements, and `AnyObject` constraints—while HLBC

@@ -62,8 +62,8 @@ public struct File: Sendable {
     public var functions: [CanonicalSIL.Function]
     public var typeEnvironment: CanonicalSIL.TypeEnvironment
     let protocolConformances: CanonicalSIL.ProtocolConformance.Environment
-    private let protocolDispatch: CanonicalSIL.ProtocolConformance
-        .StaticDispatch.Rewriter
+    private let protocolDispatchInventory: CanonicalSIL.ProtocolConformance
+        .StaticDispatch.Inventory
     private let sourceModuleByFile: [String: String]
 
     public init(text: String) throws {
@@ -82,21 +82,38 @@ public struct File: Sendable {
             }
             declarationLocations[symbol] = scope.location
         }
-        let parsedFunctions = try Self.extractFunctions(
+        let extractedFunctions = try Self.extractFunctions(
             text,
             scopeLocations: scopeLocations,
             declarationLocations: declarationLocations
         )
+        let parsedFunctions = extractedFunctions.map(
+            CanonicalSIL.OpaqueResult.concretize
+        )
         let parsedConformances = try CanonicalSIL.ProtocolConformance
             .Environment(text: text)
-        let dispatch = CanonicalSIL.ProtocolConformance.StaticDispatch.Rewriter(
+        let rawTypeEnvironment = try CanonicalSIL.TypeEnvironment(
+            text: text,
+            functions: parsedFunctions,
+            protocolConformances: parsedConformances
+        )
+        let dispatchInventory = CanonicalSIL.ProtocolConformance
+            .StaticDispatch.Inventory(
             conformances: parsedConformances,
-            availableFunctions: parsedFunctions
+            availableFunctions: parsedFunctions,
+        )
+        let dispatch = CanonicalSIL.ProtocolConformance.StaticDispatch.Rewriter(
+            inventory: dispatchInventory,
+            typeEnvironment: rawTypeEnvironment
         )
         functions = parsedFunctions.map { dispatch.rewrite($0) }
-        typeEnvironment = try .init(text: text, functions: functions)
+        typeEnvironment = try .init(
+            text: text,
+            functions: functions,
+            protocolConformances: parsedConformances
+        )
         protocolConformances = parsedConformances
-        protocolDispatch = dispatch
+        protocolDispatchInventory = dispatchInventory
         sourceModuleByFile = sourceModules
     }
 
@@ -116,17 +133,39 @@ public struct File: Sendable {
 
     func materializeGenericFunction(
         _ function: CanonicalSIL.Function,
-        arguments: String
+        arguments: String,
+        typeEnvironment: CanonicalSIL.TypeEnvironment
     ) throws -> CanonicalSIL.GenericFunction.Materialized {
         var materialized = try CanonicalSIL.GenericFunction.specialize(
             function,
-            arguments: arguments
+            arguments: arguments,
+            conformances: protocolConformances,
+            typeEnvironment: typeEnvironment
         )
-        materialized.function = protocolDispatch.rewrite(
-            materialized.function,
+        materialized.function = rewritingClosedProtocolDispatch(
+            in: materialized.function,
+            typeEnvironment: typeEnvironment,
             moduleName: owningModule(of: function)
         )
         return materialized
+    }
+
+    /// Resolves closed witness lookups against the compilation environment in
+    /// effect at the call site. Native type identity and kind metadata arrive
+    /// after canonical SIL parsing, so an environment-bound rewriter must not
+    /// be cached by `File`.
+    func rewritingClosedProtocolDispatch(
+        in function: CanonicalSIL.Function,
+        typeEnvironment: CanonicalSIL.TypeEnvironment,
+        moduleName: String? = nil
+    ) -> CanonicalSIL.Function {
+        CanonicalSIL.ProtocolConformance.StaticDispatch.Rewriter(
+            inventory: protocolDispatchInventory,
+            typeEnvironment: typeEnvironment
+        ).rewrite(
+            function,
+            moduleName: moduleName ?? owningModule(of: function)
+        )
     }
 
     func owningModule(

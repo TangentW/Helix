@@ -128,7 +128,7 @@ enum StorageInitialization {
         body: String,
         directCalls: CanonicalSIL.DirectCallTable,
         typeEnvironment: CanonicalSIL.TypeEnvironment,
-        indirectResultType: Bytecode.ValueType? = nil,
+        indirectResultTypes: [Bytecode.ValueType] = [],
         indirectErrorType: Bytecode.ValueType? = nil
     ) throws -> Plan {
         let lines = body.split(
@@ -147,8 +147,8 @@ enum StorageInitialization {
         ] = [:]
         var pointees: [String: Bytecode.ValueType] = [:]
 
-        let hiddenOutputTypes = [indirectResultType, indirectErrorType]
-            .compactMap { $0 }
+        let hiddenOutputTypes = indirectResultTypes
+            + [indirectErrorType].compactMap { $0 }
         if !hiddenOutputTypes.isEmpty {
             guard let parameters = entryBlockParameters(in: lines),
                   parameters.count >= hiddenOutputTypes.count

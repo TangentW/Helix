@@ -288,6 +288,20 @@ witnesses outside the downloaded execution surface. If recursive conversion
 would collapse distinct Dictionary keys or Set elements, HLVM raises a
 controlled trap matching Swift's terminating collection-invariant check.
 
+Concrete same-image generic execution is compile-time-only. Successive generic
+clauses are solved against exact complete frontend conformance evidence,
+including same-type, superclass/`AnyObject`, dependent associated-type, and
+recursively proven conditional-conformance requirements. Represented standard
+values additionally use a closed, toolchain-checked `Sequence`/`Collection`
+hierarchy that contributes only proven associated identities; it never treats
+matching storage as a custom conformance. Reachable generic
+helpers and constrained extension methods are monomorphized; file/module-scope
+generic struct, enum, and final-class templates materialize only concrete image
+instances. Exact frontend entry result buffers similarly replace single,
+outer-generic, and ordered multiple opaque results with their underlying types.
+No generic, opaque, or witness metadata is serialized, and unresolved or
+open-world evidence remains rejected.
+
 Immutable local protocol existentials use a stricter closed-world form of that
 representation. For complete, nonconditional current-module conformers, the
 compiler retains `any P` identity and emits bounded exact-type cast sets and
@@ -400,9 +414,10 @@ NativeImport adapters rather than API-specific runtime behavior. All ABI,
 schema, capability, and product versions remain 1/1.0.
 
 It is not arbitrary Swift. Generic roots, runtime metadata or runtime,
-conditional, open-world, ambiguous, or mutable-existential witness dispatch
-(closed concrete and immutable closed-existential patch-local witnesses are
-compiler-resolved image calls), Swift protocol existential values crossing a
+unproven conditional, open-world, ambiguous, or mutable-existential witness
+dispatch (proven closed concrete—including conditional—and immutable
+closed-existential patch-local witnesses are compiler-resolved image calls),
+Swift protocol existential values crossing a
 Shell or ordinary NativeImport boundary, a patch concrete Swift type identity
 visible to native code, function-local
 nominal declarations, hosted stored properties/custom initializers/arbitrary

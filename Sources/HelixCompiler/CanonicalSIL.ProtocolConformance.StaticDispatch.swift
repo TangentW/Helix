@@ -14,27 +14,59 @@ enum StaticDispatch {
         var symbol: String
         var functionType: String
         var witnessFunctionType: String
+        var conformingType: String
+        var conformerGenericArguments: [String]
+        var sourceGenericParameterCount: Int
+        var genericParameterCount: Int
     }
 
-    struct Rewriter: Sendable {
-        private let recordsByConformingType: [
-            String: [CanonicalSIL.ProtocolConformance.Record]
-        ]
-        private let functionsBySymbol: [String: [CanonicalSIL.Function]]
+    /// File-wide witness and function evidence is immutable. Index it once;
+    /// only the concrete type environment varies when NativeImport metadata is
+    /// injected for a compilation.
+    struct Inventory: Sendable {
+        fileprivate let conformances: CanonicalSIL.ProtocolConformance
+            .Environment
+        fileprivate let functionsBySymbol: [String: [CanonicalSIL.Function]]
 
         init(
             conformances: CanonicalSIL.ProtocolConformance.Environment,
             availableFunctions: [CanonicalSIL.Function]
         ) {
-            recordsByConformingType = Dictionary(
-                grouping: conformances.records,
-                by: \.conformingType
-            )
+            self.conformances = conformances
             functionsBySymbol = availableFunctions.reduce(
                 into: [String: [CanonicalSIL.Function]]()
             ) { result, function in
                 result[function.mangledName, default: []].append(function)
             }
+        }
+    }
+
+    struct Rewriter: Sendable {
+        private let conformances: CanonicalSIL.ProtocolConformance.Environment
+        private let typeEnvironment: CanonicalSIL.TypeEnvironment
+        private let functionsBySymbol: [String: [CanonicalSIL.Function]]
+
+        init(
+            conformances: CanonicalSIL.ProtocolConformance.Environment,
+            availableFunctions: [CanonicalSIL.Function],
+            typeEnvironment: CanonicalSIL.TypeEnvironment = .empty
+        ) {
+            self.init(
+                inventory: .init(
+                    conformances: conformances,
+                    availableFunctions: availableFunctions
+                ),
+                typeEnvironment: typeEnvironment
+            )
+        }
+
+        init(
+            inventory: Inventory,
+            typeEnvironment: CanonicalSIL.TypeEnvironment
+        ) {
+            conformances = inventory.conformances
+            self.typeEnvironment = typeEnvironment
+            functionsBySymbol = inventory.functionsBySymbol
         }
 
         func rewrite(
@@ -46,38 +78,42 @@ enum StaticDispatch {
                 moduleName: moduleName ?? CanonicalSIL.SymbolIdentity.moduleName(
                     of: function.mangledName
                 ),
-                recordsByConformingType: recordsByConformingType,
+                conformances: conformances,
+                typeEnvironment: typeEnvironment,
                 functionsBySymbol: functionsBySymbol
             )
         }
     }
 
     /// Replaces only closed, unambiguous witness lookups with their exact SIL
-    /// thunk. Dynamic, conditional, incomplete, or textually ambiguous evidence
-    /// remains as `witness_method` and therefore continues to fail closed if it
+    /// thunk. A conditional conformance is admitted only after all of its
+    /// concrete requirements are proven. Dynamic, incomplete, or textually
+    /// ambiguous evidence remains as `witness_method` and fails closed if it
     /// becomes reachable.
     static func rewrite(
         _ function: CanonicalSIL.Function,
         conformances: CanonicalSIL.ProtocolConformance.Environment,
-        availableFunctions: [CanonicalSIL.Function]
+        availableFunctions: [CanonicalSIL.Function],
+        typeEnvironment: CanonicalSIL.TypeEnvironment = .empty
     ) -> CanonicalSIL.Function {
         Rewriter(
             conformances: conformances,
-            availableFunctions: availableFunctions
+            availableFunctions: availableFunctions,
+            typeEnvironment: typeEnvironment
         ).rewrite(function)
     }
 
     private static func rewrite(
         _ function: CanonicalSIL.Function,
         moduleName: String?,
-        recordsByConformingType: [
-            String: [CanonicalSIL.ProtocolConformance.Record]
-        ],
+        conformances: CanonicalSIL.ProtocolConformance.Environment,
+        typeEnvironment: CanonicalSIL.TypeEnvironment,
         functionsBySymbol: [String: [CanonicalSIL.Function]]
     ) -> CanonicalSIL.Function {
         guard !CanonicalSIL.GenericFunction.isGeneric(
             loweredType: function.loweredType
-        ), let moduleName else { return function }
+        ), function.body.contains("witness_method"),
+           let moduleName else { return function }
 
         let lines = function.body.split(
             separator: "\n",
@@ -91,7 +127,8 @@ enum StaticDispatch {
                let target = target(
                    for: reference,
                    moduleName: moduleName,
-                   recordsByConformingType: recordsByConformingType,
+                   conformances: conformances,
+                   typeEnvironment: typeEnvironment,
                    functionsBySymbol: functionsBySymbol
                ) {
                 targetByValue[reference.result] = target
@@ -132,50 +169,88 @@ enum StaticDispatch {
     private static func target(
         for reference: WitnessReference,
         moduleName: String,
-        recordsByConformingType: [
-            String: [CanonicalSIL.ProtocolConformance.Record]
-        ],
+        conformances: CanonicalSIL.ProtocolConformance.Environment,
+        typeEnvironment: CanonicalSIL.TypeEnvironment,
         functionsBySymbol: [String: [CanonicalSIL.Function]]
     ) -> Target? {
-        let records = recordsByConformingType[
-            reference.conformingType,
-            default: []
-        ].filter {
-            $0.genericClause == nil
-                && $0.isComplete
-                && $0.moduleName == moduleName
+        let records = conformances.specializedRecords(
+            conformingType: reference.conformingType
+        ).filter { specialized in
+            let record = specialized.record
+            guard record.isComplete,
+                  record.moduleName == moduleName,
+                  requirement(
+                    reference.requirement,
+                    belongsTo: record
+                  )
+            else {
+                return false
+            }
+            guard let rawClause = record.genericClause else { return true }
+            guard let clause = try? CanonicalSIL.GenericSignature
+                .standaloneClause(rawClause),
+                  (try? CanonicalSIL.GenericSignature.resolve(
+                    clause,
+                    bindings: specialized.bindings,
+                    conformances: conformances,
+                    typeEnvironment: typeEnvironment
+                  )) != nil
+            else { return false }
+            return true
         }
-        let witnesses = records.flatMap { record in
-            record.witnesses.filter {
-                $0.requirement == reference.requirement
+        let witnesses = records.flatMap { specialized in
+            specialized.record.witnesses.compactMap {
+                witness -> (CanonicalSIL.ProtocolConformance.Witness, [String])? in
+                guard witness.requirement == reference.requirement
                     && (equivalentType(
-                            $0.loweredType,
+                            witness.loweredType,
                             reference.requirementType
                         ) || equivalentType(
                             specializingSelf(
-                                in: $0.loweredType,
+                                in: witness.loweredType,
                                 as: reference.conformingType
                             ),
                             reference.requirementType
                         ))
+                else { return nil }
+                return (witness, specialized.genericArguments)
             }
         }
         guard witnesses.count == 1,
-              let symbol = witnesses[0].symbol,
+              let symbol = witnesses[0].0.symbol,
               let candidates = functionsBySymbol[symbol],
               candidates.count == 1,
               let target = candidates.first,
               !target.isExternalDefinition,
-              isWitnessThunk(target),
-              !CanonicalSIL.GenericFunction.isGeneric(
-                  loweredType: target.loweredType
-              )
+              isWitnessThunk(target)
         else { return nil }
+        let genericParameterCount = CanonicalSIL.GenericFunction
+            .parameterCount(loweredType: target.loweredType) ?? 0
+        let sourceGenericParameterCount = CanonicalSIL.GenericFunction
+            .parameterCount(loweredType: reference.functionType) ?? 0
         return .init(
             symbol: symbol,
             functionType: target.loweredType,
-            witnessFunctionType: reference.functionType
+            witnessFunctionType: reference.functionType,
+            conformingType: reference.conformingType,
+            conformerGenericArguments: witnesses[0].1,
+            sourceGenericParameterCount: sourceGenericParameterCount,
+            genericParameterCount: genericParameterCount
         )
+    }
+
+    private static func requirement(
+        _ requirement: String,
+        belongsTo record: CanonicalSIL.ProtocolConformance.Record
+    ) -> Bool {
+        let protocolName = record.protocolName
+            .trimmingCharacters(in: .whitespaces)
+        guard !protocolName.isEmpty else { return false }
+        var prefixes = [protocolName]
+        if !protocolName.hasPrefix(record.moduleName + ".") {
+            prefixes.append(record.moduleName + "." + protocolName)
+        }
+        return prefixes.contains { requirement.hasPrefix($0 + ".") }
     }
 
     private static func equivalentType(
@@ -301,6 +376,7 @@ enum StaticDispatch {
             options: .backwards
         ) else { return nil }
         var calleeEnd = tokenEnd
+        var sourceArguments: [String] = []
         if calleeEnd < line.endIndex, line[calleeEnd] == "<" {
             guard let close = matchingClose(
                 in: line,
@@ -308,8 +384,29 @@ enum StaticDispatch {
                 open: "<",
                 close: ">"
             ) else { return nil }
+            guard let parsed = try? CanonicalSIL.GenericFunction.arguments(
+                in: String(line[line.index(after: calleeEnd)..<close])
+            ) else { return nil }
+            sourceArguments = parsed
             calleeEnd = line.index(after: close)
         }
+        guard sourceArguments.count == target.sourceGenericParameterCount else {
+            return nil
+        }
+        if let selfArgument = sourceArguments.first,
+           !CanonicalSIL.GenericSignature.equivalentType(
+            selfArgument,
+            target.conformingType
+           ) {
+            return nil
+        }
+        let targetArguments = target.conformerGenericArguments
+            + Array(sourceArguments.dropFirst())
+        guard targetArguments.count == target.genericParameterCount else {
+            return nil
+        }
+        let rewrittenCallee = token + (targetArguments.isEmpty ? "" : "<"
+            + targetArguments.joined(separator: ", ") + ">")
 
         var result = line
         result.replaceSubrange(
@@ -326,7 +423,7 @@ enum StaticDispatch {
                 )
             )..<result.endIndex
         ) else { return nil }
-        result.replaceSubrange(rewrittenToken, with: token)
+        result.replaceSubrange(rewrittenToken, with: rewrittenCallee)
         return result
     }
 

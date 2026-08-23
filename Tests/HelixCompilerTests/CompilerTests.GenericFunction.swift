@@ -80,6 +80,208 @@ struct GenericFunction {
         #expect(materialized.function.body.contains("name \"Value\""))
     }
 
+    @Test("Specialization does not rewrite a qualified nominal with the same leaf name")
+    func preservesQualifiedNominalLeafNames() throws {
+        let function = CanonicalSIL.Function(
+            mangledName: "$sFixture9qualified",
+            loweredType: "@convention(thin) <Value> "
+                + "(Value, Fixture.Value) -> Value",
+            body: """
+            bb0(%0 : $Value, %1 : $Fixture.Value):
+              debug_value %1
+              return %0
+            """
+        )
+
+        let materialized = try CanonicalSIL.GenericFunction.specialize(
+            function,
+            arguments: "Int"
+        )
+
+        #expect(materialized.function.loweredType
+            == "@convention(thin) (Int, Fixture.Value) -> Int")
+        #expect(materialized.function.body.contains("%1 : $Fixture.Value"))
+    }
+
+    @Test("Successive generic clauses and numbered archetypes specialize in order")
+    func specializesSuccessiveClauses() throws {
+        let function = CanonicalSIL.Function(
+            mangledName: "$sFixture3map",
+            loweredType: "@convention(method) <Element><Result> "
+                + "(@in_guaranteed Element) -> @out Result",
+            body: """
+            bb0(%0 : $*Result, %1 : $*Element):
+              copy_addr %1 to [init] %0
+              return %2
+            """
+        )
+        let witness = CanonicalSIL.Function(
+            mangledName: "$sFixture7witness",
+            loweredType: "@convention(witness_method: Feature) "
+                + "<τ_0_0> (@in_guaranteed τ_0_0) -> @out τ_0_0",
+            body: "bb0(%0 : $*τ_0_0, %1 : $*τ_0_0):\n  return %2"
+        )
+
+        let materialized = try CanonicalSIL.GenericFunction.specialize(
+            function,
+            arguments: "Int, String"
+        )
+        let numbered = try CanonicalSIL.GenericFunction.specialize(
+            witness,
+            arguments: "Bool"
+        )
+
+        #expect(materialized.descriptor.arguments == ["Int", "String"])
+        #expect(materialized.function.loweredType
+            == "@convention(method) (@in_guaranteed Int) -> @out String")
+        #expect(materialized.function.body.contains("$*String"))
+        #expect(materialized.function.body.contains("$*Int"))
+        #expect(numbered.function.loweredType
+            == "@convention(witness_method: Feature) (@in_guaranteed Bool) -> @out Bool")
+    }
+
+    @Test("Protocol and associated-type requirements require exact concrete evidence")
+    func resolvesConcreteRequirements() throws {
+        let evidence = """
+        struct Number {
+          @_hasStorage var value: Int
+        }
+        sil_witness_table Number: Projecting module Fixture {
+          associated_type Output: Int
+        }
+        sil_witness_table Number: Marker module Fixture {
+        }
+        """
+        let conformances = try CanonicalSIL.ProtocolConformance.Environment(
+            text: evidence
+        )
+        let environment = try CanonicalSIL.TypeEnvironment(
+            text: evidence,
+            functions: [],
+            protocolConformances: conformances
+        )
+        let function = CanonicalSIL.Function(
+            mangledName: "$sFixture7project",
+            loweredType: "@convention(thin) "
+                + "<Value, Output where Value : Projecting & Marker, "
+                + "Value.Output == Output> "
+                + "(@in_guaranteed Value) -> @out Value.Output",
+            body: """
+            bb0(%0 : $*Value.Output, %1 : $*Value):
+              copy_addr %1 to [init] %0
+              return %2
+            """
+        )
+
+        let materialized = try CanonicalSIL.GenericFunction.specialize(
+            function,
+            arguments: "Number, Int",
+            conformances: conformances,
+            typeEnvironment: environment
+        )
+        #expect(materialized.function.loweredType
+            == "@convention(thin) (@in_guaranteed Number) -> @out Int")
+        #expect(materialized.function.body.contains("$*Int"))
+        #expect(!materialized.function.body.contains("Value.Output"))
+
+        for arguments in ["Number, String", "Bool, Int"] {
+            #expect(throws: CanonicalSIL.GenericFunction.SpecializationError.self) {
+                _ = try CanonicalSIL.GenericFunction.specialize(
+                    function,
+                    arguments: arguments,
+                    conformances: conformances,
+                    typeEnvironment: environment
+                )
+            }
+        }
+
+        let incompleteEvidence = try CanonicalSIL.ProtocolConformance
+            .Environment(
+                text: """
+                struct Number {
+                  @_hasStorage var value: Int
+                }
+                sil_witness_table Number: Projecting module Fixture {
+                  associated_type Output: Int
+                  future_requirement #Projecting.project: @future
+                }
+                """
+            )
+        let incompleteEnvironment = try CanonicalSIL.TypeEnvironment(
+            text: evidence,
+            functions: [],
+            protocolConformances: incompleteEvidence
+        )
+        #expect(throws: CanonicalSIL.GenericFunction.SpecializationError.self) {
+            _ = try CanonicalSIL.GenericFunction.specialize(
+                function,
+                arguments: "Number, Int",
+                conformances: incompleteEvidence,
+                typeEnvironment: incompleteEnvironment
+            )
+        }
+    }
+
+    @Test("Represented standard Collections provide closed associated types")
+    func resolvesRepresentedStandardCollectionRequirements() throws {
+        let evidence = """
+        struct Wrapper {
+          @_hasStorage var values: Array<Int>
+        }
+        """
+        let conformances = try CanonicalSIL.ProtocolConformance.Environment(
+            text: evidence
+        )
+        let environment = try CanonicalSIL.TypeEnvironment(
+            text: evidence,
+            functions: [],
+            protocolConformances: conformances
+        )
+        let function = CanonicalSIL.Function(
+            mangledName: "$sFixture7element",
+            loweredType: "@convention(thin) "
+                + "<Value where Value : Collection> "
+                + "(@in_guaranteed Value) -> @out Value.Element",
+            body: """
+            bb0(%0 : $*Value.Element, %1 : $*Value):
+              copy_addr %1 to [init] %0
+              return %2
+            """
+        )
+
+        for (argument, element) in [
+            ("Array<Int>", "Int"),
+            ("ArraySlice<String>", "String"),
+            ("String", "Character"),
+            ("EnumeratedSequence<Array<Int>>", "(offset:Int,element:Int)"),
+            ("Range<Int>", "Int"),
+        ] {
+            let materialized = try CanonicalSIL.GenericFunction.specialize(
+                function,
+                arguments: argument,
+                conformances: conformances,
+                typeEnvironment: environment
+            )
+            #expect(materialized.function.loweredType.contains("@out \(element)"))
+            #expect(!materialized.function.body.contains("Value.Element"))
+        }
+
+        for unsupported in [
+            "Wrapper",
+            "Zip2Sequence<Array<Int>, Array<Int>>",
+            "Range<Double>",
+        ] {
+            #expect(throws: CanonicalSIL.GenericFunction.SpecializationError.self) {
+                _ = try CanonicalSIL.GenericFunction.specialize(
+                    function,
+                    arguments: unsupported,
+                    conformances: conformances,
+                    typeEnvironment: environment
+                )
+            }
+        }
+    }
+
     @Test("Concrete argument parsing preserves nested type syntax")
     func parsesNestedArguments() throws {
         #expect(
@@ -98,6 +300,27 @@ struct GenericFunction {
         }
         #expect(throws: CanonicalSIL.GenericFunction.SpecializationError.self) {
             _ = try CanonicalSIL.GenericFunction.arguments(in: "_")
+        }
+    }
+
+    @Test("Generic signature limits fail before concrete solving")
+    func rejectsOversizedGenericSignatures() {
+        let parameters = (0...CanonicalSIL.GenericSignature
+            .maximumParameterCount).map { "T\($0)" }
+        #expect(throws: CanonicalSIL.GenericSignature.ParseError.self) {
+            _ = try CanonicalSIL.GenericSignature.standaloneClause(
+                "<" + parameters.joined(separator: ", ") + ">"
+            )
+        }
+
+        let requirements = Array(
+            repeating: "T == Int",
+            count: CanonicalSIL.GenericSignature.maximumRequirementCount + 1
+        )
+        #expect(throws: CanonicalSIL.GenericSignature.ParseError.self) {
+            _ = try CanonicalSIL.GenericSignature.standaloneClause(
+                "<T where " + requirements.joined(separator: ", ") + ">"
+            )
         }
     }
 

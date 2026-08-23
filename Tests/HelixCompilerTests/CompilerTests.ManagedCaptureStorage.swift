@@ -9,14 +9,14 @@ struct ManagedCaptureStorage {
     func normalizesPhysicalCaptureABI() throws {
         let normalized = try CanonicalSIL.ManagedCaptureStorage.normalize(
             body: """
-            bb0(%0 : $*String, %1 : $*any Error, %2 : $*Int, \
-            %3 : $@thin String.Type, %4 : @closureCapture $*String):
+            bb0(%0 : $*String, %1 : $*Bool, %2 : $*any Error, %3 : $*Int, \
+            %4 : $@thin String.Type, %5 : @closureCapture $*String):
             """,
             role: .closureBody,
             parameters: [.int64, .address(.string)],
             parameterConventions: [.owned, .inout],
             erasedPhysicalIndices: [1],
-            hasIndirectResult: true,
+            indirectResultCount: 2,
             hasIndirectError: true
         )
 
@@ -33,7 +33,7 @@ struct ManagedCaptureStorage {
             parameters: [.int64],
             parameterConventions: [.owned],
             erasedPhysicalIndices: [],
-            hasIndirectResult: false,
+            indirectResultCount: 0,
             hasIndirectError: false
         )
         #expect(immutable.parameters == [.int64])
@@ -46,7 +46,7 @@ struct ManagedCaptureStorage {
             parameters: [.address(.int64)],
             parameterConventions: [.inout],
             erasedPhysicalIndices: [],
-            hasIndirectResult: false,
+            indirectResultCount: 0,
             hasIndirectError: false
         )
         #expect(inoutParameter.parameters == [.address(.int64)])
@@ -59,7 +59,7 @@ struct ManagedCaptureStorage {
             parameters: [.address(.int64)],
             parameterConventions: [.inout],
             erasedPhysicalIndices: [],
-            hasIndirectResult: false,
+            indirectResultCount: 0,
             hasIndirectError: false
         )
         #expect(directHelper.parameters == [.address(.int64)])
@@ -76,7 +76,7 @@ struct ManagedCaptureStorage {
                 parameters: [.address(.int64)],
                 parameterConventions: [.owned],
                 erasedPhysicalIndices: [],
-                hasIndirectResult: false,
+                indirectResultCount: 0,
                 hasIndirectError: false
             )
         }
@@ -87,7 +87,7 @@ struct ManagedCaptureStorage {
                 parameters: [.address(.int64)],
                 parameterConventions: [.inout],
                 erasedPhysicalIndices: [],
-                hasIndirectResult: false,
+                indirectResultCount: 0,
                 hasIndirectError: false
             )
         }
@@ -109,7 +109,7 @@ struct ManagedCaptureStorage {
             parameters: [.closure(callback), .address(.int64)],
             parameterConventions: [.owned, .inout],
             erasedPhysicalIndices: [],
-            hasIndirectResult: false,
+            indirectResultCount: 0,
             hasIndirectError: false
         )
 
@@ -134,7 +134,7 @@ struct ManagedCaptureStorage {
             parameters: signature.parameters,
             parameterConventions: signature.parameterConventions,
             erasedPhysicalIndices: [],
-            hasIndirectResult: false,
+            indirectResultCount: 0,
             hasIndirectError: false
         )
         #expect(normalized.parameters == [.mutableCell(.string)])
@@ -160,7 +160,7 @@ struct ManagedCaptureStorage {
             parameters: [.address(weakType)],
             parameterConventions: [.inout],
             erasedPhysicalIndices: [],
-            hasIndirectResult: false,
+            indirectResultCount: 0,
             hasIndirectError: false
         )
         #expect(weak.parameters == [weakType])
@@ -177,7 +177,7 @@ struct ManagedCaptureStorage {
             parameters: [.address(unownedType)],
             parameterConventions: [.inout],
             erasedPhysicalIndices: [],
-            hasIndirectResult: false,
+            indirectResultCount: 0,
             hasIndirectError: false
         )
         #expect(unowned.parameters == [unownedType])
@@ -199,7 +199,7 @@ struct ManagedCaptureStorage {
                 parameters: [.address(weakType)],
                 parameterConventions: [.inout],
                 erasedPhysicalIndices: [],
-                hasIndirectResult: false,
+                indirectResultCount: 0,
                 hasIndirectError: false
             )
         }

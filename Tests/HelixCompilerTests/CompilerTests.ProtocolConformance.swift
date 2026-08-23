@@ -121,6 +121,31 @@ struct ProtocolConformanceTests {
         #expect(record.witnesses(for: "Feature.optional").first?.symbol == nil)
     }
 
+    @Test("Conditional conformance evidence remains structured")
+    func preservesConditionalConformanceEvidence() throws {
+        let environment = try CanonicalSIL.ProtocolConformance.Environment(
+            text: """
+            sil_witness_table <Element where Element : Equatable> Box<Element>: Feature module Fixture {
+              conditional_conformance (Element: Equatable): dependent
+            }
+            """
+        )
+        let record = try #require(environment.records.first)
+        #expect(record.isComplete)
+        #expect(record.conditionalConformances == [
+            .init(requirement: "Element: Equatable", evidence: "dependent"),
+        ])
+
+        let inconsistent = try CanonicalSIL.ProtocolConformance.Environment(
+            text: """
+            sil_witness_table <Element where Element : Equatable> Box<Element>: Feature module Fixture {
+              conditional_conformance (Element: Hashable): dependent
+            }
+            """
+        )
+        #expect(inconsistent.records.first?.isComplete == false)
+    }
+
     @Test("Overloaded requirements retain distinct lowered ABIs")
     func preservesOverloadedRequirements() throws {
         let environment = try CanonicalSIL.ProtocolConformance.Environment(

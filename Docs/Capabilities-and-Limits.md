@@ -500,15 +500,26 @@ does not by itself certify a physical device or distribution channel.
   Compiler-emitted fully concrete specializations are supported when no
   archetype, metadata, or witness dependency remains. Source generic helpers
   used at concrete same-image `apply`, `try_apply`, or `partial_apply` sites are
-  also monomorphized from semantic SIL. Distinct argument lists receive
-  deterministic image identities while call bindings retain the original
-  Swift symbol; recursive, rethrowing, higher-order, and escaping-function-value
-  forms use that same path. A fully concrete patch-local struct, enum, or class
-  conformance may also resolve one exact complete witness record to a static
-  image thunk. This covers getter/setter, static, mutating, throwing, inherited,
-  default-implementation, and bound-method calls without serializing witness
-  metadata. Unresolved arguments, packs, conditional conformances, and
-  ambiguous witness evidence remain fail-closed.
+  also monomorphized from semantic SIL. Successive generic clauses support
+  concretely proven protocol/composition, same-type, `AnyObject`/superclass, and
+  dependent associated-type requirements. Exact complete frontend witness
+  records drive user conformances. Represented standard value families use a
+  closed, toolchain-checked `Sequence`/`Collection` hierarchy that exposes only
+  proven associated identities such as `Element`; storage similarity alone is
+  never conformance. Conditional conformances are accepted only when their
+  concrete requirements recursively prove. Distinct argument lists
+  receive deterministic image identities while call bindings retain the
+  original Swift symbol; constrained extension methods, recursive, rethrowing,
+  higher-order, and escaping-function-value forms use that same path.
+  File/module-scope generic struct, enum, and final class templates materialize
+  only reachable concrete instances, including their fields, enum payloads,
+  initializers, and methods. Exact frontend result buffers also concretize
+  single, generic, and ordered multiple opaque results without runtime opaque
+  metadata. A concrete patch-local conformance can then resolve one exact
+  complete witness record to a static image thunk, covering getter/setter,
+  static, mutating, throwing, inherited, default-implementation, and bound
+  method calls. Unresolved arguments, packs, unproven conditional evidence,
+  unavailable targets, and ambiguous witness evidence remain fail-closed.
 - Closed immutable protocol existentials for complete, nonconditional
   current-module conformances. Supported source use includes local `any P`,
   protocol compositions and inherited requirements, struct and patch-local
@@ -652,7 +663,7 @@ contract passes the checks above; the examples do not form an API allowlist.
 
 | Area | Supported | Intentional boundary |
 | --- | --- | --- |
-| Formation and references | Closure literals and shorthand arguments; local/global functions; operators and overloads; local bound/unbound methods, including closed concrete and immutable closed-existential protocol witnesses; enum/Optional/Result cases; patch-local initializers/static factories; eligible Shell entries; representation-preserving NativeImport free/global functions, bound instance methods, and initializers | A direct-call-only default-argument projection cannot become a function value; unresolved, conditional, open-world, mutable-existential, or ambiguous witness dispatch remains rejected |
+| Formation and references | Closure literals and shorthand arguments; local/global functions; operators and overloads; local bound/unbound methods, including proven concrete conditional and immutable closed-existential protocol witnesses; enum/Optional/Result cases; patch-local initializers/static factories; eligible Shell entries; representation-preserving NativeImport free/global functions, bound instance methods, and initializers | A direct-call-only default-argument projection cannot become a function value; unresolved or unproven conditional, open-world, mutable-existential, or ambiguous witness dispatch remains rejected |
 | Storage and higher order | Optional, tuple, Array, Dictionary value, concrete Result, patch-local struct/enum/class fields, mutable closure variables, and closure parameter/result positions; nested, recursive, and returned closures | Closure values do not enter Set keys/elements, VM-owned `Any`, Shell entries, or the general native boundary codec |
 | Captures and ownership | Immutable snapshots, shared mutable cells, strong capture, safe `weak`, checked `unowned`, captured closures, copyable imported owners, and caller-owned `inout` borrowed by a verified lexical nonescaping closure | `unowned(unsafe)`, noncopyable captures, linear `inout` captures, and escaping capture of caller-owned `inout` are rejected |
 | Invocation and errors | Synchronous nonthrowing/throwing calls, concrete typed throws, concrete rethrows specializations, normal/error inout cleanup, autoclosures, default generators, optional invocation, and `callAsFunction` | Async closure ABI, suspension, arbitrary runtime specialization, and general unwind cleanup are not implemented |
@@ -666,12 +677,19 @@ contract passes the checks above; the examples do not form an API allowlist.
 
 - Generic roots or any execution that still requires runtime generic metadata,
   runtime witness tables, unresolved/generic reabstraction, or dynamic
-  specialization. Closed concrete and immutable closed-existential witness
-  calls described above are compiler-resolved image calls and do not relax this
+  specialization. Proven closed concrete calls—including conditional witnesses
+  whose requirements were solved—and immutable closed-existential witness calls
+  described above are compiler-resolved image calls and do not relax this
   runtime boundary.
   This includes opaque custom `Sequence` implementations whose iteration has
   not been normalized to a represented managed Collection; they are not
   redirected to the Swift standard library through NativeImport.
+- Nested nominal declarations that implicitly carry an outer generic archetype,
+  opaque results whose exact underlying entry-buffer type cannot be proven, a
+  mixed direct/indirect physical multi-result ABI, and throwing calls with more
+  than one indirect normal result. These remain explicit compile-time
+  boundaries; Helix does not synthesize runtime opaque or generic metadata to
+  guess their layout.
 - True suspension: `await`, continuations, tasks, async callees, async closures,
   cancellation, and cross-suspension ownership or generation leases.
 - Actor-isolated instance roots, custom global actors, and arbitrary executor
@@ -715,11 +733,12 @@ contract passes the checks above; the examples do not form an API allowlist.
   superclass, or enum cases. The hosted Objective-C subclass above is a frozen
   superclass projection, not arbitrary Swift metadata generation.
 - Swift protocol existential values at a Shell Entry or ordinary NativeImport
-  boundary, conditional or imported conformers, and mutable existential
-  opening/writeback. The supported immutable profile is closed over complete
-  current-module image-local conformers and cannot safely be widened at those
-  boundaries without introducing runtime Swift metadata. The separately
-  proven Objective-C `!foreign` erasure is a frozen native `AnyObject` value,
+  boundary, conditional or imported conformers in an existential dispatch set,
+  and mutable existential opening/writeback. The supported immutable profile is
+  closed over complete current-module image-local conformers and cannot safely
+  be widened at those boundaries without introducing runtime Swift metadata.
+  The separately proven Objective-C `!foreign` erasure is a frozen native
+  `AnyObject` value,
   not an exception that exports this image-local representation.
 - Generic or `inout` Shell entries, noncopyable roots, arbitrary borrowing and
   consuming ABI, typed-throws roots, general `rethrows` outside the concrete

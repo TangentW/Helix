@@ -243,11 +243,13 @@ public struct Lowerer: Sendable {
         var binding: CanonicalSIL.DirectCallBinding
         var physicalParameterConventions: [Bytecode.ParameterConvention]
         var physicalValueParameterSpellings: [String]
-        var hasIndirectResult: Bool
+        var indirectResultTypes: [Bytecode.ValueType]
         var thrownType: Bytecode.ValueType?
         var indirectErrorType: Bytecode.ValueType?
         var erasedMetatypes: [ErasedMetatype]
         var usesObjectiveCBridge: Bool
+
+        var hasIndirectResult: Bool { !indirectResultTypes.isEmpty }
     }
 
     /// One physical Swift function reference can name several frozen source
@@ -593,8 +595,13 @@ public struct Lowerer: Sendable {
     /// compiler ABI addresses and re-materializes their writes on the matching
     /// control-flow edge.
     private struct IndirectCallDestinations {
-        var result: String?
+        var results: [String]
         var error: String?
+
+        var hasResult: Bool { !results.isEmpty }
+        var singleResult: String? {
+            results.count == 1 ? results[0] : nil
+        }
     }
 
     /// Keeps semantic preparation out of the instruction-emission stack
@@ -608,6 +615,7 @@ public struct Lowerer: Sendable {
             parameterConventions: [Bytecode.ParameterConvention],
             result: Bytecode.ValueType,
             hasIndirectResult: Bool,
+            indirectResultTypes: [Bytecode.ValueType],
             thrownType: Bytecode.ValueType?,
             indirectErrorType: Bytecode.ValueType?,
             effects: Core.Effects,
@@ -643,6 +651,10 @@ public struct Lowerer: Sendable {
         expectedEffects: Core.Effects? = nil,
         expectedResultType: Bytecode.ValueType? = nil
     ) throws -> IntermediateRepresentation.Function {
+        let function = sourceFile?.rewritingClosedProtocolDispatch(
+            in: function,
+            typeEnvironment: typeEnvironment
+        ) ?? function
         return try CanonicalSIL.LoweringStack.run {
             let preparation = try prepareLowering(
                 function,
@@ -677,7 +689,7 @@ public struct Lowerer: Sendable {
             erasedPhysicalIndices: Set(
                 signature.erasedMetatypes.map(\.physicalIndex)
             ),
-            hasIndirectResult: signature.hasIndirectResult,
+            indirectResultCount: signature.indirectResultTypes.count,
             hasIndirectError: signature.indirectErrorType != nil
         )
         signature.parameters = managedCaptures.parameters
@@ -715,8 +727,7 @@ public struct Lowerer: Sendable {
                 body: normalizedBody,
                 directCalls: directCalls,
                 typeEnvironment: typeEnvironment,
-                indirectResultType: signature.hasIndirectResult
-                    ? signature.result : nil,
+                indirectResultTypes: signature.indirectResultTypes,
                 indirectErrorType: signature.indirectErrorType
             )
         let existentialInitializationPlan = try CanonicalSIL
@@ -1125,6 +1136,10 @@ public struct Lowerer: Sendable {
         var takenOptionalPayloads: [String: TakenOptionalPayload] = [:]
         var indirectResultAddress: String?
         var indirectResultSlot: Bytecode.StackSlot?
+        var indirectResultComponentStorage: [
+            String: (type: Bytecode.ValueType, slot: Bytecode.StackSlot)
+        ] = [:]
+        var indirectResultComponentOrder: [String] = []
         var indirectErrorAddress: String?
         var typedErrorBoxTypes: [String: Bytecode.LocalTypeKey] = [:]
         var projectedBoxByAddress: [String: String] = [:]
@@ -3662,7 +3677,7 @@ public struct Lowerer: Sendable {
                     binding: binding,
                     physicalParameterConventions: callee.parameterConventions,
                     physicalValueParameterSpellings: physicalSpellings,
-                    hasIndirectResult: callee.hasIndirectResult,
+                    indirectResultTypes: callee.indirectResultTypes,
                     thrownType: callee.thrownType,
                     indirectErrorType: callee.indirectErrorType,
                     erasedMetatypes: callee.erasedMetatypes,
@@ -3799,6 +3814,7 @@ public struct Lowerer: Sendable {
                       reference.binding.resultType == first.binding.resultType,
                       reference.binding.effects == first.binding.effects,
                       reference.hasIndirectResult == first.hasIndirectResult,
+                      reference.indirectResultTypes == first.indirectResultTypes,
                       reference.thrownType == first.thrownType,
                       reference.indirectErrorType == first.indirectErrorType
                 else {
@@ -3879,7 +3895,7 @@ public struct Lowerer: Sendable {
             let destinations = try consumeIndirectCallDestinations(
                 from: &argumentTokens,
                 resultType: representative.binding.resultType,
-                hasIndirectResult: representative.hasIndirectResult,
+                indirectResultTypes: representative.indirectResultTypes,
                 indirectErrorType: representative.indirectErrorType,
                 physicalArgumentCount: representative.binding
                     .parameterTypes.count
@@ -3935,7 +3951,7 @@ public struct Lowerer: Sendable {
             }
 
             let result: Bytecode.Register?
-            if destinations.result != nil {
+            if destinations.hasResult {
                 guard !resultToken.isEmpty else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "indirect opened witness apply has no Void SIL result"
@@ -3975,12 +3991,12 @@ public struct Lowerer: Sendable {
             if let owner = borrowedReceiver.temporaryOwner {
                 appendInstruction(.destroyValue(owner))
             }
-            if let destination = destinations.result, let result {
-                if representative.binding.resultType == .any {
-                    try storeExistential(result, at: destination)
-                } else {
-                    try storeConstructedValue(result, at: destination)
-                }
+            if destinations.hasResult, let result {
+                try storeIndirectCallResult(
+                    result,
+                    destinations: destinations,
+                    logicalType: representative.binding.resultType
+                )
             }
             try finishPreparedAccessesAndWritebacks(prepared)
         }
@@ -4019,7 +4035,7 @@ public struct Lowerer: Sendable {
             let destinations = try consumeIndirectCallDestinations(
                 from: &argumentTokens,
                 resultType: representative.binding.resultType,
-                hasIndirectResult: representative.hasIndirectResult,
+                indirectResultTypes: representative.indirectResultTypes,
                 indirectErrorType: representative.indirectErrorType,
                 physicalArgumentCount: representative.binding
                     .parameterTypes.count
@@ -4634,6 +4650,8 @@ public struct Lowerer: Sendable {
                   appliedType.result == referenceType.result,
                   appliedType.hasIndirectResult
                     == referenceType.hasIndirectResult,
+                  appliedType.indirectResultTypes
+                    == referenceType.indirectResultTypes,
                   appliedType.indirectErrorType == nil,
                   appliedType.effects == referenceType.effects
             else {
@@ -4648,16 +4666,19 @@ public struct Lowerer: Sendable {
             let destinations = try consumeIndirectCallDestinations(
                 from: &arguments,
                 resultType: referenceType.result,
-                hasIndirectResult: referenceType.hasIndirectResult,
+                indirectResultTypes: referenceType.indirectResultTypes,
                 indirectErrorType: nil,
                 physicalArgumentCount: 0
             )
-            guard arguments.isEmpty, destinations.error == nil else {
+            guard arguments.isEmpty,
+                  destinations.error == nil,
+                  destinations.results.count <= 1
+            else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
                     "external default-argument helper has runtime inputs"
                 )
             }
-            if let destination = destinations.result {
+            if let destination = destinations.singleResult {
                 let root = addressBase(destination)
                 guard !resultToken.isEmpty,
                       stackType(at: destination) == referenceType.result,
@@ -5150,6 +5171,9 @@ public struct Lowerer: Sendable {
 
         func compilerAddressType(_ token: String) -> Bytecode.ValueType? {
             if token == indirectResultAddress { return signature.result }
+            if let component = indirectResultComponentStorage[token] {
+                return component.type
+            }
             if token == indirectErrorAddress {
                 return signature.indirectErrorType
             }
@@ -5187,11 +5211,27 @@ public struct Lowerer: Sendable {
         func consumeIndirectCallDestinations(
             from argumentTokens: inout [String],
             resultType: Bytecode.ValueType,
-            hasIndirectResult: Bool,
+            indirectResultTypes: [Bytecode.ValueType],
             indirectErrorType: Bytecode.ValueType?,
             physicalArgumentCount: Int
         ) throws -> IndirectCallDestinations {
-            let hiddenCount = (hasIndirectResult ? 1 : 0)
+            let resultTypes = indirectResultTypes
+            if resultTypes.count == 1 {
+                guard resultTypes[0] == resultType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "indirect result type differs from its logical result"
+                    )
+                }
+            } else if !resultTypes.isEmpty {
+                guard case let .tuple(elements) = resultType,
+                      elements == resultTypes
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "multiple indirect results do not form their logical tuple"
+                    )
+                }
+            }
+            let hiddenCount = resultTypes.count
                 + (indirectErrorType == nil ? 0 : 1)
             let expectedCount = physicalArgumentCount.addingReportingOverflow(
                 hiddenCount
@@ -5204,8 +5244,8 @@ public struct Lowerer: Sendable {
                 )
             }
 
-            var resultDestination: String?
-            if hasIndirectResult {
+            var resultDestinations: [String] = []
+            for resultType in resultTypes {
                 guard resultType == .void || supportsIndirectResult(resultType) else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
                         "indirect call result \(resultType)"
@@ -5221,7 +5261,7 @@ public struct Lowerer: Sendable {
                         "indirect call result address does not match its result type"
                     )
                 }
-                resultDestination = destination
+                resultDestinations.append(destination)
             }
 
             var errorDestination: String?
@@ -5234,7 +5274,7 @@ public struct Lowerer: Sendable {
                 }
                 errorDestination = destination
             }
-            return .init(result: resultDestination, error: errorDestination)
+            return .init(results: resultDestinations, error: errorDestination)
         }
 
         func bindIndirectTryCallDestinations(
@@ -5244,7 +5284,12 @@ public struct Lowerer: Sendable {
             normalTarget: Bytecode.BlockID,
             errorTarget: Bytecode.BlockID
         ) throws {
-            if destinations.result != nil
+            guard destinations.results.count <= 1 else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "throwing call with multiple indirect normal results"
+                )
+            }
+            if destinations.hasResult
                 || resultType == .void
                 || resultType == .never {
                 let suppressedType: Bytecode.ValueType = resultType == .never
@@ -5259,7 +5304,7 @@ public struct Lowerer: Sendable {
                         "uninhabited or indirect call normal continuation is shared"
                     )
                 }
-                if let destination = destinations.result,
+                if let destination = destinations.singleResult,
                    resultType != .void {
                     let result = try allocate(type: resultType)
                     implicitStackValues[normalTarget] = [.init(destination, result)]
@@ -5286,6 +5331,51 @@ public struct Lowerer: Sendable {
                 }
                 let error = try allocate(type: runtimeErrorType)
                 implicitStackValues[errorTarget] = [.init(destination, error)]
+            }
+        }
+
+        func storeIndirectCallResult(
+            _ result: Bytecode.Register,
+            destinations: IndirectCallDestinations,
+            logicalType: Bytecode.ValueType
+        ) throws {
+            guard destinations.hasResult,
+                  registerTypes[Int(result.rawValue)] == logicalType
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "indirect call result does not match its logical ABI"
+                )
+            }
+            if let destination = destinations.singleResult {
+                if logicalType == .any {
+                    try storeExistential(result, at: destination)
+                } else {
+                    try storeConstructedValue(result, at: destination)
+                }
+                return
+            }
+            guard case let .tuple(elementTypes) = logicalType,
+                  elementTypes.count == destinations.results.count
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "multiple indirect destinations do not match a tuple result"
+                )
+            }
+            let elements = try unpackTupleValue(result)
+            guard elements.count == destinations.results.count else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "tuple result decomposition changed its physical arity"
+                )
+            }
+            for (element, destination) in zip(
+                elements,
+                destinations.results
+            ) {
+                if registerTypes[Int(element.rawValue)] == .any {
+                    try storeExistential(element, at: destination)
+                } else {
+                    try storeConstructedValue(element, at: destination)
+                }
             }
         }
 
@@ -5619,6 +5709,16 @@ public struct Lowerer: Sendable {
                 }
                 appendInstruction(
                     .storeStack(slot: slot, source: value, mode: .initialize)
+                )
+                return
+            }
+            if let component = indirectResultComponentStorage[token] {
+                appendInstruction(
+                    .storeStack(
+                        slot: component.slot,
+                        source: value,
+                        mode: .initialize
+                    )
                 )
                 return
             }
@@ -16921,7 +17021,7 @@ public struct Lowerer: Sendable {
                 let destinations = try consumeIndirectCallDestinations(
                     from: &arguments,
                     resultType: resultType,
-                    hasIndirectResult: true,
+                    indirectResultTypes: [resultType],
                     indirectErrorType: errorType,
                     physicalArgumentCount: 2
                 )
@@ -16996,7 +17096,7 @@ public struct Lowerer: Sendable {
                     if resultType == .void || resultType == .never {
                         result = nil
                     } else {
-                        guard let destination = destinations.result else {
+                        guard let destination = destinations.singleResult else {
                             throw CanonicalSIL.LoweringError.malformedSIL(
                                 "withExtendedLifetime has no indirect result destination"
                             )
@@ -20961,9 +21061,8 @@ public struct Lowerer: Sendable {
                     ? signature.erasedMetatypes
                     : [],
                 bridgedParameterTypes: bridgedBlockParameterTypes,
-                indirectResultType: entryBlock == nil && signature.hasIndirectResult
-                    ? signature.result
-                    : nil,
+                indirectResultTypes: entryBlock == nil
+                    ? signature.indirectResultTypes : [],
                 indirectErrorType: entryBlock == nil
                     ? signature.indirectErrorType
                     : nil,
@@ -21107,18 +21206,22 @@ public struct Lowerer: Sendable {
                 if entryBlock == nil {
                     entryBlock = loweredBlock.id
                     if signature.hasIndirectResult {
-                        guard let address = block.indirectResultAddress else {
+                        guard block.indirectResultAddresses.count
+                                == signature.indirectResultTypes.count
+                        else {
                             throw CanonicalSIL.LoweringError.unsupportedType(
                                 "indirect result \(signature.result)"
                             )
                         }
-                        if signature.result == .void {
+                        if signature.result == .void,
+                           let address = block.indirectResultAddresses.first {
                             // A fully specialized generic closure may retain
                             // an `@out ()` parameter even though `()` is its
                             // logical no-result ABI. The pointer is zero-sized
                             // compiler metadata and never enters HLBC.
                             _ = address
-                        } else {
+                        } else if block.indirectResultAddresses.count == 1,
+                                  let address = block.indirectResultAddresses.first {
                             guard supportsIndirectResult(signature.result) else {
                                 throw CanonicalSIL.LoweringError.unsupportedType(
                                     "indirect result \(signature.result)"
@@ -21142,8 +21245,38 @@ public struct Lowerer: Sendable {
                                     slot: slot
                                 )
                             )
+                        } else {
+                            for (address, type) in zip(
+                                block.indirectResultAddresses,
+                                signature.indirectResultTypes
+                            ) {
+                                guard supportsIndirectResult(type) else {
+                                    throw CanonicalSIL.LoweringError.unsupportedType(
+                                        "indirect result component \(type)"
+                                    )
+                                }
+                                let slot = try allocateStackSlot(type: type)
+                                let runtimeAddress = try allocate(
+                                    type: .address(type)
+                                )
+                                indirectResultComponentStorage[address] = (
+                                    type,
+                                    slot
+                                )
+                                indirectResultComponentOrder.append(address)
+                                runtimeStackSlots[address] = slot
+                                runtimeAddressValues[address] = runtimeAddress
+                                runtimeAddressPointees[address] = type
+                                values[address] = runtimeAddress
+                                appendInstruction(
+                                    .stackAddress(
+                                        result: runtimeAddress,
+                                        slot: slot
+                                    )
+                                )
+                            }
                         }
-                    } else if block.indirectResultAddress != nil {
+                    } else if !block.indirectResultAddresses.isEmpty {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "entry block contains an unexpected indirect result"
                         )
@@ -22958,9 +23091,13 @@ public struct Lowerer: Sendable {
             ) {
                 let ownerType = projection[2]
                 let property = projection[3]
-                if let key = typeEnvironment.localKey(for: ownerType),
-                   typeEnvironment.isClass(key) {
-                    let object = try resolve(projection[1], line: sourceLine)
+                let object = try resolve(projection[1], line: sourceLine)
+                if case let .local(key) = registerTypes[Int(object.rawValue)],
+                   typeEnvironment.isClass(key),
+                   typeEnvironment.matchesLocalDeclaration(
+                    ownerType,
+                    concrete: key
+                   ) {
                     guard registerTypes[Int(object.rawValue)] == .local(key) else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "class field receiver does not match \(key)"
@@ -23119,7 +23256,10 @@ public struct Lowerer: Sendable {
                         continue
                     }
                     guard case let .local(key) = basePointee,
-                          typeEnvironment.localKey(for: projection[2]) == key
+                          typeEnvironment.matchesLocalDeclaration(
+                            projection[2],
+                            concrete: key
+                          )
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "struct_element_addr mutable cell is not its declared local struct"
@@ -23177,7 +23317,10 @@ public struct Lowerer: Sendable {
                 if runtimeAddress(at: projection[1]) == nil,
                    let structure = stackValue(at: projection[1]),
                    case let .local(key) = stackType(at: projection[1]),
-                   typeEnvironment.localKey(for: projection[2]) == key {
+                   typeEnvironment.matchesLocalDeclaration(
+                    projection[2],
+                    concrete: key
+                   ) {
                     let index = try typeEnvironment.structFieldIndex(
                         type: key,
                         name: projection[3]
@@ -23207,7 +23350,10 @@ public struct Lowerer: Sendable {
                 if runtimeAddress(at: projection[1]) == nil,
                    stackValue(at: projection[1]) == nil,
                    case let .local(key) = stackType(at: projection[1]),
-                   typeEnvironment.localKey(for: projection[2]) == key,
+                   typeEnvironment.matchesLocalDeclaration(
+                    projection[2],
+                    concrete: key
+                   ),
                    case let .structure(fields) = try typeEnvironment
                     .definition(for: key).kind {
                     let index = try typeEnvironment.structFieldIndex(
@@ -23246,6 +23392,14 @@ public struct Lowerer: Sendable {
                 guard case let .local(key) = basePointee else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "struct_element_addr base is not a local struct"
+                    )
+                }
+                guard typeEnvironment.matchesLocalDeclaration(
+                    projection[2],
+                    concrete: key
+                ) else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "struct_element_addr declaration does not match \(key)"
                     )
                 }
                 let index = try typeEnvironment.structFieldIndex(
@@ -23809,15 +23963,19 @@ public struct Lowerer: Sendable {
             if let extraction = match(
                 line,
                 pattern: #"^(%[0-9]+) = struct_extract (%[0-9]+), #(.+)\.([^.]+)$"#
-            ), let key = typeEnvironment.localKey(for: extraction[2]) {
+            ), typeEnvironment.containsLocalDeclaration(extraction[2]) {
                 let source = try resolve(extraction[1], line: sourceLine)
                 let structure = takePendingRetainedValue(for: extraction[1])
                     ?? source
-                guard registerTypes[Int(source.rawValue)] == .local(key),
+                guard case let .local(key) = registerTypes[Int(source.rawValue)],
+                      typeEnvironment.matchesLocalDeclaration(
+                        extraction[2],
+                        concrete: key
+                      ),
                       registerTypes[Int(structure.rawValue)] == .local(key)
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "local struct_extract operand does not match \(key)"
+                        "local struct_extract operand does not match its declaration"
                     )
                 }
                 let fields = try typeEnvironment.structFields(for: key)
@@ -24359,6 +24517,8 @@ public struct Lowerer: Sendable {
                         == reference.physicalParameterConventions,
                       physicalType.result == binding.resultType,
                       physicalType.hasIndirectResult == reference.hasIndirectResult,
+                      physicalType.indirectResultTypes
+                        == reference.indirectResultTypes,
                       physicalType.thrownType == reference.thrownType,
                       physicalType.indirectErrorType
                         == reference.indirectErrorType,
@@ -24923,7 +25083,7 @@ public struct Lowerer: Sendable {
                     let destinations = try consumeIndirectCallDestinations(
                         from: &argumentTokens,
                         resultType: signature.result,
-                        hasIndirectResult: appliedType.hasIndirectResult,
+                        indirectResultTypes: appliedType.indirectResultTypes,
                         indirectErrorType: appliedType.indirectErrorType,
                         physicalArgumentCount: signature.parameters.count
                     )
@@ -25161,7 +25321,7 @@ public struct Lowerer: Sendable {
                 let destinations = try consumeIndirectCallDestinations(
                     from: &argumentTokens,
                     resultType: physicalBinding.resultType,
-                    hasIndirectResult: physicalReference.hasIndirectResult,
+                    indirectResultTypes: physicalReference.indirectResultTypes,
                     indirectErrorType: physicalReference.indirectErrorType,
                     physicalArgumentCount: Int(
                         physicalBinding.parameterProjection.physicalParameterCount
@@ -25201,6 +25361,8 @@ public struct Lowerer: Sendable {
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
                       appliedType.hasIndirectResult == reference.hasIndirectResult,
+                      appliedType.indirectResultTypes
+                        == reference.indirectResultTypes,
                       appliedType.thrownType == reference.thrownType,
                       appliedType.indirectErrorType
                         == reference.indirectErrorType,
@@ -25443,7 +25605,7 @@ public struct Lowerer: Sendable {
                     let destinations = try consumeIndirectCallDestinations(
                         from: &argumentTokens,
                         resultType: signature.result,
-                        hasIndirectResult: appliedType.hasIndirectResult,
+                        indirectResultTypes: appliedType.indirectResultTypes,
                         indirectErrorType: appliedType.indirectErrorType,
                         physicalArgumentCount: signature.parameters.count
                     )
@@ -25452,7 +25614,7 @@ public struct Lowerer: Sendable {
                             "ordinary closure apply carries an indirect Error result"
                         )
                     }
-                    let indirectResultDestination = destinations.result
+                    let hasIndirectResultDestination = destinations.hasResult
                     let prepared = try prepareDirectCallArguments(
                         argumentTokens,
                         physicalConventions: appliedType.parameterConventions,
@@ -25483,7 +25645,7 @@ public struct Lowerer: Sendable {
                         )
                     }
                     let result: Bytecode.Register?
-                    if indirectResultDestination != nil {
+                    if hasIndirectResultDestination {
                         guard !call[0].isEmpty else {
                             throw CanonicalSIL.LoweringError.malformedSIL(
                                 "indirect closure apply does not define its Void SIL result"
@@ -25521,8 +25683,14 @@ public struct Lowerer: Sendable {
                         conventions: appliedType.parameterConventions
                     )
                     appendPreparedOwnerCleanups(prepared)
-                    if let indirectResultDestination, let result {
+                    if destinations.hasResult, let result {
                         if let resultExistentialIdentity {
+                            guard let indirectResultDestination = destinations
+                                .singleResult else {
+                                throw CanonicalSIL.LoweringError.malformedSIL(
+                                    "protocol existential result cannot span multiple indirect destinations"
+                                )
+                            }
                             let destination = addressBase(
                                 indirectResultDestination
                             )
@@ -25536,14 +25704,11 @@ public struct Lowerer: Sendable {
                             protocolExistentialAddressTypes[destination] =
                                 resultExistentialIdentity
                         }
-                        if signature.result == .any {
-                            try storeExistential(result, at: indirectResultDestination)
-                        } else {
-                            try storeConstructedValue(
-                                result,
-                                at: indirectResultDestination
-                            )
-                        }
+                        try storeIndirectCallResult(
+                            result,
+                            destinations: destinations,
+                            logicalType: signature.result
+                        )
                     }
                     try finishPreparedAccessesAndWritebacks(prepared)
                     continue
@@ -25805,7 +25970,7 @@ public struct Lowerer: Sendable {
                                 try physicalValueParameterSpellings(
                                     in: specializedReferenceType
                             ),
-                            hasIndirectResult: callee.hasIndirectResult,
+                            indirectResultTypes: callee.indirectResultTypes,
                             thrownType: callee.thrownType,
                             indirectErrorType: callee.indirectErrorType,
                             erasedMetatypes: callee.erasedMetatypes,
@@ -25837,7 +26002,7 @@ public struct Lowerer: Sendable {
                 let destinations = try consumeIndirectCallDestinations(
                     from: &argumentTokens,
                     resultType: physicalBinding.resultType,
-                    hasIndirectResult: physicalReference.hasIndirectResult,
+                    indirectResultTypes: physicalReference.indirectResultTypes,
                     indirectErrorType: physicalReference.indirectErrorType,
                     physicalArgumentCount: Int(
                         physicalBinding.parameterProjection.physicalParameterCount
@@ -25849,7 +26014,7 @@ public struct Lowerer: Sendable {
                         "ordinary apply carries an indirect Error result"
                     )
                 }
-                let indirectResultDestination = destinations.result
+                let hasIndirectResultDestination = destinations.hasResult
                 argumentTokens = try eraseMetatypeArguments(
                     argumentTokens,
                     for: physicalReference,
@@ -25876,6 +26041,8 @@ public struct Lowerer: Sendable {
                         == reference.physicalParameterConventions,
                       appliedType.result == binding.resultType,
                       appliedType.hasIndirectResult == reference.hasIndirectResult,
+                      appliedType.indirectResultTypes
+                        == reference.indirectResultTypes,
                       appliedType.thrownType == reference.thrownType,
                       appliedType.indirectErrorType
                         == reference.indirectErrorType,
@@ -25906,7 +26073,7 @@ public struct Lowerer: Sendable {
                     line: sourceLine
                 )
                 if binding.abiAdapter == .mutatingValueReceiver {
-                    guard indirectResultDestination == nil else {
+                    guard !hasIndirectResultDestination else {
                         throw CanonicalSIL.LoweringError.invalidCallTable(
                             "mutating value-receiver call unexpectedly has an indirect result"
                         )
@@ -25954,7 +26121,7 @@ public struct Lowerer: Sendable {
                         detail: "protocol existential result is not represented as Any"
                     )
                 }
-                if indirectResultDestination != nil {
+                if hasIndirectResultDestination {
                     guard !call[0].isEmpty else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "indirect apply does not define its Void SIL result"
@@ -26003,8 +26170,14 @@ public struct Lowerer: Sendable {
                     conventions: reference.physicalParameterConventions
                 )
                 appendPreparedOwnerCleanups(prepared)
-                if let indirectResultDestination, let result {
+                if destinations.hasResult, let result {
                     if let resultExistentialIdentity {
+                        guard let indirectResultDestination = destinations
+                            .singleResult else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "protocol existential result cannot span multiple indirect destinations"
+                            )
+                        }
                         let destination = addressBase(
                             indirectResultDestination
                         )
@@ -26018,14 +26191,11 @@ public struct Lowerer: Sendable {
                         protocolExistentialAddressTypes[destination] =
                             resultExistentialIdentity
                     }
-                    if binding.resultType == .any {
-                        try storeExistential(result, at: indirectResultDestination)
-                    } else {
-                        try storeConstructedValue(
-                            result,
-                            at: indirectResultDestination
-                        )
-                    }
+                    try storeIndirectCallResult(
+                        result,
+                        destinations: destinations,
+                        logicalType: binding.resultType
+                    )
                 }
                 try finishPreparedAccessesAndWritebacks(prepared)
                 releaseCompilerTemporariesAfterLastUse(
@@ -26037,7 +26207,7 @@ public struct Lowerer: Sendable {
                     },
                     after: lineIndex
                 )
-                if indirectResultDestination == nil,
+                if !hasIndirectResultDestination,
                    let result,
                    !call[0].isEmpty {
                     try trackNonreferenceNativeTemporary(
@@ -29204,6 +29374,33 @@ public struct Lowerer: Sendable {
                             appendInstruction(.returnValue(nil))
                             continue
                         }
+                        if !indirectResultComponentOrder.isEmpty {
+                            let elements = try indirectResultComponentOrder.map {
+                                address in
+                                guard let component =
+                                        indirectResultComponentStorage[address]
+                                else {
+                                    throw CanonicalSIL.LoweringError.malformedSIL(
+                                        "indirect result component lost its storage"
+                                    )
+                                }
+                                let value = try allocate(type: component.type)
+                                appendInstruction(
+                                    .loadStack(
+                                        result: value,
+                                        slot: component.slot,
+                                        mode: .take
+                                    )
+                                )
+                                return value
+                            }
+                            let result = try allocate(type: signature.result)
+                            appendInstruction(
+                                .makeTuple(result: result, elements: elements)
+                            )
+                            appendInstruction(.returnValue(result))
+                            continue
+                        }
                         guard let slot = indirectResultSlot else {
                             throw CanonicalSIL.LoweringError.malformedSIL(
                                 "indirect result returns before initialization"
@@ -29632,6 +29829,7 @@ public struct Lowerer: Sendable {
         parameterConventions: [Bytecode.ParameterConvention],
         result: Bytecode.ValueType,
         hasIndirectResult: Bool,
+        indirectResultTypes: [Bytecode.ValueType],
         thrownType: Bytecode.ValueType?,
         indirectErrorType: Bytecode.ValueType?,
         effects: Core.Effects,
@@ -29780,8 +29978,75 @@ public struct Lowerer: Sendable {
         ) != nil
         let resultComponents = splitTopLevelTuple(resultText)
         let parsedResult: (type: Bytecode.ValueType, isIndirect: Bool)
+        let indirectResultTypes: [Bytecode.ValueType]
         let thrownType: Bytecode.ValueType?
         let indirectErrorType: Bytecode.ValueType?
+
+        func parseNormalResult(
+            _ components: [String]
+        ) throws -> (
+            result: (type: Bytecode.ValueType, isIndirect: Bool),
+            indirectTypes: [Bytecode.ValueType]
+        ) {
+            let indirect = components.map {
+                $0.trimmingCharacters(in: .whitespaces).hasPrefix("@out ")
+            }
+            if indirect.contains(true) {
+                guard indirect.allSatisfy({ $0 }) else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "mixed direct and indirect multi-result function ABI"
+                    )
+                }
+                let expectedComponents: [Bytecode.ValueType?]
+                if let physicalResultExpectation {
+                    if components.count == 1 {
+                        expectedComponents = [physicalResultExpectation]
+                    } else if case let .tuple(elements) = physicalResultExpectation,
+                              elements.count == components.count {
+                        expectedComponents = elements.map(Optional.some)
+                    } else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "physical indirect results differ from the logical tuple result"
+                        )
+                    }
+                } else {
+                    expectedComponents = Array(
+                        repeating: nil,
+                        count: components.count
+                    )
+                }
+                let types = try zip(components, expectedComponents).map {
+                    component, expected in
+                    let parsed = try parseFunctionResult(
+                        component,
+                        bridgedTo: expected,
+                        allowingForeignABIRepresentation:
+                            allowingForeignABIRepresentation
+                    )
+                    guard parsed.isIndirect else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "indirect result component lost its @out convention"
+                        )
+                    }
+                    return parsed.type
+                }
+                let logical = physicalResultExpectation
+                    ?? (types.count == 1 ? types[0] : .tuple(types))
+                return ((logical, true), types)
+            }
+
+            let spelling = components.count == 1
+                ? (components[0].isEmpty ? "()" : components[0])
+                : "(" + components.joined(separator: ", ") + ")"
+            let result = try parseFunctionResult(
+                spelling,
+                bridgedTo: physicalResultExpectation,
+                allowingForeignABIRepresentation:
+                    allowingForeignABIRepresentation
+            )
+            return (result, result.isIndirect ? [result.type] : [])
+        }
+
         if resultComponents.count == 1,
            let error = try supportedErrorResult(resultComponents[0]) {
             // SIL omits the normal empty-tuple result for `throws -> Void`.
@@ -29793,6 +30058,7 @@ public struct Lowerer: Sendable {
                 )
             }
             parsedResult = (.void, false)
+            indirectResultTypes = []
             thrownType = error.isPossible ? error.type : nil
             indirectErrorType = error.isIndirect ? error.type : nil
         } else if resultComponents.count >= 2,
@@ -29802,24 +30068,15 @@ public struct Lowerer: Sendable {
             // SIL error result. Reassemble every normal component before
             // applying logical bridging or stored-type normalization.
             let normalComponents = resultComponents.dropLast()
-            let normalResult = normalComponents.count == 1
-                ? normalComponents[normalComponents.startIndex]
-                : "(" + normalComponents.joined(separator: ", ") + ")"
-            parsedResult = try parseFunctionResult(
-                normalResult,
-                bridgedTo: physicalResultExpectation,
-                allowingForeignABIRepresentation:
-                    allowingForeignABIRepresentation
-            )
+            let normal = try parseNormalResult(Array(normalComponents))
+            parsedResult = normal.result
+            indirectResultTypes = normal.indirectTypes
             thrownType = error.isPossible ? error.type : nil
             indirectErrorType = error.isIndirect ? error.type : nil
         } else {
-            parsedResult = try parseFunctionResult(
-                resultText,
-                bridgedTo: physicalResultExpectation,
-                allowingForeignABIRepresentation:
-                    allowingForeignABIRepresentation
-            )
+            let normal = try parseNormalResult(resultComponents)
+            parsedResult = normal.result
+            indirectResultTypes = normal.indirectTypes
             thrownType = nil
             indirectErrorType = nil
         }
@@ -29827,7 +30084,8 @@ public struct Lowerer: Sendable {
             parameters,
             parameterConventions,
             expected?.result ?? parsedResult.type,
-            parsedResult.isIndirect,
+            !indirectResultTypes.isEmpty,
+            indirectResultTypes,
             thrownType,
             indirectErrorType,
             .init(
@@ -30714,14 +30972,14 @@ public struct Lowerer: Sendable {
         entryParameterTypes: [Bytecode.ValueType]?,
         erasedMetatypes: [ErasedMetatype],
         bridgedParameterTypes: [Bytecode.ValueType]?,
-        indirectResultType: Bytecode.ValueType?,
+        indirectResultTypes: [Bytecode.ValueType],
         indirectErrorType: Bytecode.ValueType?,
         suppressedParameterType: Bytecode.ValueType?,
         allocate: (Bytecode.ValueType) throws -> Bytecode.Register
     ) throws -> (
         block: IntermediateRepresentation.Block,
         parameters: [(String, Bytecode.Register)],
-        indirectResultAddress: String?,
+        indirectResultAddresses: [String],
         indirectErrorAddress: String?,
         indirectValueParameters: [String: Bytecode.ValueType],
         mutableCellParameters: [String: Bytecode.ValueType],
@@ -30732,7 +30990,7 @@ public struct Lowerer: Sendable {
         let id = try parseBlockID(match[0])
         let parameterText = match.count > 1 ? match[1] : ""
         var parameters: [(String, Bytecode.Register)] = []
-        var indirectResultAddress: String?
+        var indirectResultAddresses: [String] = []
         var indirectErrorAddress: String?
         var indirectValueParameters: [String: Bytecode.ValueType] = [:]
         var mutableCellParameters: [String: Bytecode.ValueType] = [:]
@@ -30745,7 +31003,7 @@ public struct Lowerer: Sendable {
         )
         if !parameterText.isEmpty {
             let components = splitTopLevel(parameterText)
-            let leadingAddressCount = (indirectResultType == nil ? 0 : 1)
+            let leadingAddressCount = indirectResultTypes.count
                 + (indirectErrorType == nil ? 0 : 1)
             if let entryParameterTypes,
                components.count != entryParameterTypes.count
@@ -30769,7 +31027,8 @@ public struct Lowerer: Sendable {
                 guard let value = self.match(component, pattern: #"^(%[0-9]+)\s*:\s*(.+)$"#) else {
                     throw CanonicalSIL.LoweringError.malformedSIL("invalid block parameter \(component)")
                 }
-                if physicalIndex == 0, let indirectResultType {
+                if indirectResultTypes.indices.contains(physicalIndex) {
+                    let indirectResultType = indirectResultTypes[physicalIndex]
                     guard try parseType(value[1])
                             == .address(
                                 ValueRepresentation.storable(
@@ -30781,10 +31040,10 @@ public struct Lowerer: Sendable {
                             "indirect result address does not match the function result"
                         )
                     }
-                    indirectResultAddress = value[0]
+                    indirectResultAddresses.append(value[0])
                     continue
                 }
-                let indirectErrorIndex = indirectResultType == nil ? 0 : 1
+                let indirectErrorIndex = indirectResultTypes.count
                 if let indirectErrorType,
                    physicalIndex == indirectErrorIndex {
                     guard try parseType(value[1])
@@ -30858,7 +31117,7 @@ public struct Lowerer: Sendable {
         return (
             IntermediateRepresentation.Block(id: id, parameters: parameters.map(\.1), instructions: []),
             parameters,
-            indirectResultAddress,
+            indirectResultAddresses,
             indirectErrorAddress,
             indirectValueParameters,
             mutableCellParameters,
