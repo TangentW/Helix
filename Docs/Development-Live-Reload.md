@@ -469,14 +469,18 @@ autoclosures, operator/overload and unbound-method references, synchronous
 `@MainActor` closure values, common closure-variable forms, and strong `self`
 captures through one value model. A recursively called local helper can also
 form a closure value without splitting its callable identity. On-stack
-closures and `withoutActuallyEscaping` carry a verified dynamic lifetime; a
+closures and `withoutActuallyEscaping` carry a verified dynamic lifetime;
+`withExtendedLifetime` uses the ordinary synchronous closure-call model while
+holding a type-generic anchor across both normal and typed-error exits. A
 nonescaping closure may borrow caller-owned `inout` storage, but must close
 before that modify access and cannot promote the borrow into an escaping
 context. Direct-only closure and `defer` helpers keep their physical address ABI
 instead of being mistaken for managed closure construction. Imported
-free/global-function references can use the same managed closure construction
-with a declared `NativeImportID`; this is a target-category rule rather than an
-API-specific adapter. The function-value route requires an identity argument
+free/global-function, bound instance-method, and initializer references can use
+the same managed closure construction with a declared `NativeImportID`; native
+receivers are ordinary captured suffixes and compiler-only metatypes are
+erased. This is a target-category rule rather than an API-specific adapter. The
+function-value route requires an identity argument
 projection and a representation-preserving ABI adapter; default-argument call
 variants remain direct-call-only. Copyable linear captures such as frozen imported
 references are copied into the managed context. Borrowed target parameters

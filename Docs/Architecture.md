@@ -69,9 +69,11 @@ Both workflows depend on stable, build-specific identities:
   during concurrent activation or rollback.
 - One `make_closure` instruction carries a typed static target: an image
   function, a frozen Shell `EntryIndex`, or a declared `NativeImportID`.
-  Unchanged Swift callables therefore do not copy archived bodies, and imported
-  global/free-function references such as C overlay functions do not require an
-  image thunk merely to become Swift values. This route requires a complete,
+  Unchanged Swift callables therefore do not copy archived bodies. Imported
+  free/global functions, bound instance methods, and initializers also use this
+  route: an ordinary capture suffix binds a native receiver, while a
+  compiler-only initializer metatype is validated and erased. None requires an
+  image thunk merely to become a Swift value. This route requires a complete,
   representation-preserving callable ABI; call-site default-argument
   projections and direct-call-only adapters cannot masquerade as function
   values. Invocation parameters are the target ABI prefix and `partial_apply`
@@ -95,8 +97,11 @@ Both workflows depend on stable, build-specific identities:
   its frozen TypeOps are copyable. `make_closure` charges the context copy;
   every invocation reuses a borrowed capture or materializes a fresh,
   resource-charged copy for an owned target parameter. This keeps multi-shot
-  closures reusable even for imported value types. Inout captures remain
-  verifier errors. A lexical `make_closure` is a
+  closures reusable even for imported value types. For an on-stack
+  `partial_apply`, a frontend-emitted explicit capture retain stays in the
+  path-sensitive retain flow until its matching release after scope teardown;
+  an invocation closure instead transfers that retain at construction. Inout
+  captures remain verifier errors. A lexical `make_closure` is a
   distinct lifetime class: it owns a dynamic scope that must close on every CFG
   exit. For a nonescaping capture of caller-owned `inout`, `borrow_mutable_cell`
   presents the already-active modify address through the same capture ABI
@@ -511,7 +516,10 @@ Both workflows depend on stable, build-specific identities:
   `throws(any Error)` is admitted only through the compiler's concrete
   reabstraction thunk. The Verifier requires the function, closure signature,
   thrown payload, and error block parameter to name the same type, while the VM
-  never boxes that internal typed channel into a message. `throws(Never)` and
+  never boxes that internal typed channel into a message. An indirect typed
+  error result uses one real, branch-sensitive frame slot: each throwing path
+  initializes the slot, and terminal `throw_addr` consumes the value selected
+  by runtime control flow rather than a compiler-time cache. `throws(Never)` and
   the impossible normal result of a `Never` call remain unrepresented control
   flow rather than VM registers. Dynamic calls may carry
   a live inout scope across normal/error continuations, but every continuation
@@ -537,7 +545,15 @@ Both workflows depend on stable, build-specific identities:
   runtime. `Any` and `Error` conservatively use managed transfers because their
   concrete payload is dynamic. `unowned(unsafe)` remains fail-closed because a
   raw dangling reference cannot be made safe at a downloaded-code boundary.
-  `withoutActuallyEscaping` creates a separate
+  Synthetic local identities that embed canonical represented types use a
+  separate recursive value-type grammar instead of being reparsed as Swift
+  source syntax; closure, ownership, effect, container, native, and local-type
+  shapes therefore round-trip without type-specific exceptions.
+  `withExtendedLifetime` is a synchronous closure-scope intrinsic rather than
+  a generic Swift ABI call. Lowering copies its type-generic anchor, invokes the
+  no-argument closure through the ordinary nonthrowing or typed-throwing path,
+  and releases the anchor on both continuations. `withoutActuallyEscaping`
+  creates a separate
   dynamically scoped view; CFG verification covers split normal/error exits, while a
   budgeted, cycle-safe VM graph scan plus candidate-only CFG liveness rejects
   explicit-storage and semantically live aggregate escape without treating dead

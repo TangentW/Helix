@@ -445,9 +445,12 @@ does not by itself certify a physical device or distribution channel.
   compiler-generated functions, using the closure-body role only when partially
   applied; direct-only closure and `defer` helpers retain their physical capture
   ABI as concrete specializations. They are never resolved through NativeImport.
-  An unchanged eligible Swift callable or a declared NativeImport free/global
-  function may also become a closure value without copying an archived
-  implementation or creating an API-specific VM adapter. Unified
+  An unchanged eligible Swift callable or a representation-preserving declared
+  NativeImport callable may also become a closure value without copying an
+  archived implementation or creating an API-specific VM adapter. This covers
+  capture-free free/global functions, a bound instance method whose native
+  receiver is copied into the ordinary closure context, and an initializer
+  whose compiler-only metatype is validated and erased. Unified
   `make_closure` freezes an image function, `EntryIndex`, or `NativeImportID`;
   the callable ABI must be complete and representation-preserving, so a
   call-site default-argument projection or direct-call-only adapter is rejected;
@@ -467,6 +470,10 @@ does not by itself certify a physical device or distribution channel.
   a patch-local struct through field projections; the compiler reconstructs the
   aggregate only after every required field is initialized, using the same
   field-path storage and ownership model as tuple initialization.
+  `withExtendedLifetime` is lowered as a type-generic synchronous closure
+  scope: a represented copy of the lifetime anchor remains live across the
+  no-argument body's normal or typed-error continuation, and is released on
+  either exit. It does not invoke the standard library's generic runtime ABI.
   On-stack `partial_apply` and `withoutActuallyEscaping` use explicit dynamic
   scope identities. The Verifier proves that every normal and throwing CFG path
   closes the scope, and the VM rejects a scoped closure still reachable through
@@ -667,6 +674,10 @@ does not by itself certify a physical device or distribution channel.
 - Generic or `inout` Shell entries, noncopyable roots, arbitrary borrowing and
   consuming ABI, typed-throws roots, general `rethrows` outside the concrete
   standard-library operations listed above, and general unwind cleanup.
+- Closure scopes with additional native runtime semantics remain unsupported:
+  `autoreleasepool` requires a real autorelease-pool boundary, while
+  `withUnsafe...` and contiguous-storage callbacks expose pointer lifetimes.
+  They are not approximated as `withExtendedLifetime` or as no-op closure calls.
 - Unrestricted pointers, `unsafeBitCast`, arbitrary Objective-C selector/IMP,
   `dlopen`/`dlsym`, Mirror-driven field mutation, and unknown builtins.
 - A native call that does not have an exact `NativeImportID` in the target

@@ -3360,7 +3360,19 @@ public struct Lowerer: Sendable {
                         prepared.accesses.reversed()
                     )
                 }
-                for owner in prepared.temporaryOwners {
+            }
+            try scheduleTemporaryOwnerCleanups(
+                prepared.temporaryOwners,
+                in: targets
+            )
+        }
+
+        func scheduleTemporaryOwnerCleanups(
+            _ owners: [Bytecode.Register],
+            in targets: [Bytecode.BlockID]
+        ) throws {
+            for target in targets {
+                for owner in owners {
                     guard !implicitOwnerCleanups[target, default: []]
                         .contains(owner)
                     else {
@@ -4634,9 +4646,18 @@ public struct Lowerer: Sendable {
             }
 
             if let destination = destinations.error {
-                guard let runtimeErrorType = indirectErrorType,
-                      runtimeErrorType != .never,
-                      implicitStackValues[errorTarget] == nil
+                guard let runtimeErrorType = indirectErrorType else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "indirect call Error continuation has no error type"
+                    )
+                }
+                // A concretely nonthrowing rethrows specialization retains a
+                // physical `$Never` destination and error edge in canonical
+                // SIL. Neither has a runtime value to materialize.
+                if runtimeErrorType == .never {
+                    return
+                }
+                guard implicitStackValues[errorTarget] == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "indirect call Error continuation does not match its image"
@@ -16241,6 +16262,159 @@ public struct Lowerer: Sendable {
             collectionMutationYieldByToken[continuationToken] = yieldToken
         }
 
+        func lowerSynchronousClosureScopeTryApply(
+            _ intrinsic: CanonicalSIL.SynchronousClosureScopeIntrinsic,
+            genericArguments: String,
+            argumentText: String,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            switch intrinsic {
+            case .extendedLifetime:
+                let genericSpellings = splitTopLevel(genericArguments)
+                    .filter { !$0.isEmpty }
+                guard genericSpellings.count == 3 else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "withExtendedLifetime has an unsupported specialization"
+                    )
+                }
+                let lifetimeType = try parseStoredType(genericSpellings[0])
+                let errorType = ValueRepresentation.storable(
+                    try parseType(genericSpellings[1])
+                )
+                let resultType = try parseStoredType(genericSpellings[2])
+                guard try isSupportedErrorType(
+                    errorType,
+                    spelling: genericSpellings[1]
+                ) else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "withExtendedLifetime Error \(errorType)"
+                    )
+                }
+
+                var arguments = try parseApplyValueTokens(
+                    argumentText,
+                    line: line
+                )
+                let destinations = try consumeIndirectCallDestinations(
+                    from: &arguments,
+                    resultType: resultType,
+                    hasIndirectResult: true,
+                    indirectErrorType: errorType,
+                    physicalArgumentCount: 2
+                )
+                guard arguments.count == 2,
+                      compilerAddressType(arguments[0]) == lifetimeType,
+                      let lifetimeValue = try copyStoredValue(
+                          at: arguments[0],
+                          line: line
+                      ),
+                      registerTypes[Int(lifetimeValue.rawValue)] == lifetimeType
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "withExtendedLifetime value does not match its specialization"
+                    )
+                }
+
+                let closure = try resolve(arguments[1], line: line)
+                guard case let .closure(signature) = registerTypes[
+                    Int(closure.rawValue)
+                ], signature.parameters.isEmpty,
+                   signature.parameterConventions.isEmpty,
+                   signature.result == resultType,
+                   !signature.effects.isAsync
+                else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: line,
+                        mangledName: "withExtendedLifetime"
+                    )
+                }
+                let thrownType = try closureThrownType(
+                    signature,
+                    matching: errorType,
+                    context: "withExtendedLifetime closure"
+                )
+                if !lifetimeType.isTrivial {
+                    try scheduleTemporaryOwnerCleanups(
+                        [lifetimeValue],
+                        in: [normalTarget, errorTarget]
+                    )
+                }
+
+                if thrownType != nil {
+                    try bindIndirectTryCallDestinations(
+                        destinations,
+                        resultType: resultType,
+                        indirectErrorType: errorType,
+                        normalTarget: normalTarget,
+                        errorTarget: errorTarget
+                    )
+                    appendInstruction(
+                        .closureTryApply(
+                            closure: closure,
+                            arguments: [],
+                            normalTarget: normalTarget,
+                            errorTarget: errorTarget
+                        )
+                    )
+                } else {
+                    guard errorType == .never,
+                          destinations.error != nil,
+                          implicitStackValues[normalTarget] == nil,
+                          suppressedTryNormalParameterTypes.updateValue(
+                              resultType == .never ? .never : .void,
+                              forKey: normalTarget
+                          ) == nil
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "nonthrowing withExtendedLifetime has an invalid continuation ABI"
+                        )
+                    }
+                    let result: Bytecode.Register?
+                    if resultType == .void || resultType == .never {
+                        result = nil
+                    } else {
+                        guard let destination = destinations.result else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "withExtendedLifetime has no indirect result destination"
+                            )
+                        }
+                        let value = try allocate(type: resultType)
+                        try inheritCompilerAddressValue(
+                            value,
+                            at: destination,
+                            into: [normalTarget]
+                        )
+                        result = value
+                    }
+                    appendInstruction(
+                        .closureApply(
+                            result: result,
+                            closure: closure,
+                            arguments: []
+                        )
+                    )
+                    // Swift retains an impossible error edge for a
+                    // Never-specialized `rethrows` call. Keep that CFG edge
+                    // verifier-visible without making it executable.
+                    let succeeds = try allocate(type: .bool)
+                    appendInstruction(
+                        .constantBool(result: succeeds, value: true)
+                    )
+                    appendInstruction(
+                        .conditionalBranch(
+                            condition: succeeds,
+                            trueTarget: normalTarget,
+                            trueArguments: [],
+                            falseTarget: errorTarget,
+                            falseArguments: []
+                        )
+                    )
+                }
+            }
+        }
+
         func lowerSwiftCoreIntrinsic(
             _ intrinsic: SwiftCoreIntrinsic,
             resultToken: String,
@@ -17251,7 +17425,8 @@ public struct Lowerer: Sendable {
             case let .managedCollectionCast(cast):
                 try lowerRepresentationIdenticalCollectionCast(cast)
             case .higherOrder, .ordering, .arrayPredicateMutation, .split,
-                 .algebraic, .dictionaryAccumulation:
+                 .algebraic, .dictionaryAccumulation,
+                 .synchronousClosureScope:
                 throw CanonicalSIL.LoweringError.unsupportedInstruction(
                     line: line,
                     text: "Swift intrinsic requires control-flow lowering"
@@ -20359,7 +20534,27 @@ public struct Lowerer: Sendable {
                             )
                         }
                         indirectErrorAddress = address
-                        stackAddressTypes[address] = errorType
+                        if errorType == .never {
+                            // A nonthrowing rethrows specialization retains a
+                            // zero-sized compiler error address only as ABI
+                            // metadata. Never cannot have runtime storage.
+                            stackAddressTypes[address] = errorType
+                        } else {
+                            let slot = try allocateStackSlot(type: errorType)
+                            let runtimeAddress = try allocate(
+                                type: .address(errorType)
+                            )
+                            runtimeStackSlots[address] = slot
+                            runtimeAddressValues[address] = runtimeAddress
+                            runtimeAddressPointees[address] = errorType
+                            values[address] = runtimeAddress
+                            appendInstruction(
+                                .stackAddress(
+                                    result: runtimeAddress,
+                                    slot: slot
+                                )
+                            )
+                        }
                     } else if block.indirectErrorAddress != nil {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "entry block contains an unexpected indirect error result"
@@ -23499,7 +23694,10 @@ public struct Lowerer: Sendable {
                 let expectedCaptureTypes = Array(
                     binding.parameterTypes.suffix(captureTokens.count)
                 )
-                var captureTemporaryOwners: [Bytecode.Register] = []
+                var captureTemporaryOwners: [(
+                    token: String,
+                    owner: Bytecode.Register
+                )] = []
                 let captures = try zip(captureTokens, expectedCaptureTypes).map {
                     token, type in
                     if case let .mutableCell(pointee) = type {
@@ -23516,7 +23714,7 @@ public struct Lowerer: Sendable {
                                 "retained closure capture has the wrong type"
                             )
                         }
-                        captureTemporaryOwners.append(retained)
+                        captureTemporaryOwners.append((token, retained))
                         return retained
                     }
                     return try resolveStorableValue(
@@ -23559,13 +23757,19 @@ public struct Lowerer: Sendable {
                     captures: captures,
                     lifetime: lifetime
                 )
-                for owner in captureTemporaryOwners
+                for (token, owner) in captureTemporaryOwners
                 where requiresManagedOwnership(
                     registerTypes[Int(owner.rawValue)]
                 ) {
                     // make_closure copies captures into its managed context;
-                    // this owner represents Swift's explicit context retain.
-                    appendInstruction(.destroyValue(owner))
+                    // an on-stack partial_apply retains its source until the
+                    // matching SIL release after scope teardown. Invocation
+                    // closures transfer that explicit retain immediately.
+                    if lifetime == .lexical {
+                        recordPendingRetainedValue(owner, for: token)
+                    } else {
+                        appendInstruction(.destroyValue(owner))
+                    }
                 }
                 continue
             }
@@ -24105,6 +24309,18 @@ public struct Lowerer: Sendable {
                             text: "Result(catching:) requires nonthrowing apply"
                         )
                     }
+                    continue
+                }
+                if case let .synchronousClosureScope(intrinsic)? =
+                    swiftCoreReferences[call[0]] {
+                    try lowerSynchronousClosureScopeTryApply(
+                        intrinsic,
+                        genericArguments: call[1],
+                        argumentText: call[2],
+                        normalTarget: try parseBlockID(call[4]),
+                        errorTarget: try parseBlockID(call[5]),
+                        line: sourceLine
+                    )
                     continue
                 }
                 guard swiftCoreReferences[call[0]] == nil else {
@@ -27949,9 +28165,9 @@ public struct Lowerer: Sendable {
             if line == "throw_addr" {
                 guard signature.effects.mayThrow,
                       let address = indirectErrorAddress,
-                      let error = try copyStoredValue(
-                        at: address,
-                        line: sourceLine
+                      let error = try takeStoredValue(
+                          at: address,
+                          line: sourceLine
                       ),
                       registerTypes[Int(error.rawValue)]
                         == signature.thrownType

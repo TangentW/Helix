@@ -287,6 +287,81 @@ struct SubstitutedFunctionTypes {
         }
     }
 
+    @Test("Canonical value-type spellings round-trip every recursive shape")
+    func roundTripsCanonicalValueTypeSpellings() throws {
+        let nativeType = Core.TypeID(rawValue: .sha256("Fixture.Native"))
+        let localType = Bytecode.LocalTypeKey(rawValue: "Fixture.Payload")
+        let throwingClosure = Bytecode.ValueType.closure(
+            .init(
+                parameters: [
+                    .dictionary(key: .string, value: .optional(.int64)),
+                    .address(.local(localType)),
+                ],
+                parameterConventions: [.borrowed, .inout],
+                result: .optional(.native(nativeType)),
+                thrownType: .local(.init(rawValue: "Fixture.Failure")),
+                effects: .init(
+                    mayThrow: true,
+                    mayAllocate: true,
+                    hasExternalSideEffects: true,
+                    requiresMainActor: true
+                )
+            )
+        )
+        let values: [Bytecode.ValueType] = [
+            .void,
+            .never,
+            .bool,
+            .integer(bitWidth: 8, signed: true),
+            .integer(bitWidth: 64, signed: false),
+            .float(bitWidth: 32),
+            .string,
+            .any,
+            .error,
+            .array(.optional(throwingClosure)),
+            .dictionary(key: .string, value: throwingClosure),
+            .set(.local(localType)),
+            .native(nativeType),
+            .local(localType),
+            .address(.tuple([.int64, throwingClosure])),
+            .mutableCell(throwingClosure),
+            .nonOwningReference(
+                kind: .weak,
+                pointee: .optional(.local(localType))
+            ),
+            .nonOwningReference(kind: .unowned, pointee: .local(localType)),
+            .arrayState(kind: .stableSort, element: throwingClosure),
+            .dictionaryState(key: .string, value: throwingClosure),
+            throwingClosure,
+            .tuple([]),
+            .tuple([.int64, throwingClosure]),
+            .optional(throwingClosure),
+        ]
+
+        for value in values {
+            #expect(
+                try CanonicalSIL.ValueTypeSpelling.parse(value.description)
+                    == value
+            )
+        }
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.ValueTypeSpelling.parse(
+                "@closure[throws(Fixture.Failure),throws(Fixture.Failure)] "
+                    + "() -> Int64"
+            )
+        }
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.ValueTypeSpelling.parse(
+                "Dictionary<String>"
+            )
+        }
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.ValueTypeSpelling.parse(
+                "@closure[] () -> Int64"
+            )
+        }
+    }
+
     @Test("Current Swift map and filter closure ABIs are discovered concretely")
     func discoversCurrentFrontendClosureABIs() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(

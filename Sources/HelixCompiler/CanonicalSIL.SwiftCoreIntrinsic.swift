@@ -22,6 +22,9 @@ enum SwiftCoreIntrinsic: Equatable {
     case defaultValue(CanonicalSIL.DefaultValueIntrinsic)
     case scalarText(CanonicalSIL.ScalarTextIntrinsic)
     case sourceFailure(CanonicalSIL.SourceFailureIntrinsic)
+    case synchronousClosureScope(
+        CanonicalSIL.SynchronousClosureScopeIntrinsic
+    )
     case anyObjectBridge
     /// Compiler notification emitted immediately before a concrete typed
     /// error unwinds. HLBC owns that unwind and therefore lowers it to no-op.
@@ -88,7 +91,8 @@ enum SwiftCoreIntrinsic: Equatable {
     var prefersCanonicalLoweringOverImageBody: Bool {
         switch self {
         case .typedThrowNotification,
-             .sourceFailure(.typedUnexpectedError):
+             .sourceFailure(.typedUnexpectedError),
+             .synchronousClosureScope:
             true
         default:
             false
@@ -102,6 +106,12 @@ enum SwiftCoreIntrinsic: Equatable {
         }
         if mangledName == CanonicalSIL.AnyObjectBridge.silMangledName {
             self = .anyObjectBridge
+            return
+        }
+        if let closureScope = CanonicalSIL.SynchronousClosureScopeIntrinsic(
+            mangledName: mangledName
+        ) {
+            self = .synchronousClosureScope(closureScope)
             return
         }
         if let mutation = CanonicalSIL.ValueMutationIntrinsic(

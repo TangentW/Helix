@@ -208,6 +208,158 @@ struct EntryClosure {
         )
     }
 
+    @Test("Imported instance-method references bind native receivers")
+    func lowersBoundNativeMethodReference() throws {
+        let widgetType = Core.TypeID(rawValue: .sha256("Fixture.Widget"))
+        let physicalType = "@convention(objc_method) "
+            + "(Int, @guaranteed Widget) -> Int"
+        let symbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+            reference: "#Widget.transform!foreign",
+            loweredType: physicalType
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: .init(rawValue: 14),
+            key: .init(rawValue: .sha256("bound-native-method-closure")),
+            signature: .init(
+                parameters: ["Swift.Int", "Fixture.Widget"],
+                result: "Swift.Int"
+            ),
+            effects: .init(),
+            contract: .bounded(
+                kind: .instanceMethod,
+                domain: .application,
+                access: .pure,
+                maximumDurationMicroseconds: 500,
+                allowsMainThread: true
+            )
+        )
+        let directCalls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.int64, .native(widgetType)],
+                resultType: .int64,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["Widget": widgetType],
+                kinds: [widgetType: .reference]
+            )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture11bindMethodyS2icSo6WidgetCF",
+            loweredType: "@convention(thin) (@guaranteed Widget) -> "
+                + "@owned @callee_guaranteed (Int) -> Int",
+            body: """
+            bb0(%0 : @guaranteed $Widget):
+              %1 = objc_method %0, #Widget.transform!foreign : (Widget) -> (Int) -> Int, $\(physicalType)
+              %2 = partial_apply [callee_guaranteed] %1(%0) : $\(physicalType)
+              return %2
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "bindNativeMethod",
+            directCalls: directCalls
+        )
+        let parameter = try #require(lowered.parameterRegisters.first)
+        #expect(lowered.parameterConventions == [.borrowed])
+        #expect(lowered.blocks.flatMap(\.instructions).contains {
+            guard case let .makeClosure(
+                result,
+                .nativeImport(importID),
+                captures,
+                .invocation
+            ) = $0 else { return false }
+            return importID == requirement.id
+                && captures == [parameter]
+                && lowered.registerTypes[Int(result.rawValue)] == .closure(
+                    .init(
+                        parameters: [.int64],
+                        parameterConventions: [.owned],
+                        result: .int64
+                    )
+                )
+        })
+    }
+
+    @Test("Imported initializer references erase static metatypes")
+    func lowersNativeInitializerReference() throws {
+        let widgetType = Core.TypeID(rawValue: .sha256("Fixture.Widget"))
+        let symbol = "$s7Fixture6WidgetC5valueACSi_tcfC"
+        let requirement = Bytecode.ImportRequirement(
+            id: .init(rawValue: 15),
+            key: .init(rawValue: .sha256("native-initializer-closure")),
+            signature: .init(
+                parameters: ["Swift.Int"],
+                result: "Fixture.Widget"
+            ),
+            effects: .init(),
+            contract: .bounded(
+                kind: .initializer,
+                domain: .application,
+                access: .pure,
+                maximumDurationMicroseconds: 500,
+                allowsMainThread: true
+            )
+        )
+        let directCalls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.int64],
+                resultType: .native(widgetType),
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["Widget": widgetType],
+                kinds: [widgetType: .reference]
+            )
+        let physicalType = "@convention(method) "
+            + "(Int, @thick Widget.Type) -> @owned Widget"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture17initializerFactorySo6WidgetCSicSgyF",
+            loweredType: "@convention(thin) () -> "
+                + "@owned @callee_guaranteed (Int) -> @owned Widget",
+            body: """
+            bb0:
+              %0 = metatype $@thick Widget.Type
+              %1 = function_ref @\(symbol) : $\(physicalType)
+              %2 = partial_apply [callee_guaranteed] %1(%0) : $\(physicalType)
+              return %2
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "nativeInitializerFactory",
+            directCalls: directCalls
+        )
+        #expect(lowered.blocks.flatMap(\.instructions).contains {
+            guard case let .makeClosure(
+                result,
+                .nativeImport(importID),
+                captures,
+                .invocation
+            ) = $0 else { return false }
+            return importID == requirement.id
+                && captures.isEmpty
+                && lowered.registerTypes[Int(result.rawValue)] == .closure(
+                    .init(
+                        parameters: [.int64],
+                        parameterConventions: [.owned],
+                        result: .native(widgetType)
+                    )
+                )
+        })
+    }
+
     @Test("Call-site argument projections cannot masquerade as function values")
     func rejectsProjectedNativeImportFunctionReference() throws {
         let symbol = "$s7Fixture9defaultedyS2i_SiSgtF"

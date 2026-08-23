@@ -1587,15 +1587,13 @@ public struct TypeEnvironment: Sendable {
                     cases: [
                         .init(
                             name: "success",
-                            payloadType: ValueRepresentation.storable(
-                                try resolve(arguments[0])
-                            )
+                            payloadType: try CanonicalSIL.ValueTypeSpelling
+                                .parse(arguments[0])
                         ),
                         .init(
                             name: "failure",
-                            payloadType: ValueRepresentation.storable(
-                                try resolve(arguments[1])
-                            )
+                            payloadType: try CanonicalSIL.ValueTypeSpelling
+                                .parse(arguments[1])
                         ),
                     ]
                 )

@@ -164,6 +164,8 @@ struct ProfileScreen: View {
 
 经过上下文定型的运算符/重载函数引用、unbound method、同步 `@MainActor` closure 与常见 lazy/可变/条件 closure 变量复用上述值模型；递归局部 helper 可以同时直接调用并形成 closure 值，而不会拆分 callable identity。
 
+`withExtendedLifetime` 复用普通同步 closure 调用模型，并让类型通用的 lifetime anchor 跨 normal 与 typed-error 两条出口保持存活；它不会把标准库泛型 ABI 冻结成 NativeImport。
+
 Swift frontend 已携带具体错误 substitution 的标准库高阶专门化会继续保留 `Failure`；旧式 `rethrows` 调用则必须经过具体 reabstraction thunk 才能进入 `any Error` 通道。
 
 安全的 `weak` 与 checked `unowned` capture list，以及被捕获的 weak 局部变量，会与可变 capture 一起归一到 managed-capture ABI。其不持有对象的 storage 同时覆盖补丁内 class 和已冻结 identity 的 native reference；对象释放后 weak load 返回 `nil`，已失效的 checked-unowned load 则触发受控 VM trap。`unowned(unsafe)` 与 weak/unowned stored-property layout 继续 fail closed。
@@ -188,7 +190,7 @@ Array、ArraySlice、递归 Array-backed Slice 与 Repeated 共用已表示的�
 
 `Bool.toggle()` 与全局 `swap` 同样通过共享 compiler-address sink 上的值修改计划执行。swap 会验证 storage 不重叠，并在写入任一 destination 前读取两个可表示值，因此普通局部变量、aggregate projection、frame storage 与可变 closure capture 无需各自的 API adapter。
 
-冻结 imported reference 等可复制线性值也可以被 closure 捕获；构造 managed context 时生成 context 副本，调用时 borrowed 目标参数复用该副本，owned 目标参数则在每次调用重新复制，inout 线性捕获仍会被拒绝。冻结的 NativeImport 全局/自由函数引用可以直接成为同一静态目标模型中的 closure，但必须使用 identity 参数投影和表示保持的 ABI adapter；默认参数调用变体仍只能直接调用。完全具体的 reabstraction thunk 会直接链接进 image，不会被误判成 NativeImport。Dictionary 默认查找只在缺键时调用 autoclosure；其 scoped `_modify` 与 Array element `_modify` 共用 frame-backed 借出，并在正常 `end_apply` 与抛错 `abort_apply` 两条出口都通过普通强类型集合原语回写，覆盖嵌套集合和 imported-reference element。
+冻结 imported reference 等可复制线性值也可以被 closure 捕获；构造 managed context 时生成 context 副本，调用时 borrowed 目标参数复用该副本，owned 目标参数则在每次调用重新复制，inout 线性捕获仍会被拒绝。冻结的 NativeImport 全局/自由函数、绑定实例方法与 initializer 引用可以直接成为同一静态目标模型中的 closure；native receiver 作为普通 capture suffix，compiler-only metatype 经校验后擦除。该路径必须使用 identity 参数投影和表示保持的 ABI adapter；默认参数调用变体仍只能直接调用。完全具体的 reabstraction thunk 会直接链接进 image，不会被误判成 NativeImport。Dictionary 默认查找只在缺键时调用 autoclosure；其 scoped `_modify` 与 Array element `_modify` 共用 frame-backed 借出，并在正常 `end_apply` 与抛错 `abort_apply` 两条出口都通过普通强类型集合原语回写，覆盖嵌套集合和 imported-reference element。
 
 Dictionary 的 merging、可变 merge、uniquing 构造与 grouping 共用一个强类型线性 accumulator 和普通 closure CFG，因此可以统一保留“只对重复 key combine”、来源遍历顺序、抛错时可变操作的部分回写及 imported-reference ownership；不需要为每个 API 增加 opcode，也不会把 Swift 标准库泛型方法绑定成 NativeImport。
 

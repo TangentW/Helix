@@ -314,11 +314,14 @@ managed mutable captures, copyable linear captures with borrowed reuse or a
 fresh owned copy per invocation,
 safe weak and checked-unowned capture storage,
 same-image `@escaping` return/capture flows, recursively stored and higher-order
-closure values, dynamically checked `withoutActuallyEscaping`, lexical
+closure values, type-generic synchronous `withExtendedLifetime`, dynamically
+checked `withoutActuallyEscaping`, lexical
 nonescaping capture of caller-owned `inout`, fully concrete compiler
 specializations, reabstraction thunks, default-argument generators, first-class
 patch-local enum cases, concrete `Optional`/`Result` case constructors,
 patch-local struct initializers and static factories,
+declared NativeImport free/global functions, bound instance methods, and
+initializers as representation-preserving closure values,
 contextually typed operator/overload and unbound-method references,
 synchronous `@MainActor` closure values, common lazy/mutable/conditional
 closure variables, and recursively direct local helpers that also form closure
@@ -392,8 +395,9 @@ framework-neutral failure value, concurrent `Sendable` closure execution,
 async closures, `unowned(unsafe)`, weak/unowned stored-property layouts,
 escaping caller-owned `inout`
 capture, true `await`/continuations, actor-isolated `self`,
-custom global actors, unrestricted pointers, reflection-based field access, and
-unregistered native APIs are rejected. See
+custom global actors, native-runtime closure scopes such as `autoreleasepool`,
+unrestricted pointers, reflection-based field access, and unregistered native
+APIs are rejected. See
 [Capabilities and Limits](Capabilities-and-Limits.md) for the practical matrix.
 
 HLBC carries a verifier-checked source map from function/block/instruction
