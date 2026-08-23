@@ -63,6 +63,22 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 
 - NativeImport callback 的通用发现与生成路径还覆盖带 closure 的原生 initializer、completion 参数和 callback 属性 setter，例如 `UIAction`/`UIAlertAction`、`UIViewController.present`、cell configuration handler 与 `Operation.completionBlock`。属性赋值是存储行为，因此合同会将其 closure 生命周期固定为 escaping，并保留表达式上的 actor isolation；这不是 UIKit 或 Foundation 的逐 API 特例。
 
+### 同步 closure 能力矩阵
+
+下表是经过总审查的 v1 闭包基线。原生相关行仍要求存在精确冻结或由受管 Debug 生成的 NativeImport，并通过上文全部 callable 合同检查；示例不是 API allowlist。
+
+| 领域 | 已支持 | 有意保留的边界 |
+| --- | --- | --- |
+| 构造与函数引用 | closure literal 与简写参数、局部/全局函数、operator/overload、补丁内绑定/未绑定 method、enum/Optional/Result case、补丁内 initializer/static factory、eligible Shell entry，以及表示保持的 NativeImport 全局/自由函数、绑定实例方法和 initializer | 仅适用于直接调用的默认参数投影不能伪装成函数值；仍需泛型 metadata/witness dispatch 的引用会拒绝 |
+| 存储与高阶传递 | Optional、Tuple、Array、Dictionary value、具体 Result、补丁内 struct/enum/class 字段、可变 closure 变量以及 closure 参数/结果；支持嵌套、递归和返回 closure | closure 不进入 Set key/element、VM-owned `Any`、Shell entry 或通用原生边界 codec |
+| 捕获与所有权 | 不可变快照、共享 mutable cell、强捕获、安全 `weak`、checked `unowned`、捕获另一个 closure、可复制 imported owner，以及经过验证的词法期 nonescaping closure 对调用者 `inout` 的借用 | `unowned(unsafe)`、noncopyable capture、线性 `inout` capture，以及 escaping closure 捕获调用者 `inout` 会拒绝 |
+| 调用与错误 | 同步 nonthrowing/throwing、具体 typed throws、具体 rethrows specialization、inout 的 normal/error 清理、autoclosure、默认参数 generator、Optional 调用与 `callAsFunction` | async closure ABI、suspension、任意运行时 specialization 与通用 unwind cleanup 尚未实现 |
+| 编译器管理的作用域 | 仅直接调用的 `defer`、动态检查的 `withoutActuallyEscaping`，以及类型通用的同步 `withExtendedLifetime`，包括 throwing 与 closure-valued result | `autoreleasepool`、`withUnsafe...` 和 contiguous-storage scope 必须保留真实原生运行时或 pointer lifetime 语义，不做近似 |
+| 原生 callback 参数 | 直接或 Optional 的 Swift closure/Objective-C block；nonescaping/escaping 生命周期；同步 nonthrowing 参数与结果；MainActor provenance；经过检查的默认值；有界 `Error` 参数代理；确定性失败值 | throwing/async/`inout` callback ABI、C function pointer/context-pointer pair、递归或 nonescaping 的嵌套 callable、callable 容器，以及没有确定性失败值的结果 |
+| 原生来源 callable | 一层直接或 Optional 的 escaping callable 可作为外层 callback 参数或 NativeImport 结果进入 VM，并以同一强类型 closure 路径保留 identity、ownership、actor、deadline 与资源检查 | 第二层 callable、callable aggregate，以及用 image-local closure 冒充原生返回值会拒绝 |
+| 常见 SDK 场景 | UIKit animation/transition/action/presentation/configuration、`DispatchQueue.async`/`asyncAfter`、`DispatchGroup.notify`、Operation/OperationQueue、Timer、URLSession、NotificationCenter、`NSPredicate` 与 FileManager enumeration | 超出精确 profile 的泛型或 throwing SDK closure 声明（包括泛型 `DispatchQueue.sync` closure overload）在具备擦除表示的生成 wrapper 前仍要求正常构建 |
+| 隔离与并发 | 同步 `@MainActor` closure/callback、同线程重入、escaping callback 保留原 image/generation lease；callback 执行串行化 | 不声明通用 `Sendable` 语义，不允许跨线程重叠 callback、custom global actor、actor-isolated `self` 或任意 executor hop |
+
 ### 拒绝或有意未完成
 
 - generic root，以及仍需要运行时 generic metadata、witness table、未解析/泛型 reabstraction 或动态 specialization 的执行。这也包括尚未归一为可表示 managed Collection、迭代语义不透明的自定义 `Sequence`；Helix 不会把它们经 NativeImport 转交给 Swift 标准库执行。
