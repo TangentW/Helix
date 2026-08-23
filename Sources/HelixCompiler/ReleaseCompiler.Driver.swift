@@ -553,6 +553,7 @@ extension ReleaseCompiler {
                     try generatedSignature(
                         of: $0.function,
                         environment: silTypeEnvironment,
+                        file: silFile,
                         symbol: symbol,
                         kind: $0.kind,
                         executionEffectEnvelope: executionEffectEnvelope
@@ -562,6 +563,7 @@ extension ReleaseCompiler {
                     try generatedSignature(
                         of: $0.function,
                         environment: loweringTypeEnvironment,
+                        file: loweringSILFile,
                         symbol: symbol,
                         kind: $0.kind,
                         executionEffectEnvelope: executionEffectEnvelope
@@ -693,7 +695,8 @@ extension ReleaseCompiler {
                                 displayName: item.symbol,
                                 kind: item.kind,
                                 directCalls: directCalls,
-                                expectedEffects: item.signature.effects
+                                expectedEffects: item.signature.effects,
+                                expectedResultType: item.signature.result
                             )
                         } catch let error as CanonicalSIL.LoweringError {
                             guard let semantic = item.semantic,
@@ -706,7 +709,8 @@ extension ReleaseCompiler {
                                 displayName: item.symbol,
                                 kind: item.kind,
                                 directCalls: directCalls,
-                                expectedEffects: item.signature.effects
+                                expectedEffects: item.signature.effects,
+                                expectedResultType: item.signature.result
                             )
                         }
                     } else if let semantic = item.semantic {
@@ -717,7 +721,8 @@ extension ReleaseCompiler {
                             displayName: item.symbol,
                             kind: item.kind,
                             directCalls: directCalls,
-                            expectedEffects: item.signature.effects
+                            expectedEffects: item.signature.effects,
+                            expectedResultType: item.signature.result
                         )
                     } else {
                         throw DriverError.generatedFunctionUnsupported(
@@ -968,6 +973,7 @@ extension ReleaseCompiler {
         private func generatedSignature(
             of function: CanonicalSIL.Function,
             environment: CanonicalSIL.TypeEnvironment,
+            file: CanonicalSIL.File,
             symbol: String,
             kind: Bytecode.FunctionKind,
             executionEffectEnvelope: Core.Effects
@@ -978,7 +984,8 @@ extension ReleaseCompiler {
                     environment: environment,
                     symbol: symbol,
                     kind: kind,
-                    executionEffectEnvelope: executionEffectEnvelope
+                    executionEffectEnvelope: executionEffectEnvelope,
+                    file: file
                 )
             } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
                 switch error {

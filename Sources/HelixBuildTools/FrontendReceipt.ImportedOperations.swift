@@ -555,6 +555,10 @@ extension FrontendReceipt.Adapter {
                     operations: &operations
                 )
                 if !importedModules.isEmpty {
+                    let callbackActorBindings = callbackActorBindings(
+                        in: body,
+                        demangled: demangled
+                    )
                     try visitImportedExpression(
                         body,
                         role: .value,
@@ -564,6 +568,7 @@ extension FrontendReceipt.Adapter {
                         importedModules: importedModules,
                         moduleName: moduleName,
                         demangled: demangled,
+                        callbackActorBindings: callbackActorBindings,
                         types: &types,
                         operations: &operations
                     )
@@ -685,6 +690,149 @@ extension FrontendReceipt.Adapter {
         case assignmentDestination
     }
 
+    private struct CallbackActorBinding: Sendable {
+        var name: String
+        var declarationOffset: Int
+        var scopeStart: Int
+        var scopeEnd: Int
+        var actor: String
+    }
+
+    private func callbackActorBindings(
+        in body: [String: Any],
+        demangled: [String: String]
+    ) -> [CallbackActorBinding] {
+        typealias Scope = (start: Int, end: Int)
+        typealias Immutable = (
+            name: String,
+            offset: Int,
+            scope: Scope
+        )
+        typealias Candidate = (
+            name: String,
+            declarationOffset: Int,
+            declarationEnd: Int,
+            scope: Scope,
+            initializer: [String: Any],
+            explicitType: Any?
+        )
+        var immutable: [Immutable] = []
+        var candidates: [Candidate] = []
+
+        func patternNames(in value: Any) -> [String] {
+            if let values = value as? [Any] {
+                return values.flatMap(patternNames)
+            }
+            guard let item = value as? [String: Any] else { return [] }
+            if item["_kind"] as? String == "pattern_named",
+               let name = baseName(in: item) {
+                return [name]
+            }
+            return item.values.flatMap(patternNames)
+        }
+
+        func explicitPatternType(in value: Any) -> Any? {
+            guard let item = value as? [String: Any] else { return nil }
+            if item["_kind"] as? String == "pattern_typed" {
+                return item["type"]
+            }
+            return item.values.lazy.compactMap(explicitPatternType).first
+        }
+
+        func mainActor(in rawType: Any?) -> String? {
+            guard let type = importedSwiftType(
+                rawType,
+                demangled: demangled
+            ), let actor = FrontendReceipt.FunctionTypeSpelling
+                .callbackBoundary(in: type)?
+                .function.attributes.globalActor,
+                actor == "MainActor" || actor == "Swift.MainActor"
+            else { return nil }
+            return actor
+        }
+
+        func walk(_ value: Any, scope inheritedScope: Scope?) {
+            if let values = value as? [Any] {
+                for value in values { walk(value, scope: inheritedScope) }
+                return
+            }
+            guard let item = value as? [String: Any] else { return }
+            let kind = item["_kind"] as? String
+            let itemRange = sourceRange(in: item)
+            let scope: Scope? = if kind == "brace_stmt", let itemRange {
+                (itemRange.start, itemRange.end)
+            } else {
+                inheritedScope
+            }
+
+            if kind == "var_decl", item["let"] as? Bool == true,
+               let name = baseName(in: item), let itemRange, let scope {
+                immutable.append((name, itemRange.start, scope))
+            }
+            if kind == "pattern_binding_decl", let itemRange, let scope,
+               let entries = item["pattern_entries"] as? [[String: Any]] {
+                for entry in entries {
+                    guard let pattern = entry["pattern"] as? [String: Any],
+                          case let names = patternNames(in: pattern),
+                          names.count == 1,
+                          let name = names.first,
+                          let initializer = (entry["processed_init"]
+                            ?? entry["original_init"]) as? [String: Any]
+                    else { continue }
+                    candidates.append((
+                        name,
+                        itemRange.start,
+                        itemRange.end,
+                        scope,
+                        initializer,
+                        explicitPatternType(in: pattern)
+                    ))
+                }
+            }
+            // A nested named function has its own lexical declaration
+            // environment and canonical SIL body.
+            if kind == "func_decl" { return }
+            for (key, child) in item where key != "decl" {
+                walk(child, scope: scope)
+            }
+        }
+
+        walk(body, scope: nil)
+        var bindings: [CallbackActorBinding] = []
+        for candidate in candidates.sorted(by: {
+            $0.declarationOffset < $1.declarationOffset
+        }) {
+            guard immutable.contains(where: {
+                $0.name == candidate.name
+                    && $0.scope == candidate.scope
+                    && $0.offset >= candidate.declarationOffset
+                    && $0.offset <= candidate.declarationEnd
+            }) else { continue }
+            let actor: String?
+            if let explicitType = candidate.explicitType {
+                // A source-written function type is authoritative. In
+                // particular, do not undo an explicit actor erasure merely
+                // because its initializer still carries MainActor provenance.
+                actor = mainActor(in: explicitType)
+            } else {
+                actor = callbackGlobalActor(
+                    in: candidate.initializer,
+                    demangled: demangled,
+                    bindings: bindings
+                )
+            }
+            guard let actor else { continue }
+            bindings.append(.init(
+                name: candidate.name,
+                declarationOffset: candidate.declarationOffset,
+                scopeStart: candidate.scope.start,
+                scopeEnd: candidate.scope.end,
+                actor: actor
+            ))
+        }
+        return bindings
+    }
+
     private func visitImportedExpression(
         _ item: [String: Any],
         role: ImportedExpressionRole,
@@ -694,6 +842,7 @@ extension FrontendReceipt.Adapter {
         importedModules: [String],
         moduleName: String,
         demangled: [String: String],
+        callbackActorBindings: [CallbackActorBinding],
         types: inout [ImportedNativeType],
         operations: inout [ImportedOperation]
     ) throws {
@@ -710,6 +859,7 @@ extension FrontendReceipt.Adapter {
                 importedModules: importedModules,
                 moduleName: moduleName,
                 demangled: demangled,
+                callbackActorBindings: callbackActorBindings,
                 types: &types,
                 operations: &operations
             )
@@ -736,6 +886,7 @@ extension FrontendReceipt.Adapter {
                 source: source,
                 importedModules: importedModules,
                 demangled: demangled,
+                callbackActorBindings: callbackActorBindings,
                 types: &types,
                 operations: &operations
             )
@@ -749,6 +900,7 @@ extension FrontendReceipt.Adapter {
                     importedModules: importedModules,
                     moduleName: moduleName,
                     demangled: demangled,
+                    callbackActorBindings: callbackActorBindings,
                     types: &types,
                     operations: &operations
                 )
@@ -763,6 +915,7 @@ extension FrontendReceipt.Adapter {
                     importedModules: importedModules,
                     moduleName: moduleName,
                     demangled: demangled,
+                    callbackActorBindings: callbackActorBindings,
                     types: &types,
                     operations: &operations
                 )
@@ -780,6 +933,7 @@ extension FrontendReceipt.Adapter {
                 source: source,
                 importedModules: importedModules,
                 demangled: demangled,
+                callbackActorBindings: callbackActorBindings,
                 types: &types,
                 operations: &operations
             )
@@ -850,6 +1004,7 @@ extension FrontendReceipt.Adapter {
                     importedModules: importedModules,
                     moduleName: moduleName,
                     demangled: demangled,
+                    callbackActorBindings: callbackActorBindings,
                     types: &types,
                     operations: &operations
                 )
@@ -864,6 +1019,7 @@ extension FrontendReceipt.Adapter {
                         importedModules: importedModules,
                         moduleName: moduleName,
                         demangled: demangled,
+                        callbackActorBindings: callbackActorBindings,
                         types: &types,
                         operations: &operations
                     )
@@ -881,6 +1037,7 @@ extension FrontendReceipt.Adapter {
         source: SourceState,
         importedModules: [String],
         demangled: [String: String],
+        callbackActorBindings: [CallbackActorBinding],
         types: inout [ImportedNativeType],
         operations: inout [ImportedOperation]
     ) throws {
@@ -901,7 +1058,8 @@ extension FrontendReceipt.Adapter {
            let assignedValue,
            let actor = callbackGlobalActor(
                in: assignedValue,
-               demangled: demangled
+               demangled: demangled,
+               bindings: callbackActorBindings
            ), let isolated = FrontendReceipt.FunctionTypeSpelling
                .applyingGlobalActor(actor, to: propertyType) {
             propertyType = isolated
@@ -1035,6 +1193,7 @@ extension FrontendReceipt.Adapter {
         importedModules: [String],
         moduleName: String,
         demangled: [String: String],
+        callbackActorBindings: [CallbackActorBinding],
         types: inout [ImportedNativeType],
         operations: inout [ImportedOperation]
     ) throws {
@@ -1065,7 +1224,8 @@ extension FrontendReceipt.Adapter {
             else { return }
             if let actor = callbackGlobalActor(
                 in: value,
-                demangled: demangled
+                demangled: demangled,
+                bindings: callbackActorBindings
             ), let isolated = FrontendReceipt.FunctionTypeSpelling
                 .applyingGlobalActor(actor, to: type) {
                 type = isolated
@@ -1376,10 +1536,40 @@ extension FrontendReceipt.Adapter {
 
     private func callbackGlobalActor(
         in expression: [String: Any],
-        demangled: [String: String]
+        demangled: [String: String],
+        bindings: [CallbackActorBinding] = []
     ) -> String? {
         if let raw = expression["global_actor_isolated"] as? String,
            let actor = demangled[raw],
+           actor == "MainActor" || actor == "Swift.MainActor" {
+            return actor
+        }
+        if expression["_kind"] as? String == "declref_expr",
+           let declaration = expression["decl"] as? [String: Any],
+           (declaration["decl_usr"] as? String) == "",
+           let name = declaration["base_name"] as? String,
+           let offset = sourceRange(in: expression)?.start,
+           let binding = bindings.filter({ binding in
+               binding.name == name
+                   && binding.declarationOffset <= offset
+                   && binding.scopeStart <= offset
+                   && offset <= binding.scopeEnd
+           }).max(by: { left, right in
+               (left.scopeStart, left.declarationOffset)
+                   < (right.scopeStart, right.declarationOffset)
+           }) {
+            return binding.actor
+        }
+        // Swift inserts function-conversion and Optional-injection wrappers
+        // when an isolated closure value is passed to a less-specific SDK
+        // parameter. The wrapper's result type has already erased isolation,
+        // but its operand type remains authoritative provenance.
+        if let type = importedSwiftType(
+            expression["type"],
+            demangled: demangled
+        ), let actor = FrontendReceipt.FunctionTypeSpelling
+            .callbackBoundary(in: type)?
+            .function.attributes.globalActor,
            actor == "MainActor" || actor == "Swift.MainActor" {
             return actor
         }
@@ -1387,7 +1577,8 @@ extension FrontendReceipt.Adapter {
             if let child = expression[key] as? [String: Any],
                let actor = callbackGlobalActor(
                    in: child,
-                   demangled: demangled
+                   demangled: demangled,
+                   bindings: bindings
                ) {
                 return actor
             }

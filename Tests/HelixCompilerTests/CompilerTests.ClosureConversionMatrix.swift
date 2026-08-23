@@ -338,6 +338,127 @@ struct ClosureConversionMatrix {
         #expect(try invoke(fixture, [integer(4)]) == integer(8))
     }
 
+    @Test("Escaping-to-nonescaping conversions establish checked scopes")
+    func lowersEscapingToNonescapingScopes() throws {
+        func lower(
+            targetEffects: String
+        ) throws -> [Bytecode.Instruction] {
+            let function = CanonicalSIL.Function(
+                mangledName: "$s7Fixture5scopeyyyycF",
+                loweredType: "@convention(thin) "
+                    + "(@guaranteed @callee_guaranteed () -> ()) -> ()",
+                body: """
+                bb0(%0 : $@guaranteed @callee_guaranteed () -> ()):
+                  %1 = convert_escape_to_noescape %0 to $@noescape @callee_guaranteed \(targetEffects)() -> ()
+                  %2 = destroy_not_escaped_closure %1
+                  %3 = tuple ()
+                  return %3
+                """
+            )
+            return try CanonicalSIL.Lowerer().lower(
+                function,
+                displayName: "Fixture.scope"
+            ).blocks.flatMap(\.instructions)
+        }
+
+        let plain = try lower(targetEffects: "")
+        #expect(!plain.contains { instruction in
+            if case .convertClosure = instruction { return true }
+            return false
+        })
+        try expectCheckedScope(in: plain, expectsRestriction: false)
+
+        let restricted = try lower(targetEffects: "@MainActor ")
+        #expect(restricted.contains { instruction in
+            if case .convertClosure = instruction { return true }
+            return false
+        })
+        try expectCheckedScope(in: restricted, expectsRestriction: true)
+
+        let releasedConversion = CanonicalSIL.Function(
+            mangledName: "$s7Fixture18releasedConversionyyyycF",
+            loweredType: "@convention(thin) "
+                + "(@owned @callee_guaranteed () -> ()) -> ()",
+            body: """
+            bb0(%0 : $@owned @callee_guaranteed () -> ()):
+              %1 = convert_function %0 to $@callee_guaranteed @MainActor () -> ()
+              strong_release %1
+              strong_release %0
+              %2 = tuple ()
+              return %2
+            """
+        )
+        let releasedInstructions = try CanonicalSIL.Lowerer().lower(
+            releasedConversion,
+            displayName: "Fixture.releasedConversion"
+        ).blocks.flatMap(\.instructions)
+        #expect(releasedInstructions.contains { instruction in
+            if case .convertClosure = instruction { return true }
+            return false
+        })
+
+        let optionalCarrierBody = """
+        bb0(%0 : $@guaranteed @callee_guaranteed () -> ()):
+          %1 = convert_escape_to_noescape %0 to $@noescape @callee_guaranteed @MainActor () -> ()
+          %2 = enum $Optional<@callee_guaranteed @MainActor () -> ()>, #Optional.some!enumelt, %1
+          %3 = destroy_not_escaped_closure %2
+          %4 = tuple ()
+          return %4
+        """
+        let optionalCarrierFunction = CanonicalSIL.Function(
+            mangledName: "$s7Fixture15optionalCarrieryyyyXEF",
+            loweredType: "@convention(thin) "
+                + "(@guaranteed @callee_guaranteed () -> ()) -> ()",
+            body: optionalCarrierBody
+        )
+        let optionalCarrier = try CanonicalSIL.Lowerer().lower(
+            optionalCarrierFunction,
+            displayName: "Fixture.optionalCarrier"
+        ).blocks.flatMap(\.instructions)
+        #expect(!optionalCarrier.contains { instruction in
+            if case .makeOptionalSome = instruction { return true }
+            return false
+        })
+        try expectCheckedScope(
+            in: optionalCarrier,
+            expectsRestriction: true
+        )
+
+        let invalidCarrier = CanonicalSIL.Function(
+            mangledName: "$s7Fixture14invalidCarrieryyyyXEF",
+            loweredType: optionalCarrierFunction.loweredType,
+            body: optionalCarrierBody.replacingOccurrences(
+                of: "  %3 = destroy_not_escaped_closure %2",
+                with: "  retain_value %2\n  %3 = destroy_not_escaped_closure %2"
+            )
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer().lower(
+                invalidCarrier,
+                displayName: "Fixture.invalidCarrier"
+            )
+        }
+    }
+
+    private func expectCheckedScope(
+        in instructions: [Bytecode.Instruction],
+        expectsRestriction: Bool
+    ) throws {
+        let beginning = try #require(instructions.first { instruction in
+            if case .beginClosureScope = instruction { return true }
+            return false
+        })
+        guard case let .beginClosureScope(scope, source) = beginning else {
+            Issue.record("expected a dynamic closure scope")
+            return
+        }
+        #expect(instructions.contains(.endClosureScope(closure: scope)))
+        #expect(
+            instructions.contains(.destroyValue(source))
+                == expectsRestriction
+        )
+    }
+
     private func invoke(
         _ fixture: FrontendExecutionHarness.Fixture,
         _ arguments: [VM.Value]

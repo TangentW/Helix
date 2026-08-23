@@ -138,7 +138,11 @@ Both workflows depend on stable, build-specific identities:
   Discovery derives the callback's source spelling from typed AST, its
   `@noescape`/escaping authority from canonical SIL, and its global-actor
   requirement from both the applied expression and the closure body's SIL
-  isolation metadata. A property setter is the lifetime-specific form:
+  isolation metadata. Actor provenance survives frontend function-conversion
+  and Optional-injection wrappers and propagates through immutable, inferred
+  local closure aliases. A source-written function type remains authoritative,
+  so an explicit actor erasure is never silently undone. A property setter is
+  the lifetime-specific form:
   assigning a closure stores it and is therefore always `escaping`, even
   though Swift cannot spell `@escaping` in the property's function type. The
   assigned expression still supplies actor isolation. Generated adapters
@@ -161,9 +165,21 @@ Both workflows depend on stable, build-specific identities:
   authority. Possession of the resulting image-local capability then permits
   higher-order invocation without adding execution authority to the closure
   type. Parameters, results, captures, represented aggregate wrappers, and
-  NativeImport callback positions and callable-result positions all preserve
-  the exact canonical closure signature—there is no effect-authority variance
-  at those boundaries. Shell entry signatures and every other native value
+  NativeImport callback positions and callable-result positions preserve the
+  canonical closure ABI. The sole callable-effect variance is an explicit,
+  representation-preserving restriction from an otherwise identical
+  unrestricted closure to `@MainActor`; `convert_closure` records that logical
+  contract without changing its body or captures. The Verifier rejects actor
+  erasure, ABI changes, and lexical-scope escape through the converted value,
+  while the VM enforces the restricted signature when the callback executes.
+  A canonical-SIL `Optional.some` used exclusively as the operand of
+  `destroy_not_escaped_closure` is a compiler scope carrier rather than a
+  source Optional; lowering preserves its closure provenance and rejects any
+  additional semantic use.
+  Canonical SIL may erase the nested actor result of a compiler-generated
+  bound-method factory; the compiler restores it only when every returned
+  closure is proven to target a MainActor-isolated body. It never rewrites an
+  ordinary source factory. Shell entry signatures and every other native value
   slot remain closure-free. These are v1 contract fields and do not introduce
   a compatibility version split.
 - Foreign ABI normalization preserves the frozen logical Swift type while

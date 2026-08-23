@@ -106,6 +106,8 @@ public enum Disassembler {
             "\(result) = const_float_bits \(hex(bitPattern))"
         case let .constantString(result, value): "\(result) = const_string \(quoted(value))"
         case let .copyValue(result, source): "\(result) = copy_value \(source)"
+        case let .convertClosure(result, source):
+            "\(result) = convert_closure \(source)"
         case let .moveValue(result, source): "\(result) = move_value \(source)"
         case let .destroyValue(register): "destroy_value \(register)"
         case let .makeTuple(result, elements):

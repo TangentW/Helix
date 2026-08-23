@@ -1082,6 +1082,10 @@ public struct Engine: Verification.ImageVerifying {
                 guard capabilities.contains(.closureValuesV1) else {
                     throw Verification.Error.capabilityDenied(.closureValuesV1)
                 }
+                if signature.effects.requiresMainActor,
+                   !capabilities.contains(.mainActorSyncV1) {
+                    throw Verification.Error.capabilityDenied(.mainActorSyncV1)
+                }
                 if let thrownType = signature.thrownType {
                     switch thrownType {
                     case .string:
@@ -1876,10 +1880,15 @@ public struct Engine: Verification.ImageVerifying {
         let parentByScope = Dictionary(uniqueKeysWithValues:
             function.blocks.flatMap { block in
                 block.instructions.compactMap { instruction in
-                    if case let .beginClosureScope(result, closure) = instruction {
+                    switch instruction {
+                    case let .beginClosureScope(result, closure),
+                         let .convertClosure(result, closure),
+                         let .copyValue(result, closure),
+                         let .moveValue(result, closure):
                         return (result, closure)
+                    default:
+                        return nil
                     }
-                    return nil
                 }
             }
         )
@@ -1898,6 +1907,29 @@ public struct Engine: Verification.ImageVerifying {
             return false
         }
 
+        var scopeAncestorsByRegister: [
+            Bytecode.Register: Set<Bytecode.Register>
+        ] = [:]
+        func scopeAncestors(
+            of candidate: Bytecode.Register
+        ) -> Set<Bytecode.Register> {
+            if let cached = scopeAncestorsByRegister[candidate] {
+                return cached
+            }
+            var ancestors = Set<Bytecode.Register>()
+            var current = candidate
+            var visited = Set<Bytecode.Register>()
+            while visited.insert(current).inserted {
+                if scopedRegisters.contains(current) {
+                    ancestors.insert(current)
+                }
+                guard let parent = parentByScope[current] else { break }
+                current = parent
+            }
+            scopeAncestorsByRegister[candidate] = ancestors
+            return ancestors
+        }
+
         var usesBeforeDefinition: [Bytecode.BlockID: Set<Bytecode.Register>]
             = [:]
         var definitions: [Bytecode.BlockID: Set<Bytecode.Register>] = [:]
@@ -1905,10 +1937,11 @@ public struct Engine: Verification.ImageVerifying {
             var blockDefinitions = Set<Bytecode.Register>()
             var blockUses = Set<Bytecode.Register>()
             for instruction in block.instructions {
-                for operand in instruction.operandRegisters
-                where scopedRegisters.contains(operand)
-                    && !blockDefinitions.contains(operand) {
-                    blockUses.insert(operand)
+                for operand in instruction.operandRegisters {
+                    for scope in scopeAncestors(of: operand)
+                    where !blockDefinitions.contains(scope) {
+                        blockUses.insert(scope)
+                    }
                 }
                 switch instruction {
                 case let .beginClosureScope(result, _):
@@ -1971,9 +2004,11 @@ public struct Engine: Verification.ImageVerifying {
                         reason: reason
                     )
                 }
-                if let used = instruction.operandRegisters.first(
-                    where: state.closed.contains
-                ) {
+                if let used = instruction.operandRegisters.first(where: {
+                    !state.closed.isDisjoint(
+                        with: scopeAncestors(of: $0)
+                    )
+                }) {
                     throw fail(
                         "closed dynamic closure scope \(used) is reused"
                     )
@@ -2021,7 +2056,9 @@ public struct Engine: Verification.ImageVerifying {
                         } ?? []
                     )
                     for (index, argument) in arguments.enumerated()
-                    where state.open.contains(argument)
+                    where !state.open.isDisjoint(
+                        with: scopeAncestors(of: argument)
+                    )
                         && !nonescapingParameters.contains(index) {
                         throw fail(
                             "a dynamically scoped closure cannot enter an escaping NativeImport callback"
@@ -2309,6 +2346,16 @@ public struct Engine: Verification.ImageVerifying {
             guard type(result) == type(source) else { throw fail("copy source and result types differ") }
             guard isCopyable(type(source), shell: shell) else {
                 throw fail("copy_value requires a copyable type")
+            }
+        case let .convertClosure(result, source):
+            guard case let .closure(actual) = type(source),
+                  case let .closure(restricted) = type(result),
+                  restricted.isMainActorRestriction(of: actual),
+                  isCopyable(type(source), shell: shell)
+            else {
+                throw fail(
+                    "convert_closure requires an ABI-identical MainActor restriction"
+                )
             }
         case let .moveValue(result, source):
             guard type(result) == type(source) else { throw fail("copy/move source and result types differ") }
@@ -3933,9 +3980,7 @@ public struct Engine: Verification.ImageVerifying {
                   signature.hasCanonicalCallableEffects,
                   signature.hasCanonicalThrownType,
                   callee.thrownType == signature.thrownType,
-                  Bytecode.ClosureSignature.callableEffects(
-                      from: callee.effects
-                  ) == signature.effects
+                  signature.safelyRestricts(targetEffects: callee.effects)
             else {
                 throw fail(
                     "closure body result, thrown type, or callable effects do not match its closure signature"
@@ -4557,10 +4602,11 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 }
                 switch instruction {
-                case let .copyValue(result, source):
+                case let .copyValue(result, source),
+                     let .convertClosure(result, source):
                     if function.type(of: source)?.requiresLinearOwnership == true {
                         guard live.contains(source) || borrowedParameters.contains(source) else {
-                            throw fail("copy_value uses a consumed value")
+                            throw fail("copying conversion uses a consumed value")
                         }
                         live.insert(result)
                     }

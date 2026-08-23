@@ -167,6 +167,25 @@ struct NativeCallback {
         }
     }
 
+    @Test("Actor restriction cannot hide a lexical closure from an escaping callback")
+    func convertedLexicalClosureCannotEscape() throws {
+        let fixture = try Fixture()
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "a dynamically scoped closure cannot enter an escaping NativeImport callback"
+            )
+        ) {
+            try fixture.generation(
+                id: 1,
+                closureLifetime: .lexical,
+                restrictCallbackToMainActor: true
+            )
+        }
+    }
+
     private struct Fixture {
         let entry = Core.EntryIndex(rawValue: 0)
         let exportID = Core.NativeImportID(rawValue: 0)
@@ -264,9 +283,16 @@ struct NativeCallback {
 
         func generation(
             id: UInt64,
-            closureLifetime: Bytecode.ClosureLifetime = .invocation
+            closureLifetime: Bytecode.ClosureLifetime = .invocation,
+            restrictCallbackToMainActor: Bool = false
         ) throws -> Runtime.Generation {
             let closureType = Bytecode.ValueType.closure(callbackSignature)
+            var boundarySignature = callbackBoundarySignature
+            boundarySignature.effects.requiresMainActor =
+                restrictCallbackToMainActor
+            let callbackRegister: Bytecode.Register = .init(
+                rawValue: restrictCallbackToMainActor ? 1 : 0
+            )
             var entryInstructions: [Bytecode.Instruction] = [
                 .makeClosure(
                     result: .init(rawValue: 0),
@@ -274,12 +300,24 @@ struct NativeCallback {
                     captures: [],
                     lifetime: closureLifetime
                 ),
+            ]
+            var entryRegisterTypes = [closureType]
+            if restrictCallbackToMainActor {
+                entryRegisterTypes.append(.closure(boundarySignature))
+                entryInstructions.append(
+                    .convertClosure(
+                        result: callbackRegister,
+                        source: .init(rawValue: 0)
+                    )
+                )
+            }
+            entryInstructions.append(
                 .nativeApply(
                     result: nil,
                     importID: exportID,
-                    arguments: [.init(rawValue: 0)]
-                ),
-            ]
+                    arguments: [callbackRegister]
+                )
+            )
             if closureLifetime == .lexical {
                 entryInstructions.append(
                     .endClosureScope(closure: .init(rawValue: 0))
@@ -291,7 +329,7 @@ struct NativeCallback {
                 name: "installCallback",
                 parameterRegisters: [],
                 resultType: .void,
-                registerTypes: [closureType],
+                registerTypes: entryRegisterTypes,
                 entryBlock: .init(rawValue: 0),
                 blocks: [
                     .init(
@@ -333,10 +371,13 @@ struct NativeCallback {
                 parameters: ["Swift.Int"],
                 result: "Swift.Void"
             )
-            let capabilities: Set<Core.Capability> = [
+            var capabilities: Set<Core.Capability> = [
                 .baselineV1, .nativeImportsV1, .closureValuesV1,
                 .escapingClosureValuesV1,
             ]
+            if restrictCallbackToMainActor {
+                capabilities.insert(.mainActorSyncV1)
+            }
             let module = Bytecode.Module(
                 name: "RuntimeNativeCallbackFixture",
                 shellInterfaceHash: shellHash,
@@ -387,7 +428,7 @@ struct NativeCallback {
                     .init(
                         id: exportID,
                         key: exportKey,
-                        parameterTypes: [.closure(callbackBoundarySignature)],
+                        parameterTypes: [.closure(boundarySignature)],
                         resultType: .void,
                         signature: exportSignature,
                         effects: effects,

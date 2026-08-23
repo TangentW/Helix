@@ -139,6 +139,112 @@ struct FunctionIsolation {
         ))
     }
 
+    @Test("Implicit closure factories restore nested MainActor results only")
+    func restoresImplicitFactoryResultIsolation() throws {
+        let target = "$s7Fixture4rootyyFyyScMYccfu0_"
+        let implicitFactory = "$s7Fixture4rootyyFyyScMYccfu_"
+        let explicitFactory = "$s7Fixture11cfu_factoryyycyF"
+        let factoryType = "@convention(thin) () -> "
+            + "@owned @callee_guaranteed () -> ()"
+        let factoryBody = """
+        bb0:
+          %0 = function_ref @\(target) : $@convention(thin) () -> ()
+          %1 = partial_apply %0() : $@convention(thin) () -> ()
+          return %1
+        """
+        let file = try CanonicalSIL.File(text: """
+        sil private @\(implicitFactory) : $\(factoryType) {
+        \(factoryBody)
+        } // end sil function '\(implicitFactory)'
+        sil private @\(explicitFactory) : $\(factoryType) {
+        \(factoryBody)
+        } // end sil function '\(explicitFactory)'
+        // Isolation: global_actor. type: MainActor
+        sil private @\(target) : $@convention(thin) () -> () {
+        bb0:
+          %0 = tuple ()
+          return %0
+        } // end sil function '\(target)'
+        """)
+
+        let implicit = try #require(file.function(
+            mangledName: implicitFactory
+        ))
+        let restored = try CanonicalSIL.ImageFunctions.signature(
+            of: implicit,
+            environment: file.typeEnvironment,
+            symbol: implicitFactory,
+            kind: .ordinary,
+            file: file
+        )
+        #expect(restored.result.directClosureShape?.signature.effects
+            .requiresMainActor == true)
+
+        let explicit = try #require(file.function(
+            mangledName: explicitFactory
+        ))
+        let preserved = try CanonicalSIL.ImageFunctions.signature(
+            of: explicit,
+            environment: file.typeEnvironment,
+            symbol: explicitFactory,
+            kind: .ordinary,
+            file: file
+        )
+        #expect(preserved.result.directClosureShape?.signature.effects
+            .requiresMainActor == false)
+    }
+
+    @Test("Frozen closure results materialize only actor restrictions")
+    func lowersFrozenClosureResultRestriction() throws {
+        let plain = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .void
+        )
+        var restricted = plain
+        restricted.effects.requiresMainActor = true
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7factoryyyyycF",
+            loweredType: "@convention(thin) "
+                + "(@owned @callee_guaranteed () -> ()) -> "
+                + "@owned @callee_guaranteed () -> ()",
+            body: """
+            bb0(%0 : $@owned @callee_guaranteed () -> ()):
+              return %0
+            """
+        )
+        let lowered = try CanonicalSIL.Lowerer().lower(
+            function,
+            displayName: "Fixture.factory",
+            expectedResultType: .closure(restricted)
+        )
+        #expect(lowered.resultType == .closure(restricted))
+        #expect(lowered.blocks.flatMap(\.instructions).contains {
+            instruction in
+            if case .convertClosure = instruction { return true }
+            return false
+        })
+
+        let isolatedFunction = CanonicalSIL.Function(
+            mangledName: function.mangledName,
+            loweredType: function.loweredType.replacingOccurrences(
+                of: "@owned @callee_guaranteed () -> ()",
+                with: "@owned @callee_guaranteed @MainActor () -> ()"
+            ),
+            body: function.body.replacingOccurrences(
+                of: "@owned @callee_guaranteed () -> ()",
+                with: "@owned @callee_guaranteed @MainActor () -> ()"
+            )
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try CanonicalSIL.Lowerer().lower(
+                isolatedFunction,
+                displayName: "Fixture.erasingFactory",
+                expectedResultType: .closure(plain)
+            )
+        }
+    }
+
     @Test("Unsupported actor executors fail closed")
     func rejectsUnsupportedActorIsolation() throws {
         for isolation in [

@@ -616,13 +616,24 @@ struct NativeImportDiscoveryTests {
                 consumeNotification { notification in
                     _ = notification.name
                 }
-                UIView.performWithoutAnimation { view.alpha = 0.5 }
+                let withoutAnimation: @MainActor () -> Void = {
+                    view.alpha = 0.5
+                }
+                UIView.performWithoutAnimation(withoutAnimation)
+                nonisolated func unrestrictedAnimationBody() { _ = 1 }
+                let unrestrictedAnimation: () -> Void =
+                    unrestrictedAnimationBody
+                let restrictedAnimation: @MainActor () -> Void =
+                    unrestrictedAnimation
+                UIView.performWithoutAnimation(restrictedAnimation)
+                let animations: @MainActor () -> Void = view.layoutIfNeeded
+                let animationCompletion: @MainActor (Bool) -> Void = { finished in
+                    if finished { view.setNeedsDisplay() }
+                }
                 UIView.animate(
                     withDuration: 0.2,
-                    animations: { view.alpha = 1 },
-                    completion: { finished in
-                        if finished { view.setNeedsDisplay() }
-                    }
+                    animations: animations,
+                    completion: animationCompletion
                 )
                 DispatchQueue.main.async { view.setNeedsLayout() }
                 _ = Timer.scheduledTimer(
@@ -666,26 +677,35 @@ struct NativeImportDiscoveryTests {
                     _ = configuredCell
                     _ = state
                 }
-                operation.completionBlock = {
+                let operationCompletion = {
                     _ = operation.isFinished
                 }
-                _ = UIAction { action in
+                let aliasedOperationCompletion = operationCompletion
+                operation.completionBlock = aliasedOperationCompletion
+                func handleAction(_ action: UIAction) {
                     _ = action
                 }
+                _ = UIAction(handler: handleAction)
                 _ = UIAlertAction(
                     title: "Run",
                     style: .default
                 ) { action in
                     _ = action
                 }
-                _ = UIContextualAction(
-                    style: .normal,
-                    title: "Complete"
-                ) { action, sourceView, completion in
+                func handleContextualAction(
+                    _ action: UIContextualAction,
+                    _ sourceView: UIView,
+                    _ completion: @escaping (Bool) -> Void
+                ) {
                     _ = action
                     _ = sourceView
                     completion(true)
                 }
+                _ = UIContextualAction(
+                    style: .normal,
+                    title: "Complete",
+                    handler: handleContextualAction
+                )
                 controller.present(
                     UIViewController(),
                     animated: true
@@ -699,20 +719,27 @@ struct NativeImportDiscoveryTests {
                 ) { notification in
                     _ = notification.name
                 }
-                let predicate = NSPredicate { value, bindings in
+                func evaluatePredicate(
+                    _ value: Any?,
+                    _ bindings: [String: Any]?
+                ) -> Bool {
                     _ = value
                     _ = bindings
                     return true
                 }
+                let predicate = NSPredicate(block: evaluatePredicate)
                 _ = predicate
-                _ = FileManager.default.enumerator(
-                    at: url,
-                    includingPropertiesForKeys: nil
-                ) { failedURL, error in
+                let enumerationError: @MainActor (URL, any Error) -> Bool = {
+                    failedURL, error in
                     _ = failedURL
                     _ = error
                     return false
                 }
+                _ = FileManager.default.enumerator(
+                    at: url,
+                    includingPropertiesForKeys: nil,
+                    errorHandler: enumerationError
+                )
             }
         }
         """
@@ -1062,12 +1089,16 @@ struct NativeImportDiscoveryTests {
         ])
         #expect(operationCompletionDeclaration.parameterSwiftTypes[0]
             .contains("@Sendable"))
+        #expect(operationCompletionDeclaration.parameterSwiftTypes[0]
+            .contains("MainActor"))
         let presentationDeclaration = try #require(resultOperations.first {
             $0.baseName == "present"
         })
         #expect(presentationDeclaration.callbacks == [
             .init(parameterIndex: 2, lifetime: .escaping),
         ])
+        #expect(presentationDeclaration.parameterSwiftTypes[2]
+            .contains("MainActor"))
         let initializerCallbacks = resultOperations.filter {
             $0.baseName == "init" && !$0.callbacks.isEmpty
         }
@@ -1100,6 +1131,84 @@ struct NativeImportDiscoveryTests {
         #expect(completion.parameterConventions == [.owned])
         #expect(completion.result == .void)
         #expect(completion.isNativeBridgeCallable)
+    }
+
+    @Test("Explicit closure actor erasure remains authoritative")
+    func preservesExplicitClosureActorErasure() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-callback-actor-erasure-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Fixture.swift")
+        let source = """
+        import Foundation
+
+        @MainActor
+        public func install(_ operation: Operation) {
+            let isolated: @MainActor @Sendable () -> Void = {
+                _ = operation.isFinished
+            }
+            let erased: @Sendable () -> Void = isolated
+            operation.completionBlock = erased
+        }
+        """
+        let contents = Data(source.utf8)
+        try contents.write(to: sourceURL)
+
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: "CallbackActorErasureFixture",
+            targetTriple: "arm64-apple-ios15.0-simulator",
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library"]
+        )
+        let ast = try frontend.emitTypedAST(
+            sourceFiles: [sourceURL],
+            invocation: invocation
+        )
+        let documents = try FrontendReceipt.TypedAST.parseDocuments(ast)
+        let demangled = try FrontendReceipt.Demangler(
+            compilerURL: frontend.compilerURL
+        ).demangle(FrontendReceipt.TypedAST.mangledTypes(in: documents))
+        let sil = try CanonicalSIL.File(text: frontend.emitCanonicalSIL(
+            sourceFiles: [sourceURL],
+            invocation: invocation
+        ))
+        let state = FrontendReceipt.Adapter.SourceState(
+            logicalPath: "Sources/Fixture.swift",
+            url: sourceURL,
+            contents: contents,
+            contentHash: .sha256(contents)
+        )
+        let surface = try FrontendReceipt.Adapter()
+            .discoverImportedOperationSurface(
+                documents: documents,
+                sourcesByPhysicalPath: [
+                    sourceURL.resolvingSymlinksInPath()
+                        .standardizedFileURL.path: state,
+                ],
+                moduleName: invocation.moduleName,
+                demangled: demangled,
+                silFile: sil
+            )
+        let setter = try #require(surface.operations.first {
+            $0.baseName == "completionBlock"
+                && $0.dispatch == .instanceSetter
+        })
+        let callback = try #require(setter.parameterSwiftTypes.first)
+        #expect(callback.contains("@Sendable"))
+        #expect(!callback.contains("MainActor"))
     }
 
     @Test("Physical SIL aliases collapse to one deterministic logical import")
@@ -2083,17 +2192,24 @@ struct NativeImportDiscoveryTests {
                 operations: OperationQueue,
                 operation: Operation
             ) {
-                UIView.performWithoutAnimation {
+                let withoutAnimation: @MainActor () -> Void = {
                     view.alpha = 0.25
+                }
+                UIView.performWithoutAnimation(withoutAnimation)
+                nonisolated func unrestrictedAnimationBody() { _ = 1 }
+                let unrestrictedAnimation: () -> Void =
+                    unrestrictedAnimationBody
+                let restrictedAnimation: @MainActor () -> Void =
+                    unrestrictedAnimation
+                UIView.performWithoutAnimation(restrictedAnimation)
+                let animations: @MainActor () -> Void = view.layoutIfNeeded
+                let animationCompletion: @MainActor (Bool) -> Void = { finished in
+                    if finished { view.setNeedsDisplay() }
                 }
                 UIView.animate(
                     withDuration: 0.2,
-                    animations: {
-                        view.alpha = 1
-                    },
-                    completion: { finished in
-                        if finished { view.setNeedsDisplay() }
-                    }
+                    animations: animations,
+                    completion: animationCompletion
                 )
                 DispatchQueue.main.async {
                     view.setNeedsLayout()
@@ -2142,26 +2258,35 @@ struct NativeImportDiscoveryTests {
                     _ = configuredCell
                     _ = state
                 }
-                operation.completionBlock = {
+                let operationCompletion = {
                     _ = operation.isFinished
                 }
-                _ = UIAction { action in
+                let aliasedOperationCompletion = operationCompletion
+                operation.completionBlock = aliasedOperationCompletion
+                func handleAction(_ action: UIAction) {
                     _ = action
                 }
+                _ = UIAction(handler: handleAction)
                 _ = UIAlertAction(
                     title: "Run",
                     style: .default
                 ) { action in
                     _ = action
                 }
-                _ = UIContextualAction(
-                    style: .normal,
-                    title: "Complete"
-                ) { action, sourceView, completion in
+                func handleContextualAction(
+                    _ action: UIContextualAction,
+                    _ sourceView: UIView,
+                    _ completion: @escaping (Bool) -> Void
+                ) {
                     _ = action
                     _ = sourceView
                     completion(true)
                 }
+                _ = UIContextualAction(
+                    style: .normal,
+                    title: "Complete",
+                    handler: handleContextualAction
+                )
                 present(UIViewController(), animated: true) {
                     view.setNeedsLayout()
                 }
@@ -2172,20 +2297,27 @@ struct NativeImportDiscoveryTests {
                 ) { notification in
                     _ = notification.name
                 }
-                let predicate = NSPredicate { value, bindings in
+                func evaluatePredicate(
+                    _ value: Any?,
+                    _ bindings: [String: Any]?
+                ) -> Bool {
                     _ = value
                     _ = bindings
                     return true
                 }
+                let predicate = NSPredicate(block: evaluatePredicate)
                 _ = predicate.evaluate(with: "value")
-                _ = FileManager.default.enumerator(
-                    at: url,
-                    includingPropertiesForKeys: nil
-                ) { failedURL, error in
+                let enumerationError: @MainActor (URL, any Error) -> Bool = {
+                    failedURL, error in
                     _ = failedURL
                     _ = error
                     return false
                 }
+                _ = FileManager.default.enumerator(
+                    at: url,
+                    includingPropertiesForKeys: nil,
+                    errorHandler: enumerationError
+                )
             }
 
             public func constraints(
@@ -2444,6 +2576,7 @@ struct NativeImportDiscoveryTests {
         #expect(
             patch.disassembly.components(separatedBy: "native_apply").count - 1 >= 6
         )
+        #expect(patch.disassembly.contains("convert_closure"))
         _ = try Verification.Engine().verify(
             bytes: patch.bytecode,
             shell: Verification.ShellInterface(archive: shell.archive),

@@ -620,14 +620,16 @@ public struct Lowerer: Sendable {
         displayName: String,
         kind: Bytecode.FunctionKind = .ordinary,
         directCalls: CanonicalSIL.DirectCallTable = .empty,
-        expectedEffects: Core.Effects? = nil
+        expectedEffects: Core.Effects? = nil,
+        expectedResultType: Bytecode.ValueType? = nil
     ) throws -> IntermediateRepresentation.Function {
         return try CanonicalSIL.LoweringStack.run {
             let preparation = try prepareLowering(
                 function,
                 kind: kind,
                 directCalls: directCalls,
-                expectedEffects: expectedEffects
+                expectedEffects: expectedEffects,
+                expectedResultType: expectedResultType
             )
             return try lowerPrepared(
                 function,
@@ -643,7 +645,8 @@ public struct Lowerer: Sendable {
         _ function: CanonicalSIL.Function,
         kind: Bytecode.FunctionKind,
         directCalls: CanonicalSIL.DirectCallTable,
-        expectedEffects: Core.Effects?
+        expectedEffects: Core.Effects?,
+        expectedResultType: Bytecode.ValueType?
     ) throws -> PreparedLowering {
         var signature = try parseFunctionType(function.loweredType)
         let managedCaptures = try CanonicalSIL.ManagedCaptureStorage.normalize(
@@ -659,6 +662,17 @@ public struct Lowerer: Sendable {
         )
         signature.parameters = managedCaptures.parameters
         signature.parameterConventions = managedCaptures.parameterConventions
+        if let expectedResultType, signature.result != expectedResultType {
+            guard case let .closure(physical) = signature.result,
+                  case let .closure(expected) = expectedResultType,
+                  expected.isMainActorRestriction(of: physical)
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "frozen result type disagrees with the lowered function convention"
+                )
+            }
+            signature.result = expectedResultType
+        }
         let hostedMethodContext = try typeEnvironment.hostedMethodContext(
             for: function
         )
@@ -732,7 +746,8 @@ public struct Lowerer: Sendable {
         ).map(String.init)
         var remainingDeallocStackUses: [String: Int] = [:]
         var explicitlyDestroyedAddresses = Set<String>()
-        var dynamicClosureScopeEndCounts: [String: Int] = [:]
+        var dynamicClosureScopeDestructionCounts: [String: Int] = [:]
+        var optionalScopePayloadByCarrier: [String: String] = [:]
         for (index, rawLine) in rawLines.enumerated()
         where !nsErrorBridges.skippedLines.contains(index) {
             let instruction = CanonicalSIL.DebugMetadata.strippingMetadata(
@@ -754,8 +769,34 @@ public struct Lowerer: Sendable {
                 instruction,
                 pattern: #"^%[0-9]+ = destroy_not_escaped_closure(?: \[[^\]]+\])* (%[0-9]+)$"#
             ) {
-                dynamicClosureScopeEndCounts[destruction[0], default: 0] += 1
+                dynamicClosureScopeDestructionCounts[
+                    destruction[0],
+                    default: 0
+                ] += 1
             }
+            if let optional = match(
+                instruction,
+                pattern: #"^(%[0-9]+) = enum \$Optional<.+>, #Optional\.some!enumelt, (%[0-9]+)$"#
+            ) {
+                optionalScopePayloadByCarrier[optional[0]] = optional[1]
+            }
+        }
+        var dynamicClosureScopeEndCounts: [String: Int] = [:]
+        var optionalScopeCarrierEndCounts: [String: Int] = [:]
+        for (endToken, count) in dynamicClosureScopeDestructionCounts {
+            var origin = endToken
+            var visited = Set<String>()
+            while let payload = optionalScopePayloadByCarrier[origin],
+                  visited.insert(origin).inserted {
+                optionalScopeCarrierEndCounts[origin, default: 0] += count
+                origin = payload
+            }
+            guard visited.insert(origin).inserted else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "dynamic closure scope carrier cycle at \(origin)"
+                )
+            }
+            dynamicClosureScopeEndCounts[origin, default: 0] += count
         }
         // Reject a forbidden existential payload before incidental SIL such
         // as a closure reabstraction thunk obscures the actionable cause.
@@ -1270,12 +1311,37 @@ public struct Lowerer: Sendable {
             expectedType: Bytecode.ValueType? = nil,
             line: Int
         ) throws -> Bytecode.Register {
-            let value = try resolveStorableValue(
+            var value = try resolveStorableValue(
                 token,
-                expectedType: expectedType,
                 line: line
             )
-            let type = registerTypes[Int(value.rawValue)]
+            var type = registerTypes[Int(value.rawValue)]
+            if let expectedType, type != expectedType {
+                if case let .closure(actual) = type,
+                   case let .closure(expected) = expectedType,
+                   expected.isMainActorRestriction(of: actual) {
+                    let owned = try prepareOwnedValue(token, line: line)
+                    let converted = try copyRestrictingClosure(
+                        owned,
+                        to: expectedType,
+                        token: token,
+                        line: line
+                    )
+                    // convert_closure copies the closure context. The
+                    // ownership unit selected above is replaced by the
+                    // restricted result at this call/storage edge.
+                    appendInstruction(.destroyValue(owned))
+                    return converted
+                }
+                // Preserve the explicit Optional.none/native-block
+                // placeholder rebind performed by resolveStorableValue.
+                value = try resolveStorableValue(
+                    token,
+                    expectedType: expectedType,
+                    line: line
+                )
+                type = registerTypes[Int(value.rawValue)]
+            }
             if let retained = takePendingRetainedValue(for: token) {
                 guard registerTypes[Int(retained.rawValue)] == type else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
@@ -1330,11 +1396,128 @@ public struct Lowerer: Sendable {
             return try copyOwnedValue(value)
         }
 
+        func copyRestrictingClosure(
+            _ source: Bytecode.Register,
+            to expectedType: Bytecode.ValueType,
+            token: String,
+            line: Int
+        ) throws -> Bytecode.Register {
+            let actualType = registerTypes[Int(source.rawValue)]
+            guard case let .closure(actual) = actualType,
+                  case let .closure(expected) = expectedType,
+                  expected.isMainActorRestriction(of: actual)
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "stored value \(token) in \(displayName) at SIL line \(line) has type "
+                        + "\(actualType), expected \(expectedType)"
+                )
+            }
+            let result = try allocate(type: expectedType)
+            appendInstruction(
+                .convertClosure(result: result, source: source)
+            )
+            return result
+        }
+
+        func beginDynamicClosureScopeIfRequired(
+            for token: String,
+            closure: Bytecode.Register
+        ) throws -> Bytecode.Register? {
+            guard let endCount = dynamicClosureScopeEndCounts[token] else {
+                return nil
+            }
+            guard dynamicallyScopedClosureValues[token] == nil else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "dynamic closure scope \(token) is initialized more than once"
+                )
+            }
+            let result = try allocate(
+                type: registerTypes[Int(closure.rawValue)]
+            )
+            values[token] = result
+            dynamicallyScopedClosureValues[token] = endCount
+            appendInstruction(
+                .beginClosureScope(result: result, closure: closure)
+            )
+            return result
+        }
+
+        func transferDynamicClosureScopeIfRequired(
+            from sourceToken: String,
+            to carrierToken: String
+        ) throws {
+            guard let transferredEnds = optionalScopeCarrierEndCounts[
+                carrierToken
+            ] else { return }
+            guard let sourceEnds = dynamicallyScopedClosureValues[sourceToken],
+                  sourceEnds >= transferredEnds
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "dynamic closure scope carrier \(carrierToken) has no "
+                        + "matching scoped payload \(sourceToken)"
+                )
+            }
+            if sourceEnds == transferredEnds {
+                dynamicallyScopedClosureValues.removeValue(
+                    forKey: sourceToken
+                )
+            } else {
+                dynamicallyScopedClosureValues[sourceToken] =
+                    sourceEnds - transferredEnds
+            }
+            dynamicallyScopedClosureValues[carrierToken] = transferredEnds
+        }
+
+        func bindClosureConversion(
+            resultToken: String,
+            sourceToken: String,
+            source: Bytecode.Register,
+            actual: Bytecode.ClosureSignature,
+            expected: Bytecode.ClosureSignature,
+            line: Int
+        ) throws {
+            let converted: Bytecode.Register
+            if expected.isMainActorRestriction(of: actual) {
+                converted = try copyRestrictingClosure(
+                    source,
+                    to: .closure(expected),
+                    token: sourceToken,
+                    line: line
+                )
+            } else {
+                converted = source
+            }
+            if try beginDynamicClosureScopeIfRequired(
+                for: resultToken,
+                closure: converted
+            ) != nil {
+                if converted != source {
+                    // begin_closure_scope copies the restricted closure;
+                    // the conversion result is an intermediate owner.
+                    appendInstruction(.destroyValue(converted))
+                }
+            } else if converted != source {
+                values[resultToken] = converted
+                try recordCompilerOwnedTemporaryValue(
+                    converted,
+                    for: resultToken
+                )
+            } else {
+                values[resultToken] = source
+                aliasRetainedValue(resultToken, to: sourceToken)
+                aliasCompilerTemporary(resultToken, to: sourceToken)
+            }
+        }
+
         func prepareReturnValue(
             _ token: String,
             line: Int
         ) throws -> Bytecode.Register {
-            try prepareOwnedValue(token, line: line)
+            try prepareOwnedValue(
+                token,
+                expectedType: signature.result,
+                line: line
+            )
         }
 
         func prepareStoredValue(
@@ -1396,6 +1579,10 @@ public struct Lowerer: Sendable {
                         ))
             else { return }
             try closeBorrowedTemporaryLifetime(for: token, resolved: value)
+            try closeCompilerOwnedTemporaryLifetime(
+                for: token,
+                resolved: value
+            )
             appendInstruction(.destroyValue(value))
         }
 
@@ -1436,6 +1623,42 @@ public struct Lowerer: Sendable {
                 else { return false }
                 return lineContainsSILValue(token, line: instruction)
             }
+        }
+
+        func hasOnlyDynamicClosureScopeCarrierUses(
+            of token: String,
+            after lineIndex: Int
+        ) -> Bool {
+            guard lineIndex + 1 < rawLines.count else { return true }
+            for rawLine in rawLines[(lineIndex + 1)...] {
+                let instruction = CanonicalSIL.DebugMetadata.strippingComment(
+                    from: rawLine
+                ).trimmingCharacters(in: .whitespaces)
+                guard lineContainsSILValue(token, line: instruction) else {
+                    continue
+                }
+                if instruction.hasPrefix("debug_value")
+                    || instruction.hasPrefix("debug_step")
+                    || instruction.hasPrefix("end_borrow")
+                    || instruction.hasPrefix("fix_lifetime") {
+                    continue
+                }
+                if let destruction = match(
+                    instruction,
+                    pattern: #"^%[0-9]+ = destroy_not_escaped_closure(?: \[[^\]]+\])* (%[0-9]+)$"#
+                ), destruction[0] == token {
+                    continue
+                }
+                if let carrier = match(
+                    instruction,
+                    pattern: #"^(%[0-9]+) = enum \$Optional<.+>, #Optional\.some!enumelt, (%[0-9]+)$"#
+                ), carrier[1] == token,
+                   optionalScopeCarrierEndCounts[carrier[0]] != nil {
+                    continue
+                }
+                return false
+            }
+            return true
         }
 
         func hasFutureSemanticUse(
@@ -2733,6 +2956,20 @@ public struct Lowerer: Sendable {
                 let registerIndex = Int(value.rawValue)
                 let actualType = registerTypes[registerIndex]
                 if actualType != expectedType,
+                   case let .integer(actualWidth, _) = actualType,
+                   case let .integer(expectedWidth, _) = expectedType,
+                   actualWidth == expectedWidth {
+                    // Builtin.IntN is an unsignedness-neutral bit vector.
+                    // The enclosing Swift nominal type supplies signedness at
+                    // a storage edge, so preserve the bits while assigning
+                    // the verifier-visible logical type.
+                    return try materializeIntegerOperand(
+                        token,
+                        expected: expectedType,
+                        line: line
+                    )
+                }
+                if actualType != expectedType,
                    inlineOptionalNoneValues.contains(token),
                    case .optional(.never) = actualType,
                    case let .optional(expectedWrapped) = expectedType,
@@ -2862,17 +3099,29 @@ public struct Lowerer: Sendable {
                             "NativeImport callback parameters cannot use inout"
                         )
                     }
-                    value = boundaryConvention == .owned
-                        ? try prepareOwnedValue(
+                    if boundaryConvention == .owned {
+                        value = try prepareOwnedValue(
                             token,
                             expectedType: logicalType,
                             line: line
                         )
-                        : try resolveStorableValue(
+                    } else {
+                        let source = try resolveStorableValue(
                             token,
-                            expectedType: logicalType,
                             line: line
                         )
+                        if registerTypes[Int(source.rawValue)] == logicalType {
+                            value = source
+                        } else {
+                            value = try copyRestrictingClosure(
+                                source,
+                                to: logicalType,
+                                token: token,
+                                line: line
+                            )
+                            temporaryOwners.append(value)
+                        }
+                    }
                     let actual = registerTypes[Int(value.rawValue)]
                     guard actual == logicalType else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -2982,17 +3231,29 @@ public struct Lowerer: Sendable {
                     }
                     value = stored
                 } else {
-                    value = convention == .owned
-                        ? try prepareOwnedValue(
+                    if convention == .owned {
+                        value = try prepareOwnedValue(
                             token,
                             expectedType: logicalType,
                             line: line
                         )
-                        : try resolveStorableValue(
+                    } else {
+                        let source = try resolveStorableValue(
                             token,
-                            expectedType: logicalType,
                             line: line
                         )
+                        if registerTypes[Int(source.rawValue)] == logicalType {
+                            value = source
+                        } else {
+                            value = try copyRestrictingClosure(
+                                source,
+                                to: logicalType,
+                                token: token,
+                                line: line
+                            )
+                            temporaryOwners.append(value)
+                        }
+                    }
                 }
                 guard convention == .inout else {
                     arguments.append(value)
@@ -23296,16 +23557,10 @@ public struct Lowerer: Sendable {
                 if staticKeyPathValues[dependence[2]] == nil {
                     _ = try resolve(dependence[2], line: sourceLine)
                 }
-                if let endCount = dynamicClosureScopeEndCounts[dependence[0]] {
-                    let result = try allocate(
-                        type: registerTypes[Int(source.rawValue)]
-                    )
-                    values[dependence[0]] = result
-                    dynamicallyScopedClosureValues[dependence[0]] = endCount
-                    appendInstruction(
-                        .beginClosureScope(result: result, closure: source)
-                    )
-                } else {
+                if try beginDynamicClosureScopeIfRequired(
+                    for: dependence[0],
+                    closure: source
+                ) == nil {
                     values[dependence[0]] = source
                     aliasRetainedValue(dependence[0], to: dependence[1])
                     aliasCompilerTemporary(dependence[0], to: dependence[1])
@@ -23322,7 +23577,9 @@ public struct Lowerer: Sendable {
                 ]
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "destroy_not_escaped_closure has no matching dynamic scope"
+                        "destroy_not_escaped_closure operand \(scopeEnd[1]) "
+                            + "in \(displayName) at SIL line \(sourceLine) "
+                            + "has no matching dynamic scope"
                     )
                 }
                 let closure = try resolve(scopeEnd[1], line: sourceLine)
@@ -23367,10 +23624,17 @@ public struct Lowerer: Sendable {
                 }
                 // Direct and indirect SIL results share one value result in
                 // HLBC. A fully concrete conversion that preserves the VM
-                // signature is therefore an ownership-neutral closure alias.
-                values[conversion[0]] = source
-                aliasRetainedValue(conversion[0], to: conversion[1])
-                aliasCompilerTemporary(conversion[0], to: conversion[1])
+                // signature is therefore an ownership-neutral closure alias,
+                // except when Swift adds a stricter MainActor invocation
+                // contract that the erased SIL operand no longer spells.
+                try bindClosureConversion(
+                    resultToken: conversion[0],
+                    sourceToken: conversion[1],
+                    source: source,
+                    actual: actual,
+                    expected: expected,
+                    line: sourceLine
+                )
                 continue
             }
 
@@ -23389,9 +23653,14 @@ public struct Lowerer: Sendable {
                             + "to \(conversion[2])"
                     )
                 }
-                values[conversion[0]] = source
-                aliasRetainedValue(conversion[0], to: conversion[1])
-                aliasCompilerTemporary(conversion[0], to: conversion[1])
+                try bindClosureConversion(
+                    resultToken: conversion[0],
+                    sourceToken: conversion[1],
+                    source: source,
+                    actual: actual,
+                    expected: expected,
+                    line: sourceLine
+                )
                 continue
             }
 
@@ -25116,6 +25385,37 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = enum \$Optional<(.+)>, #Optional\.some!enumelt, (%[0-9]+)$"#
             ) {
+                if optionalScopeCarrierEndCounts[optional[0]] != nil {
+                    guard hasOnlyDynamicClosureScopeCarrierUses(
+                        of: optional[0],
+                        after: lineIndex
+                    ) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "dynamic closure scope carrier \(optional[0]) "
+                                + "has a non-carrier use"
+                        )
+                    }
+                    let source = try resolve(optional[2], line: sourceLine)
+                    guard case .closure = registerTypes[Int(source.rawValue)]
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "dynamic closure scope carrier payload is not a closure"
+                        )
+                    }
+                    // Swift sometimes wraps a proven nonescaping closure in
+                    // Optional.some solely as the carrier consumed by
+                    // destroy_not_escaped_closure. It has no source-level
+                    // Optional semantics, so preserve the scoped value as an
+                    // ownership-neutral compiler alias.
+                    values[optional[0]] = source
+                    aliasRetainedValue(optional[0], to: optional[2])
+                    aliasCompilerTemporary(optional[0], to: optional[2])
+                    try transferDynamicClosureScopeIfRequired(
+                        from: optional[2],
+                        to: optional[0]
+                    )
+                    continue
+                }
                 let payload: Bytecode.Register
                 let source: Bytecode.Register
                 let wrapped: Bytecode.ValueType

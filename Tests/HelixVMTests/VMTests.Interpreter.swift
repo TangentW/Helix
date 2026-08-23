@@ -1392,6 +1392,39 @@ struct Interpreter {
         )
     }
 
+    @MainActor
+    @Test("A restricted native callable result obeys its MainActor entry")
+    func restrictedNativeCallableResultObeysMainActor() async throws {
+        let fixture = try makeNativeCallableResultImage(
+            restrictToMainActor: true
+        )
+        let importID = Core.NativeImportID(rawValue: 0)
+        let key = try #require(fixture.shell.imports[importID]?.key)
+        let catalog = try VM.NativeCatalog([
+            CallableFactoryInvoker(key: key),
+        ])
+
+        #expect(
+            VM.Interpreter(nativeCatalog: catalog).invoke(
+                entry: .init(rawValue: 0),
+                image: fixture,
+                arguments: []
+            ) == .returned(
+                .integer(
+                    try .init(signed: 42, bitWidth: 64, isSigned: true)
+                )
+            )
+        )
+        let detached = await Task.detached {
+            VM.Interpreter(nativeCatalog: catalog).invoke(
+                entry: .init(rawValue: 0),
+                image: fixture,
+                arguments: []
+            )
+        }.value
+        #expect(detached == .trapped(.mainActorViolation))
+    }
+
     @Test("Native catalog effects must exactly match the frozen Shell descriptor")
     func rejectsMisdeclaredNativeEffectsBeforeInvocation() throws {
         let fixture = try makeNativeIncrementImage()
@@ -5993,6 +6026,97 @@ struct Interpreter {
         )
     }
 
+    @MainActor
+    @Test("Closure conversion preserves captures while adding MainActor isolation")
+    func convertsClosureActorRestriction() throws {
+        let plainSignature = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .int64
+        )
+        var restrictedSignature = plainSignature
+        restrictedSignature.effects.requiresMainActor = true
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "convertClosureActorRestriction",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64,
+                .closure(plainSignature),
+                .closure(restrictedSignature),
+                .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeClosure(
+                            result: .init(rawValue: 1),
+                            function: .init(rawValue: 1),
+                            captures: [.init(rawValue: 0)]
+                        ),
+                        .convertClosure(
+                            result: .init(rawValue: 2),
+                            source: .init(rawValue: 1)
+                        ),
+                        .closureApply(
+                            result: .init(rawValue: 3),
+                            closure: .init(rawValue: 2),
+                            arguments: []
+                        ),
+                        .destroyValue(.init(rawValue: 2)),
+                        .destroyValue(.init(rawValue: 1)),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ],
+            effects: .init(requiresMainActor: true)
+        )
+        let closureBody = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "capturedValue",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
+        let image = try makeVerified(
+            function: root,
+            capabilities: [
+                .baselineV1, .closureValuesV1, .mainActorSyncV1,
+            ],
+            policy: .init(
+                acceptedCapabilities: [
+                    .baselineV1, .closureValuesV1, .mainActorSyncV1,
+                ],
+                allowMainActorSynchronousEntries: true
+            ),
+            additionalFunctions: [closureBody]
+        )
+        let input = VM.Value.integer(
+            try VM.Integer(signed: 7, bitWidth: 64, isSigned: true)
+        )
+
+        #expect(
+            VM.Interpreter().invoke(
+                entry: .init(rawValue: 0),
+                image: image,
+                arguments: [input]
+            ) == .returned(input)
+        )
+    }
+
     @Test("Dynamic closure scopes reject aggregate escape")
     func rejectsDynamicallyScopedClosureEscape() throws {
         let signature = Bytecode.ClosureSignature(
@@ -6742,8 +6866,12 @@ struct Interpreter {
         )
     }
 
-    private func makeNativeCallableResultImage() throws -> Verification.Image {
+    private func makeNativeCallableResultImage(
+        restrictToMainActor: Bool = false
+    ) throws -> Verification.Image {
         let callable = CallableFactoryInvoker.signature
+        var restrictedCallable = callable
+        restrictedCallable.effects.requiresMainActor = true
         let importSignature = Core.LoweredSignature(
             parameters: [],
             result: "(Swift.Int) -> Swift.Int"
@@ -6771,40 +6899,76 @@ struct Interpreter {
             effects: .init(),
             contract: vmPureImportContract
         )
+        let registerTypes: [Bytecode.ValueType]
+        let instructions: [Bytecode.Instruction]
+        if restrictToMainActor {
+            registerTypes = [
+                .closure(callable), .closure(restrictedCallable),
+                .int64, .int64,
+            ]
+            instructions = [
+                .nativeApply(
+                    result: .init(rawValue: 0),
+                    importID: .init(rawValue: 0),
+                    arguments: []
+                ),
+                .convertClosure(
+                    result: .init(rawValue: 1),
+                    source: .init(rawValue: 0)
+                ),
+                .constantInteger(
+                    result: .init(rawValue: 2),
+                    bitPattern: 41
+                ),
+                .closureApply(
+                    result: .init(rawValue: 3),
+                    closure: .init(rawValue: 1),
+                    arguments: [.init(rawValue: 2)]
+                ),
+                .returnValue(.init(rawValue: 3)),
+            ]
+        } else {
+            registerTypes = [.closure(callable), .int64, .int64]
+            instructions = [
+                .nativeApply(
+                    result: .init(rawValue: 0),
+                    importID: .init(rawValue: 0),
+                    arguments: []
+                ),
+                .constantInteger(
+                    result: .init(rawValue: 1),
+                    bitPattern: 41
+                ),
+                .closureApply(
+                    result: .init(rawValue: 2),
+                    closure: .init(rawValue: 0),
+                    arguments: [.init(rawValue: 1)]
+                ),
+                .returnValue(.init(rawValue: 2)),
+            ]
+        }
         let function = Bytecode.Function(
             id: .init(rawValue: 0),
             name: "invokeNativeCallableResult",
             parameterRegisters: [],
             resultType: .int64,
-            registerTypes: [.closure(callable), .int64, .int64],
+            registerTypes: registerTypes,
             entryBlock: .init(rawValue: 0),
             blocks: [
                 .init(
                     id: .init(rawValue: 0),
-                    instructions: [
-                        .nativeApply(
-                            result: .init(rawValue: 0),
-                            importID: .init(rawValue: 0),
-                            arguments: []
-                        ),
-                        .constantInteger(
-                            result: .init(rawValue: 1),
-                            bitPattern: 41
-                        ),
-                        .closureApply(
-                            result: .init(rawValue: 2),
-                            closure: .init(rawValue: 0),
-                            arguments: [.init(rawValue: 1)]
-                        ),
-                        .returnValue(.init(rawValue: 2)),
-                    ]
+                    instructions: instructions
                 ),
-            ]
+            ],
+            effects: .init(requiresMainActor: restrictToMainActor)
         )
-        let capabilities: Set<Core.Capability> = [
+        var capabilities: Set<Core.Capability> = [
             .baselineV1, .nativeImportsV1, .closureValuesV1,
             .escapingClosureValuesV1,
         ]
+        if restrictToMainActor {
+            capabilities.insert(.mainActorSyncV1)
+        }
         return try makeVerified(
             function: function,
             capabilities: capabilities,
@@ -6812,7 +6976,8 @@ struct Interpreter {
             shellImports: [descriptor],
             policy: .init(
                 acceptedCapabilities: capabilities,
-                allowedNativeImports: [.init(rawValue: 0)]
+                allowedNativeImports: [.init(rawValue: 0)],
+                allowMainActorSynchronousEntries: restrictToMainActor
             ),
             signature: .init(parameters: [], result: "Swift.Int"),
             parameterTypes: [],

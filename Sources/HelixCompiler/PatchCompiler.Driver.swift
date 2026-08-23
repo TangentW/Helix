@@ -120,7 +120,8 @@ public struct Driver: Sendable {
                 displayName: item.symbol,
                 kind: item.kind,
                 directCalls: imagePlan.directCalls,
-                expectedEffects: item.signature.effects
+                expectedEffects: item.signature.effects,
+                expectedResultType: item.signature.result
             )
             let actualParameters = lowered.parameterRegisters.compactMap { register in
                 lowered.registerTypes.indices.contains(Int(register.rawValue))

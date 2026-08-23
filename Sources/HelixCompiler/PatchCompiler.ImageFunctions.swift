@@ -83,7 +83,8 @@ enum ImageFunctions {
                     symbol: symbol,
                     kind: item.kind,
                     executionEffectEnvelope: item.executionEffectEnvelope
-                        ?? executionEffectEnvelope
+                        ?? executionEffectEnvelope,
+                    file: file
                 )
             } catch let error as CanonicalSIL.ImageFunctions.DiscoveryError {
                 throw map(error)

@@ -478,7 +478,10 @@ does not by itself certify a physical device or distribution channel.
 - Exact NativeImport callable crossings under one generated, framework-neutral
   bridge profile. Typed AST supplies the source closure spelling; canonical SIL
   supplies the physical `@noescape`/escaping lifetime, Objective-C block
-  reabstraction, ownership, and global-actor evidence. The current profile
+  reabstraction, ownership, and global-actor evidence. MainActor provenance is
+  retained through frontend conversion/Optional wrappers and immutable inferred
+  local aliases, while an explicit source function type—including intentional
+  actor erasure—remains authoritative. The current profile
   accepts direct or Optional synchronous, nonthrowing callbacks. Callback
   parameters may recursively use the ordinary native bridge value family,
   including `Error` existentials (direct or Optional) represented as bounded
@@ -526,6 +529,15 @@ does not by itself certify a physical device or distribution channel.
   Source defaults omitted beside a callback are
   represented by a checked physical-to-logical projection and are supplied by
   the generated Swift invocation after SIL provenance and ownership validation.
+  A representation-preserving `convert_closure` may only add MainActor to an
+  otherwise ABI-identical closure. The Verifier rejects the reverse conversion,
+  any ownership/result/effect change, and an escaping NativeImport that receives
+  a converted lexical closure; the VM retains the logical restricted signature
+  and copied capture context. Compiler-only `Optional.some` scope carriers are
+  erased only when their sole semantic use is `destroy_not_escaped_closure`;
+  other uses fail closed. Compiler-generated bound-method factories recover
+  an erased nested MainActor result only from unanimous body-isolation evidence;
+  source-written factories are not inferred or rewritten.
 - Top-level non-suspending `async`, `async throws`, and `@MainActor async`
   entries. Exact generated Swift wrappers preserve their ABI while HLVM runs a
   body proven not to suspend.

@@ -198,7 +198,8 @@ enum ImageFunctions {
         environment: CanonicalSIL.TypeEnvironment,
         symbol: String,
         kind: Bytecode.FunctionKind,
-        executionEffectEnvelope: Core.Effects = .init()
+        executionEffectEnvelope: Core.Effects = .init(),
+        file: CanonicalSIL.File? = nil
     ) throws -> Signature {
         do {
             let parsed = try CanonicalSIL.Lowerer(
@@ -259,10 +260,17 @@ enum ImageFunctions {
                 hasIndirectResult: parsed.hasIndirectResult,
                 hasIndirectError: parsed.indirectErrorType != nil
             )
+            let result = file.map {
+                restoreImplicitClosureResultIsolation(
+                    parsed.result,
+                    function: function,
+                    file: $0
+                )
+            } ?? parsed.result
             return .init(
                 parameters: normalized.parameters,
                 parameterConventions: normalized.parameterConventions,
-                result: parsed.result,
+                result: result,
                 thrownType: parsed.thrownType,
                 effects: effects
             )
@@ -274,6 +282,72 @@ enum ImageFunctions {
                 reason: "its lowered signature is not fully concrete: \(error)"
             )
         }
+    }
+
+    /// Canonical SIL erases the nested actor annotation from the result of
+    /// Swift's implicit bound-method/autoclosure factories. Recover it only
+    /// for compiler-generated factories whose every returned closure value is
+    /// constructed from a MainActor body. An ordinary source factory may
+    /// intentionally erase actor isolation and is therefore never inferred.
+    private static func restoreImplicitClosureResultIsolation(
+        _ result: Bytecode.ValueType,
+        function: CanonicalSIL.Function,
+        file: CanonicalSIL.File
+    ) -> Bytecode.ValueType {
+        guard case var .closure(signature) = result,
+              !signature.effects.requiresMainActor,
+              function.mangledName.range(
+                of: #"(?:cfu|fu|cfU|fU)[0-9]*_$"#,
+                options: .regularExpression
+              ) != nil
+        else { return result }
+
+        var symbolByReference: [String: String] = [:]
+        var targetByClosure: [String: String] = [:]
+        var returnedValues: [String] = []
+        for rawLine in function.body.split(separator: "\n") {
+            let line = String(rawLine).trimmingCharacters(in: .whitespaces)
+            if let marker = line.range(of: "function_ref @"),
+               let value = silResultValue(in: line) {
+                let suffix = line[marker.upperBound...]
+                let end = suffix.firstIndex { $0 == " " || $0 == ":" }
+                    ?? suffix.endIndex
+                let symbol = String(suffix[..<end])
+                if !symbol.isEmpty { symbolByReference[value] = symbol }
+                continue
+            }
+            if let source = silValue(after: "partial_apply", in: line)
+                ?? silValue(after: "thin_to_thick_function", in: line),
+               let result = silResultValue(in: line),
+               let symbol = symbolByReference[source] {
+                targetByClosure[result] = symbol
+                continue
+            }
+            for marker in [
+                " = begin_borrow ", " = copy_value ", " = move_value ",
+                " = convert_function ", " = convert_escape_to_noescape ",
+                " = mark_dependence ",
+            ] where line.contains(marker) {
+                guard let result = silResultValue(in: line),
+                      let source = silValue(after: marker, in: line),
+                      let symbol = targetByClosure[source]
+                else { continue }
+                targetByClosure[result] = symbol
+            }
+            if line.hasPrefix("return "),
+               let value = silValue(after: "return ", in: line) {
+                returnedValues.append(value)
+            }
+        }
+        guard !returnedValues.isEmpty,
+              returnedValues.allSatisfy({ value in
+                  targetByClosure[value].flatMap {
+                      file.function(mangledName: $0)
+                  }?.isolation.isMainActor == true
+              })
+        else { return result }
+        signature.effects.requiresMainActor = true
+        return .closure(signature)
     }
 
     private enum ReferenceUsage: Hashable {

@@ -2387,6 +2387,83 @@ struct SemanticVerifier {
         #expect(image.module.capabilities.contains(.closureValuesV1))
     }
 
+    @Test("Closure conversion may only add an exact MainActor restriction")
+    func validatesClosureActorRestrictionConversion() throws {
+        var valid = try makeClosureFixture()
+        let plain = try #require(
+            valid.module.functions[0].registerTypes[1].directClosureShape?
+                .signature
+        )
+        var mainActor = plain
+        mainActor.effects.requiresMainActor = true
+        valid.module.functions[0].registerTypes.append(.closure(mainActor))
+        valid.module.functions[0].blocks[0].instructions.insert(
+            .convertClosure(
+                result: .init(rawValue: 3),
+                source: .init(rawValue: 1)
+            ),
+            at: 1
+        )
+        valid.module.functions[0].blocks[0].instructions.insert(
+            .destroyValue(.init(rawValue: 3)),
+            at: 2
+        )
+        valid.module.capabilities.insert(.mainActorSyncV1)
+        valid.shell.capabilities.insert(.mainActorSyncV1)
+        valid.policy.acceptedCapabilities.insert(.mainActorSyncV1)
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(valid.module),
+            shell: valid.shell,
+            policy: valid.policy
+        )
+
+        var missingCapability = valid
+        missingCapability.module.capabilities.remove(.mainActorSyncV1)
+        #expect(
+            throws: Verification.Error.capabilityDenied(.mainActorSyncV1)
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(missingCapability.module),
+                shell: missingCapability.shell,
+                policy: missingCapability.policy
+            )
+        }
+
+        func expectedFailure() -> Verification.Error {
+            .invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 1,
+                reason: "convert_closure requires an ABI-identical MainActor restriction"
+            )
+        }
+
+        var erasing = valid
+        erasing.module.functions[0].registerTypes[1] = .closure(mainActor)
+        erasing.module.functions[0].registerTypes[3] = .closure(plain)
+        #expect(throws: expectedFailure()) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(erasing.module),
+                shell: erasing.shell,
+                policy: erasing.policy
+            )
+        }
+
+        var changingABI = valid
+        var incompatible = mainActor
+        incompatible.result = .bool
+        changingABI.module.functions[0].registerTypes[3] = .closure(
+            incompatible
+        )
+        #expect(throws: expectedFailure()) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(changingABI.module),
+                shell: changingABI.shell,
+                policy: changingABI.policy
+            )
+        }
+    }
+
     @Test("A synchronous throwing closure has verified normal and error edges")
     func validatesThrowingClosureControlFlow() throws {
         var fixture = try makeClosureFixture()
@@ -4475,6 +4552,9 @@ struct SemanticVerifier {
         actorMismatch.module.functions[2].registerTypes[0] = .closure(
             actorFormal
         )
+        actorMismatch.module.capabilities.insert(.mainActorSyncV1)
+        actorMismatch.shell.capabilities.insert(.mainActorSyncV1)
+        actorMismatch.policy.acceptedCapabilities.insert(.mainActorSyncV1)
         #expect(
             throws: Verification.Error.invalidInstruction(
                 function: .init(rawValue: 0),
@@ -4884,6 +4964,114 @@ struct SemanticVerifier {
                 bytes: Bytecode.Encoder.encode(useAfterEnd.module),
                 shell: useAfterEnd.shell,
                 policy: useAfterEnd.policy
+            )
+        }
+
+        var convertedUseAfterEnd = valid
+        var restricted = signature
+        restricted.effects.requiresMainActor = true
+        convertedUseAfterEnd.module.functions[0].registerTypes.append(
+            contentsOf: [
+                .closure(restricted), .closure(restricted),
+                .closure(restricted),
+            ]
+        )
+        convertedUseAfterEnd.module.functions[0].blocks[0].instructions = [
+            .makeClosure(
+                result: .init(rawValue: 1),
+                function: .init(rawValue: 1),
+                captures: [.init(rawValue: 0)]
+            ),
+            .beginClosureScope(
+                result: .init(rawValue: 3),
+                closure: .init(rawValue: 1)
+            ),
+            .convertClosure(
+                result: .init(rawValue: 4),
+                source: .init(rawValue: 3)
+            ),
+            .endClosureScope(closure: .init(rawValue: 3)),
+            .copyValue(
+                result: .init(rawValue: 5),
+                source: .init(rawValue: 4)
+            ),
+            .returnValue(.init(rawValue: 0)),
+        ]
+        convertedUseAfterEnd.module.capabilities.insert(.mainActorSyncV1)
+        convertedUseAfterEnd.shell.capabilities.insert(.mainActorSyncV1)
+        convertedUseAfterEnd.policy.acceptedCapabilities.insert(
+            .mainActorSyncV1
+        )
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 4,
+                reason: "closed dynamic closure scope %4 is reused"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(
+                    convertedUseAfterEnd.module
+                ),
+                shell: convertedUseAfterEnd.shell,
+                policy: convertedUseAfterEnd.policy
+            )
+        }
+
+        var copiedAcrossBlock = convertedUseAfterEnd
+        copiedAcrossBlock.module.functions[0].blocks = [
+            .init(
+                id: .init(rawValue: 0),
+                parameters: [.init(rawValue: 0)],
+                instructions: [
+                    .makeClosure(
+                        result: .init(rawValue: 1),
+                        function: .init(rawValue: 1),
+                        captures: [.init(rawValue: 0)]
+                    ),
+                    .beginClosureScope(
+                        result: .init(rawValue: 3),
+                        closure: .init(rawValue: 1)
+                    ),
+                    .convertClosure(
+                        result: .init(rawValue: 4),
+                        source: .init(rawValue: 3)
+                    ),
+                    .copyValue(
+                        result: .init(rawValue: 5),
+                        source: .init(rawValue: 4)
+                    ),
+                    .endClosureScope(closure: .init(rawValue: 3)),
+                    .branch(target: .init(rawValue: 1), arguments: []),
+                ]
+            ),
+            .init(
+                id: .init(rawValue: 1),
+                instructions: [
+                    .closureApply(
+                        result: .init(rawValue: 2),
+                        closure: .init(rawValue: 5),
+                        arguments: [.init(rawValue: 0)]
+                    ),
+                    .returnValue(.init(rawValue: 2)),
+                ]
+            ),
+        ]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 1),
+                offset: 0,
+                reason: "closed dynamic closure scope %5 is reused"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(
+                    copiedAcrossBlock.module
+                ),
+                shell: copiedAcrossBlock.shell,
+                policy: copiedAcrossBlock.policy
             )
         }
     }

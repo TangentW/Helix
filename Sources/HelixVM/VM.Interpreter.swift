@@ -228,9 +228,9 @@ public struct Interpreter: Sendable {
                   closure.signature.hasCanonicalThrownType,
                   function.hasCanonicalThrownType,
                   function.thrownType == closure.signature.thrownType,
-                  Bytecode.ClosureSignature.callableEffects(
-                      from: function.effects
-                  ) == closure.signature.effects,
+                  closure.signature.safelyRestricts(
+                      targetEffects: function.effects
+                  ),
                   !function.effects.isAsync,
                   !function.effects.mayThrow,
                   function.parameterRegisters.count
@@ -243,7 +243,9 @@ public struct Interpreter: Sendable {
                     "native callback closure disagrees with its verified body ABI"
                 )
             }
-            guard !function.effects.requiresMainActor || Thread.isMainThread else {
+            guard !closure.signature.effects.requiresMainActor
+                    || Thread.isMainThread
+            else {
                 throw VM.RuntimeTrap.mainActorViolation
             }
             for (value, expected) in zip(arguments, closure.signature.parameters) {
@@ -641,6 +643,34 @@ public struct Interpreter: Sendable {
                         budget: budget
                     )
                     try initialize(copied, register: result, registers: &registers)
+                case let .convertClosure(result, source):
+                    guard case let .closure(expected) = function.type(of: result),
+                          case let .closure(sourceClosure) = try read(
+                            source,
+                            registers: registers
+                          )
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: function.type(of: result) ?? .never,
+                            actual: try read(source, registers: registers).type
+                        )
+                    }
+                    let copied = try copyCharging(
+                        .closure(sourceClosure),
+                        budget: budget
+                    )
+                    guard case var .closure(converted) = copied else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .closure(expected),
+                            actual: copied.type
+                        )
+                    }
+                    converted.signature = expected
+                    try initialize(
+                        .closure(converted),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .moveValue(result, source):
                     let value = try consume(
                         source,
@@ -4442,13 +4472,21 @@ public struct Interpreter: Sendable {
                         )
                     case let .native(nativeClosure):
                         guard closure.captures.isEmpty,
-                              nativeClosure.signature == closure.signature,
+                              (nativeClosure.signature == closure.signature
+                                || closure.signature.isMainActorRestriction(
+                                    of: nativeClosure.signature
+                                )),
                               closure.signature.isNativeBridgeCallable,
                               arguments.count == closure.signature.parameters.count
                         else {
                             throw VM.RuntimeTrap.nativeFailure(
                                 "native closure value disagrees with its callable ABI"
                             )
+                        }
+                        guard !closure.signature.effects.requiresMainActor
+                                || Thread.isMainThread
+                        else {
+                            throw VM.RuntimeTrap.mainActorViolation
                         }
                         try chargeCallShape(values, budget: budget)
                         try consumeOwnedCallArguments(

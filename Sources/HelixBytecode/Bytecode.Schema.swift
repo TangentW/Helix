@@ -454,6 +454,10 @@ public enum Instruction: Codable, Hashable, Sendable {
     case constantFloat(result: Bytecode.Register, bitPattern: UInt64)
     case constantString(result: Bytecode.Register, value: String)
     case copyValue(result: Bytecode.Register, source: Bytecode.Register)
+    /// Copies one closure while adding a verified invocation restriction.
+    /// HLBC v1 currently permits only an otherwise identical MainActor
+    /// restriction; actor erasure and ABI-changing conversions are invalid.
+    case convertClosure(result: Bytecode.Register, source: Bytecode.Register)
     case moveValue(result: Bytecode.Register, source: Bytecode.Register)
     case destroyValue(Bytecode.Register)
     case makeTuple(result: Bytecode.Register, elements: [Bytecode.Register])
@@ -1122,6 +1126,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .constantFloat(result, _),
              let .constantString(result, _),
              let .copyValue(result, _),
+             let .convertClosure(result, _),
              let .moveValue(result, _),
              let .makeTuple(result, _),
              let .makeStruct(result, _),
@@ -1282,7 +1287,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              .destroyStackIfInitialized, .stackAddress,
              .makeArrayBuilder, .allocateObject, .trap:
             []
-        case let .copyValue(_, source), let .moveValue(_, source), let .destroyValue(source):
+        case let .copyValue(_, source), let .convertClosure(_, source),
+             let .moveValue(_, source), let .destroyValue(source):
             [source]
         case let .makeTuple(_, elements):
             elements
