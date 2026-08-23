@@ -232,6 +232,40 @@ public final class Encoder {
         }
     }
 
+    /// Reserves and encodes the complete logical field graph of one frozen
+    /// Shell struct. The generated codec supplies the verified field types.
+    public func encodeStructure(
+        type: Bytecode.LocalTypeKey,
+        fieldTypes: [Bytecode.ValueType],
+        fields: () throws -> [VM.Value]
+    ) throws -> VM.Value {
+        try withContainer(childValueCount: fieldTypes.count) {
+            try Runtime.BridgeValueCodec.encodeStructure(
+                type: type,
+                fieldTypes: fieldTypes,
+                fields: fields()
+            )
+        }
+    }
+
+    /// Reserves and encodes the zero-or-one payload graph of one frozen Shell
+    /// enum case. The generated codec supplies the verified payload type.
+    public func encodeEnumeration(
+        type: Bytecode.LocalTypeKey,
+        caseIndex: UInt32,
+        payloadType: Bytecode.ValueType?,
+        payload: () throws -> VM.Value?
+    ) throws -> VM.Value {
+        try withContainer(childValueCount: payloadType == nil ? 0 : 1) {
+            try Runtime.BridgeValueCodec.encodeEnumeration(
+                type: type,
+                caseIndex: caseIndex,
+                payloadType: payloadType,
+                payload: payload()
+            )
+        }
+    }
+
     /// Reserves the complete array shape before encoding and type-checking elements.
     public func encodeArray<Element>(
         _ value: [Element],
@@ -618,8 +652,15 @@ public final class Encoder {
                     toVMBytesOf: &result,
                     limits: limits
                 )
-            case .structure, .enumeration, .object, .address,
-                 .mutableCell, .nonOwningReference,
+            case let .structure(_, fields):
+                try validate(fields.count, limits: limits)
+                try addAggregate(fields.count, to: &result, limits: limits)
+                try append(fields, below: depth, to: &pending, limits: limits)
+            case let .enumeration(_, _, payload):
+                let values = payload.map { [$0] } ?? []
+                try addAggregate(values.count, to: &result, limits: limits)
+                try append(values, below: depth, to: &pending, limits: limits)
+            case .object, .address, .mutableCell, .nonOwningReference,
                  .arrayBuilder, .arrayMutationState,
                  .dictionaryBuilder, .arraySortState, .arraySplitState:
                 throw Runtime.BridgeInputError.encodedTypeMismatch(

@@ -315,6 +315,7 @@ public struct Document: Codable, Hashable, Sendable {
     public var nativeImportCandidates: [InterfaceArchive.NativeImportRecord]
     public var nativeImportBindings: [ShellBuildReceipt.NativeImportBinding]
     public var nativeTypes: [InterfaceArchive.TypeRecord]
+    public var frozenValueTypes: [InterfaceArchive.FrozenValueTypeRecord]
     public var nativeTypeBindings: [ShellBuildReceipt.NativeTypeBinding]
     public var superclassEdges: [ShellBuildReceipt.SuperclassEdge]
     public var reloadRules: [ShellBuildReceipt.ReloadRule]
@@ -332,6 +333,7 @@ public struct Document: Codable, Hashable, Sendable {
         nativeImportCandidates: [InterfaceArchive.NativeImportRecord] = [],
         nativeImportBindings: [ShellBuildReceipt.NativeImportBinding] = [],
         nativeTypes: [InterfaceArchive.TypeRecord] = [],
+        frozenValueTypes: [InterfaceArchive.FrozenValueTypeRecord] = [],
         nativeTypeBindings: [ShellBuildReceipt.NativeTypeBinding] = [],
         superclassEdges: [ShellBuildReceipt.SuperclassEdge] = [],
         reloadRules: [ShellBuildReceipt.ReloadRule] = [],
@@ -352,6 +354,7 @@ public struct Document: Codable, Hashable, Sendable {
             $0.key.rawValue < $1.key.rawValue
         }
         self.nativeTypes = nativeTypes.sorted { $0.id.rawValue < $1.id.rawValue }
+        self.frozenValueTypes = frozenValueTypes.sorted { $0.key < $1.key }
         self.nativeTypeBindings = nativeTypeBindings.sorted {
             ($0.canonicalName, $0.layoutFingerprint.hex)
                 < ($1.canonicalName, $1.layoutFingerprint.hex)
@@ -403,6 +406,16 @@ public struct Document: Codable, Hashable, Sendable {
             )
         }
         let sourcePaths = Set(sources.map(\.logicalPath))
+        guard frozenValueTypes == frozenValueTypes.sorted(by: { $0.key < $1.key }),
+              Set(frozenValueTypes.map(\.key)).count == frozenValueTypes.count,
+              frozenValueTypes.allSatisfy({
+                  sourcePaths.contains($0.sourceFileLogicalID)
+              })
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "frozen Shell value types are duplicated, unordered, or reference unknown sources"
+            )
+        }
         guard declarations == declarations.sorted(by: { $0.mangledName < $1.mangledName }),
               Set(declarations.map(\.mangledName)).count == declarations.count,
               !declarations.isEmpty,

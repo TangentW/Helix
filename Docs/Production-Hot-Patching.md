@@ -324,6 +324,22 @@ proven Objective-C `!foreign` protocol erasure remains a frozen native
 `AnyObject` reference. Conditional, imported, open-world, and mutable
 existential dispatch remains rejected.
 
+Existing current-module Shell structs and enums use a separate frozen
+logical-value boundary. Eligible copyable, nongeneric, nonrecursive values can
+be parameters, results, or nonmutating instance receivers—including extension
+methods and ordinary, `borrowing`, or `consuming` ownership—on normal and
+throwing paths. The interface records the exact source-qualified struct fields
+or enum cases, labels, order, recursive represented types, copyability, and
+supported conformance facts. A same-source construction hook and generated
+streaming codec reconstruct private storage without Swift ABI layout,
+reflection, or runtime metadata; release indexing, patch-source replay, the
+device hash, and independent verification all require the same definition.
+Nested values and represented scalar, text, `Any`, Optional, Array,
+Dictionary, Set, and tuple storage compose recursively. Existing-value
+mutation, `inout`, accessors/subscripts, observers, enum state transitions, and
+nested writeback remain a distinct fail-closed stage. This extends the same v1
+contracts and does not introduce a compatibility version.
+
 Native text rendering is a deliberately narrow exception to keeping generic
 standard-library APIs inside HLVM. The compiler recognizes the generic
 `String(describing:)` and `String(reflecting:)` SIL entries, proves a recursive
@@ -428,7 +444,8 @@ Swift protocol existential values crossing a
 Shell or ordinary NativeImport boundary, a patch concrete Swift type identity
 visible to native code, function-local
 nominal declarations, hosted stored properties/custom initializers/arbitrary
-callback ABIs, changes to existing native stored layout, closure crossing a
+callback ABIs, changes to existing native stored layout, mutation or `inout`
+writeback of an existing Shell value root, closure crossing a
 Shell Entry or a NativeImport position outside the exact callable profile,
 throwing/async/inout callback ABIs, recursive or nonescaping nested callable
 arguments, callback results without a

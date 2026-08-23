@@ -21,6 +21,7 @@ public struct Request: Sendable {
     public var nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind]
     /// Frozen native types whose values and hosted subclasses are MainActor-bound.
     public var mainActorNativeTypes: Set<Core.TypeID>
+    public var frozenValueTypes: [InterfaceArchive.FrozenValueTypeRecord]
     /// SIL symbols that already belong to the finalized Shell. Hosted callback
     /// discovery must never reinterpret one of these declarations as a newly
     /// introduced patch-local class method.
@@ -44,6 +45,7 @@ public struct Request: Sendable {
         nativeTypes: [String: Core.TypeID] = [:],
         nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:],
         mainActorNativeTypes: Set<Core.TypeID> = [],
+        frozenValueTypes: [InterfaceArchive.FrozenValueTypeRecord] = [],
         shellDeclarationSymbols: Set<String> = [],
         effects: Core.Effects? = nil,
         sourceFileLogicalID: String? = nil
@@ -61,6 +63,7 @@ public struct Request: Sendable {
         self.nativeTypes = nativeTypes
         self.nativeTypeKinds = nativeTypeKinds
         self.mainActorNativeTypes = mainActorNativeTypes
+        self.frozenValueTypes = frozenValueTypes
         self.shellDeclarationSymbols = shellDeclarationSymbols
         self.effects = effects
         self.sourceFileLogicalID = sourceFileLogicalID
@@ -84,6 +87,7 @@ public struct Driver: Sendable {
             kinds: request.nativeTypeKinds,
             requiresMainActor: request.mainActorNativeTypes
         )
+        try typeEnvironment.validateFrozenValueTypes(request.frozenValueTypes)
         guard let silFunction = file.function(mangledName: request.mangledName) else {
             throw CanonicalSIL.LoweringError.functionSelection("function @\(request.mangledName) was not found")
         }
@@ -261,6 +265,7 @@ public struct Driver: Sendable {
                         .filter { $0.isEmittedToDevice && $0.requiresMainActor }
                         .map(\.id)
                 ),
+                frozenValueTypes: archive.frozenValueTypes,
                 shellDeclarationSymbols: Set(archive.functions.map(\.mangledName)),
                 effects: record.effects,
                 sourceFileLogicalID: record.sourceFileLogicalID

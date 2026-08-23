@@ -8,7 +8,7 @@ import HelixLiveReloadAPI
 public enum ShellBuild {
     /// Changes whenever the source-to-Shell transformation changes semantics.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v1"
+        "Helix.ShellBuild.DynamicSourceTransform.v1:frozen-value-hooks"
     )
 }
 
@@ -155,6 +155,11 @@ public struct Materializer: Sendable {
         let candidateByMangledName = Dictionary(
             uniqueKeysWithValues: receipt.declarations.map { ($0.mangledName, $0) }
         )
+        let frozenValuesBySource = Dictionary(
+            grouping: initial.archive.frozenValueTypes,
+            by: \.sourceFileLogicalID
+        )
+        let moduleName = initial.archive.metadata.frontendInvocation.moduleName
         var transformedSources: [String: Data] = [:]
         var indexedSources: [InterfaceArchive.SourceRecord] = []
         for source in receipt.sources {
@@ -165,7 +170,8 @@ public struct Materializer: Sendable {
                 candidateByMangledName[$0.declarationMangledName]?.sourceFileLogicalID
                     == source.logicalPath
             }
-            if descriptors.isEmpty {
+            let frozenValues = frozenValuesBySource[source.logicalPath] ?? []
+            if descriptors.isEmpty, frozenValues.isEmpty {
                 transformedSources[source.logicalPath] = contents
                 indexedSources.append(
                     .init(logicalPath: source.logicalPath, contentHash: source.contentHash)
@@ -186,7 +192,11 @@ public struct Materializer: Sendable {
                 source: contents,
                 logicalPath: source.logicalPath,
                 expectedSourceHash: source.contentHash,
-                edits: edits
+                edits: edits,
+                supplementalDeclarations: ShellBuild.FrozenValueHooks.render(
+                    frozenValues,
+                    moduleName: moduleName
+                )
             )
             transformedSources[source.logicalPath] = transformed.contents
             indexedSources.append(
@@ -310,6 +320,7 @@ public struct Materializer: Sendable {
                 declarations: receipt.declarations,
                 nativeImportCandidates: receipt.nativeImportCandidates,
                 nativeTypes: receipt.nativeTypes,
+                frozenValueTypes: receipt.frozenValueTypes,
                 capabilities: Set(receipt.capabilities)
             )
         )

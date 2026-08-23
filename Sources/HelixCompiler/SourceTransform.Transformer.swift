@@ -50,7 +50,8 @@ public struct Transformer: Sendable {
         source: Data,
         logicalPath: String,
         expectedSourceHash: Core.Digest,
-        edits: [SourceTransform.Edit]
+        edits: [SourceTransform.Edit],
+        supplementalDeclarations: String = ""
     ) throws -> SourceTransform.Result {
         guard Core.Digest.sha256(source) == expectedSourceHash else {
             throw SourceTransform.Error.sourceChanged
@@ -62,6 +63,13 @@ public struct Transformer: Sendable {
         }
         guard String(data: source, encoding: .utf8) != nil else {
             throw SourceTransform.Error.invalidUTF8
+        }
+        guard supplementalDeclarations.utf8.count <= 16 * 1_024 * 1_024,
+              !supplementalDeclarations.unicodeScalars.contains(where: {
+                  $0.value == 0
+              })
+        else {
+            throw SourceTransform.Error.invalidSupplementalDeclarations
         }
         let sorted = edits.sorted { $0.utf8Offset < $1.utf8Offset }
         guard Set(sorted.map(\.functionKey)).count == sorted.count else {
@@ -90,6 +98,11 @@ public struct Transformer: Sendable {
         let prologue = Data("#sourceLocation(file: \(String(reflecting: logicalPath)), line: 1)\n".utf8)
         let epilogue = Data("\n#sourceLocation()\n".utf8)
         transformed.insert(contentsOf: prologue, at: 0)
+        if !supplementalDeclarations.isEmpty {
+            transformed.append(contentsOf: "\n".utf8)
+            transformed.append(contentsOf: supplementalDeclarations.utf8)
+            transformed.append(contentsOf: "\n".utf8)
+        }
         transformed.append(epilogue)
         guard String(data: transformed, encoding: .utf8) != nil else {
             throw SourceTransform.Error.invalidUTF8
@@ -108,6 +121,7 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case sourceChanged
     case invalidLogicalPath
     case invalidUTF8
+    case invalidSupplementalDeclarations
     case duplicateFunction
     case invalidEditOffset(Int)
     case declarationMismatch(Core.FunctionKey)
@@ -117,6 +131,8 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
         case .sourceChanged: "source bytes differ from the indexed baseline"
         case .invalidLogicalPath: "source logical path is absolute or traversing"
         case .invalidUTF8: "Swift source is not valid UTF-8"
+        case .invalidSupplementalDeclarations:
+            "supplemental Swift declarations are oversized or contain NUL"
         case .duplicateFunction: "a function has more than one transform edit"
         case let .invalidEditOffset(value): "invalid or duplicate UTF-8 edit offset \(value)"
         case let .declarationMismatch(key): "declaration bytes no longer match function \(key)"

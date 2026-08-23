@@ -4306,8 +4306,7 @@ struct Interpreter {
         )
         #expect(
             throws: Verification.Error.invalidShellInterface(
-                "patch-local nominal, internal storage, and closure values "
-                    + "cannot appear in entry 0 signature"
+                "internal storage and closure values cannot appear in entry 0 signature"
             )
         ) {
             try makeVerified(

@@ -41,23 +41,66 @@ enum SourceParameterSpelling {
         return result.count == parameterRanges.count ? result : nil
     }
 
+    /// Rewrites only the compiler-validated type portions of a source
+    /// parameter list. Labels, ownership modifiers, callback attributes,
+    /// variadics, comments, and default expressions remain byte-for-byte
+    /// identical to the declaration accepted by the frontend.
+    static func replacingNominalAliases(
+        in rawParameterList: String,
+        aliases: [String: String]
+    ) -> String? {
+        guard !aliases.isEmpty else { return rawParameterList }
+        let bytes = Array(rawParameterList.utf8)
+        guard bytes.count <= 512 * 1_024,
+              let bounds = trimmedBounds(in: bytes),
+              bytes[bounds.lowerBound] == UInt8(ascii: "("),
+              bytes[bounds.upperBound - 1] == UInt8(ascii: ")")
+        else { return nil }
+
+        let body = (bounds.lowerBound + 1)..<(bounds.upperBound - 1)
+        if body.isEmpty || bytes[body].allSatisfy(isASCIIWhitespace) {
+            return rawParameterList
+        }
+        guard let parameters = splitTopLevel(
+            bytes,
+            in: body,
+            separator: UInt8(ascii: ",")
+        ) else { return nil }
+
+        var replacements: [(Range<Int>, [UInt8])] = []
+        for parameter in parameters {
+            let declaration = firstTopLevelDelimiter(
+                UInt8(ascii: "="),
+                in: bytes,
+                range: parameter
+            ).map { parameter.lowerBound..<$0 } ?? parameter
+            guard let typeRange = parameterTypeRange(
+                in: bytes,
+                range: declaration
+            ) else { return nil }
+            let rawType = String(decoding: bytes[typeRange], as: UTF8.self)
+            let rewritten = FrontendReceipt.SwiftTypeSpelling
+                .replacingNominalAliases(in: rawType, aliases: aliases)
+            guard rewritten.utf8.count <= 64 * 1_024,
+                  !rewritten.unicodeScalars.contains(where: { $0.value == 0 })
+            else { return nil }
+            if rewritten != rawType {
+                replacements.append((typeRange, Array(rewritten.utf8)))
+            }
+        }
+
+        var result = bytes
+        for (range, replacement) in replacements.reversed() {
+            result.replaceSubrange(range, with: replacement)
+        }
+        return String(bytes: result, encoding: .utf8)
+    }
+
     private static func parameterType(
         in bytes: [UInt8],
         range: Range<Int>
     ) -> String? {
-        guard let colon = firstTopLevelDelimiter(
-            UInt8(ascii: ":"),
-            in: bytes,
-            range: range
-        ), firstTopLevelDelimiter(
-            UInt8(ascii: ":"),
-            in: bytes,
-            range: (colon + 1)..<range.upperBound
-        ) == nil,
-              let typeBounds = trimmedBounds(
-                  in: bytes,
-                  range: (colon + 1)..<range.upperBound
-              )
+        guard let typeBounds = parameterTypeRange(in: bytes, range: range)
         else { return nil }
 
         let type = String(
@@ -66,6 +109,26 @@ enum SourceParameterSpelling {
         )
         return FrontendReceipt.SwiftTypeSpelling.isGeneratedType(type)
             ? type : nil
+    }
+
+    private static func parameterTypeRange(
+        in bytes: [UInt8],
+        range: Range<Int>
+    ) -> Range<Int>? {
+        guard let colon = firstTopLevelDelimiter(
+            UInt8(ascii: ":"),
+            in: bytes,
+            range: range
+        ), firstTopLevelDelimiter(
+            UInt8(ascii: ":"),
+            in: bytes,
+            range: (colon + 1)..<range.upperBound
+        ) == nil
+        else { return nil }
+        return trimmedBounds(
+            in: bytes,
+            range: (colon + 1)..<range.upperBound
+        )
     }
 
     private static func splitTopLevel(

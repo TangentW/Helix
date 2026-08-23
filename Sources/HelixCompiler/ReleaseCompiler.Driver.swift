@@ -293,6 +293,15 @@ extension ReleaseCompiler {
                 kinds: frozenNativeTypeKinds,
                 requiresMainActor: mainActorNativeTypes
             )
+            do {
+                try silTypeEnvironment.validateFrozenValueTypes(
+                    request.archive.frozenValueTypes
+                )
+            } catch {
+                throw DriverError.sourceSetMismatch(
+                    "frozen Shell value layout validation failed: \(error)"
+                )
+            }
             let archivedSymbols = Set(request.archive.functions.map(\.mangledName))
 
             var directlyChanged: [(
@@ -459,6 +468,15 @@ extension ReleaseCompiler {
                     kinds: frozenNativeTypeKinds,
                     requiresMainActor: mainActorNativeTypes
                 )
+            do {
+                try loweringTypeEnvironment.validateFrozenValueTypes(
+                    request.archive.frozenValueTypes
+                )
+            } catch {
+                throw DriverError.sourceSetMismatch(
+                    "semantic SIL changed a frozen Shell value layout: \(error)"
+                )
+            }
 
             var localFunctionIDs: [Core.FunctionKey: Bytecode.FunctionID] = [:]
             for (offset, item) in changedSIL.enumerated() {

@@ -50,6 +50,13 @@ extension Verification.ShellInterface {
                     requiresMainActor: item.requiresMainActor,
                     estimatedSize: item.estimatedSize
                 )
+            },
+            frozenValueTypes: archive.frozenValueTypes.map { item in
+                Verification.ResolvedFrozenValueType(
+                    definition: item.definition,
+                    layoutFingerprint: item.layoutFingerprint,
+                    isCopyable: item.isCopyable
+                )
             }
         )
     }

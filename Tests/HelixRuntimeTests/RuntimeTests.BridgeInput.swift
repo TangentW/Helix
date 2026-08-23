@@ -47,6 +47,198 @@ struct BridgeInput {
         #expect(entries[0].key == .string("numbers"))
     }
 
+    @Test("Frozen struct and enum codecs validate their complete logical shapes")
+    func frozenValueCodecsRoundTrip() throws {
+        let structKey = Bytecode.LocalTypeKey(rawValue: "Fixture.Snapshot")
+        let enumKey = Bytecode.LocalTypeKey(rawValue: "Fixture.Mode")
+        let fieldTypes: [Bytecode.ValueType] = [
+            .int64,
+            .optional(.string),
+        ]
+        let encoder = makeEncoder()
+        let structure = try encoder.encodeStructure(
+            type: structKey,
+            fieldTypes: fieldTypes
+        ) {
+            [
+                try encoder.encode(Int64(7)),
+                try encoder.encodeOptional("Helix") {
+                    try encoder.encode($0)
+                },
+            ]
+        }
+        let enumeration = try encoder.encodeEnumeration(
+            type: enumKey,
+            caseIndex: 2,
+            payloadType: .tuple([.string])
+        ) {
+            try encoder.encodeTuple(count: 1) {
+                [try encoder.encode("named")]
+            }
+        }
+        try encoder.finalize(arguments: [structure, enumeration])
+
+        #expect(
+            try Runtime.BridgeValueCodec.decodeStructure(
+                structure,
+                type: structKey,
+                fieldTypes: fieldTypes
+            ) == [
+                .integer(try VM.Integer(signed: 7, bitWidth: 64, isSigned: true)),
+                .optional(.string("Helix")),
+            ]
+        )
+        let decoded = try Runtime.BridgeValueCodec.decodeEnumeration(
+            enumeration,
+            type: enumKey,
+            payloadTypes: [nil, .int64, .tuple([.string])]
+        )
+        #expect(decoded.caseIndex == 2)
+        #expect(decoded.payload == .tuple([.string("named")]))
+
+        #expect(throws: Runtime.BridgeInputError.invalidContainerCount) {
+            _ = try Runtime.BridgeValueCodec.encodeStructure(
+                type: structKey,
+                fieldTypes: [.int64],
+                fields: []
+            )
+        }
+        #expect(
+            throws: Runtime.BridgeInputError.encodedTypeMismatch(
+                expected: Bytecode.ValueType.int64.description,
+                actual: Bytecode.ValueType.bool.description
+            )
+        ) {
+            _ = try Runtime.BridgeValueCodec.encodeStructure(
+                type: structKey,
+                fieldTypes: [.int64],
+                fields: [.bool(true)]
+            )
+        }
+        #expect(throws: Runtime.BridgeInputError.invalidContainerCount) {
+            _ = try Runtime.BridgeValueCodec.encodeEnumeration(
+                type: enumKey,
+                caseIndex: 0,
+                payloadType: nil,
+                payload: .bool(true)
+            )
+        }
+        #expect(
+            throws: VM.RuntimeTrap.typeMismatch(
+                expected: .local(structKey),
+                actual: .local(enumKey)
+            )
+        ) {
+            _ = try Runtime.BridgeValueCodec.decodeStructure(
+                enumeration,
+                type: structKey,
+                fieldTypes: fieldTypes
+            )
+        }
+        #expect(
+            throws: VM.RuntimeTrap.nativeFailure(
+                "frozen Shell struct field count does not match its verified definition"
+            )
+        ) {
+            _ = try Runtime.BridgeValueCodec.decodeStructure(
+                .structure(type: structKey, fields: []),
+                type: structKey,
+                fieldTypes: fieldTypes
+            )
+        }
+        #expect(
+            throws: VM.RuntimeTrap.nativeFailure(
+                "frozen Shell enum case index is outside its verified definition"
+            )
+        ) {
+            _ = try Runtime.BridgeValueCodec.decodeEnumeration(
+                .enumeration(type: enumKey, caseIndex: 3, payload: nil),
+                type: enumKey,
+                payloadTypes: [nil]
+            )
+        }
+        #expect(
+            throws: VM.RuntimeTrap.nativeFailure(
+                "frozen Shell enum payload presence does not match its verified case"
+            )
+        ) {
+            _ = try Runtime.BridgeValueCodec.decodeEnumeration(
+                .enumeration(type: enumKey, caseIndex: 0, payload: .bool(true)),
+                type: enumKey,
+                payloadTypes: [nil]
+            )
+        }
+    }
+
+    @Test("Frozen aggregate encoding reserves shape, bytes, nodes, and depth first")
+    func frozenValueEncodingIsResourceBounded() throws {
+        let key = Bytecode.LocalTypeKey(rawValue: "Fixture.Value")
+        var callbacks = 0
+        let nodeLimited = makeEncoder(
+            .init(
+                maximumEstimatedVMBytes: 1_024,
+                maximumValueNodes: 2,
+                maximumNestingDepth: 8,
+                maximumContainerElements: 8
+            )
+        )
+        #expect(
+            throws: Runtime.BridgeInputError.valueNodeLimitExceeded(maximum: 2)
+        ) {
+            _ = try nodeLimited.encodeStructure(
+                type: key,
+                fieldTypes: [.bool, .bool]
+            ) {
+                callbacks += 1
+                return [try nodeLimited.encode(true), try nodeLimited.encode(false)]
+            }
+        }
+        #expect(callbacks == 0)
+
+        let byteLimited = makeEncoder(
+            .init(
+                maximumEstimatedVMBytes: 47,
+                maximumValueNodes: 8,
+                maximumNestingDepth: 8,
+                maximumContainerElements: 8
+            )
+        )
+        #expect(
+            throws: Runtime.BridgeInputError.estimatedVMByteLimitExceeded(
+                maximum: 47
+            )
+        ) {
+            _ = try byteLimited.encodeStructure(
+                type: key,
+                fieldTypes: [.bool, .bool]
+            ) {
+                [try byteLimited.encode(true), try byteLimited.encode(false)]
+            }
+        }
+
+        let depthLimited = makeEncoder(
+            .init(
+                maximumEstimatedVMBytes: 1_024,
+                maximumValueNodes: 8,
+                maximumNestingDepth: 1,
+                maximumContainerElements: 8
+            )
+        )
+        #expect(
+            throws: Runtime.BridgeInputError.nestingDepthLimitExceeded(maximum: 1)
+        ) {
+            _ = try depthLimited.encodeEnumeration(
+                type: key,
+                caseIndex: 0,
+                payloadType: .tuple([.bool])
+            ) {
+                try depthLimited.encodeTuple(count: 1) {
+                    [try depthLimited.encode(true)]
+                }
+            }
+        }
+    }
+
     @Test("Container shape is rejected before element encoding begins")
     func preflightsContainerShape() throws {
         let encoder = makeEncoder(

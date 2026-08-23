@@ -108,6 +108,24 @@ public struct ResolvedNativeType: Hashable, Sendable {
     }
 }
 
+public struct ResolvedFrozenValueType: Hashable, Sendable {
+    public var definition: Bytecode.LocalTypeDefinition
+    public var layoutFingerprint: Core.Digest
+    public var isCopyable: Bool
+
+    public init(
+        definition: Bytecode.LocalTypeDefinition,
+        layoutFingerprint: Core.Digest,
+        isCopyable: Bool = true
+    ) {
+        self.definition = definition
+        self.layoutFingerprint = layoutFingerprint
+        self.isCopyable = isCopyable
+    }
+
+    public var key: Bytecode.LocalTypeKey { definition.key }
+}
+
 public struct ShellInterface: Sendable {
     public var interfaceHash: Core.Digest
     public var compatibility: Core.Compatibility
@@ -115,6 +133,9 @@ public struct ShellInterface: Sendable {
     public var entries: [Core.EntryIndex: Verification.ResolvedEntry]
     public var imports: [Core.NativeImportID: Verification.ResolvedNativeImport]
     public var types: [Core.TypeID: Verification.ResolvedNativeType]
+    public var frozenValueTypes: [
+        Bytecode.LocalTypeKey: Verification.ResolvedFrozenValueType
+    ]
 
     public init(
         interfaceHash: Core.Digest,
@@ -122,7 +143,8 @@ public struct ShellInterface: Sendable {
         capabilities: Set<Core.Capability> = [.baselineV1],
         entries: [Verification.ResolvedEntry] = [],
         imports: [Verification.ResolvedNativeImport] = [],
-        types: [Verification.ResolvedNativeType] = []
+        types: [Verification.ResolvedNativeType] = [],
+        frozenValueTypes: [Verification.ResolvedFrozenValueType] = []
     ) throws {
         self.interfaceHash = interfaceHash
         self.compatibility = compatibility
@@ -130,10 +152,16 @@ public struct ShellInterface: Sendable {
         self.entries = try Self.uniqueDictionary(entries, key: \.index, label: "entry")
         self.imports = try Self.uniqueDictionary(imports, key: \.id, label: "native import")
         self.types = try Self.uniqueDictionary(types, key: \.id, label: "native type")
+        self.frozenValueTypes = try Self.uniqueDictionary(
+            frozenValueTypes,
+            key: \.key,
+            label: "frozen Shell value type"
+        )
         try validateBoundarySignatures()
     }
 
     func validateBoundarySignatures() throws {
+        try validateFrozenValueTypes()
         for index in entries.keys.sorted() {
             guard let entry = entries[index] else { continue }
             guard entry.parameterConventions.count
@@ -155,7 +183,9 @@ public struct ShellInterface: Sendable {
                 try Self.validateBoundaryType(
                     type,
                     owner: "entry \(entry.index)",
-                    capabilities: capabilities
+                    capabilities: capabilities,
+                    frozenValueTypes: frozenValueTypes,
+                    allowingFrozenValue: true
                 )
             }
         }
@@ -216,7 +246,8 @@ public struct ShellInterface: Sendable {
                     try Self.validateBoundaryType(
                         type,
                         owner: "native import \(descriptor.id)",
-                        capabilities: capabilities
+                        capabilities: capabilities,
+                        frozenValueTypes: frozenValueTypes
                     )
                 }
             }
@@ -235,7 +266,8 @@ public struct ShellInterface: Sendable {
                 try Self.validateBoundaryType(
                     descriptor.resultType,
                     owner: "native import \(descriptor.id)",
-                    capabilities: capabilities
+                    capabilities: capabilities,
+                    frozenValueTypes: frozenValueTypes
                 )
             }
         }
@@ -276,17 +308,19 @@ public struct ShellInterface: Sendable {
                     )
                 }
                 try validateBoundaryType(
-                    parameter,
-                    owner: owner,
-                    capabilities: capabilities,
-                    allowingError: true
+                        parameter,
+                        owner: owner,
+                        capabilities: capabilities,
+                        frozenValueTypes: [:],
+                        allowingError: true
                 )
             }
         }
         try validateBoundaryType(
             shape.signature.result,
             owner: owner,
-            capabilities: capabilities
+            capabilities: capabilities,
+            frozenValueTypes: [:]
         )
     }
 
@@ -310,6 +344,7 @@ public struct ShellInterface: Sendable {
                 parameter,
                 owner: owner,
                 capabilities: capabilities,
+                frozenValueTypes: [:],
                 allowingError: true
             )
         }
@@ -317,6 +352,7 @@ public struct ShellInterface: Sendable {
             signature.result,
             owner: owner,
             capabilities: capabilities,
+            frozenValueTypes: [:],
             allowingError: true
         )
     }
@@ -325,7 +361,11 @@ public struct ShellInterface: Sendable {
         _ type: Bytecode.ValueType,
         owner: String,
         capabilities: Set<Core.Capability>,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: Verification.ResolvedFrozenValueType
+        ],
         allowingError: Bool = false,
+        allowingFrozenValue: Bool = false,
         depth: Int = 0
     ) throws {
         guard depth <= 32 else {
@@ -348,20 +388,29 @@ public struct ShellInterface: Sendable {
                     "Error in \(owner) is supported only in a NativeImport callback parameter with \(Core.Capability.structuredErrorsV1)"
                 )
             }
-        case .local, .address, .mutableCell, .nonOwningReference,
+        case let .local(key):
+            guard allowingFrozenValue,
+                  capabilities.contains(.localNominalsV1),
+                  frozenValueTypes[key] != nil
+            else {
+                throw Verification.Error.invalidShellInterface(
+                    "unfrozen local nominal \(key) cannot appear in \(owner) signature"
+                )
+            }
+        case .address, .mutableCell, .nonOwningReference,
              .arrayState,
              .dictionaryState, .closure:
-            // Local nominal identities exist only inside one verified image and
-            // therefore cannot be frozen into a Shell ABI or NativeImport catalog.
             throw Verification.Error.invalidShellInterface(
-                "patch-local nominal, internal storage, and closure values cannot appear in \(owner) signature"
+                "internal storage and closure values cannot appear in \(owner) signature"
             )
         case let .optional(element):
             try validateBoundaryType(
                 element,
                 owner: owner,
                 capabilities: capabilities,
+                frozenValueTypes: frozenValueTypes,
                 allowingError: allowingError,
+                allowingFrozenValue: allowingFrozenValue,
                 depth: depth + 1
             )
         case let .array(element):
@@ -369,7 +418,9 @@ public struct ShellInterface: Sendable {
                 element,
                 owner: owner,
                 capabilities: capabilities,
+                frozenValueTypes: frozenValueTypes,
                 allowingError: allowingError,
+                allowingFrozenValue: allowingFrozenValue,
                 depth: depth + 1
             )
             guard capabilities.contains(.collectionsV1) else {
@@ -382,14 +433,18 @@ public struct ShellInterface: Sendable {
                 key,
                 owner: owner,
                 capabilities: capabilities,
+                frozenValueTypes: frozenValueTypes,
                 allowingError: allowingError,
+                allowingFrozenValue: allowingFrozenValue,
                 depth: depth + 1
             )
             try validateBoundaryType(
                 value,
                 owner: owner,
                 capabilities: capabilities,
+                frozenValueTypes: frozenValueTypes,
                 allowingError: allowingError,
+                allowingFrozenValue: allowingFrozenValue,
                 depth: depth + 1
             )
             guard capabilities.contains(.collectionsV1), key.isVMHashable else {
@@ -402,7 +457,9 @@ public struct ShellInterface: Sendable {
                 element,
                 owner: owner,
                 capabilities: capabilities,
+                frozenValueTypes: frozenValueTypes,
                 allowingError: allowingError,
+                allowingFrozenValue: allowingFrozenValue,
                 depth: depth + 1
             )
             guard capabilities.contains(.collectionsV1), element.isVMHashable else {
@@ -416,12 +473,258 @@ public struct ShellInterface: Sendable {
                     element,
                     owner: owner,
                     capabilities: capabilities,
+                    frozenValueTypes: frozenValueTypes,
                     allowingError: allowingError,
+                    allowingFrozenValue: allowingFrozenValue,
                     depth: depth + 1
                 )
             }
         case .void, .never, .bool, .integer, .float, .string, .native:
             break
+        }
+    }
+
+    private func validateFrozenValueTypes() throws {
+        if !frozenValueTypes.isEmpty,
+           !capabilities.contains(.localNominalsV1) {
+            throw Verification.Error.invalidShellInterface(
+                "frozen Shell values require \(Core.Capability.localNominalsV1)"
+            )
+        }
+        var totalMembers = 0
+        func validateStorage(_ type: Bytecode.ValueType, depth: Int) throws {
+            guard depth <= 32 else {
+                throw Verification.Error.invalidShellInterface(
+                    "frozen Shell value storage exceeds 32 levels"
+                )
+            }
+            switch type {
+            case let .local(key):
+                guard frozenValueTypes[key] != nil else {
+                    throw Verification.Error.invalidShellInterface(
+                        "frozen Shell value references unknown \(key)"
+                    )
+                }
+            case let .integer(width, _):
+                guard [8, 16, 32, 64].contains(width) else {
+                    throw Verification.Error.invalidShellInterface(
+                        "frozen Shell value contains unsupported integer width"
+                    )
+                }
+            case let .float(width):
+                guard width == 32 || width == 64 else {
+                    throw Verification.Error.invalidShellInterface(
+                        "frozen Shell value contains unsupported float width"
+                    )
+                }
+            case let .array(element):
+                guard capabilities.contains(.collectionsV1) else {
+                    throw Verification.Error.invalidShellInterface(
+                        "frozen Shell Array storage requires the collection capability"
+                    )
+                }
+                try validateStorage(element, depth: depth + 1)
+            case let .optional(element):
+                try validateStorage(element, depth: depth + 1)
+            case let .set(element):
+                guard capabilities.contains(.collectionsV1),
+                      element.isVMHashable else {
+                    throw Verification.Error.invalidShellInterface(
+                        "frozen Shell Set requires collection and VM-defined Hashable semantics"
+                    )
+                }
+                try validateStorage(element, depth: depth + 1)
+            case let .dictionary(key, value):
+                guard capabilities.contains(.collectionsV1),
+                      key.isVMHashable else {
+                    throw Verification.Error.invalidShellInterface(
+                        "frozen Shell Dictionary requires collection and VM-defined Hashable semantics"
+                    )
+                }
+                try validateStorage(key, depth: depth + 1)
+                try validateStorage(value, depth: depth + 1)
+            case let .tuple(elements):
+                guard elements.count <= 64 else {
+                    throw Verification.Error.invalidShellInterface(
+                        "frozen Shell tuple contains too many elements"
+                    )
+                }
+                for element in elements {
+                    try validateStorage(element, depth: depth + 1)
+                }
+            case .void, .never, .native, .error, .address, .mutableCell,
+                 .nonOwningReference, .arrayState, .dictionaryState, .closure:
+                throw Verification.Error.invalidShellInterface(
+                    "frozen Shell value contains unsupported storage \(type)"
+                )
+            case .string:
+                guard capabilities.contains(.stringsV1) else {
+                    throw Verification.Error.invalidShellInterface(
+                        "frozen Shell String storage requires the string capability"
+                    )
+                }
+            case .any:
+                guard capabilities.contains(.anyValuesV1) else {
+                    throw Verification.Error.invalidShellInterface(
+                        "frozen Shell Any storage requires the Any capability"
+                    )
+                }
+            case .bool:
+                break
+            }
+        }
+        for key in frozenValueTypes.keys.sorted() {
+            guard let record = frozenValueTypes[key], record.isCopyable,
+                  record.definition.key == key,
+                  !record.definition.conformsToError
+                    || capabilities.contains(.structuredErrorsV1),
+                  key.rawValue.split(separator: ".").allSatisfy({
+                      Core.SwiftName.normalizedIdentifier(String($0)) != nil
+                  })
+            else {
+                throw Verification.Error.invalidShellInterface(
+                    "frozen Shell value \(key) has an unsupported conformance or identity"
+                )
+            }
+            let memberCount: Int
+            switch record.definition.kind {
+            case let .structure(fields):
+                memberCount = fields.count
+                guard Set(fields.map(\.name)).count == fields.count,
+                      fields.allSatisfy({
+                          Core.SwiftName.normalizedIdentifier($0.name) != nil
+                      })
+                else {
+                    throw Verification.Error.invalidShellInterface(
+                        "frozen Shell struct \(key) has duplicate or invalid fields"
+                    )
+                }
+                for field in fields {
+                    try validateStorage(field.type, depth: 0)
+                }
+            case let .enumeration(cases):
+                guard !cases.isEmpty,
+                      Set(cases.map(\.name)).count == cases.count,
+                      cases.allSatisfy({
+                          Core.SwiftName.normalizedIdentifier($0.name) != nil
+                      })
+                else {
+                    throw Verification.Error.invalidShellInterface(
+                        "frozen Shell enum \(key) has empty, duplicate, or invalid cases"
+                    )
+                }
+                var enumMemberCount = 0
+                for item in cases {
+                    if let payload = item.payloadType {
+                        try validateStorage(payload, depth: 0)
+                    }
+                    let caseMemberCount: Int = switch item.payloadType {
+                    case nil: 1
+                    case let .tuple(elements): max(1, elements.count)
+                    default: 1
+                    }
+                    let addition = enumMemberCount.addingReportingOverflow(
+                        caseMemberCount
+                    )
+                    guard !addition.overflow,
+                          addition.partialValue <= 65_536 else {
+                        throw Verification.Error.invalidShellInterface(
+                            "frozen Shell enum \(key) contains too many associated values"
+                        )
+                    }
+                    enumMemberCount = addition.partialValue
+                }
+                memberCount = enumMemberCount
+            case .class:
+                throw Verification.Error.invalidShellInterface(
+                    "frozen Shell value \(key) cannot be a class"
+                )
+            }
+            let addition = totalMembers.addingReportingOverflow(memberCount)
+            guard !addition.overflow, addition.partialValue <= 65_536 else {
+                throw Verification.Error.invalidShellInterface(
+                    "frozen Shell values contain too many members"
+                )
+            }
+            totalMembers = addition.partialValue
+        }
+
+        // Count the expanded value graph, not nominal and wrapper nesting as
+        // independent dimensions. This keeps every accepted frozen shape
+        // constructible under the same bounded bridge contract.
+        var visiting = Set<Bytecode.LocalTypeKey>()
+        var depthByKey: [Bytecode.LocalTypeKey: Int] = [:]
+
+        func checkedDepth(_ value: Int, owner: Bytecode.LocalTypeKey) throws -> Int {
+            guard value <= 32 else {
+                throw Verification.Error.invalidShellInterface(
+                    "frozen Shell value graph exceeds 32 levels at \(owner)"
+                )
+            }
+            return value
+        }
+
+        func depth(
+            of type: Bytecode.ValueType,
+            owner: Bytecode.LocalTypeKey
+        ) throws -> Int {
+            switch type {
+            case let .local(dependency):
+                return try depth(of: dependency)
+            case let .array(element), let .optional(element), let .set(element):
+                return try checkedDepth(
+                    1 + depth(of: element, owner: owner),
+                    owner: owner
+                )
+            case let .dictionary(key, value):
+                return try checkedDepth(
+                    1 + max(
+                        depth(of: key, owner: owner),
+                        depth(of: value, owner: owner)
+                    ),
+                    owner: owner
+                )
+            case let .tuple(elements):
+                let childDepth = try elements.map {
+                    try depth(of: $0, owner: owner)
+                }.max() ?? 0
+                return try checkedDepth(1 + childDepth, owner: owner)
+            default:
+                return 1
+            }
+        }
+
+        func depth(of key: Bytecode.LocalTypeKey) throws -> Int {
+            if let depth = depthByKey[key] { return depth }
+            guard visiting.insert(key).inserted,
+                  let record = frozenValueTypes[key]
+            else {
+                throw Verification.Error.invalidShellInterface(
+                    "frozen Shell value graph is recursive or incomplete at \(key)"
+                )
+            }
+            defer { visiting.remove(key) }
+            let members: [Bytecode.ValueType]
+            switch record.definition.kind {
+            case let .structure(fields):
+                members = fields.map(\.type)
+            case let .enumeration(cases):
+                members = cases.compactMap(\.payloadType)
+            case .class:
+                throw Verification.Error.invalidShellInterface(
+                    "frozen Shell value \(key) cannot be a class"
+                )
+            }
+            let memberDepth = try members.map {
+                try depth(of: $0, owner: key)
+            }.max() ?? 0
+            let result = try checkedDepth(1 + memberDepth, owner: key)
+            depthByKey[key] = result
+            return result
+        }
+
+        for key in frozenValueTypes.keys.sorted() {
+            _ = try depth(of: key)
         }
     }
 

@@ -333,6 +333,7 @@ public struct Archive: Codable, Hashable, Sendable {
     public var functions: [InterfaceArchive.FunctionRecord]
     public var nativeImports: [InterfaceArchive.NativeImportRecord]
     public var nativeTypes: [InterfaceArchive.TypeRecord]
+    public var frozenValueTypes: [InterfaceArchive.FrozenValueTypeRecord]
     public var bridgeRegistrationCount: UInt32
 
     public static func make(
@@ -343,6 +344,7 @@ public struct Archive: Codable, Hashable, Sendable {
         functions: [InterfaceArchive.FunctionRecord],
         nativeImports: [InterfaceArchive.NativeImportRecord] = [],
         nativeTypes: [InterfaceArchive.TypeRecord] = [],
+        frozenValueTypes: [InterfaceArchive.FrozenValueTypeRecord] = [],
         bridgeRegistrationCount: UInt32
     ) throws -> Self {
         let zero = try Core.Digest(bytes: repeatElement(UInt8(0), count: Core.Digest.byteCount))
@@ -356,6 +358,7 @@ public struct Archive: Codable, Hashable, Sendable {
             functions: functions,
             nativeImports: nativeImports,
             nativeTypes: nativeTypes,
+            frozenValueTypes: frozenValueTypes,
             bridgeRegistrationCount: bridgeRegistrationCount
         ).normalized()
         archive.shellInterfaceHash = try archive.computeShellInterfaceHash()
@@ -383,6 +386,7 @@ public struct Archive: Codable, Hashable, Sendable {
             ).sorted()
         }
         value.nativeTypes.sort { $0.id.rawValue < $1.id.rawValue }
+        value.frozenValueTypes.sort { $0.key < $1.key }
         return value
     }
 
@@ -433,6 +437,7 @@ public struct Archive: Codable, Hashable, Sendable {
         guard Set(capabilities).count == capabilities.count else {
             throw InterfaceArchive.Error.invalidArchive("capabilities are not unique")
         }
+        try validateFrozenValueTypes()
         guard shellInterfaceHash.constantTimeEquals(try computeShellInterfaceHash()) else {
             throw InterfaceArchive.Error.interfaceHashMismatch
         }
@@ -730,9 +735,11 @@ public struct Archive: Codable, Hashable, Sendable {
         let mainActorTypeIDs = Set(
             nativeTypes.filter { $0.isEmittedToDevice && $0.requiresMainActor }.map(\.id)
         )
+        let frozenValueTypeKeys = Set(frozenValueTypes.map(\.key))
         func validateDeviceType(
             _ type: Bytecode.ValueType,
             allowingError: Bool = false,
+            allowingFrozenValue: Bool = false,
             depth: Int = 0
         ) throws {
             guard depth <= 32 else {
@@ -768,6 +775,7 @@ public struct Archive: Codable, Hashable, Sendable {
                 try validateDeviceType(
                     element,
                     allowingError: allowingError,
+                    allowingFrozenValue: allowingFrozenValue,
                     depth: depth + 1
                 )
             case let .dictionary(key, value):
@@ -782,11 +790,13 @@ public struct Archive: Codable, Hashable, Sendable {
                 try validateDeviceType(
                     key,
                     allowingError: allowingError,
+                    allowingFrozenValue: allowingFrozenValue,
                     depth: depth + 1
                 )
                 try validateDeviceType(
                     value,
                     allowingError: allowingError,
+                    allowingFrozenValue: allowingFrozenValue,
                     depth: depth + 1
                 )
             case let .set(element):
@@ -798,6 +808,7 @@ public struct Archive: Codable, Hashable, Sendable {
                 try validateDeviceType(
                     element,
                     allowingError: allowingError,
+                    allowingFrozenValue: allowingFrozenValue,
                     depth: depth + 1
                 )
             case let .tuple(elements):
@@ -805,6 +816,7 @@ public struct Archive: Codable, Hashable, Sendable {
                     try validateDeviceType(
                         element,
                         allowingError: allowingError,
+                        allowingFrozenValue: allowingFrozenValue,
                         depth: depth + 1
                     )
                 }
@@ -812,14 +824,24 @@ public struct Archive: Codable, Hashable, Sendable {
                 try validateDeviceType(
                     wrapped,
                     allowingError: allowingError,
+                    allowingFrozenValue: allowingFrozenValue,
                     depth: depth + 1
                 )
             case .float:
                 break
-            case .local, .address, .mutableCell,
-                 .nonOwningReference, .arrayState, .dictionaryState, .closure:
+            case let .local(key):
+                guard allowingFrozenValue,
+                      capabilities.contains(.localNominalsV1),
+                      frozenValueTypeKeys.contains(key)
+                else {
+                    throw InterfaceArchive.Error.invalidArchive(
+                        "device signature references an unfrozen Shell value type"
+                    )
+                }
+            case .address, .mutableCell, .nonOwningReference, .arrayState,
+                 .dictionaryState, .closure:
                 throw InterfaceArchive.Error.invalidArchive(
-                    "patch-local nominal, internal storage, and closure values cannot appear in a Shell signature"
+                    "internal storage and closure values cannot appear in a Shell signature"
                 )
             case .void, .never, .bool, .integer:
                 break
@@ -881,7 +903,7 @@ public struct Archive: Codable, Hashable, Sendable {
         }
         for function in eligible {
             for type in function.parameterTypes + [function.resultType] {
-                try validateDeviceType(type)
+                try validateDeviceType(type, allowingFrozenValue: true)
             }
             guard function.effects.requiresMainActor
                     || !(function.parameterTypes + [function.resultType]).contains(
@@ -985,7 +1007,14 @@ public struct Archive: Codable, Hashable, Sendable {
                     requiresMainActor: type.requiresMainActor,
                     estimatedSize: type.estimatedSize
                 )
-            }.sorted { $0.id.rawValue < $1.id.rawValue }
+            }.sorted { $0.id.rawValue < $1.id.rawValue },
+            frozenValueTypes: frozenValueTypes.map {
+                InterfaceArchive.DeviceFrozenValueType(
+                    definition: $0.definition,
+                    layoutFingerprint: $0.layoutFingerprint,
+                    isCopyable: $0.isCopyable
+                )
+            }.sorted { $0.definition.key < $1.definition.key }
         )
     }
 
@@ -1009,6 +1038,7 @@ private struct DeviceProjection: Codable {
     var entries: [InterfaceArchive.DeviceEntry]
     var imports: [InterfaceArchive.DeviceImport]
     var types: [InterfaceArchive.DeviceType]
+    var frozenValueTypes: [InterfaceArchive.DeviceFrozenValueType]
 }
 
 private struct DeviceEntry: Codable {
@@ -1039,6 +1069,12 @@ private struct DeviceType: Codable {
     var isCopyable: Bool
     var requiresMainActor: Bool
     var estimatedSize: UInt64
+}
+
+private struct DeviceFrozenValueType: Codable {
+    var definition: Bytecode.LocalTypeDefinition
+    var layoutFingerprint: Core.Digest
+    var isCopyable: Bool
 }
 
 public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {

@@ -120,6 +120,30 @@ struct NativeImportDiscoveryTests {
         #expect(FrontendReceipt.SourceParameterSpelling.types(
             in: "(_ value: String = \"\\(untrusted)\")"
         ) == nil)
+
+        let nestedParameters = """
+        (_ value: Mode = .idle, transform: @escaping (Mode) -> Mode)
+        """
+        let nestedDeclaration = "func map" + nestedParameters
+            + " -> (Mode) -> Mode where Mode == Mode"
+        let nestedParameterRange = Range(
+            uncheckedBounds: (
+                lower: "func map".utf8.count,
+                upper: "func map".utf8.count + nestedParameters.utf8.count
+            )
+        )
+        #expect(FrontendReceipt.SourceFunctionSpelling.replacingNominalAliases(
+            in: nestedDeclaration,
+            parameterUTF8Range: nestedParameterRange,
+            aliases: ["Mode": "Values.Mode"]
+        ) == "func map(_ value: Values.Mode = .idle, "
+            + "transform: @escaping (Values.Mode) -> Values.Mode) "
+            + "-> (Values.Mode) -> Values.Mode where Mode == Mode")
+        #expect(FrontendReceipt.SourceFunctionSpelling.replacingNominalAliases(
+            in: nestedDeclaration,
+            parameterUTF8Range: 0..<1,
+            aliases: ["Mode": "Values.Mode"]
+        ) == nil)
     }
 
     @Test("Function spelling derives exact native callback lifetimes")

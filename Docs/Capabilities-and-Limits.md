@@ -384,6 +384,20 @@ does not by itself certify a physical device or distribution channel.
   associated values, are parsed at top level; duplicate or malformed case
   summaries fail closed. Nested declarations keep their namespace-qualified identity. These
   are generation-local VM values, not newly loaded Swift metadata.
+- Existing current-module Shell structs and enums may cross an eligible Entry
+  through a frozen logical-value codec. The supported profile is copyable,
+  nongeneric, nonrecursive, and source-reconstructible; it covers ordinary,
+  `borrowing`, and `consuming` nonmutating instance methods (including methods
+  declared in extensions), global parameters/results, normal and throwing
+  paths, nested declarations, private stored fields, `Error`-conforming enums,
+  and recursively represented scalar, text, `Any`, Optional, Array,
+  Dictionary, Set, tuple, and other eligible frozen local values. Struct fields
+  and enum cases, labels, order, exact source type spelling, copyability, and
+  the supported conformance facts are frozen into the interface and device
+  hash. Generated same-source construction hooks and streaming Bridge codecs
+  reconstruct the logical value without reading Swift ABI layout, reflection,
+  or runtime metadata. Patch compilation replays the exact source shape and
+  the Verifier independently requires the archived definition.
 - Newly introduced ordinary functions, private methods, and computed accessors
   are transitively linked as same-image functions, getters, or setters without
   requiring a pre-existing Shell EntryIndex. A patch-local `final class` has
@@ -752,9 +766,22 @@ contract passes the checks above; the examples do not form an API allowlist.
   The separately proven Objective-C `!foreign` erasure is a frozen native
   `AnyObject` value,
   not an exception that exports this image-local representation.
-- Generic or `inout` Shell entries, noncopyable roots, arbitrary borrowing and
-  consuming ABI, typed-throws roots, general `rethrows` outside the concrete
-  standard-library operations listed above, and general unwind cleanup.
+- Generic Shell entries; noncopyable, recursive, imported/native-backed, or
+  runtime-metadata-dependent value roots; typed-throws roots; general
+  `rethrows` outside the concrete standard-library operations listed above;
+  and general unwind cleanup. Existing Shell value mutation is also not yet
+  qualified: `mutating` receivers, `inout` roots, writable accessors and
+  subscripts, observers, enum state transitions, nested projection writeback,
+  and mutable existential opening remain fail-closed. Frozen stored properties
+  may not contain closures, protocol existentials, `AnyObject`, native values,
+  a private nested nominal that generated file-scope code cannot name,
+  or another unsupported value. A `let`
+  property with a declaration initializer is rejected because a safe
+  same-source reconstruction initializer cannot assign it; a `var` declaration
+  initializer is allowed and the frozen payload remains authoritative.
+  Availability-attributed value declarations and enum cases are rejected
+  because an unconditional codec cannot legally name them across the Shell's
+  full deployment range.
 - Closure scopes with additional native runtime semantics remain unsupported:
   `autoreleasepool` requires a real autorelease-pool boundary, while
   `withUnsafe...` and contiguous-storage callbacks expose pointer lifetimes.
@@ -779,7 +806,8 @@ machine code.
 | --- | --- |
 | Change an indexed global function body | Supported when its canonical SIL is in the documented subset |
 | Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM |
-| Change an existing Shell struct/enum/actor instance root or existing native static/class method | Rejected until Shell value writeback, executor, and native metatype ABI are implemented; this does not restrict image-local value-type accessors/helpers |
+| Change a nonmutating instance method on an eligible existing Shell struct or enum | Supported through the exact frozen logical-value codec for ordinary, `borrowing`, and `consuming` receivers, including extension methods and normal/throwing paths |
+| Mutate an existing Shell struct/enum/actor root, or change an existing native static/class method | Rejected until exact value writeback, executor, and native metatype ABI are implemented; this does not restrict image-local value-type accessors/helpers |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
 | First use a public SDK member in a managed Debug body | Supported for a uniquely measured synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. Closure-bearing methods are supported when every callback fits the exact synchronous, nonthrowing bridge-and-failure-value profile above; unfamiliar error bridges, async/generic callbacks or declarations, subscripts, and unrepresentable signatures require a full build |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |

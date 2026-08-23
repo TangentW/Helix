@@ -80,6 +80,7 @@ public struct IndexRequest: Sendable {
     public var declarations: [ReleaseCompiler.DeclarationCandidate]
     public var nativeImportCandidates: [InterfaceArchive.NativeImportRecord]
     public var nativeTypes: [InterfaceArchive.TypeRecord]
+    public var frozenValueTypes: [InterfaceArchive.FrozenValueTypeRecord]
     public var capabilities: Set<Core.Capability>
 
     public init(
@@ -90,6 +91,7 @@ public struct IndexRequest: Sendable {
         declarations: [ReleaseCompiler.DeclarationCandidate],
         nativeImportCandidates: [InterfaceArchive.NativeImportRecord] = [],
         nativeTypes: [InterfaceArchive.TypeRecord] = [],
+        frozenValueTypes: [InterfaceArchive.FrozenValueTypeRecord] = [],
         capabilities: Set<Core.Capability> = [.baselineV1]
     ) {
         self.metadata = metadata
@@ -99,6 +101,7 @@ public struct IndexRequest: Sendable {
         self.declarations = declarations
         self.nativeImportCandidates = nativeImportCandidates
         self.nativeTypes = nativeTypes
+        self.frozenValueTypes = frozenValueTypes
         self.capabilities = capabilities
     }
 }
@@ -128,6 +131,16 @@ public struct Indexer: Sendable {
         var diagnostics: [Core.Diagnostic] = []
         let mainActorNativeTypeIDs = Set(
             request.nativeTypes.filter(\.requiresMainActor).map(\.id)
+        )
+        guard Set(request.frozenValueTypes.map(\.key)).count
+                == request.frozenValueTypes.count
+        else {
+            throw ReleaseCompiler.IndexError.invalidInput(
+                "duplicate frozen Shell value type"
+            )
+        }
+        let frozenValueTypesByKey = Dictionary(
+            uniqueKeysWithValues: request.frozenValueTypes.map { ($0.key, $0) }
         )
         for declaration in request.declarations {
             guard declaration.isAsync == declaration.effects.isAsync,
@@ -167,7 +180,8 @@ public struct Indexer: Sendable {
             let patchability = eligibility(
                 of: declaration,
                 configuration: request.configuration,
-                mainActorNativeTypeIDs: mainActorNativeTypeIDs
+                mainActorNativeTypeIDs: mainActorNativeTypeIDs,
+                frozenValueTypes: frozenValueTypesByKey
             )
             if !patchability.isEligible {
                 diagnostics.append(
@@ -291,6 +305,38 @@ public struct Indexer: Sendable {
         metadata.sourceBaselineHash = baselineHasher.finalize()
 
         let eligibleCount = records.filter(\.patchability.isEligible).count
+        var requiredFrozenValueTypeKeys = Set<Bytecode.LocalTypeKey>()
+        func collectFrozenValueTypes(_ type: Bytecode.ValueType) {
+            switch type {
+            case let .local(key):
+                guard requiredFrozenValueTypeKeys.insert(key).inserted,
+                      let record = frozenValueTypesByKey[key]
+                else { return }
+                switch record.kind {
+                case let .structure(fields):
+                    fields.forEach { collectFrozenValueTypes($0.type) }
+                case let .enumeration(cases):
+                    cases.compactMap(\.payloadType).forEach(collectFrozenValueTypes)
+                }
+            case let .array(element), let .optional(element), let .set(element):
+                collectFrozenValueTypes(element)
+            case let .dictionary(key, value):
+                collectFrozenValueTypes(key)
+                collectFrozenValueTypes(value)
+            case let .tuple(elements):
+                elements.forEach(collectFrozenValueTypes)
+            default:
+                break
+            }
+        }
+        for record in records where record.patchability.isEligible {
+            (record.parameterTypes + [record.resultType]).forEach(
+                collectFrozenValueTypes
+            )
+        }
+        let frozenValueTypes = requiredFrozenValueTypeKeys.compactMap {
+            frozenValueTypesByKey[$0]
+        }.sorted { $0.key < $1.key }
         let archive = try InterfaceArchive.Archive.make(
             metadata: metadata,
             compatibility: request.compatibility,
@@ -299,6 +345,7 @@ public struct Indexer: Sendable {
             functions: records,
             nativeImports: imports,
             nativeTypes: request.nativeTypes,
+            frozenValueTypes: frozenValueTypes,
             bridgeRegistrationCount: UInt32(eligibleCount)
         )
         return .init(
@@ -313,7 +360,10 @@ public struct Indexer: Sendable {
     private func eligibility(
         of candidate: ReleaseCompiler.DeclarationCandidate,
         configuration: PatchConfiguration.Document,
-        mainActorNativeTypeIDs: Set<Core.TypeID>
+        mainActorNativeTypeIDs: Set<Core.TypeID>,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
     ) -> InterfaceArchive.Patchability {
         if CanonicalSIL.ProtocolExistential.Identity.containsProtocolExistential(
             in: candidate.interface.loweredSILType
@@ -357,7 +407,10 @@ public struct Indexer: Sendable {
             }
         }
         if candidate.hasInOut {
-            return .rejected("HLXIDX006", explanation: "inout/borrowing/consuming roots are not supported in HLBC v1")
+            return .rejected(
+                "HLXIDX006",
+                explanation: "inout or mutating roots require frozen writeback support"
+            )
         }
         if candidate.isGeneric || candidate.interface.genericSignature != nil {
             return .rejected("HLXIDX007", explanation: "generic roots are not supported in HLBC v1")
@@ -382,8 +435,19 @@ public struct Indexer: Sendable {
                 explanation: "closure-valued declarations are patch-local helpers and cannot be Shell roots"
             )
         }
-        if !candidate.parameterTypes.allSatisfy({ isSupportedType($0, allowVoid: false) })
-            || !isSupportedType(candidate.resultType, allowVoid: true) {
+        if !candidate.parameterTypes.allSatisfy({
+            isSupportedType(
+                $0,
+                allowVoid: false,
+                frozenValueTypes: frozenValueTypes,
+                moduleName: candidate.moduleName
+            )
+        }) || !isSupportedType(
+            candidate.resultType,
+            allowVoid: true,
+            frozenValueTypes: frozenValueTypes,
+            moduleName: candidate.moduleName
+        ) {
             return .rejected("HLXIDX011", explanation: "lowered signature contains an unsupported value type")
         }
         if !candidate.effects.requiresMainActor,
@@ -447,26 +511,97 @@ public struct Indexer: Sendable {
         }
     }
 
-    private func isSupportedType(_ type: Bytecode.ValueType, allowVoid: Bool) -> Bool {
+    private func isSupportedType(
+        _ type: Bytecode.ValueType,
+        allowVoid: Bool,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ],
+        moduleName: String,
+        visiting: Set<Bytecode.LocalTypeKey> = [],
+        allowsNative: Bool = true
+    ) -> Bool {
         switch type {
-        case .void: allowVoid
-        case .never: false
+        case .void: return allowVoid
+        case .never: return false
         case .address, .mutableCell, .nonOwningReference, .arrayState,
              .dictionaryState,
-             .closure: false
-        case .bool, .integer, .float, .string, .any, .native: true
-        case .local, .error: false
+             .closure: return false
+        case .bool, .integer, .float, .string, .any: return true
+        case .native: return allowsNative
+        case let .local(key):
+            guard !visiting.contains(key),
+                  let record = frozenValueTypes[key],
+                  record.isCopyable,
+                  record.canonicalName == "\(moduleName).\(key.rawValue)",
+                  record.hasSafeSourceCodecShape,
+                  record.layoutFingerprint == (try? record.expectedLayoutFingerprint())
+            else { return false }
+            var nestedVisiting = visiting
+            nestedVisiting.insert(key)
+            let members: [Bytecode.ValueType] = switch record.kind {
+            case let .structure(fields): fields.map(\.type)
+            case let .enumeration(cases): cases.compactMap(\.payloadType)
+            }
+            return members.allSatisfy {
+                isSupportedType(
+                    $0,
+                    allowVoid: false,
+                    frozenValueTypes: frozenValueTypes,
+                    moduleName: moduleName,
+                    visiting: nestedVisiting,
+                    allowsNative: false
+                )
+            }
+        case .error: return false
         case let .tuple(elements):
-            elements.count <= 64 && elements.allSatisfy { isSupportedType($0, allowVoid: false) }
+            return elements.count <= 64 && elements.allSatisfy {
+                isSupportedType(
+                    $0,
+                    allowVoid: false,
+                    frozenValueTypes: frozenValueTypes,
+                    moduleName: moduleName,
+                    visiting: visiting,
+                    allowsNative: allowsNative
+                )
+            }
         case let .optional(wrapped):
-            isSupportedType(wrapped, allowVoid: false)
+            return isSupportedType(
+                wrapped,
+                allowVoid: false,
+                frozenValueTypes: frozenValueTypes,
+                moduleName: moduleName,
+                visiting: visiting,
+                allowsNative: allowsNative
+            )
         case let .array(element):
-            isSupportedType(element, allowVoid: false)
+            return isSupportedType(
+                element,
+                allowVoid: false,
+                frozenValueTypes: frozenValueTypes,
+                moduleName: moduleName,
+                visiting: visiting,
+                allowsNative: allowsNative
+            )
         case let .dictionary(key, value):
-            key.isVMHashable
-                && isSupportedType(value, allowVoid: false)
+            return key.isVMHashable
+                && isSupportedType(
+                    value,
+                    allowVoid: false,
+                    frozenValueTypes: frozenValueTypes,
+                    moduleName: moduleName,
+                    visiting: visiting,
+                    allowsNative: allowsNative
+                )
         case let .set(element):
-            element.isVMHashable && isSupportedType(element, allowVoid: false)
+            return element.isVMHashable && isSupportedType(
+                element,
+                allowVoid: false,
+                frozenValueTypes: frozenValueTypes,
+                moduleName: moduleName,
+                visiting: visiting,
+                allowsNative: allowsNative
+            )
         }
     }
 

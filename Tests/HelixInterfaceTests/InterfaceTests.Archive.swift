@@ -143,6 +143,201 @@ struct Archive {
         #expect(try original.computeShellInterfaceHash() != changed.computeShellInterfaceHash())
     }
 
+    @Test("Frozen Shell value layouts are canonical, hashed, bounded, and fail closed")
+    func frozenValueLayoutContract() throws {
+        let counterKey = Bytecode.LocalTypeKey(rawValue: "Counter")
+        let modeKey = Bytecode.LocalTypeKey(rawValue: "Mode")
+        let mode = try InterfaceArchive.FrozenValueTypeRecord(
+            key: modeKey,
+            canonicalName: "Fixture.Mode",
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            kind: .enumeration(cases: [
+                .init(name: "idle"),
+                .init(name: "count", associatedValues: [
+                    .init(swiftType: "Swift.Int", type: .int64),
+                ]),
+                .init(name: "named", associatedValues: [
+                    .init(label: "label", swiftType: "Swift.String", type: .string),
+                ]),
+            ])
+        )
+        let counter = try InterfaceArchive.FrozenValueTypeRecord(
+            key: counterKey,
+            canonicalName: "Fixture.Counter",
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            kind: .structure(fields: [
+                .init(name: "value", swiftType: "Swift.Int", type: .int64),
+                .init(name: "mode", swiftType: "Mode", type: .local(modeKey)),
+                .init(
+                    name: "tags",
+                    swiftType: "Swift.Array<Swift.String>",
+                    type: .array(.string)
+                ),
+            ])
+        )
+
+        func archive(
+            records: [InterfaceArchive.FrozenValueTypeRecord]
+        ) throws -> InterfaceArchive.Archive {
+            var value = try fixture()
+            value.capabilities.append(contentsOf: [
+                .collectionsV1, .localNominalsV1, .stringsV1,
+            ])
+            value.frozenValueTypes = records.sorted { $0.key < $1.key }
+            value.functions[0].canonicalDeclaration =
+                "func inspect(_: Counter) -> Int"
+            value.functions[0].loweredSignature = .init(
+                parameters: ["Fixture.Counter"],
+                result: "Swift.Int"
+            )
+            value.functions[0].parameterTypes = [.local(counterKey)]
+            value.functions[0].parameterConventions = [.owned]
+            value.functions[0].key = try Core.FunctionKey.derive(
+                namespace: value.metadata.shellNamespaceID,
+                module: "Fixture",
+                sourceFileLogicalID: "Sources/Fixture.swift",
+                canonicalDeclaration: value.functions[0].canonicalDeclaration,
+                loweredSignature: value.functions[0].loweredSignature,
+                role: .function
+            )
+            value.shellInterfaceHash = try value.computeShellInterfaceHash()
+            return value
+        }
+
+        let original = try archive(records: [counter, mode])
+        try original.validate()
+        let decoded = try InterfaceArchive.Codec.decode(
+            InterfaceArchive.Codec.encode(original)
+        ).archive
+        #expect(decoded.frozenValueTypes == [counter, mode].sorted { $0.key < $1.key })
+        #expect(decoded.schemaVersion == 1)
+        #expect(decoded.compatibility.interfaceArchive == .init(1, 0, 0))
+
+        let equalWidthSpelling = try InterfaceArchive.FrozenValueTypeRecord(
+            key: counterKey,
+            canonicalName: "Fixture.Counter",
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            kind: .structure(fields: [
+                .init(name: "value", swiftType: "Swift.Int64", type: .int64),
+                .init(name: "mode", swiftType: "Mode", type: .local(modeKey)),
+                .init(
+                    name: "tags",
+                    swiftType: "Swift.Array<Swift.String>",
+                    type: .array(.string)
+                ),
+            ])
+        )
+        let changed = try archive(records: [equalWidthSpelling, mode])
+        #expect(original.shellInterfaceHash != changed.shellInterfaceHash)
+
+        var missingCollections = original
+        missingCollections.capabilities.removeAll { $0 == .collectionsV1 }
+        missingCollections.shellInterfaceHash = try missingCollections
+            .computeShellInterfaceHash()
+        #expect(throws: InterfaceArchive.Error.self) {
+            try missingCollections.validate()
+        }
+
+        let recursive = try InterfaceArchive.FrozenValueTypeRecord(
+            key: counterKey,
+            canonicalName: "Fixture.Counter",
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            kind: .structure(fields: [
+                .init(name: "next", swiftType: "Counter", type: .local(counterKey)),
+            ])
+        )
+        #expect(throws: InterfaceArchive.Error.self) {
+            try archive(records: [recursive]).validate()
+        }
+
+        var deeplyNested: [InterfaceArchive.FrozenValueTypeRecord] = []
+        for offset in (0..<17).reversed() {
+            let key = offset == 0
+                ? counterKey
+                : Bytecode.LocalTypeKey(rawValue: "Depth\(offset)")
+            let field: InterfaceArchive.FrozenStoredProperty
+            if offset == 16 {
+                field = .init(
+                    name: "value",
+                    swiftType: "Swift.Int",
+                    type: .int64
+                )
+            } else {
+                let next = Bytecode.LocalTypeKey(rawValue: "Depth\(offset + 1)")
+                field = .init(
+                    name: "next",
+                    swiftType: "Depth\(offset + 1)?",
+                    type: .optional(.local(next))
+                )
+            }
+            deeplyNested.append(try .init(
+                key: key,
+                canonicalName: "Fixture.\(key.rawValue)",
+                sourceFileLogicalID: "Sources/Fixture.swift",
+                kind: .structure(fields: [field])
+            ))
+        }
+        #expect(throws: InterfaceArchive.Error.self) {
+            try archive(records: deeplyNested).validate()
+        }
+
+        let errorMode = try InterfaceArchive.FrozenValueTypeRecord(
+            key: modeKey,
+            canonicalName: "Fixture.Mode",
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            kind: mode.kind,
+            conformsToError: true
+        )
+        #expect(throws: InterfaceArchive.Error.self) {
+            try archive(records: [counter, errorMode]).validate()
+        }
+        var structuredError = try archive(records: [counter, errorMode])
+        structuredError.capabilities.append(.structuredErrorsV1)
+        structuredError.shellInterfaceHash = try structuredError
+            .computeShellInterfaceHash()
+        try structuredError.validate()
+
+        let native = try InterfaceArchive.FrozenValueTypeRecord(
+            key: counterKey,
+            canonicalName: "Fixture.Counter",
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            kind: .structure(fields: [
+                .init(
+                    name: "object",
+                    swiftType: "Fixture.Object",
+                    type: .native(.init(rawValue: .sha256("Fixture.Object")))
+                ),
+            ])
+        )
+        #expect(throws: InterfaceArchive.Error.self) {
+            try archive(records: [native]).validate()
+        }
+
+        let unsafe = try InterfaceArchive.FrozenValueTypeRecord(
+            key: counterKey,
+            canonicalName: "Fixture.Counter",
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            kind: .structure(fields: [
+                .init(name: "value; fatalError()", swiftType: "Swift.Int", type: .int64),
+            ])
+        )
+        #expect(!unsafe.hasSafeSourceCodecShape)
+        #expect(throws: InterfaceArchive.Error.self) {
+            try archive(records: [unsafe]).validate()
+        }
+
+        let noncopyable = try InterfaceArchive.FrozenValueTypeRecord(
+            key: counterKey,
+            canonicalName: "Fixture.Counter",
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            kind: .structure(fields: []),
+            isCopyable: false
+        )
+        #expect(throws: InterfaceArchive.Error.self) {
+            try archive(records: [noncopyable]).validate()
+        }
+    }
+
     @Test("Native callback contracts survive archive validation and hashing")
     func nativeCallbackContractRoundTrip() throws {
         var archive = try fixture()

@@ -30,11 +30,13 @@ public struct TypeEnvironment: Sendable {
     private struct RawField: Sendable {
         var name: String
         var type: String
+        var hasImmutableDeclarationInitializer: Bool
     }
 
     private struct RawEnumCase: Sendable {
         var name: String
         var associatedTypes: [String]
+        var hasAvailabilityConstraint: Bool
     }
 
     private struct RawHostedMethod: Equatable, Sendable {
@@ -59,6 +61,8 @@ public struct TypeEnvironment: Sendable {
         var parentScope: String?
         var kind: RawKind
         var conformsToError: Bool
+        var isCopyable: Bool
+        var hasUnparsedInstanceStorage: Bool
     }
 
     private struct RawGenericDefinition: Sendable {
@@ -190,8 +194,10 @@ public struct TypeEnvironment: Sendable {
             )
             let key = Bytecode.LocalTypeKey(rawValue: name)
             var fields: [RawField] = []
+            var hasUnparsedInstanceStorage = false
             var cases: [RawEnumCase] = []
             var caseNames = Set<String>()
+            var pendingEnumCaseAvailability = false
             var hostedMethods: [RawHostedMethod] = []
             index += 1
 
@@ -228,12 +234,17 @@ public struct TypeEnvironment: Sendable {
                     }
                     let conformsToError = conformances.contains("Error")
                         || conformances.contains("Swift.Error")
+                    let isCopyable = !conformances.contains("~Copyable")
+                        && !conformances.contains("Swift.~Copyable")
                     if genericParameters.isEmpty {
                         let definition = RawDefinition(
                             key: key,
                             parentScope: TypeEnvironment.parentScope(of: name),
                             kind: kind,
-                            conformsToError: conformsToError
+                            conformsToError: conformsToError,
+                            isCopyable: isCopyable,
+                            hasUnparsedInstanceStorage:
+                                hasUnparsedInstanceStorage
                         )
                         guard definitions.updateValue(
                             definition,
@@ -278,6 +289,7 @@ public struct TypeEnvironment: Sendable {
                     return
                 }
                 if let nested = try TypeEnvironment.nominalHeader(in: member) {
+                    pendingEnumCaseAvailability = false
                     if genericParameters.isEmpty {
                         try parseNominal(nested, parentScope: name)
                     } else {
@@ -293,7 +305,23 @@ public struct TypeEnvironment: Sendable {
                     member,
                     pattern: TypeEnvironment.storedFieldPattern
                    ) {
-                    fields.append(.init(name: field[0], type: field[1]))
+                    fields.append(.init(
+                        name: field[0],
+                        type: field[1],
+                        hasImmutableDeclarationInitializer:
+                            member.contains("@_hasInitialValue")
+                                && member.range(
+                                    of: #"(?:^|\s)let(?:\s|$)"#,
+                                    options: .regularExpression
+                                ) != nil
+                    ))
+                } else if (header.kind == "struct" || header.kind == "class"),
+                          member.contains("@_hasStorage"),
+                          member.range(
+                              of: #"(?:^|\s)(?:static|class)\s+(?:var|let)(?:\s|$)"#,
+                              options: .regularExpression
+                          ) == nil {
+                    hasUnparsedInstanceStorage = true
                 } else if header.kind == "class",
                           let method = TypeEnvironment.hostedMethodDeclaration(
                             in: member
@@ -302,7 +330,9 @@ public struct TypeEnvironment: Sendable {
                 } else if header.kind == "enum",
                           let declarations = try TypeEnvironment
                             .enumCaseDeclarations(in: member) {
-                    for declaration in declarations {
+                    for var declaration in declarations {
+                        declaration.hasAvailabilityConstraint =
+                            pendingEnumCaseAvailability
                         guard caseNames.insert(declaration.name).inserted else {
                             throw CanonicalSIL.LoweringError.malformedSIL(
                                 "duplicate enum case \(name).\(declaration.name)"
@@ -310,6 +340,9 @@ public struct TypeEnvironment: Sendable {
                         }
                         cases.append(declaration)
                     }
+                }
+                if header.kind == "enum" {
+                    pendingEnumCaseAvailability = member.hasPrefix("@available(")
                 }
                 if TypeEnvironment.braceDelta(in: member) > 0 {
                     try skipBracedDeclaration()
@@ -1871,6 +1904,141 @@ public struct TypeEnvironment: Sendable {
         throw CanonicalSIL.LoweringError.unsupportedType(key.rawValue)
     }
 
+    /// Captures the exact source-level spellings needed by generated Shell
+    /// codecs alongside the portable logical aggregate definition. Generic,
+    /// class, and compiler-synthesized value identities remain image-local.
+    public func frozenValueTypeRecord(
+        key: Bytecode.LocalTypeKey,
+        canonicalName: String,
+        sourceFileLogicalID: String
+    ) throws -> InterfaceArchive.FrozenValueTypeRecord {
+        guard let raw = rawDefinitions[key] else {
+            throw CanonicalSIL.LoweringError.unsupportedType(key.rawValue)
+        }
+        guard !raw.hasUnparsedInstanceStorage else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "frozen Shell value \(key) contains unmodeled instance storage"
+            )
+        }
+        let definition = try definition(for: key)
+        let kind: InterfaceArchive.FrozenValueTypeKind
+        switch (raw.kind, definition.kind) {
+        case let (.structure(rawFields), .structure(fields)):
+            guard rawFields.count == fields.count else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "frozen struct \(key) changed field arity while materializing"
+                )
+            }
+            guard !rawFields.contains(where: \.hasImmutableDeclarationInitializer)
+            else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "frozen struct \(key) has a let property with a declaration initializer"
+                )
+            }
+            guard !rawFields.contains(where: {
+                Self.hasUnsupportedFrozenExistential(in: $0.type)
+            }) else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "frozen struct \(key) stores a protocol existential"
+                )
+            }
+            kind = .structure(
+                fields: zip(rawFields, fields).map { rawField, field in
+                    .init(
+                        name: field.name,
+                        swiftType: rawField.type,
+                        type: field.type
+                    )
+                }
+            )
+        case let (.enumeration(rawCases), .enumeration(cases)):
+            guard rawCases.count == cases.count else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "frozen enum \(key) changed case arity while materializing"
+                )
+            }
+            guard !rawCases.contains(where: \.hasAvailabilityConstraint) else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "frozen enum \(key) has an availability-constrained case"
+                )
+            }
+            kind = .enumeration(
+                cases: try zip(rawCases, cases).map { rawCase, item in
+                    guard !rawCase.associatedTypes.contains(where: {
+                        Self.hasUnsupportedFrozenExistential(in: $0)
+                    }) else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "frozen enum \(key).\(item.name) stores a protocol existential"
+                        )
+                    }
+                    let associatedValues = try rawCase.associatedTypes.map { spelling in
+                        let labeled = splitTopLevelKeyValue(spelling)
+                        let swiftType = labeled?.value ?? spelling
+                        let type = ValueRepresentation.storable(
+                            try resolve(
+                                swiftType,
+                                relativeTo: raw.parentScope
+                            )
+                        )
+                        return InterfaceArchive.FrozenEnumAssociatedValue(
+                            label: labeled?.key == "_" ? nil : labeled?.key,
+                            swiftType: swiftType,
+                            type: type
+                        )
+                    }
+                    let result = InterfaceArchive.FrozenEnumCase(
+                        name: item.name,
+                        associatedValues: associatedValues
+                    )
+                    guard result.payloadType == item.payloadType else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "frozen enum \(key).\(item.name) payload changed while materializing"
+                        )
+                    }
+                    return result
+                }
+            )
+        default:
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "frozen Shell value \(key) is not a concrete struct or enum"
+            )
+        }
+        let record = try InterfaceArchive.FrozenValueTypeRecord(
+            key: key,
+            canonicalName: canonicalName,
+            sourceFileLogicalID: sourceFileLogicalID,
+            kind: kind,
+            conformsToError: raw.conformsToError,
+            isCopyable: raw.isCopyable
+        )
+        guard record.definition == definition else {
+            throw CanonicalSIL.LoweringError.malformedSIL(
+                "frozen value codec shape disagrees with \(key)"
+            )
+        }
+        return record
+    }
+
+    /// Replays the current frontend summary against every value layout frozen
+    /// in the target Shell. Swift spellings are included so equal-width source
+    /// changes such as `Int` to `Int64` cannot evade the interface gate.
+    public func validateFrozenValueTypes(
+        _ records: [InterfaceArchive.FrozenValueTypeRecord]
+    ) throws {
+        for frozen in records {
+            let current = try frozenValueTypeRecord(
+                key: frozen.key,
+                canonicalName: frozen.canonicalName,
+                sourceFileLogicalID: frozen.sourceFileLogicalID
+            )
+            guard current == frozen else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "frozen Shell value layout changed for \(frozen.key)"
+                )
+            }
+        }
+    }
+
     private func materializeDefinition(
         key: Bytecode.LocalTypeKey,
         parentScope: String?,
@@ -2855,6 +3023,17 @@ public struct TypeEnvironment: Sendable {
     private static let hostedMethodPattern =
         #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate|override|final|dynamic|class|nonisolated)\s+)*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)(?:\s+(?:async|throws|rethrows))*\s*$"#
 
+    private static func hasUnsupportedFrozenExistential(
+        in spelling: String
+    ) -> Bool {
+        CanonicalSIL.ProtocolExistential.Identity.containsProtocolExistential(
+            in: spelling
+        ) || spelling.range(
+            of: #"(?<![A-Za-z0-9_])(?:Swift\.)?AnyObject(?![A-Za-z0-9_])"#,
+            options: .regularExpression
+        ) != nil
+    }
+
     private static func hostedMethodDeclaration(
         in line: String
     ) -> RawHostedMethod? {
@@ -2964,7 +3143,8 @@ public struct TypeEnvironment: Sendable {
             }
             return .init(
                 name: captures[0],
-                associatedTypes: associatedTypes
+                associatedTypes: associatedTypes,
+                hasAvailabilityConstraint: false
             )
         }
     }

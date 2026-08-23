@@ -67,6 +67,10 @@ public struct Adapter: Sendable {
         let sourceNominalsByName = Dictionary(uniqueKeysWithValues: sourceNominals.map {
             ($0.canonicalName, $0)
         })
+        let sourceNominalAliasIndex = SourceNominalAliasIndex(
+            sourceNominals: sourceNominals,
+            moduleName: moduleName
+        )
         let discoveredImportedTypes = try discoverImportedNativeTypes(
             documents: documents,
             sourcesByPhysicalPath: sourceByPhysicalPath,
@@ -142,6 +146,7 @@ public struct Adapter: Sendable {
                 $0.requiresMainActor && resolvedNativeTypeIDs.contains($0.id) ? $0.id : nil
             })
         )
+        let localValueTypes = makeLocalValueTypeLookup(sourceNominals)
         let importedSwiftTypeAliases = try makeImportedSwiftTypeAliases(
             importedTypes
         )
@@ -180,8 +185,10 @@ public struct Adapter: Sendable {
                 silFile: silFile,
                 typeEnvironment: declarationTypeEnvironment,
                 nativeTypes: nativeTypeIDs,
+                localValueTypes: localValueTypes,
                 importedSwiftTypeAliases: importedSwiftTypeAliases,
                 sourceNominals: sourceNominalsByName,
+                sourceNominalAliasIndex: sourceNominalAliasIndex,
                 drafts: &drafts
             )
         }
@@ -229,6 +236,11 @@ public struct Adapter: Sendable {
             configuration: effectiveConfiguration,
             moduleName: moduleName
         )
+        let frozenValueTypes = try makeFrozenValueTypes(
+            referencedBy: drafts.map(\.candidate),
+            sourceNominals: sourceNominals,
+            typeEnvironment: declarationTypeEnvironment
+        )
         var explicitNativeImports = try NativeImportCatalog.Builtins.merging(
             makeNativeImportCandidates(
                 request.nativeImportCatalog,
@@ -258,7 +270,8 @@ public struct Adapter: Sendable {
                 sources: sourceRecords,
                 declarations: drafts.map(\.candidate),
                 nativeImportCandidates: explicitNativeImports,
-                nativeTypes: nativeTypeRecords
+                nativeTypes: nativeTypeRecords,
+                frozenValueTypes: frozenValueTypes
             )
         )
         let entrySymbols = Set(preliminary.archive.functions.compactMap { function in
@@ -310,7 +323,8 @@ public struct Adapter: Sendable {
                 sources: sourceRecords,
                 declarations: drafts.map(\.candidate),
                 nativeImportCandidates: nativeImportCandidates,
-                nativeTypes: nativeTypeRecords
+                nativeTypes: nativeTypeRecords,
+                frozenValueTypes: frozenValueTypes
             )
         )
         let finalEntrySymbols = Set(indexed.archive.functions.compactMap { function in
@@ -371,6 +385,7 @@ public struct Adapter: Sendable {
             nativeImportCandidates: indexed.archive.nativeImports,
             nativeImportBindings: nativeImportBindings,
             nativeTypes: indexed.archive.nativeTypes,
+            frozenValueTypes: indexed.archive.frozenValueTypes,
             nativeTypeBindings: nativeTypeBindings
         )
         try receipt.validate()
@@ -452,14 +467,36 @@ extension FrontendReceipt.Adapter {
 
     enum SourceNominalKind: Equatable, Sendable {
         case reference
-        case value
+        case structure
+        case enumeration
         case actor
+        case alias
+
+        var isValue: Bool {
+            self == .structure || self == .enumeration
+        }
     }
 
     struct SourceNominal: Sendable {
         var canonicalName: String
         var sourceFileLogicalID: String
         var kind: SourceNominalKind
+        /// A private nominal member cannot be named by generated file-scope
+        /// declarations, even in its defining file. Codecs need this exact
+        /// frontend access fact before promising a source reconstruction path.
+        var isFileScopeNameable: Bool
+        /// Generated codecs are unconditional. Availability-attributed source
+        /// values remain closed until the codec contract models those guards.
+        var isAvailabilityConstrained: Bool
+
+        var localTypeKey: Bytecode.LocalTypeKey {
+            let separator = canonicalName.firstIndex(of: ".")
+            return .init(
+                rawValue: separator.map {
+                    String(canonicalName[canonicalName.index(after: $0)...])
+                } ?? canonicalName
+            )
+        }
     }
 
     struct NominalContext {
@@ -467,6 +504,119 @@ extension FrontendReceipt.Adapter {
         var moduleQualifiedName: String
         var kind: SourceNominalKind?
         var referenceTypeID: Core.TypeID?
+        var localValueTypeKey: Bytecode.LocalTypeKey?
+    }
+
+    struct SourceNominalAliasIndex: Sendable {
+        struct Candidate: Sendable {
+            var relativeName: String
+            var components: [String]
+        }
+
+        var exact: [String: String]
+        var byBaseName: [String: [Candidate]]
+
+        init(sourceNominals: [SourceNominal], moduleName: String) {
+            let modulePrefix = moduleName + "."
+            var exact: [String: String] = [:]
+            var candidates: [String: [Candidate]] = [:]
+            for nominal in sourceNominals
+            where nominal.isFileScopeNameable
+                    && !nominal.isAvailabilityConstrained {
+                let relative = nominal.canonicalName.hasPrefix(modulePrefix)
+                    ? String(nominal.canonicalName.dropFirst(modulePrefix.count))
+                    : nominal.canonicalName
+                let components = relative.split(separator: ".").map(String.init)
+                guard let baseName = components.last else { continue }
+                exact[nominal.canonicalName] = relative
+                exact[relative] = relative
+                candidates[baseName, default: []].append(
+                    .init(relativeName: relative, components: components)
+                )
+            }
+            self.exact = exact
+            byBaseName = candidates.mapValues {
+                $0.sorted { $0.relativeName < $1.relativeName }
+            }
+        }
+
+        func aliases(
+            visibleFrom context: NominalContext?,
+            in declaration: String
+        ) -> [String: String] {
+            let tokens = Self.nominalTokens(in: declaration)
+            var result: [String: String] = [:]
+            var requestedBaseNames = Set<String>()
+            for token in tokens {
+                var prefix = token
+                while true {
+                    if let replacement = exact[prefix] {
+                        result[prefix] = replacement
+                    }
+                    guard let separator = prefix.lastIndex(of: ".") else {
+                        requestedBaseNames.insert(prefix)
+                        break
+                    }
+                    prefix = String(prefix[..<separator])
+                }
+            }
+
+            let contextComponents = context?.canonicalName
+                .split(separator: ".").map(String.init) ?? []
+            for baseName in requestedBaseNames.sorted() {
+                guard let candidates = byBaseName[baseName] else { continue }
+                let ranked = candidates.compactMap {
+                    candidate -> (Int, String)? in
+                    if candidate.components == contextComponents {
+                        return (0, candidate.relativeName)
+                    }
+                    let parent = Array(candidate.components.dropLast())
+                    if parent == contextComponents {
+                        return (1, candidate.relativeName)
+                    }
+                    for ancestorLength in stride(
+                        from: contextComponents.count,
+                        through: 0,
+                        by: -1
+                    ) where parent == Array(
+                        contextComponents.prefix(ancestorLength)
+                    ) {
+                        return (
+                            2 + contextComponents.count - ancestorLength,
+                            candidate.relativeName
+                        )
+                    }
+                    return nil
+                }.sorted {
+                    $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 < $1.0
+                }
+                guard let first = ranked.first,
+                      ranked.dropFirst().first?.0 != first.0
+                else { continue }
+                result[baseName] = first.1
+            }
+            return result
+        }
+
+        private static func nominalTokens(in value: String) -> Set<String> {
+            var result = Set<String>()
+            var token = ""
+            func finish() {
+                guard !token.isEmpty else { return }
+                result.insert(token)
+                token.removeAll(keepingCapacity: true)
+            }
+            for character in value {
+                if character == "." || character == "_"
+                    || character.isLetter || character.isNumber {
+                    token.append(character)
+                } else {
+                    finish()
+                }
+            }
+            finish()
+            return result
+        }
     }
 
     struct Draft {
@@ -500,6 +650,8 @@ extension FrontendReceipt.Adapter {
                 items: items,
                 parentCanonicalName: nil,
                 isInsideGenericContext: false,
+                isInsidePrivateMemberScope: false,
+                isInsideAvailabilityConstrainedScope: false,
                 source: source,
                 moduleName: moduleName,
                 demangled: demangled,
@@ -513,6 +665,8 @@ extension FrontendReceipt.Adapter {
         items: [Any],
         parentCanonicalName: String?,
         isInsideGenericContext: Bool,
+        isInsidePrivateMemberScope: Bool,
+        isInsideAvailabilityConstrainedScope: Bool,
         source: SourceState,
         moduleName: String,
         demangled: [String: String],
@@ -536,22 +690,37 @@ extension FrontendReceipt.Adapter {
                     .actor
                 } else if kind == "class_decl" {
                     .reference
+                } else if kind == "struct_decl" {
+                    .structure
                 } else {
-                    .value
+                    .enumeration
                 }
                 // A declaration inside a generic context has no single concrete
                 // Swift runtime type that can back a frozen TypeID.
                 let entersGenericContext = isInsideGenericContext
                     || item["generic_sig"] != nil
+                let entersPrivateMemberScope = isInsidePrivateMemberScope
+                    || (parentCanonicalName != nil
+                        && (item["access"] as? String) == "private")
+                let entersAvailabilityConstrainedScope =
+                    isInsideAvailabilityConstrainedScope
+                    || Self.hasAvailabilityAttribute(item)
                 if !entersGenericContext {
                     let nominal = SourceNominal(
                         canonicalName: canonicalName,
                         sourceFileLogicalID: source.logicalPath,
-                        kind: nominalKind
+                        kind: nominalKind,
+                        isFileScopeNameable: !entersPrivateMemberScope,
+                        isAvailabilityConstrained:
+                            entersAvailabilityConstrainedScope
                     )
                     if let existing = byName[canonicalName],
                        existing.sourceFileLogicalID != nominal.sourceFileLogicalID
-                        || existing.kind != nominal.kind {
+                        || existing.kind != nominal.kind
+                        || existing.isFileScopeNameable
+                            != nominal.isFileScopeNameable
+                        || existing.isAvailabilityConstrained
+                            != nominal.isAvailabilityConstrained {
                         throw FrontendReceipt.Error.malformedAST(
                             "source nominal \(canonicalName) has conflicting declarations"
                         )
@@ -562,11 +731,44 @@ extension FrontendReceipt.Adapter {
                     items: members,
                     parentCanonicalName: relativeName,
                     isInsideGenericContext: entersGenericContext,
+                    isInsidePrivateMemberScope: entersPrivateMemberScope,
+                    isInsideAvailabilityConstrainedScope:
+                        entersAvailabilityConstrainedScope,
                     source: source,
                     moduleName: moduleName,
                     demangled: demangled,
                     byName: &byName
                 )
+            case "typealias", "typealias_decl":
+                guard !isInsideGenericContext,
+                      let name = baseName(in: item)
+                else { continue }
+                let relativeName = [parentCanonicalName, name]
+                    .compactMap { $0 }.joined(separator: ".")
+                let canonicalName = "\(moduleName).\(relativeName)"
+                let isNameable = !isInsidePrivateMemberScope
+                    && (parentCanonicalName == nil
+                        || (item["access"] as? String) != "private")
+                let alias = SourceNominal(
+                    canonicalName: canonicalName,
+                    sourceFileLogicalID: source.logicalPath,
+                    kind: .alias,
+                    isFileScopeNameable: isNameable,
+                    isAvailabilityConstrained:
+                        isInsideAvailabilityConstrainedScope
+                            || Self.hasAvailabilityAttribute(item)
+                )
+                if let existing = byName[canonicalName],
+                   existing.sourceFileLogicalID != alias.sourceFileLogicalID
+                    || existing.kind != alias.kind
+                    || existing.isFileScopeNameable != alias.isFileScopeNameable
+                    || existing.isAvailabilityConstrained
+                        != alias.isAvailabilityConstrained {
+                    throw FrontendReceipt.Error.malformedAST(
+                        "source type name \(canonicalName) has conflicting declarations"
+                    )
+                }
+                byName[canonicalName] = alias
             case "extension_decl":
                 guard let mangled = item["extended_type"] as? String,
                       let fullName = demangled[mangled],
@@ -582,6 +784,10 @@ extension FrontendReceipt.Adapter {
                     isInsideGenericContext: isInsideGenericContext
                         || item["generic_sig"] != nil
                         || fullName.contains("<"),
+                    isInsidePrivateMemberScope: isInsidePrivateMemberScope,
+                    isInsideAvailabilityConstrainedScope:
+                        isInsideAvailabilityConstrainedScope
+                            || Self.hasAvailabilityAttribute(item),
                     source: source,
                     moduleName: moduleName,
                     demangled: demangled,
@@ -867,6 +1073,14 @@ extension FrontendReceipt.Adapter {
         })
         let sourceTypeNames = Set(sourceNominals.map(\.canonicalName))
         let sourceReferences = sourceNominals.filter { $0.kind == .reference }
+        let sourceValues = sourceNominals.filter { $0.kind.isValue }
+        if let collision = sourceValues.first(where: {
+            catalogByName[$0.canonicalName] != nil
+        }) {
+            throw FrontendReceipt.Error.invalidRequest(
+                "source value type \(collision.canonicalName) must use its frozen structural codec, not NativeImport TypeOps"
+            )
+        }
         for source in sourceReferences {
             guard let explicit = catalogByName[source.canonicalName] else { continue }
             guard explicit.kind == .reference,
@@ -963,6 +1177,78 @@ extension FrontendReceipt.Adapter {
             )
         }
         return records.sorted { $0.id.rawValue < $1.id.rawValue }
+    }
+
+    func makeLocalValueTypeLookup(
+        _ sourceNominals: [SourceNominal]
+    ) -> [String: Bytecode.LocalTypeKey] {
+        var result: [String: Bytecode.LocalTypeKey] = [:]
+        for nominal in sourceNominals where nominal.kind.isValue {
+            result[nominal.canonicalName] = nominal.localTypeKey
+            result[nominal.localTypeKey.rawValue] = nominal.localTypeKey
+        }
+        return result
+    }
+
+    /// Materializes only the transitive source values that can reach a Shell
+    /// declaration boundary. Large applications commonly contain thousands of
+    /// unrelated value declarations, and eagerly resolving all of them would
+    /// turn one boundary feature into whole-module quadratic work.
+    func makeFrozenValueTypes(
+        referencedBy declarations: [ReleaseCompiler.DeclarationCandidate],
+        sourceNominals: [SourceNominal],
+        typeEnvironment: CanonicalSIL.TypeEnvironment
+    ) throws -> [InterfaceArchive.FrozenValueTypeRecord] {
+        let sourceValues = Dictionary(uniqueKeysWithValues: sourceNominals
+            .filter { $0.kind.isValue }
+            .map { ($0.localTypeKey, $0) })
+        var pending: [Bytecode.LocalTypeKey] = []
+        func collect(_ type: Bytecode.ValueType) {
+            switch type {
+            case let .local(key): pending.append(key)
+            case let .array(element), let .optional(element), let .set(element):
+                collect(element)
+            case let .dictionary(key, value):
+                collect(key)
+                collect(value)
+            case let .tuple(elements):
+                elements.forEach(collect)
+            default:
+                break
+            }
+        }
+        for declaration in declarations {
+            (declaration.parameterTypes + [declaration.resultType]).forEach(
+                collect
+            )
+        }
+
+        var visited = Set<Bytecode.LocalTypeKey>()
+        var records: [InterfaceArchive.FrozenValueTypeRecord] = []
+        while let key = pending.popLast() {
+            guard visited.insert(key).inserted,
+                  let nominal = sourceValues[key], nominal.isFileScopeNameable,
+                  !nominal.isAvailabilityConstrained
+            else { continue }
+            let record: InterfaceArchive.FrozenValueTypeRecord
+            do {
+                record = try typeEnvironment.frozenValueTypeRecord(
+                    key: key,
+                    canonicalName: nominal.canonicalName,
+                    sourceFileLogicalID: nominal.sourceFileLogicalID
+                )
+            } catch CanonicalSIL.LoweringError.unsupportedType {
+                continue
+            }
+            records.append(record)
+            switch record.kind {
+            case let .structure(fields):
+                fields.forEach { collect($0.type) }
+            case let .enumeration(cases):
+                cases.compactMap(\.payloadType).forEach(collect)
+            }
+        }
+        return records.sorted { $0.key < $1.key }
     }
 
     func makeNativeImportBindings(
@@ -1179,8 +1465,10 @@ extension FrontendReceipt.Adapter {
         silFile: CanonicalSIL.File,
         typeEnvironment: CanonicalSIL.TypeEnvironment,
         nativeTypes: [String: Core.TypeID],
+        localValueTypes: [String: Bytecode.LocalTypeKey],
         importedSwiftTypeAliases: [String: String],
         sourceNominals: [String: SourceNominal],
+        sourceNominalAliasIndex: SourceNominalAliasIndex,
         drafts: inout [Draft]
     ) throws {
         for value in items {
@@ -1200,7 +1488,9 @@ extension FrontendReceipt.Adapter {
                     silFile: silFile,
                     typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
-                    importedSwiftTypeAliases: importedSwiftTypeAliases
+                    localValueTypes: localValueTypes,
+                    importedSwiftTypeAliases: importedSwiftTypeAliases,
+                    sourceNominalAliasIndex: sourceNominalAliasIndex
                 ) {
                     drafts.append(draft)
                 }
@@ -1232,7 +1522,9 @@ extension FrontendReceipt.Adapter {
                         moduleQualifiedName: moduleQualifiedName,
                         kind: nominal?.kind,
                         referenceTypeID: nominal?.kind == .reference
-                            ? nativeTypes[moduleQualifiedName] : nil
+                            ? nativeTypes[moduleQualifiedName] : nil,
+                        localValueTypeKey: nominal?.kind.isValue == true
+                            ? nominal?.localTypeKey : nil
                     ),
                     source: source,
                     imports: imports,
@@ -1242,8 +1534,10 @@ extension FrontendReceipt.Adapter {
                     silFile: silFile,
                     typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
+                    localValueTypes: localValueTypes,
                     importedSwiftTypeAliases: importedSwiftTypeAliases,
                     sourceNominals: sourceNominals,
+                    sourceNominalAliasIndex: sourceNominalAliasIndex,
                     drafts: &drafts
                 )
             case "extension_decl":
@@ -1265,7 +1559,9 @@ extension FrontendReceipt.Adapter {
                         moduleQualifiedName: moduleQualifiedName,
                         kind: nominal?.kind,
                         referenceTypeID: nominal?.kind == .reference
-                            ? nativeTypes[moduleQualifiedName] : nil
+                            ? nativeTypes[moduleQualifiedName] : nil,
+                        localValueTypeKey: nominal?.kind.isValue == true
+                            ? nominal?.localTypeKey : nil
                     ),
                     source: source,
                     imports: imports,
@@ -1275,8 +1571,10 @@ extension FrontendReceipt.Adapter {
                     silFile: silFile,
                     typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
+                    localValueTypes: localValueTypes,
                     importedSwiftTypeAliases: importedSwiftTypeAliases,
                     sourceNominals: sourceNominals,
+                    sourceNominalAliasIndex: sourceNominalAliasIndex,
                     drafts: &drafts
                 )
             default:
@@ -1296,7 +1594,9 @@ extension FrontendReceipt.Adapter {
         silFile: CanonicalSIL.File,
         typeEnvironment: CanonicalSIL.TypeEnvironment,
         nativeTypes: [String: Core.TypeID],
-        importedSwiftTypeAliases: [String: String]
+        localValueTypes: [String: Bytecode.LocalTypeKey],
+        importedSwiftTypeAliases: [String: String],
+        sourceNominalAliasIndex: SourceNominalAliasIndex
     ) throws -> Draft? {
         guard item["implicit"] as? Bool != true,
               let usr = item["usr"] as? String,
@@ -1330,25 +1630,72 @@ extension FrontendReceipt.Adapter {
                 "\(source.logicalPath): typed range for \(baseName) has no unique func token"
             )
         }
-        var header = String(rawHeader[token.functionStart...])
+        let sourceHeader = String(rawHeader[token.functionStart...])
         let relativeNameStart = rawHeader.distance(
             from: token.functionStart,
             to: token.nameStart
         )
-        let nameStart = header.index(header.startIndex, offsetBy: relativeNameStart)
-        let nameEnd = header.index(nameStart, offsetBy: baseName.count)
-        let expectedPrefix = String(header[..<nameEnd])
+        let sourceNameStart = sourceHeader.index(
+            sourceHeader.startIndex,
+            offsetBy: relativeNameStart
+        )
+        let sourceNameEnd = sourceHeader.index(
+            sourceNameStart,
+            offsetBy: baseName.count
+        )
+        let expectedPrefix = String(sourceHeader[..<sourceNameEnd])
         let replacementName = SwiftFrontend.DynamicReplacement.replacementBaseName(
             usr: usr,
             baseName: baseName
         )
-        header.replaceSubrange(nameStart..<nameEnd, with: replacementName)
-        header = header.trimmingCharacters(in: .whitespacesAndNewlines)
         let declarationOffset = functionRange.start
             + rawHeader[..<token.functionStart].utf8.count
 
+        func replacingFunctionName(in value: String) -> String {
+            var result = value
+            let start = result.index(
+                result.startIndex,
+                offsetBy: relativeNameStart
+            )
+            let end = result.index(start, offsetBy: baseName.count)
+            result.replaceSubrange(start..<end, with: replacementName)
+            return result.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
         let parametersObject = item["params"] as? [String: Any]
         let parameterItems = parametersObject?["params"] as? [[String: Any]] ?? []
+        let canonicalFunctionHeader = replacingFunctionName(in: sourceHeader)
+        let sourceTypeAliases = sourceNominalAliasIndex.aliases(
+            visibleFrom: context,
+            in: sourceHeader
+        )
+        guard let parameterRange = parametersObject.flatMap(sourceRange(in:)),
+              parameterRange.start >= declarationOffset,
+              parameterRange.end >= parameterRange.start,
+              parameterRange.end < bodyRange.start
+        else {
+            throw FrontendReceipt.Error.malformedAST(
+                "\(mangledName) has no bounded source parameter list"
+            )
+        }
+        let relativeParameterRange: Range<Int> = (
+            parameterRange.start - declarationOffset
+        )..<(parameterRange.end - declarationOffset + 1)
+        guard let qualifiedSourceHeader = FrontendReceipt.SourceFunctionSpelling
+            .replacingNominalAliases(
+                in: sourceHeader,
+                parameterUTF8Range: relativeParameterRange,
+                aliases: sourceTypeAliases
+            )
+        else {
+            throw FrontendReceipt.Error.unsupportedDeclaration(
+                "\(source.logicalPath): cannot preserve the qualified signature for \(baseName)"
+            )
+        }
+        let generatedFunctionHeader = replacingFunctionName(
+            in: qualifiedSourceHeader
+        )
+
         let parameterNames = try parameterItems.map { parameter -> String in
             guard let name = self.baseName(in: parameter), Self.isSwiftIdentifier(name) else {
                 throw FrontendReceipt.Error.unsupportedDeclaration(
@@ -1411,14 +1758,19 @@ extension FrontendReceipt.Adapter {
             of: #"(?:^|\s)@async(?:\s|$)"#,
             options: .regularExpression
         ) != nil
-        let mayThrow = Self.containsWord("throws", in: header)
-            || Self.containsWord("rethrows", in: header)
+        let mayThrow = Self.containsWord("throws", in: canonicalFunctionHeader)
+            || Self.containsWord("rethrows", in: canonicalFunctionHeader)
             || sil.loweredType.contains("@error")
-        let hasTypedThrows = header.range(
+        let hasTypedThrows = canonicalFunctionHeader.range(
             of: #"\bthrows\s*\("#,
             options: .regularExpression
         ) != nil
-        let isGeneric = header[header.index(header.startIndex, offsetBy: 5)...]
+        let isGeneric = canonicalFunctionHeader[
+            canonicalFunctionHeader.index(
+                canonicalFunctionHeader.startIndex,
+                offsetBy: 5
+            )...
+        ]
             .hasPrefix("\(replacementName)<")
             || item["generic_sig"] != nil
         let hasInOut = parameterItems.contains { $0["inout"] as? Bool == true }
@@ -1440,13 +1792,15 @@ extension FrontendReceipt.Adapter {
             FrontendReceipt.ValueTypeParser.parse(
                 $0,
                 allowVoid: false,
-                nativeTypes: nativeTypes
+                nativeTypes: nativeTypes,
+                localTypes: localValueTypes
             ) ?? .never
         }
         let valueResultType = FrontendReceipt.ValueTypeParser.parse(
             resultType,
             allowVoid: true,
-            nativeTypes: nativeTypes
+            nativeTypes: nativeTypes,
+            localTypes: localValueTypes
         ) ?? .never
         let isTypeMethod = item["static"] as? Bool == true
         let referenceReceiverType = context.flatMap { nominal -> String? in
@@ -1458,8 +1812,17 @@ extension FrontendReceipt.Adapter {
         let referenceReceiverID = referenceReceiverType.flatMap { _ in
             context?.referenceTypeID
         }
+        let valueReceiverKey = context.flatMap { nominal -> Bytecode.LocalTypeKey? in
+            guard !isTypeMethod, nominal.kind?.isValue == true else {
+                return nil
+            }
+            return nominal.localValueTypeKey
+        }
+        let bridgedReceiverType: Bytecode.ValueType? = referenceReceiverID.map {
+            .native($0)
+        } ?? valueReceiverKey.map { .local($0) }
         let bridgedParameterTypes = valueParameterTypes
-            + (referenceReceiverID.map { [.native($0)] } ?? [])
+            + (bridgedReceiverType.map { [$0] } ?? [])
         // Canonical SIL is the single ownership authority. In particular, `Any`
         // and `Error` can carry reference identity despite not being linear VM
         // handles, so source-level `inout` versus owned inference is incomplete.
@@ -1490,9 +1853,9 @@ extension FrontendReceipt.Adapter {
                     || Self.containsWord("nonisolated", in: modifierPrefix) {
             declarationPrefix += "nonisolated "
         }
-        if Self.containsWord("borrowing", in: modifierPrefix) {
+        if attributeKinds.contains("borrowing_attr") {
             declarationPrefix += "borrowing "
-        } else if Self.containsWord("consuming", in: modifierPrefix) {
+        } else if attributeKinds.contains("consuming_attr") {
             declarationPrefix += "consuming "
         }
         if isTypeMethod {
@@ -1500,8 +1863,8 @@ extension FrontendReceipt.Adapter {
                 ? "class " : "static "
         }
         if attributeKinds.contains("mutating_attr") { declarationPrefix += "mutating " }
-        let replacementDeclaration = declarationPrefix + header
-        let canonicalHeader = replacementDeclaration
+        let replacementDeclaration = declarationPrefix + generatedFunctionHeader
+        let canonicalHeader = (declarationPrefix + canonicalFunctionHeader)
             .replacingOccurrences(of: replacementName, with: baseName)
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
         let interfaceType = try demangledType(item["interface_type"], using: demangled)
@@ -1540,6 +1903,7 @@ extension FrontendReceipt.Adapter {
             isAsync: isAsync,
             hasInOut: hasInOut,
             isGeneric: isGeneric,
+            isNoncopyable: false,
             hasTypedThrows: hasTypedThrows,
             hasCompleteDynamicCoverage: canDynamicallyReplace,
             forcedPatchability: {
@@ -1549,7 +1913,7 @@ extension FrontendReceipt.Adapter {
                         explanation: "custom function attributes are Native-only in HLBC v1"
                     )
                 }
-                if context != nil, referenceReceiverID == nil {
+                if context != nil, bridgedReceiverType == nil {
                     return .rejected(
                         "HLXIDX020",
                         explanation: "this member receiver has no ABI-safe HLBC self Bridge"
@@ -1589,9 +1953,9 @@ extension FrontendReceipt.Adapter {
                 )
             }
         let nativeImportSignatureSwiftTypes = nativeImportDeclaredParameterTypes
-            + (referenceReceiverID.flatMap { _ in context?.canonicalName }.map { [$0] } ?? [])
+            + (bridgedReceiverType.flatMap { _ in context?.canonicalName }.map { [$0] } ?? [])
         let nativeImportParameterSwiftTypes = nativeImportGeneratedExplicitParameterTypes
-            + (referenceReceiverID.flatMap { _ in context?.canonicalName }.map { [$0] } ?? [])
+            + (bridgedReceiverType.flatMap { _ in context?.canonicalName }.map { [$0] } ?? [])
         let nativeImportCallbacks = FrontendReceipt.NativeBridgeProfile.callbacks(
             parameterSpellings: nativeImportSignatureSwiftTypes,
             parameterTypes: bridgedParameterTypes,
@@ -1692,19 +2056,19 @@ extension FrontendReceipt.Adapter {
             nativeReplacement: nativeReplacement
         )
         let bridge: ShellBuildReceipt.Bridge?
-        if (context == nil || referenceReceiverID != nil),
+        if (context == nil || bridgedReceiverType != nil),
            !hasInOut, !isGeneric, !hasTypedThrows,
            customAttributes.isEmpty, !hasUnrepresentableCustomAttribute,
            valueParameterTypes.allSatisfy({ $0 != .never }),
            valueResultType != .never {
             let receiverOffset = parameterNames.count
             let bridgeParameterExpressions = parameterNames
-                + (referenceReceiverID.map { _ in ["self"] } ?? [])
+                + (bridgedReceiverType.map { _ in ["self"] } ?? [])
             let bridgeParameterSwiftTypes = generatedParameterTypes
-                + (referenceReceiverID.flatMap { _ in context?.canonicalName }
+                + (bridgedReceiverType.flatMap { _ in context?.canonicalName }
                     .map { [$0] } ?? [])
             let bridgedInvocation: String
-            if referenceReceiverID != nil {
+            if bridgedReceiverType != nil {
                 bridgedInvocation = "argument\(receiverOffset).\(replacementName)(\(bridgeArguments))"
             } else {
                 bridgedInvocation = "\(replacementName)(\(bridgeArguments))"
@@ -1801,6 +2165,12 @@ extension FrontendReceipt.Adapter {
             of: #"\b"# + NSRegularExpression.escapedPattern(for: word) + #"\b"#,
             options: .regularExpression
         ) != nil
+    }
+
+    static func hasAvailabilityAttribute(_ item: [String: Any]) -> Bool {
+        (item["attrs"] as? [[String: Any]])?.contains {
+            $0["_kind"] as? String == "available_attr"
+        } == true
     }
 
     static func customAttributeName(_ demangledType: String) -> String? {

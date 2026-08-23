@@ -60,6 +60,7 @@ public struct Engine: Verification.ImageVerifying {
             module.localTypes,
             capabilities: module.capabilities
         )
+        try verifyFrozenValueTypeDefinitions(localTypes, shell: shell)
 
         let effectiveLimits = module.requestedResources.constrained(by: policy.resourceCeiling)
         let functionMap = try verifyUniqueFunctions(module.functions)
@@ -560,6 +561,20 @@ public struct Engine: Verification.ImageVerifying {
                 visiting: &visiting,
                 depths: &depths
             )
+        }
+    }
+
+    private func verifyFrozenValueTypeDefinitions(
+        _ localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        shell: Verification.ShellInterface
+    ) throws {
+        for (key, definition) in localTypes {
+            guard let frozen = shell.frozenValueTypes[key] else { continue }
+            guard definition == frozen.definition else {
+                throw Verification.Error.invalidModule(
+                    "local type \(key) disagrees with its frozen Shell value layout"
+                )
+            }
         }
     }
 
@@ -4702,7 +4717,9 @@ public struct Engine: Verification.ImageVerifying {
             isCopyable(element, shell: shell)
         case .void, .never, .address:
             false
-        case .bool, .integer, .float, .string, .any, .local, .error:
+        case let .local(key):
+            shell.frozenValueTypes[key]?.isCopyable ?? true
+        case .bool, .integer, .float, .string, .any, .error:
             true
         }
     }

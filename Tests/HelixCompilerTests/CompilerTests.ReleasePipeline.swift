@@ -394,9 +394,21 @@ struct ReleasePipeline {
                     expectedDeclarationPrefix: "func transform",
                     functionKey: eligible.key
                 ),
-            ]
+            ],
+            supplementalDeclarations: "private func __helixHook() {}"
         )
-        #expect(String(decoding: transformed.contents, as: UTF8.self).contains("public dynamic func transform"))
+        let transformedText = String(decoding: transformed.contents, as: UTF8.self)
+        #expect(transformedText.contains("public dynamic func transform"))
+        #expect(transformedText.contains("private func __helixHook() {}\n\n#sourceLocation()"))
+        #expect(throws: SourceTransform.Error.invalidSupplementalDeclarations) {
+            try SourceTransform.Transformer().transform(
+                source: sourceData,
+                logicalPath: "Sources/Patch.swift",
+                expectedSourceHash: .sha256(sourceData),
+                edits: [],
+                supplementalDeclarations: "private let invalid = \"\0\""
+            )
+        }
 
         let bridgeRoots: [BridgeGeneration.Root] = [
             .init(

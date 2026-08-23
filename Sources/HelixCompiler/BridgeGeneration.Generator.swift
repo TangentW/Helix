@@ -258,6 +258,9 @@ public struct Generator: Sendable {
             throw BridgeGeneration.Error.incompleteRootSet
         }
         let byKey = Dictionary(uniqueKeysWithValues: eligible.map { ($0.key, $0) })
+        let frozenValueTypes = Dictionary(
+            uniqueKeysWithValues: archive.frozenValueTypes.map { ($0.key, $0) }
+        )
         for root in roots {
             guard let record = byKey[root.functionKey],
                   record.entryIndex == root.entryIndex,
@@ -265,8 +268,17 @@ public struct Generator: Sendable {
             else {
                 throw BridgeGeneration.Error.rootDoesNotMatchArchive(root.functionKey)
             }
-            try validateRoot(root, record: record, archive: archive)
+            try validateRoot(
+                root,
+                record: record,
+                archive: archive,
+                frozenValueTypes: frozenValueTypes
+            )
         }
+        try validateFrozenValueCodecs(
+            archive: archive,
+            frozenValueTypes: frozenValueTypes
+        )
         try validateNativeBindings(
             archive: archive,
             imports: nativeImports,
@@ -284,7 +296,14 @@ public struct Generator: Sendable {
             grouping: generatedTypes,
             by: { $0.1.sourceFileLogicalID }
         )
-        let sourceGroups = Set(grouped.keys).union(generatedTypeGroups.keys).sorted()
+        let frozenValueGroups = Dictionary(
+            grouping: archive.frozenValueTypes,
+            by: \.sourceFileLogicalID
+        )
+        let sourceGroups = Set(grouped.keys)
+            .union(generatedTypeGroups.keys)
+            .union(frozenValueGroups.keys)
+            .sorted()
         let nativeTypesByID = Dictionary(uniqueKeysWithValues: archive.nativeTypes.map {
             ($0.id, $0)
         })
@@ -293,6 +312,7 @@ public struct Generator: Sendable {
         for source in sourceGroups {
             let values = grouped[source] ?? []
             let typeValues = generatedTypeGroups[source] ?? []
+            let frozenValues = frozenValueGroups[source] ?? []
             let privateImportSourceFile = URL(fileURLWithPath: source).lastPathComponent
             guard values.allSatisfy({
                 $0.privateImportSourceFile == privateImportSourceFile
@@ -325,7 +345,11 @@ public struct Generator: Sendable {
             let sortedValues = values.sorted(by: { $0.entryIndex < $1.entryIndex })
             for (offset, root) in sortedValues.enumerated() {
                 let record = byKey[root.functionKey]!
-                lines.append(indent(try renderOriginalEntry(root, record: record), spaces: 12)
+                lines.append(indent(try renderOriginalEntry(
+                    root,
+                    record: record,
+                    frozenValueTypes: frozenValueTypes
+                ), spaces: 12)
                     + (offset == sortedValues.count - 1 ? "" : ","))
             }
             lines.append(contentsOf: [
@@ -346,17 +370,32 @@ public struct Generator: Sendable {
                     spaces: 4
                 ))
             }
+            for record in frozenValues.sorted(by: { $0.key < $1.key }) {
+                lines.append("")
+                lines.append(indent(
+                    try renderFrozenValueCodec(
+                        record,
+                        frozenValueTypes: frozenValueTypes
+                    ),
+                    spaces: 4
+                ))
+            }
             lines.append("}")
             for root in sortedValues {
                 let record = byKey[root.functionKey]!
                 lines.append("")
-                lines.append(try renderReplacement(root, record: record))
+                lines.append(try renderReplacement(
+                    root,
+                    record: record,
+                    frozenValueTypes: frozenValueTypes
+                ))
             }
             lines.append("")
             files[Self.entrySourcePath(for: source)] = lines.joined(separator: "\n")
         }
         for source in archive.sources.map(\.logicalPath)
-        where grouped[source] == nil && generatedTypeGroups[source] == nil {
+        where grouped[source] == nil && generatedTypeGroups[source] == nil
+                && frozenValueGroups[source] == nil {
             let path = Self.entrySourcePath(for: source)
             guard files[path] == nil else { throw BridgeGeneration.Error.outputCollision(path) }
             files[path] = Self.emptyGeneratedSource(
@@ -539,18 +578,27 @@ public struct Generator: Sendable {
     private func validateRoot(
         _ root: BridgeGeneration.Root,
         record: InterfaceArchive.FunctionRecord,
-        archive: InterfaceArchive.Archive
+        archive: InterfaceArchive.Archive,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
     ) throws {
         let hasExactLogicalParameters =
             root.parameterSwiftTypes.count == record.loweredSignature.parameters.count
-        let hasBridgedReferenceReceiver: Bool = {
+        let hasBridgedReceiver: Bool = {
             guard record.role == .method,
                   root.parameterSwiftTypes.count
                     == record.loweredSignature.parameters.count + 1,
-                  let receiver = record.parameterTypes.last,
-                  case .native = receiver
+                  let receiver = record.parameterTypes.last
             else { return false }
-            return true
+            switch receiver {
+            case .native:
+                return true
+            case let .local(key):
+                return frozenValueTypes[key] != nil
+            default:
+                return false
+            }
         }()
         let strings = [
             root.privateImportSourceFile, root.originalReference, root.replacementDeclaration,
@@ -565,7 +613,7 @@ public struct Generator: Sendable {
               !root.bridgeInvocation.isEmpty,
               root.parameterExpressions.count == record.parameterTypes.count,
               root.parameterSwiftTypes.count == record.parameterTypes.count,
-              hasExactLogicalParameters || hasBridgedReferenceReceiver,
+              hasExactLogicalParameters || hasBridgedReceiver,
               root.parameterExpressions.allSatisfy({ !$0.isEmpty }),
               strings.allSatisfy({
                   $0.utf8.count <= 64 * 1_024
@@ -593,6 +641,7 @@ public struct Generator: Sendable {
                 parseSwiftType(spelling),
                 matches: type,
                 archive: archive,
+                frozenValueTypes: frozenValueTypes,
                 key: root.functionKey
             )
         }
@@ -600,8 +649,47 @@ public struct Generator: Sendable {
             parseSwiftType(root.resultSwiftType),
             matches: record.resultType,
             archive: archive,
+            frozenValueTypes: frozenValueTypes,
             key: root.functionKey
         )
+    }
+
+    private func validateFrozenValueCodecs(
+        archive: InterfaceArchive.Archive,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
+    ) throws {
+        for record in archive.frozenValueTypes {
+            guard swiftTypeMatches(
+                try parseSwiftType(record.swiftType(
+                    moduleName: archive.metadata.frontendInvocation.moduleName
+                )),
+                type: .local(record.key),
+                archive: archive,
+                frozenValueTypes: frozenValueTypes
+            ) else {
+                throw BridgeGeneration.Error.frozenValueTypeMismatch(record.key)
+            }
+            let members: [(String, Bytecode.ValueType)] = switch record.kind {
+            case let .structure(fields):
+                fields.map { ($0.swiftType, $0.type) }
+            case let .enumeration(cases):
+                cases.flatMap { item in
+                    item.associatedValues.map { ($0.swiftType, $0.type) }
+                }
+            }
+            for (swiftType, valueType) in members {
+                guard swiftTypeMatches(
+                    try parseSwiftType(swiftType),
+                    type: valueType,
+                    archive: archive,
+                    frozenValueTypes: frozenValueTypes
+                ) else {
+                    throw BridgeGeneration.Error.frozenValueTypeMismatch(record.key)
+                }
+            }
+        }
     }
 
     private func parseSwiftType(_ raw: String) throws -> SwiftTypeShape {
@@ -988,9 +1076,17 @@ public struct Generator: Sendable {
         _ shape: SwiftTypeShape,
         matches type: Bytecode.ValueType,
         archive: InterfaceArchive.Archive,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]? = nil,
         key: Core.FunctionKey
     ) throws {
-        guard swiftTypeMatches(shape, type: type, archive: archive) else {
+        guard swiftTypeMatches(
+            shape,
+            type: type,
+            archive: archive,
+            frozenValueTypes: frozenValueTypes
+        ) else {
             throw BridgeGeneration.Error.swiftTypeMismatch(key)
         }
     }
@@ -998,7 +1094,10 @@ public struct Generator: Sendable {
     private func swiftTypeMatches(
         _ shape: SwiftTypeShape,
         type: Bytecode.ValueType,
-        archive: InterfaceArchive.Archive
+        archive: InterfaceArchive.Archive,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]? = nil
     ) -> Bool {
         switch (shape, type) {
         case let (.named(name), .integer(width, signed)):
@@ -1022,18 +1121,56 @@ public struct Generator: Sendable {
                 ? String(canonicalName.dropFirst(modulePrefix.count))
                 : canonicalName
             return name == canonicalName || name == moduleRelativeName
+        case let (.named(name), .local(key)):
+            let record = frozenValueTypes?[key]
+                ?? archive.frozenValueTypes.first(where: { $0.key == key })
+            guard let record else { return false }
+            let modulePrefix = archive.metadata.frontendInvocation.moduleName + "."
+            let moduleRelativeName = record.canonicalName.hasPrefix(modulePrefix)
+                ? String(record.canonicalName.dropFirst(modulePrefix.count))
+                : record.canonicalName
+            return name == record.canonicalName || name == moduleRelativeName
         case let (.optional(shape), .optional(type)):
-            return swiftTypeMatches(shape, type: type, archive: archive)
+            return swiftTypeMatches(
+                shape,
+                type: type,
+                archive: archive,
+                frozenValueTypes: frozenValueTypes
+            )
         case let (.array(shape), .array(type)):
-            return swiftTypeMatches(shape, type: type, archive: archive)
+            return swiftTypeMatches(
+                shape,
+                type: type,
+                archive: archive,
+                frozenValueTypes: frozenValueTypes
+            )
         case let (.dictionary(keyShape, valueShape), .dictionary(keyType, valueType)):
-            return swiftTypeMatches(keyShape, type: keyType, archive: archive)
-                && swiftTypeMatches(valueShape, type: valueType, archive: archive)
+            return swiftTypeMatches(
+                keyShape,
+                type: keyType,
+                archive: archive,
+                frozenValueTypes: frozenValueTypes
+            ) && swiftTypeMatches(
+                valueShape,
+                type: valueType,
+                archive: archive,
+                frozenValueTypes: frozenValueTypes
+            )
         case let (.set(shape), .set(type)):
-            return swiftTypeMatches(shape, type: type, archive: archive)
+            return swiftTypeMatches(
+                shape,
+                type: type,
+                archive: archive,
+                frozenValueTypes: frozenValueTypes
+            )
         case let (.tuple(shapes), .tuple(types)):
             return shapes.count == types.count && zip(shapes, types).allSatisfy {
-                swiftTypeMatches($0.0, type: $0.1, archive: archive)
+                swiftTypeMatches(
+                    $0.0,
+                    type: $0.1,
+                    archive: archive,
+                    frozenValueTypes: frozenValueTypes
+                )
             }
         case let (
             .function(attributes, parameterShapes, resultShape),
@@ -1055,12 +1192,18 @@ public struct Generator: Sendable {
                 && !signature.effects.mayThrow
                 && !signature.effects.isAsync
                 && zip(parameterShapes, signature.parameters).allSatisfy {
-                    swiftTypeMatches($0.0, type: $0.1, archive: archive)
+                    swiftTypeMatches(
+                        $0.0,
+                        type: $0.1,
+                        archive: archive,
+                        frozenValueTypes: frozenValueTypes
+                    )
                 }
                 && swiftTypeMatches(
                     resultShape,
                     type: signature.result,
-                    archive: archive
+                    archive: archive,
+                    frozenValueTypes: frozenValueTypes
                 )
         case let (.named(name), .bool):
             return ["Bool", "Swift.Bool"].contains(name)
@@ -1086,7 +1229,10 @@ public struct Generator: Sendable {
 
     private func renderReplacement(
         _ root: BridgeGeneration.Root,
-        record: InterfaceArchive.FunctionRecord
+        record: InterfaceArchive.FunctionRecord,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
     ) throws -> String {
         let shapes = try root.parameterSwiftTypes.map(parseSwiftType)
         let arguments = zip(zip(root.parameterExpressions, shapes), record.parameterTypes).map {
@@ -1095,11 +1241,16 @@ public struct Generator: Sendable {
                 shape: $0.0.1,
                 type: $0.1,
                 nativeCatalog: "try Runtime.Bridge.shared.requireNativeTypeCatalog()",
-                inputEncoder: "encoder"
+                inputEncoder: "encoder",
+                frozenValueTypes: frozenValueTypes
             )
         }
         let resultShape = try parseSwiftType(root.resultSwiftType)
-        let decodeResult = renderDecodeResult(shape: resultShape, type: record.resultType)
+        let decodeResult = renderDecodeResult(
+            shape: resultShape,
+            type: record.resultType,
+            frozenValueTypes: frozenValueTypes
+        )
         let array = renderArray(arguments, indentation: 20)
         let originalAttempt = (record.effects.mayThrow ? "try " : "")
             + (record.effects.isAsync ? "await " : "")
@@ -1138,7 +1289,10 @@ public struct Generator: Sendable {
 
     private func renderOriginalEntry(
         _ root: BridgeGeneration.Root,
-        record: InterfaceArchive.FunctionRecord
+        record: InterfaceArchive.FunctionRecord,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
     ) throws -> String {
         if record.effects.isAsync {
             // Async entries can only be reached through their exact Swift async
@@ -1160,7 +1314,12 @@ public struct Generator: Sendable {
         let shapes = try root.parameterSwiftTypes.map(parseSwiftType)
         let decoded = zip(shapes, record.parameterTypes).enumerated().map { offset, pair in
             "let argument\(offset): \(pair.0.rendered) = "
-                + renderDecode(expression: "arguments[\(offset)]", shape: pair.0, type: pair.1)
+                + renderDecode(
+                    expression: "arguments[\(offset)]",
+                    shape: pair.0,
+                    type: pair.1,
+                    frozenValueTypes: frozenValueTypes
+                )
         }
         let call = renderOriginalCall(root, record: record)
         let invocation: String
@@ -1179,7 +1338,8 @@ public struct Generator: Sendable {
                 expression: "result",
                 shape: resultShape,
                 type: record.resultType,
-                nativeCatalog: "nativeTypeCatalog"
+                nativeCatalog: "nativeTypeCatalog",
+                frozenValueTypes: frozenValueTypes
             )
             invocation = callBody + "\nreturn .returned(\(encoded))"
         }
@@ -1246,6 +1406,262 @@ public struct Generator: Sendable {
             return .businessError(String(describing: error))
         }
         """
+    }
+
+    private func renderFrozenValueCodec(
+        _ record: InterfaceArchive.FrozenValueTypeRecord,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
+    ) throws -> String {
+        let swiftType = record.key.rawValue.split(separator: ".").map {
+            escapedSwiftIdentifier(String($0))
+        }.joined(separator: ".")
+        switch record.kind {
+        case let .structure(fields):
+            let shapes = try fields.map { try parseSwiftType($0.swiftType) }
+            let inputFields = zip(fields, shapes).map { field, shape in
+                renderEncode(
+                    expression: "value.\(escapedSwiftIdentifier(field.name))",
+                    shape: shape,
+                    type: field.type,
+                    nativeCatalog: "try Runtime.Bridge.shared.requireNativeTypeCatalog()",
+                    inputEncoder: "encoder",
+                    frozenValueTypes: frozenValueTypes
+                )
+            }
+            let resultFields = zip(fields, shapes).map { field, shape in
+                renderEncode(
+                    expression: "value.\(escapedSwiftIdentifier(field.name))",
+                    shape: shape,
+                    type: field.type,
+                    nativeCatalog: "try Runtime.Bridge.shared.requireNativeTypeCatalog()",
+                    frozenValueTypes: frozenValueTypes
+                )
+            }
+            let decodedFields = zip(fields, shapes).enumerated().map {
+                offset, pair in
+                "field\(offset): " + renderDecode(
+                    expression: "fields[\(offset)]",
+                    shape: pair.1,
+                    type: pair.0.type,
+                    frozenValueTypes: frozenValueTypes
+                )
+            }
+            let decodedBinding = fields.isEmpty
+                ? "_ = try Runtime.BridgeValueCodec.decodeStructure"
+                : "let fields = try Runtime.BridgeValueCodec.decodeStructure"
+            let constructionArguments = [
+                "__helix_\(record.codecIdentifier): ()",
+            ] + decodedFields
+            return """
+            static func encodeInput_\(record.codecIdentifier)(
+                _ value: \(swiftType),
+                using encoder: Runtime.BridgeValueCodec.Encoder
+            ) throws -> VM.Value {
+                try encoder.encodeStructure(
+                    type: \(render(record.key)),
+                    fieldTypes: \(renderValueTypes(fields.map(\.type)))
+                ) {
+                    \(renderArray(inputFields, indentation: 20))
+                }
+            }
+
+            static func encodeResult_\(record.codecIdentifier)(
+                _ value: \(swiftType)
+            ) throws -> VM.Value {
+                try Runtime.BridgeValueCodec.encodeStructure(
+                    type: \(render(record.key)),
+                    fieldTypes: \(renderValueTypes(fields.map(\.type))),
+                    fields: \(renderArray(resultFields, indentation: 20))
+                )
+            }
+
+            static func decode_\(record.codecIdentifier)(
+                _ value: VM.Value
+            ) throws -> \(swiftType) {
+                \(decodedBinding)(
+                    value,
+                    type: \(render(record.key)),
+                    fieldTypes: \(renderValueTypes(fields.map(\.type)))
+                )
+                return \(swiftType)(
+                    \(constructionArguments.joined(separator: ",\n        "))
+                )
+            }
+            """
+        case let .enumeration(cases):
+            let inputCases = try cases.enumerated().map { offset, item in
+                try renderFrozenEnumEncodeCase(
+                    item,
+                    caseIndex: offset,
+                    inputEncoder: "encoder",
+                    record: record,
+                    frozenValueTypes: frozenValueTypes
+                )
+            }
+            let resultCases = try cases.enumerated().map { offset, item in
+                try renderFrozenEnumEncodeCase(
+                    item,
+                    caseIndex: offset,
+                    inputEncoder: nil,
+                    record: record,
+                    frozenValueTypes: frozenValueTypes
+                )
+            }
+            let decodeCases = try cases.enumerated().map { offset, item in
+                try renderFrozenEnumDecodeCase(
+                    item,
+                    caseIndex: offset,
+                    frozenValueTypes: frozenValueTypes
+                )
+            }
+            let payloadTypes = cases.map { render($0.payloadType) }
+                .joined(separator: ", ")
+            return """
+            static func encodeInput_\(record.codecIdentifier)(
+                _ value: \(swiftType),
+                using encoder: Runtime.BridgeValueCodec.Encoder
+            ) throws -> VM.Value {
+                switch value {
+            \(indent(inputCases.joined(separator: "\n"), spaces: 4))
+                }
+            }
+
+            static func encodeResult_\(record.codecIdentifier)(
+                _ value: \(swiftType)
+            ) throws -> VM.Value {
+                switch value {
+            \(indent(resultCases.joined(separator: "\n"), spaces: 4))
+                }
+            }
+
+            static func decode_\(record.codecIdentifier)(
+                _ value: VM.Value
+            ) throws -> \(swiftType) {
+                let decoded = try Runtime.BridgeValueCodec.decodeEnumeration(
+                    value,
+                    type: \(render(record.key)),
+                    payloadTypes: [\(payloadTypes)]
+                )
+                switch decoded.caseIndex {
+            \(indent(decodeCases.joined(separator: "\n"), spaces: 4))
+                default:
+                    throw VM.RuntimeTrap.nativeFailure(
+                        "verified frozen enum decoder received an impossible case"
+                    )
+                }
+            }
+            """
+        }
+    }
+
+    private func renderFrozenEnumEncodeCase(
+        _ item: InterfaceArchive.FrozenEnumCase,
+        caseIndex: Int,
+        inputEncoder: String?,
+        record: InterfaceArchive.FrozenValueTypeRecord,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
+    ) throws -> String {
+        let caseName = escapedSwiftIdentifier(item.name)
+        let bindings = item.associatedValues.enumerated().map { offset, associated in
+            let label = associated.label.map {
+                escapedSwiftIdentifier($0) + ": "
+            } ?? ""
+            return label + "associated\(offset)"
+        }
+        let pattern = bindings.isEmpty
+            ? ".\(caseName)"
+            : "let .\(caseName)(\(bindings.joined(separator: ", ")))"
+        let encodedValues = try item.associatedValues.enumerated().map {
+            offset, associated in
+            renderEncode(
+                expression: "associated\(offset)",
+                shape: try parseSwiftType(associated.swiftType),
+                type: associated.type,
+                nativeCatalog: "try Runtime.Bridge.shared.requireNativeTypeCatalog()",
+                inputEncoder: inputEncoder,
+                frozenValueTypes: frozenValueTypes
+            )
+        }
+        let payload: String
+        if encodedValues.isEmpty {
+            payload = "nil"
+        } else if encodedValues.count == 1,
+                  item.associatedValues[0].label == nil {
+            payload = encodedValues[0]
+        } else if let inputEncoder {
+            payload = "try \(inputEncoder).encodeTuple(count: \(encodedValues.count)) { "
+                + "\(renderArray(encodedValues, indentation: 12)) }"
+        } else {
+            payload = "try Runtime.BridgeValueCodec.encodeTuple("
+                + "\(renderArray(encodedValues, indentation: 12)))"
+        }
+        let invocation: String
+        if let inputEncoder {
+            invocation = "try \(inputEncoder).encodeEnumeration("
+                + "type: \(render(record.key)), caseIndex: \(caseIndex), "
+                + "payloadType: \(render(item.payloadType))) { \(payload) }"
+        } else {
+            invocation = "try Runtime.BridgeValueCodec.encodeEnumeration("
+                + "type: \(render(record.key)), caseIndex: \(caseIndex), "
+                + "payloadType: \(render(item.payloadType)), payload: \(payload))"
+        }
+        return "case \(pattern):\n    return \(invocation)"
+    }
+
+    private func renderFrozenEnumDecodeCase(
+        _ item: InterfaceArchive.FrozenEnumCase,
+        caseIndex: Int,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
+    ) throws -> String {
+        let caseName = escapedSwiftIdentifier(item.name)
+        guard !item.associatedValues.isEmpty else {
+            return "case \(caseIndex):\n    return .\(caseName)"
+        }
+        let payloadValues: [String]
+        let prelude: [String]
+        if item.associatedValues.count == 1,
+           item.associatedValues[0].label == nil {
+            payloadValues = ["payload"]
+            prelude = [
+                "guard let payload = decoded.payload else {",
+                "    throw VM.RuntimeTrap.nativeFailure(\"verified frozen enum payload is missing\")",
+                "}",
+            ]
+        } else {
+            payloadValues = item.associatedValues.indices.map {
+                "payloadValues[\($0)]"
+            }
+            prelude = [
+                "guard let payload = decoded.payload else {",
+                "    throw VM.RuntimeTrap.nativeFailure(\"verified frozen enum payload is missing\")",
+                "}",
+                "let payloadValues = try Runtime.BridgeValueCodec.decodeTuple(",
+                "    payload, count: \(item.associatedValues.count)",
+                ")",
+            ]
+        }
+        let arguments = try zip(item.associatedValues, payloadValues).map {
+            associated, expression in
+            let decoded = renderDecode(
+                expression: expression,
+                shape: try parseSwiftType(associated.swiftType),
+                type: associated.type,
+                frozenValueTypes: frozenValueTypes
+            )
+            let label = associated.label.map {
+                escapedSwiftIdentifier($0) + ": "
+            } ?? ""
+            return label + decoded
+        }
+        return "case \(caseIndex):\n"
+            + indent(prelude.joined(separator: "\n"), spaces: 4)
+            + "\n    return .\(caseName)(\(arguments.joined(separator: ", ")))"
     }
 
     private func renderOriginalCatalogFactory(entryGroupNames: [String]) -> String {
@@ -1817,7 +2233,10 @@ public struct Generator: Sendable {
 
     private func renderDecodeResult(
         shape: SwiftTypeShape,
-        type: Bytecode.ValueType
+        type: Bytecode.ValueType,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
     ) -> String {
         if type == .void {
             return "{ value in try Runtime.BridgeValueCodec.decodeVoid(value); return () }"
@@ -1827,7 +2246,12 @@ public struct Generator: Sendable {
             guard let value else {
                 throw VM.RuntimeTrap.typeMismatch(expected: \(render(type)), actual: nil)
             }
-            return \(renderDecode(expression: "value", shape: shape, type: type))
+            return \(renderDecode(
+                expression: "value",
+                shape: shape,
+                type: type,
+                frozenValueTypes: frozenValueTypes
+            ))
         }
         """
     }
@@ -1837,7 +2261,10 @@ public struct Generator: Sendable {
         shape: SwiftTypeShape,
         type: Bytecode.ValueType,
         nativeCatalog: String,
-        inputEncoder: String? = nil
+        inputEncoder: String? = nil,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ] = [:]
     ) -> String {
         switch (shape, type) {
         case (.named, .any):
@@ -1864,6 +2291,18 @@ public struct Generator: Sendable {
             }
             return "try Runtime.BridgeValueCodec.encodeNative(\(expression), as: \(render(typeID)), "
                 + "catalog: \(nativeCatalog))"
+        case let (.named, .local(key)):
+            guard let record = frozenValueTypes[key] else {
+                preconditionFailure("validated frozen value requires a generated codec")
+            }
+            let group = BridgeGeneration.GeneratedNativeType.groupName(
+                sourceFileLogicalID: record.sourceFileLogicalID
+            )
+            if let inputEncoder {
+                return "try \(group).encodeInput_\(record.codecIdentifier)("
+                    + "\(expression), using: \(inputEncoder))"
+            }
+            return "try \(group).encodeResult_\(record.codecIdentifier)(\(expression))"
         case (.named, .error):
             if let inputEncoder {
                 return "try \(inputEncoder).encodeError(\(expression))"
@@ -1886,7 +2325,8 @@ public struct Generator: Sendable {
                 resultShape: resultShape,
                 signature: signature,
                 nativeCatalog: nativeCatalog,
-                inputEncoder: inputEncoder
+                inputEncoder: inputEncoder,
+                frozenValueTypes: frozenValueTypes
             )
             return "try \(inputEncoder).encodeOptional(\(expression)) { wrapped in "
                 + "\(encoded) }"
@@ -1896,7 +2336,8 @@ public struct Generator: Sendable {
                 shape: wrappedShape,
                 type: wrappedType,
                 nativeCatalog: nativeCatalog,
-                inputEncoder: inputEncoder
+                inputEncoder: inputEncoder,
+                frozenValueTypes: frozenValueTypes
             )
             if let inputEncoder {
                 return "try \(inputEncoder).encodeOptional(\(expression)) { wrapped in "
@@ -1910,7 +2351,8 @@ public struct Generator: Sendable {
                 shape: elementShape,
                 type: elementType,
                 nativeCatalog: nativeCatalog,
-                inputEncoder: inputEncoder
+                inputEncoder: inputEncoder,
+                frozenValueTypes: frozenValueTypes
             )
             if let inputEncoder {
                 return "try \(inputEncoder).encodeArray(\(expression), elementType: "
@@ -1924,14 +2366,16 @@ public struct Generator: Sendable {
                 shape: keyShape,
                 type: keyType,
                 nativeCatalog: nativeCatalog,
-                inputEncoder: inputEncoder
+                inputEncoder: inputEncoder,
+                frozenValueTypes: frozenValueTypes
             )
             let encodedValue = renderEncode(
                 expression: "value",
                 shape: valueShape,
                 type: valueType,
                 nativeCatalog: nativeCatalog,
-                inputEncoder: inputEncoder
+                inputEncoder: inputEncoder,
+                frozenValueTypes: frozenValueTypes
             )
             if let inputEncoder {
                 return "try \(inputEncoder).encodeDictionary(\(expression), keyType: "
@@ -1949,7 +2393,8 @@ public struct Generator: Sendable {
                 shape: elementShape,
                 type: elementType,
                 nativeCatalog: nativeCatalog,
-                inputEncoder: inputEncoder
+                inputEncoder: inputEncoder,
+                frozenValueTypes: frozenValueTypes
             )
             if let inputEncoder {
                 return "try \(inputEncoder).encodeSet(\(expression), elementType: "
@@ -1964,7 +2409,8 @@ public struct Generator: Sendable {
                     shape: pair.0,
                     type: pair.1,
                     nativeCatalog: nativeCatalog,
-                    inputEncoder: inputEncoder
+                    inputEncoder: inputEncoder,
+                    frozenValueTypes: frozenValueTypes
                 )
             }
             if let inputEncoder {
@@ -1989,7 +2435,8 @@ public struct Generator: Sendable {
                 resultShape: resultShape,
                 signature: signature,
                 nativeCatalog: nativeCatalog,
-                inputEncoder: inputEncoder
+                inputEncoder: inputEncoder,
+                frozenValueTypes: frozenValueTypes
             )
         case (.named, .void):
             return "try Runtime.BridgeValueCodec.encodeVoid(\(expression))"
@@ -2004,7 +2451,10 @@ public struct Generator: Sendable {
         resultShape: SwiftTypeShape,
         signature: Bytecode.ClosureSignature,
         nativeCatalog: String,
-        inputEncoder: String
+        inputEncoder: String,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ] = [:]
     ) -> String {
         precondition(parameterShapes.count == signature.parameters.count)
         let decoded = zip(parameterShapes, signature.parameters).enumerated().map {
@@ -2012,7 +2462,8 @@ public struct Generator: Sendable {
             "let nativeArgument\(index) = " + renderDecode(
                 expression: "nativeArguments[\(index)]",
                 shape: pair.0,
-                type: pair.1
+                type: pair.1,
+                frozenValueTypes: frozenValueTypes
             )
         }
         let arguments = parameterShapes.indices.map {
@@ -2031,7 +2482,8 @@ public struct Generator: Sendable {
                 shape: resultShape,
                 type: signature.result,
                 nativeCatalog: nativeCatalog,
-                inputEncoder: "nativeResultEncoder"
+                inputEncoder: "nativeResultEncoder",
+                frozenValueTypes: frozenValueTypes
             )
             invocation = "let nativeResult = \(isolatedCall)\nreturn \(encoded)"
         }
@@ -2048,7 +2500,10 @@ public struct Generator: Sendable {
     private func renderDecode(
         expression: String,
         shape: SwiftTypeShape,
-        type: Bytecode.ValueType
+        type: Bytecode.ValueType,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ] = [:]
     ) -> String {
         switch (shape, type) {
         case (.named, .any):
@@ -2063,16 +2518,31 @@ public struct Generator: Sendable {
         case let (.named(name), .native(typeID)):
             return "try Runtime.BridgeValueCodec.decodeNative(\(expression), as: \(name).self, "
                 + "typeID: \(render(typeID)))"
+        case let (.named, .local(key)):
+            guard let record = frozenValueTypes[key] else {
+                preconditionFailure("validated frozen value requires a generated codec")
+            }
+            let group = BridgeGeneration.GeneratedNativeType.groupName(
+                sourceFileLogicalID: record.sourceFileLogicalID
+            )
+            return "try \(group).decode_\(record.codecIdentifier)(\(expression))"
         case (.named, .error):
             return "try Runtime.BridgeValueCodec.decodeError(\(expression))"
         case let (.optional(wrappedShape), .optional(wrappedType)):
+            let decoded = renderDecode(
+                expression: "wrapped",
+                shape: wrappedShape,
+                type: wrappedType,
+                frozenValueTypes: frozenValueTypes
+            )
             return "try Runtime.BridgeValueCodec.decodeOptional(\(expression)) { wrapped in "
-                + "\(renderDecode(expression: "wrapped", shape: wrappedShape, type: wrappedType)) }"
+                + "\(decoded) }"
         case let (.array(elementShape), .array(elementType)):
             let decoded = renderDecode(
                 expression: "element",
                 shape: elementShape,
-                type: elementType
+                type: elementType,
+                frozenValueTypes: frozenValueTypes
             )
             return "try Runtime.BridgeValueCodec.decodeArray(\(expression), elementType: "
                 + "\(render(elementType))) { element in \(decoded) }"
@@ -2080,12 +2550,14 @@ public struct Generator: Sendable {
             let decodedKey = renderDecode(
                 expression: "key",
                 shape: keyShape,
-                type: keyType
+                type: keyType,
+                frozenValueTypes: frozenValueTypes
             )
             let decodedValue = renderDecode(
                 expression: "value",
                 shape: valueShape,
-                type: valueType
+                type: valueType,
+                frozenValueTypes: frozenValueTypes
             )
             return "try Runtime.BridgeValueCodec.decodeDictionary(\(expression), keyType: "
                 + "\(render(keyType)), valueType: \(render(valueType)), "
@@ -2095,7 +2567,8 @@ public struct Generator: Sendable {
             let decoded = renderDecode(
                 expression: "element",
                 shape: elementShape,
-                type: elementType
+                type: elementType,
+                frozenValueTypes: frozenValueTypes
             )
             return "try Runtime.BridgeValueCodec.decodeSet(\(expression), elementType: "
                 + "\(render(elementType))) { element in \(decoded) }"
@@ -2105,7 +2578,8 @@ public struct Generator: Sendable {
                 renderDecode(
                     expression: "\(temporary)[\(offset)]",
                     shape: pair.0,
-                    type: pair.1
+                    type: pair.1,
+                    frozenValueTypes: frozenValueTypes
                 )
             }
             return "try { () throws -> \(shape.rendered) in let \(temporary) = "
@@ -2118,6 +2592,10 @@ public struct Generator: Sendable {
 
     private func render(_ typeID: Core.TypeID) -> String {
         "Core.TypeID(rawValue: \(render(typeID.rawValue)))"
+    }
+
+    private func render(_ key: Bytecode.LocalTypeKey) -> String {
+        "Bytecode.LocalTypeKey(rawValue: \(quoted(key.rawValue)))"
     }
 
     private func indent(_ value: String, spaces: Int) -> String {
@@ -2530,6 +3008,9 @@ public struct Generator: Sendable {
             .filter(\.isEmittedToDevice)
             .sorted { $0.id.rawValue < $1.id.rawValue }
             .map(renderType)
+        let frozenValueTypes = archive.frozenValueTypes
+            .sorted { $0.key < $1.key }
+            .map(renderFrozenValueType)
         return """
             public static func makeShellInterface() throws -> Verification.ShellInterface {
                 try Verification.ShellInterface(
@@ -2538,7 +3019,8 @@ public struct Generator: Sendable {
                     capabilities: \(renderCapabilities(archive.capabilities)),
                     entries: \(renderArray(entries, indentation: 20)),
                     imports: \(renderArray(imports, indentation: 20)),
-                    types: \(renderArray(types, indentation: 20))
+                    types: \(renderArray(types, indentation: 20)),
+                    frozenValueTypes: \(renderArray(frozenValueTypes, indentation: 20))
                 )
             }
         """
@@ -2645,6 +3127,35 @@ public struct Generator: Sendable {
             estimatedSize: \(record.estimatedSize)
         )
         """
+    }
+
+    private func renderFrozenValueType(
+        _ record: InterfaceArchive.FrozenValueTypeRecord
+    ) -> String {
+        """
+        Verification.ResolvedFrozenValueType(
+            definition: \(render(record.definition)),
+            layoutFingerprint: \(render(record.layoutFingerprint)),
+            isCopyable: \(record.isCopyable)
+        )
+        """
+    }
+
+    private func render(_ definition: Bytecode.LocalTypeDefinition) -> String {
+        let kind: String = switch definition.kind {
+        case let .structure(fields):
+            ".structure(fields: [" + fields.map {
+                "Bytecode.LocalStructField(name: \(quoted($0.name)), type: \(render($0.type)))"
+            }.joined(separator: ", ") + "])"
+        case let .enumeration(cases):
+            ".enumeration(cases: [" + cases.map {
+                "Bytecode.LocalEnumCase(name: \(quoted($0.name)), payloadType: \(render($0.payloadType)))"
+            }.joined(separator: ", ") + "])"
+        case .class:
+            preconditionFailure("a frozen Shell value cannot be a class")
+        }
+        return "Bytecode.LocalTypeDefinition(key: \(render(definition.key)), "
+            + "kind: \(kind), conformsToError: \(definition.conformsToError))"
     }
 
     private func render(_ compatibility: Core.Compatibility) -> String {
@@ -2810,6 +3321,7 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case invalidRoot(Core.FunctionKey)
     case invalidSwiftType(String)
     case swiftTypeMismatch(Core.FunctionKey)
+    case frozenValueTypeMismatch(Bytecode.LocalTypeKey)
     case unsupportedIsolatedRoot(Core.FunctionKey)
     case incompleteNativeImportBindings
     case nativeImportBindingMismatch(Core.NativeImportID)
@@ -2826,6 +3338,8 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
         case let .invalidSwiftType(type): "bridge contains an invalid Swift type spelling: \(type)"
         case let .swiftTypeMismatch(key):
             "bridge Swift type metadata disagrees with the frozen value type for \(key)"
+        case let .frozenValueTypeMismatch(key):
+            "bridge codec metadata disagrees with frozen Shell value \(key)"
         case let .unsupportedIsolatedRoot(key):
             "bridge root \(key) uses an unsupported actor isolation; v1 accepts MainActor only for synchronous or non-suspending async entries"
         case .incompleteNativeImportBindings:

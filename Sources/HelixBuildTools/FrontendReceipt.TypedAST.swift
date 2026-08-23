@@ -74,7 +74,8 @@ enum ValueTypeParser {
     static func parse(
         _ spelling: String,
         allowVoid: Bool,
-        nativeTypes: [String: Core.TypeID] = [:]
+        nativeTypes: [String: Core.TypeID] = [:],
+        localTypes: [String: Bytecode.LocalTypeKey] = [:]
     ) -> Bytecode.ValueType? {
         let value = spelling.trimmingCharacters(in: .whitespacesAndNewlines)
         if let function = FrontendReceipt.FunctionTypeSpelling.parse(value) {
@@ -88,14 +89,16 @@ enum ValueTypeParser {
                 parse(
                     removeTupleLabel($0),
                     allowVoid: false,
-                    nativeTypes: nativeTypes
+                    nativeTypes: nativeTypes,
+                    localTypes: localTypes
                 )
             }
             guard parameters.count == function.parameters.count,
                   let result = parse(
                       function.result,
                       allowVoid: true,
-                      nativeTypes: nativeTypes
+                      nativeTypes: nativeTypes,
+                      localTypes: localTypes
                   )
             else { return nil }
             return .closure(
@@ -121,20 +124,31 @@ enum ValueTypeParser {
             return parse(
                 wrapped,
                 allowVoid: false,
-                nativeTypes: nativeTypes
+                nativeTypes: nativeTypes,
+                localTypes: localTypes
             ).map(Bytecode.ValueType.optional)
         }
         if value.hasPrefix("["), value.hasSuffix("]") {
             let body = String(value.dropFirst().dropLast())
             if let components = dictionaryComponents(body),
-               let key = parse(components.key, allowVoid: false, nativeTypes: nativeTypes),
-               let element = parse(components.value, allowVoid: false, nativeTypes: nativeTypes) {
+               let key = parse(
+                   components.key,
+                   allowVoid: false,
+                   nativeTypes: nativeTypes,
+                   localTypes: localTypes
+               ), let element = parse(
+                   components.value,
+                   allowVoid: false,
+                   nativeTypes: nativeTypes,
+                   localTypes: localTypes
+               ) {
                 return .dictionary(key: key, value: element)
             }
             return parse(
                 body,
                 allowVoid: false,
-                nativeTypes: nativeTypes
+                nativeTypes: nativeTypes,
+                localTypes: localTypes
             ).map(Bytecode.ValueType.array)
         }
         for prefix in ["Array<", "Swift.Array<"]
@@ -143,7 +157,8 @@ enum ValueTypeParser {
             return parse(
                 wrapped,
                 allowVoid: false,
-                nativeTypes: nativeTypes
+                nativeTypes: nativeTypes,
+                localTypes: localTypes
             ).map(Bytecode.ValueType.array)
         }
         for prefix in ["Set<", "Swift.Set<"]
@@ -152,7 +167,8 @@ enum ValueTypeParser {
             return parse(
                 wrapped,
                 allowVoid: false,
-                nativeTypes: nativeTypes
+                nativeTypes: nativeTypes,
+                localTypes: localTypes
             ).map(Bytecode.ValueType.set)
         }
         for prefix in ["Dictionary<", "Swift.Dictionary<"]
@@ -160,8 +176,17 @@ enum ValueTypeParser {
             let body = String(value.dropFirst(prefix.count).dropLast())
             let components = splitTopLevel(body)
             guard components.count == 2,
-                  let key = parse(components[0], allowVoid: false, nativeTypes: nativeTypes),
-                  let element = parse(components[1], allowVoid: false, nativeTypes: nativeTypes)
+                  let key = parse(
+                      components[0],
+                      allowVoid: false,
+                      nativeTypes: nativeTypes,
+                      localTypes: localTypes
+                  ), let element = parse(
+                      components[1],
+                      allowVoid: false,
+                      nativeTypes: nativeTypes,
+                      localTypes: localTypes
+                  )
             else { return nil }
             return .dictionary(key: key, value: element)
         }
@@ -173,7 +198,8 @@ enum ValueTypeParser {
                     parse(
                         removeTupleLabel($0),
                         allowVoid: false,
-                        nativeTypes: nativeTypes
+                        nativeTypes: nativeTypes,
+                        localTypes: localTypes
                     )
                 }
                 return elements.count == components.count ? .tuple(elements) : nil
@@ -182,7 +208,8 @@ enum ValueTypeParser {
                 return parse(
                     removeTupleLabel(only),
                     allowVoid: allowVoid,
-                    nativeTypes: nativeTypes
+                    nativeTypes: nativeTypes,
+                    localTypes: localTypes
                 )
             }
         }
@@ -194,6 +221,9 @@ enum ValueTypeParser {
             ? String(existential.dropFirst(6)) : existential
         if let id = nativeTypes[value] {
             return .native(id)
+        }
+        if let key = localTypes[value] {
+            return .local(key)
         }
         switch name {
         case "Bool": return .bool

@@ -33,7 +33,7 @@ struct SemanticVerifier {
 
         #expect(
             throws: Verification.Error.invalidShellInterface(
-                "patch-local nominal, internal storage, and closure values cannot appear in entry 0 signature"
+                "unfrozen local nominal Fixture.Local cannot appear in entry 0 signature"
             )
         ) {
             try Verification.ShellInterface(
@@ -55,6 +55,165 @@ struct SemanticVerifier {
                 bytes: Bytecode.Encoder.encode(fixture.module),
                 shell: mutatedShell,
                 policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("Frozen Shell values require an exact verified module definition")
+    func verifiesFrozenShellValueDefinition() throws {
+        var fixture = try makeFixture()
+        let key = Bytecode.LocalTypeKey(rawValue: "Fixture.Counter")
+        let definition = Bytecode.LocalTypeDefinition(
+            key: key,
+            kind: .structure(fields: [
+                .init(name: "value", type: .int64),
+            ])
+        )
+        fixture.module.localTypes = [definition]
+        fixture.module.capabilities.insert(.localNominalsV1)
+        fixture.module.functions[0].registerTypes = [.local(key)]
+        fixture.module.functions[0].resultType = .local(key)
+        fixture.shell = try Verification.ShellInterface(
+            interfaceHash: fixture.shell.interfaceHash,
+            compatibility: fixture.shell.compatibility,
+            capabilities: [.baselineV1, .localNominalsV1],
+            entries: [
+                .init(
+                    index: .init(rawValue: 0),
+                    key: try #require(fixture.shell.entries[.init(rawValue: 0)]).key,
+                    parameterTypes: [.local(key)],
+                    parameterConventions: [.owned],
+                    resultType: .local(key)
+                ),
+            ],
+            frozenValueTypes: [
+                .init(
+                    definition: definition,
+                    layoutFingerprint: .sha256("Fixture.Counter.layout")
+                ),
+            ]
+        )
+        fixture.policy.acceptedCapabilities.insert(.localNominalsV1)
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        fixture.module.localTypes[0].kind = .structure(fields: [
+            .init(name: "value", type: .bool),
+        ])
+        #expect(
+            throws: Verification.Error.invalidModule(
+                "local type \(key) disagrees with its frozen Shell value layout"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("Malformed frozen Shell value graphs fail at the trust boundary")
+    func rejectsMalformedFrozenShellValues() throws {
+        let fixture = try makeFixture()
+        let key = Bytecode.LocalTypeKey(rawValue: "Fixture.Value")
+        let compatibility = fixture.shell.compatibility
+
+        func reject(_ definition: Bytecode.LocalTypeDefinition) {
+            #expect(throws: Verification.Error.self) {
+                try Verification.ShellInterface(
+                    interfaceHash: fixture.shell.interfaceHash,
+                    compatibility: compatibility,
+                    capabilities: [.baselineV1, .localNominalsV1],
+                    frozenValueTypes: [
+                        .init(
+                            definition: definition,
+                            layoutFingerprint: .sha256("malformed")
+                        ),
+                    ]
+                )
+            }
+        }
+
+        reject(.init(key: key, kind: .enumeration(cases: [])))
+        reject(.init(
+            key: key,
+            kind: .structure(fields: [
+                .init(name: "value", type: .integer(bitWidth: 7, signed: true)),
+            ])
+        ))
+        reject(.init(
+            key: key,
+            kind: .structure(fields: [
+                .init(name: "next", type: .local(key)),
+            ])
+        ))
+        reject(.init(
+            key: key,
+            kind: .structure(fields: [
+                .init(name: "values", type: .array(.bool)),
+            ])
+        ))
+        reject(.init(
+            key: key,
+            kind: .structure(fields: [
+                .init(name: "values", type: .dictionary(key: .any, value: .bool)),
+            ])
+        ))
+        reject(.init(
+            key: key,
+            kind: .class(fields: [], hostedSuperclass: nil, hostedMethods: [])
+        ))
+
+        let errorDefinition = Bytecode.LocalTypeDefinition(
+            key: key,
+            kind: .enumeration(cases: [.init(name: "failed")]),
+            conformsToError: true
+        )
+        reject(errorDefinition)
+        _ = try Verification.ShellInterface(
+            interfaceHash: fixture.shell.interfaceHash,
+            compatibility: compatibility,
+            capabilities: [
+                .baselineV1, .localNominalsV1, .structuredErrorsV1,
+            ],
+            frozenValueTypes: [
+                .init(
+                    definition: errorDefinition,
+                    layoutFingerprint: .sha256("structured-error")
+                ),
+            ]
+        )
+
+        var deeplyNested: [Verification.ResolvedFrozenValueType] = []
+        for offset in (0..<17).reversed() {
+            let current = offset == 0
+                ? key
+                : Bytecode.LocalTypeKey(rawValue: "Fixture.Depth\(offset)")
+            let fieldType: Bytecode.ValueType = if offset == 16 {
+                .int64
+            } else {
+                .optional(.local(.init(rawValue: "Fixture.Depth\(offset + 1)")))
+            }
+            deeplyNested.append(.init(
+                definition: .init(
+                    key: current,
+                    kind: .structure(fields: [
+                        .init(name: "value", type: fieldType),
+                    ])
+                ),
+                layoutFingerprint: .sha256("depth-\(offset)")
+            ))
+        }
+        #expect(throws: Verification.Error.self) {
+            try Verification.ShellInterface(
+                interfaceHash: fixture.shell.interfaceHash,
+                compatibility: compatibility,
+                capabilities: [.baselineV1, .localNominalsV1],
+                frozenValueTypes: deeplyNested
             )
         }
     }

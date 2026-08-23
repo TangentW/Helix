@@ -52,6 +52,20 @@ Both workflows depend on stable, build-specific identities:
   native capabilities without embedding process pointers in a patch.
 - Interface and transitive implementation fingerprints distinguish a body
   edit from an ABI, layout, source-membership, or dependency change.
+- Eligible existing Shell structs and enums use a frozen logical-value
+  contract, not their private Swift ABI layout. The archive records exact
+  source-qualified identity, stored fields or enum cases, labels and order,
+  recursive Bridge types, copyability, supported conformance facts, and a
+  deterministic layout fingerprint that also participates in the device hash.
+  The build emits same-source private construction hooks so private
+  storage can be reconstructed legally; generated Bridge code streams fields
+  and cases through the ordinary bounded value codec. Release and patch
+  compilation both derive the source shape independently, and the Verifier
+  requires an exact match before a nonmutating ordinary, `borrowing`, or
+  `consuming` value receiver can become a root. No reflection, raw-memory
+  projection, runtime metadata, or Swift layout assumption is involved.
+  Mutable receiver/address writeback is a separate storage contract and stays
+  fail-closed until that contract is proven end to end.
 - Toolchain, SDK, target triple, compiler arguments, module source set, and
   binary identity bind every artifact to the Shell for which it was built.
 - Version 1 Shells advertise pure-VM String and Collection capabilities even
