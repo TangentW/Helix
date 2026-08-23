@@ -406,11 +406,22 @@ public struct Indexer: Sendable {
                 )
             }
         }
-        if candidate.hasInOut {
-            return .rejected(
-                "HLXIDX006",
-                explanation: "inout or mutating roots require frozen writeback support"
-            )
+        let inoutCount = candidate.parameterConventions.filter {
+            $0 == .inout
+        }.count
+        if candidate.hasInOut || inoutCount > 0 {
+            guard inoutCount == 1 else {
+                return .rejected(
+                    "HLXIDX006",
+                    explanation: "Shell roots require exactly one provable inout writeback region"
+                )
+            }
+            guard !candidate.isAsync else {
+                return .rejected(
+                    "HLXIDX006",
+                    explanation: "inout writeback cannot cross an async suspension boundary"
+                )
+            }
         }
         if candidate.isGeneric || candidate.interface.genericSignature != nil {
             return .rejected("HLXIDX007", explanation: "generic roots are not supported in HLBC v1")

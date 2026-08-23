@@ -166,10 +166,19 @@ public struct ShellInterface: Sendable {
             guard let entry = entries[index] else { continue }
             guard entry.parameterConventions.count
                     == entry.parameterTypes.count,
-                  !entry.parameterConventions.contains(.inout)
+                  entry.parameterConventions.filter({ $0 == .inout }).count <= 1,
+                  !(entry.effects.isAsync
+                    && entry.parameterConventions.contains(.inout))
             else {
                 throw Verification.Error.invalidShellInterface(
                     "entry \(entry.index) has invalid parameter ownership"
+                )
+            }
+            if entry.parameterConventions.contains(.inout),
+               !capabilities.contains(.addressValuesV1) {
+                throw Verification.Error.invalidShellInterface(
+                    "entry \(entry.index) uses writeback without "
+                        + "\(Core.Capability.addressValuesV1)"
                 )
             }
             if entry.parameterConventions.contains(.borrowed),

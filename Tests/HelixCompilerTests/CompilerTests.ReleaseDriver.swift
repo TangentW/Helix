@@ -1964,8 +1964,8 @@ struct ReleaseDriver {
         }
     }
 
-    @Test("A changed inout helper pulls its unchanged patchable caller into one image")
-    func buildsPatchLocalInoutDependencyClosure() throws {
+    @Test("A changed inout root lowers to one transactional writeback entry")
+    func buildsTransactionalInoutRoot() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "helix-release-inout-helper-\(UUID().uuidString)",
@@ -2011,12 +2011,11 @@ struct ReleaseDriver {
         let helper = try #require(
             archive.functions.first { $0.canonicalDeclaration.contains("helper") }
         )
-        let entry = try #require(transform.entryIndex)
+        let entry = try #require(helper.entryIndex)
 
         #expect(transform.patchability.isEligible)
-        #expect(!helper.patchability.isEligible)
-        #expect(helper.patchability.reasonCode == "HLXIDX006")
-        #expect(helper.entryIndex == nil)
+        #expect(helper.patchability.isEligible)
+        #expect(helper.patchability.reasonCode == nil)
         #expect(helper.parameterConventions == [.inout, .owned])
         #expect(archive.capabilities.contains(.addressValuesV1))
 
@@ -2037,36 +2036,39 @@ struct ReleaseDriver {
             .init(archive: archive, sourceFiles: [sourceURL])
         )
 
-        #expect(result.module.functions.count == 2)
+        #expect(result.module.functions.count == 1)
         #expect(result.module.entries.count == 1)
         #expect(result.module.capabilities.contains(.addressValuesV1))
-        #expect(result.disassembly.contains("stack_address"))
-        #expect(result.disassembly.contains("begin_access.modify"))
+        #expect(result.disassembly.contains("@inout @address<Int64>"))
+        #expect(result.disassembly.contains("load_address.copy"))
         #expect(result.disassembly.contains("store_address.assign"))
-        #expect(result.disassembly.contains("hlbc_apply @"))
-        let localHelper = try #require(
+        let writebackRoot = try #require(
             result.module.functions.first { $0.parameterConventions.contains(.inout) }
         )
-        #expect(!result.module.entries.contains { $0.functionID == localHelper.id })
+        #expect(result.module.entries.contains { $0.functionID == writebackRoot.id })
 
         let image = try Verification.Engine().verify(
             bytes: result.bytecode,
             shell: Verification.ShellInterface(archive: archive),
             policy: .init(acceptedCapabilities: Set(archive.capabilities))
         )
-        #expect(
-            VM.Interpreter().invoke(
-                entry: entry,
-                image: image,
-                arguments: [
-                    .integer(
-                        try VM.Integer(signed: 3, bitWidth: 64, isSigned: true)
-                    ),
-                ]
-            ) == .returned(
-                .integer(try VM.Integer(signed: 9, bitWidth: 64, isSigned: true))
-            )
+        let invocation = VM.Interpreter().invokeEntry(
+            entry: entry,
+            image: image,
+            arguments: [
+                .integer(try VM.Integer(signed: 3, bitWidth: 64, isSigned: true)),
+                .integer(try VM.Integer(signed: 2, bitWidth: 64, isSigned: true)),
+            ]
         )
+        #expect(invocation.outcome == .returned(nil))
+        #expect(invocation.writebacks == [
+            .init(
+                parameterIndex: 0,
+                value: .integer(
+                    try VM.Integer(signed: 9, bitWidth: 64, isSigned: true)
+                )
+            ),
+        ])
     }
 
     @Test("Production Onone patches link local closure helpers and closure bodies")

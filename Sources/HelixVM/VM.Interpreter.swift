@@ -59,6 +59,12 @@ private enum FrameOutcome {
     case returned(VM.Value?)
 }
 
+private struct RootWritebackRegion {
+    var parameterIndex: UInt32
+    var address: VM.Address
+    var pointee: Bytecode.ValueType
+}
+
 extension VM {
 public struct Interpreter: Sendable {
     public var nativeCatalog: VM.NativeCatalog
@@ -105,6 +111,29 @@ public struct Interpreter: Sendable {
         )
     }
 
+    public func invokeEntry(
+        entry: Core.EntryIndex,
+        image: Verification.Image,
+        arguments: [VM.Value],
+        budget: VM.InvocationBudget? = nil,
+        rootContext: VM.RootExecutionContext = .synchronous
+    ) -> VM.EntryInvocationResult {
+        guard let mapping = image.module.entries.first(where: {
+            $0.entryIndex == entry
+        }) else {
+            let trap = VM.RuntimeTrap.unknownEntry(entry)
+            trapObserver?(.init(trap: trap, programCounter: nil))
+            return .trapped(trap)
+        }
+        return invokeEntry(
+            function: mapping.functionID,
+            image: image,
+            arguments: arguments,
+            budget: budget,
+            rootContext: rootContext
+        )
+    }
+
     public func invoke(
         function: Bytecode.FunctionID,
         image: Verification.Image,
@@ -112,7 +141,41 @@ public struct Interpreter: Sendable {
         budget: VM.InvocationBudget? = nil,
         rootContext: VM.RootExecutionContext = .synchronous
     ) -> VM.ExecutionResult {
+        if image.module.functions.first(where: { $0.id == function })?
+            .parameterConventions.contains(.inout) == true {
+            let trap = VM.RuntimeTrap.explicit(
+                "an inout Shell entry requires the writeback-aware invocation API"
+            )
+            trapObserver?(.init(trap: trap, programCounter: nil))
+            return .trapped(trap)
+        }
+        let invocation = invokeEntry(
+            function: function,
+            image: image,
+            arguments: arguments,
+            budget: budget,
+            rootContext: rootContext
+        )
+        guard invocation.writebacks.isEmpty else {
+            return .trapped(.explicit(
+                "an inout Shell entry requires the writeback-aware invocation API"
+            ))
+        }
+        return invocation.outcome
+    }
+
+    /// Invokes one verified entry function from logical boundary values and
+    /// returns its complete copy-out set. Address capabilities are created and
+    /// retired entirely inside HLVM; callers never manufacture VM addresses.
+    package func invokeEntry(
+        function: Bytecode.FunctionID,
+        image: Verification.Image,
+        arguments: [VM.Value],
+        budget: VM.InvocationBudget? = nil,
+        rootContext: VM.RootExecutionContext = .synchronous
+    ) -> VM.EntryInvocationResult {
         let trace = ExecutionTrace()
+        var writebackRegions: [RootWritebackRegion] = []
         do {
             try validate(image: image)
             let resolvedBudget = budget ?? VM.InvocationBudget(limits: image.effectiveResourceLimits)
@@ -133,28 +196,58 @@ public struct Interpreter: Sendable {
             guard !rootFunction.effects.requiresMainActor || Thread.isMainThread else {
                 throw VM.RuntimeTrap.mainActorViolation
             }
-            guard !rootFunction.parameterConventions.contains(.inout),
-                  !rootFunction.parameterRegisters.contains(where: {
-                      guard let type = rootFunction.type(of: $0) else { return false }
-                      return switch type {
-                      case .address, .mutableCell, .nonOwningReference,
-                           .arrayState,
-                           .dictionaryState: true
-                      default: false
-                      }
-                  })
+            guard rootFunction.parameterConventions.count
+                    == rootFunction.parameterRegisters.count,
+                  arguments.count == rootFunction.parameterRegisters.count
             else {
-                throw VM.RuntimeTrap.explicit(
-                    "internal storage values cannot cross the root invocation boundary"
-                )
-            }
-            guard arguments.count == rootFunction.parameterRegisters.count else {
                 throw VM.RuntimeTrap.typeMismatch(
-                    expected: .tuple(rootFunction.parameterRegisters.map { rootFunction.type(of: $0)! }),
+                    expected: .tuple(
+                        rootFunction.parameterRegisters.compactMap {
+                            rootFunction.type(of: $0)
+                        }
+                    ),
                     actual: .tuple(arguments.map(\.type))
                 )
             }
-            for (register, value) in zip(rootFunction.parameterRegisters, arguments) {
+
+            let inoutCount = rootFunction.parameterConventions.reduce(into: 0) {
+                if $1 == .inout { $0 += 1 }
+            }
+            guard inoutCount <= 1 else {
+                throw VM.RuntimeTrap.explicit(
+                    "a Shell entry may expose at most one inout writeback region"
+                )
+            }
+
+            var physicalArguments: [VM.Value] = []
+            physicalArguments.reserveCapacity(arguments.count)
+            for parameterIndex in rootFunction.parameterRegisters.indices {
+                let register = rootFunction.parameterRegisters[parameterIndex]
+                let convention = rootFunction.parameterConventions[parameterIndex]
+                let value = arguments[parameterIndex]
+                guard let physicalType = rootFunction.type(of: register) else {
+                    throw VM.RuntimeTrap.invalidProgramCounter
+                }
+                let logicalType: Bytecode.ValueType
+                switch convention {
+                case .owned, .borrowed:
+                    guard !isInternalStorageType(physicalType) else {
+                        throw VM.RuntimeTrap.explicit(
+                            "internal storage values cannot cross the root invocation boundary"
+                        )
+                    }
+                    logicalType = physicalType
+                case .inout:
+                    guard case let .address(pointee) = physicalType,
+                          !isInternalStorageType(pointee)
+                    else {
+                        throw VM.RuntimeTrap.explicit(
+                            "a root inout parameter must be one logical value address"
+                        )
+                    }
+                    logicalType = pointee
+                }
+
                 if case .object = value,
                    rootContext.permitsPatchLocalObjectArguments {
                     // The Runtime reconstructed this identity from storage
@@ -166,31 +259,126 @@ public struct Interpreter: Sendable {
                 }
                 try validateRuntimeValue(
                     value,
-                    expected: rootFunction.type(of: register)!,
+                    expected: logicalType,
                     localTypes: localTypes,
                     budget: resolvedBudget
                 )
                 try resolvedBudget.checkDeadline()
+
+                switch convention {
+                case .owned, .borrowed:
+                    physicalArguments.append(value)
+                case .inout:
+                    guard let parameterIndex = UInt32(exactly: parameterIndex) else {
+                        throw VM.RuntimeTrap.vmHeapLimitExceeded
+                    }
+                    let cell = VM.MemoryCell(
+                        value,
+                        storageShape: try storageShape(
+                            logicalType,
+                            localTypes: localTypes
+                        )
+                    )
+                    let address = try VM.Address(
+                        cell: cell,
+                        pointee: logicalType
+                    ).begin(.modify)
+                    writebackRegions.append(
+                        .init(
+                            parameterIndex: parameterIndex,
+                            address: address,
+                            pointee: logicalType
+                        )
+                    )
+                    physicalArguments.append(.address(address))
+                }
             }
-            let value = try execute(
-                functionID: function,
-                functions: functions,
-                arguments: arguments,
-                entries: image.shell.entries,
+
+            let outcome: VM.ExecutionResult
+            do {
+                let value = try execute(
+                    functionID: function,
+                    functions: functions,
+                    arguments: physicalArguments,
+                    entries: image.shell.entries,
+                    localTypes: localTypes,
+                    budget: resolvedBudget,
+                    trace: trace
+                )
+                outcome = .returned(value)
+            } catch let business as VM.BusinessError {
+                outcome = .businessError(business.message)
+            }
+            return try finishRootInvocation(
+                outcome,
+                regions: &writebackRegions,
                 localTypes: localTypes,
-                budget: resolvedBudget,
-                trace: trace
+                budget: resolvedBudget
             )
-            return .returned(value)
-        } catch let business as VM.BusinessError {
-            return .businessError(business.message)
         } catch let trap as VM.RuntimeTrap {
+            discardRootWritebackRegions(&writebackRegions)
             trapObserver?(.init(trap: trap, programCounter: trace.programCounter))
             return .trapped(trap)
         } catch {
+            discardRootWritebackRegions(&writebackRegions)
             let trap = VM.RuntimeTrap.nativeFailure(String(describing: error))
             trapObserver?(.init(trap: trap, programCounter: trace.programCounter))
             return .trapped(trap)
+        }
+    }
+
+    private func finishRootInvocation(
+        _ outcome: VM.ExecutionResult,
+        regions: inout [RootWritebackRegion],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget
+    ) throws -> VM.EntryInvocationResult {
+        let completedRegions = regions
+        for region in completedRegions {
+            try region.address.end()
+        }
+        regions.removeAll(keepingCapacity: true)
+
+        guard case .trapped = outcome else {
+            var writebacks: [VM.EntryWriteback] = []
+            writebacks.reserveCapacity(completedRegions.count)
+            for region in completedRegions {
+                let value = try region.address.cell.directTake()
+                try validateRuntimeValue(
+                    value,
+                    expected: region.pointee,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+                try budget.checkDeadline()
+                writebacks.append(
+                    .init(
+                        parameterIndex: region.parameterIndex,
+                        value: value
+                    )
+                )
+            }
+            return .init(outcome: outcome, writebacks: writebacks)
+        }
+        return .init(outcome: outcome)
+    }
+
+    private func discardRootWritebackRegions(
+        _ regions: inout [RootWritebackRegion]
+    ) {
+        for region in regions where region.address.isScoped {
+            try? region.address.end()
+        }
+        regions.removeAll(keepingCapacity: true)
+    }
+
+    private func isInternalStorageType(_ type: Bytecode.ValueType) -> Bool {
+        switch type {
+        case .address, .mutableCell, .nonOwningReference, .arrayState,
+             .dictionaryState:
+            true
+        default:
+            false
         }
     }
 
@@ -364,6 +552,7 @@ public struct Interpreter: Sendable {
                     entry: entry,
                     arguments: callValues,
                     descriptor: entryDescriptor,
+                    localTypes: localTypes,
                     budget: budget
                 )
             case let .bytecode(.nativeImport(importID)):
@@ -4502,6 +4691,7 @@ public struct Interpreter: Sendable {
                         entry: entry,
                         arguments: values,
                         descriptor: descriptor,
+                        localTypes: localTypes,
                         budget: budget
                     ) {
                     case let .returned(value):
@@ -4758,6 +4948,7 @@ public struct Interpreter: Sendable {
                             entry: entry,
                             arguments: callValues,
                             descriptor: descriptor,
+                            localTypes: localTypes,
                             budget: budget
                         ) {
                         case let .returned(value):
@@ -5000,6 +5191,7 @@ public struct Interpreter: Sendable {
                             entry: entry,
                             arguments: callValues,
                             descriptor: descriptor,
+                            localTypes: localTypes,
                             budget: budget
                         ) {
                         case let .returned(value):
@@ -5192,6 +5384,7 @@ public struct Interpreter: Sendable {
                         entry: entry,
                         arguments: values,
                         descriptor: descriptor,
+                        localTypes: localTypes,
                         budget: budget
                     ) {
                     case let .returned(value):
@@ -5478,15 +5671,26 @@ public struct Interpreter: Sendable {
         let boundaryErrorMatches = !descriptor.effects.mayThrow
             || signature.thrownType == .string
             || signature.thrownType == .error
+        guard descriptor.parameterConventions.count
+                == descriptor.parameterTypes.count
+        else {
+            throw VM.RuntimeTrap.nativeFailure(
+                "\(operation) disagrees with its callable ABI"
+            )
+        }
+        let physicalParameterTypes = zip(
+            descriptor.parameterTypes,
+            descriptor.parameterConventions
+        ).map { type, convention in
+            convention == .inout ? Bytecode.ValueType.address(type) : type
+        }
         guard signature.hasCanonicalCallableEffects,
               signature.hasCanonicalThrownType,
               !descriptor.effects.isAsync,
               throwingRequirementMatches,
               boundaryErrorMatches,
-              descriptor.parameterTypes
+              physicalParameterTypes
                 == signature.parameters + closure.captures.map(\.type),
-              descriptor.parameterConventions.count
-                == descriptor.parameterTypes.count,
               Array(descriptor.parameterConventions.prefix(
                 signature.parameters.count
               )) == signature.parameterConventions,
@@ -5582,18 +5786,106 @@ public struct Interpreter: Sendable {
         entry: Core.EntryIndex,
         arguments: [VM.Value],
         descriptor: Verification.ResolvedEntry,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
         budget: VM.InvocationBudget
     ) throws -> VM.ExecutionResult {
+        guard arguments.count == descriptor.parameterTypes.count,
+              descriptor.parameterConventions.count
+                == descriptor.parameterTypes.count
+        else {
+            throw VM.RuntimeTrap.nativeFailure(
+                "Shell entry \(entry) received an invalid call shape"
+            )
+        }
+
+        var logicalArguments: [VM.Value] = []
+        logicalArguments.reserveCapacity(arguments.count)
+        var writebackAddresses: [UInt32: VM.Address] = [:]
+        for parameterIndex in arguments.indices {
+            let argument = arguments[parameterIndex]
+            let logicalType = descriptor.parameterTypes[parameterIndex]
+            let convention = descriptor.parameterConventions[parameterIndex]
+            switch convention {
+            case .owned, .borrowed:
+                try validateRuntimeValue(
+                    argument,
+                    expected: logicalType,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+                logicalArguments.append(argument)
+            case .inout:
+                guard writebackAddresses.isEmpty,
+                      case let .address(address) = argument,
+                      address.pointee == logicalType,
+                      address.canModify,
+                      let parameterIndex = UInt32(exactly: parameterIndex)
+                else {
+                    throw VM.RuntimeTrap.nativeFailure(
+                        "Shell entry \(entry) has an invalid or aliased inout region"
+                    )
+                }
+                let value = try copyCharging(address.read(), budget: budget)
+                try validateRuntimeValue(
+                    value,
+                    expected: logicalType,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+                logicalArguments.append(value)
+                writebackAddresses[parameterIndex] = address
+            }
+        }
+
         try budget.checkDeadline()
-        let outcome = invocation(entry, arguments, budget)
+        let result = invocation(entry, logicalArguments, budget)
         try budget.checkDeadline()
-        if case .businessError = outcome,
+        if case .businessError = result.outcome,
            !descriptor.effects.mayThrow {
             throw VM.RuntimeTrap.nativeFailure(
                 "nonthrowing Shell entry \(entry) returned a business error"
             )
         }
-        return outcome
+
+        let expectedWritebackIndices = Set(writebackAddresses.keys)
+        let actualWritebackIndices = result.writebacks.map(\.parameterIndex)
+        let hasValidWritebacks = switch result.outcome {
+        case .trapped:
+            result.writebacks.isEmpty
+        case .returned, .businessError:
+            Set(actualWritebackIndices).count == actualWritebackIndices.count
+                && Set(actualWritebackIndices) == expectedWritebackIndices
+        }
+        guard hasValidWritebacks else {
+            throw VM.RuntimeTrap.nativeFailure(
+                "Shell entry \(entry) returned an invalid writeback set"
+            )
+        }
+
+        var validatedWritebacks: [(VM.Address, VM.Value)] = []
+        validatedWritebacks.reserveCapacity(result.writebacks.count)
+        for writeback in result.writebacks {
+            guard let parameterIndex = Int(exactly: writeback.parameterIndex),
+                  descriptor.parameterTypes.indices.contains(parameterIndex),
+                  let address = writebackAddresses[writeback.parameterIndex]
+            else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "Shell entry \(entry) returned an invalid writeback index"
+                )
+            }
+            try validateRuntimeValue(
+                writeback.value,
+                expected: descriptor.parameterTypes[parameterIndex],
+                localTypes: localTypes,
+                budget: budget
+            )
+            validatedWritebacks.append((address, writeback.value))
+        }
+        try budget.checkDeadline()
+        for (address, value) in validatedWritebacks {
+            try address.store(value, mode: .assign)
+        }
+        return result.outcome
     }
 
     private func validateRuntimeValue(

@@ -390,12 +390,14 @@ struct NativeCallback {
                     index: entry,
                     parameterTypes: [],
                     resultType: .void,
+                    effects: effects,
                     invoke: { _ in .returned(nil) }
                 ),
                 .init(
                     index: callbackEntry,
                     parameterTypes: [.int64],
                     resultType: callbackSignature.result,
+                    effects: effects,
                     invoke: { arguments in
                         guard arguments.count == 1,
                               case let .integer(value) = arguments[0]

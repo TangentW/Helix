@@ -18,6 +18,11 @@ extension CompilerCapabilities {
         }) {
             capabilities.insert(.borrowCallsV1)
         }
+        if entryParameterConventions.values.contains(where: {
+            $0.contains(.inout)
+        }) {
+            capabilities.insert(.addressValuesV1)
+        }
         for function in functions {
             switch function.kind {
             case .ordinary:

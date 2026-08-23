@@ -322,7 +322,7 @@ public typealias EntryInvocation = @Sendable (
     _ entry: Core.EntryIndex,
     _ arguments: [VM.Value],
     _ budget: VM.InvocationBudget
-) -> VM.ExecutionResult
+) -> VM.EntryInvocationResult
 }
 
 private extension NSLock {

@@ -34,7 +34,7 @@ public enum BridgeRoutingResult: Equatable, Sendable {
     /// No active route exists, or safe encoding fallback selected original code.
     case originalRequired
     /// Patched code executed and produced a VM-level result.
-    case executed(VM.ExecutionResult)
+    case executed(VM.EntryInvocationResult)
 }
 
 /// Executes verified HLBC generations and routes instrumented App entry points.
@@ -50,7 +50,7 @@ public final class Engine: @unchecked Sendable {
 
     private enum InvocationOutcome {
         case originalRequired
-        case executed(VM.ExecutionResult)
+        case executed(VM.EntryInvocationResult)
     }
 
     /// Frozen Shell interface identity, required for generated Bridge installation.
@@ -125,7 +125,28 @@ public final class Engine: @unchecked Sendable {
     /// Generated Swift bridges use lazy encoding so original calls avoid bridge
     /// allocation when no patch route exists.
     public func invoke(entry: Core.EntryIndex, arguments: [VM.Value]) -> VM.ExecutionResult {
-        executionResult(
+        guard originals[entry]?.parameterConventions.contains(.inout) != true else {
+            return .trapped(.explicit(
+                "an inout Shell entry requires the writeback-aware invocation API"
+            ))
+        }
+        let result = entryInvocationResult(
+            invoke(entry: entry, arguments: arguments, originalResolution: .catalog)
+        )
+        guard result.writebacks.isEmpty else {
+            return .trapped(.explicit(
+                "an inout Shell entry requires the writeback-aware invocation API"
+            ))
+        }
+        return result.outcome
+    }
+
+    /// Invokes one Shell entry and returns its complete logical copy-out set.
+    public func invokeEntry(
+        entry: Core.EntryIndex,
+        arguments: [VM.Value]
+    ) -> VM.EntryInvocationResult {
+        entryInvocationResult(
             invoke(entry: entry, arguments: arguments, originalResolution: .catalog)
         )
     }
@@ -273,7 +294,7 @@ public final class Engine: @unchecked Sendable {
                 guard nestedBudget === budget else {
                     return .trapped(.explicit("nested entry attempted to replace the root invocation budget"))
                 }
-                return self.executionResult(
+                return self.entryInvocationResult(
                     self.invokePinned(
                         entry: nestedEntry,
                         arguments: nestedArguments,
@@ -294,16 +315,18 @@ public final class Engine: @unchecked Sendable {
             ),
             trapObserver: trapObserver
         )
-        let result = interpreter.invoke(
+        let result = interpreter.invokeEntry(
             function: route.functionID,
             image: route.image,
             arguments: arguments,
             budget: budget,
             rootContext: originalResolution == .signalBridge
-                ? .generatedAsyncBridge
-                : .synchronous
+                ? VM.RootExecutionContext.generatedAsyncBridge
+                : VM.RootExecutionContext.synchronous
         )
-        guard case let .trapped(trap) = result else { return .executed(result) }
+        guard case let .trapped(trap) = result.outcome else {
+            return .executed(result)
+        }
 
         if isRuntimeInvariantViolation(trap) {
             let activeBeforeQuarantine = registry.snapshot().activeGenerationID
@@ -375,7 +398,7 @@ public final class Engine: @unchecked Sendable {
                             .explicit("hosted invocation attempted to replace its root budget")
                         )
                     }
-                    return self.executionResult(
+                    return self.entryInvocationResult(
                         self.invokePinned(
                             entry: nestedEntry,
                             arguments: nestedArguments,
@@ -510,7 +533,7 @@ public final class Engine: @unchecked Sendable {
                             .explicit("native callback attempted to replace its invocation budget")
                         )
                     }
-                    return self.executionResult(
+                    return self.entryInvocationResult(
                         self.invokePinned(
                             entry: entry,
                             arguments: values,
@@ -652,6 +675,9 @@ public final class Engine: @unchecked Sendable {
             return .executed(.trapped(.unknownEntry(entry)))
         }
         guard arguments.count == original.parameterTypes.count,
+              original.parameterConventions.count
+                == original.parameterTypes.count,
+              original.parameterConventions.filter({ $0 == .inout }).count <= 1,
               zip(arguments, original.parameterTypes).allSatisfy({ $0.matches($1) })
         else {
             return .executed(
@@ -662,7 +688,42 @@ public final class Engine: @unchecked Sendable {
             return .originalRequired
         }
         let result = original.invoke(arguments)
-        if case let .returned(value) = result {
+        let expectedWritebacks = Set(
+            original.parameterConventions.indices.compactMap { index in
+                original.parameterConventions[index] == .inout
+                    ? UInt32(exactly: index) : nil
+            }
+        )
+        let actualWritebacks = result.writebacks.map(\.parameterIndex)
+        let writebackSetIsValid = switch result.outcome {
+        case .trapped:
+            result.writebacks.isEmpty
+        case .returned, .businessError:
+            Set(actualWritebacks).count == actualWritebacks.count
+                && Set(actualWritebacks) == expectedWritebacks
+        }
+        guard writebackSetIsValid else {
+            return .executed(.trapped(.nativeFailure(
+                "original entry \(entry) returned an invalid writeback set"
+            )))
+        }
+        for writeback in result.writebacks {
+            guard let index = Int(exactly: writeback.parameterIndex),
+                  original.parameterTypes.indices.contains(index),
+                  writeback.value.matches(original.parameterTypes[index])
+            else {
+                return .executed(.trapped(.nativeFailure(
+                    "original entry \(entry) returned an invalid writeback value"
+                )))
+            }
+        }
+        if case .businessError = result.outcome,
+           !original.effects.mayThrow {
+            return .executed(.trapped(.nativeFailure(
+                "nonthrowing original entry \(entry) returned a business error"
+            )))
+        }
+        if case let .returned(value) = result.outcome {
             if original.resultType == .void, value != nil {
                 return .executed(
                     .trapped(.nativeFailure("Void original entry \(entry) returned a value"))
@@ -683,10 +744,23 @@ public final class Engine: @unchecked Sendable {
                 }
             }
         }
+        if let budget {
+            do {
+                for writeback in result.writebacks {
+                    try budget.consumeBoundaryValue(writeback.value)
+                }
+            } catch let trap as VM.RuntimeTrap {
+                return .executed(.trapped(trap))
+            } catch {
+                return .executed(.trapped(.nativeFailure(String(describing: error))))
+            }
+        }
         return .executed(result)
     }
 
-    private func executionResult(_ outcome: InvocationOutcome) -> VM.ExecutionResult {
+    private func entryInvocationResult(
+        _ outcome: InvocationOutcome
+    ) -> VM.EntryInvocationResult {
         switch outcome {
         case let .executed(result):
             result
@@ -723,7 +797,10 @@ public final class Engine: @unchecked Sendable {
                     )
                 }
                 guard original.parameterTypes == shellEntry.parameterTypes,
+                      original.parameterConventions
+                        == shellEntry.parameterConventions,
                       original.resultType == shellEntry.resultType,
+                      original.effects == shellEntry.effects,
                       original.fallbackAllowed == shellEntry.fallbackAllowed
                 else {
                     throw Runtime.ActivationError.invalidGeneration(

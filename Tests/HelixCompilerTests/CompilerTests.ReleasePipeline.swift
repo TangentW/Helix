@@ -937,7 +937,7 @@ struct ReleasePipeline {
         #expect(entrySource.contains("encoder.encodeSet"))
         #expect(entrySource.contains("return try risky(x)"))
         #expect(entrySource.contains("MainActor.assumeIsolated"))
-        #expect(entrySource.contains("return .businessError"))
+        #expect(entrySource.contains("outcome: .businessError"))
         #expect(entrySource.contains("BridgeValueCodec.encodeArray"))
         #expect(entrySource.contains("BridgeValueCodec.decodeArray"))
         #expect(entrySource.contains("BridgeValueCodec.encodeDictionary"))
@@ -1330,7 +1330,7 @@ struct ReleasePipeline {
                 }
                 let input = try Runtime.BridgeValueCodec.encode(Int(9))
                 mark("catalog")
-                guard case let .returned(value) = original.invoke([input]),
+                guard case let .returned(value) = original.invoke([input]).outcome,
                       let value,
                       try Runtime.BridgeValueCodec.decode(value, as: Int.self) == 36
                 else {

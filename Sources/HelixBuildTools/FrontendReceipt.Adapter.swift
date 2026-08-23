@@ -1729,11 +1729,6 @@ extension FrontendReceipt.Adapter {
             baseName: baseName,
             labels: labels
         )
-        let originalArguments = Self.arguments(labels: labels, values: parameterNames)
-        let bridgeArguments = Self.arguments(
-            labels: labels,
-            values: parameterNames.indices.map { "argument\($0)" }
-        )
         let attributes = item["attrs"] as? [[String: Any]] ?? []
         let attributeKinds = Set(attributes.compactMap { $0["_kind"] as? String })
         let customAttributeItems = attributes.filter {
@@ -1831,6 +1826,27 @@ extension FrontendReceipt.Adapter {
         ).parseParameterConventions(
             sil.loweredType,
             parameterTypes: bridgedParameterTypes
+        )
+        guard bridgedParameterConventions.count == bridgedParameterTypes.count else {
+            throw FrontendReceipt.Error.malformedAST(
+                "\(mangledName) has an inconsistent canonical ownership signature"
+            )
+        }
+        let explicitParameterConventions = bridgedParameterConventions.prefix(
+            parameterNames.count
+        )
+        let originalArguments = Self.arguments(
+            labels: labels,
+            values: zip(parameterNames, explicitParameterConventions).map {
+                $0.1 == .inout ? "&\($0.0)" : $0.0
+            }
+        )
+        let bridgeArguments = Self.arguments(
+            labels: labels,
+            values: zip(
+                parameterNames.indices.map { "argument\($0)" },
+                explicitParameterConventions
+            ).map { $0.1 == .inout ? "&\($0.0)" : $0.0 }
         )
         let effects = Core.Effects(
             mayThrow: mayThrow,
@@ -2056,8 +2072,14 @@ extension FrontendReceipt.Adapter {
             nativeReplacement: nativeReplacement
         )
         let bridge: ShellBuildReceipt.Bridge?
+        let writebackCount = bridgedParameterConventions.filter {
+            $0 == .inout
+        }.count
         if (context == nil || bridgedReceiverType != nil),
-           !hasInOut, !isGeneric, !hasTypedThrows,
+           writebackCount <= 1,
+           (!hasInOut || writebackCount == 1),
+           !(isAsync && writebackCount > 0),
+           !isGeneric, !hasTypedThrows,
            customAttributes.isEmpty, !hasUnrepresentableCustomAttribute,
            valueParameterTypes.allSatisfy({ $0 != .never }),
            valueResultType != .never {

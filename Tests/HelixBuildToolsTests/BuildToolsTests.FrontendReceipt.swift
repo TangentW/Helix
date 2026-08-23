@@ -6,6 +6,7 @@ import HelixCore
 import HelixDevTools
 import HelixInterface
 import HelixVerifier
+import HelixVM
 import Testing
 @testable import HelixBuildTools
 
@@ -348,15 +349,42 @@ struct FrontendReceiptPipeline {
 
         public struct Counter {
             public var value: Int
+            public var samples: [Int] = []
 
-            public mutating func increment(by amount: Int) { value += amount }
+            public mutating func incrementOrReject(
+                by amount: Int,
+                reject: Bool
+            ) throws {
+                samples.append(amount)
+                value += samples.count
+                if reject { throw CounterError.rejected }
+            }
+            public mutating func incrementThenDivide(
+                by amount: Int,
+                divisor: Int
+            ) -> Int {
+                value += amount
+                return value / divisor
+            }
             public borrowing func snapshot() -> Int { value }
             public consuming func consumed() -> Int { value }
             public static func doubled(_ value: Int) -> Int { value * 2 }
         }
 
+        public enum CounterError: Error { case rejected }
+
+        public enum Phase {
+            case idle
+            case count(Int)
+
+            public mutating func advance(by amount: Int) {
+                self = .count(amount)
+            }
+        }
+
         extension Counter {
             public func adding(_ amount: Int) -> Int { value + amount }
+            public mutating func increment(by amount: Int) { value += amount }
         }
 
         public class Factory {
@@ -381,6 +409,14 @@ struct FrontendReceiptPipeline {
         public func throwing(_ value: Int) throws -> Int {
             if value < 0 { throw SampleError.failed }
             return value
+        }
+        public func adjust(_ value: inout Int, by amount: Int) {
+            value += amount
+        }
+        public func exchange(_ lhs: inout Int, _ rhs: inout Int) {
+            let temporary = lhs
+            lhs = rhs
+            rhs = temporary
         }
         public func rethrowing(_ body: () throws -> Int) rethrows -> Int { try body() }
         """
@@ -433,9 +469,9 @@ struct FrontendReceiptPipeline {
                 compilerURL: compilerURL
             )
         )
-        #expect(output.receipt.declarations.count == 15)
-        #expect(output.receipt.roots.count == 15)
-        #expect(output.receipt.roots.filter { $0.bridge != nil }.count == 7)
+        #expect(output.receipt.declarations.count == 20)
+        #expect(output.receipt.roots.count == 20)
+        #expect(output.receipt.roots.filter { $0.bridge != nil }.count == 12)
         #expect(output.receipt.roots.allSatisfy { $0.nativeReplacement != nil })
         #expect(output.diagnostics.contains { $0.code == "HLXIDX012" })
         #expect(output.diagnostics.contains { $0.code == "HLXIDX007" })
@@ -465,6 +501,25 @@ struct FrontendReceiptPipeline {
         })
         #expect(output.receipt.roots.first {
             $0.declarationMangledName == increment.mangledName
+        }?.bridge != nil)
+        #expect(increment.parameterConventions == [.owned, .inout])
+        let adjust = try #require(output.receipt.declarations.first {
+            $0.interface.baseName == "adjust"
+        })
+        #expect(adjust.parameterConventions == [.inout, .owned])
+        let adjustBridge = try #require(output.receipt.roots.first {
+            $0.declarationMangledName == adjust.mangledName
+        }?.bridge)
+        #expect(adjustBridge.originalInvocation == "adjust(&value, by: amount)")
+        #expect(adjustBridge.bridgeInvocation.hasSuffix(
+            "_adjust(&argument0, by: argument1)"
+        ))
+        let exchange = try #require(output.receipt.declarations.first {
+            $0.interface.baseName == "exchange"
+        })
+        #expect(exchange.parameterConventions == [.inout, .inout])
+        #expect(output.receipt.roots.first {
+            $0.declarationMangledName == exchange.mangledName
         }?.bridge == nil)
         let asynchronous = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "asynchronous"
@@ -524,6 +579,187 @@ struct FrontendReceiptPipeline {
             directory: directory,
             moduleName: moduleName
         )
+
+        let patchedSource = source
+            .replacingOccurrences(
+                of: "value += amount }",
+                with: "value += amount + 10 }"
+            )
+            .replacingOccurrences(
+                of: "value += samples.count",
+                with: "value += samples.count + 10"
+            )
+            .replacingOccurrences(
+                of: "return value / divisor",
+                with: "return (value + 10) / divisor"
+            )
+            .replacingOccurrences(
+                of: "self = .count(amount)",
+                with: "self = .count(amount + 10)"
+            )
+            .replacingOccurrences(
+                of: "value += amount\n}\npublic func exchange",
+                with: "value += amount + 10\n}\npublic func exchange"
+            )
+        #expect(patchedSource != source)
+        try Data(patchedSource.utf8).write(to: sourceURL)
+        let selectedNames: Set<String> = [
+            "increment", "incrementOrReject", "incrementThenDivide", "advance",
+            "adjust",
+        ]
+        let selectedKeys = Set(shell.archive.functions.compactMap { record in
+            selectedNames.contains(
+                output.receipt.declarations.first {
+                    $0.mangledName == record.mangledName
+                }?.interface.baseName ?? ""
+            ) ? record.key : nil
+        })
+        #expect(selectedKeys.count == 5)
+        let patch = try ReleaseCompiler.Driver().build(
+            .init(
+                archive: shell.archive,
+                sourceFiles: [sourceURL],
+                selectedFunctionKeys: selectedKeys,
+                compilerURL: compilerURL,
+                enforceToolchainFingerprint: false
+            )
+        )
+        let image = try Verification.Engine().verify(
+            bytes: patch.bytecode,
+            shell: Verification.ShellInterface(archive: shell.archive),
+            policy: .init(
+                acceptedCapabilities: Set(shell.archive.capabilities)
+            )
+        )
+        func integer(_ value: Int64) throws -> VM.Value {
+            .integer(try .init(signed: value, bitWidth: 64, isSigned: true))
+        }
+        func entry(named name: String) throws -> Core.EntryIndex {
+            let declaration = try #require(output.receipt.declarations.first {
+                $0.interface.baseName == name
+            })
+            return try #require(shell.archive.functions.first {
+                $0.mangledName == declaration.mangledName
+            }?.entryIndex)
+        }
+
+        let counter = VM.Value.structure(
+            type: .init(rawValue: "Counter"),
+            fields: [
+                try integer(3),
+                .array(.init(elements: [try integer(5)], elementType: .int64)),
+            ]
+        )
+        let incremented = VM.Interpreter().invokeEntry(
+            entry: try entry(named: "increment"),
+            image: image,
+            arguments: [try integer(2), counter]
+        )
+        #expect(incremented.outcome == .returned(nil))
+        #expect(incremented.writebacks == [
+            .init(
+                parameterIndex: 1,
+                value: .structure(
+                    type: .init(rawValue: "Counter"),
+                    fields: [
+                        try integer(15),
+                        .array(.init(
+                            elements: [try integer(5)],
+                            elementType: .int64
+                        )),
+                    ]
+                )
+            ),
+        ])
+
+        let rejected = VM.Interpreter().invokeEntry(
+            entry: try entry(named: "incrementOrReject"),
+            image: image,
+            arguments: [try integer(7), .bool(true), counter]
+        )
+        guard case .businessError = rejected.outcome else {
+            Issue.record("throwing mutating root did not preserve its business error")
+            return
+        }
+        #expect(rejected.writebacks == [
+            .init(
+                parameterIndex: 2,
+                value: .structure(
+                    type: .init(rawValue: "Counter"),
+                    fields: [
+                        try integer(15),
+                        .array(.init(
+                            elements: [try integer(5), try integer(7)],
+                            elementType: .int64
+                        )),
+                    ]
+                )
+            ),
+        ])
+
+        let completed = VM.Interpreter().invokeEntry(
+            entry: try entry(named: "incrementThenDivide"),
+            image: image,
+            arguments: [try integer(7), try integer(2), counter]
+        )
+        #expect(completed.outcome == .returned(try integer(10)))
+        #expect(completed.writebacks == [
+            .init(
+                parameterIndex: 2,
+                value: .structure(
+                    type: .init(rawValue: "Counter"),
+                    fields: [
+                        try integer(10),
+                        .array(.init(
+                            elements: [try integer(5)],
+                            elementType: .int64
+                        )),
+                    ]
+                )
+            ),
+        ])
+
+        let trapped = VM.Interpreter().invokeEntry(
+            entry: try entry(named: "incrementThenDivide"),
+            image: image,
+            arguments: [try integer(7), try integer(0), counter]
+        )
+        #expect(trapped.outcome == .trapped(.divisionByZero))
+        #expect(trapped.writebacks.isEmpty)
+
+        let advanced = VM.Interpreter().invokeEntry(
+            entry: try entry(named: "advance"),
+            image: image,
+            arguments: [
+                try integer(2),
+                .enumeration(
+                    type: .init(rawValue: "Phase"),
+                    caseIndex: 0,
+                    payload: nil
+                ),
+            ]
+        )
+        #expect(advanced.outcome == .returned(nil))
+        #expect(advanced.writebacks == [
+            .init(
+                parameterIndex: 1,
+                value: .enumeration(
+                    type: .init(rawValue: "Phase"),
+                    caseIndex: 1,
+                    payload: try integer(12)
+                )
+            ),
+        ])
+
+        let adjusted = VM.Interpreter().invokeEntry(
+            entry: try entry(named: "adjust"),
+            image: image,
+            arguments: [try integer(3), try integer(2)]
+        )
+        #expect(adjusted.outcome == .returned(nil))
+        #expect(adjusted.writebacks == [
+            .init(parameterIndex: 0, value: try integer(15)),
+        ])
     }
 
     @Test("Frozen Shell struct and enum receivers use generated structural codecs")

@@ -1,3 +1,4 @@
+import Foundation
 import HelixBytecode
 import HelixCore
 import HelixVerifier
@@ -615,6 +616,163 @@ struct AddressExecution {
         }
     }
 
+    @Test("Nested Shell entry copy-out updates the caller address atomically")
+    func appliesNestedEntryWriteback() throws {
+        let nestedEntry = Core.EntryIndex(rawValue: 1)
+        let nestedKey = try Core.FunctionKey.derive(
+            namespace: namespace,
+            module: "Fixture",
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            canonicalDeclaration: "func nested(_: inout Int)",
+            loweredSignature: .init(
+                parameters: ["inout Swift.Int"],
+                result: "Swift.Void"
+            ),
+            role: .function
+        )
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "nestedWriteback",
+            parameterRegisters: [.init(rawValue: 0)],
+            parameterConventions: [.inout],
+            resultType: .void,
+            registerTypes: [.address(.int64)],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .entryApply(
+                            result: nil,
+                            entry: nestedEntry,
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .returnValue(nil),
+                    ]
+                ),
+            ]
+        )
+        let image = try verify(
+            root: root,
+            additionalFunctions: [],
+            capabilities: [.baselineV1, .addressValuesV1],
+            parameterTypes: [.int64],
+            resultType: .void,
+            additionalShellEntries: [
+                .init(
+                    index: nestedEntry,
+                    key: nestedKey,
+                    parameterTypes: [.int64],
+                    parameterConventions: [.inout],
+                    resultType: .void
+                ),
+            ]
+        )
+        let input = VM.Value.integer(try int(3))
+        let replacement = VM.Value.integer(try int(8))
+        let invocation = VM.Interpreter(
+            entryInvocation: { entry, arguments, _ in
+                guard entry == nestedEntry, arguments == [input] else {
+                    return .trapped(.nativeFailure("nested logical ABI mismatch"))
+                }
+                return .init(
+                    outcome: .returned(nil),
+                    writebacks: [
+                        .init(parameterIndex: 0, value: replacement),
+                    ]
+                )
+            }
+        ).invokeEntry(
+            entry: .init(rawValue: 0),
+            image: image,
+            arguments: [input]
+        )
+        #expect(invocation.outcome == .returned(nil))
+        #expect(invocation.writebacks == [
+            .init(parameterIndex: 0, value: replacement),
+        ])
+
+        let legacyCalls = InvocationCounter()
+        let legacy = VM.Interpreter(
+            entryInvocation: { _, _, _ in
+                legacyCalls.increment()
+                return .returned(nil)
+            }
+        ).invoke(
+            entry: .init(rawValue: 0),
+            image: image,
+            arguments: [input]
+        )
+        #expect(legacy == .trapped(.explicit(
+            "an inout Shell entry requires the writeback-aware invocation API"
+        )))
+        #expect(legacyCalls.value == 0)
+
+        let malformed = VM.Interpreter(
+            entryInvocation: { _, _, _ in .returned(nil) }
+        ).invokeEntry(
+            entry: .init(rawValue: 0),
+            image: image,
+            arguments: [input]
+        )
+        guard case let .trapped(.nativeFailure(message)) = malformed.outcome else {
+            Issue.record("nested entry accepted an incomplete writeback set")
+            return
+        }
+        #expect(message.contains("invalid writeback set"))
+        #expect(malformed.writebacks.isEmpty)
+    }
+
+    @Test("Writeback reuses storage already charged to the pinned invocation")
+    func writebackDoesNotDoubleChargeBoundaryStorage() throws {
+        let arrayType = Bytecode.ValueType.array(.int64)
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "arrayWriteback",
+            parameterRegisters: [.init(rawValue: 0)],
+            parameterConventions: [.inout],
+            resultType: .void,
+            registerTypes: [.address(arrayType)],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(nil)]
+                ),
+            ]
+        )
+        // Boundary Arrays reserve one 16-byte header slot plus one per element.
+        let boundaryBytes: UInt64 = 32
+        let frameBytes = UInt64(MemoryLayout<VM.Value?>.stride)
+        let limits = Core.ResourceLimits(
+            maxVMHeapBytes: boundaryBytes + frameBytes,
+            maxWallTimeMainThreadMilliseconds: 1_000
+        )
+        let image = try verify(
+            root: root,
+            additionalFunctions: [],
+            capabilities: [.baselineV1, .addressValuesV1, .collectionsV1],
+            parameterTypes: [arrayType],
+            resultType: .void,
+            limits: limits
+        )
+        let input = VM.Value.array(.init(
+            elements: [.integer(try int(4))],
+            elementType: .int64
+        ))
+        let invocation = VM.Interpreter().invokeEntry(
+            entry: .init(rawValue: 0),
+            image: image,
+            arguments: [input]
+        )
+        #expect(invocation.outcome == .returned(nil))
+        #expect(invocation.writebacks == [
+            .init(parameterIndex: 0, value: input),
+        ])
+    }
+
     private let namespace = Core.ShellNamespaceID.derive(
         bundleID: "dev.helix.vm.address",
         buildNumber: "1",
@@ -658,7 +816,11 @@ struct AddressExecution {
         localTypes: [Bytecode.LocalTypeDefinition] = [],
         parameterTypes: [Bytecode.ValueType] = [.int64],
         resultType: Bytecode.ValueType = .int64,
-        shellTypes: [Verification.ResolvedNativeType] = []
+        shellTypes: [Verification.ResolvedNativeType] = [],
+        additionalShellEntries: [Verification.ResolvedEntry] = [],
+        limits: Core.ResourceLimits = .init(
+            maxWallTimeMainThreadMilliseconds: 1_000
+        )
     ) throws -> Verification.Image {
         let shellHash = Core.Digest.sha256("address-vm-shell")
         let signature = Core.LoweredSignature(
@@ -684,7 +846,7 @@ struct AddressExecution {
             shellInterfaceHash: shellHash,
             compatibility: compatibility,
             capabilities: capabilities,
-            requestedResources: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            requestedResources: limits,
             localTypes: localTypes,
             functions: [root] + additionalFunctions,
             entries: [
@@ -707,7 +869,7 @@ struct AddressExecution {
                     parameterConventions: root.parameterConventions,
                     resultType: resultType
                 ),
-            ],
+            ] + additionalShellEntries,
             types: shellTypes
         )
         return try Verification.Engine().verify(
@@ -715,9 +877,26 @@ struct AddressExecution {
             shell: shell,
             policy: .init(
                 acceptedCapabilities: capabilities,
-                resourceCeiling: .init(maxWallTimeMainThreadMilliseconds: 1_000)
+                resourceCeiling: limits
             )
         )
+    }
+
+    private final class InvocationCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = 0
+
+        var value: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+
+        func increment() {
+            lock.lock()
+            storage += 1
+            lock.unlock()
+        }
     }
 }
 }

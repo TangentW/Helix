@@ -218,7 +218,7 @@ struct SemanticVerifier {
         }
     }
 
-    @Test("Shell entries freeze one exact non-inout ownership ABI")
+    @Test("Shell entries freeze one exact single-region ownership ABI")
     func rejectsInvalidShellEntryOwnership() throws {
         let fixture = try makeFixture()
         let index = Core.EntryIndex(rawValue: 0)
@@ -241,7 +241,7 @@ struct SemanticVerifier {
         entry.parameterConventions = [.inout]
         #expect(
             throws: Verification.Error.invalidShellInterface(
-                "entry 0 has invalid parameter ownership"
+                "entry 0 uses writeback without address-values-1"
             )
         ) {
             try Verification.ShellInterface(
@@ -251,7 +251,46 @@ struct SemanticVerifier {
                 entries: [entry]
             )
         }
+        var writebackCapabilities = fixture.shell.capabilities
+        writebackCapabilities.insert(.addressValuesV1)
+        _ = try Verification.ShellInterface(
+            interfaceHash: fixture.shell.interfaceHash,
+            compatibility: fixture.shell.compatibility,
+            capabilities: writebackCapabilities,
+            entries: [entry]
+        )
 
+        entry.effects.isAsync = true
+        #expect(
+            throws: Verification.Error.invalidShellInterface(
+                "entry 0 has invalid parameter ownership"
+            )
+        ) {
+            try Verification.ShellInterface(
+                interfaceHash: fixture.shell.interfaceHash,
+                compatibility: fixture.shell.compatibility,
+                capabilities: writebackCapabilities,
+                entries: [entry]
+            )
+        }
+        entry.effects.isAsync = false
+
+        entry.parameterTypes.append(.int64)
+        entry.parameterConventions = [.inout, .inout]
+        #expect(
+            throws: Verification.Error.invalidShellInterface(
+                "entry 0 has invalid parameter ownership"
+            )
+        ) {
+            try Verification.ShellInterface(
+                interfaceHash: fixture.shell.interfaceHash,
+                compatibility: fixture.shell.compatibility,
+                capabilities: writebackCapabilities,
+                entries: [entry]
+            )
+        }
+
+        entry.parameterTypes.removeLast()
         entry.parameterConventions = [.borrowed]
         var capabilities = fixture.shell.capabilities
         capabilities.remove(.borrowCallsV1)

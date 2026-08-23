@@ -109,29 +109,86 @@ public final class Bridge: @unchecked Sendable {
         arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value],
         decodeResult: (VM.Value?) throws -> Result
     ) throws -> Runtime.BridgeDispatchResult<Result> {
+        try dispatchImpl(
+            isolation: isolation,
+            entry: entry,
+            arguments: arguments,
+            decodeResult: decodeResult,
+            acceptsWritebacks: false,
+            applyWritebacks: { writebacks in
+                guard writebacks.isEmpty else {
+                    throw VM.RuntimeTrap.nativeFailure(
+                        "non-inout generated Bridge received writebacks"
+                    )
+                }
+            }
+        )
+    }
+
+    /// Dispatches a wrapper with one generated transactional copy-out region.
+    /// The closure must decode every writeback before mutating Swift storage.
+    public func dispatch<Result>(
+        isolation: isolated (any Actor)? = #isolation,
+        entry: Core.EntryIndex,
+        arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value],
+        decodeResult: (VM.Value?) throws -> Result,
+        applyWritebacks: ([VM.EntryWriteback]) throws -> Void
+    ) throws -> Runtime.BridgeDispatchResult<Result> {
+        try dispatchImpl(
+            isolation: isolation,
+            entry: entry,
+            arguments: arguments,
+            decodeResult: decodeResult,
+            acceptsWritebacks: true,
+            applyWritebacks: applyWritebacks
+        )
+    }
+
+    private func dispatchImpl<Result>(
+        isolation: isolated (any Actor)?,
+        entry: Core.EntryIndex,
+        arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value],
+        decodeResult: (VM.Value?) throws -> Result,
+        acceptsWritebacks: Bool,
+        applyWritebacks: ([VM.EntryWriteback]) throws -> Void
+    ) throws -> Runtime.BridgeDispatchResult<Result> {
         _ = isolation
         let runtime = installation.loadAcquire()?.runtime
         guard let runtime else {
             throw Runtime.BridgeDispatchError.notInstalled
+        }
+        if !acceptsWritebacks,
+           runtime.originals[entry]?.parameterConventions.contains(.inout) == true {
+            throw VM.RuntimeTrap.nativeFailure(
+                "an inout Shell entry requires the writeback-aware generated Bridge"
+            )
         }
         guard runtime.requiresRouting else { return .originalRequired }
         // The bypass lookup is needed only while a generation is active or
         // pinned. Keeping it off the normal Shell path avoids a second TLS map
         // lookup on every unpatched call.
         if isBypassingOriginal(entry) { return .originalRequired }
-        let result: VM.ExecutionResult
+        let result: VM.EntryInvocationResult
         switch try runtime.routeEncodedFromBridge(entry: entry, arguments: arguments) {
         case .originalRequired:
             return .originalRequired
         case let .executed(executed):
             result = executed
         }
-        switch result {
+        switch result.outcome {
         case let .returned(value):
-            return .returned(try decodeResult(value))
+            let decoded = try decodeResult(value)
+            try applyWritebacks(result.writebacks)
+            return .returned(decoded)
         case let .businessError(message):
+            try applyWritebacks(result.writebacks)
             throw Runtime.BridgeDispatchError.businessError(message)
         case let .trapped(trap):
+            guard result.writebacks.isEmpty else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "trapped Shell entry returned forbidden writebacks"
+                )
+            }
             throw trap
         }
     }

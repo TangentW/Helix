@@ -61,11 +61,16 @@ Both workflows depend on stable, build-specific identities:
   storage can be reconstructed legally; generated Bridge code streams fields
   and cases through the ordinary bounded value codec. Release and patch
   compilation both derive the source shape independently, and the Verifier
-  requires an exact match before a nonmutating ordinary, `borrowing`, or
-  `consuming` value receiver can become a root. No reflection, raw-memory
-  projection, runtime metadata, or Swift layout assumption is involved.
-  Mutable receiver/address writeback is a separate storage contract and stays
-  fail-closed until that contract is proven end to end.
+  requires an exact match before an ordinary, `borrowing`, `consuming`, or
+  `mutating` value receiver can become a root. A synchronous entry may expose
+  exactly one logical `inout` region, including mutable `self`. Generated
+  Bridge code snapshots that value, gives HLVM only an invocation-scoped
+  address, validates one exact typed writeback, and commits it on the normal or
+  declared-error continuation. A VM trap commits no writeback; the Original
+  route follows the same result contract. Multiple or async `inout` regions
+  remain fail-closed because the generated boundary cannot prove alias
+  identity. No reflection, raw-memory projection, runtime metadata, VM address,
+  or Swift layout assumption crosses the boundary.
 - Toolchain, SDK, target triple, compiler arguments, module source set, and
   binary identity bind every artifact to the Shell for which it was built.
 - Version 1 Shells advertise pure-VM String and Collection capabilities even

@@ -321,7 +321,8 @@ struct HostedClasses {
                     .init(
                         index: entry,
                         parameterTypes: [],
-                        resultType: .native(nativeTypeID)
+                        resultType: .native(nativeTypeID),
+                        effects: .init(mayAllocate: true)
                     ) { _ in .returned(.native(fallback)) },
                 ]),
                 shellInterfaceHash: shellHash,

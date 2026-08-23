@@ -494,11 +494,13 @@ public struct Archive: Codable, Hashable, Sendable {
             }
         }
         let eligible = functions.filter(\.patchability.isEligible)
-        guard eligible.allSatisfy({
-            !$0.parameterConventions.contains(.inout)
+        guard eligible.allSatisfy({ function in
+            function.parameterConventions.filter({ $0 == .inout }).count <= 1
+                && !(function.effects.isAsync
+                    && function.parameterConventions.contains(.inout))
         }) else {
             throw InterfaceArchive.Error.invalidArchive(
-                "Shell entry signatures cannot contain inout parameters"
+                "Shell entries support one synchronous inout writeback region"
             )
         }
         guard eligible.allSatisfy({ $0.entryIndex != nil }),

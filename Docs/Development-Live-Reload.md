@@ -682,8 +682,12 @@ supported stored or computed instance properties and supported static
 properties through their canonical getter/setter SIL. A closure-valued setter
 is authoritatively escaping because assignment stores the value; direct and
 Optional closure-valued getters use the native callable-result contract above.
-Value-type instance mutation, async or throwing accessors, and unsupported
-callable signatures still fail closed rather than being inferred from names.
+An eligible existing Shell struct or enum may instead use one synchronous
+logical `inout` entry region, including mutable `self`. Normal and declared
+error exits write back the exact decoded value; traps write back nothing.
+Multiple or async `inout` regions, writable value-type accessors/subscripts,
+observers, async or throwing accessors, and unsupported callable signatures
+still fail closed rather than being inferred from names.
 
 An unrelated declaration is not collected merely because it exists, and this
 feature does not add source files or native ABI. Changes to an existing native

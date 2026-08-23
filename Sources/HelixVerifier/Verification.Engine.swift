@@ -862,7 +862,7 @@ public struct Engine: Verification.ImageVerifying {
                     reason: "closure bodies and compiler specializations cannot be patch entries"
                 )
             }
-            let parameterTypes = try function.parameterRegisters.map { register -> Bytecode.ValueType in
+            let physicalParameterTypes = try function.parameterRegisters.map { register -> Bytecode.ValueType in
                 guard let type = function.type(of: register) else {
                     throw Verification.Error.invalidFunction(
                         function: function.id,
@@ -871,10 +871,24 @@ public struct Engine: Verification.ImageVerifying {
                 }
                 return type
             }
-            guard parameterTypes == shellEntry.parameterTypes,
+            guard physicalParameterTypes.count
+                    == function.parameterConventions.count
+            else {
+                throw Verification.Error.entrySignatureMismatch(entry.entryIndex)
+            }
+            let logicalParameterTypes = try zip(
+                physicalParameterTypes,
+                function.parameterConventions
+            ).map { type, convention -> Bytecode.ValueType in
+                guard convention == .inout else { return type }
+                guard case let .address(pointee) = type else {
+                    throw Verification.Error.entrySignatureMismatch(entry.entryIndex)
+                }
+                return pointee
+            }
+            guard logicalParameterTypes == shellEntry.parameterTypes,
                   function.parameterConventions
                     == shellEntry.parameterConventions,
-                  !function.parameterConventions.contains(.inout),
                   function.resultType == shellEntry.resultType,
                   function.effects == shellEntry.effects
             else {
@@ -1503,6 +1517,7 @@ public struct Engine: Verification.ImageVerifying {
         try verifyAddressLifecycle(
             function: function,
             functions: functions,
+            shell: shell,
             borrowedMutableCells: borrowedMutableCells
         )
     }
@@ -4284,6 +4299,10 @@ public struct Engine: Verification.ImageVerifying {
             )
         case let .entryApply(result, entry, arguments):
             guard let descriptor = shell.entries[entry] else { throw fail("unknown Shell entry \(entry)") }
+            let parameterTypes = try physicalShellParameterTypes(
+                descriptor,
+                fail: fail
+            )
             try verifyBorrowedCallCapability(
                 descriptor.parameterConventions,
                 capabilities: capabilities
@@ -4303,7 +4322,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyCall(
                 arguments: arguments,
                 result: result,
-                parameterTypes: descriptor.parameterTypes,
+                parameterTypes: parameterTypes,
                 resultType: descriptor.resultType,
                 function: function,
                 block: block,
@@ -4370,7 +4389,10 @@ public struct Engine: Verification.ImageVerifying {
                     throw fail("unknown Shell entry \(entry)")
                 }
                 constructionTarget = .shellEntry
-                targetParameterTypes = descriptor.parameterTypes
+                targetParameterTypes = try physicalShellParameterTypes(
+                    descriptor,
+                    fail: fail
+                )
                 targetParameterConventions = descriptor.parameterConventions
                 targetResultType = descriptor.resultType
                 targetEffects = descriptor.effects
@@ -4592,6 +4614,10 @@ public struct Engine: Verification.ImageVerifying {
             guard let descriptor = shell.entries[entry] else {
                 throw fail("unknown Shell entry \(entry)")
             }
+            let parameterTypes = try physicalShellParameterTypes(
+                descriptor,
+                fail: fail
+            )
             try verifyBorrowedCallCapability(
                 descriptor.parameterConventions,
                 capabilities: capabilities
@@ -4608,7 +4634,7 @@ public struct Engine: Verification.ImageVerifying {
             )
             try verifyTryCall(
                 arguments: arguments,
-                parameterTypes: descriptor.parameterTypes,
+                parameterTypes: parameterTypes,
                 resultType: descriptor.resultType,
                 thrownType: nil,
                 normalTarget: normalTarget,
@@ -4954,6 +4980,23 @@ public struct Engine: Verification.ImageVerifying {
         if conventions.contains(.borrowed),
            !capabilities.contains(.borrowCallsV1) {
             throw Verification.Error.capabilityDenied(.borrowCallsV1)
+        }
+    }
+
+    private func physicalShellParameterTypes(
+        _ descriptor: Verification.ResolvedEntry,
+        fail: (String) -> Verification.Error
+    ) throws -> [Bytecode.ValueType] {
+        guard descriptor.parameterConventions.count
+                == descriptor.parameterTypes.count
+        else {
+            throw fail("Shell entry has an inconsistent ownership signature")
+        }
+        return zip(
+            descriptor.parameterTypes,
+            descriptor.parameterConventions
+        ).map { type, convention in
+            convention == .inout ? .address(type) : type
         }
     }
 
@@ -5885,6 +5928,7 @@ public struct Engine: Verification.ImageVerifying {
     private func verifyAddressLifecycle(
         function: Bytecode.Function,
         functions: [Bytecode.FunctionID: Bytecode.Function],
+        shell: Verification.ShellInterface,
         borrowedMutableCells: BorrowedMutableCellFacts
     ) throws {
         guard function.registerTypes.contains(where: {
@@ -6114,13 +6158,20 @@ public struct Engine: Verification.ImageVerifying {
                             "conditional stack destroy requires a root modify access"
                         )
                     }
-                case .entryApply, .nativeApply, .entryTryApply, .nativeTryApply:
+                case let .entryApply(_, entry, arguments),
+                     let .entryTryApply(entry, arguments, _, _):
+                    guard let descriptor = shell.entries[entry] else { break }
+                    try verifyCallAddresses(
+                        arguments: arguments,
+                        conventions: descriptor.parameterConventions
+                    )
+                case .nativeApply, .nativeTryApply:
                     for operand in instruction.operandRegisters
                     where function.type(of: operand).map({ type in
                         if case .address = type { return true }
                         return false
                     }) == true {
-                        throw fail("address values cannot cross Shell or NativeImport boundaries")
+                        throw fail("address values cannot cross NativeImport boundaries")
                     }
                 default:
                     for operand in instruction.operandRegisters

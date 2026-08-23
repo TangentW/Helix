@@ -200,6 +200,260 @@ struct Routing {
         #expect(encodedArgumentCount == 1)
     }
 
+    @Test("Bridge commits normal and business-error writebacks transactionally")
+    func bridgeCommitsWritebacks() throws {
+        for mode in [WritebackFixture.Mode.returned, .businessError] {
+            let fixture = try WritebackFixture(mayThrow: mode == .businessError)
+            let runtime = try fixture.makeRuntime(
+                fallbackAllowed: false,
+                originalValue: 1
+            )
+            try runtime.activate(
+                fixture.generation(
+                    id: 1,
+                    mode: mode,
+                    fallbackAllowed: false
+                ),
+                expectedActiveID: nil
+            )
+            let bridge = Runtime.Bridge()
+            try bridge.install(
+                runtime: runtime,
+                interfaceHash: fixture.shellHash,
+                registrationCount: 1
+            )
+            var value: Int64 = 3
+
+            do {
+                let decision: Runtime.BridgeDispatchResult<Void> = try bridge.dispatch(
+                    entry: fixture.entry,
+                    arguments: { encoder in
+                        [try encoder.encode(value), try encoder.encode(Int64(9))]
+                    },
+                    decodeResult: { result in
+                        try Runtime.BridgeValueCodec.decodeVoid(result)
+                    },
+                    applyWritebacks: { writebacks in
+                        guard writebacks.count == 1,
+                              writebacks[0].parameterIndex == 0
+                        else {
+                            throw VM.RuntimeTrap.nativeFailure(
+                                "test Bridge received an invalid writeback set"
+                            )
+                        }
+                        let decoded = try Runtime.BridgeValueCodec.decode(
+                            writebacks[0].value,
+                            as: Int64.self
+                        )
+                        value = decoded
+                    }
+                )
+                guard mode == .returned, case .returned = decision else {
+                    Issue.record("business-error patch returned normally")
+                    continue
+                }
+            } catch let error as Runtime.BridgeDispatchError {
+                guard mode == .businessError,
+                      error == .businessError("patched failure")
+                else { throw error }
+            }
+            #expect(value == 9)
+        }
+    }
+
+    @Test("Bridge decodes the result before committing writeback storage")
+    func bridgeLeavesStorageUntouchedWhenResultDecodingFails() throws {
+        let fixture = try WritebackFixture(mayThrow: false)
+        let runtime = try fixture.makeRuntime(
+            fallbackAllowed: false,
+            originalValue: 1
+        )
+        try runtime.activate(
+            fixture.generation(
+                id: 1,
+                mode: .returned,
+                fallbackAllowed: false
+            ),
+            expectedActiveID: nil
+        )
+        let bridge = Runtime.Bridge()
+        try bridge.install(
+            runtime: runtime,
+            interfaceHash: fixture.shellHash,
+            registrationCount: 1
+        )
+        let appliedWritebacks = Counter()
+        var value: Int64 = 3
+
+        do {
+            let _: Runtime.BridgeDispatchResult<Void> = try bridge.dispatch(
+                entry: fixture.entry,
+                arguments: { encoder in
+                    [try encoder.encode(value), try encoder.encode(Int64(9))]
+                },
+                decodeResult: { _ in
+                    throw VM.RuntimeTrap.nativeFailure("deliberate result decode failure")
+                },
+                applyWritebacks: { _ in
+                    appliedWritebacks.increment()
+                    value = 9
+                }
+            )
+            Issue.record("Bridge committed writeback after result decoding failed")
+        } catch let trap as VM.RuntimeTrap {
+            #expect(trap == .nativeFailure("deliberate result decode failure"))
+        }
+        #expect(appliedWritebacks.value == 0)
+        #expect(value == 3)
+    }
+
+    @Test("Trap fallback discards patch storage before selecting the original route")
+    func trapFallbackUsesOriginalWriteback() throws {
+        let fixture = try WritebackFixture(mayThrow: false)
+        let runtime = try fixture.makeRuntime(
+            fallbackAllowed: true,
+            originalValue: 77
+        )
+        try runtime.activate(
+            fixture.generation(
+                id: 1,
+                mode: .trap,
+                fallbackAllowed: true
+            ),
+            expectedActiveID: nil
+        )
+        let catalogFallback = runtime.invokeEntry(
+            entry: fixture.entry,
+            arguments: [
+                .integer(try int(3)),
+                .integer(try int(9)),
+            ]
+        )
+        #expect(catalogFallback.outcome == .returned(nil))
+        #expect(catalogFallback.writebacks == [
+            .init(parameterIndex: 0, value: .integer(try int(77))),
+        ])
+        let bridge = Runtime.Bridge()
+        try bridge.install(
+            runtime: runtime,
+            interfaceHash: fixture.shellHash,
+            registrationCount: 1
+        )
+        var value: Int64 = 3
+        let decision: Runtime.BridgeDispatchResult<Void> = try bridge.dispatch(
+            entry: fixture.entry,
+            arguments: { encoder in
+                [try encoder.encode(value), try encoder.encode(Int64(9))]
+            },
+            decodeResult: { result in
+                try Runtime.BridgeValueCodec.decodeVoid(result)
+            },
+            applyWritebacks: { writebacks in
+                let writeback = try #require(writebacks.first)
+                #expect(writebacks.count == 1)
+                #expect(writeback.parameterIndex == 0)
+                value = try Runtime.BridgeValueCodec.decode(
+                    writeback.value,
+                    as: Int64.self
+                )
+            }
+        )
+        guard case .originalRequired = decision else {
+            Issue.record("safe trap did not select the lexical original route")
+            return
+        }
+        #expect(value == 3)
+    }
+
+    @Test("Original adapters must return the exact frozen writeback set")
+    func rejectsInvalidOriginalWritebackSet() throws {
+        let fixture = try WritebackFixture(mayThrow: false)
+        let runtime = Runtime.Engine(
+            originals: try .init([
+                .init(
+                    index: fixture.entry,
+                    parameterTypes: [.int64, .int64],
+                    parameterConventions: [.inout, .owned],
+                    resultType: .void
+                ) { _ in .returned(nil) },
+            ])
+        )
+        let result = runtime.invokeEntry(
+            entry: fixture.entry,
+            arguments: [
+                .integer(try int(3)),
+                .integer(try int(9)),
+            ]
+        )
+        guard case let .trapped(.nativeFailure(message)) = result.outcome else {
+            Issue.record("Runtime accepted an incomplete original writeback set")
+            return
+        }
+        #expect(message.contains("invalid writeback set"))
+        #expect(result.writebacks.isEmpty)
+    }
+
+    @Test("Legacy routing APIs reject writeback entries before execution")
+    func legacyRoutingRejectsWritebackBeforeExecution() throws {
+        let entry = Core.EntryIndex(rawValue: 0)
+        let shellHash = Core.Digest.sha256("runtime-legacy-writeback-shell")
+        let originalCalls = Counter()
+        let encodedCalls = Counter()
+        let runtime = Runtime.Engine(
+            originals: try .init([
+                .init(
+                    index: entry,
+                    parameterTypes: [.int64],
+                    parameterConventions: [.inout],
+                    resultType: .void
+                ) { arguments in
+                    originalCalls.increment()
+                    return .init(
+                        outcome: .returned(nil),
+                        writebacks: [
+                            .init(parameterIndex: 0, value: arguments[0]),
+                        ]
+                    )
+                },
+            ]),
+            shellInterfaceHash: shellHash
+        )
+        #expect(
+            runtime.invoke(
+                entry: entry,
+                arguments: [.integer(try int(3))]
+            ) == .trapped(.explicit(
+                "an inout Shell entry requires the writeback-aware invocation API"
+            ))
+        )
+        #expect(originalCalls.value == 0)
+
+        let bridge = Runtime.Bridge()
+        try bridge.install(
+            runtime: runtime,
+            interfaceHash: shellHash,
+            registrationCount: 1
+        )
+        do {
+            let _: Runtime.BridgeDispatchResult<Void> = try bridge.dispatch(
+                entry: entry,
+                arguments: { encoder in
+                    encodedCalls.increment()
+                    return [try encoder.encode(Int64(3))]
+                },
+                decodeResult: { value in
+                    try Runtime.BridgeValueCodec.decodeVoid(value)
+                }
+            )
+            Issue.record("legacy Bridge accepted a writeback entry")
+        } catch let trap as VM.RuntimeTrap {
+            #expect(trap == .nativeFailure(
+                "an inout Shell entry requires the writeback-aware generated Bridge"
+            ))
+        }
+        #expect(encodedCalls.value == 0)
+    }
+
     @Test("Only generated Bridge routing may execute an async HLBC entry")
     func asyncEntryRequiresBridgeContext() throws {
         let entry = Core.EntryIndex(rawValue: 0)
@@ -293,7 +547,8 @@ struct Routing {
                 .init(
                     index: entry,
                     parameterTypes: [.int64],
-                    resultType: .int64
+                    resultType: .int64,
+                    effects: effects
                 ) { _ in .returned(.integer(try! int(1))) },
             ]),
             shellInterfaceHash: shellHash
@@ -644,7 +899,10 @@ struct Routing {
                 } catch {
                     return .trapped(.explicit(String(describing: error)))
                 }
-                return runtime.invoke(entry: fixture.entry, arguments: arguments)
+                return runtime.invokeEntry(
+                    entry: fixture.entry,
+                    arguments: arguments
+                )
             },
             .init(index: fixture.entry, parameterTypes: [.int64], resultType: .int64) { _ in
                 .returned(.integer(try! int(1)))
@@ -1058,12 +1316,18 @@ struct Routing {
                     index: outerEntry,
                     parameterTypes: [.int64],
                     resultType: .int64,
+                    effects: effects,
                     fallbackAllowed: true
                 ) { _ in
                     replayed.increment()
                     return .returned(.integer(try! int(99)))
                 },
-                .init(index: innerEntry, parameterTypes: [.int64], resultType: .void) { _ in
+                .init(
+                    index: innerEntry,
+                    parameterTypes: [.int64],
+                    resultType: .void,
+                    effects: effects
+                ) { _ in
                     committed.increment()
                     return .returned(nil)
                 },
@@ -1322,6 +1586,189 @@ struct Routing {
                 id: .init(rawValue: id),
                 parentID: parent,
                 packageID: "HLX-runtime-\(id)",
+                packageHash: .sha256(bytes),
+                images: [image],
+                estimatedByteCount: bytes.count
+            )
+        }
+    }
+
+    private struct WritebackFixture {
+        enum Mode {
+            case returned
+            case businessError
+            case trap
+        }
+
+        let entry = Core.EntryIndex(rawValue: 0)
+        let shellHash: Core.Digest
+        let compatibility = Core.Compatibility(
+            runtime: Core.Versions.runtime,
+            bytecode: Core.Versions.bytecode,
+            interfaceArchive: Core.Versions.interfaceArchive,
+            compilerFingerprint: "swift-runtime-writeback-fixture"
+        )
+        let key: Core.FunctionKey
+        let effects: Core.Effects
+
+        init(mayThrow: Bool) throws {
+            shellHash = .sha256("runtime-writeback-shell-\(mayThrow)")
+            effects = .init(mayThrow: mayThrow)
+            key = try Core.FunctionKey.derive(
+                namespace: .derive(
+                    bundleID: "dev.helix.runtime.writeback",
+                    buildNumber: "1",
+                    seed: mayThrow ? "throwing" : "plain"
+                ),
+                module: "Fixture",
+                sourceFileLogicalID: "Sources/Fixture.swift",
+                canonicalDeclaration: mayThrow
+                    ? "func update(_: inout Int, to: Int) throws"
+                    : "func update(_: inout Int, to: Int)",
+                loweredSignature: .init(
+                    parameters: ["inout Swift.Int", "Swift.Int"],
+                    result: "Swift.Void",
+                    isThrowing: mayThrow
+                ),
+                role: .function
+            )
+        }
+
+        func makeRuntime(
+            fallbackAllowed: Bool,
+            originalValue: Int64
+        ) throws -> Runtime.Engine {
+            Runtime.Engine(
+                originals: try .init([
+                    .init(
+                        index: entry,
+                        parameterTypes: [.int64, .int64],
+                        parameterConventions: [.inout, .owned],
+                        resultType: .void,
+                        effects: effects,
+                        fallbackAllowed: fallbackAllowed
+                    ) { _ in
+                        .init(
+                            outcome: .returned(nil),
+                            writebacks: [
+                                .init(
+                                    parameterIndex: 0,
+                                    value: .integer(try! int(originalValue))
+                                ),
+                            ]
+                        )
+                    },
+                ]),
+                shellInterfaceHash: shellHash
+            )
+        }
+
+        func generation(
+            id: UInt64,
+            mode: Mode,
+            fallbackAllowed: Bool
+        ) throws -> Runtime.Generation {
+            var registerTypes: [Bytecode.ValueType] = [
+                .address(.int64), .int64,
+            ]
+            let terminal: [Bytecode.Instruction]
+            switch mode {
+            case .returned:
+                terminal = [.returnValue(nil)]
+            case .businessError:
+                registerTypes.append(.string)
+                terminal = [
+                    .constantString(
+                        result: .init(rawValue: 2),
+                        value: "patched failure"
+                    ),
+                    .throwError(.init(rawValue: 2)),
+                ]
+            case .trap:
+                terminal = [.trap(.explicit("patched trap after mutation"))]
+            }
+            let function = Bytecode.Function(
+                id: .init(rawValue: 0),
+                name: "writeback",
+                parameterRegisters: [
+                    .init(rawValue: 0), .init(rawValue: 1),
+                ],
+                parameterConventions: [.inout, .owned],
+                resultType: .void,
+                thrownType: effects.mayThrow ? .string : nil,
+                registerTypes: registerTypes,
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [
+                            .init(rawValue: 0), .init(rawValue: 1),
+                        ],
+                        instructions: [
+                            .storeAddress(
+                                address: .init(rawValue: 0),
+                                source: .init(rawValue: 1),
+                                mode: .assign
+                            ),
+                        ] + terminal
+                    ),
+                ],
+                effects: effects
+            )
+            var capabilities: Set<Core.Capability> = [
+                .baselineV1, .addressValuesV1,
+            ]
+            if effects.mayThrow {
+                capabilities.formUnion([.stringsV1, .untypedThrowsV1])
+            }
+            let module = Bytecode.Module(
+                name: "RuntimeWritebackFixture",
+                shellInterfaceHash: shellHash,
+                compatibility: compatibility,
+                capabilities: capabilities,
+                requestedResources: .init(
+                    maxWallTimeMainThreadMilliseconds: 1_000
+                ),
+                functions: [function],
+                entries: [
+                    .init(
+                        entryIndex: entry,
+                        functionKey: key,
+                        functionID: function.id
+                    ),
+                ]
+            )
+            let shell = try Verification.ShellInterface(
+                interfaceHash: shellHash,
+                compatibility: compatibility,
+                capabilities: capabilities,
+                entries: [
+                    .init(
+                        index: entry,
+                        key: key,
+                        parameterTypes: [.int64, .int64],
+                        parameterConventions: [.inout, .owned],
+                        resultType: .void,
+                        effects: effects,
+                        fallbackAllowed: fallbackAllowed
+                    ),
+                ]
+            )
+            let bytes = try Bytecode.Encoder.encode(module)
+            let image = try Verification.Engine().verify(
+                bytes: bytes,
+                shell: shell,
+                policy: .init(
+                    acceptedCapabilities: capabilities,
+                    resourceCeiling: .init(
+                        maxWallTimeMainThreadMilliseconds: 1_000
+                    )
+                )
+            )
+            return try Runtime.Generation(
+                id: .init(rawValue: id),
+                parentID: nil,
+                packageID: "HLX-runtime-writeback-\(id)",
                 packageHash: .sha256(bytes),
                 images: [image],
                 estimatedByteCount: bytes.count

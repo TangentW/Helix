@@ -12,24 +12,33 @@ public struct OriginalEntry: Sendable {
     public var index: Core.EntryIndex
     /// VM parameter types accepted by the original adapter.
     public var parameterTypes: [Bytecode.ValueType]
+    /// Frozen ownership convention for every logical parameter.
+    public var parameterConventions: [Bytecode.ParameterConvention]
     /// VM result type returned by the original adapter.
     public var resultType: Bytecode.ValueType
+    /// Frozen execution effects of the original implementation.
+    public var effects: Core.Effects
     /// Whether safe pre-side-effect patch failures may fall back to this implementation.
     public var fallbackAllowed: Bool
     /// Generated adapter that invokes original App code from VM values.
-    public var invoke: @Sendable ([VM.Value]) -> VM.ExecutionResult
+    public var invoke: @Sendable ([VM.Value]) -> VM.EntryInvocationResult
 
     /// Creates one generated original implementation entry.
     public init(
         index: Core.EntryIndex,
         parameterTypes: [Bytecode.ValueType],
+        parameterConventions: [Bytecode.ParameterConvention]? = nil,
         resultType: Bytecode.ValueType,
+        effects: Core.Effects = .init(),
         fallbackAllowed: Bool = false,
-        invoke: @escaping @Sendable ([VM.Value]) -> VM.ExecutionResult
+        invoke: @escaping @Sendable ([VM.Value]) -> VM.EntryInvocationResult
     ) {
         self.index = index
         self.parameterTypes = parameterTypes
+        self.parameterConventions = parameterConventions
+            ?? Array(repeating: .owned, count: parameterTypes.count)
         self.resultType = resultType
+        self.effects = effects
         self.fallbackAllowed = fallbackAllowed
         self.invoke = invoke
     }
@@ -43,6 +52,15 @@ public struct OriginalCatalog: Sendable {
     public init(_ entries: [Runtime.OriginalEntry]) throws {
         var table: [Core.EntryIndex: Runtime.OriginalEntry] = [:]
         for entry in entries {
+            guard entry.parameterConventions.count == entry.parameterTypes.count,
+                  entry.parameterConventions.filter({ $0 == .inout }).count <= 1,
+                  !(entry.effects.isAsync
+                    && entry.parameterConventions.contains(.inout))
+            else {
+                throw Runtime.ActivationError.invalidGeneration(
+                    "original entry \(entry.index) has an invalid writeback signature"
+                )
+            }
             guard table.updateValue(entry, forKey: entry.index) == nil else {
                 throw Runtime.ActivationError.invalidGeneration("duplicate original entry \(entry.index)")
             }

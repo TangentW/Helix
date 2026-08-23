@@ -1235,7 +1235,11 @@ public struct Generator: Sendable {
         ]
     ) throws -> String {
         let shapes = try root.parameterSwiftTypes.map(parseSwiftType)
-        let arguments = zip(zip(root.parameterExpressions, shapes), record.parameterTypes).map {
+        let writebackIndex = record.parameterConventions.firstIndex(of: .inout)
+        let boundaryExpressions = root.parameterExpressions.indices.map { index in
+            index == writebackIndex ? "helixWriteback\(index)" : root.parameterExpressions[index]
+        }
+        let arguments = zip(zip(boundaryExpressions, shapes), record.parameterTypes).map {
             renderEncode(
                 expression: $0.0.0,
                 shape: $0.0.1,
@@ -1254,13 +1258,37 @@ public struct Generator: Sendable {
         let array = renderArray(arguments, indentation: 20)
         let originalAttempt = (record.effects.mayThrow ? "try " : "")
             + (record.effects.isAsync ? "await " : "")
-        let dispatch = """
+        let writebackDeclaration = writebackIndex.map { index in
+            "let helixWriteback\(index): \(shapes[index].rendered) = "
+                + root.parameterExpressions[index]
+        }
+        let applyWritebacks = writebackIndex.map { index -> String in
+            let decoded = renderDecode(
+                expression: "writebacks[0].value",
+                shape: shapes[index],
+                type: record.parameterTypes[index],
+                frozenValueTypes: frozenValueTypes
+            )
+            return """
+            ,
+            applyWritebacks: { writebacks in
+                guard writebacks.count == 1,
+                      writebacks[0].parameterIndex == \(index)
+                else {
+                    throw VM.RuntimeTrap.nativeFailure("generated Bridge received an invalid writeback set")
+                }
+                let decodedWriteback: \(shapes[index].rendered) = \(decoded)
+                \(root.parameterExpressions[index]) = decodedWriteback
+            }
+            """
+        } ?? ""
+        let dispatch = (writebackDeclaration.map { $0 + "\n" } ?? "") + """
         let decision = try Runtime.Bridge.shared.dispatch(
             entry: .init(rawValue: \(root.entryIndex.rawValue)),
             arguments: { encoder in
                 try encoder.encodeArguments(count: \(arguments.count)) { \(array) }
             },
-            decodeResult: \(decodeResult)
+            decodeResult: \(decodeResult)\(applyWritebacks)
         )
         switch decision {
         case .originalRequired:
@@ -1303,7 +1331,9 @@ public struct Generator: Sendable {
             Runtime.OriginalEntry(
                 index: .init(rawValue: \(root.entryIndex.rawValue)),
                 parameterTypes: \(renderValueTypes(record.parameterTypes)),
+                parameterConventions: \(renderParameterConventions(record.parameterConventions)),
                 resultType: \(render(record.resultType)),
+                effects: \(render(record.effects)),
                 fallbackAllowed: \(record.fallbackAllowed),
                 invoke: { _ in
                     .trapped(.nativeFailure("async Shell entry requires its generated async Bridge"))
@@ -1312,27 +1342,45 @@ public struct Generator: Sendable {
             """
         }
         let shapes = try root.parameterSwiftTypes.map(parseSwiftType)
-        let decoded = zip(shapes, record.parameterTypes).enumerated().map { offset, pair in
-            "let argument\(offset): \(pair.0.rendered) = "
+        let decoded = zip(
+            zip(shapes, record.parameterTypes),
+            record.parameterConventions
+        ).enumerated().map { offset, pair in
+            let ((shape, type), convention) = pair
+            return "\(convention == .inout ? "var" : "let") argument\(offset): "
+                + "\(shape.rendered) = "
                 + renderDecode(
                     expression: "arguments[\(offset)]",
-                    shape: pair.0,
-                    type: pair.1,
+                    shape: shape,
+                    type: type,
                     frozenValueTypes: frozenValueTypes
                 )
         }
+        let writebacks = try renderOriginalWritebacks(
+            record: record,
+            shapes: shapes,
+            frozenValueTypes: frozenValueTypes
+        )
         let call = renderOriginalCall(root, record: record)
         let invocation: String
         if record.resultType == .void {
-            let callBody = renderThrowingOriginalCall(call, resultDeclaration: nil, record: record)
-            invocation = callBody + "\nreturn .returned(try Runtime.BridgeValueCodec.encodeVoid())"
+            let callBody = renderThrowingOriginalCall(
+                call,
+                resultDeclaration: nil,
+                record: record,
+                writebacks: writebacks
+            )
+            invocation = callBody
+                + "\nreturn .init(outcome: .returned(try Runtime.BridgeValueCodec.encodeVoid()), "
+                + "writebacks: \(writebacks))"
         } else {
             let resultShape = try parseSwiftType(root.resultSwiftType)
             let resultDeclaration = "let result: \(resultShape.rendered)"
             let callBody = renderThrowingOriginalCall(
                 call,
                 resultDeclaration: resultDeclaration,
-                record: record
+                record: record,
+                writebacks: writebacks
             )
             let encoded = renderEncode(
                 expression: "result",
@@ -1341,7 +1389,9 @@ public struct Generator: Sendable {
                 nativeCatalog: "nativeTypeCatalog",
                 frozenValueTypes: frozenValueTypes
             )
-            invocation = callBody + "\nreturn .returned(\(encoded))"
+            invocation = callBody
+                + "\nreturn .init(outcome: .returned(\(encoded)), "
+                + "writebacks: \(writebacks))"
         }
         let actorGuard = record.effects.requiresMainActor
             ? ["guard Thread.isMainThread else {",
@@ -1353,7 +1403,9 @@ public struct Generator: Sendable {
         Runtime.OriginalEntry(
             index: .init(rawValue: \(root.entryIndex.rawValue)),
             parameterTypes: \(renderValueTypes(record.parameterTypes)),
+            parameterConventions: \(renderParameterConventions(record.parameterConventions)),
             resultType: \(render(record.resultType)),
+            effects: \(render(record.effects)),
             fallbackAllowed: \(record.fallbackAllowed),
             invoke: { arguments in
                 guard arguments.count == \(record.parameterTypes.count) else {
@@ -1394,7 +1446,8 @@ public struct Generator: Sendable {
     private func renderThrowingOriginalCall(
         _ call: String,
         resultDeclaration: String?,
-        record: InterfaceArchive.FunctionRecord
+        record: InterfaceArchive.FunctionRecord,
+        writebacks: String
     ) -> String {
         let assignment = resultDeclaration.map { "\($0) = " } ?? ""
         guard record.effects.mayThrow else { return assignment + call }
@@ -1403,9 +1456,38 @@ public struct Generator: Sendable {
         \(declaration)do {
             \(resultDeclaration == nil ? "" : "result = ")\(call)
         } catch {
-            return .businessError(String(describing: error))
+            return .init(
+                outcome: .businessError(String(describing: error)),
+                writebacks: \(writebacks)
+            )
         }
         """
+    }
+
+    private func renderOriginalWritebacks(
+        record: InterfaceArchive.FunctionRecord,
+        shapes: [SwiftTypeShape],
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
+    ) throws -> String {
+        guard let index = record.parameterConventions.firstIndex(of: .inout) else {
+            return "[]"
+        }
+        guard record.parameterConventions.filter({ $0 == .inout }).count == 1,
+              shapes.indices.contains(index),
+              record.parameterTypes.indices.contains(index)
+        else {
+            throw BridgeGeneration.Error.invalidRoot(record.key)
+        }
+        let encoded = renderEncode(
+            expression: "argument\(index)",
+            shape: shapes[index],
+            type: record.parameterTypes[index],
+            nativeCatalog: "nativeTypeCatalog",
+            frozenValueTypes: frozenValueTypes
+        )
+        return "[.init(parameterIndex: \(index), value: \(encoded))]"
     }
 
     private func renderFrozenValueCodec(
