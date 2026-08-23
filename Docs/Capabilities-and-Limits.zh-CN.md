@@ -69,7 +69,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 
 | 领域 | 已支持 | 有意保留的边界 |
 | --- | --- | --- |
-| 构造与函数引用 | closure literal 与简写参数、局部/全局函数、operator/overload、补丁内绑定/未绑定 method、enum/Optional/Result case、补丁内 initializer/static factory、eligible Shell entry，以及表示保持的 NativeImport 全局/自由函数、绑定实例方法和 initializer | 仅适用于直接调用的默认参数投影不能伪装成函数值；仍需泛型 metadata/witness dispatch 的引用会拒绝 |
+| 构造与函数引用 | closure literal 与简写参数、局部/全局函数、operator/overload、补丁内绑定/未绑定 method（包括唯一且闭合的具体 protocol witness）、enum/Optional/Result case、补丁内 initializer/static factory、eligible Shell entry，以及表示保持的 NativeImport 全局/自由函数、绑定实例方法和 initializer | 仅适用于直接调用的默认参数投影不能伪装成函数值；未解析、条件式、existential 或歧义 witness dispatch 会拒绝 |
 | 存储与高阶传递 | Optional、Tuple、Array、Dictionary value、具体 Result、补丁内 struct/enum/class 字段、可变 closure 变量以及 closure 参数/结果；支持嵌套、递归和返回 closure | closure 不进入 Set key/element、VM-owned `Any`、Shell entry 或通用原生边界 codec |
 | 捕获与所有权 | 不可变快照、共享 mutable cell、强捕获、安全 `weak`、checked `unowned`、捕获另一个 closure、可复制 imported owner，以及经过验证的词法期 nonescaping closure 对调用者 `inout` 的借用 | `unowned(unsafe)`、noncopyable capture、线性 `inout` capture，以及 escaping closure 捕获调用者 `inout` 会拒绝 |
 | 调用与错误 | 同步 nonthrowing/throwing、具体 typed throws、具体 rethrows specialization、inout 的 normal/error 清理、autoclosure、默认参数 generator、Optional 调用与 `callAsFunction` | async closure ABI、suspension、任意运行时 specialization 与通用 unwind cleanup 尚未实现 |
@@ -81,7 +81,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 
 ### 拒绝或有意未完成
 
-- generic root，以及仍需要运行时 generic metadata、witness table、未解析/泛型 reabstraction 或动态 specialization 的执行。这也包括尚未归一为可表示 managed Collection、迭代语义不透明的自定义 `Sequence`；Helix 不会把它们经 NativeImport 转交给 Swift 标准库执行。
+- generic root，以及仍需要运行时 generic metadata、运行时 witness table、未解析/泛型 reabstraction 或动态 specialization 的执行。完全具体且唯一的补丁内 conformance 会在 Compiler 中解析成静态 image call，不放宽这条运行时边界。这也包括尚未归一为可表示 managed Collection、迭代语义不透明的自定义 `Sequence`；Helix 不会把它们经 NativeImport 转交给 Swift 标准库执行。
 - 真正 suspension：`await`、continuation、Task、async callee、async closure、cancellation，以及跨 suspension ownership 或 generation lease。
 - actor-isolated instance root、custom global actor 和任意 executor hop；上面的受限 `@MainActor async` leaf 是不同能力。
 - closure 不能穿过 Shell Entry，也不能在上述精确 callable profile 之外穿过 NativeImport。普通 native value 与通用 boundary codec 都不能包含 closure；只有精确 callback 参数，或直接/Optional 的原生 callable 结果，可以使用强类型 handle 边界。没有 framework-neutral 失败值的 callback 结果、throwing/async callback ABI、`inout` callback 参数、递归或 nonescaping 的嵌套 callable、callable 容器以及并发 `Sendable` 执行语义仍不支持；`unowned(unsafe)` 会因无法安全表达悬空引用而被拒绝，weak/unowned stored property 也尚未进入补丁内 nominal layout。调用者拥有的 `inout` 只能走上面经过验证的词法期 nonescaping 借用，escaping capture 仍会 fail closed。

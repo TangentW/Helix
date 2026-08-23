@@ -73,10 +73,10 @@ Both workflows depend on stable, build-specific identities:
   dispatch evidence and are ignored. Unfamiliar members make only that
   conformance unavailable, so an unrelated advanced declaration cannot block a
   reachable ordinary function. The inventory does not expose Swift witness
-  tables or metadata to HLBC and, by
-  itself, does not make protocol dispatch executable; subsequent concrete
-  specialization and existential stages may consume only an exact, complete
-  record from this inventory.
+  tables or metadata to HLBC and, by itself, does not make protocol dispatch
+  executable. The closed concrete-specialization consumer below, and any later
+  existential consumer, may use only an exact, complete record from this
+  inventory.
 - Verified debug metadata maps HLBC function/block/instruction coordinates to
   logical Swift file, line, and column. Production artifacts redact build-host
   absolute paths; traps add the exact VM program counter and pinned generation.
@@ -586,9 +586,15 @@ Both workflows depend on stable, build-specific identities:
   concrete image body back to the original Swift symbol plus its exact argument
   list. Multiple concrete instantiations and recursive calls therefore remain
   distinct, statically typed targets without depending on optimizer-private
-  symbols. Unresolved archetypes, packs, unstable declaration parameters, and
-  bodies that still require runtime metadata or witness dispatch fail before
-  lowering.
+  symbols. Once a body is concrete, closed protocol dispatch matches the exact
+  conforming nominal, full requirement ABI, and one complete witness record,
+  then rewrites `apply`, `try_apply`, and `partial_apply` to the concrete
+  frontend-emitted thunk. Getter/setter, static, mutating, throwing, inherited,
+  and default-implementation chains for patch-local struct, enum, and class
+  conformers therefore remain ordinary statically typed image calls; witness
+  metadata never enters HLBC. Unresolved archetypes, packs, unstable declaration
+  parameters, conditional conformances, opened existentials, unavailable
+  targets, and textually ambiguous requirements fail before lowering.
 - Frame-local and heap-promoted storage share one field-sensitive aggregate
   shape. The compiler promotes multi-block lifetimes, classifies
   initialize/assign/replace and conditional cleanup, and the Verifier computes

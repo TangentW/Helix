@@ -31,7 +31,7 @@ enum ImageFunctions {
         let hostedSymbols = Set(hostedCandidates.map(\.symbol))
         let rootSymbols: Set<String> = Set([root.mangledName])
             .union(hostedSymbols)
-        let moduleName = CanonicalSIL.SymbolIdentity.moduleName(of: root.mangledName)
+        let moduleName = file.owningModule(of: root)
         var discovered: [String: CanonicalSIL.ImageFunctions.Discovered]
         do {
             discovered = try CanonicalSIL.ImageFunctions.discover(
@@ -161,8 +161,16 @@ enum ImageFunctions {
         else { return nil }
         let isRooted = roots.contains { symbol != $0 && symbol.hasPrefix($0) }
         let isModuleLocal = moduleName.map {
-            CanonicalSIL.SymbolIdentity.moduleName(of: symbol) == $0
+            file.isCurrentModuleDefinition(
+                mangledName: symbol,
+                moduleName: $0
+            )
         } ?? false
+        if isModuleLocal, file.function(mangledName: symbol).map(
+            CanonicalSIL.ProtocolConformance.StaticDispatch.isWitnessThunk
+        ) == true {
+            return .concreteSpecialization
+        }
         if ReleaseCompiler.ImplementationFingerprint
             .isDefaultArgumentGenerator(symbol) {
             return .concreteSpecialization

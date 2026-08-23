@@ -491,7 +491,9 @@ NativeImports. Concrete same-image calls can also monomorphize source generic
 closure helpers from semantic SIL, including direct, throwing, recursive,
 rethrowing, returning, and escaping function-value forms; each concrete type
 argument list receives a deterministic image target. This path does not invent
-runtime metadata or witness dispatch, so any body that still needs either fails
+runtime metadata. A fully concrete patch-local protocol conformance can resolve
+one exact witness to a static image thunk, including bound method formation;
+conditional, existential, missing, or ambiguous witness dispatch still fails
 closed. Mutable captures use the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
 boxes. Safe `weak` and checked `unowned` capture lists and captured weak locals

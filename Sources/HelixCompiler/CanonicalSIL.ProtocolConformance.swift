@@ -47,6 +47,16 @@ extension CanonicalSIL.ProtocolConformance {
 
         let records: [Record]
 
+        func containsWitnessTarget(
+            _ symbol: String,
+            moduleName: String
+        ) -> Bool {
+            records.contains { record in
+                record.moduleName == moduleName
+                    && record.witnesses.contains { $0.symbol == symbol }
+            }
+        }
+
         init(text: String) throws {
             let lines = text.split(
                 separator: "\n",

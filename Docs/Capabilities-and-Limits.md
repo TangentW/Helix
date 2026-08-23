@@ -503,8 +503,12 @@ does not by itself certify a physical device or distribution channel.
   also monomorphized from semantic SIL. Distinct argument lists receive
   deterministic image identities while call bindings retain the original
   Swift symbol; recursive, rethrowing, higher-order, and escaping-function-value
-  forms use that same path. Unresolved arguments, packs, and bodies that retain
-  metadata or witness dispatch remain fail-closed.
+  forms use that same path. A fully concrete patch-local struct, enum, or class
+  conformance may also resolve one exact complete witness record to a static
+  image thunk. This covers getter/setter, static, mutating, throwing, inherited,
+  default-implementation, and bound-method calls without serializing witness
+  metadata. Unresolved arguments, packs, conditional conformances, opened
+  existentials, and ambiguous witness evidence remain fail-closed.
 - Exact NativeImport callable crossings under one generated, framework-neutral
   bridge profile. Typed AST supplies the source closure spelling; canonical SIL
   supplies the physical `@noescape`/escaping lifetime, Objective-C block
@@ -630,7 +634,7 @@ contract passes the checks above; the examples do not form an API allowlist.
 
 | Area | Supported | Intentional boundary |
 | --- | --- | --- |
-| Formation and references | Closure literals and shorthand arguments; local/global functions; operators and overloads; local bound/unbound methods; enum/Optional/Result cases; patch-local initializers/static factories; eligible Shell entries; representation-preserving NativeImport free/global functions, bound instance methods, and initializers | A direct-call-only default-argument projection cannot become a function value; unresolved generic metadata/witness dispatch remains rejected |
+| Formation and references | Closure literals and shorthand arguments; local/global functions; operators and overloads; local bound/unbound methods, including one closed concrete protocol witness; enum/Optional/Result cases; patch-local initializers/static factories; eligible Shell entries; representation-preserving NativeImport free/global functions, bound instance methods, and initializers | A direct-call-only default-argument projection cannot become a function value; unresolved, conditional, existential, or ambiguous witness dispatch remains rejected |
 | Storage and higher order | Optional, tuple, Array, Dictionary value, concrete Result, patch-local struct/enum/class fields, mutable closure variables, and closure parameter/result positions; nested, recursive, and returned closures | Closure values do not enter Set keys/elements, VM-owned `Any`, Shell entries, or the general native boundary codec |
 | Captures and ownership | Immutable snapshots, shared mutable cells, strong capture, safe `weak`, checked `unowned`, captured closures, copyable imported owners, and caller-owned `inout` borrowed by a verified lexical nonescaping closure | `unowned(unsafe)`, noncopyable captures, linear `inout` captures, and escaping capture of caller-owned `inout` are rejected |
 | Invocation and errors | Synchronous nonthrowing/throwing calls, concrete typed throws, concrete rethrows specializations, normal/error inout cleanup, autoclosures, default generators, optional invocation, and `callAsFunction` | Async closure ABI, suspension, arbitrary runtime specialization, and general unwind cleanup are not implemented |
@@ -643,7 +647,9 @@ contract passes the checks above; the examples do not form an API allowlist.
 ### Rejected or intentionally incomplete
 
 - Generic roots or any execution that still requires runtime generic metadata,
-  witness tables, unresolved/generic reabstraction, or dynamic specialization.
+  runtime witness tables, unresolved/generic reabstraction, or dynamic
+  specialization. Closed concrete witness calls described above are compiler-
+  resolved image calls and do not relax this runtime boundary.
   This includes opaque custom `Sequence` implementations whose iteration has
   not been normalized to a represented managed Collection; they are not
   redirected to the Swift standard library through NativeImport.

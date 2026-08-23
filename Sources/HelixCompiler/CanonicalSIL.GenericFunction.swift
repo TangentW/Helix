@@ -156,7 +156,8 @@ enum GenericFunction {
                 body: concreteBody,
                 isolation: function.isolation,
                 declarationLocation: function.declarationLocation,
-                debugLineLocations: function.debugLineLocations
+                debugLineLocations: function.debugLineLocations,
+                isExternalDefinition: function.isExternalDefinition
             )
         )
     }

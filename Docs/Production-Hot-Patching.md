@@ -384,7 +384,9 @@ and Foundation value-overlay bridges are likewise frozen as exact generic
 NativeImport adapters rather than API-specific runtime behavior. All ABI,
 schema, capability, and product versions remain 1/1.0.
 
-It is not arbitrary Swift. Generic roots, runtime metadata/witness dispatch, a
+It is not arbitrary Swift. Generic roots, runtime metadata or runtime/opened/
+conditional witness dispatch (closed concrete patch-local witnesses are
+compiler-resolved static image calls), a
 patch concrete Swift type identity visible to native code, function-local
 nominal declarations, hosted stored properties/custom initializers/arbitrary
 callback ABIs, changes to existing native stored layout, closure crossing a

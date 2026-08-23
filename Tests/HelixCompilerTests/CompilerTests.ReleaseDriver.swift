@@ -2854,6 +2854,96 @@ struct ReleaseDriver {
         )
     }
 
+    @Test("Production generic helpers resolve concrete protocol witnesses")
+    func buildsConcreteProtocolSpecializationPatch() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-release-protocol-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        private protocol Adjusting {
+            func adjusted(by amount: Int) -> Int
+        }
+
+        extension Int: Adjusting {
+            func adjusted(by amount: Int) -> Int { self + amount }
+        }
+
+        @inline(never)
+        private func helper<Value: Adjusting>(
+            _ value: Value,
+            by amount: Int
+        ) -> Int {
+            value.adjusted(by: amount)
+        }
+
+        @inline(never)
+        public func transform(_ value: Int) -> Int {
+            helper(value, by: 1)
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            helperSignature: .init(
+                parameters: ["Value", "Swift.Int"],
+                result: "Swift.Int"
+            ),
+            helperParameterTypes: [.int64, .int64],
+            helperEffects: .init(),
+            helperIsGeneric: true,
+            helperCanonicalDeclaration:
+                "func helper<Value>(_: Value, by: Int) -> Int",
+            helperFormalType: "<Value where Value : Adjusting> "
+                + "(Value, Swift.Int) -> Swift.Int"
+        )
+        let root = try #require(archive.functions.first {
+            $0.canonicalDeclaration.contains("transform")
+        })
+        let entry = try #require(root.entryIndex)
+        let changed = baseline.replacingOccurrences(
+            of: "helper(value, by: 1)",
+            with: "helper(value, by: 4)"
+        )
+        try Data(changed.utf8).write(to: sourceURL)
+
+        let result = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+
+        #expect(result.changedFunctions.map(\.key) == [root.key])
+        #expect(result.module.functions.contains {
+            $0.kind == .concreteSpecialization
+        })
+        #expect(result.module.capabilities.contains(.compilerSpecializationsV1))
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: entry,
+                image: image,
+                arguments: [
+                    .integer(try VM.Integer(signed: 6, bitWidth: 64, isSigned: true)),
+                ]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 10, bitWidth: 64, isSigned: true))
+            )
+        )
+    }
+
     @Test("Production replay preserves async ABI and rejects a newly suspending body")
     func buildsAsyncLeafAndRejectsAwait() throws {
         let directory = FileManager.default.temporaryDirectory

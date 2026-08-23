@@ -35,6 +35,41 @@ enum DebugMetadata {
     private static let locationRegex = makeRegex(
         #"(?:,\s*)?loc\s+(?:\*\s*)?\"((?:\\.|[^\"\\])*)\":([0-9]+):([0-9]+)"#
     )
+    private static let fileIDMappingRegex = makeRegex(
+        #"^//\s+'((?:\\.|[^'\\])*)'\s+=>\s+'((?:\\.|[^'\\])*)'\s*$"#
+    )
+
+    static func sourceModules(in text: String) throws -> [String: String] {
+        var modulesByFile: [String: String] = [:]
+        for rawLine in text.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ) {
+            let line = String(rawLine).trimmingCharacters(in: .whitespaces)
+            guard let match = firstMatch(in: line, regex: fileIDMappingRegex),
+                  let encodedFileID = capture(match, at: 1, in: line),
+                  let encodedPath = capture(match, at: 2, in: line)
+            else { continue }
+            let fileID = try decodeSILUTF8Literal(encodedFileID)
+            let path = try decodeSILUTF8Literal(encodedPath)
+            guard let separator = fileID.firstIndex(of: "/"),
+                  separator > fileID.startIndex,
+                  !path.isEmpty
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "debug file mapping has an invalid identity"
+                )
+            }
+            let moduleName = String(fileID[..<separator])
+            if let existing = modulesByFile[path], existing != moduleName {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "debug file path is mapped to conflicting modules"
+                )
+            }
+            modulesByFile[path] = moduleName
+        }
+        return modulesByFile
+    }
 
     static func scopes(in text: String) throws -> [CanonicalSIL.DebugScope] {
         var rawScopes: [UInt32: RawScope] = [:]

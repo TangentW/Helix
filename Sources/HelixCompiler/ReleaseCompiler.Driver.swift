@@ -1014,7 +1014,15 @@ extension ReleaseCompiler {
             let isRooted = archive.functions.contains {
                 symbol != $0.mangledName && symbol.hasPrefix($0.mangledName)
             }
-            let isModuleLocal = CanonicalSIL.SymbolIdentity.moduleName(of: symbol) == moduleName
+            let isModuleLocal = file.isCurrentModuleDefinition(
+                mangledName: symbol,
+                moduleName: moduleName
+            )
+            if isModuleLocal, file.function(mangledName: symbol).map(
+                CanonicalSIL.ProtocolConformance.StaticDispatch.isWitnessThunk
+            ) == true {
+                return .concreteSpecialization
+            }
             if ReleaseCompiler.ImplementationFingerprint
                 .isDefaultArgumentGenerator(symbol) {
                 return .concreteSpecialization

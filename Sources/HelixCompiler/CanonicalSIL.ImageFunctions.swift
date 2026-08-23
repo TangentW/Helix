@@ -453,7 +453,7 @@ enum ImageFunctions {
             else { return false }
             let materialized: CanonicalSIL.GenericFunction.Materialized
             do {
-                materialized = try CanonicalSIL.GenericFunction.specialize(
+                materialized = try file.materializeGenericFunction(
                     declaration,
                     arguments: rawArguments
                 )

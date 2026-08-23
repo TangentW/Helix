@@ -13,6 +13,7 @@ public struct Function: Hashable, Sendable {
     public var declarationLocation: Core.SourceLocation?
     var debugLineLocations: [CanonicalSIL.DebugLineLocation]
     var hasStrippedDebugMetadata: Bool
+    var isExternalDefinition: Bool
 
     public init(
         mangledName: String,
@@ -27,6 +28,7 @@ public struct Function: Hashable, Sendable {
         declarationLocation = nil
         debugLineLocations = []
         hasStrippedDebugMetadata = false
+        isExternalDefinition = false
     }
 
     /// Returns the original Swift source location associated with a normalized
@@ -42,7 +44,8 @@ public struct Function: Hashable, Sendable {
         body: String,
         isolation: CanonicalSIL.FunctionIsolation,
         declarationLocation: Core.SourceLocation?,
-        debugLineLocations: [CanonicalSIL.DebugLineLocation]
+        debugLineLocations: [CanonicalSIL.DebugLineLocation],
+        isExternalDefinition: Bool = false
     ) {
         self.mangledName = mangledName
         self.loweredType = loweredType
@@ -51,6 +54,7 @@ public struct Function: Hashable, Sendable {
         self.declarationLocation = declarationLocation
         self.debugLineLocations = debugLineLocations
         hasStrippedDebugMetadata = true
+        self.isExternalDefinition = isExternalDefinition
     }
 }
 
@@ -58,9 +62,13 @@ public struct File: Sendable {
     public var functions: [CanonicalSIL.Function]
     public var typeEnvironment: CanonicalSIL.TypeEnvironment
     let protocolConformances: CanonicalSIL.ProtocolConformance.Environment
+    private let protocolDispatch: CanonicalSIL.ProtocolConformance
+        .StaticDispatch.Rewriter
+    private let sourceModuleByFile: [String: String]
 
     public init(text: String) throws {
         let scopes = try CanonicalSIL.DebugMetadata.scopes(in: text)
+        let sourceModules = try CanonicalSIL.DebugMetadata.sourceModules(in: text)
         let scopeLocations = Dictionary(
             uniqueKeysWithValues: scopes.map { ($0.id, $0.location) }
         )
@@ -74,13 +82,22 @@ public struct File: Sendable {
             }
             declarationLocations[symbol] = scope.location
         }
-        functions = try Self.extractFunctions(
+        let parsedFunctions = try Self.extractFunctions(
             text,
             scopeLocations: scopeLocations,
             declarationLocations: declarationLocations
         )
+        let parsedConformances = try CanonicalSIL.ProtocolConformance
+            .Environment(text: text)
+        let dispatch = CanonicalSIL.ProtocolConformance.StaticDispatch.Rewriter(
+            conformances: parsedConformances,
+            availableFunctions: parsedFunctions
+        )
+        functions = parsedFunctions.map { dispatch.rewrite($0) }
         typeEnvironment = try .init(text: text, functions: functions)
-        protocolConformances = try .init(text: text)
+        protocolConformances = parsedConformances
+        protocolDispatch = dispatch
+        sourceModuleByFile = sourceModules
     }
 
     public func function(mangledName: String) -> CanonicalSIL.Function? {
@@ -95,6 +112,57 @@ public struct File: Sendable {
             )
         }
         return match
+    }
+
+    func materializeGenericFunction(
+        _ function: CanonicalSIL.Function,
+        arguments: String
+    ) throws -> CanonicalSIL.GenericFunction.Materialized {
+        var materialized = try CanonicalSIL.GenericFunction.specialize(
+            function,
+            arguments: arguments
+        )
+        materialized.function = protocolDispatch.rewrite(
+            materialized.function,
+            moduleName: owningModule(of: function)
+        )
+        return materialized
+    }
+
+    func owningModule(
+        of function: CanonicalSIL.Function
+    ) -> String? {
+        if let encoded = CanonicalSIL.SymbolIdentity.moduleName(
+            of: function.mangledName
+        ) {
+            return encoded
+        }
+        return function.declarationLocation.flatMap {
+            sourceModuleByFile[$0.file]
+        }
+    }
+
+    /// Swift manglings for declarations in extensions can begin with the
+    /// extended foreign type rather than the source module. The frontend's
+    /// exact file-ID mapping and local witness tables provide bounded ownership
+    /// evidence without admitting serialized bodies from imported modules.
+    func isCurrentModuleDefinition(
+        mangledName: String,
+        moduleName: String
+    ) -> Bool {
+        guard let function = function(mangledName: mangledName) else {
+            return false
+        }
+        if owningModule(of: function) == moduleName {
+            return !function.isExternalDefinition
+        }
+        if protocolConformances.containsWitnessTarget(
+            mangledName,
+            moduleName: moduleName
+        ) {
+            return !function.isExternalDefinition
+        }
+        return false
     }
 
     private static func extractFunctions(
@@ -120,6 +188,9 @@ public struct File: Sendable {
             }
             let name = String(line[nameRange])
             let type = String(line[typeRange])
+            let prefix = line[..<nameRange.lowerBound]
+            let isExternalDefinition = prefix.contains("public_external")
+                || prefix.contains("package_external")
             var isolation: CanonicalSIL.FunctionIsolation = .unspecified
             var commentIndex = index
             while commentIndex > 0 {
@@ -167,7 +238,8 @@ public struct File: Sendable {
                     body: normalizedBody,
                     isolation: isolation,
                     declarationLocation: declarationLocations[name],
-                    debugLineLocations: debugLineLocations
+                    debugLineLocations: debugLineLocations,
+                    isExternalDefinition: isExternalDefinition
                 )
             )
             index += 1
