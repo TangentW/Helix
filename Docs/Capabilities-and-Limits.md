@@ -507,8 +507,26 @@ does not by itself certify a physical device or distribution channel.
   conformance may also resolve one exact complete witness record to a static
   image thunk. This covers getter/setter, static, mutating, throwing, inherited,
   default-implementation, and bound-method calls without serializing witness
-  metadata. Unresolved arguments, packs, conditional conformances, opened
-  existentials, and ambiguous witness evidence remain fail-closed.
+  metadata. Unresolved arguments, packs, conditional conformances, and
+  ambiguous witness evidence remain fail-closed.
+- Closed immutable protocol existentials for complete, nonconditional
+  current-module conformances. Supported source use includes local `any P`,
+  protocol compositions and inherited requirements, struct and patch-local
+  class conformers, `AnyObject` constraints, immutable opening and erasure,
+  closed widening/narrowing, Array storage, bound methods, closure and direct
+  function results, synchronous throwing requirements, concrete casts, and
+  `as?`/`as!` between protocol existentials. The compiler keeps protocol
+  identity out of HLBC and emits only exact represented-type sets and finite
+  represented-type-to-function tables. The Verifier requires unique known
+  types, concrete-specialization targets, a common ABI/effect set, and safe
+  receiver ownership; tables and cast sets are bounded to 4,096 entries. HLVM
+  performs exact matching and meters the full linear lookup. These values are
+  image-local: a protocol existential Shell root is ineligible, and a call
+  carrying a Swift protocol value across Shell or an ordinary NativeImport is
+  rejected before bytecode is emitted. A proven Objective-C `!foreign`
+  protocol erasure remains the existing frozen native `AnyObject` path.
+  Conditional/retroactive/imported conformances, an open conformer universe,
+  and mutable existential opening/writeback remain fail-closed.
 - Exact NativeImport callable crossings under one generated, framework-neutral
   bridge profile. Typed AST supplies the source closure spelling; canonical SIL
   supplies the physical `@noescape`/escaping lifetime, Objective-C block
@@ -634,7 +652,7 @@ contract passes the checks above; the examples do not form an API allowlist.
 
 | Area | Supported | Intentional boundary |
 | --- | --- | --- |
-| Formation and references | Closure literals and shorthand arguments; local/global functions; operators and overloads; local bound/unbound methods, including one closed concrete protocol witness; enum/Optional/Result cases; patch-local initializers/static factories; eligible Shell entries; representation-preserving NativeImport free/global functions, bound instance methods, and initializers | A direct-call-only default-argument projection cannot become a function value; unresolved, conditional, existential, or ambiguous witness dispatch remains rejected |
+| Formation and references | Closure literals and shorthand arguments; local/global functions; operators and overloads; local bound/unbound methods, including closed concrete and immutable closed-existential protocol witnesses; enum/Optional/Result cases; patch-local initializers/static factories; eligible Shell entries; representation-preserving NativeImport free/global functions, bound instance methods, and initializers | A direct-call-only default-argument projection cannot become a function value; unresolved, conditional, open-world, mutable-existential, or ambiguous witness dispatch remains rejected |
 | Storage and higher order | Optional, tuple, Array, Dictionary value, concrete Result, patch-local struct/enum/class fields, mutable closure variables, and closure parameter/result positions; nested, recursive, and returned closures | Closure values do not enter Set keys/elements, VM-owned `Any`, Shell entries, or the general native boundary codec |
 | Captures and ownership | Immutable snapshots, shared mutable cells, strong capture, safe `weak`, checked `unowned`, captured closures, copyable imported owners, and caller-owned `inout` borrowed by a verified lexical nonescaping closure | `unowned(unsafe)`, noncopyable captures, linear `inout` captures, and escaping capture of caller-owned `inout` are rejected |
 | Invocation and errors | Synchronous nonthrowing/throwing calls, concrete typed throws, concrete rethrows specializations, normal/error inout cleanup, autoclosures, default generators, optional invocation, and `callAsFunction` | Async closure ABI, suspension, arbitrary runtime specialization, and general unwind cleanup are not implemented |
@@ -648,8 +666,9 @@ contract passes the checks above; the examples do not form an API allowlist.
 
 - Generic roots or any execution that still requires runtime generic metadata,
   runtime witness tables, unresolved/generic reabstraction, or dynamic
-  specialization. Closed concrete witness calls described above are compiler-
-  resolved image calls and do not relax this runtime boundary.
+  specialization. Closed concrete and immutable closed-existential witness
+  calls described above are compiler-resolved image calls and do not relax this
+  runtime boundary.
   This includes opaque custom `Sequence` implementations whose iteration has
   not been normalized to a represented managed Collection; they are not
   redirected to the Swift standard library through NativeImport.
@@ -695,6 +714,13 @@ contract passes the checks above; the examples do not form an API allowlist.
   native code, retroactive conformances, or changes to a Shell type's layout,
   superclass, or enum cases. The hosted Objective-C subclass above is a frozen
   superclass projection, not arbitrary Swift metadata generation.
+- Swift protocol existential values at a Shell Entry or ordinary NativeImport
+  boundary, conditional or imported conformers, and mutable existential
+  opening/writeback. The supported immutable profile is closed over complete
+  current-module image-local conformers and cannot safely be widened at those
+  boundaries without introducing runtime Swift metadata. The separately
+  proven Objective-C `!foreign` erasure is a frozen native `AnyObject` value,
+  not an exception that exports this image-local representation.
 - Generic or `inout` Shell entries, noncopyable roots, arbitrary borrowing and
   consuming ABI, typed-throws roots, general `rethrows` outside the concrete
   standard-library operations listed above, and general unwind cleanup.

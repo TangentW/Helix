@@ -6,6 +6,7 @@ import HelixInterface
 extension CanonicalSIL {
 public struct Lowerer: Sendable {
     private let typeEnvironment: CanonicalSIL.TypeEnvironment
+    private let sourceFile: CanonicalSIL.File?
 
     /// Swift emits these Foundation bridges around imported Objective-C APIs.
     /// HLBC calls a generated, Swift-typed NativeImport instead, so lowering
@@ -259,6 +260,16 @@ public struct Lowerer: Sendable {
         var sole: ResolvedFunctionReference? {
             variants.count == 1 ? variants[0] : nil
         }
+    }
+
+    private struct ResolvedExistentialCandidate {
+        var target: Bytecode.ExistentialDispatchTarget
+        var reference: ResolvedFunctionReference
+    }
+
+    private struct OpenedProtocolExistential: Equatable {
+        var source: String
+        var archetype: CanonicalSIL.ProtocolExistential.OpenedArchetype
     }
 
     private struct DeferredGenericFunctionReference {
@@ -613,6 +624,15 @@ public struct Lowerer: Sendable {
 
     public init(typeEnvironment: CanonicalSIL.TypeEnvironment = .empty) {
         self.typeEnvironment = typeEnvironment
+        sourceFile = nil
+    }
+
+    init(
+        typeEnvironment: CanonicalSIL.TypeEnvironment,
+        file: CanonicalSIL.File
+    ) {
+        self.typeEnvironment = typeEnvironment
+        sourceFile = file
     }
 
     public func lower(
@@ -744,6 +764,50 @@ public struct Lowerer: Sendable {
             separator: "\n",
             omittingEmptySubsequences: false
         ).map(String.init)
+        let dynamicWitnessReferences = try CanonicalSIL.ProtocolExistential
+            .WitnessReference.inventory(in: normalizedBody)
+        let dynamicProtocolExistentialResolver: CanonicalSIL.ProtocolExistential
+            .Resolver? = try {
+                guard !dynamicWitnessReferences.isEmpty else { return nil }
+                guard let sourceFile else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "opened protocol existential requires its complete canonical SIL file"
+                    )
+                }
+                return try .init(
+                    file: sourceFile,
+                    function: function,
+                    typeEnvironment: typeEnvironment
+                )
+            }()
+        var declaredProtocolExistentialAddresses: [
+            String: CanonicalSIL.ProtocolExistential.Identity
+        ] = [:]
+        for rawLine in rawLines {
+            let instruction = CanonicalSIL.DebugMetadata.strippingMetadata(
+                from: rawLine
+            ).trimmingCharacters(in: .whitespaces)
+            guard let header = match(
+                instruction,
+                pattern: #"^bb[0-9]+(?:\((.*)\))?:$"#
+            ) else { continue }
+            for component in splitTopLevel(header[0]) where !component.isEmpty {
+                guard let parameter = match(
+                    component,
+                    pattern: #"^(%[0-9]+)\s*:\s*(.+)$"#
+                ), let identity = CanonicalSIL.ProtocolExistential.Identity(
+                    spelling: parameter[1]
+                ) else { continue }
+                guard declaredProtocolExistentialAddresses.updateValue(
+                    identity,
+                    forKey: parameter[0]
+                ) == nil else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "duplicate protocol existential block parameter \(parameter[0])"
+                    )
+                }
+            }
+        }
         var remainingDeallocStackUses: [String: Int] = [:]
         var explicitlyDestroyedAddresses = Set<String>()
         var dynamicClosureScopeDestructionCounts: [String: Int] = [:]
@@ -958,6 +1022,14 @@ public struct Lowerer: Sendable {
         // separate owner maps preserve their distinct +0/+1 semantics.
         var compilerTemporaryAliasRoots: [String: String] = [:]
         var addressAliases: [String: String] = [:]
+        var protocolExistentialAddressTypes =
+            declaredProtocolExistentialAddresses
+        var optionalProtocolExistentialPayloadTypes: [
+            String: CanonicalSIL.ProtocolExistential.Identity
+        ] = [:]
+        var openedProtocolExistentials: [
+            String: OpenedProtocolExistential
+        ] = [:]
         var nativePropertyAddresses: [String: NativePropertyAddress] = [:]
         var pendingArrayIteratorTypes: [String: Bytecode.ValueType] = [:]
         var arrayIteratorStates: [String: ArrayIteratorState] = [:]
@@ -1917,6 +1989,83 @@ public struct Lowerer: Sendable {
                 current = next
             }
             return current
+        }
+
+        func requireProtocolExistentialResolver()
+            throws -> CanonicalSIL.ProtocolExistential.Resolver {
+            if let dynamicProtocolExistentialResolver {
+                return dynamicProtocolExistentialResolver
+            }
+            guard let sourceFile else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "protocol existential requires its complete canonical SIL file"
+                )
+            }
+            return try .init(
+                file: sourceFile,
+                function: function,
+                typeEnvironment: typeEnvironment
+            )
+        }
+
+        func validateClosedProtocolWidening(
+            from source: CanonicalSIL.ProtocolExistential.Identity,
+            to destination: CanonicalSIL.ProtocolExistential.Identity
+        ) throws {
+            let resolver = try requireProtocolExistentialResolver()
+            let sourceTypes = Set(try resolver.conformers(
+                to: source
+            ).map(\.dynamicType))
+            let destinationTypes = Set(try resolver.conformers(
+                to: destination
+            ).map(\.dynamicType))
+            guard !sourceTypes.isEmpty,
+                  sourceTypes.isSubset(of: destinationTypes)
+            else {
+                throw CanonicalSIL.LoweringError.unsupportedType(
+                    "protocol existential re-erasure is not a closed widening conversion"
+                )
+            }
+        }
+
+        func openedProtocolExistential(
+            at token: String
+        ) -> OpenedProtocolExistential? {
+            openedProtocolExistentials[token]
+                ?? openedProtocolExistentials[addressBase(token)]
+        }
+
+        func propagateProtocolExistentialMetadata(
+            from source: String,
+            to destination: String,
+            consuming: Bool = false
+        ) {
+            let sourceRoot = addressBase(source)
+            if let identity = protocolExistentialAddressTypes[source]
+                ?? protocolExistentialAddressTypes[sourceRoot] {
+                protocolExistentialAddressTypes[destination] = identity
+            }
+            if let opened = openedProtocolExistential(at: source) {
+                openedProtocolExistentials[destination] = opened
+            }
+            if consuming, source != sourceRoot {
+                protocolExistentialAddressTypes.removeValue(forKey: source)
+                openedProtocolExistentials.removeValue(forKey: source)
+            }
+        }
+
+        func borrowOpenedProtocolExistential(
+            at token: String,
+            line: Int
+        ) throws -> BorrowedStoredValue? {
+            if stackType(at: token) != nil {
+                return try borrowStoredValue(at: token, line: line)
+            }
+            let value = try resolve(token, line: line)
+            guard registerTypes[Int(value.rawValue)] == .any else {
+                return nil
+            }
+            return .init(register: value, temporaryOwner: nil)
         }
 
         func mutableCell(at token: String) -> Bytecode.Register? {
@@ -3349,6 +3498,21 @@ public struct Lowerer: Sendable {
                     "compiler-only inout writeback cannot cross call continuations"
                 )
             }
+            // Canonical SIL prints mutually exclusive `try_apply` successors
+            // in one linear stream. Snapshot every still-initialized
+            // compiler-only root after owned arguments have transferred so a
+            // cleanup in the first printed successor cannot erase the state
+            // observed by the other edge.
+            for (address, value) in stackAddressValues.sorted(
+                by: { $0.key < $1.key }
+            ) where runtimeAddress(at: address) == nil
+                && mutableCell(at: address) == nil {
+                try inheritCompilerAddressValue(
+                    value,
+                    at: address,
+                    into: targets
+                )
+            }
             for target in targets {
                 if !prepared.accesses.isEmpty {
                     guard implicitAccessCleanups[target] == nil else {
@@ -3506,6 +3670,435 @@ public struct Lowerer: Sendable {
                 )
             }
             return .init(variants: variants)
+        }
+
+        func resolveExistentialCandidates(
+            _ witness: CanonicalSIL.ProtocolExistential.WitnessReference,
+            line: Int
+        ) throws -> [ResolvedExistentialCandidate] {
+            let resolver = try requireProtocolExistentialResolver()
+            let candidates: [CanonicalSIL.ProtocolExistential.DispatchCandidate]
+            do {
+                candidates = try resolver.dispatchCandidates(for: witness)
+            } catch let error as CanonicalSIL.ProtocolExistential.ResolutionError {
+                throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                    line: line,
+                    text: error.description
+                )
+            }
+            return try candidates.map { candidate in
+                let bindings = directCalls.bindings(for: candidate.symbol)
+                guard bindings.count == 1, let binding = bindings.first,
+                      binding.mangledName == candidate.symbol,
+                      binding.abiAdapter == .direct,
+                      binding.genericSpecialization == nil,
+                      binding.parameterProjection == .identity(
+                        parameterCount: binding.parameterTypes.count
+                      ),
+                      case let .function(functionID) = binding.target
+                else {
+                    throw CanonicalSIL.LoweringError.invalidCallTable(
+                        "opened witness @\(candidate.symbol) has no unique direct image-local binding"
+                    )
+                }
+                let references = try resolveFunctionReferenceSet(
+                    bindings: [binding],
+                    loweredType: candidate.function.loweredType,
+                    bridgesPhysicalTypes: true,
+                    usesObjectiveCBridge: false,
+                    symbol: candidate.symbol,
+                    line: line
+                )
+                guard let reference = references.sole,
+                      reference.erasedMetatypes.isEmpty,
+                      !reference.usesObjectiveCBridge
+                else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: line,
+                        mangledName: candidate.symbol,
+                        detail: "opened witnesses cannot erase metatypes or bridge foreign ABI"
+                    )
+                }
+                return .init(
+                    target: .init(
+                        dynamicType: candidate.conformer.dynamicType,
+                        function: functionID
+                    ),
+                    reference: reference
+                )
+            }
+        }
+
+        func validateExistentialDispatch(
+            _ candidates: [ResolvedExistentialCandidate],
+            receiverIndex: Int,
+            line: Int
+        ) throws -> Bytecode.ExistentialDispatchTable {
+            guard let firstCandidate = candidates.first,
+                  candidates.count
+                    <= Bytecode.ExistentialDispatchTable.maximumTargetCountV1,
+                  let rawReceiverIndex = UInt32(exactly: receiverIndex)
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "opened witness dispatch has no bounded receiver index"
+                )
+            }
+            let first = firstCandidate.reference
+            guard first.binding.parameterTypes.indices.contains(receiverIndex),
+                  first.physicalParameterConventions.indices.contains(
+                    receiverIndex
+                  )
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: first.binding.mangledName,
+                    detail: "opened witness receiver index is outside its concrete ABI"
+                )
+            }
+            var commonTypes = first.binding.parameterTypes
+            var commonConventions = first.physicalParameterConventions
+            commonTypes.remove(at: receiverIndex)
+            commonConventions.remove(at: receiverIndex)
+            for candidate in candidates {
+                let reference = candidate.reference
+                var types = reference.binding.parameterTypes
+                var conventions = reference.physicalParameterConventions
+                guard types.indices.contains(receiverIndex),
+                      conventions.indices.contains(receiverIndex)
+                else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: line,
+                        mangledName: reference.binding.mangledName,
+                        detail: "opened witness receiver #\(receiverIndex) is not one exact borrowed concrete value; logical=\(types), logical conventions=\(reference.binding.parameterConventions), physical conventions=\(conventions), dynamic=\(candidate.target.dynamicType.storageType)"
+                    )
+                }
+                let receiverType = types[receiverIndex]
+                let logicalConvention = reference.binding
+                    .parameterConventions[receiverIndex]
+                let physicalConvention = conventions[receiverIndex]
+                let acceptsOwnedCopyableReceiver = logicalConvention == .owned
+                    && physicalConvention == .owned
+                    && typeEnvironment.isSafelyCopyableExistentialReceiver(
+                        receiverType
+                    )
+                guard receiverType == candidate.target.dynamicType.storageType,
+                      (logicalConvention == .borrowed
+                        && physicalConvention == .borrowed)
+                        || acceptsOwnedCopyableReceiver
+                else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: line,
+                        mangledName: reference.binding.mangledName,
+                        detail: "opened witness receiver #\(receiverIndex) is neither borrowed nor safely copyable; logical=\(types), logical conventions=\(reference.binding.parameterConventions), physical conventions=\(conventions), dynamic=\(candidate.target.dynamicType.storageType)"
+                    )
+                }
+                types.remove(at: receiverIndex)
+                conventions.remove(at: receiverIndex)
+                guard types == commonTypes,
+                      conventions == commonConventions,
+                      reference.binding.resultType == first.binding.resultType,
+                      reference.binding.effects == first.binding.effects,
+                      reference.hasIndirectResult == first.hasIndirectResult,
+                      reference.thrownType == first.thrownType,
+                      reference.indirectErrorType == first.indirectErrorType
+                else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: line,
+                        mangledName: reference.binding.mangledName,
+                        detail: "opened witness candidates do not share one nonreceiver ABI"
+                    )
+                }
+            }
+            return .init(
+                receiverParameterIndex: rawReceiverIndex,
+                targets: candidates.map(\.target)
+            )
+        }
+
+        func existentialReceiver(
+            for witness: CanonicalSIL.ProtocolExistential.WitnessReference,
+            in tokens: [String],
+            genericArguments: String,
+            appliedFunctionType: String,
+            line: Int
+        ) throws -> (index: Int, sourceAddress: String) {
+            guard let witnessOpened = openedProtocolExistential(
+                at: witness.receiver
+            ) else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "#\(witness.requirement)",
+                    detail: "opened witness has no existential source"
+                )
+            }
+            let indices = tokens.indices.filter {
+                openedProtocolExistential(at: tokens[$0]) == witnessOpened
+            }
+            guard indices.count == 1, let index = indices.first,
+                  let opened = openedProtocolExistential(at: tokens[index]),
+                  opened.archetype == witness.openedArchetype,
+                  CanonicalSIL.ProtocolExistential.OpenedArchetype(
+                    spelling: genericArguments
+                  ) == witness.openedArchetype,
+                  appliedFunctionType.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                  ) == witness.functionType.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                  )
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "#\(witness.requirement)",
+                    detail: "opened witness application changes its receiver, archetype, or SIL function type"
+                )
+            }
+            return (index, tokens[index])
+        }
+
+        func lowerExistentialApply(
+            resultToken: String,
+            witness: CanonicalSIL.ProtocolExistential.WitnessReference,
+            genericArguments: String,
+            argumentText: String,
+            appliedFunctionType: String,
+            line: Int
+        ) throws {
+            let candidates = try resolveExistentialCandidates(
+                witness,
+                line: line
+            )
+            guard let representative = candidates.first?.reference else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "opened witness dispatch has no concrete candidate"
+                )
+            }
+            var argumentTokens = try parseApplyValueTokens(
+                argumentText,
+                line: line
+            )
+            let destinations = try consumeIndirectCallDestinations(
+                from: &argumentTokens,
+                resultType: representative.binding.resultType,
+                hasIndirectResult: representative.hasIndirectResult,
+                indirectErrorType: representative.indirectErrorType,
+                physicalArgumentCount: representative.binding
+                    .parameterTypes.count
+            )
+            guard destinations.error == nil else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "ordinary opened witness apply carries an indirect Error result"
+                )
+            }
+            let receiver = try existentialReceiver(
+                for: witness,
+                in: argumentTokens,
+                genericArguments: genericArguments,
+                appliedFunctionType: appliedFunctionType,
+                line: line
+            )
+            argumentTokens.remove(at: receiver.index)
+            let dispatch = try validateExistentialDispatch(
+                candidates,
+                receiverIndex: receiver.index,
+                line: line
+            )
+            var parameterTypes = representative.binding.parameterTypes
+            var parameterConventions = representative
+                .physicalParameterConventions
+            parameterTypes.remove(at: receiver.index)
+            parameterConventions.remove(at: receiver.index)
+            let borrowedReceiver = try borrowOpenedProtocolExistential(
+                at: receiver.sourceAddress,
+                line: line
+            )
+            guard let borrowedReceiver,
+                  registerTypes[Int(borrowedReceiver.register.rawValue)] == .any
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "opened witness receiver has no initialized Any storage"
+                )
+            }
+            let prepared = try prepareDirectCallArguments(
+                argumentTokens,
+                physicalConventions: parameterConventions,
+                logicalTypes: parameterTypes,
+                line: line,
+                allowsCompilerInoutWriteback: true
+            )
+            guard prepared.arguments.map({
+                registerTypes[Int($0.rawValue)]
+            }) == parameterTypes else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "#\(witness.requirement)"
+                )
+            }
+
+            let result: Bytecode.Register?
+            if destinations.result != nil {
+                guard !resultToken.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "indirect opened witness apply has no Void SIL result"
+                    )
+                }
+                result = try allocate(type: representative.binding.resultType)
+                voidValues.insert(resultToken)
+            } else if representative.binding.resultType == .void {
+                result = nil
+                if !resultToken.isEmpty { voidValues.insert(resultToken) }
+            } else {
+                guard !resultToken.isEmpty else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "non-Void opened witness apply has no result"
+                    )
+                }
+                let register = try allocate(
+                    type: representative.binding.resultType
+                )
+                values[resultToken] = register
+                result = register
+            }
+            appendInstruction(
+                .existentialApply(
+                    result: result,
+                    existential: borrowedReceiver.register,
+                    arguments: prepared.arguments,
+                    dispatch: dispatch
+                )
+            )
+            try transferOwnedCompilerAddressArguments(
+                tokens: argumentTokens,
+                resolvedArguments: prepared.arguments,
+                conventions: parameterConventions
+            )
+            appendPreparedOwnerCleanups(prepared)
+            if let owner = borrowedReceiver.temporaryOwner {
+                appendInstruction(.destroyValue(owner))
+            }
+            if let destination = destinations.result, let result {
+                if representative.binding.resultType == .any {
+                    try storeExistential(result, at: destination)
+                } else {
+                    try storeConstructedValue(result, at: destination)
+                }
+            }
+            try finishPreparedAccessesAndWritebacks(prepared)
+        }
+
+        func lowerExistentialTryApply(
+            witness: CanonicalSIL.ProtocolExistential.WitnessReference,
+            genericArguments: String,
+            argumentText: String,
+            appliedFunctionType: String,
+            normalTarget: Bytecode.BlockID,
+            errorTarget: Bytecode.BlockID,
+            line: Int
+        ) throws {
+            let candidates = try resolveExistentialCandidates(
+                witness,
+                line: line
+            )
+            guard let representative = candidates.first?.reference else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "opened throwing witness dispatch has no concrete candidate"
+                )
+            }
+            guard representative.binding.effects.mayThrow,
+                  !representative.binding.effects.isAsync
+            else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "#\(witness.requirement)",
+                    detail: "try_apply requires synchronous throwing witnesses"
+                )
+            }
+            var argumentTokens = try parseApplyValueTokens(
+                argumentText,
+                line: line
+            )
+            let destinations = try consumeIndirectCallDestinations(
+                from: &argumentTokens,
+                resultType: representative.binding.resultType,
+                hasIndirectResult: representative.hasIndirectResult,
+                indirectErrorType: representative.indirectErrorType,
+                physicalArgumentCount: representative.binding
+                    .parameterTypes.count
+            )
+            try bindIndirectTryCallDestinations(
+                destinations,
+                resultType: representative.binding.resultType,
+                indirectErrorType: representative.indirectErrorType,
+                normalTarget: normalTarget,
+                errorTarget: errorTarget
+            )
+            let receiver = try existentialReceiver(
+                for: witness,
+                in: argumentTokens,
+                genericArguments: genericArguments,
+                appliedFunctionType: appliedFunctionType,
+                line: line
+            )
+            argumentTokens.remove(at: receiver.index)
+            let dispatch = try validateExistentialDispatch(
+                candidates,
+                receiverIndex: receiver.index,
+                line: line
+            )
+            var parameterTypes = representative.binding.parameterTypes
+            var parameterConventions = representative
+                .physicalParameterConventions
+            parameterTypes.remove(at: receiver.index)
+            parameterConventions.remove(at: receiver.index)
+            let borrowedReceiver = try borrowOpenedProtocolExistential(
+                at: receiver.sourceAddress,
+                line: line
+            )
+            guard let borrowedReceiver,
+                  registerTypes[Int(borrowedReceiver.register.rawValue)] == .any
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "opened throwing witness receiver has no initialized Any storage"
+                )
+            }
+            let prepared = try prepareDirectCallArguments(
+                argumentTokens,
+                physicalConventions: parameterConventions,
+                logicalTypes: parameterTypes,
+                line: line,
+                allowsCompilerInoutWriteback: false
+            )
+            guard prepared.arguments.map({
+                registerTypes[Int($0.rawValue)]
+            }) == parameterTypes else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: "#\(witness.requirement)"
+                )
+            }
+            appendInstruction(
+                .existentialTryApply(
+                    existential: borrowedReceiver.register,
+                    arguments: prepared.arguments,
+                    dispatch: dispatch,
+                    normalTarget: normalTarget,
+                    errorTarget: errorTarget
+                )
+            )
+            try transferOwnedCompilerAddressArguments(
+                tokens: argumentTokens,
+                resolvedArguments: prepared.arguments,
+                conventions: parameterConventions
+            )
+            try schedulePreparedContinuationCleanups(
+                prepared,
+                in: [normalTarget, errorTarget]
+            )
+            if let owner = borrowedReceiver.temporaryOwner {
+                try scheduleTemporaryOwnerCleanups(
+                    [owner],
+                    in: [normalTarget, errorTarget]
+                )
+            }
         }
 
         func resolveDeferredForeignReference(
@@ -4123,6 +4716,34 @@ public struct Lowerer: Sendable {
                     return physical == .borrowed && logical == .owned
                         ? try copyOwnedValue(argument)
                         : argument
+                }
+            }
+        }
+
+        func validateProtocolExistentialBoundary(
+            binding: CanonicalSIL.DirectCallBinding,
+            appliedTypeSpelling: String,
+            permitsObjectiveCProtocolErasure: Bool,
+            line: Int
+        ) throws {
+            switch binding.target {
+            case .function:
+                return
+            case .nativeImport where permitsObjectiveCProtocolErasure:
+                // `resolveFunctionReferenceSet` has already proven every
+                // physical `!foreign` protocol slot against one frozen
+                // AnyObject NativeImport slot. That Objective-C ABI erasure
+                // carries a native reference, not an image-local Swift
+                // protocol value, so it remains a supported boundary shape.
+                return
+            case .entry, .nativeImport:
+                guard !CanonicalSIL.ProtocolExistential.Identity
+                    .containsProtocolExistential(
+                        in: appliedTypeSpelling
+                    ) else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "protocol existential call to \(binding.mangledName) at line \(line) crosses a Shell or NativeImport boundary"
+                    )
                 }
             }
         }
@@ -20989,14 +21610,57 @@ public struct Lowerer: Sendable {
 
             if let opened = match(
                 line,
+                pattern: #"^(%[0-9]+) = open_existential_ref (%[0-9]+) to \$(.+)$"#
+            ), let archetype = CanonicalSIL.ProtocolExistential
+                .OpenedArchetype(spelling: opened[2]) {
+                let sourceToken = addressBase(opened[1])
+                let source = try resolve(opened[1], line: sourceLine)
+                guard registerTypes[Int(source.rawValue)] == .any,
+                      protocolExistentialAddressTypes[sourceToken]
+                        == archetype.identity
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "opened protocol reference in \(displayName) expects "
+                            + "\(archetype.identity), found "
+                            + "\(String(describing: protocolExistentialAddressTypes[sourceToken]))"
+                    )
+                }
+                values[opened[0]] = source
+                openedProtocolExistentials[opened[0]] = .init(
+                    source: sourceToken,
+                    archetype: archetype
+                )
+                continue
+            }
+
+            if let opened = match(
+                line,
                 pattern: #"^(%[0-9]+) = open_existential_addr (immutable_access|mutable_access) (%[0-9]+) to \$\*(.+)$"#
             ) {
                 guard opened[1] == "immutable_access",
-                      compilerAddressType(opened[2]) == .any,
-                      CanonicalSIL.AnyObjectBridge.isOpenedAnyArchetype(
-                        opened[3]
-                      )
+                      compilerAddressType(opened[2]) == .any
                 else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: line
+                    )
+                }
+                if let archetype = CanonicalSIL.ProtocolExistential
+                    .OpenedArchetype(spelling: opened[3]) {
+                    let source = addressBase(opened[2])
+                    guard protocolExistentialAddressTypes[source]
+                            == archetype.identity
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "opened protocol existential \(archetype.identity) does not match source \(source) identity \(String(describing: protocolExistentialAddressTypes[source]))"
+                        )
+                    }
+                    openedProtocolExistentials[opened[0]] = .init(
+                        source: source,
+                        archetype: archetype
+                    )
+                } else if !CanonicalSIL.AnyObjectBridge
+                    .isOpenedAnyArchetype(opened[3]) {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
                         text: line
@@ -21006,10 +21670,37 @@ public struct Lowerer: Sendable {
                 continue
             }
 
+            if let witness = match(
+                line,
+                pattern: #"^(%[0-9]+) = witness_method \$@opened\(.+$"#
+            ), dynamicWitnessReferences[witness[0]] != nil {
+                // The compiler-only witness value is consumed by the
+                // existential apply lowering below. No runtime function
+                // pointer or Swift witness metadata enters the image.
+                continue
+            }
+
             if let stack = match(
                 line,
                 pattern: #"^(%[0-9]+) = alloc_stack(?: \[[^\]]+\])* \$(.+?)(?:, (?:var|let),.*)?$"#
             ) {
+                if let opened = CanonicalSIL.ProtocolExistential
+                    .OpenedArchetype(spelling: stack[1]) {
+                    stackAddressTypes[stack[0]] = .any
+                    protocolExistentialAddressTypes[stack[0]] = opened.identity
+                    continue
+                }
+                if let identity = CanonicalSIL.ProtocolExistential.Identity(
+                    spelling: stack[1]
+                ) {
+                    stackAddressTypes[stack[0]] = .any
+                    protocolExistentialAddressTypes[stack[0]] = identity
+                    continue
+                }
+                if let identity = CanonicalSIL.ProtocolExistential.Identity
+                    .optionalPayload(spelling: stack[1]) {
+                    optionalProtocolExistentialPayloadTypes[stack[0]] = identity
+                }
                 if let signature = try nativeBlockStorageClosureSignature(
                     stack[1]
                 ) {
@@ -22799,6 +23490,68 @@ public struct Lowerer: Sendable {
 
             if let cast = match(
                 line,
+                pattern: #"^(%[0-9]+) = init_existential_ref (%[0-9]+) : \$(.+) : \$(.+), \$(any .+)$"#
+            ), let identity = CanonicalSIL.ProtocolExistential.Identity(
+                spelling: cast[4]
+            ) {
+                guard cast[2].trimmingCharacters(in: .whitespaces)
+                        == cast[3].trimmingCharacters(in: .whitespaces)
+                else {
+                    throw CanonicalSIL.LoweringError.unsupportedType(
+                        "protocol reference erasure changes its concrete type"
+                    )
+                }
+                protocolExistentialAddressTypes[cast[0]] = identity
+                if let opened = CanonicalSIL.ProtocolExistential
+                    .OpenedArchetype(spelling: cast[2]) {
+                    guard let source = openedProtocolExistential(at: cast[1]),
+                          source.archetype == opened
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "protocol reference re-erasure lost its opened source"
+                        )
+                    }
+                    try validateClosedProtocolWidening(
+                        from: source.archetype.identity,
+                        to: identity
+                    )
+                    values[cast[0]] = try prepareOwnedValue(
+                        cast[1],
+                        expectedType: .any,
+                        line: sourceLine
+                    )
+                } else {
+                    let dynamicType = try parseDynamicAnyType(cast[2])
+                    guard dynamicType.isAnyPayloadV1,
+                          try requireProtocolExistentialResolver().accepts(
+                              dynamicType,
+                              as: identity
+                          )
+                    else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "protocol reference erasure has no exact complete local conformance"
+                        )
+                    }
+                    let payload = try prepareOwnedValue(
+                        cast[1],
+                        expectedType: dynamicType.storageType,
+                        line: sourceLine
+                    )
+                    let result = try allocate(type: .any)
+                    values[cast[0]] = result
+                    appendInstruction(
+                        .eraseToAny(
+                            result: result,
+                            value: payload,
+                            dynamicType: dynamicType
+                        )
+                    )
+                }
+                continue
+            }
+
+            if let cast = match(
+                line,
                 pattern: #"^(%[0-9]+) = init_existential_ref (%[0-9]+) : \$(.+) : \$.+, \$(?:Swift\.)?AnyObject$"#
             ) {
                 let borrowedSource = try resolve(cast[1], line: sourceLine)
@@ -23928,6 +24681,10 @@ public struct Lowerer: Sendable {
                     localFactoryReferences[borrowed[0]] = key
                 } else {
                     values[borrowed[0]] = try resolve(borrowed[1], line: sourceLine)
+                    propagateProtocolExistentialMetadata(
+                        from: borrowed[1],
+                        to: borrowed[0]
+                    )
                     borrowedValueTokens.insert(borrowed[0])
                     aliasRetainedValue(borrowed[0], to: borrowed[1])
                     aliasCompilerTemporary(borrowed[0], to: borrowed[1])
@@ -24120,6 +24877,18 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^try_apply (%[0-9]+)(?:<(.+)>)?\((.*)\) : \$(.+), normal bb([0-9]+), error bb([0-9]+)$"#
             ) {
+                if let witness = dynamicWitnessReferences[call[0]] {
+                    try lowerExistentialTryApply(
+                        witness: witness,
+                        genericArguments: call[1],
+                        argumentText: call[2],
+                        appliedFunctionType: call[3],
+                        normalTarget: try parseBlockID(call[4]),
+                        errorTarget: try parseBlockID(call[5]),
+                        line: sourceLine
+                    )
+                    continue
+                }
                 if let closure = values[call[0]],
                    case let .closure(signature) = registerTypes[
                     Int(closure.rawValue)
@@ -24450,6 +25219,13 @@ public struct Lowerer: Sendable {
                         mangledName: binding.mangledName
                     )
                 }
+                try validateProtocolExistentialBoundary(
+                    binding: binding,
+                    appliedTypeSpelling: appliedLoweredType,
+                    permitsObjectiveCProtocolErasure:
+                        reference.usesObjectiveCBridge,
+                    line: sourceLine
+                )
                 argumentTokens = try projectNativeImportArguments(
                     argumentTokens,
                     for: reference,
@@ -24516,6 +25292,17 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(?:(%[0-9]+) = )?apply (%[0-9]+)(?:<(.+)>)?\((.*)\) : \$(.+)$"#
             ) {
+                if let witness = dynamicWitnessReferences[call[1]] {
+                    try lowerExistentialApply(
+                        resultToken: call[0],
+                        witness: witness,
+                        genericArguments: call[2],
+                        argumentText: call[3],
+                        appliedFunctionType: call[4],
+                        line: sourceLine
+                    )
+                    continue
+                }
                 if let generator = externalDefaultArgumentGenerators[call[1]] {
                     try lowerExternalDefaultArgumentGenerator(
                         generator,
@@ -24682,6 +25469,19 @@ public struct Lowerer: Sendable {
                             mangledName: "<closure>"
                         )
                     }
+                    let resultExistentialIdentity = CanonicalSIL
+                        .ProtocolExistential.Identity.functionResult(
+                            spelling: call[4]
+                        )
+                    guard resultExistentialIdentity == nil
+                            || signature.result == .any
+                    else {
+                        throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                            line: sourceLine,
+                            mangledName: "<closure>",
+                            detail: "protocol existential result is not represented as Any"
+                        )
+                    }
                     let result: Bytecode.Register?
                     if indirectResultDestination != nil {
                         guard !call[0].isEmpty else {
@@ -24702,6 +25502,10 @@ public struct Lowerer: Sendable {
                         }
                         let register = try allocate(type: signature.result)
                         values[call[0]] = register
+                        if let resultExistentialIdentity {
+                            protocolExistentialAddressTypes[call[0]] =
+                                resultExistentialIdentity
+                        }
                         result = register
                     }
                     appendInstruction(
@@ -24718,6 +25522,20 @@ public struct Lowerer: Sendable {
                     )
                     appendPreparedOwnerCleanups(prepared)
                     if let indirectResultDestination, let result {
+                        if let resultExistentialIdentity {
+                            let destination = addressBase(
+                                indirectResultDestination
+                            )
+                            guard protocolExistentialAddressTypes[destination]
+                                .map({ $0 == resultExistentialIdentity }) != false
+                            else {
+                                throw CanonicalSIL.LoweringError.malformedSIL(
+                                    "indirect closure call changes its protocol existential result identity"
+                                )
+                            }
+                            protocolExistentialAddressTypes[destination] =
+                                resultExistentialIdentity
+                        }
                         if signature.result == .any {
                             try storeExistential(result, at: indirectResultDestination)
                         } else {
@@ -25075,6 +25893,13 @@ public struct Lowerer: Sendable {
                         mangledName: binding.mangledName
                     )
                 }
+                try validateProtocolExistentialBoundary(
+                    binding: binding,
+                    appliedTypeSpelling: appliedLoweredType,
+                    permitsObjectiveCProtocolErasure:
+                        reference.usesObjectiveCBridge,
+                    line: sourceLine
+                )
                 argumentTokens = try projectNativeImportArguments(
                     argumentTokens,
                     for: reference,
@@ -25116,6 +25941,19 @@ public struct Lowerer: Sendable {
                     )
                 }
                 let result: Bytecode.Register?
+                let resultExistentialIdentity = CanonicalSIL
+                    .ProtocolExistential.Identity.functionResult(
+                        spelling: appliedLoweredType
+                    )
+                guard resultExistentialIdentity == nil
+                        || binding.resultType == .any
+                else {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: sourceLine,
+                        mangledName: binding.mangledName,
+                        detail: "protocol existential result is not represented as Any"
+                    )
+                }
                 if indirectResultDestination != nil {
                     guard !call[0].isEmpty else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
@@ -25138,6 +25976,10 @@ public struct Lowerer: Sendable {
                     }
                     let register = try allocate(type: binding.resultType)
                     values[call[0]] = register
+                    if let resultExistentialIdentity {
+                        protocolExistentialAddressTypes[call[0]] =
+                            resultExistentialIdentity
+                    }
                     result = register
                 }
                 let instruction: Bytecode.Instruction = switch binding.target {
@@ -25162,6 +26004,20 @@ public struct Lowerer: Sendable {
                 )
                 appendPreparedOwnerCleanups(prepared)
                 if let indirectResultDestination, let result {
+                    if let resultExistentialIdentity {
+                        let destination = addressBase(
+                            indirectResultDestination
+                        )
+                        guard protocolExistentialAddressTypes[destination].map({
+                            $0 == resultExistentialIdentity
+                        }) != false else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "indirect call changes its protocol existential result identity"
+                            )
+                        }
+                        protocolExistentialAddressTypes[destination] =
+                            resultExistentialIdentity
+                    }
                     if binding.resultType == .any {
                         try storeExistential(result, at: indirectResultDestination)
                     } else {
@@ -25618,6 +26474,11 @@ public struct Lowerer: Sendable {
                 }
                 stackAddressTypes[extraction[0]] = wrapped
                 stackAddressValues[extraction[0]] = payload
+                if let identity = optionalProtocolExistentialPayloadTypes[
+                    addressBase(extraction[1])
+                ] {
+                    protocolExistentialAddressTypes[extraction[0]] = identity
+                }
                 if payloadUse == .modify {
                     takenOptionalPayloads[extraction[0]] = .init(
                         address: extraction[1]
@@ -25918,6 +26779,11 @@ public struct Lowerer: Sendable {
                     wrappedType: wrapped
                 )
                 optionalPayloadAddressRoots[initialization[0]] = initialization[1]
+                if let identity = optionalProtocolExistentialPayloadTypes[
+                    addressBase(initialization[1])
+                ] {
+                    protocolExistentialAddressTypes[initialization[0]] = identity
+                }
                 continue
             }
 
@@ -26002,7 +26868,15 @@ public struct Lowerer: Sendable {
                 line,
                 pattern: #"^(%[0-9]+) = init_existential_addr (%[0-9]+), \$(.+)$"#
             ) {
-                let dynamicType = try parseDynamicAnyType(projection[2])
+                let opened = CanonicalSIL.ProtocolExistential.OpenedArchetype(
+                    spelling: projection[2]
+                )
+                let dynamicType: Bytecode.DynamicType
+                if opened != nil {
+                    dynamicType = .any
+                } else {
+                    dynamicType = try parseDynamicAnyType(projection[2])
+                }
                 guard compilerAddressType(projection[1]) == .any,
                       dynamicType.isAnyPayloadOrExistentialV1,
                       existentialProjections[projection[0]] == nil
@@ -26010,6 +26884,43 @@ public struct Lowerer: Sendable {
                     throw CanonicalSIL.LoweringError.unsupportedType(
                         "Any payload \(dynamicType)"
                     )
+                }
+                if let destinationIdentity = protocolExistentialAddressTypes[
+                    addressBase(projection[1])
+                ] {
+                    let resolver = try requireProtocolExistentialResolver()
+                    if let opened {
+                        let sources = Set(
+                            openedProtocolExistentials.values.compactMap {
+                                $0.archetype == opened ? $0.source : nil
+                            }
+                        )
+                        guard sources.count == 1,
+                              let sourceToken = sources.first,
+                              let source = openedProtocolExistentials.values
+                                .first(where: {
+                                    $0.source == sourceToken
+                                        && $0.archetype == opened
+                                })
+                        else {
+                            throw CanonicalSIL.LoweringError.malformedSIL(
+                                "re-erased opened protocol existential has no unique source"
+                            )
+                        }
+                        try validateClosedProtocolWidening(
+                            from: source.archetype.identity,
+                            to: destinationIdentity
+                        )
+                    } else {
+                        guard try resolver.accepts(
+                            dynamicType,
+                            as: destinationIdentity
+                        ) else {
+                            throw CanonicalSIL.LoweringError.unsupportedType(
+                                "\(dynamicType) has no complete local conformance to \(destinationIdentity)"
+                            )
+                        }
+                    }
                 }
                 existentialProjections[projection[0]] = .init(
                     destination: projection[1],
@@ -26406,6 +27317,20 @@ public struct Lowerer: Sendable {
                     )
                 }
                 try storeConstructedValue(value, at: store[1])
+                if let opened = openedProtocolExistential(at: store[0]) {
+                    guard addressType == .any,
+                          protocolExistentialAddressTypes[
+                            addressBase(store[1])
+                          ] == opened.archetype.identity
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "opened protocol value is stored into unrelated scratch storage"
+                        )
+                    }
+                    openedProtocolExistentials[
+                        addressBase(store[1])
+                    ] = opened
+                }
                 if let source = copiedLocalOwnerSource,
                    value != source,
                    !hasFutureSemanticUse(of: store[0], after: currentSILLineIndex) {
@@ -26863,7 +27788,7 @@ public struct Lowerer: Sendable {
                     requiresManagedOwnership
                 ) == true {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "destroy_addr references uninitialized compiler storage"
+                        "destroy_addr references uninitialized compiler storage \(destroy[0]) in \(displayName)"
                     )
                 }
                 continue
@@ -26871,41 +27796,83 @@ public struct Lowerer: Sendable {
 
             if let cast = match(
                 line,
-                pattern: #"^checked_cast_addr_br (take_always|copy_on_success) Any in (%[0-9]+) to (.+) in (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
-            ) {
-                let targetDynamicType = try parseDynamicAnyType(cast[2])
-                let targetType = targetDynamicType.storageType
-                guard stackType(at: cast[1]) == .any,
+                pattern: #"^checked_cast_addr_br (take_always|copy_on_success) (Any|Swift\.Any|any .+?) in (%[0-9]+) to (.+) in (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
+            ), cast[1] != "any Error", cast[1] != "any Swift.Error" {
+                let sourceIdentity = CanonicalSIL.ProtocolExistential.Identity(
+                    spelling: cast[1]
+                )
+                guard cast[1] == "Any" || cast[1] == "Swift.Any"
+                        || sourceIdentity != nil,
+                      stackType(at: cast[2]) == .any,
                       let source = try transferAddressCastSource(
                         mode: cast[0],
-                        at: cast[1],
+                        at: cast[2],
                         line: sourceLine
                       ),
                       registerTypes[Int(source.rawValue)] == .any,
-                      compilerAddressType(cast[3]) == targetType,
-                      targetDynamicType.isAnyCastTargetV1,
-                      runtimeAddress(at: cast[3]) == nil
+                      runtimeAddress(at: cast[4]) == nil
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "checked Any cast source or destination type does not match"
+                        "checked existential cast source is not represented Any storage"
                     )
                 }
-                let successTarget = try parseBlockID(cast[4])
-                let failureTarget = try parseBlockID(cast[5])
+                let targetType: Bytecode.ValueType
+                let optional: Bytecode.Register
+                let castInstruction: Bytecode.Instruction
+                if let targetIdentity = CanonicalSIL.ProtocolExistential
+                    .Identity(spelling: cast[3]) {
+                    targetType = .any
+                    guard compilerAddressType(cast[4]) == .any else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "checked protocol cast destination is not Any storage"
+                        )
+                    }
+                    let accepted = try requireProtocolExistentialResolver()
+                        .acceptedTypeSet(
+                            for: targetIdentity,
+                            source: sourceIdentity
+                        )
+                    optional = try allocate(type: .optional(.any))
+                    castInstruction = .checkedCastExistential(
+                        result: optional,
+                        value: source,
+                        acceptedTypes: accepted
+                    )
+                    let destination = addressBase(cast[4])
+                    guard protocolExistentialAddressTypes[destination].map({
+                        $0 == targetIdentity
+                    }) != false else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "checked protocol cast destination changes existential identity"
+                        )
+                    }
+                    protocolExistentialAddressTypes[destination] = targetIdentity
+                } else {
+                    let targetDynamicType = try parseDynamicAnyType(cast[3])
+                    targetType = targetDynamicType.storageType
+                    guard compilerAddressType(cast[4]) == targetType,
+                          targetDynamicType.isAnyCastTargetV1
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "checked existential cast destination type does not match"
+                        )
+                    }
+                    optional = try allocate(type: .optional(targetType))
+                    castInstruction = .checkedCastAny(
+                        result: optional,
+                        value: source,
+                        targetType: targetDynamicType
+                    )
+                }
+                let successTarget = try parseBlockID(cast[5])
+                let failureTarget = try parseBlockID(cast[6])
                 guard implicitStackValues[successTarget] == nil else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "multiple checked Any casts share a success block"
                     )
                 }
-                let optional = try allocate(type: .optional(targetType))
                 let projected = try allocate(type: targetType)
-                appendInstruction(
-                    .checkedCastAny(
-                        result: optional,
-                        value: source,
-                        targetType: targetDynamicType
-                    )
-                )
+                appendInstruction(castInstruction)
                 appendInstruction(
                     .switchOptional(
                         optional: optional,
@@ -26913,44 +27880,86 @@ public struct Lowerer: Sendable {
                         noneTarget: failureTarget
                     )
                 )
-                implicitStackValues[successTarget] = [.init(cast[3], projected)]
+                implicitStackValues[successTarget] = [.init(cast[4], projected)]
                 continue
             }
 
             if let cast = match(
                 line,
-                pattern: #"^unconditional_checked_cast_addr Any in (%[0-9]+) to (.+) in (%[0-9]+)$"#
-            ) {
-                let targetDynamicType = try parseDynamicAnyType(cast[1])
-                let targetType = targetDynamicType.storageType
-                guard stackType(at: cast[0]) == .any,
+                pattern: #"^unconditional_checked_cast_addr (Any|Swift\.Any|any .+?) in (%[0-9]+) to (.+) in (%[0-9]+)$"#
+            ), cast[0] != "any Error", cast[0] != "any Swift.Error" {
+                let sourceIdentity = CanonicalSIL.ProtocolExistential.Identity(
+                    spelling: cast[0]
+                )
+                guard cast[0] == "Any" || cast[0] == "Swift.Any"
+                        || sourceIdentity != nil,
+                      stackType(at: cast[1]) == .any,
                       let source = try copyStoredValue(
-                        at: cast[0],
+                        at: cast[1],
                         line: sourceLine
                       ),
-                      registerTypes[Int(source.rawValue)] == .any,
-                      compilerAddressType(cast[2]) == targetType,
-                      targetDynamicType.isAnyCastTargetV1
+                      registerTypes[Int(source.rawValue)] == .any
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "forced Any cast source or destination type does not match"
+                        "forced existential cast source is not represented Any storage"
                     )
                 }
-                let result = try allocate(type: targetType)
-                appendInstruction(
-                    .forceCastAny(
-                        result: result,
-                        value: source,
-                        targetType: targetDynamicType
+                if let targetIdentity = CanonicalSIL.ProtocolExistential
+                    .Identity(spelling: cast[2]) {
+                    guard compilerAddressType(cast[3]) == .any else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "forced protocol cast destination is not Any storage"
+                        )
+                    }
+                    let accepted = try requireProtocolExistentialResolver()
+                        .acceptedTypeSet(
+                            for: targetIdentity,
+                            source: sourceIdentity
+                        )
+                    let result = try allocate(type: .any)
+                    appendInstruction(
+                        .forceCastExistential(
+                            result: result,
+                            value: source,
+                            acceptedTypes: accepted
+                        )
                     )
-                )
-                try storeVMValue(result, at: cast[2])
+                    let destination = addressBase(cast[3])
+                    guard protocolExistentialAddressTypes[destination].map({
+                        $0 == targetIdentity
+                    }) != false else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "forced protocol cast destination changes existential identity"
+                        )
+                    }
+                    protocolExistentialAddressTypes[destination] = targetIdentity
+                    try storeExistential(result, at: cast[3])
+                } else {
+                    let targetDynamicType = try parseDynamicAnyType(cast[2])
+                    let targetType = targetDynamicType.storageType
+                    guard compilerAddressType(cast[3]) == targetType,
+                          targetDynamicType.isAnyCastTargetV1
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "forced existential cast destination type does not match"
+                        )
+                    }
+                    let result = try allocate(type: targetType)
+                    appendInstruction(
+                        .forceCastAny(
+                            result: result,
+                            value: source,
+                            targetType: targetDynamicType
+                        )
+                    )
+                    try storeVMValue(result, at: cast[3])
+                }
                 continue
             }
 
             if let cast = match(
                 line,
-                pattern: #"^checked_cast_addr_br (take_always|copy_on_success) any Error in (%[0-9]+) to (.+) in (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
+                pattern: #"^checked_cast_addr_br (take_always|copy_on_success) any (?:Swift\.)?Error in (%[0-9]+) to (.+) in (%[0-9]+), bb([0-9]+), bb([0-9]+)$"#
             ) {
                 let sourceAddress = addressBase(cast[1])
                 let destinationAddress = addressBase(cast[3])
@@ -27172,6 +28181,10 @@ public struct Lowerer: Sendable {
                 let source = try resolve(copy[1], line: sourceLine)
                 let result = try allocate(type: registerTypes[Int(source.rawValue)])
                 values[copy[0]] = result
+                propagateProtocolExistentialMetadata(
+                    from: copy[1],
+                    to: copy[0]
+                )
                 if frozenObjectiveCBridgeResults.contains(source) {
                     frozenObjectiveCBridgeResults.insert(result)
                 }
@@ -27310,6 +28323,11 @@ public struct Lowerer: Sendable {
                 let source = try resolve(move[1], line: sourceLine)
                 let result = try allocate(type: registerTypes[Int(source.rawValue)])
                 values[move[0]] = result
+                propagateProtocolExistentialMetadata(
+                    from: move[1],
+                    to: move[0],
+                    consuming: true
+                )
                 if frozenObjectiveCBridgeResults.remove(source) != nil {
                     frozenObjectiveCBridgeResults.insert(result)
                 }
@@ -29424,6 +30442,15 @@ public struct Lowerer: Sendable {
                 || value.hasPrefix("@unowned ")
                 || value.hasPrefix("@in_guaranteed ")
             let explicitlyOwned = value.hasPrefix("@owned ")
+            if explicitlyBorrowed,
+               CanonicalSIL.ProtocolExistential.Identity(
+                spelling: String(value)
+               ) != nil {
+                // The VM stores every protocol existential in Any. Retain
+                // Swift's +0 boundary so an immutable existential call cannot
+                // transfer the compiler address that still owns the box.
+                return .borrowed
+            }
             if preservesClosureOwnership,
                type.directClosureShape != nil {
                 // Closure ownership is semantically relevant even though a
@@ -29485,7 +30512,12 @@ public struct Lowerer: Sendable {
     private func parseDynamicAnyType(
         _ raw: String
     ) throws -> Bytecode.DynamicType {
-        try CanonicalSIL.DynamicType.parse(
+        if CanonicalSIL.ProtocolExistential.OpenedArchetype(
+            spelling: raw
+        ) != nil {
+            return .any
+        }
+        return try CanonicalSIL.DynamicType.parse(
             raw,
             resolveStorage: parseType
         )

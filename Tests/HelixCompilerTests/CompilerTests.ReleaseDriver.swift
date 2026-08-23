@@ -2944,6 +2944,105 @@ struct ReleaseDriver {
         )
     }
 
+    @Test("Production patches link closed local existential witness tables")
+    func buildsProtocolExistentialPatch() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-release-existential-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        private protocol Valued {
+            func value() -> Int
+        }
+
+        private struct Item: Valued {
+            var amount: Int
+            func value() -> Int { amount * 2 }
+        }
+
+        @inline(never)
+        private func erase(_ amount: Int) -> any Valued {
+            Item(amount: amount)
+        }
+
+        @inline(never)
+        private func read(_ value: any Valued) -> Int {
+            value.value()
+        }
+
+        public func transform(_ value: Int) -> Int {
+            read(erase(value)) + 1
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            additionalCapabilities: [
+                .anyValuesV1,
+                .borrowCallsV1,
+                .compilerSpecializationsV1,
+                .localNominalsV1,
+            ]
+        )
+        let root = try #require(archive.functions.first {
+            $0.canonicalDeclaration.contains("transform")
+        })
+        let entry = try #require(root.entryIndex)
+        let changed = baseline.replacingOccurrences(
+            of: "read(erase(value)) + 1",
+            with: "read(erase(value)) + 4"
+        )
+        try Data(changed.utf8).write(to: sourceURL)
+
+        let result = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+
+        #expect(result.changedFunctions.map(\.key) == [root.key])
+        #expect(result.disassembly.contains("existential_apply"))
+        #expect(result.module.functions.contains {
+            $0.kind == .concreteSpecialization
+        })
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        #expect(
+            VM.Interpreter().invoke(
+                entry: entry,
+                image: image,
+                arguments: [
+                    .integer(
+                        try VM.Integer(
+                            signed: 5,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    ),
+                ]
+            ) == .returned(
+                .integer(
+                    try VM.Integer(
+                        signed: 14,
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
+            )
+        )
+    }
+
     @Test("Production replay preserves async ABI and rejects a newly suspending body")
     func buildsAsyncLeafAndRejectsAwait() throws {
         let directory = FileManager.default.temporaryDirectory

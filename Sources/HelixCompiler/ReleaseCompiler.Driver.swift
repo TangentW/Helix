@@ -630,11 +630,23 @@ extension ReleaseCompiler {
                 ) else {
                     throw DriverError.functionMissingFromSIL(item.record.key)
                 }
+                if rootKeys.contains(item.record.key),
+                   CanonicalSIL.ProtocolExistential.Identity
+                    .containsProtocolExistential(
+                       in: loweringFunction.loweredType
+                   ) {
+                    throw DriverError.loweredSignatureChanged(
+                        item.record.key,
+                        reason: "protocol existential values are image-local and cannot cross a Shell entry"
+                    )
+                }
                 let lowered = try lowerProductionFunction(
                     optimized: item.function,
                     semantic: loweringFunction,
                     optimizedTypeEnvironment: silTypeEnvironment,
                     semanticTypeEnvironment: loweringTypeEnvironment,
+                    optimizedFile: silFile,
+                    semanticFile: loweringSILFile,
                     displayName: item.record.canonicalDeclaration,
                     directCalls: directCalls,
                     expectedEffects: item.record.effects,
@@ -689,7 +701,8 @@ extension ReleaseCompiler {
                     if let optimized = item.optimized {
                         do {
                             lowered = try CanonicalSIL.Lowerer(
-                                typeEnvironment: silTypeEnvironment
+                                typeEnvironment: silTypeEnvironment,
+                                file: silFile
                             ).lower(
                                 optimized,
                                 displayName: item.symbol,
@@ -703,7 +716,8 @@ extension ReleaseCompiler {
                                   permitsSemanticFallback(error)
                             else { throw error }
                             lowered = try CanonicalSIL.Lowerer(
-                                typeEnvironment: loweringTypeEnvironment
+                                typeEnvironment: loweringTypeEnvironment,
+                                file: loweringSILFile
                             ).lower(
                                 semantic,
                                 displayName: item.symbol,
@@ -715,7 +729,8 @@ extension ReleaseCompiler {
                         }
                     } else if let semantic = item.semantic {
                         lowered = try CanonicalSIL.Lowerer(
-                            typeEnvironment: loweringTypeEnvironment
+                            typeEnvironment: loweringTypeEnvironment,
+                            file: loweringSILFile
                         ).lower(
                             semantic,
                             displayName: item.symbol,
@@ -1056,18 +1071,25 @@ extension ReleaseCompiler {
             var worklist = Array(roots)
             while let id = worklist.popLast(), let function = byID[id] {
                 for instruction in function.blocks.flatMap(\.instructions) {
-                    let target: Bytecode.FunctionID? = switch instruction {
+                    let targets: [Bytecode.FunctionID] = switch instruction {
                     case let .apply(_, function, _),
                          let .tryApply(function, _, _, _),
                          let .makeClosure(_, .image(function), _, _):
-                        function
+                        [function]
+                    case let .existentialApply(_, _, _, dispatch),
+                         let .existentialTryApply(_, _, dispatch, _, _):
+                        dispatch.targets.map(\.function)
                     default:
-                        nil
+                        []
                     }
-                    guard let target, byID[target] != nil,
-                          reachable.insert(target).inserted
-                    else { continue }
-                    worklist.append(target)
+                    // Every finite witness target remains reachable even when
+                    // one concrete type is absent from the patch's currently
+                    // exercised source path.
+                    for candidate in targets where byID[candidate] != nil {
+                        if reachable.insert(candidate).inserted {
+                            worklist.append(candidate)
+                        }
+                    }
                 }
             }
             return reachable
@@ -1161,6 +1183,8 @@ extension ReleaseCompiler {
             semantic: CanonicalSIL.Function,
             optimizedTypeEnvironment: CanonicalSIL.TypeEnvironment,
             semanticTypeEnvironment: CanonicalSIL.TypeEnvironment,
+            optimizedFile: CanonicalSIL.File,
+            semanticFile: CanonicalSIL.File,
             displayName: String,
             directCalls: CanonicalSIL.DirectCallTable,
             expectedEffects: Core.Effects,
@@ -1168,7 +1192,8 @@ extension ReleaseCompiler {
         ) throws -> IntermediateRepresentation.Function {
             do {
                 return try CanonicalSIL.Lowerer(
-                    typeEnvironment: optimizedTypeEnvironment
+                    typeEnvironment: optimizedTypeEnvironment,
+                    file: optimizedFile
                 ).lower(
                     optimized,
                     displayName: displayName,
@@ -1178,7 +1203,8 @@ extension ReleaseCompiler {
             } catch let error as CanonicalSIL.LoweringError
                 where hasDistinctSemanticFallback && permitsSemanticFallback(error) {
                 return try CanonicalSIL.Lowerer(
-                    typeEnvironment: semanticTypeEnvironment
+                    typeEnvironment: semanticTypeEnvironment,
+                    file: semanticFile
                 ).lower(
                     semantic,
                     displayName: displayName,

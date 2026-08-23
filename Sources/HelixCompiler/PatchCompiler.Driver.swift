@@ -87,6 +87,14 @@ public struct Driver: Sendable {
         guard let silFunction = file.function(mangledName: request.mangledName) else {
             throw CanonicalSIL.LoweringError.functionSelection("function @\(request.mangledName) was not found")
         }
+        guard !CanonicalSIL.ProtocolExistential.Identity
+            .containsProtocolExistential(
+                in: silFunction.loweredType
+            ) else {
+            throw CanonicalSIL.LoweringError.unsupportedType(
+                "protocol existential Shell root \(request.displayName)"
+            )
+        }
         let imagePlan = try PatchCompiler.ImageFunctions.makePlan(
             file: file,
             root: silFunction,
@@ -97,7 +105,8 @@ public struct Driver: Sendable {
             shellDeclarationSymbols: request.shellDeclarationSymbols
         )
         var root = try CanonicalSIL.Lowerer(
-            typeEnvironment: typeEnvironment
+            typeEnvironment: typeEnvironment,
+            file: file
         ).lower(
             silFunction,
             displayName: request.displayName,
@@ -114,7 +123,8 @@ public struct Driver: Sendable {
         )] = [(request.functionID, root)]
         for item in imagePlan.functions {
             var lowered = try CanonicalSIL.Lowerer(
-                typeEnvironment: typeEnvironment
+                typeEnvironment: typeEnvironment,
+                file: file
             ).lower(
                 item.function,
                 displayName: item.symbol,

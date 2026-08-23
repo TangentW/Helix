@@ -755,7 +755,9 @@ public final class Engine: @unchecked Sendable {
             true
         case .integerOverflow, .divisionByZero, .optionalUnwrapOfNil,
              .danglingUnownedReference,
-             .dynamicCastFailure, .dynamicCastProducedDuplicateDictionaryKey,
+             .dynamicCastFailure, .existentialCastFailure,
+             .existentialDispatchFailure,
+             .dynamicCastProducedDuplicateDictionaryKey,
              .dynamicCastProducedDuplicateSetElement, .valueNestingDepthExceeded,
              .arrayIndexOutOfBounds, .collectionCursorOutOfBounds, .unknownEntry,
              .instructionFuelExhausted, .callDepthExceeded, .nativeCallLimitExceeded,

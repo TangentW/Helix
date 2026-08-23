@@ -164,7 +164,7 @@ struct ProfileScreen: View {
 
 经过上下文定型的运算符/重载函数引用、unbound method、同步 `@MainActor` closure 与常见 lazy/可变/条件 closure 变量复用上述值模型；递归局部 helper 可以同时直接调用并形成 closure 值，而不会拆分 callable identity。
 
-这里“仍依赖 witness dispatch”的边界特指运行时、条件式、existential、缺失或歧义派发。泛型 helper 完全具体化后，若补丁内 struct/enum/class 的完整 conformance record 能唯一匹配 requirement ABI，Compiler 会把 getter/setter、static、mutating、throwing、继承/默认实现及绑定 method 直接解析成静态 image thunk；不会把 witness metadata 带入 HLBC。
+这里“仍依赖 witness dispatch”的边界特指运行时、条件式、开放式、缺失或歧义派发。泛型 helper 完全具体化后，若补丁内 struct/enum/class 的完整 conformance record 能唯一匹配 requirement ABI，Compiler 会把 getter/setter、static、mutating、throwing、继承/默认实现及绑定 method 直接解析成静态 image thunk；不会把 witness metadata 带入 HLBC。不可变的局部 protocol existential 也可以在当前 module 的完整 conformer 集合有限时复用这份 inventory：局部 `any P`、composition、继承与 class-bound requirement、erasure/opening、闭合 narrowing/widening、绑定 method、closure 返回、同步 throwing 调用和 checked/forced protocol cast 都会降低为精确表示类型集合与有限 image-function 表。Swift metadata 与 witness table 不会进入 HLBC；Verifier 把每个集合限制在 4,096 项，HLVM 对精确查找计入 fuel。这类 Swift existential value 只能留在 image 内，不能穿过 Shell 或普通 NativeImport；另行证明的 Objective-C `!foreign` protocol 擦除仍以冻结的原生 `AnyObject` reference 越界。mutable existential opening/writeback 仍会拒绝。
 
 `withExtendedLifetime` 复用普通同步 closure 调用模型，并让类型通用的 lifetime anchor 跨 normal 与 typed-error 两条出口保持存活；它不会把标准库泛型 ABI 冻结成 NativeImport。
 

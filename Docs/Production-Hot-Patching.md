@@ -288,6 +288,21 @@ witnesses outside the downloaded execution surface. If recursive conversion
 would collapse distinct Dictionary keys or Set elements, HLVM raises a
 controlled trap matching Swift's terminating collection-invariant check.
 
+Immutable local protocol existentials use a stricter closed-world form of that
+representation. For complete, nonconditional current-module conformers, the
+compiler retains `any P` identity and emits bounded exact-type cast sets and
+exact-type-to-witness-function tables. This covers compositions, inheritance,
+patch-local struct/class values and `AnyObject` constraints, immutable
+erasure/opening and closed narrowing/widening, bound methods, closure results,
+synchronous throwing requirements, and checked/forced protocol casts. The
+Verifier requires one common callable ABI and concrete image targets, with at
+most 4,096 cases; HLVM exact-matches and meters the full lookup. Swift protocol
+metadata and witness tables still never enter HLBC. These Swift existentials
+are image-local and cannot cross a Shell or ordinary NativeImport boundary; a
+proven Objective-C `!foreign` protocol erasure remains a frozen native
+`AnyObject` reference. Conditional, imported, open-world, and mutable
+existential dispatch remains rejected.
+
 Native text rendering is a deliberately narrow exception to keeping generic
 standard-library APIs inside HLVM. The compiler recognizes the generic
 `String(describing:)` and `String(reflecting:)` SIL entries, proves a recursive
@@ -384,10 +399,12 @@ and Foundation value-overlay bridges are likewise frozen as exact generic
 NativeImport adapters rather than API-specific runtime behavior. All ABI,
 schema, capability, and product versions remain 1/1.0.
 
-It is not arbitrary Swift. Generic roots, runtime metadata or runtime/opened/
-conditional witness dispatch (closed concrete patch-local witnesses are
-compiler-resolved static image calls), a
-patch concrete Swift type identity visible to native code, function-local
+It is not arbitrary Swift. Generic roots, runtime metadata or runtime,
+conditional, open-world, ambiguous, or mutable-existential witness dispatch
+(closed concrete and immutable closed-existential patch-local witnesses are
+compiler-resolved image calls), Swift protocol existential values crossing a
+Shell or ordinary NativeImport boundary, a patch concrete Swift type identity
+visible to native code, function-local
 nominal declarations, hosted stored properties/custom initializers/arbitrary
 callback ABIs, changes to existing native stored layout, closure crossing a
 Shell Entry or a NativeImport position outside the exact callable profile,

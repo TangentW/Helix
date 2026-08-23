@@ -593,8 +593,27 @@ Both workflows depend on stable, build-specific identities:
   and default-implementation chains for patch-local struct, enum, and class
   conformers therefore remain ordinary statically typed image calls; witness
   metadata never enters HLBC. Unresolved archetypes, packs, unstable declaration
-  parameters, conditional conformances, opened existentials, unavailable
-  targets, and textually ambiguous requirements fail before lowering.
+  parameters, conditional conformances, unavailable targets, and textually
+  ambiguous requirements fail before lowering.
+  Immutable protocol existentials use the same inventory through a separate
+  closed-world plan. The compiler retains the source `any P` identity—including
+  compositions, inherited requirements, and `AnyObject` constraints—while HLBC
+  stores only a VM-owned `Any` payload plus a bounded exact-dynamic-type to
+  concrete-function table. Every case must be a complete, nonconditional
+  current-module conformance with a concrete image witness thunk. The Verifier
+  checks unique represented types, the common nonreceiver ABI, receiver
+  ownership, effects, and concrete-specialization targets; each table or cast
+  set is capped at 4,096 cases. HLVM performs exact matching and charges the
+  complete lookup size to invocation fuel. This supports immutable erasure and
+  opening, protocol composition narrowing/widening, class-bound values, bound
+  methods, synchronous throwing requirements, and checked/forced protocol
+  casts without Swift metadata or runtime witness tables. Protocol existential
+  identities are image-local compiler facts, so the Indexer and lowerer reject
+  Swift protocol values at Shell and ordinary NativeImport boundaries. A
+  separately proven Objective-C `!foreign` protocol erasure still crosses as
+  its frozen native `AnyObject` reference, not as this existential value.
+  Mutable existential opening and writeback remain fail-closed until the
+  storage model can preserve mutation.
 - Frame-local and heap-promoted storage share one field-sensitive aggregate
   shape. The compiler promotes multi-block lifetimes, classifies
   initialize/assign/replace and conditional cleanup, and the Verifier computes

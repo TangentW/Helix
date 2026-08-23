@@ -501,6 +501,48 @@ public struct TypeEnvironment: Sendable {
         return visit(type)
     }
 
+    /// An owned opened-existential receiver is copied out of its erased
+    /// container without a runtime TypeOps lookup. Admit only recursively
+    /// value-copyable shapes for which that copy has no hidden linear owner.
+    func isSafelyCopyableExistentialReceiver(
+        _ type: Bytecode.ValueType
+    ) -> Bool {
+        var visiting = Set<Bytecode.LocalTypeKey>()
+
+        func visit(_ type: Bytecode.ValueType) -> Bool {
+            switch type {
+            case .void, .never, .bool, .integer, .float, .string:
+                return true
+            case let .optional(wrapped), let .array(wrapped), let .set(wrapped):
+                return visit(wrapped)
+            case let .dictionary(key, value):
+                return visit(key) && visit(value)
+            case let .tuple(elements):
+                return elements.allSatisfy(visit)
+            case let .local(key):
+                guard visiting.insert(key).inserted,
+                      let definition = try? definition(for: key)
+                else { return false }
+                defer { visiting.remove(key) }
+                switch definition.kind {
+                case let .structure(fields):
+                    return fields.allSatisfy { visit($0.type) }
+                case let .enumeration(cases):
+                    return cases.allSatisfy {
+                        $0.payloadType.map(visit) != false
+                    }
+                case .class:
+                    return false
+                }
+            case .any, .native, .error, .address, .mutableCell,
+                 .nonOwningReference, .arrayState, .dictionaryState, .closure:
+                return false
+            }
+        }
+
+        return visit(type)
+    }
+
     func matchesPseudogenericNativeType(
         _ raw: String,
         expected typeID: Core.TypeID
@@ -956,6 +998,16 @@ public struct TypeEnvironment: Sendable {
             )
         }
 
+        if type == "any Error" || type == "any Swift.Error"
+            || type == "Swift.Error" {
+            return preservesTypedErrors ? .error : .string
+        }
+        if CanonicalSIL.ProtocolExistential.Identity(
+            spelling: type
+        ) != nil {
+            return .any
+        }
+
         switch type {
         case "Int", "Swift.Int": return .int64
         case "UInt", "Swift.UInt": return .integer(bitWidth: 64, signed: false)
@@ -983,7 +1035,6 @@ public struct TypeEnvironment: Sendable {
         case "Character", "Swift.Character": return .string
         case "Substring", "Swift.Substring": return .array(.string)
         case "Any", "Swift.Any": return .any
-        case "any Error", "Swift.Error": return preservesTypedErrors ? .error : .string
         case "Void", "Swift.Void": return .void
         case "Never", "Swift.Never": return .never
         default:

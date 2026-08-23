@@ -131,6 +131,22 @@ struct AnyWireContract {
         )
     }
 
+    @Test("Closed protocol instructions round-trip and disassemble deterministically")
+    func protocolExistentialWireContract() throws {
+        let module = protocolExistentialModule()
+        let decoded = try Bytecode.Decoder.decode(
+            Bytecode.Encoder.encode(module)
+        ).module
+        let text = Bytecode.Disassembler.disassemble(decoded)
+
+        #expect(decoded == module)
+        #expect(text.contains("checked_cast_existential"))
+        #expect(text.contains("force_cast_existential"))
+        #expect(text.contains("existential_apply"))
+        #expect(text.contains("existential_try_apply"))
+        #expect(text.contains("receiver #0 {Fixture.Payload: @1}"))
+    }
+
     private func makeModule() throws -> Bytecode.Module {
         let namespace = Core.ShellNamespaceID.derive(
             bundleID: "dev.helix.any-wire",
@@ -204,6 +220,160 @@ struct AnyWireContract {
                     functionID: function.id
                 ),
             ]
+        )
+    }
+
+    private func protocolExistentialModule() -> Bytecode.Module {
+        let key = Bytecode.LocalTypeKey(rawValue: "Fixture.Payload")
+        let target = Bytecode.ExistentialDispatchTarget(
+            dynamicType: .local(key),
+            function: .init(rawValue: 1)
+        )
+        let dispatch = Bytecode.ExistentialDispatchTable(
+            receiverParameterIndex: 0,
+            targets: [target]
+        )
+        let throwingDispatch = Bytecode.ExistentialDispatchTable(
+            receiverParameterIndex: 0,
+            targets: [
+                .init(
+                    dynamicType: .local(key),
+                    function: .init(rawValue: 2)
+                ),
+            ]
+        )
+        let caller = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "protocolWire",
+            parameterRegisters: [
+                .init(rawValue: 0),
+                .init(rawValue: 1),
+                .init(rawValue: 2),
+            ],
+            resultType: .int64,
+            registerTypes: [
+                .any, .any, .any, .optional(.any), .any, .int64,
+                .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [
+                        .init(rawValue: 0),
+                        .init(rawValue: 1),
+                        .init(rawValue: 2),
+                    ],
+                    instructions: [
+                        .checkedCastExistential(
+                            result: .init(rawValue: 3),
+                            value: .init(rawValue: 0),
+                            acceptedTypes: .init(types: [.local(key)])
+                        ),
+                        .forceCastExistential(
+                            result: .init(rawValue: 4),
+                            value: .init(rawValue: 1),
+                            acceptedTypes: .init(types: [.local(key)])
+                        ),
+                        .existentialApply(
+                            result: .init(rawValue: 5),
+                            existential: .init(rawValue: 2),
+                            arguments: [],
+                            dispatch: dispatch
+                        ),
+                        .existentialTryApply(
+                            existential: .init(rawValue: 4),
+                            arguments: [],
+                            dispatch: throwingDispatch,
+                            normalTarget: .init(rawValue: 1),
+                            errorTarget: .init(rawValue: 2)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 6)],
+                    instructions: [.returnValue(.init(rawValue: 6))]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    instructions: [.trap(.explicit("wire fixture"))]
+                ),
+            ]
+        )
+        let witness = Bytecode.Function(
+            id: .init(rawValue: 1),
+            name: "witness",
+            kind: .concreteSpecialization,
+            parameterRegisters: [.init(rawValue: 0)],
+            parameterConventions: [.borrowed],
+            resultType: .int64,
+            registerTypes: [.local(key), .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            bitPattern: 1
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let throwingWitness = Bytecode.Function(
+            id: .init(rawValue: 2),
+            name: "throwingWitness",
+            kind: .concreteSpecialization,
+            parameterRegisters: [.init(rawValue: 0)],
+            parameterConventions: [.borrowed],
+            resultType: .int64,
+            thrownType: .string,
+            registerTypes: [.local(key), .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .constantInteger(
+                            result: .init(rawValue: 1),
+                            bitPattern: 2
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ],
+            effects: .init(mayThrow: true)
+        )
+        return .init(
+            name: "ProtocolExistentialWireFixture",
+            shellInterfaceHash: .sha256("protocol-existential-wire"),
+            compatibility: .init(
+                runtime: Core.Versions.runtime,
+                bytecode: Core.Versions.bytecode,
+                interfaceArchive: Core.Versions.interfaceArchive,
+                compilerFingerprint: "swift-protocol-existential-wire"
+            ),
+            capabilities: [
+                .baselineV1,
+                .anyValuesV1,
+                .borrowCallsV1,
+                .compilerSpecializationsV1,
+                .localNominalsV1,
+                .stringsV1,
+                .untypedThrowsV1,
+            ],
+            localTypes: [
+                .init(
+                    key: key,
+                    kind: .structure(fields: [])
+                ),
+            ],
+            functions: [caller, witness, throwingWitness]
         )
     }
 }

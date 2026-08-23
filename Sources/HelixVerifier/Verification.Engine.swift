@@ -2420,6 +2420,193 @@ public struct Engine: Verification.ImageVerifying {
                 return type
             }
         }
+        func isKnownDynamicType(
+            _ dynamicType: Bytecode.DynamicType,
+            depth: Int = 0
+        ) -> Bool {
+            guard depth <= Bytecode.DynamicType.maximumNestingDepthV1 else {
+                return false
+            }
+            return switch dynamicType {
+            case .any, .bool, .integer, .floatingPoint, .string, .character,
+                 .substring:
+                true
+            case let .local(key):
+                localTypes[key] != nil
+            case let .optional(wrapped), let .array(wrapped),
+                 let .arraySlice(wrapped), let .set(wrapped):
+                isKnownDynamicType(wrapped, depth: depth + 1)
+            case let .dictionary(key, value):
+                isKnownDynamicType(key, depth: depth + 1)
+                    && isKnownDynamicType(value, depth: depth + 1)
+            case let .tuple(elements):
+                elements.allSatisfy {
+                    isKnownDynamicType($0.type, depth: depth + 1)
+                }
+            }
+        }
+        func isSafelyCopyableExistentialReceiver(
+            _ type: Bytecode.ValueType,
+            visiting: Set<Bytecode.LocalTypeKey> = []
+        ) -> Bool {
+            switch type {
+            case .void, .never, .bool, .integer, .float, .string:
+                return true
+            case let .optional(wrapped), let .array(wrapped), let .set(wrapped):
+                return isSafelyCopyableExistentialReceiver(
+                    wrapped,
+                    visiting: visiting
+                )
+            case let .dictionary(key, value):
+                return isSafelyCopyableExistentialReceiver(
+                    key,
+                    visiting: visiting
+                )
+                    && isSafelyCopyableExistentialReceiver(
+                        value,
+                        visiting: visiting
+                    )
+            case let .tuple(elements):
+                return elements.allSatisfy {
+                    isSafelyCopyableExistentialReceiver(
+                        $0,
+                        visiting: visiting
+                    )
+                }
+            case let .local(key):
+                guard !visiting.contains(key),
+                      let definition = localTypes[key]
+                else { return false }
+                var next = visiting
+                next.insert(key)
+                switch definition.kind {
+                case let .structure(fields):
+                    return fields.allSatisfy {
+                        isSafelyCopyableExistentialReceiver(
+                            $0.type,
+                            visiting: next
+                        )
+                    }
+                case let .enumeration(cases):
+                    return cases.allSatisfy {
+                        $0.payloadType.map {
+                            isSafelyCopyableExistentialReceiver(
+                                $0,
+                                visiting: next
+                            )
+                        } != false
+                    }
+                case .class:
+                    return false
+                }
+            case .any, .native, .error, .address, .mutableCell,
+                 .nonOwningReference, .arrayState, .dictionaryState, .closure:
+                return false
+            }
+        }
+        func verifyExistentialTypeSet(
+            _ set: Bytecode.ExistentialTypeSet
+        ) throws {
+            guard set.types.count
+                    <= Bytecode.ExistentialTypeSet.maximumTypeCountV1,
+                  Set(set.types).count == set.types.count,
+                  set.types.allSatisfy({
+                      $0.isAnyPayloadV1 && isKnownDynamicType($0)
+                  })
+            else {
+                throw fail(
+                    "protocol existential type set is oversized, duplicate, or invalid"
+                )
+            }
+        }
+        func existentialDispatchABI(
+            _ dispatch: Bytecode.ExistentialDispatchTable,
+            arguments: [Bytecode.Register]
+        ) throws -> (
+            parameterConventions: [Bytecode.ParameterConvention],
+            resultType: Bytecode.ValueType,
+            thrownType: Bytecode.ValueType?,
+            effects: Core.Effects
+        ) {
+            guard !dispatch.targets.isEmpty,
+                  dispatch.targets.count
+                    <= Bytecode.ExistentialDispatchTable.maximumTargetCountV1,
+                  Set(dispatch.targets.map(\.dynamicType)).count
+                    == dispatch.targets.count,
+                  let receiverIndex = Int(
+                      exactly: dispatch.receiverParameterIndex
+                  ),
+                  receiverIndex <= arguments.count
+            else {
+                throw fail(
+                    "existential dispatch table is empty, oversized, duplicate, or has an invalid receiver"
+                )
+            }
+            var common: (
+                parameterConventions: [Bytecode.ParameterConvention],
+                resultType: Bytecode.ValueType,
+                thrownType: Bytecode.ValueType?,
+                effects: Core.Effects
+            )?
+            let argumentTypes = arguments.map(type)
+            for target in dispatch.targets {
+                guard target.dynamicType.isAnyPayloadV1,
+                      isKnownDynamicType(target.dynamicType),
+                      let callee = functions[target.function],
+                      callee.kind == .concreteSpecialization
+                else {
+                    throw fail(
+                        "existential dispatch target must name a known concrete specialization and dynamic type"
+                    )
+                }
+                var types = try parameterTypes(of: callee)
+                var conventions = callee.parameterConventions
+                guard types.indices.contains(receiverIndex),
+                      conventions.indices.contains(receiverIndex),
+                      types[receiverIndex]
+                        == target.dynamicType.storageType,
+                      conventions[receiverIndex] == .borrowed
+                        || (conventions[receiverIndex] == .owned
+                            && isSafelyCopyableExistentialReceiver(
+                                types[receiverIndex]
+                            ))
+                else {
+                    throw fail(
+                        "existential dispatch receiver is neither borrowed nor one safely copyable concrete target parameter"
+                    )
+                }
+                types.remove(at: receiverIndex)
+                conventions.remove(at: receiverIndex)
+                guard types == argumentTypes else {
+                    throw fail(
+                        "existential dispatch arguments do not match a target ABI"
+                    )
+                }
+                let candidate = (
+                    conventions,
+                    callee.resultType,
+                    callee.thrownType,
+                    callee.effects
+                )
+                if let common {
+                    guard common.parameterConventions == candidate.0,
+                          common.resultType == candidate.1,
+                          common.thrownType == candidate.2,
+                          common.effects == candidate.3
+                    else {
+                        throw fail(
+                            "existential dispatch targets do not share one callable ABI"
+                        )
+                    }
+                } else {
+                    common = candidate
+                }
+            }
+            guard let common else {
+                throw fail("existential dispatch table has no target")
+            }
+            return common
+        }
         switch instruction {
         case let .constantInteger(result, bitPattern):
             guard case let .integer(width, _) = type(result) else {
@@ -2611,6 +2798,28 @@ public struct Engine: Verification.ImageVerifying {
                 throw fail(
                     "force_cast_any requires Any and a matching dynamic target"
                 )
+            }
+        case let .checkedCastExistential(result, value, acceptedTypes):
+            guard capabilities.contains(.anyValuesV1) else {
+                throw fail(
+                    "checked_cast_existential requires \(Core.Capability.anyValuesV1)"
+                )
+            }
+            try verifyExistentialTypeSet(acceptedTypes)
+            guard type(value) == .any, type(result) == .optional(.any) else {
+                throw fail(
+                    "checked_cast_existential requires Any and Optional<Any>"
+                )
+            }
+        case let .forceCastExistential(result, value, acceptedTypes):
+            guard capabilities.contains(.anyValuesV1) else {
+                throw fail(
+                    "force_cast_existential requires \(Core.Capability.anyValuesV1)"
+                )
+            }
+            try verifyExistentialTypeSet(acceptedTypes)
+            guard type(value) == .any, type(result) == .any else {
+                throw fail("force_cast_existential requires two Any values")
             }
         case let .makeOptionalSome(result, value):
             guard case let .optional(wrapped) = type(result), wrapped == type(value) else {
@@ -4015,6 +4224,49 @@ public struct Engine: Verification.ImageVerifying {
                 block: block,
                 offset: offset
             )
+        case let .existentialApply(
+            result, existential, arguments, dispatch
+        ):
+            guard capabilities.contains(.anyValuesV1),
+                  type(existential) == .any
+            else {
+                throw fail(
+                    "existential_apply requires \(Core.Capability.anyValuesV1) and Any"
+                )
+            }
+            let abi = try existentialDispatchABI(
+                dispatch,
+                arguments: arguments
+            )
+            guard !zip(arguments, abi.parameterConventions).contains(where: {
+                $0.0 == existential && $0.1 == .owned
+            }) else {
+                throw fail(
+                    "an owned argument aliases the existential receiver source"
+                )
+            }
+            try verifyEffects(
+                abi.effects,
+                allowedBy: function.effects,
+                operation: "existential_apply",
+                fail: fail
+            )
+            try verifyExactErrorPropagation(
+                from: abi.thrownType,
+                ifThrowing: abi.effects.mayThrow,
+                to: function,
+                operation: "existential_apply",
+                fail: fail
+            )
+            try verifyCall(
+                arguments: arguments,
+                result: result,
+                parameterTypes: arguments.map(type),
+                resultType: abi.resultType,
+                function: function,
+                block: block,
+                offset: offset
+            )
         case let .entryApply(result, entry, arguments):
             guard let descriptor = shell.entries[entry] else { throw fail("unknown Shell entry \(entry)") }
             try verifyBorrowedCallCapability(
@@ -4255,6 +4507,59 @@ public struct Engine: Verification.ImageVerifying {
                 parameterTypes: try parameterTypes(of: callee),
                 resultType: callee.resultType,
                 thrownType: callee.thrownType,
+                normalTarget: normalTarget,
+                errorTarget: errorTarget,
+                function: function,
+                block: block,
+                offset: offset,
+                blocks: blocks,
+                capabilities: capabilities
+            )
+        case let .existentialTryApply(
+            existential,
+            arguments,
+            dispatch,
+            normalTarget,
+            errorTarget
+        ):
+            guard capabilities.contains(.anyValuesV1),
+                  capabilities.contains(.untypedThrowsV1)
+                    || capabilities.contains(.structuredErrorsV1)
+                    || capabilities.contains(.typedThrowsV1),
+                  type(existential) == .any
+            else {
+                throw fail(
+                    "existential_try_apply requires Any and Error capabilities"
+                )
+            }
+            let abi = try existentialDispatchABI(
+                dispatch,
+                arguments: arguments
+            )
+            guard !zip(arguments, abi.parameterConventions).contains(where: {
+                $0.0 == existential && $0.1 == .owned
+            }) else {
+                throw fail(
+                    "an owned argument aliases the existential receiver source"
+                )
+            }
+            guard abi.effects.mayThrow else {
+                throw fail(
+                    "existential_try_apply requires throwing targets"
+                )
+            }
+            try verifyEffects(
+                abi.effects,
+                allowedBy: function.effects,
+                operation: "existential_try_apply",
+                catchesError: true,
+                fail: fail
+            )
+            try verifyTryCall(
+                arguments: arguments,
+                parameterTypes: arguments.map(type),
+                resultType: abi.resultType,
+                thrownType: abi.thrownType,
                 normalTarget: normalTarget,
                 errorTarget: errorTarget,
                 function: function,
@@ -4877,7 +5182,9 @@ public struct Engine: Verification.ImageVerifying {
                         live.insert(result)
                     }
                 case .makeStruct, .structExtract, .makeEnum, .makeError, .castError,
-                     .eraseToAny, .checkedCastAny, .forceCastAny, .stackAddress,
+                     .eraseToAny, .checkedCastAny, .forceCastAny,
+                     .checkedCastExistential, .forceCastExistential,
+                     .stackAddress,
                      .projectAggregateAddress, .projectMutableCell, .allocateObject,
                      .projectObjectAddress, .hostedSuperApply, .beginAccess,
                      .endAccess, .makeNonOwningReference,
@@ -5133,6 +5440,34 @@ public struct Engine: Verification.ImageVerifying {
                        target.requiresLinearOwnership {
                         live.insert(result)
                     }
+                case let .existentialApply(
+                    result, _, arguments, dispatch
+                ):
+                    guard let first = dispatch.targets.first,
+                          var conventions = functions[first.function]?
+                            .parameterConventions,
+                          let receiverIndex = Int(
+                              exactly: dispatch.receiverParameterIndex
+                          ),
+                          conventions.indices.contains(receiverIndex)
+                    else {
+                        throw fail(
+                            "existential dispatch ownership ABI is invalid"
+                        )
+                    }
+                    conventions.remove(at: receiverIndex)
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: conventions,
+                        live: &live,
+                        function: function,
+                        fail: fail
+                    )
+                    if let result,
+                       function.type(of: result)?.requiresLinearOwnership
+                        == true {
+                        live.insert(result)
+                    }
                 case let .entryApply(result, entry, arguments):
                     guard let descriptor = shell.entries[entry] else {
                         throw fail("unknown Shell entry \(entry)")
@@ -5204,6 +5539,31 @@ public struct Engine: Verification.ImageVerifying {
                         arguments,
                         conventions: functions[callee]?.parameterConventions
                             ?? Array(repeating: .owned, count: arguments.count),
+                        live: &live,
+                        function: function,
+                        fail: fail
+                    )
+                    try forward(live, to: normalTarget)
+                    try forward(live, to: errorTarget)
+                case let .existentialTryApply(
+                    _, arguments, dispatch, normalTarget, errorTarget
+                ):
+                    guard let first = dispatch.targets.first,
+                          var conventions = functions[first.function]?
+                            .parameterConventions,
+                          let receiverIndex = Int(
+                              exactly: dispatch.receiverParameterIndex
+                          ),
+                          conventions.indices.contains(receiverIndex)
+                    else {
+                        throw fail(
+                            "existential dispatch ownership ABI is invalid"
+                        )
+                    }
+                    conventions.remove(at: receiverIndex)
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: conventions,
                         live: &live,
                         function: function,
                         fail: fail
@@ -5687,6 +6047,24 @@ public struct Engine: Verification.ImageVerifying {
                     try verifyCallAddresses(
                         arguments: arguments,
                         conventions: callee.parameterConventions
+                    )
+                case let .existentialApply(
+                    _, _, arguments, dispatch
+                ), let .existentialTryApply(
+                    _, arguments, dispatch, _, _
+                ):
+                    guard let first = dispatch.targets.first,
+                          var conventions = functions[first.function]?
+                            .parameterConventions,
+                          let receiverIndex = Int(
+                              exactly: dispatch.receiverParameterIndex
+                          ),
+                          conventions.indices.contains(receiverIndex)
+                    else { break }
+                    conventions.remove(at: receiverIndex)
+                    try verifyCallAddresses(
+                        arguments: arguments,
+                        conventions: conventions
                     )
                 case let .closureApply(_, closure, arguments),
                      let .closureTryApply(closure, arguments, _, _):

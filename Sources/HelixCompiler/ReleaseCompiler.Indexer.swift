@@ -315,6 +315,14 @@ public struct Indexer: Sendable {
         configuration: PatchConfiguration.Document,
         mainActorNativeTypeIDs: Set<Core.TypeID>
     ) -> InterfaceArchive.Patchability {
+        if CanonicalSIL.ProtocolExistential.Identity.containsProtocolExistential(
+            in: candidate.interface.loweredSILType
+        ) {
+            return .rejected(
+                "HLXIDX023",
+                explanation: "protocol existential values are image-local and cannot be Shell roots"
+            )
+        }
         if let forced = candidate.forcedPatchability { return forced }
         guard let module = configuration.modules[candidate.moduleName] else {
             return .rejected("HLXIDX001", explanation: "module is absent from HelixPatchable.yml")

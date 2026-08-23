@@ -135,6 +135,12 @@ public enum Disassembler {
             "\(result) = checked_cast_any \(value) to \(targetType)"
         case let .forceCastAny(result, value, targetType):
             "\(result) = force_cast_any \(value) to \(targetType)"
+        case let .checkedCastExistential(result, value, acceptedTypes):
+            "\(result) = checked_cast_existential \(value) in "
+                + typeSet(acceptedTypes)
+        case let .forceCastExistential(result, value, acceptedTypes):
+            "\(result) = force_cast_existential \(value) in "
+                + typeSet(acceptedTypes)
         case let .makeOptionalSome(result, value):
             "\(result) = optional_some \(value)"
         case let .makeOptionalNone(result):
@@ -415,6 +421,12 @@ public enum Disassembler {
                 + "\(falseTarget)(\(falseArguments.map(\.description).joined(separator: ", ")))"
         case let .apply(result, function, arguments):
             "\(assignment(result))hlbc_apply @\(function)(\(arguments.map(\.description).joined(separator: ", ")))"
+        case let .existentialApply(
+            result, existential, arguments, dispatch
+        ):
+            "\(assignment(result))existential_apply \(existential)"
+                + "(\(arguments.map(\.description).joined(separator: ", "))) "
+                + dispatchTable(dispatch)
         case let .entryApply(result, entry, arguments):
             "\(assignment(result))entry_apply #\(entry)(\(arguments.map(\.description).joined(separator: ", ")))"
         case let .nativeApply(result, importID, arguments):
@@ -436,6 +448,13 @@ public enum Disassembler {
         case let .tryApply(function, arguments, normalTarget, errorTarget):
             "try_apply @\(function)(\(arguments.map(\.description).joined(separator: ", "))), "
                 + "normal: \(normalTarget), error: \(errorTarget)"
+        case let .existentialTryApply(
+            existential, arguments, dispatch, normalTarget, errorTarget
+        ):
+            "existential_try_apply \(existential)"
+                + "(\(arguments.map(\.description).joined(separator: ", "))) "
+                + dispatchTable(dispatch)
+                + ", normal: \(normalTarget), error: \(errorTarget)"
         case let .entryTryApply(entry, arguments, normalTarget, errorTarget):
             "entry_try_apply #\(entry)(\(arguments.map(\.description).joined(separator: ", "))), "
                 + "normal: \(normalTarget), error: \(errorTarget)"
@@ -456,6 +475,21 @@ public enum Disassembler {
 
     private static func assignment(_ result: Bytecode.Register?) -> String {
         result.map { "\($0) = " } ?? ""
+    }
+
+    private static func typeSet(
+        _ set: Bytecode.ExistentialTypeSet
+    ) -> String {
+        "{" + set.types.map(\.description).joined(separator: ", ") + "}"
+    }
+
+    private static func dispatchTable(
+        _ table: Bytecode.ExistentialDispatchTable
+    ) -> String {
+        let targets = table.targets.map {
+            "\($0.dynamicType): @\($0.function)"
+        }.joined(separator: ", ")
+        return "receiver #\(table.receiverParameterIndex) {\(targets)}"
     }
 
     private static func quoted(_ value: String) -> String {

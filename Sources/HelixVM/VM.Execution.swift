@@ -30,6 +30,8 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
         actual: Bytecode.DynamicType,
         expected: Bytecode.DynamicType
     )
+    case existentialCastFailure(actual: Bytecode.DynamicType)
+    case existentialDispatchFailure(actual: Bytecode.DynamicType)
     case dynamicCastProducedDuplicateDictionaryKey
     case dynamicCastProducedDuplicateSetElement
     case valueNestingDepthExceeded(maximum: Int)
@@ -85,6 +87,10 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
             "attempted to load an unowned reference after deallocation"
         case let .dynamicCastFailure(actual, expected):
             "could not cast value of type \(actual) to \(expected)"
+        case let .existentialCastFailure(actual):
+            "value of type \(actual) does not satisfy the closed protocol cast"
+        case let .existentialDispatchFailure(actual):
+            "no closed protocol witness target exists for \(actual)"
         case .dynamicCastProducedDuplicateDictionaryKey:
             "Dictionary dynamic cast produced duplicate keys"
         case .dynamicCastProducedDuplicateSetElement:

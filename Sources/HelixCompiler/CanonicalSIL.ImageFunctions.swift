@@ -419,6 +419,48 @@ enum ImageFunctions {
                 reason: error.reason
             )
         }
+        let dynamicWitnessReferences: [Reference]
+        do {
+            let inventory = try CanonicalSIL.ProtocolExistential
+                .WitnessReference.inventory(in: function.body)
+            if inventory.isEmpty {
+                dynamicWitnessReferences = []
+            } else {
+                let resolver = try CanonicalSIL.ProtocolExistential.Resolver(
+                    file: file,
+                    function: function,
+                    typeEnvironment: environment
+                )
+                let witnesses = Set(inventory.values).sorted {
+                    $0.result < $1.result
+                }
+                let symbols = try witnesses.flatMap {
+                    try resolver.dispatchCandidates(for: $0).map(\.symbol)
+                }
+                dynamicWitnessReferences = try Set(symbols).sorted().map {
+                    symbol in
+                    guard kindForSymbol(symbol) == .concreteSpecialization else {
+                        throw DiscoveryError.unsupported(
+                            symbol: symbol,
+                            reason: "an opened protocol witness is not a concrete image-local specialization"
+                        )
+                    }
+                    return .init(
+                        symbol: symbol,
+                        kind: .concreteSpecialization,
+                        replacement: nil,
+                        abiAdapter: .direct
+                    )
+                }
+            }
+        } catch let error as DiscoveryError {
+            throw error
+        } catch {
+            throw DiscoveryError.unsupported(
+                symbol: function.mangledName,
+                reason: "opened protocol witness discovery failed: \(error)"
+            )
+        }
         var symbolByValue: [String: String] = [:]
         var usageBySymbol: [String: Set<ReferenceUsage>] = [:]
         var unboundedRangeFunctionByValue: [String: String] = [:]
@@ -658,7 +700,7 @@ enum ImageFunctions {
                     genericSpecialization: item.specialization
                 )
             }
-        return ordinary + specialized
+        return ordinary + specialized + dynamicWitnessReferences
     }
 
     private static func silResultValue(in line: String) -> String? {

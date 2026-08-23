@@ -493,8 +493,19 @@ rethrowing, returning, and escaping function-value forms; each concrete type
 argument list receives a deterministic image target. This path does not invent
 runtime metadata. A fully concrete patch-local protocol conformance can resolve
 one exact witness to a static image thunk, including bound method formation;
-conditional, existential, missing, or ambiguous witness dispatch still fails
-closed. Mutable captures use the same VM-managed cell for scalar,
+conditional, open-world, missing, or ambiguous witness dispatch still fails
+closed. Immutable local protocol existentials also use the conformance
+inventory when their complete current-module conformer set is finite. Local
+`any P`, compositions, inherited and class-bound requirements, erasure/opening,
+closed narrowing or widening, bound methods, closure results, synchronous
+throwing calls, and checked/forced protocol casts lower to exact represented
+type sets and finite image-function tables. No Swift metadata or witness table
+enters HLBC; the Verifier bounds each set to 4,096 cases and HLVM meters exact
+lookup work. Such Swift existential values remain image-local and cannot cross
+a Shell or ordinary NativeImport boundary; proven Objective-C `!foreign`
+protocol erasure continues to cross as a frozen native `AnyObject` reference.
+Mutable existential opening/writeback remains rejected. Mutable captures use
+the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
 boxes. Safe `weak` and checked `unowned` capture lists and captured weak locals
 use a second managed storage kind shared by patch-local and frozen native

@@ -1164,6 +1164,85 @@ public struct Interpreter: Sendable {
                         )
                     }
                     try initialize(converted, register: result, registers: &registers)
+                case let .checkedCastExistential(
+                    result, source, acceptedTypes
+                ):
+                    try budget.consumeLinearWork(
+                        elementCount: acceptedTypes.types.count
+                    )
+                    let value = try consume(
+                        source,
+                        type: .any,
+                        localTypes: localTypes,
+                        registers: &registers
+                    )
+                    guard case let .any(erased) = value,
+                          function.type(of: result) == .optional(.any),
+                          erased.dynamicType.isAnyPayloadV1
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .any,
+                            actual: value.type
+                        )
+                    }
+                    try budget.consumeValueTraversal(erased.payload)
+                    guard erased.payload.matches(erased.dynamicType) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .any,
+                            actual: value.type
+                        )
+                    }
+                    let converted: VM.Value? = acceptedTypes.types.contains(
+                        erased.dynamicType
+                    ) ? .any(erased) : nil
+                    try chargeAggregate(
+                        elementCount: converted == nil ? 0 : 1,
+                        budget: budget
+                    )
+                    try initialize(
+                        .optional(converted),
+                        register: result,
+                        registers: &registers
+                    )
+                case let .forceCastExistential(
+                    result, source, acceptedTypes
+                ):
+                    try budget.consumeLinearWork(
+                        elementCount: acceptedTypes.types.count
+                    )
+                    let value = try consume(
+                        source,
+                        type: .any,
+                        localTypes: localTypes,
+                        registers: &registers
+                    )
+                    guard case let .any(erased) = value,
+                          function.type(of: result) == .any,
+                          erased.dynamicType.isAnyPayloadV1
+                    else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .any,
+                            actual: value.type
+                        )
+                    }
+                    try budget.consumeValueTraversal(erased.payload)
+                    guard erased.payload.matches(erased.dynamicType) else {
+                        throw VM.RuntimeTrap.typeMismatch(
+                            expected: .any,
+                            actual: value.type
+                        )
+                    }
+                    guard acceptedTypes.types.contains(erased.dynamicType)
+                    else {
+                        throw VM.RuntimeTrap.existentialCastFailure(
+                            actual: erased.dynamicType
+                        )
+                    }
+                    try initialize(
+                        .any(erased),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .makeOptionalSome(result, value):
                     try chargeAggregate(elementCount: 1, budget: budget)
                     let payload = try consume(
@@ -4367,6 +4446,44 @@ public struct Interpreter: Sendable {
                             )
                         )
                     )
+                case let .existentialApply(
+                    result, existential, arguments, dispatch
+                ):
+                    let call = try materializeExistentialCall(
+                        existential: existential,
+                        arguments: arguments,
+                        dispatch: dispatch,
+                        caller: function,
+                        functions: functions,
+                        registers: registers,
+                        budget: budget
+                    )
+                    try chargeCallShape(call.values, budget: budget)
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: call.argumentConventions,
+                        function: function,
+                        localTypes: localTypes,
+                        registers: &registers
+                    )
+                    persist(
+                        frame,
+                        registers: registers,
+                        stackSlots: stackSlots,
+                        currentBlock: currentBlock,
+                        nextInstruction: instructionIndex + 1
+                    )
+                    try budget.checkDeadline()
+                    return .call(
+                        FrameCall(
+                            functionID: call.functionID,
+                            arguments: call.values,
+                            continuation: .returning(
+                                result: result,
+                                programCounter: programCounter
+                            )
+                        )
+                    )
                 case let .entryApply(result, entry, arguments):
                     guard let entryInvocation,
                           let descriptor = entries[entry]
@@ -5014,6 +5131,49 @@ public struct Interpreter: Sendable {
                             )
                         )
                     )
+                case let .existentialTryApply(
+                    existential,
+                    arguments,
+                    dispatch,
+                    normalTarget,
+                    errorTarget
+                ):
+                    let call = try materializeExistentialCall(
+                        existential: existential,
+                        arguments: arguments,
+                        dispatch: dispatch,
+                        caller: function,
+                        functions: functions,
+                        registers: registers,
+                        budget: budget
+                    )
+                    try chargeCallShape(call.values, budget: budget)
+                    try consumeOwnedCallArguments(
+                        arguments,
+                        conventions: call.argumentConventions,
+                        function: function,
+                        localTypes: localTypes,
+                        registers: &registers
+                    )
+                    persist(
+                        frame,
+                        registers: registers,
+                        stackSlots: stackSlots,
+                        currentBlock: currentBlock,
+                        nextInstruction: instructionIndex + 1
+                    )
+                    try budget.checkDeadline()
+                    return .call(
+                        FrameCall(
+                            functionID: call.functionID,
+                            arguments: call.values,
+                            continuation: .throwing(
+                                normalTarget: normalTarget,
+                                errorTarget: errorTarget,
+                                programCounter: programCounter
+                            )
+                        )
+                    )
                 case let .entryTryApply(entry, arguments, normalTarget, errorTarget):
                     guard let entryInvocation,
                           let descriptor = entries[entry]
@@ -5219,6 +5379,83 @@ public struct Interpreter: Sendable {
                 _ = try take(argument, registers: &registers)
             }
         }
+    }
+
+    private func materializeExistentialCall(
+        existential: Bytecode.Register,
+        arguments: [Bytecode.Register],
+        dispatch: Bytecode.ExistentialDispatchTable,
+        caller: Bytecode.Function,
+        functions: [Bytecode.FunctionID: Bytecode.Function],
+        registers: [VM.Value?],
+        budget: VM.InvocationBudget
+    ) throws -> (
+        functionID: Bytecode.FunctionID,
+        values: [VM.Value],
+        argumentConventions: [Bytecode.ParameterConvention]
+    ) {
+        guard caller.type(of: existential) == .any,
+              case let .any(erased) = try read(
+                  existential,
+                  registers: registers
+              ),
+              erased.dynamicType.isAnyPayloadV1
+        else {
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: .any,
+                actual: caller.type(of: existential)
+            )
+        }
+        try budget.consumeValueTraversal(erased.payload)
+        guard erased.payload.matches(erased.dynamicType) else {
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: .any,
+                actual: caller.type(of: existential)
+            )
+        }
+        try budget.consumeLinearWork(elementCount: dispatch.targets.count)
+        guard let selected = dispatch.targets.first(where: {
+            $0.dynamicType == erased.dynamicType
+        }) else {
+            throw VM.RuntimeTrap.existentialDispatchFailure(
+                actual: erased.dynamicType
+            )
+        }
+        guard let callee = functions[selected.function],
+              let receiverIndex = Int(
+                  exactly: dispatch.receiverParameterIndex
+              ),
+              receiverIndex <= arguments.count,
+              callee.parameterRegisters.count == arguments.count + 1,
+              callee.parameterConventions.indices.contains(receiverIndex),
+              callee.parameterConventions[receiverIndex] == .borrowed
+                || callee.parameterConventions[receiverIndex] == .owned
+        else {
+            throw VM.RuntimeTrap.invalidProgramCounter
+        }
+        let parameterTypes = callee.parameterRegisters.compactMap {
+            callee.type(of: $0)
+        }
+        guard parameterTypes.count == callee.parameterRegisters.count,
+              parameterTypes[receiverIndex]
+                == erased.dynamicType.storageType
+        else {
+            throw VM.RuntimeTrap.invalidProgramCounter
+        }
+        var nonreceiverTypes = parameterTypes
+        nonreceiverTypes.remove(at: receiverIndex)
+        guard nonreceiverTypes == arguments.compactMap({ caller.type(of: $0) }),
+              nonreceiverTypes.count == arguments.count
+        else {
+            throw VM.RuntimeTrap.invalidProgramCounter
+        }
+        var values = try arguments.map {
+            try read($0, registers: registers)
+        }
+        values.insert(erased.payload, at: receiverIndex)
+        var conventions = callee.parameterConventions
+        conventions.remove(at: receiverIndex)
+        return (selected.function, values, conventions)
     }
 
     /// Shell entry closures cross back into code outside the verified image.

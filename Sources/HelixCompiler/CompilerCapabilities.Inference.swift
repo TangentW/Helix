@@ -79,6 +79,7 @@ extension CompilerCapabilities {
                 }
                 let errorTarget: Bytecode.BlockID? = switch instruction {
                 case let .tryApply(_, _, _, target),
+                     let .existentialTryApply(_, _, _, _, target),
                      let .entryTryApply(_, _, _, target),
                      let .nativeTryApply(_, _, _, target),
                      let .closureTryApply(_, _, _, target):

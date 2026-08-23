@@ -515,6 +515,18 @@ public enum Instruction: Codable, Hashable, Sendable {
         value: Bytecode.Register,
         targetType: Bytecode.DynamicType
     )
+    /// Retains the erased payload only when its exact represented type belongs
+    /// to the compiler-proven target protocol conformance set.
+    case checkedCastExistential(
+        result: Bytecode.Register,
+        value: Bytecode.Register,
+        acceptedTypes: Bytecode.ExistentialTypeSet
+    )
+    case forceCastExistential(
+        result: Bytecode.Register,
+        value: Bytecode.Register,
+        acceptedTypes: Bytecode.ExistentialTypeSet
+    )
     case makeOptionalSome(result: Bytecode.Register, value: Bytecode.Register)
     case makeOptionalNone(result: Bytecode.Register)
     case optionalIsSome(result: Bytecode.Register, optional: Bytecode.Register)
@@ -1073,6 +1085,15 @@ public enum Instruction: Codable, Hashable, Sendable {
         function: Bytecode.FunctionID,
         arguments: [Bytecode.Register]
     )
+    /// Dynamically selects one verified image-local witness target. `arguments`
+    /// omits the receiver, which is opened from `existential` and inserted at
+    /// the table's frozen receiver parameter index.
+    case existentialApply(
+        result: Bytecode.Register?,
+        existential: Bytecode.Register,
+        arguments: [Bytecode.Register],
+        dispatch: Bytecode.ExistentialDispatchTable
+    )
     case entryApply(
         result: Bytecode.Register?,
         entry: Core.EntryIndex,
@@ -1119,6 +1140,13 @@ public enum Instruction: Codable, Hashable, Sendable {
         normalTarget: Bytecode.BlockID,
         errorTarget: Bytecode.BlockID
     )
+    case existentialTryApply(
+        existential: Bytecode.Register,
+        arguments: [Bytecode.Register],
+        dispatch: Bytecode.ExistentialDispatchTable,
+        normalTarget: Bytecode.BlockID,
+        errorTarget: Bytecode.BlockID
+    )
     case entryTryApply(
         entry: Core.EntryIndex,
         arguments: [Bytecode.Register],
@@ -1156,6 +1184,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .eraseToAny(result, _, _),
              let .checkedCastAny(result, _, _),
              let .forceCastAny(result, _, _),
+             let .checkedCastExistential(result, _, _),
+             let .forceCastExistential(result, _, _),
              let .makeOptionalSome(result, _),
              let .makeOptionalNone(result),
              let .optionalIsSome(result, _),
@@ -1275,6 +1305,7 @@ public enum Instruction: Codable, Hashable, Sendable {
         case let .setPopFirst(elementResult, setResult, _):
             [elementResult, setResult]
         case let .apply(result, _, _),
+             let .existentialApply(result, _, _, _),
              let .entryApply(result, _, _),
              let .nativeApply(result, _, _),
              let .closureApply(result, _, _):
@@ -1293,7 +1324,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              .storeAddress, .destroyAddress,
              .destroyAddressIfInitialized, .switchOptional, .branch,
              .conditionalBranch, .endClosureScope, .closureTryApply, .tryApply,
-             .entryTryApply, .nativeTryApply,
+             .existentialTryApply, .entryTryApply, .nativeTryApply,
              .returnValue, .throwError, .sourceFailure, .trap:
             []
         }
@@ -1327,7 +1358,9 @@ public enum Instruction: Codable, Hashable, Sendable {
             [error]
         case let .eraseToAny(_, value, _),
              let .checkedCastAny(_, value, _),
-             let .forceCastAny(_, value, _):
+             let .forceCastAny(_, value, _),
+             let .checkedCastExistential(_, value, _),
+             let .forceCastExistential(_, value, _):
             [value]
         case let .makeOptionalSome(_, value):
             [value]
@@ -1543,6 +1576,8 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .entryApply(_, _, arguments),
              let .nativeApply(_, _, arguments):
             arguments
+        case let .existentialApply(_, existential, arguments, _):
+            [existential] + arguments
         case let .makeClosure(_, _, captures, _):
             captures
         case let .beginClosureScope(_, closure),
@@ -1556,6 +1591,10 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .entryTryApply(_, arguments, _, _),
              let .nativeTryApply(_, arguments, _, _):
             arguments
+        case let .existentialTryApply(
+            existential, arguments, _, _, _
+        ):
+            [existential] + arguments
         case let .returnValue(value):
             value.map { [$0] } ?? []
         case let .throwError(error), let .sourceFailure(_, error):
@@ -1566,7 +1605,8 @@ public enum Instruction: Codable, Hashable, Sendable {
     public var isTerminator: Bool {
         switch self {
         case .switchOptional, .switchEnum, .branch, .conditionalBranch,
-             .closureTryApply, .tryApply, .entryTryApply, .nativeTryApply,
+             .closureTryApply, .tryApply, .existentialTryApply,
+             .entryTryApply, .nativeTryApply,
              .returnValue, .throwError, .sourceFailure, .trap:
             true
         default: false
@@ -1589,6 +1629,7 @@ public enum Instruction: Codable, Hashable, Sendable {
         case let .switchEnum(_, cases, defaultTarget):
             cases.map(\.target) + (defaultTarget.map { [$0] } ?? [])
         case let .tryApply(_, _, normalTarget, errorTarget),
+             let .existentialTryApply(_, _, _, normalTarget, errorTarget),
              let .entryTryApply(_, _, normalTarget, errorTarget),
              let .nativeTryApply(_, _, normalTarget, errorTarget),
              let .closureTryApply(_, _, normalTarget, errorTarget):
