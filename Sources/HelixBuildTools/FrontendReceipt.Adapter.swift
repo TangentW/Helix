@@ -1436,13 +1436,14 @@ extension FrontendReceipt.Adapter {
                   let source = sourceByPath[draft.candidate.sourceFileLogicalID]
             else { continue }
             let anchor = Data(replacement.declarationAnchor.utf8)
-            guard root.declarationUTF8Offset <= source.count,
-                  anchor.count <= source.count - root.declarationUTF8Offset,
-                  source[root.declarationUTF8Offset..<(root.declarationUTF8Offset + anchor.count)]
+            let offset = replacement.declarationAnchorUTF8Offset
+            guard offset <= source.count,
+                  anchor.count <= source.count - offset,
+                  source[offset..<(offset + anchor.count)]
                     == anchor,
                   Self.occurrence(
                       of: anchor,
-                      at: root.declarationUTF8Offset,
+                      at: offset,
                       in: source
                   ) == replacement.declarationOccurrence
             else {
@@ -2033,6 +2034,23 @@ extension FrontendReceipt.Adapter {
             )
         }
         let enclosure = context.map { ("extension \($0.canonicalName) {", "}") }
+        let sourceDeclaration = Core.DynamicReplacement.Declaration(
+            identity: usr,
+            kind: .function,
+            originalReference: originalReference,
+            replacementHeader: replacementDeclaration,
+            members: [
+                .init(
+                    role: .functionBody,
+                    fallbackBody: "return "
+                        + (mayThrow ? "try " : "")
+                        + (isAsync ? "await " : "")
+                        + "\(baseName)(\(originalArguments))"
+                ),
+            ],
+            enclosingPrefix: enclosure?.0 ?? "",
+            enclosingSuffix: enclosure?.1 ?? ""
+        )
         let anchorData = source.contents.subdata(
             in: declarationOffset..<(bodyRange.start + 1)
         )
@@ -2052,19 +2070,21 @@ extension FrontendReceipt.Adapter {
             )
         }
         let nativeReplacement = ShellBuildReceipt.NativeReplacement(
+            declarationAnchorUTF8Offset: declarationOffset,
             declarationAnchor: declarationAnchor,
             declarationOccurrence: declarationOccurrence,
             loweredType: sil.loweredType,
-            originalReference: originalReference,
-            replacementDeclaration: replacementDeclaration,
-            enclosingPrefix: enclosure?.0 ?? "",
-            enclosingSuffix: enclosure?.1 ?? "",
             importedModules: imports
         )
         let root = ShellBuildReceipt.Root(
             declarationMangledName: mangledName,
             declarationUTF8Offset: declarationOffset,
             expectedDeclarationPrefix: expectedPrefix,
+            declarationInsertion: attributeKinds.contains("dynamic_attr")
+                || Self.containsWord("dynamic", in: modifierPrefix)
+                ? nil : "dynamic ",
+            sourceDeclaration: sourceDeclaration,
+            memberRole: .functionBody,
             reloadRole: Self.reloadRole(baseName: baseName),
             nominalType: context.map {
                 .init(moduleName: moduleName, canonicalName: $0.canonicalName)
@@ -2097,15 +2117,11 @@ extension FrontendReceipt.Adapter {
             }
             bridge = .init(
                 privateImportSourceFile: source.logicalPath,
-                originalReference: originalReference,
-                replacementDeclaration: replacementDeclaration,
                 parameterExpressions: bridgeParameterExpressions,
                 parameterSwiftTypes: bridgeParameterSwiftTypes,
                 resultSwiftType: generatedResultType,
                 originalInvocation: "\(baseName)(\(originalArguments))",
-                bridgeInvocation: bridgedInvocation,
-                enclosingPrefix: enclosure?.0 ?? "",
-                enclosingSuffix: enclosure?.1 ?? ""
+                bridgeInvocation: bridgedInvocation
             )
         } else {
             bridge = nil

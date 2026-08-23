@@ -95,36 +95,30 @@ public struct FactoryDescriptor: Codable, Hashable, Sendable {
 public struct NativeReplacement: Codable, Hashable, Sendable {
     public var functionKey: Core.FunctionKey
     public var sourceFileID: LiveReload.SourceFileID
+    public var sourceDeclaration: Core.DynamicReplacement.Declaration
+    public var memberRole: Core.DynamicReplacement.MemberRole
     public var declarationAnchor: String
     public var declarationOccurrence: UInt32
     public var loweredType: String
-    public var originalReference: String
-    public var replacementDeclaration: String
-    public var enclosingPrefix: String
-    public var enclosingSuffix: String
     public var importedModules: [String]
 
     public init(
         functionKey: Core.FunctionKey,
         sourceFileID: LiveReload.SourceFileID,
+        sourceDeclaration: Core.DynamicReplacement.Declaration,
+        memberRole: Core.DynamicReplacement.MemberRole,
         declarationAnchor: String,
         declarationOccurrence: UInt32 = 0,
         loweredType: String,
-        originalReference: String,
-        replacementDeclaration: String,
-        enclosingPrefix: String = "",
-        enclosingSuffix: String = "",
         importedModules: [String] = []
     ) {
         self.functionKey = functionKey
         self.sourceFileID = sourceFileID
+        self.sourceDeclaration = sourceDeclaration
+        self.memberRole = memberRole
         self.declarationAnchor = declarationAnchor
         self.declarationOccurrence = declarationOccurrence
         self.loweredType = loweredType
-        self.originalReference = originalReference
-        self.replacementDeclaration = replacementDeclaration
-        self.enclosingPrefix = enclosingPrefix
-        self.enclosingSuffix = enclosingSuffix
         self.importedModules = importedModules.sorted()
     }
 }
@@ -212,34 +206,39 @@ public struct Document: Codable, Hashable, Sendable {
         for replacement in nativeReplacements {
             guard knownRoots.contains(replacement.functionKey),
                   knownSources.contains(replacement.sourceFileID),
+                  replacement.sourceDeclaration.isWellFormed,
+                  replacement.sourceDeclaration.member(replacement.memberRole) != nil,
                   replacement.declarationAnchor.utf8.last == UInt8(ascii: "{"),
-                  replacement.declarationAnchor.range(
-                      of: #"^func\s+"#,
-                      options: .regularExpression
-                  ) != nil,
                   replacement.declarationOccurrence <= 65_535,
                   replacement.declarationAnchor.utf8.count <= 64 * 1_024,
                   !replacement.loweredType.isEmpty,
                   replacement.loweredType.utf8.count <= 64 * 1_024,
-                  !replacement.originalReference.isEmpty,
-                  replacement.originalReference.utf8.count <= 16 * 1_024,
-                  replacement.replacementDeclaration.contains("func "),
-                  replacement.replacementDeclaration.utf8.count <= 64 * 1_024,
-                  replacement.enclosingPrefix.utf8.count <= 64 * 1_024,
-                  replacement.enclosingSuffix.utf8.count <= 64 * 1_024,
                   replacement.importedModules.count <= 256,
                   Set(replacement.importedModules).count == replacement.importedModules.count,
                   replacement.importedModules == replacement.importedModules.sorted(),
                   replacement.importedModules.allSatisfy(Self.isModulePath),
                   !Self.containsNull(replacement.declarationAnchor),
                   !Self.containsNull(replacement.loweredType),
-                  !Self.containsNull(replacement.originalReference),
-                  !Self.containsNull(replacement.replacementDeclaration),
-                  !Self.containsNull(replacement.enclosingPrefix),
-                  !Self.containsNull(replacement.enclosingSuffix)
+                  !Self.containsNull(replacement.sourceDeclaration.identity)
             else {
                 throw DevProtocol.Error.malformedMessage(
                     "Native replacement metadata is incomplete, oversized, or dangling"
+                )
+            }
+        }
+        for values in Dictionary(
+            grouping: nativeReplacements,
+            by: { $0.sourceDeclaration.identity }
+        ).values {
+            guard let first = values.first,
+                  values.allSatisfy({
+                      $0.sourceFileID == first.sourceFileID
+                          && $0.sourceDeclaration == first.sourceDeclaration
+                  }),
+                  Set(values.map(\.memberRole)).count == values.count
+            else {
+                throw DevProtocol.Error.malformedMessage(
+                    "Native replacement declaration groups are inconsistent"
                 )
             }
         }

@@ -20,7 +20,19 @@ public struct Edit: Codable, Hashable, Sendable {
     public var utf8Offset: Int
     public var expectedDeclarationPrefix: String
     public var insertion: String
-    public var functionKey: Core.FunctionKey
+    public var functionKeys: [Core.FunctionKey]
+
+    public init(
+        utf8Offset: Int,
+        expectedDeclarationPrefix: String,
+        insertion: String = "dynamic ",
+        functionKeys: [Core.FunctionKey]
+    ) {
+        self.utf8Offset = utf8Offset
+        self.expectedDeclarationPrefix = expectedDeclarationPrefix
+        self.insertion = insertion
+        self.functionKeys = functionKeys.sorted { $0.description < $1.description }
+    }
 
     public init(
         utf8Offset: Int,
@@ -28,10 +40,12 @@ public struct Edit: Codable, Hashable, Sendable {
         insertion: String = "dynamic ",
         functionKey: Core.FunctionKey
     ) {
-        self.utf8Offset = utf8Offset
-        self.expectedDeclarationPrefix = expectedDeclarationPrefix
-        self.insertion = insertion
-        self.functionKey = functionKey
+        self.init(
+            utf8Offset: utf8Offset,
+            expectedDeclarationPrefix: expectedDeclarationPrefix,
+            insertion: insertion,
+            functionKeys: [functionKey]
+        )
     }
 }
 
@@ -72,7 +86,16 @@ public struct Transformer: Sendable {
             throw SourceTransform.Error.invalidSupplementalDeclarations
         }
         let sorted = edits.sorted { $0.utf8Offset < $1.utf8Offset }
-        guard Set(sorted.map(\.functionKey)).count == sorted.count else {
+        let allFunctionKeys = sorted.flatMap(\.functionKeys)
+        guard sorted.allSatisfy({
+                  !$0.functionKeys.isEmpty
+                      && $0.functionKeys == $0.functionKeys.sorted(by: {
+                          $0.description < $1.description
+                      })
+                      && Set($0.functionKeys).count == $0.functionKeys.count
+              }),
+              Set(allFunctionKeys).count == allFunctionKeys.count
+        else {
             throw SourceTransform.Error.duplicateFunction
         }
         var lastOffset = -1
@@ -86,7 +109,7 @@ public struct Transformer: Sendable {
             guard edit.utf8Offset <= source.count - min(prefix.count, source.count),
                   source[edit.utf8Offset...].starts(with: prefix)
             else {
-                throw SourceTransform.Error.declarationMismatch(edit.functionKey)
+                throw SourceTransform.Error.declarationMismatch(edit.functionKeys[0])
             }
             lastOffset = edit.utf8Offset
         }
@@ -112,7 +135,7 @@ public struct Transformer: Sendable {
             contents: transformed,
             originalHash: expectedSourceHash,
             transformedHash: .sha256(transformed),
-            appliedFunctionKeys: sorted.map(\.functionKey)
+            appliedFunctionKeys: allFunctionKeys
         )
     }
 }

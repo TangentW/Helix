@@ -92,6 +92,8 @@ flowchart TB
 
 接入 Helix 的 Release 构建会产出 App Shell 和 finalized interface archive。生成的 Derived Sources 建立永久动态入口与强类型原生 Bridge，不修改手写 Swift 文件。最终归档记录精确编译环境、源码身份、可补丁 root、签名、能力以及最终可执行文件身份。
 
+typed frontend 会把替换语法表示成以 declaration USR 为键的声明组；普通函数 body 或每个 accessor 分别对应一个可执行成员。因此多个 function key 共用属性或下标声明时，源码变换也只会插入一次 `dynamic`。Release Bridge 与显式 Native 差分后端消费同一个闭合声明形状，不会再从名字或 offset 猜测属性/下标的分组。语法要求存在但本次未变化的 getter/setter companion 会显式串到 previous implementation，而可独立替换的 observer 成员可以省略；普通函数只是这个模型的单成员情形。
+
 发生缺陷时，补丁构建器在归档环境中重新类型检查完整 module，确认只有 eligible implementation 发生变化，把当前支持的 canonical SIL 子集降成 HLBC，执行独立验证，再对补丁包签名。App 在产物进入不可变存储或激活为 generation 前会重新完成设备侧验证。
 
 随 App 安装的 Runtime 已包含字节码解码器、Verifier、HLVM、Bridge Catalog、包信任链、激活日志、Crash Guard 与回滚逻辑。生产补丁无法凭空新增 Shell 发布时不存在的原生能力。

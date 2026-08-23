@@ -709,6 +709,16 @@ typed native bridges without modifying handwritten Swift files. The finalized
 archive records the exact compiler environment, source identities, patchable
 roots, signatures, capabilities, and final executable identity.
 
+The typed frontend represents replacement syntax as a declaration group keyed
+by the declaration USR, with one executable member per function body or
+accessor. Source transformation therefore inserts `dynamic` once per Swift
+declaration even when several function keys share it. Release Bridge and the
+explicit Native differential backend consume the same closed declaration
+shape; generator code never reconstructs property/subscript grouping from
+names or offsets. Required but unchanged getter/setter companions chain to the
+previous implementation, while independently replaceable observer members may
+be omitted. Ordinary functions are the one-member case of this model.
+
 When a defect is fixed, the patch builder type-checks the complete module in
 the archived environment, confirms that only eligible implementations changed,
 lowers the supported canonical SIL subset into HLBC, runs an independent

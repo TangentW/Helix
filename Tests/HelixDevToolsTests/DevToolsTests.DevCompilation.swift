@@ -682,10 +682,26 @@ private struct NativeFixture {
                     .init(
                         functionKey: function.key,
                         sourceFileID: sourceID,
+                        sourceDeclaration: .init(
+                            identity: try #require(
+                                SwiftFrontend.DynamicReplacement.declarationUSR(
+                                    mangledName: parsed.mangledName
+                                )
+                            ),
+                            kind: .function,
+                            originalReference: "transform(_:)",
+                            replacementHeader:
+                                "public func replacementTransform(_ x: Int) -> Int",
+                            members: [
+                                .init(
+                                    role: .functionBody,
+                                    fallbackBody: "return transform(x)"
+                                ),
+                            ]
+                        ),
+                        memberRole: .functionBody,
                         declarationAnchor: "func transform(_ x: Int) -> Int {",
-                        loweredType: parsed.loweredType,
-                        originalReference: "transform(_:)",
-                        replacementDeclaration: "public func replacementTransform(_ x: Int) -> Int"
+                        loweredType: parsed.loweredType
                     ),
                 ]
             )

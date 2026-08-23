@@ -209,20 +209,28 @@ struct Tooling {
             imports: ["UIKit"],
             roots: [
                 .init(
-                    originalReference: "value(_:)",
-                    replacementDeclaration: "private func replacementValue(_ x: Int) -> Int",
+                    sourceDeclaration: .init(
+                        identity: "s:7Feature5valueyS2iF",
+                        kind: .function,
+                        originalReference: "value(_:)",
+                        replacementHeader:
+                            "private func replacementValue(_ x: Int) -> Int",
+                        members: [
+                            .init(
+                                role: .functionBody,
+                                fallbackBody: "return value(x)"
+                            ),
+                        ]
+                    ),
+                    memberRole: .functionBody,
                     body: "    x + 1",
                     sourceLine: 42
                 ),
             ]
         )
         #expect(source.contains("@_dynamicReplacement(for: value(_:))"))
-        #expect(
-            source.contains(
-                "@_dynamicReplacement(for: value(_:)) "
-                    + "private func replacementValue(_ x: Int) -> Int {    x + 1}"
-            )
-        )
+        #expect(source.contains("private func replacementValue(_ x: Int) -> Int {"))
+        #expect(source.contains("    x + 1"))
         #expect(source.contains("@_private(sourceFile: \"Feature.swift\") import Feature"))
         #expect(
             source.contains(
@@ -239,8 +247,20 @@ struct Tooling {
             imports: [],
             roots: [
                 .init(
-                    originalReference: "value(_:)",
-                    replacementDeclaration: "func replacementValue(_ x: Int) -> Int",
+                    sourceDeclaration: .init(
+                        identity: "s:7Feature5valueyS2iF",
+                        kind: .function,
+                        originalReference: "value(_:)",
+                        replacementHeader:
+                            "func replacementValue(_ x: Int) -> Int",
+                        members: [
+                            .init(
+                                role: .functionBody,
+                                fallbackBody: "return value(x)"
+                            ),
+                        ]
+                    ),
+                    memberRole: .functionBody,
                     body: " x + 1"
                 ),
             ]

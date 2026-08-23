@@ -38,70 +38,52 @@ public struct NominalType: Codable, Hashable, Sendable {
 }
 
 public struct NativeReplacement: Codable, Hashable, Sendable {
+    public var declarationAnchorUTF8Offset: Int
     public var declarationAnchor: String
     public var declarationOccurrence: UInt32
     public var loweredType: String
-    public var originalReference: String
-    public var replacementDeclaration: String
-    public var enclosingPrefix: String
-    public var enclosingSuffix: String
     public var importedModules: [String]
 
     public init(
+        declarationAnchorUTF8Offset: Int,
         declarationAnchor: String,
         declarationOccurrence: UInt32 = 0,
         loweredType: String,
-        originalReference: String,
-        replacementDeclaration: String,
-        enclosingPrefix: String = "",
-        enclosingSuffix: String = "",
         importedModules: [String] = []
     ) {
+        self.declarationAnchorUTF8Offset = declarationAnchorUTF8Offset
         self.declarationAnchor = declarationAnchor
         self.declarationOccurrence = declarationOccurrence
         self.loweredType = loweredType
-        self.originalReference = originalReference
-        self.replacementDeclaration = replacementDeclaration
-        self.enclosingPrefix = enclosingPrefix
-        self.enclosingSuffix = enclosingSuffix
         self.importedModules = importedModules.sorted()
     }
 }
 
 public struct Bridge: Codable, Hashable, Sendable {
     public var privateImportSourceFile: String
-    public var originalReference: String
-    public var replacementDeclaration: String
     public var parameterExpressions: [String]
     public var parameterSwiftTypes: [String]
     public var resultSwiftType: String
     public var originalInvocation: String
     public var bridgeInvocation: String
-    public var enclosingPrefix: String
-    public var enclosingSuffix: String
+    public var sourceSupplementalDeclaration: String?
 
     public init(
         privateImportSourceFile: String,
-        originalReference: String,
-        replacementDeclaration: String,
         parameterExpressions: [String],
         parameterSwiftTypes: [String],
         resultSwiftType: String,
         originalInvocation: String,
         bridgeInvocation: String,
-        enclosingPrefix: String = "",
-        enclosingSuffix: String = ""
+        sourceSupplementalDeclaration: String? = nil
     ) {
         self.privateImportSourceFile = privateImportSourceFile
-        self.originalReference = originalReference
-        self.replacementDeclaration = replacementDeclaration
         self.parameterExpressions = parameterExpressions
         self.parameterSwiftTypes = parameterSwiftTypes
         self.resultSwiftType = resultSwiftType
         self.originalInvocation = originalInvocation
         self.bridgeInvocation = bridgeInvocation
-        self.enclosingPrefix = enclosingPrefix
-        self.enclosingSuffix = enclosingSuffix
+        self.sourceSupplementalDeclaration = sourceSupplementalDeclaration
     }
 }
 
@@ -109,6 +91,9 @@ public struct Root: Codable, Hashable, Sendable {
     public var declarationMangledName: String
     public var declarationUTF8Offset: Int
     public var expectedDeclarationPrefix: String
+    public var declarationInsertion: String?
+    public var sourceDeclaration: Core.DynamicReplacement.Declaration
+    public var memberRole: Core.DynamicReplacement.MemberRole
     public var reloadRole: ReloadIndex.FunctionRole
     public var nominalType: ShellBuildReceipt.NominalType?
     public var bridge: ShellBuildReceipt.Bridge?
@@ -118,6 +103,9 @@ public struct Root: Codable, Hashable, Sendable {
         declarationMangledName: String,
         declarationUTF8Offset: Int,
         expectedDeclarationPrefix: String,
+        declarationInsertion: String? = "dynamic ",
+        sourceDeclaration: Core.DynamicReplacement.Declaration,
+        memberRole: Core.DynamicReplacement.MemberRole,
         reloadRole: ReloadIndex.FunctionRole = .unknown,
         nominalType: ShellBuildReceipt.NominalType? = nil,
         bridge: ShellBuildReceipt.Bridge? = nil,
@@ -126,6 +114,9 @@ public struct Root: Codable, Hashable, Sendable {
         self.declarationMangledName = declarationMangledName
         self.declarationUTF8Offset = declarationUTF8Offset
         self.expectedDeclarationPrefix = expectedDeclarationPrefix
+        self.declarationInsertion = declarationInsertion
+        self.sourceDeclaration = sourceDeclaration
+        self.memberRole = memberRole
         self.reloadRole = reloadRole
         self.nominalType = nominalType
         self.bridge = bridge
@@ -440,6 +431,29 @@ public struct Document: Codable, Hashable, Sendable {
             )
         }
         try roots.forEach(Self.validateRoot)
+        let declarationByName = Dictionary(
+            uniqueKeysWithValues: declarations.map { ($0.mangledName, $0) }
+        )
+        for values in Dictionary(grouping: roots, by: { $0.sourceDeclaration.identity }).values {
+            guard let first = values.first,
+                  values.allSatisfy({
+                      $0.sourceDeclaration == first.sourceDeclaration
+                          && $0.declarationUTF8Offset == first.declarationUTF8Offset
+                          && $0.expectedDeclarationPrefix == first.expectedDeclarationPrefix
+                          && $0.declarationInsertion == first.declarationInsertion
+                          && $0.nominalType == first.nominalType
+                          && $0.reloadRole == first.reloadRole
+                  }),
+                  Set(values.map(\.memberRole)).count == values.count,
+                  Set(values.compactMap {
+                      declarationByName[$0.declarationMangledName]?.sourceFileLogicalID
+                  }).count == 1
+            else {
+                throw ShellBuildReceipt.Error.invalid(
+                    "a grouped Swift declaration has inconsistent source or member metadata"
+                )
+            }
+        }
         guard nativeImportCandidates == nativeImportCandidates.sorted(by: {
             $0.key.rawValue < $1.key.rawValue
         }), Set(nativeImportCandidates.map(\.key)).count == nativeImportCandidates.count,
@@ -543,6 +557,11 @@ public struct Document: Codable, Hashable, Sendable {
               !root.expectedDeclarationPrefix.isEmpty,
               Self.isBoundText(root.declarationMangledName),
               Self.isBoundText(root.expectedDeclarationPrefix),
+              (root.declarationInsertion.map {
+                  !$0.isEmpty && Self.isBoundText($0)
+              } ?? true),
+              root.sourceDeclaration.isWellFormed,
+              root.sourceDeclaration.member(root.memberRole) != nil,
               root.bridge != nil || root.nativeReplacement != nil
         else {
             throw ShellBuildReceipt.Error.invalid(
@@ -551,15 +570,11 @@ public struct Document: Codable, Hashable, Sendable {
         }
         if let bridge = root.bridge {
             let requiredStrings = [
-                bridge.privateImportSourceFile, bridge.originalReference,
-                bridge.replacementDeclaration, bridge.resultSwiftType,
+                bridge.privateImportSourceFile, bridge.resultSwiftType,
                 bridge.originalInvocation, bridge.bridgeInvocation,
             ] + bridge.parameterExpressions + bridge.parameterSwiftTypes
-            guard bridge.replacementDeclaration.contains("func "),
-                  bridge.enclosingPrefix.isEmpty == bridge.enclosingSuffix.isEmpty,
-                  requiredStrings.allSatisfy(Self.isBoundText),
-                  Self.isBoundOptionalText(bridge.enclosingPrefix),
-                  Self.isBoundOptionalText(bridge.enclosingSuffix)
+            guard requiredStrings.allSatisfy(Self.isBoundText),
+                  bridge.sourceSupplementalDeclaration.map(Self.isBoundText) ?? true
             else {
                 throw ShellBuildReceipt.Error.invalid(
                     "HLBC Bridge metadata for \(root.declarationMangledName) is invalid"
@@ -567,21 +582,12 @@ public struct Document: Codable, Hashable, Sendable {
             }
         }
         if let replacement = root.nativeReplacement {
-            guard replacement.declarationAnchor.utf8.last == UInt8(ascii: "{"),
-                  replacement.declarationAnchor.range(
-                      of: #"^func\s+"#,
-                      options: .regularExpression
-                  ) != nil,
+            guard replacement.declarationAnchorUTF8Offset >= 0,
+                  replacement.declarationAnchor.utf8.last == UInt8(ascii: "{"),
                   replacement.declarationOccurrence <= 65_535,
                   Self.isBoundText(replacement.declarationAnchor),
                   !replacement.loweredType.isEmpty,
                   Self.isBoundText(replacement.loweredType),
-                  Self.isBoundText(replacement.originalReference),
-                  replacement.replacementDeclaration.contains("func "),
-                  Self.isBoundText(replacement.replacementDeclaration),
-                  replacement.enclosingPrefix.isEmpty == replacement.enclosingSuffix.isEmpty,
-                  Self.isBoundOptionalText(replacement.enclosingPrefix),
-                  Self.isBoundOptionalText(replacement.enclosingSuffix),
                   replacement.importedModules == replacement.importedModules.sorted(),
                   Set(replacement.importedModules).count == replacement.importedModules.count,
                   replacement.importedModules.allSatisfy(Self.isModulePath)

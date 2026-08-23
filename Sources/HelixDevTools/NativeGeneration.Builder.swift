@@ -76,26 +76,20 @@ public enum NativeGeneration {}
 
 extension NativeGeneration {
 public struct ReplacementRoot: Codable, Hashable, Sendable {
-    public var originalReference: String
-    public var replacementDeclaration: String
+    public var sourceDeclaration: Core.DynamicReplacement.Declaration
+    public var memberRole: Core.DynamicReplacement.MemberRole
     public var body: String
-    public var enclosingPrefix: String
-    public var enclosingSuffix: String
     public var sourceLine: Int?
 
     public init(
-        originalReference: String,
-        replacementDeclaration: String,
+        sourceDeclaration: Core.DynamicReplacement.Declaration,
+        memberRole: Core.DynamicReplacement.MemberRole,
         body: String,
-        enclosingPrefix: String = "",
-        enclosingSuffix: String = "",
         sourceLine: Int? = nil
     ) {
-        self.originalReference = originalReference
-        self.replacementDeclaration = replacementDeclaration
+        self.sourceDeclaration = sourceDeclaration
+        self.memberRole = memberRole
         self.body = body
-        self.enclosingPrefix = enclosingPrefix
-        self.enclosingSuffix = enclosingSuffix
         self.sourceLine = sourceLine
     }
 }
@@ -114,10 +108,28 @@ public struct SourceGenerator: Sendable {
             throw BuildCapture.Error.invalidManifest("replacement source input is empty")
         }
         guard roots.allSatisfy({
-            !$0.originalReference.isEmpty
-                && $0.replacementDeclaration.contains("func ")
+            $0.sourceDeclaration.isWellFormed
+                && $0.sourceDeclaration.member($0.memberRole) != nil
+                && !$0.body.unicodeScalars.contains(where: { $0.value == 0 })
+                && $0.body.utf8.count <= 16 * 1_024 * 1_024
         }) else {
             throw BuildCapture.Error.invalidManifest("replacement root is incomplete")
+        }
+        let groups = Dictionary(
+            grouping: roots,
+            by: { $0.sourceDeclaration.identity }
+        ).values.sorted {
+            $0[0].sourceDeclaration.identity < $1[0].sourceDeclaration.identity
+        }
+        guard groups.allSatisfy({ values in
+            guard let first = values.first else { return false }
+            return values.allSatisfy({
+                $0.sourceDeclaration == first.sourceDeclaration
+            }) && Set(values.map(\.memberRole)).count == values.count
+        }) else {
+            throw BuildCapture.Error.invalidManifest(
+                "replacement declaration group is inconsistent"
+            )
         }
         let privateImportName = privateImportSourceFile
             ?? URL(fileURLWithPath: sourceFileLogicalPath).lastPathComponent
@@ -135,29 +147,101 @@ public struct SourceGenerator: Sendable {
         for module in imports.sorted() where module != moduleName {
             lines.append("import \(module)")
         }
-        for root in roots {
+        for group in groups {
             lines.append("")
-            if !root.enclosingPrefix.isEmpty { lines.append(root.enclosingPrefix) }
-            if let sourceLine = root.sourceLine {
-                guard sourceLine > 0 else {
-                    throw BuildCapture.Error.invalidManifest("replacement source line is invalid")
-                }
-                lines.append(
-                    "#sourceLocation(file: \(String(reflecting: sourceFileLogicalPath)), line: \(sourceLine))"
-                )
-            }
-            lines.append(
-                "@_dynamicReplacement(for: \(root.originalReference)) "
-                    + "\(root.replacementDeclaration) {\(root.body)}"
-            )
-            if root.sourceLine != nil { lines.append("#sourceLocation()") }
-            if !root.enclosingSuffix.isEmpty { lines.append(root.enclosingSuffix) }
+            lines.append(try renderDeclarationGroup(
+                group,
+                sourceFileLogicalPath: sourceFileLogicalPath
+            ))
         }
         lines.append("")
         lines.append("@_cdecl(\"hlx_generation_registration_v1\")")
         lines.append("public func generationRegistration() -> UInt32 { \(roots.count) }")
         lines.append("")
         return lines.joined(separator: "\n")
+    }
+
+    private func renderDeclarationGroup(
+        _ roots: [NativeGeneration.ReplacementRoot],
+        sourceFileLogicalPath: String
+    ) throws -> String {
+        guard let first = roots.first else {
+            throw BuildCapture.Error.invalidManifest("replacement declaration group is empty")
+        }
+        let declaration = first.sourceDeclaration
+        let rootsByRole = Dictionary(uniqueKeysWithValues: roots.map {
+            ($0.memberRole, $0)
+        })
+        let rendered: String
+        if declaration.kind == .function {
+            guard roots.count == 1, let root = rootsByRole[.functionBody] else {
+                throw BuildCapture.Error.invalidManifest(
+                    "function replacement declaration has invalid members"
+                )
+            }
+            rendered = """
+            @_dynamicReplacement(for: \(declaration.originalReference))
+            \(declaration.replacementHeader) {
+            \(indent(try renderBody(root, sourceFileLogicalPath: sourceFileLogicalPath), by: 4))
+            }
+            """
+        } else {
+            let accessors = try declaration.members.compactMap {
+                member -> String? in
+                if let root = rootsByRole[member.role] {
+                    return "\(member.header) {\n"
+                        + indent(
+                            try renderBody(
+                                root,
+                                sourceFileLogicalPath: sourceFileLogicalPath
+                            ),
+                            by: 4
+                        ) + "\n}"
+                }
+                guard ![Core.DynamicReplacement.MemberRole.willSet, .didSet]
+                    .contains(member.role)
+                else { return nil }
+                return "\(member.header) {\n"
+                    + indent(member.fallbackBody, by: 4) + "\n}"
+            }
+            guard !accessors.isEmpty else {
+                throw BuildCapture.Error.invalidManifest(
+                    "accessor replacement declaration has no emitted members"
+                )
+            }
+            rendered = """
+            @_dynamicReplacement(for: \(declaration.originalReference))
+            \(declaration.replacementHeader) {
+            \(indent(accessors.joined(separator: "\n"), by: 4))
+            }
+            """
+        }
+        guard !declaration.enclosingPrefix.isEmpty else { return rendered }
+        return declaration.enclosingPrefix + "\n"
+            + indent(rendered, by: 4) + "\n"
+            + declaration.enclosingSuffix
+    }
+
+    private func renderBody(
+        _ root: NativeGeneration.ReplacementRoot,
+        sourceFileLogicalPath: String
+    ) throws -> String {
+        guard let sourceLine = root.sourceLine else { return root.body }
+        guard sourceLine > 0 else {
+            throw BuildCapture.Error.invalidManifest("replacement source line is invalid")
+        }
+        return """
+        #sourceLocation(file: \(String(reflecting: sourceFileLogicalPath)), line: \(sourceLine))
+        \(root.body)
+        #sourceLocation()
+        """
+    }
+
+    private func indent(_ value: String, by spaces: Int) -> String {
+        let prefix = String(repeating: " ", count: spaces)
+        return value.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.isEmpty ? "" : prefix + $0 }
+            .joined(separator: "\n")
     }
 }
 

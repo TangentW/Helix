@@ -8,7 +8,7 @@ import HelixLiveReloadAPI
 public enum ShellBuild {
     /// Changes whenever the source-to-Shell transformation changes semantics.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v1:frozen-value-hooks"
+        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks"
     )
 }
 
@@ -178,25 +178,48 @@ public struct Materializer: Sendable {
                 )
                 continue
             }
-            let edits = try descriptors.map { descriptor -> SourceTransform.Edit in
-                guard let function = functionByMangledName[descriptor.declarationMangledName] else {
+            let descriptorGroups = Dictionary(
+                grouping: descriptors,
+                by: { $0.sourceDeclaration.identity }
+            ).values
+            let edits = try descriptorGroups.compactMap {
+                values -> SourceTransform.Edit? in
+                guard let first = values.first else {
                     throw ShellBuild.Error.rootSetMismatch
                 }
+                let keys = try values.map { descriptor -> Core.FunctionKey in
+                    guard let function = functionByMangledName[
+                        descriptor.declarationMangledName
+                    ] else {
+                        throw ShellBuild.Error.rootSetMismatch
+                    }
+                    return function.key
+                }
+                guard let insertion = first.declarationInsertion else { return nil }
                 return .init(
-                    utf8Offset: descriptor.declarationUTF8Offset,
-                    expectedDeclarationPrefix: descriptor.expectedDeclarationPrefix,
-                    functionKey: function.key
+                    utf8Offset: first.declarationUTF8Offset,
+                    expectedDeclarationPrefix: first.expectedDeclarationPrefix,
+                    insertion: insertion,
+                    functionKeys: keys
                 )
             }
+            let frozenValueDeclarations = ShellBuild.FrozenValueHooks.render(
+                frozenValues,
+                moduleName: moduleName
+            )
+            let bridgeDeclarations = Array(Set(descriptors.compactMap {
+                $0.bridge?.sourceSupplementalDeclaration
+            })).sorted()
+            let supplementalDeclarations = ([frozenValueDeclarations]
+                + bridgeDeclarations)
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n\n")
             let transformed = try SourceTransform.Transformer().transform(
                 source: contents,
                 logicalPath: source.logicalPath,
                 expectedSourceHash: source.contentHash,
                 edits: edits,
-                supplementalDeclarations: ShellBuild.FrozenValueHooks.render(
-                    frozenValues,
-                    moduleName: moduleName
-                )
+                supplementalDeclarations: supplementalDeclarations
             )
             transformedSources[source.logicalPath] = transformed.contents
             indexedSources.append(
@@ -377,13 +400,14 @@ public struct Materializer: Sendable {
                   let source = sources[declaration.sourceFileLogicalID]
             else { continue }
             let anchor = Data(replacement.declarationAnchor.utf8)
-            guard root.declarationUTF8Offset <= source.count,
-                  anchor.count <= source.count - root.declarationUTF8Offset,
-                  source[root.declarationUTF8Offset..<(root.declarationUTF8Offset + anchor.count)]
+            let offset = replacement.declarationAnchorUTF8Offset
+            guard offset <= source.count,
+                  anchor.count <= source.count - offset,
+                  source[offset..<(offset + anchor.count)]
                     == anchor,
                   Self.occurrence(
                       of: anchor,
-                      at: root.declarationUTF8Offset,
+                      at: offset,
                       in: source
                   ) == replacement.declarationOccurrence
             else {
@@ -433,15 +457,13 @@ public struct Materializer: Sendable {
                 privateImportSourceFile: URL(
                     fileURLWithPath: function.sourceFileLogicalID
                 ).lastPathComponent,
-                originalReference: bridge.originalReference,
-                replacementDeclaration: bridge.replacementDeclaration,
+                sourceDeclaration: descriptor.sourceDeclaration,
+                memberRole: descriptor.memberRole,
                 parameterExpressions: bridge.parameterExpressions,
                 parameterSwiftTypes: bridge.parameterSwiftTypes,
                 resultSwiftType: bridge.resultSwiftType,
                 originalInvocation: bridge.originalInvocation,
-                bridgeInvocation: bridge.bridgeInvocation,
-                enclosingPrefix: bridge.enclosingPrefix,
-                enclosingSuffix: bridge.enclosingSuffix
+                bridgeInvocation: bridge.bridgeInvocation
             )
         }
     }
@@ -584,13 +606,11 @@ public struct Materializer: Sendable {
             return .init(
                 functionKey: function.key,
                 sourceFileID: .derive(logicalPath: function.sourceFileLogicalID),
+                sourceDeclaration: descriptor.sourceDeclaration,
+                memberRole: descriptor.memberRole,
                 declarationAnchor: replacement.declarationAnchor,
                 declarationOccurrence: replacement.declarationOccurrence,
                 loweredType: replacement.loweredType,
-                originalReference: replacement.originalReference,
-                replacementDeclaration: replacement.replacementDeclaration,
-                enclosingPrefix: replacement.enclosingPrefix,
-                enclosingSuffix: replacement.enclosingSuffix,
                 importedModules: replacement.importedModules
             )
         }

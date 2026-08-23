@@ -7,6 +7,51 @@ import HelixVM
 import Testing
 @testable import HelixCompiler
 
+private extension BridgeGeneration.Root {
+    init(
+        functionKey: Core.FunctionKey,
+        entryIndex: Core.EntryIndex,
+        sourceFileLogicalID: String,
+        privateImportSourceFile: String,
+        originalReference: String,
+        replacementDeclaration: String,
+        parameterExpressions: [String],
+        parameterSwiftTypes: [String],
+        resultSwiftType: String,
+        originalInvocation: String,
+        bridgeInvocation: String,
+        enclosingPrefix: String = "",
+        enclosingSuffix: String = ""
+    ) {
+        self.init(
+            functionKey: functionKey,
+            entryIndex: entryIndex,
+            sourceFileLogicalID: sourceFileLogicalID,
+            privateImportSourceFile: privateImportSourceFile,
+            sourceDeclaration: .init(
+                identity: "s:test:\(functionKey.description)",
+                kind: .function,
+                originalReference: originalReference,
+                replacementHeader: replacementDeclaration,
+                members: [
+                    .init(
+                        role: .functionBody,
+                        fallbackBody: "return \(originalInvocation)"
+                    ),
+                ],
+                enclosingPrefix: enclosingPrefix,
+                enclosingSuffix: enclosingSuffix
+            ),
+            memberRole: .functionBody,
+            parameterExpressions: parameterExpressions,
+            parameterSwiftTypes: parameterSwiftTypes,
+            resultSwiftType: resultSwiftType,
+            originalInvocation: originalInvocation,
+            bridgeInvocation: bridgeInvocation
+        )
+    }
+}
+
 extension CompilerTests {
 @Suite("Release index, transform, Bridge, and archive-driven compilation")
 struct ReleasePipeline {
@@ -392,13 +437,18 @@ struct ReleasePipeline {
                 .init(
                     utf8Offset: utf8Offset,
                     expectedDeclarationPrefix: "func transform",
-                    functionKey: eligible.key
+                    functionKeys: [
+                        eligible.key,
+                        .init(rawValue: .sha256("grouped-accessor-companion")),
+                    ]
                 ),
             ],
             supplementalDeclarations: "private func __helixHook() {}"
         )
         let transformedText = String(decoding: transformed.contents, as: UTF8.self)
         #expect(transformedText.contains("public dynamic func transform"))
+        #expect(transformed.appliedFunctionKeys.count == 2)
+        #expect(Set(transformed.appliedFunctionKeys).contains(eligible.key))
         #expect(transformedText.contains("private func __helixHook() {}\n\n#sourceLocation()"))
         #expect(throws: SourceTransform.Error.invalidSupplementalDeclarations) {
             try SourceTransform.Transformer().transform(

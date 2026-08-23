@@ -11,44 +11,38 @@ public struct Root: Hashable, Sendable {
     public var entryIndex: Core.EntryIndex
     public var sourceFileLogicalID: String
     public var privateImportSourceFile: String
-    public var originalReference: String
-    public var replacementDeclaration: String
+    public var sourceDeclaration: Core.DynamicReplacement.Declaration
+    public var memberRole: Core.DynamicReplacement.MemberRole
     public var parameterExpressions: [String]
     public var parameterSwiftTypes: [String]
     public var resultSwiftType: String
     public var originalInvocation: String
     public var bridgeInvocation: String
-    public var enclosingPrefix: String
-    public var enclosingSuffix: String
 
     public init(
         functionKey: Core.FunctionKey,
         entryIndex: Core.EntryIndex,
         sourceFileLogicalID: String,
         privateImportSourceFile: String,
-        originalReference: String,
-        replacementDeclaration: String,
+        sourceDeclaration: Core.DynamicReplacement.Declaration,
+        memberRole: Core.DynamicReplacement.MemberRole,
         parameterExpressions: [String],
         parameterSwiftTypes: [String],
         resultSwiftType: String,
         originalInvocation: String,
-        bridgeInvocation: String,
-        enclosingPrefix: String = "",
-        enclosingSuffix: String = ""
+        bridgeInvocation: String
     ) {
         self.functionKey = functionKey
         self.entryIndex = entryIndex
         self.sourceFileLogicalID = sourceFileLogicalID
         self.privateImportSourceFile = privateImportSourceFile
-        self.originalReference = originalReference
-        self.replacementDeclaration = replacementDeclaration
+        self.sourceDeclaration = sourceDeclaration
+        self.memberRole = memberRole
         self.parameterExpressions = parameterExpressions
         self.parameterSwiftTypes = parameterSwiftTypes
         self.resultSwiftType = resultSwiftType
         self.originalInvocation = originalInvocation
         self.bridgeInvocation = bridgeInvocation
-        self.enclosingPrefix = enclosingPrefix
-        self.enclosingSuffix = enclosingSuffix
     }
 }
 
@@ -275,6 +269,20 @@ public struct Generator: Sendable {
                 frozenValueTypes: frozenValueTypes
             )
         }
+        for values in Dictionary(
+            grouping: roots,
+            by: { $0.sourceDeclaration.identity }
+        ).values {
+            guard let first = values.first,
+                  values.allSatisfy({
+                      $0.sourceFileLogicalID == first.sourceFileLogicalID
+                          && $0.sourceDeclaration == first.sourceDeclaration
+                  }),
+                  Set(values.map(\.memberRole)).count == values.count
+            else {
+                throw BridgeGeneration.Error.incompleteRootSet
+            }
+        }
         try validateFrozenValueCodecs(
             archive: archive,
             frozenValueTypes: frozenValueTypes
@@ -381,12 +389,17 @@ public struct Generator: Sendable {
                 ))
             }
             lines.append("}")
-            for root in sortedValues {
-                let record = byKey[root.functionKey]!
+            let replacementGroups = Dictionary(
+                grouping: sortedValues,
+                by: { $0.sourceDeclaration.identity }
+            ).values.sorted {
+                $0[0].sourceDeclaration.identity < $1[0].sourceDeclaration.identity
+            }
+            for replacementGroup in replacementGroups {
                 lines.append("")
-                lines.append(try renderReplacement(
-                    root,
-                    record: record,
+                lines.append(try renderReplacementDeclaration(
+                    replacementGroup,
+                    records: byKey,
                     frozenValueTypes: frozenValueTypes
                 ))
             }
@@ -601,13 +614,12 @@ public struct Generator: Sendable {
             }
         }()
         let strings = [
-            root.privateImportSourceFile, root.originalReference, root.replacementDeclaration,
             root.resultSwiftType, root.originalInvocation,
-            root.bridgeInvocation, root.enclosingPrefix, root.enclosingSuffix,
+            root.bridgeInvocation, root.privateImportSourceFile,
         ] + root.parameterExpressions + root.parameterSwiftTypes
         guard !root.privateImportSourceFile.isEmpty,
-              !root.originalReference.isEmpty,
-              root.replacementDeclaration.contains("func "),
+              root.sourceDeclaration.isWellFormed,
+              root.sourceDeclaration.member(root.memberRole) != nil,
               !root.resultSwiftType.isEmpty,
               !root.originalInvocation.isEmpty,
               !root.bridgeInvocation.isEmpty,
@@ -618,8 +630,7 @@ public struct Generator: Sendable {
               strings.allSatisfy({
                   $0.utf8.count <= 64 * 1_024
                       && !$0.unicodeScalars.contains(where: { $0.value == 0 })
-              }),
-              root.enclosingPrefix.isEmpty == root.enclosingSuffix.isEmpty
+              })
         else {
             throw BridgeGeneration.Error.invalidRoot(root.functionKey)
         }
@@ -1227,7 +1238,7 @@ public struct Generator: Sendable {
         }
     }
 
-    private func renderReplacement(
+    private func renderReplacementBody(
         _ root: BridgeGeneration.Root,
         record: InterfaceArchive.FunctionRecord,
         frozenValueTypes: [
@@ -1304,15 +1315,87 @@ public struct Generator: Sendable {
             body = "do {\n" + indent(dispatch, spaces: 4)
                 + "\n} catch {\n    Runtime.Bridge.terminate(error)\n}"
         }
-        let wrapper = """
-        @_dynamicReplacement(for: \(root.originalReference))
-        \(root.replacementDeclaration) {
-        \(indent(body, spaces: 4))
+        return body
+    }
+
+    private func renderReplacementDeclaration(
+        _ roots: [BridgeGeneration.Root],
+        records: [Core.FunctionKey: InterfaceArchive.FunctionRecord],
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
+    ) throws -> String {
+        guard let first = roots.first else {
+            throw BridgeGeneration.Error.incompleteRootSet
         }
-        """
-        guard !root.enclosingPrefix.isEmpty else { return wrapper }
-        return root.enclosingPrefix + "\n" + indent(wrapper, spaces: 4)
-            + "\n" + root.enclosingSuffix
+        let declaration = first.sourceDeclaration
+        let rootsByRole = Dictionary(uniqueKeysWithValues: roots.map {
+            ($0.memberRole, $0)
+        })
+        let renderedDeclaration: String
+        if declaration.kind == .function {
+            guard roots.count == 1,
+                  let root = rootsByRole[.functionBody],
+                  let record = records[root.functionKey]
+            else {
+                throw BridgeGeneration.Error.invalidRoot(first.functionKey)
+            }
+            let body = try renderReplacementBody(
+                root,
+                record: record,
+                frozenValueTypes: frozenValueTypes
+            )
+            renderedDeclaration = """
+            @_dynamicReplacement(for: \(declaration.originalReference))
+            \(declaration.replacementHeader) {
+            \(indent(body, spaces: 4))
+            }
+            """
+        } else {
+            let accessors = try declaration.members.compactMap {
+                member -> String? in
+                if let root = rootsByRole[member.role] {
+                    guard let record = records[root.functionKey] else {
+                        throw BridgeGeneration.Error.invalidRoot(root.functionKey)
+                    }
+                    let body = try renderReplacementBody(
+                        root,
+                        record: record,
+                        frozenValueTypes: frozenValueTypes
+                    )
+                    return "\(member.header) {\n"
+                        + indent(body, spaces: 4) + "\n}"
+                }
+                // An observer can be omitted independently. A setter cannot,
+                // because Swift requires its replacement declaration to carry
+                // a getter; companion get/set accessors therefore chain to the
+                // previous implementation explicitly.
+                guard ![Core.DynamicReplacement.MemberRole.willSet, .didSet]
+                    .contains(member.role)
+                else { return nil }
+                return "\(member.header) {\n"
+                    + indent(member.fallbackBody, spaces: 4) + "\n}"
+            }
+            guard !accessors.isEmpty,
+                  Set(roots.map(\.memberRole)).isSubset(
+                    of: Set(declaration.members.map(\.role))
+                  )
+            else {
+                throw BridgeGeneration.Error.invalidRoot(first.functionKey)
+            }
+            renderedDeclaration = """
+            @_dynamicReplacement(for: \(declaration.originalReference))
+            \(declaration.replacementHeader) {
+            \(indent(accessors.joined(separator: "\n"), spaces: 4))
+            }
+            """
+        }
+        guard !declaration.enclosingPrefix.isEmpty else {
+            return renderedDeclaration
+        }
+        return declaration.enclosingPrefix + "\n"
+            + indent(renderedDeclaration, spaces: 4) + "\n"
+            + declaration.enclosingSuffix
     }
 
     private func renderOriginalEntry(

@@ -444,7 +444,8 @@ public actor NativeBuilder {
                         descriptor.functionKey.description
                     )
                 }
-                guard plan.currentReferenceCount == 0 || descriptor.replacementDeclaration.range(
+                guard plan.currentReferenceCount == 0
+                        || descriptor.sourceDeclaration.replacementHeader.range(
                     of: #"\bfunc\s+"#
                         + NSRegularExpression.escapedPattern(for: plan.replacementBaseName)
                         + #"(?=[<(])"#,
@@ -462,11 +463,9 @@ public actor NativeBuilder {
                     using: plan
                 )
                 return NativeGeneration.ReplacementRoot(
-                    originalReference: descriptor.originalReference,
-                    replacementDeclaration: descriptor.replacementDeclaration,
+                    sourceDeclaration: descriptor.sourceDeclaration,
+                    memberRole: descriptor.memberRole,
                     body: body,
-                    enclosingPrefix: descriptor.enclosingPrefix,
-                    enclosingSuffix: descriptor.enclosingSuffix,
                     sourceLine: try declarationLine(
                         in: state.contents,
                         anchor: descriptor.declarationAnchor,

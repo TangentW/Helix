@@ -351,6 +351,8 @@ struct ShellBuildPipeline {
         try source.write(to: fixture.sourceURL)
         fixture.receipt.sources[0].contentHash = .sha256(source)
         fixture.receipt.roots[0].declarationUTF8Offset += duplicate.utf8.count
+        fixture.receipt.roots[0].nativeReplacement?
+            .declarationAnchorUTF8Offset += duplicate.utf8.count
 
         #expect(throws: ShellBuild.Error.self) {
             try ShellBuild.Materializer().materialize(
@@ -572,12 +574,24 @@ struct ShellBuildPipeline {
             declarationMangledName: mangledName,
             declarationUTF8Offset: Data("public ".utf8).count,
             expectedDeclarationPrefix: "func transform",
+            sourceDeclaration: .init(
+                identity: "s:7Fixture9transformyS2iF",
+                kind: .function,
+                originalReference: "transform(_:)",
+                replacementHeader:
+                    "public func helixBridge_transform(_ x: Int) -> Int",
+                members: [
+                    .init(
+                        role: .functionBody,
+                        fallbackBody: "return transform(x)"
+                    ),
+                ]
+            ),
+            memberRole: .functionBody,
             reloadRole: .viewLoadOrInitialization,
             nominalType: controller,
             bridge: .init(
                 privateImportSourceFile: "Sources/Patch.swift",
-                originalReference: "transform(_:)",
-                replacementDeclaration: "public func helixBridge_transform(_ x: Int) -> Int",
                 parameterExpressions: ["x"],
                 parameterSwiftTypes: ["Swift.Int"],
                 resultSwiftType: "Swift.Int",
@@ -585,10 +599,9 @@ struct ShellBuildPipeline {
                 bridgeInvocation: "helixBridge_transform(argument0)"
             ),
             nativeReplacement: .init(
+                declarationAnchorUTF8Offset: Data("public ".utf8).count,
                 declarationAnchor: "func transform(_ x: Int) -> Int {",
-                loweredType: "@convention(thin) (Int) -> Int",
-                originalReference: "transform(_:)",
-                replacementDeclaration: "public func helixBridge_transform(_ x: Int) -> Int"
+                loweredType: "@convention(thin) (Int) -> Int"
             )
         )
         let factoryID = LiveReload.FactoryID(rawValue: "fixture.patch-controller")

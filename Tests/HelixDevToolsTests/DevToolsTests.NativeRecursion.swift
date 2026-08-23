@@ -1,5 +1,6 @@
 import Foundation
 import HelixCompiler
+import HelixCore
 import HelixDevTools
 import Testing
 
@@ -230,11 +231,22 @@ struct NativeRecursion {
                 enclosure = ("", "")
             }
             return .init(
-                originalReference: "\(baseName)(_:)",
-                replacementDeclaration: declarationText,
+                sourceDeclaration: .init(
+                    identity: usr,
+                    kind: .function,
+                    originalReference: "\(baseName)(_:)",
+                    replacementHeader: declarationText,
+                    members: [
+                        .init(
+                            role: .functionBody,
+                            fallbackBody: "return \(baseName)(n)"
+                        ),
+                    ],
+                    enclosingPrefix: enclosure.0,
+                    enclosingSuffix: enclosure.1
+                ),
+                memberRole: .functionBody,
                 body: rewritten,
-                enclosingPrefix: enclosure.0,
-                enclosingSuffix: enclosure.1
             )
         }
 

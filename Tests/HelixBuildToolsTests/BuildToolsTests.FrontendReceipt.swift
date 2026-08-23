@@ -154,7 +154,7 @@ struct FrontendReceiptPipeline {
             return forward(adjust)(value)
         }
 
-        public func remap(_ values: [String: Int]) -> [String: Int] { values }
+        public dynamic func remap(_ values: [String: Int]) -> [String: Int] { values }
 
         public final class Screen {
             @MainActor public func viewDidLoad(_ value: Int) -> Int { value + 1 }
@@ -270,7 +270,7 @@ struct FrontendReceiptPipeline {
             methodRoot.bridge?.parameterSwiftTypes
                 == ["Swift.Int", "Screen"]
         )
-        #expect(methodRoot.bridge?.enclosingPrefix == "extension Screen {")
+        #expect(methodRoot.sourceDeclaration.enclosingPrefix == "extension Screen {")
         #expect(methodRoot.nominalType?.canonicalName == "Screen")
         #expect(methodRoot.reloadRole == .viewLoadOrInitialization)
 
@@ -299,6 +299,8 @@ struct FrontendReceiptPipeline {
             as: UTF8.self
         )
         #expect(transformed.contains("public dynamic func transform"))
+        #expect(transformed.contains("public dynamic func remap"))
+        #expect(!transformed.contains("dynamic dynamic func remap"))
         #expect(transformed.contains("@MainActor public dynamic func viewDidLoad"))
         try typeCheckNativeReplacements(
             receipt: receipt,
@@ -486,16 +488,16 @@ struct FrontendReceiptPipeline {
         #expect(snapshot.parameterTypes.last == .local(.init(rawValue: "Counter")))
         #expect(snapshot.parameterConventions.last == .owned)
         #expect(consumed.parameterConventions.last == .owned)
-        let snapshotBridge = output.receipt.roots.first {
+        let snapshotRoot = output.receipt.roots.first {
             $0.declarationMangledName == snapshot.mangledName
-        }?.bridge
-        #expect(snapshotBridge != nil)
-        #expect(snapshotBridge?.replacementDeclaration.contains(
+        }
+        #expect(snapshotRoot?.bridge != nil)
+        #expect(snapshotRoot?.sourceDeclaration.replacementHeader.contains(
             "borrowing func"
         ) == true)
         #expect(output.receipt.roots.first {
             $0.declarationMangledName == consumed.mangledName
-        }?.bridge?.replacementDeclaration.contains("consuming func") == true)
+        }?.sourceDeclaration.replacementHeader.contains("consuming func") == true)
         let increment = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "increment"
         })
@@ -528,7 +530,7 @@ struct FrontendReceiptPipeline {
         #expect(asynchronous.forcedPatchability == nil)
         #expect(output.receipt.roots.first {
             $0.declarationMangledName == asynchronous.mangledName
-        }?.bridge?.replacementDeclaration.contains(" async ") == true)
+        }?.sourceDeclaration.replacementHeader.contains(" async ") == true)
         let escapedAsyncLabel = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "escapedAsyncLabel"
         })
@@ -545,14 +547,14 @@ struct FrontendReceiptPipeline {
         #expect(customActorFunction.effects.isAsync)
         #expect(customActorFunction.forcedPatchability?.reasonCode == "HLXIDX012")
         #expect(output.receipt.roots.contains {
-            $0.nativeReplacement?.replacementDeclaration.contains(
+            $0.nativeReplacement != nil && $0.sourceDeclaration.replacementHeader.contains(
                 "@\(moduleName).FeatureActor"
-            ) == true
+            )
         })
         let classMethod = try #require(output.receipt.roots.first {
             $0.declarationMangledName.contains("FactoryC7doubled")
         })
-        #expect(classMethod.nativeReplacement?.replacementDeclaration.hasPrefix("class func ") == true)
+        #expect(classMethod.sourceDeclaration.replacementHeader.hasPrefix("class func "))
         #expect(
             try ShellBuildReceipt.Codec.decode(
                 ShellBuildReceipt.Codec.encode(output.receipt)
@@ -1030,8 +1032,9 @@ struct FrontendReceiptPipeline {
         #expect(receipt.frozenValueTypes.first {
             $0.key.rawValue == "Values.CheckError"
         }?.conformsToError == true)
-        #expect(receipt.roots.compactMap(\.bridge).contains {
-            $0.replacementDeclaration.contains("Values.StoredMode")
+        #expect(receipt.roots.contains {
+            $0.bridge != nil
+                && $0.sourceDeclaration.replacementHeader.contains("Values.StoredMode")
         })
 
         let shell = try ShellBuild.Materializer().materialize(
@@ -1312,15 +1315,13 @@ struct FrontendReceiptPipeline {
             }), let descriptor = nativeByKey[function.key], functionByKey[function.key] != nil
             else { return nil }
             return .init(
-                originalReference: descriptor.originalReference,
-                replacementDeclaration: descriptor.replacementDeclaration,
+                sourceDeclaration: descriptor.sourceDeclaration,
+                memberRole: descriptor.memberRole,
                 body: try NativeGeneration.BodyExtractor().extract(
                     from: originalSource,
                     declarationAnchor: descriptor.declarationAnchor,
                     declarationOccurrence: descriptor.declarationOccurrence
-                ),
-                enclosingPrefix: descriptor.enclosingPrefix,
-                enclosingSuffix: descriptor.enclosingSuffix
+                )
             )
         }
         let generated = try NativeGeneration.SourceGenerator().generateFiles(
