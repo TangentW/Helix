@@ -61,6 +61,22 @@ Both workflows depend on stable, build-specific identities:
   Shell surface. Exact native type names are authoritative; a derived
   module-relative shorthand is installed only when it resolves to one unique
   frozen identity, so sibling nested types cannot overwrite each other.
+- Canonical SIL parsing inventories the captured frontend's protocol witness
+  tables as bounded, deterministic compiler-only evidence. It retains the
+  conforming type pattern, protocol identity, conditional generic clause,
+  associated-type and inherited-protocol evidence, requirement ABI, and exact
+  witness symbol and table order. Duplicate conformance identities or malformed
+  records fail during inventory. Multiple witness rows with the same printed
+  requirement and ABI remain distinct because textual SIL can erase source
+  argument labels; a later consumer must reject a lookup it cannot uniquely
+  resolve. Imported witness-table declarations without target bodies are not
+  dispatch evidence and are ignored. Unfamiliar members make only that
+  conformance unavailable, so an unrelated advanced declaration cannot block a
+  reachable ordinary function. The inventory does not expose Swift witness
+  tables or metadata to HLBC and, by
+  itself, does not make protocol dispatch executable; subsequent concrete
+  specialization and existential stages may consume only an exact, complete
+  record from this inventory.
 - Verified debug metadata maps HLBC function/block/instruction coordinates to
   logical Swift file, line, and column. Production artifacts redact build-host
   absolute paths; traps add the exact VM program counter and pinned generation.

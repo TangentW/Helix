@@ -57,6 +57,7 @@ public struct Function: Hashable, Sendable {
 public struct File: Sendable {
     public var functions: [CanonicalSIL.Function]
     public var typeEnvironment: CanonicalSIL.TypeEnvironment
+    let protocolConformances: CanonicalSIL.ProtocolConformance.Environment
 
     public init(text: String) throws {
         let scopes = try CanonicalSIL.DebugMetadata.scopes(in: text)
@@ -79,6 +80,7 @@ public struct File: Sendable {
             declarationLocations: declarationLocations
         )
         typeEnvironment = try .init(text: text, functions: functions)
+        protocolConformances = try .init(text: text)
     }
 
     public func function(mangledName: String) -> CanonicalSIL.Function? {
