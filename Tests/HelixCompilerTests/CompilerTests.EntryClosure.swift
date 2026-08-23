@@ -1,10 +1,11 @@
 import HelixBytecode
 import HelixCore
+import HelixInterface
 import Testing
 @testable import HelixCompiler
 
 extension CompilerTests {
-@Suite("Canonical SIL frozen-entry closures")
+@Suite("Canonical SIL static-target closures")
 struct EntryClosure {
     @Test("Partial application binds the suffix of a frozen Shell entry ABI")
     func lowersCapturedEntryClosure() throws {
@@ -39,14 +40,16 @@ struct EntryClosure {
         let parameter = try #require(lowered.parameterRegisters.first)
         let construction = try #require(
             lowered.blocks.flatMap(\.instructions).first { instruction in
-                if case .makeEntryClosure = instruction { return true }
+                if case .makeClosure(_, .entry, _, _) = instruction {
+                    return true
+                }
                 return false
             }
         )
 
-        guard case let .makeEntryClosure(
+        guard case let .makeClosure(
             result,
-            targetEntry,
+            .entry(targetEntry),
             captures,
             lifetime
         ) = construction else {
@@ -82,6 +85,190 @@ struct EntryClosure {
         )
         #expect(entryConventions == [entry: [.owned, .borrowed]])
         #expect(capabilities.contains(.borrowCallsV1))
+    }
+
+    @Test("Imported free-function references form ordinary Swift closures")
+    func lowersNativeImportFunctionReference() throws {
+        let symbol = "$s6Darwin3sinyS2dF"
+        let requirement = nativeRequirement(
+            id: 11,
+            parameters: ["Swift.Double"],
+            result: "Swift.Double"
+        )
+        let float64 = Bytecode.ValueType.float(bitWidth: 64)
+        let directCalls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [float64],
+                resultType: float64,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7factoryS2dcSgyF",
+            loweredType: "@convention(thin) () -> "
+                + "@owned @callee_guaranteed (Double) -> Double",
+            body: """
+            bb0:
+              %0 = function_ref @\(symbol) : $@convention(thin) (Double) -> Double
+              %1 = thin_to_thick_function %0 to $@callee_guaranteed (Double) -> Double
+              return %1
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer().lower(
+            function,
+            displayName: "factory",
+            directCalls: directCalls
+        )
+        let construction = try #require(
+            lowered.blocks.flatMap(\.instructions).first { instruction in
+                if case .makeClosure(_, .nativeImport, _, _) = instruction {
+                    return true
+                }
+                return false
+            }
+        )
+        guard case let .makeClosure(
+            result,
+            .nativeImport(importID),
+            captures,
+            lifetime
+        ) = construction else {
+            Issue.record("expected a NativeImport closure construction")
+            return
+        }
+        #expect(importID == requirement.id)
+        #expect(captures.isEmpty)
+        #expect(lifetime == .invocation)
+        #expect(
+            lowered.registerTypes[Int(result.rawValue)] == .closure(
+                .init(
+                    parameters: [float64],
+                    parameterConventions: [.owned],
+                    result: float64
+                )
+            )
+        )
+        let imports = try directCalls.importRequirements(
+            referencedBy: [lowered]
+        )
+        #expect(imports == [requirement])
+        let capabilities = CompilerCapabilities.infer(
+            for: [lowered],
+            imports: imports
+        )
+        #expect(capabilities.contains(.closureValuesV1))
+        #expect(capabilities.contains(.nativeImportsV1))
+    }
+
+    @Test("Partial application binds a NativeImport suffix generically")
+    func lowersCapturedNativeImportClosure() throws {
+        let symbol = "$s7Fixture6offsetyS2i_SitF"
+        let requirement = nativeRequirement(id: 12)
+        let directCalls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.int64, .int64],
+                parameterConventions: [.owned, .owned],
+                resultType: .int64,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture4makeyS2icS2iF",
+            loweredType: "@convention(thin) (Int) -> "
+                + "@owned @callee_guaranteed (Int) -> Int",
+            body: """
+            bb0(%0 : $Int):
+              %1 = function_ref @\(symbol) : $@convention(thin) (Int, Int) -> Int
+              %2 = partial_apply [callee_guaranteed] %1(%0) : $@convention(thin) (Int, Int) -> Int
+              return %2
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer().lower(
+            function,
+            displayName: "makeImportedOffset",
+            directCalls: directCalls
+        )
+        let parameter = try #require(lowered.parameterRegisters.first)
+        #expect(lowered.blocks.flatMap(\.instructions).contains {
+            guard case let .makeClosure(
+                _,
+                .nativeImport(importID),
+                captures,
+                .invocation
+            ) = $0 else { return false }
+            return importID == requirement.id && captures == [parameter]
+        })
+        #expect(
+            try directCalls.importRequirements(referencedBy: [lowered])
+                == [requirement]
+        )
+    }
+
+    @Test("Call-site argument projections cannot masquerade as function values")
+    func rejectsProjectedNativeImportFunctionReference() throws {
+        let symbol = "$s7Fixture9defaultedyS2i_SiSgtF"
+        let requirement = nativeRequirement(
+            id: 13,
+            parameters: ["Swift.Int"]
+        )
+        let directCalls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.int64],
+                parameterProjection: .init(
+                    physicalParameterCount: 2,
+                    logicalParameterIndices: [0],
+                    defaultArguments: [
+                        .optionalNone(physicalParameterIndex: 1),
+                    ]
+                ),
+                resultType: .int64,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7factoryS2icSgyF",
+            loweredType: "@convention(thin) () -> "
+                + "@owned @callee_guaranteed (Int) -> Int",
+            body: """
+            bb0:
+              %0 = function_ref @\(symbol) : $@convention(thin) (Int, Optional<Int>) -> Int
+              %1 = thin_to_thick_function %0 to $@callee_guaranteed (Int) -> Int
+              return %1
+            """
+        )
+
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer().lower(
+                function,
+                displayName: "projectedNativeFunctionValue",
+                directCalls: directCalls
+            )
+        }
+    }
+
+    private func nativeRequirement(
+        id: UInt32,
+        parameters: [String] = ["Swift.Int", "Swift.Int"],
+        result: String = "Swift.Int"
+    ) -> Bytecode.ImportRequirement {
+        .init(
+            id: .init(rawValue: id),
+            key: .init(rawValue: .sha256("closure-import-\(id)")),
+            signature: .init(parameters: parameters, result: result),
+            effects: .init(),
+            contract: .bounded(
+                kind: .globalFunction,
+                domain: .application,
+                access: .pure,
+                maximumDurationMicroseconds: 500,
+                allowsMainThread: true
+            )
+        )
     }
 }
 }

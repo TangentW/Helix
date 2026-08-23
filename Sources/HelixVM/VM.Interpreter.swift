@@ -236,8 +236,9 @@ public struct Interpreter: Sendable {
             let targetResult: Bytecode.ValueType
             let targetEffects: Core.Effects
             let entryDescriptor: Verification.ResolvedEntry?
+            let nativeImportInvoker: (any VM.NativeInvoker)?
             switch closure.target {
-            case let .image(functionID):
+            case let .bytecode(.image(functionID)):
                 guard let target = functions[functionID],
                       target.kind == .closureBody,
                       target.hasCanonicalThrownType,
@@ -257,7 +258,8 @@ public struct Interpreter: Sendable {
                 targetResult = target.resultType
                 targetEffects = target.effects
                 entryDescriptor = nil
-            case let .entry(entry):
+                nativeImportInvoker = nil
+            case let .bytecode(.entry(entry)):
                 let target = try validatedEntryClosureTarget(
                     entry,
                     closure: closure,
@@ -270,6 +272,22 @@ public struct Interpreter: Sendable {
                 targetResult = target.resultType
                 targetEffects = target.effects
                 entryDescriptor = target
+                nativeImportInvoker = nil
+            case let .bytecode(.nativeImport(importID)):
+                let target = try validatedNativeImportClosureTarget(
+                    importID,
+                    closure: closure,
+                    requiresThrowing: false,
+                    operation: "native callback NativeImport closure"
+                )
+                targetParameterTypes = target.parameterTypes
+                targetParameterConventions = nativeParameterConventions(
+                    target
+                )
+                targetResult = target.resultType
+                targetEffects = target.effects
+                entryDescriptor = nil
+                nativeImportInvoker = target
             case .native:
                 throw VM.RuntimeTrap.nativeFailure(
                     "a native callable cannot be exported as a VM callback"
@@ -318,11 +336,16 @@ public struct Interpreter: Sendable {
                     budget: budget
                 )
             }
-            let callValues = arguments + closure.captures
+            let callValues = try materializeClosureCallValues(
+                arguments: arguments,
+                closure: closure,
+                targetParameterConventions: targetParameterConventions,
+                budget: budget
+            )
             try chargeCallShape(callValues, budget: budget)
             let outcome: VM.ExecutionResult
             switch closure.target {
-            case let .image(functionID):
+            case let .bytecode(.image(functionID)):
                 outcome = .returned(try execute(
                     functionID: functionID,
                     functions: functions,
@@ -332,7 +355,7 @@ public struct Interpreter: Sendable {
                     budget: budget,
                     trace: trace
                 ))
-            case let .entry(entry):
+            case let .bytecode(.entry(entry)):
                 guard let entryInvocation, let entryDescriptor else {
                     throw VM.RuntimeTrap.unknownEntry(entry)
                 }
@@ -343,6 +366,32 @@ public struct Interpreter: Sendable {
                     descriptor: entryDescriptor,
                     budget: budget
                 )
+            case let .bytecode(.nativeImport(importID)):
+                guard let nativeImportInvoker else {
+                    throw VM.RuntimeTrap.unknownNativeImport(importID)
+                }
+                switch try invokeNative(
+                    nativeImportInvoker,
+                    id: importID,
+                    arguments: callValues,
+                    budget: budget
+                ) {
+                case let .returned(value):
+                    if let value {
+                        try budget.consumeNativeCallableBoundaryValue(value)
+                        try validateRuntimeValue(
+                            value,
+                            expected: nativeImportInvoker.resultType,
+                            localTypes: localTypes,
+                            budget: budget
+                        )
+                    }
+                    outcome = .returned(value)
+                case .businessError:
+                    throw VM.RuntimeTrap.nativeFailure(
+                        "nonthrowing import \(importID) returned a business error"
+                    )
+                }
             case .native:
                 throw VM.RuntimeTrap.nativeFailure(
                     "a native callable cannot be exported as a VM callback"
@@ -4403,7 +4452,7 @@ public struct Interpreter: Sendable {
                         }
                         throw VM.BusinessError(message: message, requiresBoundaryCharge: true)
                     }
-                case let .makeClosure(result, callee, captures, lifetime):
+                case let .makeClosure(result, target, captures, lifetime):
                     guard case let .closure(signature) = function.type(of: result) else {
                         throw VM.RuntimeTrap.typeMismatch(
                             expected: .closure(
@@ -4426,43 +4475,7 @@ public struct Interpreter: Sendable {
                     try initialize(
                         .closure(
                             .init(
-                                target: .image(callee),
-                                signature: signature,
-                                captures: capturedValues,
-                                dynamicScope: lifetime == .lexical
-                                    ? .init() : nil
-                            )
-                        ),
-                        register: result,
-                        registers: &registers
-                    )
-                case let .makeEntryClosure(result, entry, captures, lifetime):
-                    guard case let .closure(signature) = function.type(of: result) else {
-                        throw VM.RuntimeTrap.typeMismatch(
-                            expected: .closure(
-                                .init(
-                                    parameters: [],
-                                    parameterConventions: [],
-                                    result: .void
-                                )
-                            ),
-                            actual: function.type(of: result)
-                        )
-                    }
-                    let capturedValues = try captures.map { register in
-                        try copyCharging(
-                            try read(register, registers: registers),
-                            budget: budget
-                        )
-                    }
-                    try chargeAggregate(
-                        elementCount: capturedValues.count,
-                        budget: budget
-                    )
-                    try initialize(
-                        .closure(
-                            .init(
-                                target: .entry(entry),
+                                target: .bytecode(target),
                                 signature: signature,
                                 captures: capturedValues,
                                 dynamicScope: lifetime == .lexical
@@ -4552,14 +4565,20 @@ public struct Interpreter: Sendable {
                         throw VM.RuntimeTrap.mainActorViolation
                     }
                     switch closure.target {
-                    case let .image(functionID):
+                    case let .bytecode(.image(functionID)):
                         guard let calleeFunction = functions[functionID],
                               calleeFunction.parameterConventions.count
                                 >= arguments.count
                         else {
                             throw VM.RuntimeTrap.unknownFunction(functionID)
                         }
-                        let callValues = values + closure.captures
+                        let callValues = try materializeClosureCallValues(
+                            arguments: values,
+                            closure: closure,
+                            targetParameterConventions:
+                                calleeFunction.parameterConventions,
+                            budget: budget
+                        )
                         try chargeCallShape(callValues, budget: budget)
                         try consumeOwnedCallArguments(
                             arguments,
@@ -4590,7 +4609,7 @@ public struct Interpreter: Sendable {
                                 )
                             )
                         )
-                    case let .entry(entry):
+                    case let .bytecode(.entry(entry)):
                         guard let entryInvocation else {
                             throw VM.RuntimeTrap.unknownEntry(entry)
                         }
@@ -4600,7 +4619,13 @@ public struct Interpreter: Sendable {
                             entries: entries,
                             operation: "Shell entry closure"
                         )
-                        let callValues = values + closure.captures
+                        let callValues = try materializeClosureCallValues(
+                            arguments: values,
+                            closure: closure,
+                            targetParameterConventions:
+                                descriptor.parameterConventions,
+                            budget: budget
+                        )
                         try chargeCallShape(callValues, budget: budget)
                         try consumeOwnedCallArguments(
                             arguments,
@@ -4634,6 +4659,65 @@ public struct Interpreter: Sendable {
                             )
                         case let .trapped(trap):
                             throw trap
+                        }
+                    case let .bytecode(.nativeImport(importID)):
+                        let invoker = try validatedNativeImportClosureTarget(
+                            importID,
+                            closure: closure,
+                            operation: "NativeImport closure"
+                        )
+                        let conventions = nativeParameterConventions(invoker)
+                        let callValues = try materializeClosureCallValues(
+                            arguments: values,
+                            closure: closure,
+                            targetParameterConventions: conventions,
+                            budget: budget
+                        )
+                        try chargeCallShape(callValues, budget: budget)
+                        try consumeOwnedCallArguments(
+                            arguments,
+                            conventions: closure.signature
+                                .parameterConventions,
+                            function: function,
+                            localTypes: localTypes,
+                            registers: &registers
+                        )
+                        switch try invokeNative(
+                            invoker,
+                            id: importID,
+                            arguments: callValues,
+                            budget: budget
+                        ) {
+                        case let .returned(value):
+                            if let value {
+                                try budget.consumeNativeCallableBoundaryValue(
+                                    value
+                                )
+                                try validateRuntimeValue(
+                                    value,
+                                    expected: invoker.resultType,
+                                    localTypes: localTypes,
+                                    budget: budget
+                                )
+                            }
+                            try storeCallResult(
+                                value,
+                                in: result,
+                                function: function,
+                                registers: &registers,
+                                localTypes: localTypes,
+                                budget: budget
+                            )
+                        case let .businessError(message):
+                            guard invoker.effects.mayThrow else {
+                                throw VM.RuntimeTrap.nativeFailure(
+                                    "nonthrowing import \(importID) returned a business error"
+                                )
+                            }
+                            throw VM.BusinessError(
+                                message: message,
+                                requiresBoundaryCharge: true
+                            )
                         }
                     case let .native(nativeClosure):
                         guard closure.captures.isEmpty,
@@ -4720,16 +4804,22 @@ public struct Interpreter: Sendable {
                     let values = try arguments.map {
                         try read($0, registers: registers)
                     }
-                    let callValues = values + closure.captures
-                    try chargeCallShape(callValues, budget: budget)
                     switch closure.target {
-                    case let .image(functionID):
+                    case let .bytecode(.image(functionID)):
                         guard let calleeFunction = functions[functionID],
                               calleeFunction.parameterConventions.count
                                 >= arguments.count
                         else {
                             throw VM.RuntimeTrap.unknownFunction(functionID)
                         }
+                        let callValues = try materializeClosureCallValues(
+                            arguments: values,
+                            closure: closure,
+                            targetParameterConventions:
+                                calleeFunction.parameterConventions,
+                            budget: budget
+                        )
+                        try chargeCallShape(callValues, budget: budget)
                         try consumeOwnedCallArguments(
                             arguments,
                             conventions: Array(
@@ -4760,7 +4850,7 @@ public struct Interpreter: Sendable {
                                 )
                             )
                         )
-                    case let .entry(entry):
+                    case let .bytecode(.entry(entry)):
                         guard let entryInvocation else {
                             throw VM.RuntimeTrap.unknownEntry(entry)
                         }
@@ -4771,6 +4861,14 @@ public struct Interpreter: Sendable {
                             requiresThrowing: true,
                             operation: "throwing Shell entry closure"
                         )
+                        let callValues = try materializeClosureCallValues(
+                            arguments: values,
+                            closure: closure,
+                            targetParameterConventions:
+                                descriptor.parameterConventions,
+                            budget: budget
+                        )
+                        try chargeCallShape(callValues, budget: budget)
                         try consumeOwnedCallArguments(
                             arguments,
                             conventions: closure.signature
@@ -4814,9 +4912,74 @@ public struct Interpreter: Sendable {
                             throw trap
                         }
                         advancedToNextBlock = true
+                    case let .bytecode(.nativeImport(importID)):
+                        let invoker = try validatedNativeImportClosureTarget(
+                            importID,
+                            closure: closure,
+                            requiresThrowing: true,
+                            operation: "throwing NativeImport closure"
+                        )
+                        let callValues = try materializeClosureCallValues(
+                            arguments: values,
+                            closure: closure,
+                            targetParameterConventions:
+                                nativeParameterConventions(invoker),
+                            budget: budget
+                        )
+                        try chargeCallShape(callValues, budget: budget)
+                        try consumeOwnedCallArguments(
+                            arguments,
+                            conventions: closure.signature
+                                .parameterConventions,
+                            function: function,
+                            localTypes: localTypes,
+                            registers: &registers
+                        )
+                        switch try invokeNative(
+                            invoker,
+                            id: importID,
+                            arguments: callValues,
+                            budget: budget
+                        ) {
+                        case let .returned(value):
+                            if let value {
+                                try budget.consumeNativeCallableBoundaryValue(
+                                    value
+                                )
+                                try validateRuntimeValue(
+                                    value,
+                                    expected: invoker.resultType,
+                                    localTypes: localTypes,
+                                    budget: budget
+                                )
+                            }
+                            try transferCallOutcome(
+                                value,
+                                to: frame.blocks[normalTarget]!,
+                                function: function,
+                                registers: &registers,
+                                localTypes: localTypes,
+                                budget: budget
+                            )
+                            currentBlock = normalTarget
+                        case let .businessError(message):
+                            try transferBusinessError(
+                                VM.BusinessError(
+                                    message: message,
+                                    requiresBoundaryCharge: true
+                                ),
+                                to: frame.blocks[errorTarget]!,
+                                function: function,
+                                registers: &registers,
+                                localTypes: localTypes,
+                                budget: budget
+                            )
+                            currentBlock = errorTarget
+                        }
+                        advancedToNextBlock = true
                     case .native:
                         throw VM.RuntimeTrap.nativeFailure(
-                            "closure_try_apply requires an image or Shell entry target"
+                            "closure_try_apply cannot invoke a native callable handle"
                         )
                     }
                 case let .tryApply(callee, arguments, normalTarget, errorTarget):
@@ -5098,6 +5261,83 @@ public struct Interpreter: Sendable {
             )
         }
         return descriptor
+    }
+
+    /// A managed closure context is reusable. Materialize a fresh value for
+    /// every owned capture before dispatch while borrowed captures keep the
+    /// context's stored value. This is target-agnostic and is particularly
+    /// important for imported value types whose copy operation is explicit.
+    private func materializeClosureCallValues(
+        arguments: [VM.Value],
+        closure: VM.Closure,
+        targetParameterConventions: [Bytecode.ParameterConvention],
+        budget: VM.InvocationBudget
+    ) throws -> [VM.Value] {
+        guard targetParameterConventions.count
+                == arguments.count + closure.captures.count
+        else {
+            throw VM.RuntimeTrap.nativeFailure(
+                "closure target ownership disagrees with its callable ABI"
+            )
+        }
+        let captureConventions = targetParameterConventions.suffix(
+            closure.captures.count
+        )
+        var result = arguments
+        result.reserveCapacity(arguments.count + closure.captures.count)
+        for (capture, convention) in zip(
+            closure.captures,
+            captureConventions
+        ) {
+            switch convention {
+            case .owned:
+                result.append(try copyCharging(capture, budget: budget))
+            case .borrowed:
+                result.append(capture)
+            case .inout:
+                throw VM.RuntimeTrap.nativeFailure(
+                    "closure captures cannot carry inout ownership"
+                )
+            }
+        }
+        return result
+    }
+
+    private func validatedNativeImportClosureTarget(
+        _ importID: Core.NativeImportID,
+        closure: VM.Closure,
+        requiresThrowing: Bool? = nil,
+        operation: String
+    ) throws -> any VM.NativeInvoker {
+        guard let invoker = nativeCatalog[importID] else {
+            throw VM.RuntimeTrap.unknownNativeImport(importID)
+        }
+        let signature = closure.signature
+        let conventions = nativeParameterConventions(invoker)
+        let throwingRequirementMatches = requiresThrowing.map {
+            invoker.effects.mayThrow == $0
+        } ?? true
+        let boundaryErrorMatches = !invoker.effects.mayThrow
+            || signature.thrownType == .string
+            || signature.thrownType == .error
+        guard signature.hasCanonicalCallableEffects,
+              signature.hasCanonicalThrownType,
+              !invoker.effects.isAsync,
+              throwingRequirementMatches,
+              boundaryErrorMatches,
+              invoker.parameterTypes
+                == signature.parameters + closure.captures.map(\.type),
+              conventions.count == invoker.parameterTypes.count,
+              Array(conventions.prefix(signature.parameters.count))
+                == signature.parameterConventions,
+              invoker.resultType == signature.result,
+              signature.safelyRestricts(targetEffects: invoker.effects)
+        else {
+            throw VM.RuntimeTrap.nativeFailure(
+                "\(operation) disagrees with its callable ABI"
+            )
+        }
+        return invoker
     }
 
     private func invokeShellEntry(
@@ -5824,239 +6064,23 @@ public struct Interpreter: Sendable {
         instructionIndex: Int,
         budget: VM.InvocationBudget
     ) throws -> Bool {
-        func inspectCell(
-            _ cell: VM.MemoryCell,
-            depth: Int,
-            visitedReferences: inout Set<ObjectIdentifier>
-        ) throws -> Bool {
-            guard visitedReferences.insert(ObjectIdentifier(cell)).inserted
-            else { return false }
-            for value in cell.initializedValuesForInspection() {
-                if try inspect(
-                    value,
-                    depth: depth + 1,
-                    visitedReferences: &visitedReferences
-                ) {
-                    return true
-                }
-            }
-            return false
-        }
-
-        func inspect(
-            _ value: VM.Value,
-            depth: Int,
-            visitedReferences: inout Set<ObjectIdentifier>
-        ) throws -> Bool {
-            guard depth <= VM.ValueLimits.maximumNestingDepth else {
-                throw VM.RuntimeTrap.valueNestingDepthExceeded(
-                    maximum: VM.ValueLimits.maximumNestingDepth
-                )
-            }
-            try budget.consumeWork(units: 1)
-            switch value {
-            case let .closure(closure):
-                if let dynamicScope = closure.dynamicScope,
-                   dynamicScope.depends(on: scope) {
-                    return true
-                }
-                for capture in closure.captures {
-                    if try inspect(
-                        capture,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case let .any(erased):
-                return try inspect(
-                    erased.payload,
-                    depth: depth + 1,
-                    visitedReferences: &visitedReferences
-                )
-            case let .tuple(elements):
-                for element in elements {
-                    if try inspect(
-                        element,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case let .array(storage):
-                for element in storage.elements {
-                    if try inspect(
-                        element,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case let .dictionary(entries, _, _):
-                for entry in entries {
-                    if try inspect(
-                        entry.key,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) || inspect(
-                        entry.value,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case let .set(set):
-                for element in set.elements {
-                    if try inspect(
-                        element,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case let .optional(.some(wrapped)):
-                return try inspect(
-                    wrapped,
-                    depth: depth + 1,
-                    visitedReferences: &visitedReferences
-                )
-            case let .structure(_, fields):
-                for field in fields {
-                    if try inspect(
-                        field,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case let .enumeration(_, _, payload):
-                if let payload {
-                    return try inspect(
-                        payload,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    )
-                }
-            case let .object(object):
-                let identity = ObjectIdentifier(object.storage)
-                guard visitedReferences.insert(identity).inserted else {
-                    return false
-                }
-                for field in object.storage.initializedValuesForInspection() {
-                    if try inspect(
-                        field,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case let .error(error):
-                if let payload = error.payload {
-                    return try inspect(
-                        payload,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    )
-                }
-            case let .address(address):
-                return try inspectCell(
-                    address.cell,
-                    depth: depth,
-                    visitedReferences: &visitedReferences
-                )
-            case let .mutableCell(cell):
-                return try inspectCell(
-                    cell.storageForInspection,
-                    depth: depth,
-                    visitedReferences: &visitedReferences
-                )
-            case let .arrayBuilder(builder):
-                for element in builder.valuesForInspection() {
-                    if try inspect(
-                        element,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case let .arrayMutationState(state):
-                for element in state.valuesForInspection() {
-                    if try inspect(
-                        element,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case let .dictionaryBuilder(builder):
-                for value in builder.valuesForInspection() {
-                    if try inspect(
-                        value,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case let .arraySortState(state):
-                for element in state.valuesForInspection() {
-                    if try inspect(
-                        element,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case let .arraySplitState(state):
-                for element in state.valuesForInspection() {
-                    if try inspect(
-                        element,
-                        depth: depth + 1,
-                        visitedReferences: &visitedReferences
-                    ) {
-                        return true
-                    }
-                }
-            case .optional(nil), .native, .nonOwningReference, .bool,
-                 .integer, .float, .string:
-                break
-            }
-            return false
-        }
-
-        func containsScope(_ value: VM.Value) throws -> Bool {
-            var visitedReferences = Set<ObjectIdentifier>()
-            return try inspect(
-                value,
-                depth: 0,
-                visitedReferences: &visitedReferences
-            )
-        }
-
         var candidateRegisters = Set<Bytecode.Register>()
         for (index, value) in registers.enumerated()
         where UInt32(index) != closureRegister.rawValue {
             guard let raw = UInt32(exactly: index), let value else { continue }
-            if try containsScope(value) {
+            if try VM.ValueGraph.containsClosureScope(
+                in: value,
+                matching: { $0.depends(on: scope) },
+                budget: budget
+            ) {
                 candidateRegisters.insert(.init(rawValue: raw))
             }
         }
         for slot in stackSlots {
-            var visitedReferences = Set<ObjectIdentifier>()
-            if try inspectCell(
-                slot,
-                depth: 0,
-                visitedReferences: &visitedReferences
+            if try VM.ValueGraph.containsClosureScope(
+                in: slot,
+                matching: { $0.depends(on: scope) },
+                budget: budget
             ) {
                 return true
             }

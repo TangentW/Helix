@@ -170,7 +170,7 @@ struct AddressSemantics {
                         ),
                         .makeClosure(
                             result: .init(rawValue: 3),
-                            function: .init(rawValue: 1),
+                            target: .image(.init(rawValue: 1)),
                             captures: []
                         ),
                         .closureTryApply(
@@ -402,7 +402,7 @@ struct AddressSemantics {
                             ),
                             .makeClosure(
                                 result: .init(rawValue: 4),
-                                function: body.id,
+                                target: .image(body.id),
                                 captures: [.init(rawValue: 3)],
                                 lifetime: lifetime
                             ),

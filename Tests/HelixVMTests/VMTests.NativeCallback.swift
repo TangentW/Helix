@@ -154,6 +154,198 @@ struct NativeCallback {
         #expect(box.arguments == [[.bool(true)]])
         #expect(box.budgets.count == 1)
         #expect(box.budgets[0] == nil)
+        #expect(
+            throws: VM.RuntimeTrap.nativeFailure(
+                "native invocation context escaped its synchronous call"
+            )
+        ) {
+            try context.makeCallback(
+                parameterIndex: 0,
+                from: .closure(closure())
+            )
+        }
+    }
+
+    @Test("Escaping callbacks reject lexical scopes hidden in deep capture graphs")
+    func escapingRejectsNestedLexicalScope() throws {
+        let box = InvocationBox()
+        let signature = closure().signature
+        let lexical = VM.Closure(
+            target: .bytecode(.image(.init(rawValue: 8))),
+            signature: signature,
+            captures: [],
+            dynamicScope: .init()
+        )
+        func outer(capturing value: VM.Value) -> VM.Closure {
+            .init(
+                target: .bytecode(.image(.init(rawValue: 7))),
+                signature: signature,
+                captures: [value],
+                dynamicScope: nil
+            )
+        }
+        func expectEscapingRejection(_ candidate: VM.Closure) throws {
+            let budget = VM.InvocationBudget(
+                limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+                isMainThread: false,
+                nowNanoseconds: { 0 }
+            )
+            let context = try budget.beginNativeInvocation(
+                id: .init(rawValue: 0),
+                effects: .init(),
+                contract: contract(lifetime: .escaping),
+                parameterTypes: [.closure(signature)],
+                callbackHost: host(box: box),
+                isMainThread: false
+            )
+            #expect(
+                throws: VM.RuntimeTrap.nativeFailure(
+                    "a dynamically scoped closure cannot escape through NativeImport"
+                )
+            ) {
+                try context.makeCallback(
+                    parameterIndex: 0,
+                    from: .closure(candidate)
+                )
+            }
+            try context.finish(requireCooperation: true)
+        }
+
+        let arrayCapture = VM.Value.array(
+            [.closure(lexical)],
+            elementType: .closure(signature)
+        )
+        try expectEscapingRejection(outer(capturing: arrayCapture))
+
+        let cell = VM.MutableCell(
+            initialValue: .closure(lexical),
+            pointee: .closure(signature),
+            shape: .leaf
+        )
+        try expectEscapingRejection(outer(capturing: .mutableCell(cell)))
+
+        let weakType = Bytecode.LocalTypeKey(
+            rawValue: "Fixture.WeakCapture"
+        )
+        let weakObject = VM.ObjectReference(
+            typeKey: weakType,
+            fieldCount: 1
+        )
+        let weakField = try weakObject.address(
+            field: 0,
+            pointee: .closure(signature)
+        ).begin(.modify)
+        try weakField.store(.closure(lexical), mode: .initialize)
+        try weakField.end()
+        let liveWeakReference = VM.NonOwningReference(
+            kind: .weak,
+            pointee: .optional(.local(weakType)),
+            target: .local(weakType)
+        )
+        try liveWeakReference.store(
+            object: weakObject,
+            mode: .initialize
+        )
+        try expectEscapingRejection(
+            outer(capturing: .nonOwningReference(liveWeakReference))
+        )
+        let liveUnownedReference = VM.NonOwningReference(
+            kind: .unowned,
+            pointee: .local(weakType),
+            target: .local(weakType)
+        )
+        try liveUnownedReference.store(
+            object: weakObject,
+            mode: .initialize
+        )
+        try expectEscapingRejection(
+            outer(capturing: .nonOwningReference(liveUnownedReference))
+        )
+
+        let deadWeakReference = VM.NonOwningReference(
+            kind: .weak,
+            pointee: .optional(.local(weakType)),
+            target: .local(weakType)
+        )
+        do {
+            let releasedObject = VM.ObjectReference(
+                typeKey: weakType,
+                fieldCount: 1
+            )
+            let releasedField = try releasedObject.address(
+                field: 0,
+                pointee: .closure(signature)
+            ).begin(.modify)
+            try releasedField.store(
+                .closure(lexical),
+                mode: .initialize
+            )
+            try releasedField.end()
+            try deadWeakReference.store(
+                object: releasedObject,
+                mode: .initialize
+            )
+        }
+        #expect(
+            try deadWeakReference.loadObject(mode: .copy) == nil
+        )
+        let deadWeakBudget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let deadWeakContext = try deadWeakBudget.beginNativeInvocation(
+            id: .init(rawValue: 2),
+            effects: .init(),
+            contract: contract(lifetime: .escaping),
+            parameterTypes: [.closure(signature)],
+            callbackHost: host(box: box),
+            isMainThread: false
+        )
+        _ = try deadWeakContext.makeCallback(
+            parameterIndex: 0,
+            from: .closure(
+                outer(capturing: .nonOwningReference(deadWeakReference))
+            )
+        )
+        try deadWeakContext.finish(requireCooperation: true)
+
+        let object = VM.ObjectReference(
+            typeKey: .init(rawValue: "Fixture.RecursiveCapture"),
+            fieldCount: 1
+        )
+        let cyclic = VM.Closure(
+            target: .bytecode(.image(.init(rawValue: 7))),
+            signature: signature,
+            captures: [.object(object), .closure(lexical)],
+            dynamicScope: nil
+        )
+        let field = try object.address(
+            field: 0,
+            pointee: .closure(signature)
+        ).begin(.modify)
+        try field.store(.closure(cyclic), mode: .initialize)
+        try field.end()
+        try expectEscapingRejection(cyclic)
+
+        let nonescapingBudget = VM.InvocationBudget(
+            limits: .init(maxWallTimeMainThreadMilliseconds: 1_000),
+            isMainThread: false,
+            nowNanoseconds: { 0 }
+        )
+        let nonescapingContext = try nonescapingBudget.beginNativeInvocation(
+            id: .init(rawValue: 1),
+            effects: .init(),
+            contract: contract(lifetime: .nonescaping),
+            parameterTypes: [.closure(signature)],
+            callbackHost: host(box: box),
+            isMainThread: false
+        )
+        _ = try nonescapingContext.makeCallback(
+            parameterIndex: 0,
+            from: .closure(outer(capturing: arrayCapture))
+        )
+        try nonescapingContext.finish(requireCooperation: true)
     }
 
     @Test("Synchronous callback failure becomes the importing VM trap")

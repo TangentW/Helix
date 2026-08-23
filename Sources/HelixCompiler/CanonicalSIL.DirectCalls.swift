@@ -338,7 +338,8 @@ public struct DirectCallTable: Sendable {
                 block.instructions.compactMap { instruction -> Core.NativeImportID? in
                     switch instruction {
                     case let .nativeApply(_, id, _),
-                         let .nativeTryApply(id, _, _, _):
+                         let .nativeTryApply(id, _, _, _),
+                         let .makeClosure(_, .nativeImport(id), _, _):
                         id
                     default:
                         nil
@@ -375,7 +376,7 @@ public struct DirectCallTable: Sendable {
                     switch instruction {
                     case let .entryApply(_, entry, _),
                          let .entryTryApply(entry, _, _, _),
-                         let .makeEntryClosure(_, entry, _, _):
+                         let .makeClosure(_, .entry(entry), _, _):
                         entry
                     default:
                         nil

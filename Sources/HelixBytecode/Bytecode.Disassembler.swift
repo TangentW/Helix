@@ -419,11 +419,8 @@ public enum Disassembler {
             "\(assignment(result))entry_apply #\(entry)(\(arguments.map(\.description).joined(separator: ", ")))"
         case let .nativeApply(result, importID, arguments):
             "\(assignment(result))native_apply #\(importID)(\(arguments.map(\.description).joined(separator: ", ")))"
-        case let .makeClosure(result, function, captures, lifetime):
-            "\(result) = make_closure.\(lifetime.rawValue) @\(function)"
-                + " [\(captures.map(\.description).joined(separator: ", "))]"
-        case let .makeEntryClosure(result, entry, captures, lifetime):
-            "\(result) = make_entry_closure.\(lifetime.rawValue) #\(entry)"
+        case let .makeClosure(result, target, captures, lifetime):
+            "\(result) = make_closure.\(lifetime.rawValue) \(target.description)"
                 + " [\(captures.map(\.description).joined(separator: ", "))]"
         case let .beginClosureScope(result, closure):
             "\(result) = begin_closure_scope \(closure)"

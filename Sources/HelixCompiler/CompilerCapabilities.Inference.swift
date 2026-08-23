@@ -61,8 +61,7 @@ extension CompilerCapabilities {
                     capabilities.insert(.collectionsV1)
                 }
                 let closureCaptures: [Bytecode.Register]? = switch instruction {
-                case let .makeClosure(_, _, captures, _),
-                     let .makeEntryClosure(_, _, captures, _):
+                case let .makeClosure(_, _, captures, _):
                     captures
                 default:
                     nil

@@ -848,11 +848,13 @@ struct Container {
         module.functions[0].registerTypes.append(.address(.int64))
         module.functions[0].registerTypes.append(.address(.int64))
         module.functions[0].registerTypes.append(.mutableCell(.int64))
+        module.functions[0].registerTypes.append(.closure(signature))
+        module.functions[0].registerTypes.append(.closure(signature))
         module.functions[0].stackSlotTypes.append(.int64)
         module.functions[0].blocks[0].instructions.insert(
             .makeClosure(
                 result: .init(rawValue: 5),
-                function: .init(rawValue: 1),
+                target: .image(.init(rawValue: 1)),
                 captures: [.init(rawValue: 0)]
             ),
             at: 0
@@ -879,11 +881,21 @@ struct Container {
         module.functions[0].blocks[0].instructions.insert(contentsOf: [
             .makeClosure(
                 result: .init(rawValue: 8),
-                function: .init(rawValue: 1),
+                target: .image(.init(rawValue: 1)),
                 captures: [.init(rawValue: 0)],
                 lifetime: .lexical
             ),
             .endClosureScope(closure: .init(rawValue: 8)),
+            .makeClosure(
+                result: .init(rawValue: 12),
+                target: .entry(.init(rawValue: 7)),
+                captures: []
+            ),
+            .makeClosure(
+                result: .init(rawValue: 13),
+                target: .nativeImport(.init(rawValue: 9)),
+                captures: []
+            ),
             .storeStack(
                 slot: .init(rawValue: 0),
                 source: .init(rawValue: 0),
@@ -950,6 +962,8 @@ struct Container {
         #expect(decoded.module == module)
         #expect(try Bytecode.Encoder.encode(decoded.module) == bytes)
         #expect(text.contains("make_closure.lexical"))
+        #expect(text.contains("make_closure.invocation entry #7"))
+        #expect(text.contains("make_closure.invocation import #9"))
         #expect(text.contains("borrow_mutable_cell"))
         #expect(text.contains("begin_closure_scope"))
         #expect(text.contains("end_closure_scope"))

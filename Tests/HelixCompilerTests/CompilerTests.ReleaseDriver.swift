@@ -303,7 +303,7 @@ struct ReleaseDriver {
         #expect(result.changedFunctions.map(\.key) == [transform.key])
         #expect(
             result.disassembly.contains(
-                "make_entry_closure.invocation #\(helperEntry.rawValue)"
+                "make_closure.invocation entry #\(helperEntry.rawValue)"
             )
         )
         #expect(result.disassembly.contains("closure_apply"))
@@ -1119,6 +1119,118 @@ struct ReleaseDriver {
                 image: image,
                 arguments: [.integer(try VM.Integer(signed: 4, bitWidth: 64, isSigned: true))]
             ) == .returned(.integer(try VM.Integer(signed: 17, bitWidth: 64, isSigned: true)))
+        )
+    }
+
+    @Test("An allowlisted Swift callee remains a NativeImport as a function value")
+    func lowersNativeImportFunctionValuesEndToEnd() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-native-function-value-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        @inline(never) public func helper(_ x: Int) -> Int { x + 1 }
+        @inline(never) public func transform(_ x: Int) -> Int {
+            let operations: [(Int) -> Int] = [helper]
+            return operations[0](x)
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+        let driver = ReleaseCompiler.Driver()
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            helperExposure: .nativeImport,
+            optimization: "-Onone"
+        )
+        let transform = try #require(
+            archive.functions.first {
+                $0.canonicalDeclaration.contains("transform")
+            }
+        )
+        let transformEntry = try #require(transform.entryIndex)
+        let nativeImport = try #require(archive.nativeImports.first)
+        let importID = try #require(nativeImport.id)
+
+        try Data(
+            """
+            @inline(never) public func helper(_ x: Int) -> Int { x + 1 }
+            @inline(never) public func transform(_ x: Int) -> Int {
+                let operations: [(Int) -> Int] = [helper]
+                return operations[0](x) + 3
+            }
+            """.utf8
+        ).write(to: sourceURL)
+        let result = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+
+        #expect(result.changedFunctions.map(\.key) == [transform.key])
+        #expect(result.module.imports.map(\.id) == [importID])
+        #expect(
+            result.module.functions.flatMap(\.blocks).flatMap(\.instructions)
+                .contains {
+                    if case let .makeClosure(
+                        _,
+                        .nativeImport(targetID),
+                        captures,
+                        lifetime
+                    ) = $0 {
+                        return targetID == importID
+                            && captures.isEmpty
+                            && lifetime == .invocation
+                    }
+                    return false
+                }
+        )
+        #expect(result.disassembly.contains("closure_apply"))
+        let policy = Core.RuntimePolicy(
+            acceptedCapabilities: Set(archive.capabilities),
+            allowedNativeImports: [importID]
+        )
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: policy
+        )
+        let catalog = try VM.NativeCatalog([
+            IncrementInvoker(
+                id: importID,
+                key: nativeImport.key,
+                effects: nativeImport.effects,
+                contract: nativeImport.contract
+            ),
+        ])
+        #expect(
+            VM.Interpreter(nativeCatalog: catalog).invoke(
+                entry: transformEntry,
+                image: image,
+                arguments: [
+                    .integer(
+                        try VM.Integer(
+                            signed: 4,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    ),
+                ]
+            ) == .returned(
+                .integer(
+                    try VM.Integer(
+                        signed: 17,
+                        bitWidth: 64,
+                        isSigned: true
+                    )
+                )
+            )
         )
     }
 

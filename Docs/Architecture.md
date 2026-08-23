@@ -67,12 +67,20 @@ Both workflows depend on stable, build-specific identities:
 - An immutable `Runtime.Generation` makes all routes in one activation visible
   atomically. A call chain pins one generation so it cannot observe a mixture
   during concurrent activation or rollback.
-- A frozen Shell entry includes its parameter ownership conventions as well as
-  types, result, and effects. An unchanged callable used as a Swift closure is
-  represented by its `EntryIndex`, not by a copied archived body or a process
-  pointer. The closure stores only verified suffix captures; ordinary,
-  throwing, and NativeImport-callback invocation all re-enter through the same
-  pinned-generation routing path.
+- One `make_closure` instruction carries a typed static target: an image
+  function, a frozen Shell `EntryIndex`, or a declared `NativeImportID`.
+  Unchanged Swift callables therefore do not copy archived bodies, and imported
+  global/free-function references such as C overlay functions do not require an
+  image thunk merely to become Swift values. This route requires a complete,
+  representation-preserving callable ABI; call-site default-argument
+  projections and direct-call-only adapters cannot masquerade as function
+  values. Invocation parameters are the target ABI prefix and `partial_apply`
+  captures are its suffix. The Verifier
+  checks exact ownership, result, effects, boundary-error type, import policy,
+  and creator authority before constructing the capability. Runtime-native
+  callable handles returned by an import remain a separate target kind. Shell
+  and escaping NativeImport-callback invocation retain pinned-generation
+  routing.
 - Closure captures and collection transforms use verifier-private storage
   values rather than Swift runtime layout. Mutable captures share managed cells;
   `weak` and checked `unowned` captures share non-retaining handles whose
@@ -84,16 +92,23 @@ Both workflows depend on stable, build-specific identities:
   every control-flow path. These internal storage values cannot enter a stack
   slot, Shell/Native boundary, local value layout, or function result.
   Immutable closure contexts may also copy a represented linear capture when
-  its frozen TypeOps are copyable and the closure body receives that capture
-  with a borrowed ABI. `make_closure` charges and performs the copy; owned or
-  inout linear captures remain verifier errors. A lexical `make_closure` is a
+  its frozen TypeOps are copyable. `make_closure` charges the context copy;
+  every invocation reuses a borrowed capture or materializes a fresh,
+  resource-charged copy for an owned target parameter. This keeps multi-shot
+  closures reusable even for imported value types. Inout captures remain
+  verifier errors. A lexical `make_closure` is a
   distinct lifetime class: it owns a dynamic scope that must close on every CFG
   exit. For a nonescaping capture of caller-owned `inout`, `borrow_mutable_cell`
   presents the already-active modify address through the same capture ABI
   without copying it. Provenance verification prevents that cell from entering
   an invocation-lifetime closure, and requires the lexical closure to end before
   the address scope; the runtime address token independently invalidates stale
-  access.
+  access. Closure-scope provenance also follows branch arguments and every
+  closure-bearing managed aggregate. As defense in depth, creation of an
+  escaping native callback performs a budgeted, cycle-safe traversal of the
+  complete capture graph, including collections, mutable cells, local object
+  storage, and live local weak/unowned referents; nesting cannot hide a lexical
+  scope from the boundary.
 - Native callable boundary crossings use explicit contracts rather than making
   closure values part of the ordinary boundary codec. Each callback-bearing
   NativeImport identity freezes its parameter index and `nonescaping` or
@@ -108,7 +123,8 @@ Both workflows depend on stable, build-specific identities:
   importing thread. A detached escaping callback may run later on another
   thread only after entering that same serialized domain. This mechanism does
   not claim general Swift `Sendable` semantics.
-  Dynamic lexical scopes cannot enter an escaping handle;
+  Dynamic lexical scopes cannot enter an escaping handle, even when nested in
+  another closure's aggregate or reference-backed capture graph;
   callback arguments are re-encoded and shape-checked at every invocation.
   One controlled higher-order edge is part of the same profile: an SDK may
   supply a direct or Optional synchronous, nonthrowing callable as an outer
@@ -168,7 +184,7 @@ Both workflows depend on stable, build-specific identities:
   throwing behavior, global actor, and async behavior. Allocation and external
   side-effect authority remain properties of the concrete closure body;
   verification permits `make_closure` only when the creator already has that
-  authority. Possession of the resulting image-local capability then permits
+  authority. Possession of the resulting static-target capability then permits
   higher-order invocation without adding execution authority to the closure
   type. Parameters, results, captures, represented aggregate wrappers, and
   NativeImport callback positions and callable-result positions preserve the

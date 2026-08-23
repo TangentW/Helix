@@ -94,6 +94,16 @@ public final class NonOwningReference: @unchecked Sendable, Hashable,
         return result
     }
 
+    /// Acquires only the temporary strong reference needed for a bounded
+    /// security traversal. A dead weak/unowned referent is not resurrected and
+    /// does not turn inspection into a checked language-level load.
+    func referentForInspection() -> AnyObject? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .object = state else { return nil }
+        return objectStorage
+    }
+
     public static func == (lhs: VM.NonOwningReference, rhs: VM.NonOwningReference) -> Bool {
         lhs === rhs
     }

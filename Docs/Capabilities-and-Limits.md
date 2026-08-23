@@ -436,19 +436,25 @@ does not by itself certify a physical device or distribution channel.
   Optional and imported SDK reference values used by the supported higher-order
   operations, ordinary same-image inout closures on normal/throwing paths, and
   scoped frame-owned mutation used by `reduce(into:_:)`. A copyable linear
-  capture, such as an imported reference, is copied into the
-  managed closure context only when the closure body receives it with a
-  borrowed capture ABI; owned and inout linear captures remain rejected. Fully
+  capture, such as an imported reference, is copied into the managed closure
+  context when it is formed. A borrowed target parameter reuses that stored
+  value, while an owned target parameter receives a fresh, resource-charged
+  copy on every invocation so the closure remains multi-shot. Inout captures
+  remain rejected. Fully
   concrete direct/indirect-result reabstraction thunks are linked as image-local
   compiler-generated functions, using the closure-body role only when partially
   applied; direct-only closure and `defer` helpers retain their physical capture
   ABI as concrete specializations. They are never resolved through NativeImport.
-  An unchanged eligible Swift callable may also become a closure value without
-  copying its archived implementation into the patch. `make_entry_closure`
-  freezes its `EntryIndex`; invocation parameters are the prefix of the frozen
-  Shell ABI and `partial_apply` captures are its suffix, with exact ownership,
-  result, callable effects, and boundary-error checks shared with image-local
-  closures. A referenced entry with any borrowed parameter requires the same
+  An unchanged eligible Swift callable or a declared NativeImport free/global
+  function may also become a closure value without copying an archived
+  implementation or creating an API-specific VM adapter. Unified
+  `make_closure` freezes an image function, `EntryIndex`, or `NativeImportID`;
+  the callable ABI must be complete and representation-preserving, so a
+  call-site default-argument projection or direct-call-only adapter is rejected;
+  invocation parameters are the target ABI prefix and `partial_apply` captures
+  are its suffix. Exact ownership, result, callable effects, boundary-error,
+  import declaration/policy, and creator-authority checks are shared. A
+  referenced entry with any borrowed parameter requires the same
   `borrow-calls-1` declaration for direct, throwing, and closure-target calls.
   Normal and throwing calls route through the invocation's pinned generation.
   The same target can therefore enter a declared nonescaping or
@@ -469,7 +475,12 @@ does not by itself certify a physical device or distribution channel.
   caller-owned `inout` address through the managed-cell capture ABI; the borrow
   becomes invalid with the address access, and both static verification and the
   VM require the closure to close first. An escaping capture of that address is
-  rejected. Other closure values must remain inside the same pinned HLVM
+  rejected. Static scope provenance follows branch parameters and
+  closure-bearing aggregates. Exporting an escaping callback also performs a
+  budgeted, cycle-safe scan through nested closures, collections, mutable cells,
+  local objects, and live local weak/unowned referents, so reference-backed
+  storage cannot hide a lexical scope.
+  Other closure values must remain inside the same pinned HLVM
   invocation;
   `escaping-closure-values-1` gates return and
   nested-capture semantics, while `mutable-captures-1` gates managed cells.

@@ -118,7 +118,7 @@ struct NativeCallback {
         )
         let generation = try fixture.generation(
             id: 1,
-            usesShellEntryTarget: true
+            target: .entry
         )
         _ = try runtime.activate(generation, expectedActiveID: nil)
         #expect(runtime.invoke(entry: fixture.entry, arguments: []) == .returned(nil))
@@ -145,6 +145,63 @@ struct NativeCallback {
             failureResult: { -1 }
         )
         #expect(result == 42)
+        #expect(observed.values == [42])
+    }
+
+    @Test("An escaping NativeImport function closure keeps its generation")
+    func nativeImportClosurePinsGeneration() throws {
+        let fixture = try Fixture()
+        let callbackBox = CallbackBox()
+        let observed = IntegerBox()
+        let callbackImport = VM.ClosureNativeInvoker(
+            id: fixture.exportID,
+            key: fixture.exportKey,
+            parameterTypes: [.closure(fixture.callbackBoundarySignature)],
+            resultType: .void,
+            effects: fixture.effects,
+            contract: fixture.exportContract,
+            invoke: { arguments, context in
+                callbackBox.value = try context.makeCallback(
+                    parameterIndex: 0,
+                    from: arguments[0]
+                )
+                return .returned(nil)
+            }
+        )
+        let observationImport = VM.ClosureNativeInvoker(
+            id: fixture.observationID,
+            key: fixture.observationKey,
+            parameterTypes: [.int64],
+            resultType: .void,
+            effects: fixture.effects,
+            contract: fixture.observationContract,
+            invoke: { arguments, _ in
+                guard case let .integer(value) = arguments[0] else {
+                    throw VM.RuntimeTrap.typeMismatch(
+                        expected: .int64,
+                        actual: arguments[0].type
+                    )
+                }
+                observed.append(value.signedValue)
+                return .returned(nil)
+            }
+        )
+        let runtime = try Runtime.Engine(
+            originals: fixture.originals(observed: observed),
+            nativeCatalog: .init([callbackImport, observationImport])
+        )
+        let generation = try fixture.generation(
+            id: 1,
+            target: .nativeImport
+        )
+        _ = try runtime.activate(generation, expectedActiveID: nil)
+        #expect(runtime.invoke(entry: fixture.entry, arguments: []) == .returned(nil))
+        let callback = try #require(callbackBox.value)
+        try runtime.rollback(expectedActiveID: generation.id, to: nil)
+
+        callback.invokeVoid {
+            [.integer(try VM.Integer(signed: 42, bitWidth: 64, isSigned: true))]
+        }
         #expect(observed.values == [42])
     }
 
@@ -175,7 +232,51 @@ struct NativeCallback {
         }
     }
 
+    @Test("An outer closure cannot hide a lexical callback capture")
+    func nestedLexicalClosureCannotEscape() throws {
+        let fixture = try Fixture()
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "a dynamically scoped closure cannot enter an escaping NativeImport callback"
+            )
+        ) {
+            try fixture.generation(
+                id: 1,
+                closureLifetime: .lexical,
+                wrapsCallback: true
+            )
+        }
+    }
+
+    @Test("An aggregate capture cannot hide a lexical callback")
+    func aggregateLexicalClosureCannotEscape() throws {
+        let fixture = try Fixture()
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 3,
+                reason: "a dynamically scoped closure cannot enter an escaping NativeImport callback"
+            )
+        ) {
+            try fixture.generation(
+                id: 1,
+                closureLifetime: .lexical,
+                wrapsCallbackInArray: true
+            )
+        }
+    }
+
     private struct Fixture {
+        enum CallbackTarget: Equatable {
+            case image
+            case entry
+            case nativeImport
+        }
+
         let entry = Core.EntryIndex(rawValue: 0)
         let callbackEntry = Core.EntryIndex(rawValue: 1)
         let exportID = Core.NativeImportID(rawValue: 0)
@@ -320,29 +421,38 @@ struct NativeCallback {
             id: UInt64,
             closureLifetime: Bytecode.ClosureLifetime = .invocation,
             restrictCallbackToMainActor: Bool = false,
-            usesShellEntryTarget: Bool = false
+            wrapsCallback: Bool = false,
+            wrapsCallbackInArray: Bool = false,
+            target: CallbackTarget = .image
         ) throws -> Runtime.Generation {
+            precondition(
+                [
+                    restrictCallbackToMainActor,
+                    wrapsCallback,
+                    wrapsCallbackInArray,
+                ].filter { $0 }.count <= 1
+            )
             let closureType = Bytecode.ValueType.closure(callbackSignature)
             var boundarySignature = callbackBoundarySignature
             boundarySignature.effects.requiresMainActor =
                 restrictCallbackToMainActor
             let callbackRegister: Bytecode.Register = .init(
-                rawValue: restrictCallbackToMainActor ? 1 : 0
+                rawValue: wrapsCallbackInArray
+                    ? 2
+                    : (restrictCallbackToMainActor || wrapsCallback ? 1 : 0)
             )
+            let closureTarget: Bytecode.ClosureTarget = switch target {
+            case .image: .image(.init(rawValue: 1))
+            case .entry: .entry(callbackEntry)
+            case .nativeImport: .nativeImport(observationID)
+            }
             var entryInstructions: [Bytecode.Instruction] = [
-                usesShellEntryTarget
-                    ? .makeEntryClosure(
-                        result: .init(rawValue: 0),
-                        entry: callbackEntry,
-                        captures: [],
-                        lifetime: closureLifetime
-                    )
-                    : .makeClosure(
-                        result: .init(rawValue: 0),
-                        function: .init(rawValue: 1),
-                        captures: [],
-                        lifetime: closureLifetime
-                    ),
+                .makeClosure(
+                    result: .init(rawValue: 0),
+                    target: closureTarget,
+                    captures: [],
+                    lifetime: closureLifetime
+                ),
             ]
             var entryRegisterTypes = [closureType]
             if restrictCallbackToMainActor {
@@ -351,6 +461,33 @@ struct NativeCallback {
                     .convertClosure(
                         result: callbackRegister,
                         source: .init(rawValue: 0)
+                    )
+                )
+            }
+            if wrapsCallback {
+                entryRegisterTypes.append(closureType)
+                entryInstructions.append(
+                    .makeClosure(
+                        result: callbackRegister,
+                        target: .image(.init(rawValue: 2)),
+                        captures: [.init(rawValue: 0)]
+                    )
+                )
+            }
+            if wrapsCallbackInArray {
+                entryRegisterTypes.append(.array(closureType))
+                entryInstructions.append(
+                    .makeArray(
+                        result: .init(rawValue: 1),
+                        elements: [.init(rawValue: 0)]
+                    )
+                )
+                entryRegisterTypes.append(closureType)
+                entryInstructions.append(
+                    .makeClosure(
+                        result: callbackRegister,
+                        target: .image(.init(rawValue: 2)),
+                        captures: [.init(rawValue: 1)]
                     )
                 )
             }
@@ -410,6 +547,89 @@ struct NativeCallback {
                 ],
                 effects: effects
             )
+            let wrapperFunction: Bytecode.Function
+            if wrapsCallbackInArray {
+                let wrapperResult: Bytecode.Register? =
+                    callbackSignature.result == .void
+                        ? nil : .init(rawValue: 4)
+                wrapperFunction = .init(
+                    id: .init(rawValue: 2),
+                    name: "aggregateCallbackWrapper",
+                    kind: .closureBody,
+                    parameterRegisters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                    ],
+                    parameterConventions: [.owned, .borrowed],
+                    resultType: callbackSignature.result,
+                    registerTypes: [
+                        .int64, .array(.closure(callbackSignature)), .int64,
+                        .closure(callbackSignature),
+                    ] + (callbackSignature.result == .void
+                        ? [] : [callbackSignature.result]),
+                    entryBlock: .init(rawValue: 0),
+                    blocks: [
+                        .init(
+                            id: .init(rawValue: 0),
+                            parameters: [
+                                .init(rawValue: 0), .init(rawValue: 1),
+                            ],
+                            instructions: [
+                                .constantInteger(
+                                    result: .init(rawValue: 2),
+                                    bitPattern: 0
+                                ),
+                                .arrayGet(
+                                    result: .init(rawValue: 3),
+                                    array: .init(rawValue: 1),
+                                    index: .init(rawValue: 2)
+                                ),
+                                .closureApply(
+                                    result: wrapperResult,
+                                    closure: .init(rawValue: 3),
+                                    arguments: [.init(rawValue: 0)]
+                                ),
+                                .returnValue(wrapperResult),
+                            ]
+                        ),
+                    ],
+                    effects: effects
+                )
+            } else {
+                let wrapperResult: Bytecode.Register? =
+                    callbackSignature.result == .void
+                        ? nil : .init(rawValue: 2)
+                wrapperFunction = .init(
+                    id: .init(rawValue: 2),
+                    name: "callbackWrapper",
+                    kind: .closureBody,
+                    parameterRegisters: [
+                        .init(rawValue: 0), .init(rawValue: 1),
+                    ],
+                    parameterConventions: [.owned, .borrowed],
+                    resultType: callbackSignature.result,
+                    registerTypes: [.int64, .closure(callbackSignature)]
+                        + (callbackSignature.result == .void
+                            ? [] : [callbackSignature.result]),
+                    entryBlock: .init(rawValue: 0),
+                    blocks: [
+                        .init(
+                            id: .init(rawValue: 0),
+                            parameters: [
+                                .init(rawValue: 0), .init(rawValue: 1),
+                            ],
+                            instructions: [
+                                .closureApply(
+                                    result: wrapperResult,
+                                    closure: .init(rawValue: 1),
+                                    arguments: [.init(rawValue: 0)]
+                                ),
+                                .returnValue(wrapperResult),
+                            ]
+                        ),
+                    ],
+                    effects: effects
+                )
+            }
             let observationSignature = Core.LoweredSignature(
                 parameters: ["Swift.Int"],
                 result: "Swift.Void"
@@ -421,6 +641,9 @@ struct NativeCallback {
             if restrictCallbackToMainActor {
                 capabilities.insert(.mainActorSyncV1)
             }
+            if wrapsCallbackInArray {
+                capabilities.insert(.collectionsV1)
+            }
             let module = Bytecode.Module(
                 name: "RuntimeNativeCallbackFixture",
                 shellInterfaceHash: shellHash,
@@ -429,8 +652,10 @@ struct NativeCallback {
                 requestedResources: .init(
                     maxWallTimeMainThreadMilliseconds: 1_000
                 ),
-                functions: usesShellEntryTarget
-                    ? [entryFunction] : [entryFunction, callbackFunction],
+                functions: [entryFunction]
+                    + (target == .image ? [callbackFunction] : [])
+                    + (wrapsCallback || wrapsCallbackInArray
+                        ? [wrapperFunction] : []),
                 entries: [
                     .init(
                         entryIndex: entry,

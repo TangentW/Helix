@@ -1399,7 +1399,8 @@ public struct Engine: Verification.ImageVerifying {
         try verifyClosureScopeLifetimes(
             function,
             blocks: blocks,
-            shell: shell
+            shell: shell,
+            localTypes: localTypes
         )
 
         let predecessors = try buildPredecessors(function: function, blocks: blocks)
@@ -1854,7 +1855,8 @@ public struct Engine: Verification.ImageVerifying {
     private func verifyClosureScopeLifetimes(
         _ function: Bytecode.Function,
         blocks: [Bytecode.BlockID: Bytecode.Block],
-        shell: Verification.ShellInterface
+        shell: Verification.ShellInterface,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
     ) throws {
         let scopedRegisters: Set<Bytecode.Register> = Set(
             function.blocks.flatMap { block -> [Bytecode.Register] in
@@ -1863,8 +1865,7 @@ public struct Engine: Verification.ImageVerifying {
                     switch instruction {
                     case let .beginClosureScope(result, _):
                         result
-                    case let .makeClosure(result, _, _, .lexical),
-                         let .makeEntryClosure(result, _, _, .lexical):
+                    case let .makeClosure(result, _, _, .lexical):
                         result
                     default:
                         nil
@@ -1879,32 +1880,130 @@ public struct Engine: Verification.ImageVerifying {
             }
         }
         guard !scopedRegisters.isEmpty || hasScopeEnd else { return }
-        let parentByScope = Dictionary(uniqueKeysWithValues:
-            function.blocks.flatMap { block in
-                block.instructions.compactMap { instruction in
-                    switch instruction {
-                    case let .beginClosureScope(result, closure),
-                         let .convertClosure(result, closure),
-                         let .copyValue(result, closure),
-                         let .moveValue(result, closure):
-                        return (result, closure)
-                    default:
-                        return nil
+        var parentsByValue: [
+            Bytecode.Register: Set<Bytecode.Register>
+        ] = [:]
+
+        func canContainClosure(
+            _ type: Bytecode.ValueType,
+            visiting: inout Set<Bytecode.LocalTypeKey>
+        ) -> Bool {
+            if type.containsClosureValue { return true }
+            switch type {
+            case .any, .error:
+                return true
+            case let .local(key):
+                guard visiting.insert(key).inserted,
+                      let definition = localTypes[key]
+                else { return false }
+                defer { visiting.remove(key) }
+                switch definition.kind {
+                case let .structure(fields), let .class(fields, _, _):
+                    return fields.contains {
+                        canContainClosure($0.type, visiting: &visiting)
+                    }
+                case let .enumeration(cases):
+                    return cases.contains {
+                        $0.payloadType.map {
+                            canContainClosure($0, visiting: &visiting)
+                        } == true
                     }
                 }
+            case let .optional(wrapped), let .array(wrapped),
+                 let .set(wrapped), let .address(wrapped),
+                 let .mutableCell(wrapped),
+                 let .nonOwningReference(_, wrapped),
+                 let .arrayState(_, wrapped):
+                return canContainClosure(wrapped, visiting: &visiting)
+            case let .dictionary(key, value),
+                 let .dictionaryState(key, value):
+                return canContainClosure(key, visiting: &visiting)
+                    || canContainClosure(value, visiting: &visiting)
+            case let .tuple(elements):
+                return elements.contains {
+                    canContainClosure($0, visiting: &visiting)
+                }
+            case .closure:
+                return true
+            case .void, .never, .bool, .integer, .float, .string, .native:
+                return false
             }
-        )
+        }
+
+        func canContainClosure(_ register: Bytecode.Register) -> Bool {
+            guard let type = function.type(of: register) else { return false }
+            var visiting = Set<Bytecode.LocalTypeKey>()
+            return canContainClosure(type, visiting: &visiting)
+        }
+
+        func addParents(
+            _ parents: some Sequence<Bytecode.Register>,
+            to result: Bytecode.Register
+        ) {
+            parentsByValue[result, default: []].formUnion(parents)
+        }
+
+        for instruction in function.blocks.flatMap(\.instructions) {
+            let operands = instruction.operandRegisters
+            let structurallyPropagatesOperands: Bool = switch instruction {
+            case .apply, .entryApply, .nativeApply, .closureApply:
+                // A call result is not storage derived from its arguments.
+                // Runtime graph checks still catch a callee that actually
+                // returns a dynamically scoped closure value.
+                false
+            default:
+                true
+            }
+            if structurallyPropagatesOperands {
+                for result in instruction.resultRegisters
+                where canContainClosure(result) {
+                    addParents(operands, to: result)
+                }
+            }
+        }
+
+        for block in function.blocks {
+            guard let terminator = block.instructions.last else { continue }
+            let edges: [(Bytecode.BlockID, [Bytecode.Register])] =
+                switch terminator {
+                case let .branch(target, arguments):
+                    [(target, arguments)]
+                case let .conditionalBranch(
+                    _,
+                    trueTarget,
+                    trueArguments,
+                    falseTarget,
+                    falseArguments
+                ):
+                    [
+                        (trueTarget, trueArguments),
+                        (falseTarget, falseArguments),
+                    ]
+                default:
+                    []
+                }
+            for (target, arguments) in edges {
+                guard let parameters = blocks[target]?.parameters else {
+                    continue
+                }
+                for (parameter, argument) in zip(parameters, arguments)
+                where canContainClosure(parameter) {
+                    addParents([argument], to: parameter)
+                }
+            }
+        }
 
         func depends(
             _ candidate: Bytecode.Register,
             on ancestor: Bytecode.Register
         ) -> Bool {
-            var current = candidate
+            var pending = [candidate]
             var visited = Set<Bytecode.Register>()
-            while let parent = parentByScope[current],
+            while let current = pending.popLast(),
                   visited.insert(current).inserted {
-                if parent == ancestor { return true }
-                current = parent
+                let parents = parentsByValue[current] ?? []
+                if parents.contains(ancestor) { return true }
+                pending.append(contentsOf: parents)
             }
             return false
         }
@@ -1919,14 +2018,14 @@ public struct Engine: Verification.ImageVerifying {
                 return cached
             }
             var ancestors = Set<Bytecode.Register>()
-            var current = candidate
+            var pending = [candidate]
             var visited = Set<Bytecode.Register>()
-            while visited.insert(current).inserted {
+            while let current = pending.popLast(),
+                  visited.insert(current).inserted {
                 if scopedRegisters.contains(current) {
                     ancestors.insert(current)
                 }
-                guard let parent = parentByScope[current] else { break }
-                current = parent
+                pending.append(contentsOf: parentsByValue[current] ?? [])
             }
             scopeAncestorsByRegister[candidate] = ancestors
             return ancestors
@@ -1948,8 +2047,7 @@ public struct Engine: Verification.ImageVerifying {
                 switch instruction {
                 case let .beginClosureScope(result, _):
                     blockDefinitions.insert(result)
-                case let .makeClosure(result, _, _, .lexical),
-                     let .makeEntryClosure(result, _, _, .lexical):
+                case let .makeClosure(result, _, _, .lexical):
                     blockDefinitions.insert(result)
                 default:
                     break
@@ -2024,8 +2122,7 @@ public struct Engine: Verification.ImageVerifying {
                     }
                     state.closed.remove(result)
                     state.open.insert(result)
-                case let .makeClosure(result, _, _, .lexical),
-                     let .makeEntryClosure(result, _, _, .lexical):
+                case let .makeClosure(result, _, _, .lexical):
                     guard !state.open.contains(result) else {
                         throw fail(
                             "a lexical closure scope is reentered before it closes"
@@ -2171,8 +2268,7 @@ public struct Engine: Verification.ImageVerifying {
                     captures: [Bytecode.Register],
                     lifetime: Bytecode.ClosureLifetime
                 )? = switch instruction {
-                case let .makeClosure(result, _, captures, lifetime),
-                     let .makeEntryClosure(result, _, captures, lifetime):
+                case let .makeClosure(result, _, captures, lifetime):
                     (result, captures, lifetime)
                 default:
                     nil
@@ -2212,8 +2308,7 @@ public struct Engine: Verification.ImageVerifying {
                      .projectMutableCell, .loadMutableCell,
                      .storeMutableCell:
                     true
-                case let .makeClosure(_, _, captures, lifetime),
-                     let .makeEntryClosure(_, _, captures, lifetime):
+                case let .makeClosure(_, _, captures, lifetime):
                     lifetime == .lexical
                         && borrowedOperands.allSatisfy(captures.contains)
                 default:
@@ -3976,53 +4071,67 @@ public struct Engine: Verification.ImageVerifying {
                 block: block,
                 offset: offset
             )
-        case let .makeClosure(result, calleeID, captures, _):
+        case let .makeClosure(result, target, captures, _):
             guard capabilities.contains(.closureValuesV1) else {
                 throw fail("make_closure requires \(Core.Capability.closureValuesV1)")
             }
             guard case let .closure(signature) = type(result) else {
                 throw fail("make_closure result must have a closure type")
             }
-            guard let callee = functions[calleeID] else {
-                throw fail("unknown closure body \(calleeID)")
-            }
-            guard callee.kind == .closureBody else {
-                throw fail("make_closure target must be a closure body")
-            }
-            try verifyClosureConstruction(
-                target: .imageBody(thrownType: callee.thrownType),
-                signature: signature,
-                captureTypes: captures.map(type),
-                targetParameterTypes: try parameterTypes(of: callee),
-                targetParameterConventions: callee.parameterConventions,
-                targetResultType: callee.resultType,
-                targetEffects: callee.effects,
-                creatorEffects: function.effects,
-                shell: shell,
-                capabilities: capabilities,
-                fail: fail
-            )
-        case let .makeEntryClosure(result, entry, captures, _):
-            guard capabilities.contains(.closureValuesV1) else {
-                throw fail(
-                    "make_entry_closure requires "
-                        + "\(Core.Capability.closureValuesV1)"
+            let constructionTarget: ClosureConstructionTarget
+            let targetParameterTypes: [Bytecode.ValueType]
+            let targetParameterConventions: [Bytecode.ParameterConvention]
+            let targetResultType: Bytecode.ValueType
+            let targetEffects: Core.Effects
+            switch target {
+            case let .image(calleeID):
+                guard let callee = functions[calleeID] else {
+                    throw fail("unknown closure body \(calleeID)")
+                }
+                guard callee.kind == .closureBody else {
+                    throw fail("make_closure image target must be a closure body")
+                }
+                constructionTarget = .imageBody(
+                    thrownType: callee.thrownType
                 )
-            }
-            guard case let .closure(signature) = type(result) else {
-                throw fail("make_entry_closure result must have a closure type")
-            }
-            guard let descriptor = shell.entries[entry] else {
-                throw fail("unknown Shell entry \(entry)")
+                targetParameterTypes = try parameterTypes(of: callee)
+                targetParameterConventions = callee.parameterConventions
+                targetResultType = callee.resultType
+                targetEffects = callee.effects
+            case let .entry(entry):
+                guard let descriptor = shell.entries[entry] else {
+                    throw fail("unknown Shell entry \(entry)")
+                }
+                constructionTarget = .shellEntry
+                targetParameterTypes = descriptor.parameterTypes
+                targetParameterConventions = descriptor.parameterConventions
+                targetResultType = descriptor.resultType
+                targetEffects = descriptor.effects
+            case let .nativeImport(importID):
+                guard let requirement = declaredImports[importID] else {
+                    throw fail("native import \(importID) is used but not declared")
+                }
+                guard capabilities.contains(requirement.requiredCapability)
+                else {
+                    throw fail("native import capability is not declared")
+                }
+                guard let descriptor = shell.imports[importID] else {
+                    throw fail("unknown native import \(importID)")
+                }
+                constructionTarget = .nativeImport
+                targetParameterTypes = descriptor.parameterTypes
+                targetParameterConventions = descriptor.parameterConventions
+                targetResultType = descriptor.resultType
+                targetEffects = descriptor.effects
             }
             try verifyClosureConstruction(
-                target: .shellEntry,
+                target: constructionTarget,
                 signature: signature,
                 captureTypes: captures.map(type),
-                targetParameterTypes: descriptor.parameterTypes,
-                targetParameterConventions: descriptor.parameterConventions,
-                targetResultType: descriptor.resultType,
-                targetEffects: descriptor.effects,
+                targetParameterTypes: targetParameterTypes,
+                targetParameterConventions: targetParameterConventions,
+                targetResultType: targetResultType,
+                targetEffects: targetEffects,
                 creatorEffects: function.effects,
                 shell: shell,
                 capabilities: capabilities,
@@ -4398,11 +4507,11 @@ public struct Engine: Verification.ImageVerifying {
     private enum ClosureConstructionTarget {
         case imageBody(thrownType: Bytecode.ValueType?)
         case shellEntry
+        case nativeImport
 
         var operation: String {
             switch self {
-            case .imageBody: "make_closure"
-            case .shellEntry: "make_entry_closure"
+            case .imageBody, .shellEntry, .nativeImport: "make_closure"
             }
         }
 
@@ -4410,6 +4519,7 @@ public struct Engine: Verification.ImageVerifying {
             switch self {
             case .imageBody: "closure body"
             case .shellEntry: "Shell entry closure target"
+            case .nativeImport: "NativeImport closure target"
             }
         }
 
@@ -4419,7 +4529,10 @@ public struct Engine: Verification.ImageVerifying {
                 "closure body result, thrown type, or callable effects do not "
                     + "match its closure signature"
             case .shellEntry:
-                "make_entry_closure target result, boundary error type, or "
+                "Shell entry closure target result, boundary error type, or "
+                    + "callable effects do not match its closure signature"
+            case .nativeImport:
+                "NativeImport closure target result, boundary error type, or "
                     + "callable effects do not match its closure signature"
             }
         }
@@ -4431,7 +4544,7 @@ public struct Engine: Verification.ImageVerifying {
             switch self {
             case let .imageBody(targetThrownType):
                 targetThrownType == thrownType
-            case .shellEntry:
+            case .shellEntry, .nativeImport:
                 !effects.mayThrow
                     || thrownType == .string
                     || thrownType == .error
@@ -4496,10 +4609,7 @@ public struct Engine: Verification.ImageVerifying {
         guard captureConventions.allSatisfy({ $0 != .inout }) else {
             throw fail("closure captures cannot carry inout parameters")
         }
-        for (captureType, convention) in zip(
-            captureTypes,
-            captureConventions
-        ) {
+        for captureType in captureTypes {
             if case .address = captureType {
                 throw fail("closure captures cannot contain address values")
             }
@@ -4511,12 +4621,6 @@ public struct Engine: Verification.ImageVerifying {
             }
             guard isCopyable(captureType, shell: shell) else {
                 throw fail("closure captures must be copyable")
-            }
-            if captureType.requiresLinearOwnership,
-                convention != .borrowed {
-                throw fail(
-                    "linear closure captures require a borrowed capture ABI"
-                )
             }
         }
     }
@@ -4531,9 +4635,9 @@ public struct Engine: Verification.ImageVerifying {
         }
     }
 
-    /// A closure is a capability for its concrete image or frozen Shell target.
-    /// Swift's function type carries callable ABI only, so target resource
-    /// authority is checked once when that capability is constructed.
+    /// A closure is a capability for its concrete image, frozen Shell entry, or
+    /// declared NativeImport target. Swift's function type carries callable ABI
+    /// only, so target resource authority is checked at construction.
     private func verifyClosureTargetAuthority(
         _ target: Core.Effects,
         allowedBy creator: Core.Effects,
@@ -5058,10 +5162,9 @@ public struct Engine: Verification.ImageVerifying {
                        type.requiresLinearOwnership {
                         live.insert(result)
                     }
-                case .makeClosure, .makeEntryClosure:
+                case .makeClosure:
                     // Captures are copied into a VM-managed closure context.
-                    // Type validation rejects addresses, noncopyable values,
-                    // and linear captures without a borrowed capture ABI.
+                    // Type validation rejects addresses and noncopyable values.
                     break
                 case let .closureApply(result, closure, arguments):
                     let signature: Bytecode.ClosureSignature? = if case let .closure(value)

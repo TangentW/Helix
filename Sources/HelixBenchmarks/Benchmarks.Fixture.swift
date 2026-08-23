@@ -333,7 +333,7 @@ struct Fixture {
                         .constantInteger(result: .init(rawValue: 1), bitPattern: 27),
                         .makeClosure(
                             result: .init(rawValue: 2),
-                            function: .init(rawValue: 1),
+                            target: .image(.init(rawValue: 1)),
                             captures: [.init(rawValue: 1)]
                         ),
                         .closureApply(

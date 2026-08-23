@@ -2588,7 +2588,7 @@ struct SemanticVerifier {
                 instructions: [
                     .makeClosure(
                         result: .init(rawValue: 1),
-                        function: .init(rawValue: 1),
+                        target: .image(.init(rawValue: 1)),
                         captures: [.init(rawValue: 0)]
                     ),
                     .closureTryApply(
@@ -2663,9 +2663,9 @@ struct SemanticVerifier {
         var typedBoundaryClosure = typed.fixture
         let boundaryEntry = Core.EntryIndex(rawValue: 1)
         typedBoundaryClosure.module.functions[0].blocks[0].instructions[0] =
-            .makeEntryClosure(
+            .makeClosure(
                 result: .init(rawValue: 1),
-                entry: boundaryEntry,
+                target: .entry(boundaryEntry),
                 captures: [.init(rawValue: 0)]
             )
         let rootDescriptor = try #require(
@@ -2684,7 +2684,7 @@ struct SemanticVerifier {
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
                 offset: 0,
-                reason: "make_entry_closure target result, boundary error type, or callable effects do not match its closure signature"
+                reason: "Shell entry closure target result, boundary error type, or callable effects do not match its closure signature"
             )
         ) {
             try Verification.Engine().verify(
@@ -2780,7 +2780,7 @@ struct SemanticVerifier {
                 instructions: [
                     .makeClosure(
                         result: .init(rawValue: 1),
-                        function: .init(rawValue: 1),
+                        target: .image(.init(rawValue: 1)),
                         captures: [.init(rawValue: 0)]
                     ),
                     .closureApply(
@@ -3016,7 +3016,7 @@ struct SemanticVerifier {
                 ),
                 .makeClosure(
                     result: .init(rawValue: 2),
-                    function: .init(rawValue: 1),
+                    target: .image(.init(rawValue: 1)),
                     captures: [.init(rawValue: 1)]
                 ),
                 .closureApply(
@@ -4252,7 +4252,7 @@ struct SemanticVerifier {
         fixture.module.functions[0].blocks[0].instructions = [
             .makeClosure(
                 result: .init(rawValue: 1),
-                function: .init(rawValue: 1),
+                target: .image(.init(rawValue: 1)),
                 captures: []
             ),
             .closureApply(
@@ -4344,8 +4344,8 @@ struct SemanticVerifier {
         }
     }
 
-    @Test("Copyable linear captures require a borrowed closure-capture ABI")
-    func validatesBorrowedLinearClosureCapture() throws {
+    @Test("Copyable linear captures support borrowed and owned target ABIs")
+    func validatesCopyableLinearClosureCapture() throws {
         var fixture = try makeFixture { _ in }
         let typeID = Core.TypeID.derive(
             namespace: .derive(
@@ -4366,7 +4366,7 @@ struct SemanticVerifier {
         fixture.module.functions[0].blocks[0].instructions = [
             .makeClosure(
                 result: .init(rawValue: 1),
-                function: .init(rawValue: 1),
+                target: .image(.init(rawValue: 1)),
                 captures: [.init(rawValue: 0)]
             ),
             .closureApply(
@@ -4436,20 +4436,15 @@ struct SemanticVerifier {
 
         var consuming = fixture.module
         consuming.functions[1].parameterConventions = [.owned]
-        #expect(
-            throws: Verification.Error.invalidInstruction(
-                function: .init(rawValue: 0),
-                block: .init(rawValue: 0),
-                offset: 0,
-                reason: "linear closure captures require a borrowed capture ABI"
-            )
-        ) {
-            try Verification.Engine().verify(
-                bytes: Bytecode.Encoder.encode(consuming),
-                shell: fixture.shell,
-                policy: fixture.policy
-            )
-        }
+        consuming.functions[1].blocks[0].instructions.insert(
+            .destroyValue(.init(rawValue: 0)),
+            at: 1
+        )
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(consuming),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
 
         var noncopyableShell = fixture.shell
         noncopyableShell.types[typeID]?.isCopyable = false
@@ -4478,7 +4473,7 @@ struct SemanticVerifier {
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
                 offset: 0,
-                reason: "make_closure target must be a closure body"
+                reason: "make_closure image target must be a closure body"
             )
         ) {
             try Verification.Engine().verify(
@@ -4511,9 +4506,9 @@ struct SemanticVerifier {
         var fixture = try makeClosureFixture()
         let targetEntry = Core.EntryIndex(rawValue: 1)
         fixture.module.functions[0].blocks[0].instructions[0] =
-            .makeEntryClosure(
+            .makeClosure(
                 result: .init(rawValue: 1),
-                entry: targetEntry,
+                target: .entry(targetEntry),
                 captures: [.init(rawValue: 0)]
             )
         let rootEntry = try #require(
@@ -4545,9 +4540,9 @@ struct SemanticVerifier {
         )
 
         var missing = fixture.module
-        missing.functions[0].blocks[0].instructions[0] = .makeEntryClosure(
+        missing.functions[0].blocks[0].instructions[0] = .makeClosure(
             result: .init(rawValue: 1),
-            entry: .init(rawValue: 99),
+            target: .entry(.init(rawValue: 99)),
             captures: [.init(rawValue: 0)]
         )
         #expect(
@@ -4580,6 +4575,94 @@ struct SemanticVerifier {
             try Verification.Engine().verify(
                 bytes: Bytecode.Encoder.encode(fixture.module),
                 shell: mismatchedOwnership,
+                policy: fixture.policy
+            )
+        }
+    }
+
+    @Test("NativeImport closures require a declared exact callable ABI")
+    func validatesNativeImportClosureContract() throws {
+        var fixture = try makeClosureFixture()
+        let importID = Core.NativeImportID(rawValue: 7)
+        let effects = Core.Effects()
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let signature = Core.LoweredSignature(
+            parameters: ["Swift.Int", "Swift.Int"],
+            result: "Swift.Int"
+        )
+        let key = Core.NativeImportKey(
+            rawValue: .sha256("verifier-native-closure")
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: importID,
+            key: key,
+            signature: signature,
+            effects: effects,
+            contract: contract
+        )
+        fixture.module.functions[0].blocks[0].instructions[0] = .makeClosure(
+            result: .init(rawValue: 1),
+            target: .nativeImport(importID),
+            captures: [.init(rawValue: 0)]
+        )
+        fixture.module.imports = [requirement]
+        fixture.shell.imports[importID] = .init(
+            id: importID,
+            key: key,
+            parameterTypes: [.int64, .int64],
+            resultType: .int64,
+            signature: signature,
+            effects: effects,
+            contract: contract
+        )
+        let capabilities: Set<Core.Capability> = [.nativeImportsV1]
+        fixture.module.capabilities.formUnion(capabilities)
+        fixture.shell.capabilities.formUnion(capabilities)
+        fixture.policy.acceptedCapabilities.formUnion(capabilities)
+        fixture.policy.allowedNativeImports.insert(importID)
+
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(fixture.module),
+            shell: fixture.shell,
+            policy: fixture.policy
+        )
+
+        var undeclared = fixture.module
+        undeclared.imports = []
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "native import 7 is used but not declared"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(undeclared),
+                shell: fixture.shell,
+                policy: fixture.policy
+            )
+        }
+
+        var mismatched = fixture.shell
+        mismatched.imports[importID]?.parameterTypes = [.int64, .bool]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "NativeImport closure target parameters must equal invocation parameters followed by captures"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(fixture.module),
+                shell: mismatched,
                 policy: fixture.policy
             )
         }
@@ -4623,7 +4706,7 @@ struct SemanticVerifier {
                         instructions: [
                             .makeClosure(
                                 result: .init(rawValue: 1),
-                                function: .init(rawValue: 1),
+                                target: .image(.init(rawValue: 1)),
                                 captures: [.init(rawValue: 0)]
                             ),
                             .returnValue(.init(rawValue: 1)),
@@ -4670,7 +4753,7 @@ struct SemanticVerifier {
             root.blocks[0].instructions = [
                 .makeClosure(
                     result: .init(rawValue: 1),
-                    function: .init(rawValue: 1),
+                    target: .image(.init(rawValue: 1)),
                     captures: [.init(rawValue: 0)]
                 ),
                 .apply(
@@ -4812,12 +4895,12 @@ struct SemanticVerifier {
         fixture.module.functions[0].blocks[0].instructions = [
             .makeClosure(
                 result: .init(rawValue: 1),
-                function: .init(rawValue: 1),
+                target: .image(.init(rawValue: 1)),
                 captures: [.init(rawValue: 0)]
             ),
             .makeClosure(
                 result: .init(rawValue: 3),
-                function: .init(rawValue: 2),
+                target: .image(.init(rawValue: 2)),
                 captures: [.init(rawValue: 1)]
             ),
             .closureApply(
@@ -5015,7 +5098,7 @@ struct SemanticVerifier {
         valid.module.functions[0].blocks[0].instructions = [
             .makeClosure(
                 result: .init(rawValue: 1),
-                function: .init(rawValue: 1),
+                target: .image(.init(rawValue: 1)),
                 captures: [.init(rawValue: 0)]
             ),
             .beginClosureScope(
@@ -5041,7 +5124,7 @@ struct SemanticVerifier {
         nested.module.functions[0].blocks[0].instructions = [
             .makeClosure(
                 result: .init(rawValue: 1),
-                function: .init(rawValue: 1),
+                target: .image(.init(rawValue: 1)),
                 captures: [.init(rawValue: 0)]
             ),
             .beginClosureScope(
@@ -5096,7 +5179,7 @@ struct SemanticVerifier {
                 instructions: [
                     .makeClosure(
                         result: .init(rawValue: 1),
-                        function: .init(rawValue: 1),
+                        target: .image(.init(rawValue: 1)),
                         captures: [.init(rawValue: 0)]
                     ),
                     .beginClosureScope(
@@ -5193,6 +5276,65 @@ struct SemanticVerifier {
             )
         }
 
+        var aggregateUseAfterEnd = valid
+        aggregateUseAfterEnd.module.functions[0].registerTypes.append(
+            contentsOf: [
+                .closure(signature),
+                .optional(.closure(signature)),
+                .bool,
+            ]
+        )
+        aggregateUseAfterEnd.module.capabilities.insert(
+            .escapingClosureValuesV1
+        )
+        aggregateUseAfterEnd.shell.capabilities.insert(
+            .escapingClosureValuesV1
+        )
+        aggregateUseAfterEnd.policy.acceptedCapabilities.insert(
+            .escapingClosureValuesV1
+        )
+        aggregateUseAfterEnd.module.functions[0].blocks[0].instructions = [
+            .makeClosure(
+                result: .init(rawValue: 1),
+                target: .image(.init(rawValue: 1)),
+                captures: [.init(rawValue: 0)]
+            ),
+            .beginClosureScope(
+                result: .init(rawValue: 3),
+                closure: .init(rawValue: 1)
+            ),
+            .copyValue(
+                result: .init(rawValue: 4),
+                source: .init(rawValue: 3)
+            ),
+            .makeOptionalSome(
+                result: .init(rawValue: 5),
+                value: .init(rawValue: 4)
+            ),
+            .endClosureScope(closure: .init(rawValue: 3)),
+            .optionalIsSome(
+                result: .init(rawValue: 6),
+                optional: .init(rawValue: 5)
+            ),
+            .returnValue(.init(rawValue: 0)),
+        ]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 5,
+                reason: "closed dynamic closure scope %5 is reused"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(
+                    aggregateUseAfterEnd.module
+                ),
+                shell: aggregateUseAfterEnd.shell,
+                policy: aggregateUseAfterEnd.policy
+            )
+        }
+
         var convertedUseAfterEnd = valid
         var restricted = signature
         restricted.effects.requiresMainActor = true
@@ -5205,7 +5347,7 @@ struct SemanticVerifier {
         convertedUseAfterEnd.module.functions[0].blocks[0].instructions = [
             .makeClosure(
                 result: .init(rawValue: 1),
-                function: .init(rawValue: 1),
+                target: .image(.init(rawValue: 1)),
                 captures: [.init(rawValue: 0)]
             ),
             .beginClosureScope(
@@ -5253,7 +5395,7 @@ struct SemanticVerifier {
                 instructions: [
                     .makeClosure(
                         result: .init(rawValue: 1),
-                        function: .init(rawValue: 1),
+                        target: .image(.init(rawValue: 1)),
                         captures: [.init(rawValue: 0)]
                     ),
                     .beginClosureScope(
@@ -5679,7 +5821,7 @@ struct SemanticVerifier {
             function.blocks[0].instructions = [
                 .makeClosure(
                     result: .init(rawValue: 1),
-                    function: .init(rawValue: 1),
+                    target: .image(.init(rawValue: 1)),
                     captures: [.init(rawValue: 0)]
                 ),
                 .closureApply(
@@ -5742,7 +5884,7 @@ struct SemanticVerifier {
                 instructions: [
                     .makeClosure(
                         result: .init(rawValue: 1),
-                        function: .init(rawValue: 1),
+                        target: .image(.init(rawValue: 1)),
                         captures: [.init(rawValue: 0)]
                     ),
                     .closureTryApply(

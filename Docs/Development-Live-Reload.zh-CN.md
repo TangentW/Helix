@@ -188,7 +188,7 @@ Array、ArraySlice、递归 Array-backed Slice 与 Repeated 共用已表示的�
 
 `Bool.toggle()` 与全局 `swap` 同样通过共享 compiler-address sink 上的值修改计划执行。swap 会验证 storage 不重叠，并在写入任一 destination 前读取两个可表示值，因此普通局部变量、aggregate projection、frame storage 与可变 closure capture 无需各自的 API adapter。
 
-冻结 imported reference 等可复制线性值也可以被 closure 捕获，但 closure body 的 capture convention 必须是 borrowed；完全具体的 reabstraction thunk 会直接链接进 image，不会被误判成 NativeImport。Dictionary 默认查找只在缺键时调用 autoclosure；其 scoped `_modify` 与 Array element `_modify` 共用 frame-backed 借出，并在正常 `end_apply` 与抛错 `abort_apply` 两条出口都通过普通强类型集合原语回写，覆盖嵌套集合和 imported-reference element。
+冻结 imported reference 等可复制线性值也可以被 closure 捕获；构造 managed context 时生成 context 副本，调用时 borrowed 目标参数复用该副本，owned 目标参数则在每次调用重新复制，inout 线性捕获仍会被拒绝。冻结的 NativeImport 全局/自由函数引用可以直接成为同一静态目标模型中的 closure，但必须使用 identity 参数投影和表示保持的 ABI adapter；默认参数调用变体仍只能直接调用。完全具体的 reabstraction thunk 会直接链接进 image，不会被误判成 NativeImport。Dictionary 默认查找只在缺键时调用 autoclosure；其 scoped `_modify` 与 Array element `_modify` 共用 frame-backed 借出，并在正常 `end_apply` 与抛错 `abort_apply` 两条出口都通过普通强类型集合原语回写，覆盖嵌套集合和 imported-reference element。
 
 Dictionary 的 merging、可变 merge、uniquing 构造与 grouping 共用一个强类型线性 accumulator 和普通 closure CFG，因此可以统一保留“只对重复 key combine”、来源遍历顺序、抛错时可变操作的部分回写及 imported-reference ownership；不需要为每个 API 增加 opcode，也不会把 Swift 标准库泛型方法绑定成 NativeImport。
 

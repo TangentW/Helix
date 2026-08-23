@@ -1118,36 +1118,30 @@ public struct Lowerer: Sendable {
             result: Bytecode.Register,
             target: CanonicalSIL.DirectCallBinding.Target,
             captures: [Bytecode.Register],
-            lifetime: Bytecode.ClosureLifetime = .invocation,
-            line: Int,
-            source: String
-        ) throws {
-            switch target {
-            case let .function(function):
-                appendInstruction(
-                    .makeClosure(
-                        result: result,
-                        function: function,
-                        captures: captures,
-                        lifetime: lifetime
-                    )
-                )
-            case let .entry(entry):
-                appendInstruction(
-                    .makeEntryClosure(
-                        result: result,
-                        entry: entry,
-                        captures: captures,
-                        lifetime: lifetime
-                    )
-                )
-            case .nativeImport:
-                throw CanonicalSIL.LoweringError.unsupportedInstruction(
-                    line: line,
-                    text: source
-                        + " (a NativeImport function cannot yet become a Swift closure value)"
-                )
+            lifetime: Bytecode.ClosureLifetime = .invocation
+        ) {
+            let closureTarget: Bytecode.ClosureTarget = switch target {
+            case let .function(function): .image(function)
+            case let .entry(entry): .entry(entry)
+            case let .nativeImport(requirement): .nativeImport(requirement.id)
             }
+            appendInstruction(
+                .makeClosure(
+                    result: result,
+                    target: closureTarget,
+                    captures: captures,
+                    lifetime: lifetime
+                )
+            )
+        }
+
+        func hasRepresentationPreservingClosureABI(
+            _ binding: CanonicalSIL.DirectCallBinding
+        ) -> Bool {
+            binding.abiAdapter == .direct
+                && binding.parameterProjection == .identity(
+                    parameterCount: binding.parameterTypes.count
+                )
         }
 
         func allocate(type: Bytecode.ValueType) throws -> Bytecode.Register {
@@ -23262,8 +23256,14 @@ public struct Lowerer: Sendable {
                         text: line + " (target is not a closure value type)"
                     )
                 }
-                guard binding.abiAdapter == .direct,
-                      !binding.effects.isAsync,
+                guard hasRepresentationPreservingClosureABI(binding) else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: line
+                            + " (the callable requires a direct-call-only argument projection or ABI adapter)"
+                    )
+                }
+                guard !binding.effects.isAsync,
                       signature.parameters == binding.parameterTypes,
                       signature.parameterConventions
                         == binding.parameterConventions,
@@ -23299,12 +23299,10 @@ public struct Lowerer: Sendable {
                 )
                 let result = try allocate(type: .closure(logicalSignature))
                 values[conversion[0]] = result
-                try appendClosureConstruction(
+                appendClosureConstruction(
                     result: result,
                     target: binding.target,
-                    captures: [],
-                    line: sourceLine,
-                    source: line
+                    captures: []
                 )
                 continue
             }
@@ -23471,12 +23469,19 @@ public struct Lowerer: Sendable {
                     appendInstruction(
                         .makeClosure(
                             result: result,
-                            function: functionID,
+                            target: .image(functionID),
                             captures: [],
                             lifetime: lifetime
                         )
                     )
                     continue
+                }
+                guard hasRepresentationPreservingClosureABI(binding) else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: line
+                            + " (the callable requires a direct-call-only argument projection or ABI adapter)"
+                    )
                 }
                 let captureTokens = try eraseMetatypeCaptures(
                     physicalCaptureTokens,
@@ -23548,13 +23553,11 @@ public struct Lowerer: Sendable {
                 if lifetime == .lexical {
                     onStackClosureValues[closure[0]] = result
                 }
-                try appendClosureConstruction(
+                appendClosureConstruction(
                     result: result,
                     target: binding.target,
                     captures: captures,
-                    lifetime: lifetime,
-                    line: sourceLine,
-                    source: line
+                    lifetime: lifetime
                 )
                 for owner in captureTemporaryOwners
                 where requiresManagedOwnership(

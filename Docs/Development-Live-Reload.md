@@ -473,9 +473,15 @@ closures and `withoutActuallyEscaping` carry a verified dynamic lifetime; a
 nonescaping closure may borrow caller-owned `inout` storage, but must close
 before that modify access and cannot promote the borrow into an escaping
 context. Direct-only closure and `defer` helpers keep their physical address ABI
-instead of being mistaken for managed closure construction. Copyable linear
-captures such as frozen imported references are
-accepted when their closure-body capture convention is borrowed; fully concrete
+instead of being mistaken for managed closure construction. Imported
+free/global-function references can use the same managed closure construction
+with a declared `NativeImportID`; this is a target-category rule rather than an
+API-specific adapter. The function-value route requires an identity argument
+projection and a representation-preserving ABI adapter; default-argument call
+variants remain direct-call-only. Copyable linear captures such as frozen imported
+references are copied into the managed context. Borrowed target parameters
+reuse that value and owned target parameters receive a fresh, resource-charged
+copy on every invocation; fully concrete
 reabstraction thunks are linked into the image rather than treated as
 NativeImports. Concrete same-image calls can also monomorphize source generic
 closure helpers from semantic SIL, including direct, throwing, recursive,

@@ -310,7 +310,8 @@ computed accessors, file- or module-scope patch-local struct/enum, pure HLVM cla
 concrete `Result` values,
 payload-carrying local errors, scoped patch-local `inout`/`mutating` helpers,
 synchronous nonthrowing or throwing patch-local closures, type-independent
-managed mutable captures, copyable linear captures with a borrowed capture ABI,
+managed mutable captures, copyable linear captures with borrowed reuse or a
+fresh owned copy per invocation,
 safe weak and checked-unowned capture storage,
 same-image `@escaping` return/capture flows, recursively stored and higher-order
 closure values, dynamically checked `withoutActuallyEscaping`, lexical

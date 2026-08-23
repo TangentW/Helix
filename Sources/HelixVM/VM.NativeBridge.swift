@@ -100,7 +100,9 @@ public struct NativeInvocationContext: Sendable {
         parameterIndex: Int,
         from value: VM.Value
     ) throws -> VM.NativeCallback {
-        let (callback, epoch, host) = try state.lock.withLock {
+        // Keep liveness validation, graph inspection, and handle publication
+        // atomic with finish() so no callback can be exported after teardown.
+        try state.lock.withLock {
             guard !state.isFinished else {
                 throw VM.RuntimeTrap.nativeFailure(
                     "native invocation context escaped its synchronous call"
@@ -121,31 +123,35 @@ public struct NativeInvocationContext: Sendable {
                     "native callback export has no active callback epoch"
                 )
             }
-            return (callback, epoch, host)
-        }
-        guard state.parameterTypes.indices.contains(parameterIndex),
-              let expectedShape = state.parameterTypes[parameterIndex]
-                .directClosureShape,
-              case let .closure(closure) = value,
-              closure.isNativeCallbackTarget,
-              closure.signature == expectedShape.signature,
-              closure.signature.isNativeBridgeCallback
-        else {
-            throw VM.RuntimeTrap.nativeFailure(
-                "native callback export received an unsupported closure value"
+            guard state.parameterTypes.indices.contains(parameterIndex),
+                  let expectedShape = state.parameterTypes[parameterIndex]
+                    .directClosureShape,
+                  case let .closure(closure) = value,
+                  closure.isNativeCallbackTarget,
+                  closure.signature == expectedShape.signature,
+                  closure.signature.isNativeBridgeCallback
+            else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "native callback export received an unsupported closure value"
+                )
+            }
+            if callback.lifetime == .escaping,
+               try VM.ValueGraph.containsClosureScope(
+                   in: value,
+                   matching: { _ in true },
+                   budget: state.budget
+               ) {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "a dynamically scoped closure cannot escape through NativeImport"
+                )
+            }
+            return VM.NativeCallback(
+                closure: closure,
+                lifetime: callback.lifetime,
+                epoch: epoch,
+                host: host
             )
         }
-        if callback.lifetime == .escaping, closure.dynamicScope != nil {
-            throw VM.RuntimeTrap.nativeFailure(
-                "a dynamically scoped closure cannot escape through NativeImport"
-            )
-        }
-        return VM.NativeCallback(
-            closure: closure,
-            lifetime: callback.lifetime,
-            epoch: epoch,
-            host: host
-        )
     }
 
     public func checkpoint(workUnits: UInt64 = 0) throws {

@@ -51,6 +51,22 @@ public enum ClosureLifetime: String, Codable, Hashable, Sendable {
     case lexical
 }
 
+/// A statically authorized callable identity. Native callable values returned
+/// by an import are runtime handles and deliberately do not use this type.
+public enum ClosureTarget: Codable, Hashable, Sendable, CustomStringConvertible {
+    case image(Bytecode.FunctionID)
+    case entry(Core.EntryIndex)
+    case nativeImport(Core.NativeImportID)
+
+    public var description: String {
+        switch self {
+        case let .image(function): "@\(function)"
+        case let .entry(entry): "entry #\(entry)"
+        case let .nativeImport(importID): "import #\(importID)"
+        }
+    }
+}
+
 public struct ClosureSignature: Codable, Hashable, Sendable, CustomStringConvertible {
     public var parameters: [Bytecode.ValueType]
     /// Invocation ownership is part of a closure's callable ABI. In
@@ -1067,17 +1083,12 @@ public enum Instruction: Codable, Hashable, Sendable {
         importID: Core.NativeImportID,
         arguments: [Bytecode.Register]
     )
+    /// Captures are the bound suffix of the target ABI, matching Swift
+    /// `partial_apply`. Owned captures are copied for every invocation so the
+    /// managed closure context remains reusable.
     case makeClosure(
         result: Bytecode.Register,
-        function: Bytecode.FunctionID,
-        captures: [Bytecode.Register],
-        lifetime: Bytecode.ClosureLifetime = .invocation
-    )
-    /// Creates a closure that routes through one frozen Shell entry. Captures
-    /// are the bound suffix of the entry ABI, matching Swift partial_apply.
-    case makeEntryClosure(
-        result: Bytecode.Register,
-        entry: Core.EntryIndex,
+        target: Bytecode.ClosureTarget,
         captures: [Bytecode.Register],
         lifetime: Bytecode.ClosureLifetime = .invocation
     )
@@ -1235,7 +1246,6 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .setRelation(result, _, _, _),
              let .compare(result, _, _, _),
              let .makeClosure(result, _, _, _),
-             let .makeEntryClosure(result, _, _, _),
              let .beginClosureScope(result, _):
             [result]
         case let .unpackTuple(results, _):
@@ -1533,8 +1543,7 @@ public enum Instruction: Codable, Hashable, Sendable {
              let .entryApply(_, _, arguments),
              let .nativeApply(_, _, arguments):
             arguments
-        case let .makeClosure(_, _, captures, _),
-             let .makeEntryClosure(_, _, captures, _):
+        case let .makeClosure(_, _, captures, _):
             captures
         case let .beginClosureScope(_, closure),
              let .endClosureScope(closure):

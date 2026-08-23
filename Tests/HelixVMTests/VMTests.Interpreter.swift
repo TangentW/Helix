@@ -1354,6 +1354,183 @@ struct Interpreter {
         #expect(!rejectedBudget.sideEffectsCommitted)
     }
 
+    @Test("A NativeImport function value dispatches through closure_apply")
+    func invokesNativeImportClosure() throws {
+        let fixture = try makeNativeIncrementImage(throughClosure: true)
+        let importID = Core.NativeImportID(rawValue: 0)
+        let key = try #require(fixture.shell.imports[importID]?.key)
+        let catalog = try VM.NativeCatalog([IncrementInvoker(key: key)])
+        let budget = VM.InvocationBudget(limits: fixture.effectiveResourceLimits)
+
+        #expect(
+            VM.Interpreter(nativeCatalog: catalog).invoke(
+                entry: .init(rawValue: 0),
+                image: fixture,
+                arguments: [
+                    .integer(
+                        try .init(
+                            signed: 4,
+                            bitWidth: 64,
+                            isSigned: true
+                        )
+                    ),
+                ],
+                budget: budget
+            ) == .returned(
+                .integer(
+                    try .init(signed: 5, bitWidth: 64, isSigned: true)
+                )
+            )
+        )
+        #expect(budget.sideEffectsCommitted)
+    }
+
+    @Test("Owned NativeImport captures are copied for every closure invocation")
+    func copiesOwnedNativeImportClosureCapturesPerCall() throws {
+        let pointType = Core.TypeID.derive(
+            namespace: namespace(),
+            canonicalType: "Fixture.ClosurePoint"
+        )
+        let layout = Core.Digest.sha256("Fixture.ClosurePoint.layout.v1")
+        let operations = VM.NativeTypeOperations(
+            id: pointType,
+            canonicalName: "Fixture.ClosurePoint",
+            kind: .value,
+            layoutFingerprint: layout,
+            estimatedSize: 16,
+            estimatedByteCount: { (_: Point) -> UInt64 in 16 }
+        )
+        let nativeTypes = try VM.NativeTypeCatalog([operations])
+        let boxed = try nativeTypes.box(Point(x: 3, y: 5), as: pointType)
+        let importSignature = Core.LoweredSignature(
+            parameters: ["Fixture.ClosurePoint"],
+            result: "Swift.Int"
+        )
+        let importKey = try Core.NativeImportKey.derive(
+            namespace: namespace(),
+            canonicalCallee: "Fixture.sumClosurePoint(_:)",
+            signature: importSignature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let importID = Core.NativeImportID(rawValue: 3)
+        let requirement = Bytecode.ImportRequirement(
+            id: importID,
+            key: importKey,
+            signature: importSignature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let descriptor = Verification.ResolvedNativeImport(
+            id: importID,
+            key: importKey,
+            parameterTypes: [.native(pointType)],
+            resultType: .int64,
+            signature: importSignature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let closureSignature = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .int64
+        )
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "repeatedOwnedImportCapture",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .native(pointType), .closure(closureSignature), .int64, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeClosure(
+                            result: .init(rawValue: 1),
+                            target: .nativeImport(importID),
+                            captures: [.init(rawValue: 0)]
+                        ),
+                        .destroyValue(.init(rawValue: 0)),
+                        .closureApply(
+                            result: .init(rawValue: 2),
+                            closure: .init(rawValue: 1),
+                            arguments: []
+                        ),
+                        .closureApply(
+                            result: .init(rawValue: 3),
+                            closure: .init(rawValue: 1),
+                            arguments: []
+                        ),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .closureValuesV1, .nativeImportsV1, .nativeTypesV1,
+        ]
+        let shellType = Verification.ResolvedNativeType(
+            id: pointType,
+            canonicalName: "Fixture.ClosurePoint",
+            kind: .value,
+            layoutFingerprint: layout,
+            isCopyable: true,
+            estimatedSize: 16
+        )
+        func verified(nativeBytes: UInt64) throws -> Verification.Image {
+            let limits = Core.ResourceLimits(
+                maxNativeOwnedBytes: nativeBytes,
+                maxWallTimeMainThreadMilliseconds: 1_000
+            )
+            return try makeVerified(
+                function: function,
+                limits: limits,
+                capabilities: capabilities,
+                imports: [requirement],
+                shellImports: [descriptor],
+                policy: .init(
+                    acceptedCapabilities: capabilities,
+                    resourceCeiling: limits,
+                    allowedNativeImports: [importID]
+                ),
+                signature: .init(
+                    parameters: ["Fixture.ClosurePoint"],
+                    result: "Swift.Int"
+                ),
+                parameterTypes: [.native(pointType)],
+                resultType: .int64,
+                shellTypes: [shellType]
+            )
+        }
+        let interpreter = VM.Interpreter(
+            nativeCatalog: try .init([
+                SumPointInvoker(key: importKey, typeID: pointType),
+            ]),
+            nativeTypeCatalog: nativeTypes
+        )
+
+        #expect(
+            interpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: try verified(nativeBytes: 64),
+                arguments: [.native(boxed)]
+            ) == .returned(
+                .integer(try .init(signed: 8, bitWidth: 64, isSigned: true))
+            )
+        )
+        #expect(
+            interpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: try verified(nativeBytes: 63),
+                arguments: [.native(boxed)]
+            ) == .trapped(.nativeOwnedMemoryLimitExceeded)
+        )
+    }
+
     @Test("NativeImport callable results dispatch through typed closure_apply")
     func invokesNativeCallableResult() throws {
         let fixture = try makeNativeCallableResultImage()
@@ -3229,8 +3406,8 @@ struct Interpreter {
         )
     }
 
-    @Test("native_try_apply catches only a declared native business error")
-    func nativeTryApplyCatchesBusinessError() throws {
+    @Test("Direct and closure NativeImport calls catch declared business errors")
+    func nativeTryApplyAndClosureCatchBusinessError() throws {
         let signature = Core.LoweredSignature(
             parameters: ["Swift.Bool"],
             result: "Swift.Int",
@@ -3333,6 +3510,94 @@ struct Interpreter {
                 .integer(try VM.Integer(signed: -1, bitWidth: 64, isSigned: true))
             )
         )
+
+        let closureSignature = Bytecode.ClosureSignature(
+            parameters: [.bool],
+            parameterConventions: [.owned],
+            result: .int64,
+            effects: effects
+        )
+        let closureFunction = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "catchNativeClosure",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .bool, .closure(closureSignature), .int64, .string, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .makeClosure(
+                            result: .init(rawValue: 1),
+                            target: .nativeImport(.init(rawValue: 2)),
+                            captures: []
+                        ),
+                        .closureTryApply(
+                            closure: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 0)],
+                            normalTarget: .init(rawValue: 1),
+                            errorTarget: .init(rawValue: 2)
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 2)],
+                    instructions: [.returnValue(.init(rawValue: 2))]
+                ),
+                .init(
+                    id: .init(rawValue: 2),
+                    parameters: [.init(rawValue: 3)],
+                    instructions: [
+                        .destroyValue(.init(rawValue: 3)),
+                        .constantInteger(
+                            result: .init(rawValue: 4),
+                            bitPattern: UInt64.max
+                        ),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ]
+        )
+        let closureCapabilities = capabilities.union([.closureValuesV1])
+        let closureImage = try makeVerified(
+            function: closureFunction,
+            capabilities: closureCapabilities,
+            imports: [requirement],
+            shellImports: [descriptor],
+            policy: .init(
+                acceptedCapabilities: closureCapabilities,
+                allowedNativeImports: [.init(rawValue: 2)]
+            ),
+            signature: .init(
+                parameters: ["Swift.Bool"],
+                result: "Swift.Int"
+            ),
+            parameterTypes: [.bool],
+            resultType: .int64
+        )
+        #expect(
+            interpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: closureImage,
+                arguments: [.bool(false)]
+            ) == .returned(
+                .integer(try VM.Integer(signed: 7, bitWidth: 64, isSigned: true))
+            )
+        )
+        #expect(
+            interpreter.invoke(
+                entry: .init(rawValue: 0),
+                image: closureImage,
+                arguments: [.bool(true)]
+            ) == .returned(
+                .integer(try VM.Integer(signed: -1, bitWidth: 64, isSigned: true))
+            )
+        )
     }
 
     @Test("Throwing closures resume through normal and error continuations")
@@ -3364,7 +3629,7 @@ struct Interpreter {
                         ),
                         .makeClosure(
                             result: .init(rawValue: 2),
-                            function: .init(rawValue: 1),
+                            target: .image(.init(rawValue: 1)),
                             captures: [.init(rawValue: 1)]
                         ),
                         .closureTryApply(
@@ -3498,9 +3763,9 @@ struct Interpreter {
                             result: .init(rawValue: 1),
                             bitPattern: 7
                         ),
-                        .makeEntryClosure(
+                        .makeClosure(
                             result: .init(rawValue: 2),
-                            entry: targetEntry,
+                            target: .entry(targetEntry),
                             captures: [.init(rawValue: 1)]
                         ),
                         .closureTryApply(
@@ -3623,7 +3888,7 @@ struct Interpreter {
                     instructions: [
                         .makeClosure(
                             result: .init(rawValue: 1),
-                            function: .init(rawValue: 1),
+                            target: .image(.init(rawValue: 1)),
                             captures: [.init(rawValue: 0)]
                         ),
                         .apply(
@@ -3980,7 +4245,7 @@ struct Interpreter {
                     instructions: [
                         .makeClosure(
                             result: .init(rawValue: 1),
-                            function: .init(rawValue: 1),
+                            target: .image(.init(rawValue: 1)),
                             captures: [.init(rawValue: 0)]
                         ),
                         .makeOptionalSome(
@@ -4085,7 +4350,7 @@ struct Interpreter {
                         ),
                         .makeClosure(
                             result: .init(rawValue: 2),
-                            function: .init(rawValue: 1),
+                            target: .image(.init(rawValue: 1)),
                             captures: [.init(rawValue: 1)]
                         ),
                         .closureApply(
@@ -6047,7 +6312,7 @@ struct Interpreter {
                         .constantInteger(result: .init(rawValue: 1), bitPattern: 3),
                         .makeClosure(
                             result: .init(rawValue: 2),
-                            function: .init(rawValue: 2),
+                            target: .image(.init(rawValue: 2)),
                             captures: [.init(rawValue: 1)]
                         ),
                         .apply(
@@ -6177,9 +6442,9 @@ struct Interpreter {
                             result: .init(rawValue: 1),
                             bitPattern: 3
                         ),
-                        .makeEntryClosure(
+                        .makeClosure(
                             result: .init(rawValue: 2),
-                            entry: targetEntry,
+                            target: .entry(targetEntry),
                             captures: [.init(rawValue: 1)]
                         ),
                         .closureApply(
@@ -6310,7 +6575,7 @@ struct Interpreter {
                     instructions: [
                         .makeClosure(
                             result: .init(rawValue: 1),
-                            function: .init(rawValue: 1),
+                            target: .image(.init(rawValue: 1)),
                             captures: [.init(rawValue: 0)]
                         ),
                         .convertClosure(
@@ -6372,7 +6637,7 @@ struct Interpreter {
         )
     }
 
-    @Test("Dynamic closure scopes reject aggregate escape")
+    @Test("Dynamic closure scopes reject opaque call-result escape")
     func rejectsDynamicallyScopedClosureEscape() throws {
         let signature = Bytecode.ClosureSignature(
             parameters: [],
@@ -6384,13 +6649,14 @@ struct Interpreter {
             id: .init(rawValue: 0),
             name: "scopedClosureEscape",
             parameterRegisters: [.init(rawValue: 0)],
-            resultType: .bool,
+            resultType: .int64,
             registerTypes: [
                 .int64,
                 closureType,
                 closureType,
-                .optional(closureType),
-                .bool,
+                closureType,
+                closureType,
+                .int64,
             ],
             entryBlock: .init(rawValue: 0),
             blocks: [
@@ -6400,23 +6666,29 @@ struct Interpreter {
                     instructions: [
                         .makeClosure(
                             result: .init(rawValue: 1),
-                            function: .init(rawValue: 1),
+                            target: .image(.init(rawValue: 1)),
                             captures: [.init(rawValue: 0)]
                         ),
                         .beginClosureScope(
                             result: .init(rawValue: 2),
                             closure: .init(rawValue: 1)
                         ),
-                        .makeOptionalSome(
+                        .copyValue(
                             result: .init(rawValue: 3),
-                            value: .init(rawValue: 2)
+                            source: .init(rawValue: 2)
+                        ),
+                        .apply(
+                            result: .init(rawValue: 4),
+                            function: .init(rawValue: 2),
+                            arguments: [.init(rawValue: 3)]
                         ),
                         .endClosureScope(closure: .init(rawValue: 2)),
-                        .optionalIsSome(
-                            result: .init(rawValue: 4),
-                            optional: .init(rawValue: 3)
+                        .closureApply(
+                            result: .init(rawValue: 5),
+                            closure: .init(rawValue: 4),
+                            arguments: []
                         ),
-                        .returnValue(.init(rawValue: 4)),
+                        .returnValue(.init(rawValue: 5)),
                     ]
                 ),
             ]
@@ -6437,6 +6709,21 @@ struct Interpreter {
                 ),
             ]
         )
+        let returnClosure = Bytecode.Function(
+            id: .init(rawValue: 2),
+            name: "returnClosure",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: closureType,
+            registerTypes: [closureType],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ]
+        )
         let image = try makeVerified(
             function: root,
             capabilities: [
@@ -6444,12 +6731,7 @@ struct Interpreter {
                 .closureValuesV1,
                 .escapingClosureValuesV1,
             ],
-            signature: .init(
-                parameters: ["Swift.Int"],
-                result: "Swift.Bool"
-            ),
-            resultType: .bool,
-            additionalFunctions: [closureBody]
+            additionalFunctions: [closureBody, returnClosure]
         )
 
         #expect(
@@ -6496,13 +6778,13 @@ struct Interpreter {
                     instructions: [
                         .makeClosure(
                             result: .init(rawValue: 1),
-                            function: .init(rawValue: 1),
+                            target: .image(.init(rawValue: 1)),
                             captures: [.init(rawValue: 0)],
                             lifetime: .lexical
                         ),
                         .makeClosure(
                             result: .init(rawValue: 2),
-                            function: .init(rawValue: 2),
+                            target: .image(.init(rawValue: 2)),
                             captures: [.init(rawValue: 1)],
                             lifetime: .lexical
                         ),
@@ -6606,7 +6888,7 @@ struct Interpreter {
                     instructions: [
                         .makeClosure(
                             result: .init(rawValue: 1),
-                            function: .init(rawValue: 1),
+                            target: .image(.init(rawValue: 1)),
                             captures: [.init(rawValue: 0)],
                             lifetime: .lexical
                         ),
@@ -6692,7 +6974,7 @@ struct Interpreter {
                         .constantString(result: .init(rawValue: 1), value: "!"),
                         .makeClosure(
                             result: .init(rawValue: 2),
-                            function: .init(rawValue: 1),
+                            target: .image(.init(rawValue: 1)),
                             captures: [.init(rawValue: 1)]
                         ),
                         .closureApply(
@@ -7060,7 +7342,9 @@ struct Interpreter {
         )
     }
 
-    private func makeNativeIncrementImage() throws -> Verification.Image {
+    private func makeNativeIncrementImage(
+        throughClosure: Bool = false
+    ) throws -> Verification.Image {
         let signature = Core.LoweredSignature(parameters: ["Swift.Int"], result: "Swift.Int")
         let effects = Core.Effects(hasExternalSideEffects: true)
         let importKey = try Core.NativeImportKey.derive(
@@ -7086,36 +7370,82 @@ struct Interpreter {
             effects: effects,
             contract: vmWriteImportContract
         )
-        let function = Bytecode.Function(
-            id: .init(rawValue: 0),
-            name: "native",
-            parameterRegisters: [.init(rawValue: 0)],
-            resultType: .int64,
-            registerTypes: [.int64, .int64],
-            entryBlock: .init(rawValue: 0),
-            blocks: [
-                .init(
-                    id: .init(rawValue: 0),
-                    parameters: [.init(rawValue: 0)],
-                    instructions: [
-                        .nativeApply(
-                            result: .init(rawValue: 1),
-                            importID: .init(rawValue: 0),
-                            arguments: [.init(rawValue: 0)]
-                        ),
-                        .returnValue(.init(rawValue: 1)),
-                    ]
-                ),
-            ],
-            effects: effects
-        )
+        let function: Bytecode.Function
+        if throughClosure {
+            let closureSignature = Bytecode.ClosureSignature(
+                parameters: [.int64],
+                parameterConventions: [.owned],
+                result: .int64,
+                effects: Bytecode.ClosureSignature.callableEffects(
+                    from: effects
+                )
+            )
+            function = .init(
+                id: .init(rawValue: 0),
+                name: "nativeClosure",
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: .int64,
+                registerTypes: [
+                    .int64, .closure(closureSignature), .int64,
+                ],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .makeClosure(
+                                result: .init(rawValue: 1),
+                                target: .nativeImport(.init(rawValue: 0)),
+                                captures: []
+                            ),
+                            .closureApply(
+                                result: .init(rawValue: 2),
+                                closure: .init(rawValue: 1),
+                                arguments: [.init(rawValue: 0)]
+                            ),
+                            .returnValue(.init(rawValue: 2)),
+                        ]
+                    ),
+                ],
+                effects: effects
+            )
+        } else {
+            function = .init(
+                id: .init(rawValue: 0),
+                name: "native",
+                parameterRegisters: [.init(rawValue: 0)],
+                resultType: .int64,
+                registerTypes: [.int64, .int64],
+                entryBlock: .init(rawValue: 0),
+                blocks: [
+                    .init(
+                        id: .init(rawValue: 0),
+                        parameters: [.init(rawValue: 0)],
+                        instructions: [
+                            .nativeApply(
+                                result: .init(rawValue: 1),
+                                importID: .init(rawValue: 0),
+                                arguments: [.init(rawValue: 0)]
+                            ),
+                            .returnValue(.init(rawValue: 1)),
+                        ]
+                    ),
+                ],
+                effects: effects
+            )
+        }
+        var capabilities: Set<Core.Capability> = [
+            .baselineV1, .nativeImportsV1,
+        ]
+        if throughClosure { capabilities.insert(.closureValuesV1) }
         return try makeVerified(
             function: function,
-            capabilities: [.baselineV1, .nativeImportsV1],
+            capabilities: capabilities,
             imports: [requirement],
             shellImports: [descriptor],
             policy: .init(
-                acceptedCapabilities: [.baselineV1, .nativeImportsV1],
+                acceptedCapabilities: capabilities,
                 allowedNativeImports: [.init(rawValue: 0)]
             )
         )
