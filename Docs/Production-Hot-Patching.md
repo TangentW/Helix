@@ -18,9 +18,10 @@ The Release pipeline must:
    and semantic compiler arguments.
 2. Index declarations with the exact Swift frontend and decide which existing
    roots are patchable.
-3. Generate Derived Sources containing permanent dynamic replacement bridges,
-   exact Swift entry wrappers, and allowed native invokers. Handwritten source
-   files are not rewritten.
+3. Generate Derived Sources containing permanent declaration bridges, exact
+   hashed source-body wrappers where lexical execution is required, and allowed
+   native invokers. Handwritten source files are not changed; Shell compilation
+   uses derived copies for observer and async source-body transformation.
 4. Build and sign the App with `HelixAppRuntime`.
 5. Finalize an HLXI archive with the linked Mach-O UUID and preserve the exact
    release source baseline and toolchain artifacts for future patch builds.
@@ -161,6 +162,21 @@ If no patch is active, the permanent Bridge invokes the original Swift body.
 The no-patch fast path does not construct a VM call frame; it still pays the
 cost of the dynamic entry and generation lookup, which remains part of the
 device performance qualification.
+
+An async Shell entry uses an exact source-body wrapper rather than an async
+`@_dynamicReplacement`. Before the first possible suspension, the wrapper asks
+Runtime to prepare routing and argument encoding. With no route, it invokes the
+lexical baseline statements inside an immediately invoked async closure, which
+preserves private lookup, implicit `self`, `super`, `#function`, and
+single-expression return semantics. With a route, preparation pins one
+immutable generation and produces a one-shot dispatch plan; resume, declared
+errors, cancellation checkpoints, safe fallback, and cleanup all use that same
+plan. A fallback after suspension calls the generated async Original Catalog
+through a unique exact-original thunk emitted in the declaration's source
+file. That thunk is statically dispatched, including for subclass receivers,
+and preserves private lookup, `super`, outer `#function`, and logical source
+coordinates. No bypass scope leaks across its suspension or suppresses valid
+recursion, and Runtime never attempts to re-enter the suspended lexical frame.
 
 ## Current language boundary
 
@@ -357,11 +373,13 @@ fallback setter. A value-receiver accessor uses the entry's one synchronous
 logical `inout` region and commits the same typed writeback on normal and
 declared-error exits; ordinary synchronous `throws` getters therefore preserve
 mutation on both paths, while a VM trap commits nothing. Explicit coroutine
-accessors (`_read`/`_modify`), async or typed-throws accessors,
+accessors (`_read`/`_modify`), async or typed-throws Shell accessors,
 availability-constrained declarations, generic accessor declarations or
 accessors in generic nominal/extension contexts, accessors whose private nested
 receiver cannot be named by generated file-scope code,
 multiple/async `inout`, and mutable-existential writeback remain fail-closed.
+An exact, fully concrete async getter may instead be frozen as an async
+NativeImport; it is never selected as a Shell accessor root.
 This extends the same v1 contracts and does not introduce a compatibility
 version.
 
@@ -432,8 +450,9 @@ synchronous `@MainActor` closure values, common lazy/mutable/conditional
 closure variables, and recursively direct local helpers that also form closure
 values,
 automatically frozen `Swift.print`, `Swift.debugPrint`, and fixed
-String-description NativeImports, and top-level non-suspending
-`async`, `async throws`, and `@MainActor async` entries. A new `final` class may
+String-description NativeImports, and fully concrete sequential `async`,
+`async throws`, and `@MainActor async` entries with multiple suspension points,
+exact patch-local async calls, and exact async NativeImports. A new `final` class may
 also inherit an HLXI-frozen, `NSObject`-compatible project or system type under
 the closed hosted profile and cross into native code as that superclass. The
 current profile is limited to inherited no-argument initialization, no stored
@@ -489,6 +508,18 @@ and Foundation value-overlay bridges are likewise frozen as exact generic
 NativeImport adapters rather than API-specific runtime behavior. All ABI,
 schema, capability, and product versions remain 1/1.0.
 
+The suspending NativeImport profile is deliberately separate from the callback
+profile. Exact source discovery admits non-generic global/static/instance
+functions and readable properties with `async`/`async throws` and either
+`nonisolated` or `MainActor` isolation; generated invokers call those native
+Swift declarations directly and preserve their declared effects. An explicit
+async catalog factory may additionally expose a predeclared initializer, but
+initializers are not inferred automatically. Async setters, closure
+parameters or results, callback-to-async conversion, `inout`, typed throws,
+indirect ABI adapters, and unknown actor isolation fail closed. The signed
+contract uses a suspending deadline distinct from the short bounded deadline
+used by synchronous imports; neither is inferred from a framework or API name.
+
 It is not arbitrary Swift. Generic roots, runtime metadata or runtime,
 unproven conditional, open-world, ambiguous, or mutable-existential witness
 dispatch (proven closed concrete—including conditional—and immutable
@@ -498,17 +529,20 @@ Shell or ordinary NativeImport boundary, a patch concrete Swift type identity
 visible to native code, function-local
 nominal declarations, hosted stored properties/custom initializers/arbitrary
 callback ABIs, changes to existing native stored layout, multiple or async
-`inout` regions, explicit coroutine/async/typed-throws,
+`inout` regions, explicit coroutine accessors, typed-throws accessors,
 availability-constrained, generic-context, or unnameable-private-nested-receiver
-Shell accessors, unsupported stored-property observer profiles, closure crossing a
+Shell accessors, async methods whose exact source-local original thunk cannot
+name a private nested receiver, unsupported stored-property observer profiles, closure crossing a
 Shell Entry or a NativeImport position outside the exact callable profile,
 throwing/async/inout callback ABIs, recursive or nonescaping nested callable
 arguments, callback results without a
 framework-neutral failure value, concurrent `Sendable` closure execution,
-async closures, `unowned(unsafe)`, weak/unowned stored-property layouts,
+async closure values, `Task`/`Task.detached`, `async let`, task groups,
+continuation APIs, `AsyncSequence`/`AsyncStream`, `TaskLocal`,
+`unowned(unsafe)`, weak/unowned stored-property layouts,
 escaping caller-owned `inout`
-capture, true `await`/continuations, actor-isolated `self`,
-custom global actors, native-runtime closure scopes such as `autoreleasepool`,
+capture, custom actors/global actors and unsupported actor-isolated `self`,
+native-runtime closure scopes such as `autoreleasepool`,
 unrestricted pointers, reflection-based field access, and unregistered native
 APIs are rejected. See
 [Capabilities and Limits](Capabilities-and-Limits.md) for the practical matrix.

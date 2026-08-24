@@ -26,15 +26,6 @@ public final class Bridge: @unchecked Sendable {
         var depths: [Core.EntryIndex: Int] = [:]
     }
 
-    private struct AsyncOriginalBypassState: Sendable {
-        var bridgeID: UUID
-        var depths: [Core.EntryIndex: Int]
-    }
-
-    private enum AsyncOriginalBypassScope {
-        @TaskLocal static var state: AsyncOriginalBypassState?
-    }
-
     private final class Installation: @unchecked Sendable {
         let runtime: Runtime.Engine
         let runtimeID: ObjectIdentifier
@@ -136,15 +127,14 @@ public final class Bridge: @unchecked Sendable {
         )
     }
 
-    /// Async counterpart used only by generated wrappers whose frozen Swift
-    /// ABI is async. The task-local Runtime context survives executor hops and
-    /// keeps one generation lease pinned until the VM result is produced.
-    public func dispatchAsync<Result>(
+    /// Resolves and encodes an async generated wrapper before its first await.
+    /// `nil` means the wrapper must immediately call its lexical original.
+    /// A non-`nil` value pins the selected generation and is one-shot.
+    public func prepareAsyncDispatch(
         isolation: isolated (any Actor)? = #isolation,
         entry: Core.EntryIndex,
-        arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value],
-        decodeResult: (VM.Value?) throws -> Result
-    ) async throws -> Runtime.BridgeDispatchResult<Result> {
+        arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value]
+    ) throws -> Runtime.PreparedAsyncBridgeDispatch? {
         _ = isolation
         guard let runtime = installation.loadAcquire()?.runtime else {
             throw Runtime.BridgeDispatchError.notInstalled
@@ -154,20 +144,32 @@ public final class Bridge: @unchecked Sendable {
                 "synchronous entry reached the generated async Bridge"
             )
         }
-        guard runtime.requiresRouting else { return .originalRequired }
-        if isBypassingOriginal(entry) { return .originalRequired }
-
-        let result: VM.EntryInvocationResult
-        switch try await runtime.routeEncodedFromBridgeAsync(
-            isolation: isolation,
+        return try runtime.prepareEncodedFromBridgeAsync(
+            bridgeID: bridgeID,
             entry: entry,
             arguments: arguments
-        ) {
-        case .originalRequired:
-            return .originalRequired
-        case let .executed(executed):
-            result = executed
+        )
+    }
+
+    /// Executes a prepared async wrapper route. Safe patch failure fallback is
+    /// handled through the async OriginalCatalog inside Runtime, so generated
+    /// source never calls a lexical original after it has suspended.
+    public func dispatchAsync<Result>(
+        isolation: isolated (any Actor)? = #isolation,
+        prepared: Runtime.PreparedAsyncBridgeDispatch,
+        decodeResult: (VM.Value?) throws -> Result
+    ) async throws -> Result {
+        guard let runtime = installation.loadAcquire()?.runtime else {
+            throw Runtime.BridgeDispatchError.notInstalled
         }
+        let payload = try prepared.consume(
+            bridgeID: bridgeID,
+            runtime: runtime
+        )
+        let result = await runtime.routePreparedFromBridgeAsync(
+            isolation: isolation,
+            payload: payload
+        )
         guard result.writebacks.isEmpty else {
             throw VM.RuntimeTrap.nativeFailure(
                 "async generated Bridge received forbidden writebacks"
@@ -175,7 +177,7 @@ public final class Bridge: @unchecked Sendable {
         }
         switch result.outcome {
         case let .returned(value):
-            return .returned(try decodeResult(value))
+            return try decodeResult(value)
         case let .businessError(message):
             throw Runtime.BridgeDispatchError.businessError(message)
         case let .trapped(trap):
@@ -294,27 +296,6 @@ public final class Bridge: @unchecked Sendable {
         return try operation()
     }
 
-    /// Task-local async bypass paired with generated lexical original calls.
-    /// It cannot leak through unrelated tasks or another Bridge instance.
-    public func withOriginalBypassAsync<Result>(
-        isolation: isolated (any Actor)? = #isolation,
-        entry: Core.EntryIndex,
-        operation: () async throws -> Result
-    ) async rethrows -> Result {
-        _ = isolation
-        var state: AsyncOriginalBypassState
-        if let current = AsyncOriginalBypassScope.state,
-           current.bridgeID == bridgeID {
-            state = current
-        } else {
-            state = .init(bridgeID: bridgeID, depths: [:])
-        }
-        state.depths[entry, default: 0] += 1
-        return try await AsyncOriginalBypassScope.$state.withValue(state) {
-            try await operation()
-        }
-    }
-
     /// Native type catalog of the installed Runtime, or `nil` before bootstrap.
     public var nativeTypeCatalog: VM.NativeTypeCatalog? {
         installation.loadAcquire()?.runtime.nativeTypeCatalog
@@ -342,11 +323,6 @@ public final class Bridge: @unchecked Sendable {
     }
 
     private func isBypassingOriginal(_ entry: Core.EntryIndex) -> Bool {
-        if let state = AsyncOriginalBypassScope.state,
-           state.bridgeID == bridgeID,
-           state.depths[entry, default: 0] > 0 {
-            return true
-        }
         guard let state = Thread.current.threadDictionary[originalBypassKey]
             as? OriginalBypassState
         else {

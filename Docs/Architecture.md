@@ -9,7 +9,7 @@ share compiler facts and identity contracts; they do not share a delivery
 channel.
 
 This document describes the implementation available in the repository as of
-August 23, 2026. It does not turn unfinished qualification work into a product
+August 24, 2026. It does not turn unfinished qualification work into a product
 claim.
 
 ## The two workflows
@@ -119,9 +119,20 @@ Both workflows depend on stable, build-specific identities:
   MainActor resume scaffolding, and links fully concrete patch-local async
   helpers into the image. Multiple sequential awaits, handled or propagated
   async errors, and nonisolated/MainActor image transitions therefore execute
-  through the verified async driver. App-facing generated Shell async wrappers
-  and generated async NativeImport adapters remain a separate boundary stage;
-  this compiler milestone does not yet claim those integration paths.
+  through the verified async driver. App-facing async Shell entries use an
+  exact hashed source-body installation rather than Swift async dynamic-
+  replacement chaining. A synchronous prepare step either selects the lexical
+  original before suspension or pins one generation and encoded argument set;
+  the awaited dispatch is then one-shot, and safe post-suspension fallback goes
+  through the async OriginalCatalog and its source-local, statically dispatched
+  exact-original thunk. Exact generated
+  async NativeImports use a separate suspending catalog. Exact project-source
+  discovery generates direct nonisolated/MainActor functions, methods, and
+  getters; an explicit async catalog factory may additionally expose a
+  predeclared initializer. Their continuous native deadline stays distinct
+  from the VM active-time budget.
+  Closure-bearing async imports and completion-handler-to-async inference stay
+  fail-closed.
 - One `make_closure` instruction carries a typed static target: an image
   function, a frozen Shell `EntryIndex`, or a declared `NativeImportID`.
   Unchanged Swift callables therefore do not copy archived bodies. Imported
@@ -724,8 +735,8 @@ private Swift ABI compatible across unrelated App versions.
 ## Release architecture
 
 A Helix-enabled Release build produces an App Shell plus a finalized interface
-archive. Generated Derived Sources establish permanent dynamic entry points and
-typed native bridges without modifying handwritten Swift files. The finalized
+archive. Generated Derived Sources establish permanent entry points and typed
+native bridges without modifying handwritten Swift files. The finalized
 archive records the exact compiler environment, source identities, patchable
 roots, signatures, capabilities, and final executable identity.
 
@@ -743,6 +754,22 @@ permanent wrapper dispatches to HLBC and keeps its lexical body as baseline
 fallback. This avoids observer-only dynamic replacement and preserves storage
 and source access semantics; observer roots therefore have neither a Native
 replacement nor a source-callable OriginalEntry.
+
+Async function roots use the same exact-range source-body infrastructure for a
+different reason: Swift async previous-dynamic-replacement thunks can recurse.
+The derived body retains the exact original statements inside an immediately
+invoked async closure, preserving lexical `self`, `super`, magic literals, and
+single-expression returns. Its permanent wrapper prepares routing before the
+first suspension and dispatches only the resulting opaque one-shot plan. Async
+OriginalCatalog entries call a uniquely named thunk emitted in the same source
+file. The thunk copies the exact body, preserves private lookup and `super`,
+freezes outer `#function` identity, retains logical line/byte-column mapping,
+and is statically dispatched even for a subclass receiver. It needs no scoped
+bypass, so legitimate recursion inside the original remains routable; fallback
+after suspension also never jumps back into a stale lexical frame.
+Existing async computed accessors are not Shell roots in this profile; an exact
+async getter may still be frozen as a NativeImport when its boundary is fully
+representable.
 
 When a defect is fixed, the patch builder type-checks the complete module in
 the archived environment, confirms that only eligible implementations changed,

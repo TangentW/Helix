@@ -8,7 +8,7 @@ import HelixLiveReloadAPI
 public enum ShellBuild {
     /// Changes whenever the source-to-Shell transformation changes semantics.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:observer-body-dispatch"
+        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks"
     )
 }
 
@@ -156,8 +156,8 @@ public struct Materializer: Sendable {
             archive: initial.archive,
             descriptors: rootsByMangledName
         )
-        let observerTransform = try BridgeGeneration.Generator()
-            .renderObserverTransform(
+        let sourceBodyTransform = try BridgeGeneration.Generator()
+            .renderSourceBodyTransform(
                 archive: initial.archive,
                 roots: initialBridgeRoots
             )
@@ -191,9 +191,10 @@ public struct Materializer: Sendable {
                     == source.logicalPath
             }
             let frozenValues = frozenValuesBySource[source.logicalPath] ?? []
-            let observerSupplemental = observerTransform
+            let sourceBodySupplemental = sourceBodyTransform
                 .supplementalDeclarations[source.logicalPath] ?? ""
-            if descriptors.isEmpty, frozenValues.isEmpty, observerSupplemental.isEmpty {
+            if descriptors.isEmpty, frozenValues.isEmpty,
+               sourceBodySupplemental.isEmpty {
                 try accountForTransformedSource(contents.count)
                 transformedSources[source.logicalPath] = contents
                 indexedSources.append(
@@ -205,6 +206,7 @@ public struct Materializer: Sendable {
                 grouping: descriptors,
                 by: { $0.sourceDeclaration.identity }
             ).values
+            let locationMap = SourceTransform.LocationMap(contents)
             let edits = try descriptorGroups.compactMap {
                 values -> SourceTransform.Edit? in
                 guard let first = values.first else {
@@ -231,7 +233,7 @@ public struct Materializer: Sendable {
                 guard let transform = descriptor.sourceBodyTransform else { return nil }
                 guard let function = functionByMangledName[
                     descriptor.declarationMangledName
-                ], let body = observerTransform.bodies[function.key]
+                ], let body = sourceBodyTransform.bodies[function.key]
                 else {
                     throw ShellBuild.Error.rootSetMismatch
                 }
@@ -243,7 +245,13 @@ public struct Materializer: Sendable {
                 return .init(
                     utf8Range: transform.openingBraceUTF8Offset..<upperBound.partialValue,
                     expectedContentHash: transform.expectedBodyHash,
-                    replacement: body,
+                    replacement: try renderSourceBody(
+                        body,
+                        source: contents,
+                        transform: transform,
+                        logicalPath: source.logicalPath,
+                        locationMap: locationMap
+                    ),
                     functionKey: function.key,
                     restoresSourceLocationBeforeFinalBrace: true
                 )
@@ -257,7 +265,7 @@ public struct Materializer: Sendable {
             })).sorted()
             let supplementalDeclarations = (
                 [frozenValueDeclarations] + bridgeDeclarations
-                    + [observerSupplemental]
+                    + [sourceBodySupplemental]
             )
                 .filter { !$0.isEmpty }
                 .joined(separator: "\n\n")
@@ -376,6 +384,40 @@ public struct Materializer: Sendable {
             reloadIndexBytes: reloadIndexBytes,
             xcodeIntegration: xcodeIntegration,
             report: report
+        )
+    }
+
+    private func renderSourceBody(
+        _ body: BridgeGeneration.SourceBodyTransform.Body,
+        source: Data,
+        transform: ShellBuildReceipt.SourceBodyTransform,
+        logicalPath: String,
+        locationMap: SourceTransform.LocationMap
+    ) throws -> String {
+        let lowerBound = transform.openingBraceUTF8Offset
+            .addingReportingOverflow(1)
+        guard !lowerBound.overflow,
+              lowerBound.partialValue <= transform.closingBraceUTF8Offset,
+              transform.closingBraceUTF8Offset <= source.count,
+              let original = String(
+                  data: source.subdata(
+                      in: lowerBound.partialValue..<transform.closingBraceUTF8Offset
+                  ),
+                  encoding: .utf8
+              )
+        else {
+            throw ShellBuild.Error.rootSetMismatch
+        }
+        guard let location = locationMap.location(
+            atUTF8Offset: transform.openingBraceUTF8Offset
+        ) else {
+            throw ShellBuild.Error.rootSetMismatch
+        }
+        return body.render(
+            originalBody: original,
+            logicalPath: logicalPath,
+            openingBraceLine: location.line,
+            openingBraceColumn: location.column
         )
     }
 
@@ -512,7 +554,9 @@ public struct Materializer: Sendable {
                 parameterSwiftTypes: bridge.parameterSwiftTypes,
                 resultSwiftType: bridge.resultSwiftType,
                 originalInvocation: bridge.originalInvocation,
-                bridgeInvocation: bridge.bridgeInvocation
+                bridgeInvocation: bridge.bridgeInvocation,
+                installation: descriptor.sourceBodyTransform == nil
+                    ? .dynamicReplacement : .sourceBody
             )
         }
     }

@@ -233,6 +233,7 @@ extension FrontendReceipt.Adapter {
                 parameters: parameterSwiftTypes,
                 result: resultSwiftType,
                 isThrowing: effects.mayThrow,
+                isAsync: effects.isAsync,
                 isolation: isolation
             ),
             callbacks: callbacks,

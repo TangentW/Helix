@@ -206,16 +206,18 @@ public struct Transformer: Sendable {
         }
 
         var transformed = source
+        let locationMap = SourceTransform.LocationMap(source)
         var continuationLineByOffset: [Int: Int] = [:]
-        var scannedOffset = 0
-        var logicalLine = 1
         for replacement in sortedReplacements {
-            for byte in source[scannedOffset..<replacement.utf8Range.upperBound]
-            where byte == UInt8(ascii: "\n") {
-                logicalLine += 1
+            guard let location = locationMap.location(
+                atUTF8Offset: replacement.utf8Range.upperBound
+            ) else {
+                throw SourceTransform.Error.invalidReplacementRange(
+                    replacement.utf8Range
+                )
             }
-            continuationLineByOffset[replacement.utf8Range.lowerBound] = logicalLine
-            scannedOffset = replacement.utf8Range.upperBound
+            continuationLineByOffset[replacement.utf8Range.lowerBound] =
+                location.line
         }
         enum Operation {
             case insertion(SourceTransform.Edit)

@@ -1477,17 +1477,32 @@ struct NativeImportDiscoveryTests {
         let patchURL = patchDirectory.appendingPathComponent("Feature.swift")
         let nativeURL = nativeDirectory.appendingPathComponent("Operations.swift")
         try Data(
-            "public func transform(_ value: Int) -> Int { adjust(value, by: 1) }\n".utf8
+            """
+            public func transform(_ value: Int) -> Int { adjust(value, by: 1) }
+            public func asyncTransform(_ value: Int) async -> Int {
+                await asyncAdjust(value, by: 1)
+            }
+            """.utf8
         ).write(to: patchURL)
         try Data(
             """
             public enum SampleError: Error { case negative }
             public func adjust(_ value: Int, by amount: Int) -> Int { value + amount }
+            public func asyncAdjust(_ value: Int, by amount: Int) async -> Int {
+                value + amount
+            }
             public func checked(_ value: Int) throws -> Int {
                 if value < 0 { throw SampleError.negative }
                 return value
             }
             @MainActor public func mainValue(_ value: Int) -> Int { value + 10 }
+            @MainActor public func mainChecked(_ value: Int) async throws -> Int {
+                if value < 0 { throw SampleError.negative }
+                return value + 20
+            }
+            public func invalidAsyncCallback(_ body: () -> Void) async {
+                body()
+            }
             public func copy(_ values: [String: Int]?) -> [String: Int]? { values }
             public func echo(_ value: Any) -> Any { value }
             public func keyword(_ value: Int, `repeat` count: Int) -> Int { value + count }
@@ -1573,8 +1588,9 @@ struct NativeImportDiscoveryTests {
                 declarations:
                   - \(moduleName).*
                 visibility: public
-                profile: bounded-pure
-                maximumDurationMicroseconds: 500
+                profile: pure
+                maximumBoundedDurationMicroseconds: 500
+                maximumSuspendingDurationMicroseconds: 5000000
                 allowsMainThread: true
         """
         let configuration = try PatchConfiguration.Document.parse(yaml: configurationYAML)
@@ -1620,6 +1636,7 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).Math.doubled(_:)",
             "\(moduleName).Math.incrementer.get",
             "\(moduleName).adjust(_:by:)",
+            "\(moduleName).asyncAdjust(_:by:)",
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
             "\(moduleName).echo(_:)",
@@ -1635,6 +1652,7 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).invokeSendable(_:)",
             "\(moduleName).invokeTuple(_:)",
             "\(moduleName).keyword(_:repeat:)",
+            "\(moduleName).mainChecked(_:)",
             "\(moduleName).mainValue(_:)",
             "\(moduleName).makeMainTransform(_:)",
             "\(moduleName).makeOptionalTransform(_:)",
@@ -1644,9 +1662,85 @@ struct NativeImportDiscoveryTests {
             "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
-        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...28).map {
+        #expect(output.receipt.nativeImportCandidates.map(\.id) == (0...30).map {
             Core.NativeImportID(rawValue: UInt32($0))
         })
+        let asyncImports = output.receipt.nativeImportCandidates.filter {
+            $0.effects.isAsync
+        }
+        #expect(asyncImports.map(\.canonicalCallee).sorted() == [
+            "\(moduleName).asyncAdjust(_:by:)",
+            "\(moduleName).mainChecked(_:)",
+        ])
+        #expect(asyncImports.allSatisfy {
+            $0.signature.isAsync
+                && $0.contract.execution.deadlineMode == .suspending
+                && $0.contract.execution.maximumDurationMicroseconds
+                    == 5_000_000
+                && $0.contract.callbacks.isEmpty
+        })
+        let asyncEntryDeclaration = try #require(
+            output.receipt.declarations.first {
+                $0.interface.baseName == "asyncTransform"
+            }
+        )
+        let asyncEntryRoot = try #require(output.receipt.roots.first {
+            $0.declarationMangledName == asyncEntryDeclaration.mangledName
+        })
+        #expect(
+            asyncEntryRoot.sourceBodyTransform?.kind
+                == .asynchronousFunction
+        )
+        #expect(asyncEntryRoot.declarationInsertion == nil)
+        #expect(asyncEntryRoot.nativeReplacement == nil)
+        #expect(
+            asyncEntryRoot.bridge?.bridgeInvocation?.hasPrefix("helixReload_")
+                == true
+        )
+        #expect(
+            asyncEntryRoot.bridge?.bridgeInvocation?.hasSuffix("(argument0)")
+                == true
+        )
+        #expect(asyncEntryRoot.bridge?.sourceSupplementalDeclaration?.contains(
+            "exact async original thunk"
+        ) == true)
+        let asyncEntryRootIndex = try #require(output.receipt.roots.firstIndex {
+            $0.declarationMangledName == asyncEntryDeclaration.mangledName
+        })
+        var missingAsyncTransform = output.receipt
+        missingAsyncTransform.roots[asyncEntryRootIndex].sourceBodyTransform = nil
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try missingAsyncTransform.validate()
+        }
+        var oversizedAsyncTransform = output.receipt
+        oversizedAsyncTransform.roots[asyncEntryRootIndex]
+            .sourceBodyTransform?.openingBraceUTF8Offset = 0
+        oversizedAsyncTransform.roots[asyncEntryRootIndex]
+            .sourceBodyTransform?.closingBraceUTF8Offset = 64 * 1_024
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try oversizedAsyncTransform.validate()
+        }
+        var dynamicAsyncTransform = output.receipt
+        dynamicAsyncTransform.roots[asyncEntryRootIndex].declarationInsertion =
+            "dynamic "
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try dynamicAsyncTransform.validate()
+        }
+        var missingAsyncThunk = output.receipt
+        missingAsyncThunk.roots[asyncEntryRootIndex].bridge?
+            .sourceSupplementalDeclaration = nil
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try missingAsyncThunk.validate()
+        }
+        let synchronousRootIndex = try #require(output.receipt.roots.firstIndex {
+            $0.bridge != nil && $0.sourceBodyTransform == nil
+        })
+        var injectedSynchronousSupplement = output.receipt
+        injectedSynchronousSupplement.roots[synchronousRootIndex].bridge?
+            .sourceSupplementalDeclaration = "func injected() {}"
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try injectedSynchronousSupplement.validate()
+        }
         let callbacks = Dictionary(uniqueKeysWithValues: output.receipt
             .nativeImportCandidates.compactMap { record in
                 record.canonicalCallee.contains(".invoke")
@@ -1711,7 +1805,7 @@ struct NativeImportDiscoveryTests {
         #expect(callableResults.values.allSatisfy {
             $0.signature.isNativeBridgeCallable
         })
-        #expect(output.receipt.nativeImportBindings.count == 29)
+        #expect(output.receipt.nativeImportBindings.count == 31)
         #expect(output.receipt.nativeImportBindings.filter {
             $0.generated != nil
         }.allSatisfy {
@@ -1719,7 +1813,7 @@ struct NativeImportDiscoveryTests {
         })
         #expect(output.receipt.nativeImportBindings.filter {
             $0.generated != nil
-        }.count == 25)
+        }.count == 27)
         #expect(output.receipt.nativeImportBindings.contains {
             $0.generated == nil && $0.importedModules == ["HelixRuntime"]
         })
@@ -1733,6 +1827,7 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).Math.doubled(_:)",
             "\(moduleName).Math.incrementer.get",
             "\(moduleName).adjust(_:by:)",
+            "\(moduleName).asyncAdjust(_:by:)",
             "\(moduleName).checked(_:)",
             "\(moduleName).copy(_:)",
             "\(moduleName).echo(_:)",
@@ -1748,6 +1843,7 @@ struct NativeImportDiscoveryTests {
             "\(moduleName).invokeSendable(_:)",
             "\(moduleName).invokeTuple(_:)",
             "\(moduleName).keyword(_:repeat:)",
+            "\(moduleName).mainChecked(_:)",
             "\(moduleName).mainValue(_:)",
             "\(moduleName).makeMainTransform(_:)",
             "\(moduleName).makeOptionalTransform(_:)",
@@ -1757,6 +1853,10 @@ struct NativeImportDiscoveryTests {
             "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
+        #expect(output.diagnostics.contains {
+            $0.code == "HLXNID002"
+                && $0.message.contains("invalidAsyncCallback")
+        })
 
         let adjustDeclaration = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "adjust"
@@ -1815,6 +1915,15 @@ struct NativeImportDiscoveryTests {
             $0.canonicalDeclaration.contains("transform")
         })
         #expect(transform.effects.mayAllocate)
+        let transformedFeature = String(
+            decoding: try #require(
+                shell.transformedSources["Patch/Feature.swift"]
+            ),
+            as: UTF8.self
+        )
+        #expect(transformedFeature.contains("prepareAsyncDispatch"))
+        #expect(transformedFeature.contains("dispatchAsync"))
+        #expect(!transformedFeature.contains("dynamic func asyncTransform"))
         let generatedSources = shell.bridge.sourceFiles.filter {
             $0.key.contains("HelixBridge.NativeImport_")
         }
@@ -1833,6 +1942,9 @@ struct NativeImportDiscoveryTests {
         #expect(generated.contains("argument1.value = argument0"))
         #expect(generated.contains("keyword(argument0, repeat: argument1)"))
         #expect(generated.contains("VM.ClosureNativeInvoker("))
+        #expect(generated.contains("VM.ClosureAsyncNativeInvoker("))
+        #expect(generated.contains("await asyncAdjust(argument0, by: argument1)"))
+        #expect(generated.contains("try await mainChecked(argument0)"))
         #expect(generated.contains("catch let trap as VM.RuntimeTrap"))
         #expect(generated.contains("try context.withMainActor"))
         #expect(generated.contains("BridgeValueCodec.decodeDictionary"))
@@ -1861,6 +1973,8 @@ struct NativeImportDiscoveryTests {
             shell.bridge.sourceFiles["Generated/\(moduleName)Bridge.swift"]
         )
         #expect(bridge.contains("HelixNativeImports_"))
+        #expect(bridge.contains("makeAsyncNativeCatalog()"))
+        #expect(bridge.contains("asyncNativeCatalog: asyncNativeCatalog"))
         try typeCheckGeneratedBridge(
             shell: shell,
             directory: directory,
@@ -1883,6 +1997,10 @@ struct NativeImportDiscoveryTests {
                 let incremented = Math.incrementer(value)
                 return adjust(value, by: 1) + (accepted ? 3 : 4)
                     + transformed + optionalValue + incremented
+            }
+            public func asyncTransform(_ value: Int) async -> Int {
+                let adjusted = await asyncAdjust(value, by: 2)
+                return (try? await mainChecked(adjusted)) ?? -1
             }
             """.utf8
         ).write(to: patchURL)
@@ -1908,7 +2026,12 @@ struct NativeImportDiscoveryTests {
 
         // Restore the indexed baseline before comparing the independent CLI receipt.
         try Data(
-            "public func transform(_ value: Int) -> Int { adjust(value, by: 1) }\n".utf8
+            """
+            public func transform(_ value: Int) -> Int { adjust(value, by: 1) }
+            public func asyncTransform(_ value: Int) async -> Int {
+                await asyncAdjust(value, by: 1)
+            }
+            """.utf8
         ).write(to: patchURL)
 
         let metadataURL = directory.appendingPathComponent("ReleaseMetadata.json")
@@ -1948,15 +2071,16 @@ struct NativeImportDiscoveryTests {
         }
         let sourcePaths = shell.transformedSources.keys.sorted()
         let frontend = SwiftFrontend.Driver()
+        let modules = try swiftPMModulesDirectory()
         try requireFrontendSuccess(
             frontend.run(
                 arguments: sourcePaths + [
-                    "-emit-library", "-emit-module", "-parse-as-library",
+                    "-emit-module", "-parse-as-library",
                     "-module-name", moduleName,
                     "-Xfrontend", "-enable-private-imports",
                     "-emit-module-path", "\(moduleName).swiftmodule",
-                    "-o", "lib\(moduleName).dylib",
-                ],
+                    "-I", modules.path,
+                ] + (try runtimeSupportCompilerArguments(modules: modules)),
                 workingDirectory: output
             )
         )
@@ -1965,7 +2089,6 @@ struct NativeImportDiscoveryTests {
             try Data($0.value.utf8).write(to: url)
             return url
         }
-        let modules = try swiftPMModulesDirectory()
         try requireFrontendSuccess(
             frontend.run(
                 arguments: generatedURLs.map(\.path) + [
@@ -1980,6 +2103,159 @@ struct NativeImportDiscoveryTests {
                 ],
                 workingDirectory: output
             )
+        )
+    }
+
+    @Test("Generated async getter imports preserve await and throws")
+    func generatesEffectfulAsyncGetterImports() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-native-async-getters-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let patchDirectory = directory.appendingPathComponent("Patch", isDirectory: true)
+        let nativeDirectory = directory.appendingPathComponent("Native", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: patchDirectory,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: nativeDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let patchURL = patchDirectory.appendingPathComponent("Feature.swift")
+        let nativeURL = nativeDirectory.appendingPathComponent("Values.swift")
+        try Data("""
+        @MainActor public func total(_ box: Box) async throws -> Int {
+            let shared = await Values.number
+            return shared + (try await box.number)
+        }
+        """.utf8).write(to: patchURL)
+        try Data("""
+        public enum Values {
+            public static var number: Int {
+                get async { 41 }
+            }
+        }
+
+        @MainActor public final class Box {
+            public var number: Int {
+                get async throws { 42 }
+            }
+        }
+        """.utf8).write(to: nativeURL)
+
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let moduleName = "AsyncGetterFixture"
+        let target = "arm64-apple-ios15.0-simulator"
+        let configuration = try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          \(moduleName):
+            include:
+              - "**/*.swift"
+            nativeImports:
+              candidateIndex: source-and-catalog
+              emit: scoped
+              sourceScope:
+                include:
+                  - Native/**/*.swift
+                declarations:
+                  - \(moduleName).*
+                visibility: public
+                profile: pure
+        """)
+        let metadata = InterfaceArchive.ReleaseMetadata(
+            bundleID: "dev.helix.async-getters",
+            buildNumber: "1",
+            shellNamespaceID: .derive(
+                bundleID: "dev.helix.async-getters",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            machOUUIDs: [],
+            targetTriple: target,
+            minimumOS: .init(15),
+            xcodeBuild: "integration-test",
+            sdkBuild: sdk.buildVersion,
+            frontendInvocation: .init(
+                moduleName: moduleName,
+                targetTriple: target,
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: ["-parse-as-library"]
+            ),
+            transformPipelineHash: ShellBuild.transformPipelineHash,
+            sourceBaselineHash: .sha256("computed by the indexer")
+        )
+        let output = try FrontendReceipt.Adapter().generate(
+            .init(
+                metadata: metadata,
+                configuration: configuration,
+                sources: [
+                    .init(logicalPath: "Patch/Feature.swift", url: patchURL),
+                    .init(logicalPath: "Native/Values.swift", url: nativeURL),
+                ],
+                compilerURL: compilerURL
+            )
+        )
+        let asyncGetters = output.receipt.nativeImportBindings.compactMap {
+            binding -> ShellBuildReceipt.NativeImportBinding? in
+            guard let generated = binding.generated,
+                  [.staticGetter, .instanceGetter].contains(generated.dispatch)
+            else { return nil }
+            return binding
+        }
+        #expect(
+            asyncGetters.count == 2,
+            Comment(rawValue: String(describing: output.diagnostics))
+        )
+        #expect(asyncGetters.allSatisfy { binding in
+            output.receipt.nativeImportCandidates.contains {
+                $0.key == binding.key
+                    && $0.effects.isAsync
+                    && $0.contract.execution.deadlineMode == .suspending
+            }
+        })
+        let staticGetter = try #require(asyncGetters.first {
+            $0.generated?.dispatch == .staticGetter
+        })
+        let instanceGetter = try #require(asyncGetters.first {
+            $0.generated?.dispatch == .instanceGetter
+        })
+        #expect(output.receipt.nativeImportCandidates.first {
+            $0.key == staticGetter.key
+        }?.effects.requiresMainActor == false)
+        #expect(output.receipt.nativeImportCandidates.first {
+            $0.key == instanceGetter.key
+        }?.effects.requiresMainActor == true)
+        let asyncAccessorDeclarations = output.receipt.declarations.filter {
+            $0.role == .getter && $0.effects.isAsync
+        }
+        #expect(asyncAccessorDeclarations.count == 2)
+        #expect(asyncAccessorDeclarations.allSatisfy { declaration in
+            declaration.forcedPatchability?.reasonCode == "HLXIDX005"
+                && !output.receipt.roots.contains(where: {
+                    $0.declarationMangledName == declaration.mangledName
+                })
+        })
+
+        let shell = try ShellBuild.Materializer().materialize(
+            receipt: output.receipt,
+            sourceRoot: directory
+        )
+        let generated = shell.bridge.sourceFiles.values.joined(separator: "\n")
+        #expect(generated.contains("await Values.number"))
+        #expect(generated.contains("try await argument0.number"))
+        #expect(generated.contains("VM.ClosureAsyncNativeInvoker("))
+        try typeCheckGeneratedBridge(
+            shell: shell,
+            directory: directory,
+            moduleName: moduleName
         )
     }
 
@@ -2746,8 +3022,8 @@ struct NativeImportDiscoveryTests {
                 declarations:
                   - \(moduleName).*
                 visibility: all
-                profile: bounded-read-write
-                maximumDurationMicroseconds: 2000
+                profile: read-write
+                maximumBoundedDurationMicroseconds: 2000
                 allowsMainThread: true
         """)
         let invocation = InterfaceArchive.FrontendInvocation(
@@ -3096,8 +3372,9 @@ struct NativeImportDiscoveryTests {
                 declarations:
                   - ScopeFixture.*
                 visibility: public
-                profile: bounded-read
-                maximumDurationMicroseconds: 750
+                profile: read
+                maximumBoundedDurationMicroseconds: 750
+                maximumSuspendingDurationMicroseconds: 5000000
                 allowsMainThread: false
         """)
         let metadata = makeMetadata(moduleName: "ScopeFixture")
@@ -3171,11 +3448,15 @@ struct NativeImportDiscoveryTests {
             "ScopeFixture.Counter.increment(_:)",
             "ScopeFixture.Math.double(_:)",
             "ScopeFixture.compute(_:)",
+            "ScopeFixture.suspend(_:)",
         ])
         #expect(output.candidates.allSatisfy {
             $0.record.contract.domain == .application
                 && $0.record.contract.access == .read
-                && $0.record.contract.execution.maximumDurationMicroseconds == 750
+                && $0.record.contract.execution.maximumDurationMicroseconds
+                    == ($0.record.effects.isAsync ? 5_000_000 : 750)
+                && $0.record.contract.execution.deadlineMode
+                    == ($0.record.effects.isAsync ? .suspending : .bounded)
                 && !$0.record.contract.execution.allowsMainThread
                 && $0.record.effects.mayAllocate
                 && !$0.record.effects.hasExternalSideEffects
@@ -3184,7 +3465,7 @@ struct NativeImportDiscoveryTests {
         #expect(Set(output.candidates.map(\.record.contract.kind)) == [
             .globalFunction, .instanceMethod, .staticMethod,
         ])
-        #expect(output.diagnostics.map(\.code) == ["HLXNID001", "HLXNID002"])
+        #expect(output.diagnostics.map(\.code) == ["HLXNID001"])
         #expect(!output.candidates.contains {
             $0.record.canonicalCallee == "ScopeFixture.hidden(_:)"
         })
@@ -3222,7 +3503,7 @@ struct NativeImportDiscoveryTests {
               sourceScope:
                 include:
                   - Sources/**
-                profile: bounded-pure
+                profile: pure
         """)
         let metadata = makeMetadata(moduleName: "ScopeFixture")
         let typeID = Core.TypeID.derive(

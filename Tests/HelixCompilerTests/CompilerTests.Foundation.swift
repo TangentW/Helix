@@ -53,7 +53,7 @@ struct Foundation {
         }
     }
 
-    @Test("Schema 1 models a bounded source NativeImport range")
+    @Test("Schema 1 models exact bounded and suspending NativeImport deadlines")
     func parsesNativeImportSourceScope() throws {
         let configuration = try PatchConfiguration.Document.parse(yaml: """
         schema: 1
@@ -74,8 +74,9 @@ struct Foundation {
                 declarations:
                   - CheckoutFeature.*
                 visibility: public
-                profile: bounded-read
-                maximumDurationMicroseconds: 750
+                profile: read
+                maximumBoundedDurationMicroseconds: 750
+                maximumSuspendingDurationMicroseconds: 5000000
                 allowsMainThread: false
         """)
 
@@ -86,8 +87,9 @@ struct Foundation {
         #expect(imports.emit == .scoped)
         #expect(imports.allow == ["SharedSupport.clock()"])
         let scope = try #require(imports.sourceScope)
-        #expect(scope.profile == .boundedRead)
-        #expect(scope.maximumDurationMicroseconds == 750)
+        #expect(scope.profile == .read)
+        #expect(scope.maximumBoundedDurationMicroseconds == 750)
+        #expect(scope.maximumSuspendingDurationMicroseconds == 5_000_000)
         #expect(!scope.allowsMainThread)
         #expect(scope.includes(
             logicalPath: "Sources/Checkout/Services/Pricing.swift",
@@ -126,12 +128,12 @@ struct Foundation {
         #expect(
             PatchConfiguration.NativeImportSourceScope(
                 include: ["Sources/**"],
-                profile: .boundedPure
+                profile: .pure
             ).visibility == .publicOnly
         )
     }
 
-    @Test("Source discovery requires an explicit profile and bounded deadline")
+    @Test("Source discovery requires an access profile and bounded exact deadlines")
     func rejectsIncompleteNativeImportSourceScope() {
         #expect(throws: PatchConfiguration.Error.self) {
             try PatchConfiguration.Document.parse(yaml: """
@@ -161,8 +163,58 @@ struct Foundation {
                   sourceScope:
                     include:
                       - Sources/**
-                    profile: bounded-pure
-                    maximumDurationMicroseconds: 2001
+                    profile: pure
+                    maximumBoundedDurationMicroseconds: 2001
+            """)
+        }
+        #expect(throws: PatchConfiguration.Error.self) {
+            try PatchConfiguration.Document.parse(yaml: """
+            schema: 1
+            modules:
+              InvalidModule:
+                include:
+                  - Sources/**
+                nativeImports:
+                  candidateIndex: source-and-catalog
+                  emit: scoped
+                  sourceScope:
+                    include:
+                      - Sources/**
+                    profile: pure
+                    maximumSuspendingDurationMicroseconds: 60000001
+            """)
+        }
+        #expect(throws: PatchConfiguration.Error.self) {
+            try PatchConfiguration.Document.parse(yaml: """
+            schema: 1
+            modules:
+              ObsoleteModule:
+                include:
+                  - Sources/**
+                nativeImports:
+                  candidateIndex: source-and-catalog
+                  emit: scoped
+                  sourceScope:
+                    include:
+                      - Sources/**
+                    profile: bounded-read
+            """)
+        }
+        #expect(throws: PatchConfiguration.Error.self) {
+            try PatchConfiguration.Document.parse(yaml: """
+            schema: 1
+            modules:
+              ObsoleteModule:
+                include:
+                  - Sources/**
+                nativeImports:
+                  candidateIndex: source-and-catalog
+                  emit: scoped
+                  sourceScope:
+                    include:
+                      - Sources/**
+                    profile: read
+                    maximumDurationMicroseconds: 750
             """)
         }
     }

@@ -323,7 +323,7 @@ extension BuildToolsTests.FrontendReceiptPipeline {
         )
         let receipt = output.receipt
         #expect(receipt.schemaVersion == 1)
-        #expect(receipt.declarations.count == 27)
+        #expect(receipt.declarations.count == 28)
         #expect(receipt.roots.count == 26)
         #expect(receipt.roots.compactMap(\.bridge).count == 25)
         #expect(receipt.roots.compactMap(\.nativeReplacement).count == 26)
@@ -344,8 +344,20 @@ extension BuildToolsTests.FrontendReceiptPipeline {
                 $0.mangledName == importedExtension.declarationMangledName
             })
         #expect(importedExtensionDeclaration.forcedPatchability?.reasonCode == "HLXIDX020")
+        let asynchronous = try #require(
+            receipt.declarations.first {
+                $0.interface.baseName == "asynchronous"
+            }
+        )
+        #expect(asynchronous.effects.isAsync)
+        #expect(asynchronous.forcedPatchability?.reasonCode == "HLXIDX005")
+        #expect(
+            !receipt.roots.contains {
+                $0.declarationMangledName == asynchronous.mangledName
+            }
+        )
         let unsupportedNames: Set<String> = [
-            "asynchronous", "typedFailure", "streamed", "explicitlyModified", "future",
+            "typedFailure", "streamed", "explicitlyModified", "future",
             "futureBoxValue", "extensionFuture", "genericValue",
             "genericReferenceStaticValue", "hiddenValue",
             "hiddenReferenceStaticValue", "unavailableReferenceValue",

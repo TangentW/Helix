@@ -174,10 +174,12 @@ public struct Adapter: Sendable {
                 )
             }
             let imports = imports(in: items)
+            let locationMap = SourceTransform.LocationMap(source.contents)
             try walk(
                 items: items,
                 context: nil,
                 source: source,
+                locationMap: locationMap,
                 imports: imports,
                 moduleName: moduleName,
                 configuration: effectiveConfiguration,
@@ -354,11 +356,11 @@ public struct Adapter: Sendable {
         var roots: [ShellBuildReceipt.Root] = []
         for draft in drafts {
             guard var root = draft.root else { continue }
-            if root.sourceDeclaration.kind == .propertyObservers,
-                !eligibleNames.contains(draft.candidate.mangledName) {
-                // Observers have no independently useful Native replacement
-                // descriptor. Keep their rejection diagnostic, but do not
-                // persist a source-body transform that can never dispatch.
+            if root.sourceBodyTransform != nil,
+               !eligibleNames.contains(draft.candidate.mangledName) {
+                // Source-body installations have no independently safe Native
+                // replacement descriptor. Keep their rejection diagnostic,
+                // but do not persist a transform that can never dispatch.
                 continue
             }
             if eligibleNames.contains(draft.candidate.mangledName) {
@@ -833,8 +835,9 @@ extension FrontendReceipt.Adapter {
                 include: sources.map(\.logicalPath).sorted(),
                 declarations: ["\(moduleName).*"],
                 visibility: .all,
-                profile: .boundedReadWrite,
-                maximumDurationMicroseconds: 2_000,
+                profile: .readWrite,
+                maximumBoundedDurationMicroseconds: 2_000,
+                maximumSuspendingDurationMicroseconds: 30_000_000,
                 allowsMainThread: true
             )
         )
@@ -1472,6 +1475,7 @@ extension FrontendReceipt.Adapter {
         items: [Any],
         context: NominalContext?,
         source: SourceState,
+        locationMap: SourceTransform.LocationMap,
         imports: [String],
         moduleName: String,
         configuration: PatchConfiguration.Document,
@@ -1495,6 +1499,7 @@ extension FrontendReceipt.Adapter {
                     item,
                     context: context,
                     source: source,
+                    locationMap: locationMap,
                     imports: imports,
                     moduleName: moduleName,
                     configuration: configuration,
@@ -1597,6 +1602,7 @@ extension FrontendReceipt.Adapter {
                             || Self.hasGenericSignature(item)
                     ),
                     source: source,
+                    locationMap: locationMap,
                     imports: imports,
                     moduleName: moduleName,
                     configuration: configuration,
@@ -1641,6 +1647,7 @@ extension FrontendReceipt.Adapter {
                             || fullName.contains("<")
                     ),
                     source: source,
+                    locationMap: locationMap,
                     imports: imports,
                     moduleName: moduleName,
                     configuration: configuration,
@@ -1664,6 +1671,7 @@ extension FrontendReceipt.Adapter {
         _ item: [String: Any],
         context: NominalContext?,
         source: SourceState,
+        locationMap: SourceTransform.LocationMap,
         imports: [String],
         moduleName: String,
         configuration: PatchConfiguration.Document,
@@ -1685,7 +1693,10 @@ extension FrontendReceipt.Adapter {
               let bodyRange = sourceRange(in: body),
               functionRange.start >= 0,
               bodyRange.start >= functionRange.start,
-              bodyRange.start < source.contents.count
+              bodyRange.start < source.contents.count,
+              bodyRange.end >= bodyRange.start,
+              bodyRange.end < source.contents.count,
+              source.contents[bodyRange.end] == UInt8(ascii: "}")
         else {
             return nil
         }
@@ -1817,7 +1828,28 @@ extension FrontendReceipt.Adapter {
             else { return nil }
             return Self.customAttributeName(demangledType)
         }
-        let mainActor = decodedCustomAttributes.contains(where: Self.isMainActor)
+        let silIsolationName: String? = switch sil.isolation {
+        case .unspecified, .nonisolated:
+            nil
+        case let .globalActor(name):
+            name
+        case let .actorInstance(name):
+            name ?? "actor-instance"
+        case let .unknown(description):
+            description
+        }
+        let hasSupportedSILIsolation = supportedIsolation(sil.isolation)
+        let hasMainActorAttribute = decodedCustomAttributes.contains(
+            where: Self.isMainActor
+        )
+        let mainActor = switch sil.isolation {
+        case let .globalActor(name):
+            Self.isMainActor(name)
+        case .unspecified:
+            hasMainActorAttribute
+        case .nonisolated, .actorInstance, .unknown:
+            false
+        }
         let customAttributes = Array(Set(
             decodedCustomAttributes.filter { !Self.isMainActor($0) }
         )).sorted()
@@ -1833,6 +1865,26 @@ extension FrontendReceipt.Adapter {
         let mayThrow = Self.containsWord("throws", in: canonicalFunctionHeader)
             || Self.containsWord("rethrows", in: canonicalFunctionHeader)
             || sil.loweredType.contains("@error")
+        let sourceBodyTransform: ShellBuildReceipt.SourceBodyTransform?
+        if isAsync {
+            let span = bodyRange.end.subtractingReportingOverflow(bodyRange.start)
+            if !span.overflow, span.partialValue < 64 * 1_024 {
+                sourceBodyTransform = .init(
+                    kind: .asynchronousFunction,
+                    openingBraceUTF8Offset: bodyRange.start,
+                    closingBraceUTF8Offset: bodyRange.end,
+                    expectedBodyHash: .sha256(
+                        source.contents.subdata(
+                            in: bodyRange.start..<(bodyRange.end + 1)
+                        )
+                    )
+                )
+            } else {
+                sourceBodyTransform = nil
+            }
+        } else {
+            sourceBodyTransform = nil
+        }
         let hasTypedThrows = canonicalFunctionHeader.range(
             of: #"\bthrows\s*\("#,
             options: .regularExpression
@@ -1845,14 +1897,22 @@ extension FrontendReceipt.Adapter {
         ]
             .hasPrefix("\(replacementName)<")
             || Self.hasGenericSignature(item)
+            || context?.isGenericContext == true
         let hasInOut = parameterItems.contains { $0["inout"] as? Bool == true }
             || (item["implicit_self_decl"] as? [String: Any])?["inout"] as? Bool == true
         let forbiddenAttributes: Set<String> = [
             "transparent_attr", "inlinable_attr", "always_emit_into_client_attr",
-            "cdecl_attr", "silgen_name_attr",
+            "cdecl_attr", "silgen_name_attr", "available_attr",
         ]
-        let canDynamicallyReplace = attributeKinds.isDisjoint(with: forbiddenAttributes)
+        let hasSupportedInstallationContext = attributeKinds.isDisjoint(
+            with: forbiddenAttributes
+        )
             && !hasUnrepresentableCustomAttribute
+            && hasSupportedSILIsolation
+            && context?.kind != .actor
+            && context?.isAvailabilityConstrained != true
+            && (!isAsync || context?.isFileScopeNameable != false)
+            && (!isAsync || sourceBodyTransform != nil)
         let access = item["access"] as? String ?? "internal"
         let moduleRule = configuration.modules[moduleName]
         let selectedByConfiguration = moduleRule?.includes(
@@ -1957,11 +2017,31 @@ extension FrontendReceipt.Adapter {
         }
         if attributeKinds.contains("mutating_attr") { declarationPrefix += "mutating " }
         let replacementDeclaration = declarationPrefix + generatedFunctionHeader
+        let enclosure = context.map { ("extension \($0.canonicalName) {", "}") }
+        let asyncOriginalThunk: String? = if isAsync,
+            hasSupportedInstallationContext {
+            try FrontendReceipt.AsyncOriginalThunk.render(
+                body: body,
+                bodyRange: bodyRange,
+                source: source.contents,
+                locationMap: locationMap,
+                logicalPath: source.logicalPath,
+                originalFunctionName: originalReference,
+                thunkHeader: replacementDeclaration,
+                enclosingPrefix: enclosure?.0 ?? "",
+                enclosingSuffix: enclosure?.1 ?? ""
+            )
+        } else {
+            nil
+        }
+        let canInstallBridge = hasSupportedInstallationContext
+            && (!isAsync || asyncOriginalThunk != nil)
         let canonicalHeader = (declarationPrefix + canonicalFunctionHeader)
             .replacingOccurrences(of: replacementName, with: baseName)
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
         let interfaceType = try demangledType(item["interface_type"], using: demangled)
-        let isolation = mainActor ? "MainActor" : customAttributes.first
+        let isolation = mainActor
+            ? "MainActor" : customAttributes.first ?? silIsolationName
         let interface = ReleaseCompiler.DeclarationInterface(
             declarationKind: "function",
             baseName: baseName,
@@ -1998,7 +2078,7 @@ extension FrontendReceipt.Adapter {
             isGeneric: isGeneric,
             isNoncopyable: false,
             hasTypedThrows: hasTypedThrows,
-            hasCompleteDynamicCoverage: canDynamicallyReplace,
+            hasCompleteDynamicCoverage: canInstallBridge,
             forcedPatchability: {
                 if !customAttributes.isEmpty || hasUnrepresentableCustomAttribute {
                     return .rejected(
@@ -2006,10 +2086,36 @@ extension FrontendReceipt.Adapter {
                         explanation: "custom function attributes are Native-only in HLBC v1"
                     )
                 }
+                if !hasSupportedSILIsolation, context?.kind != .actor {
+                    return .rejected(
+                        "HLXIDX012",
+                        explanation: "custom function isolation requires a supported executor Bridge"
+                    )
+                }
+                if attributeKinds.contains("available_attr")
+                    || context?.isAvailabilityConstrained == true {
+                    return .rejected(
+                        "HLXIDX010",
+                        explanation: "availability-constrained declarations cannot install a permanent Bridge across the Shell deployment range"
+                    )
+                }
+                if isAsync, context?.isFileScopeNameable == false {
+                    return .rejected(
+                        "HLXIDX020",
+                        explanation: "the source-local async original thunk cannot name this private nested receiver"
+                    )
+                }
                 if context != nil, bridgedReceiverType == nil {
                     return .rejected(
                         "HLXIDX020",
                         explanation: "this member receiver has no ABI-safe HLBC self Bridge"
+                    )
+                }
+                if isAsync,
+                   sourceBodyTransform == nil || asyncOriginalThunk == nil {
+                    return .rejected(
+                        "HLXIDX010",
+                        explanation: "async source body exceeds permanent Bridge metadata limits"
                     )
                 }
                 return nil
@@ -2099,8 +2205,12 @@ extension FrontendReceipt.Adapter {
             hasTypedThrows: hasTypedThrows,
             hasUnsupportedAttributes: !customAttributes.isEmpty
                 || hasUnrepresentableCustomAttribute
+                || attributeKinds.contains("available_attr")
+                || !hasSupportedSILIsolation
+                || context?.kind == .actor
+                || context?.isAvailabilityConstrained == true
         )
-        guard selectedByConfiguration, canDynamicallyReplace else {
+        guard selectedByConfiguration, canInstallBridge else {
             return .init(
                 candidate: candidate,
                 root: nil,
@@ -2109,7 +2219,6 @@ extension FrontendReceipt.Adapter {
                 referenceReceiverType: referenceReceiverType
             )
         }
-        let enclosure = context.map { ("extension \($0.canonicalName) {", "}") }
         let sourceDeclaration = Core.DynamicReplacement.Declaration(
             identity: usr,
             kind: .function,
@@ -2156,7 +2265,8 @@ extension FrontendReceipt.Adapter {
             declarationMangledName: mangledName,
             declarationUTF8Offset: declarationOffset,
             expectedDeclarationPrefix: expectedPrefix,
-            declarationInsertion: attributeKinds.contains("dynamic_attr")
+            declarationInsertion: isAsync
+                || attributeKinds.contains("dynamic_attr")
                 || Self.containsWord("dynamic", in: modifierPrefix)
                 ? nil : "dynamic ",
             sourceDeclaration: sourceDeclaration,
@@ -2165,7 +2275,8 @@ extension FrontendReceipt.Adapter {
             nominalType: context.map {
                 .init(moduleName: moduleName, canonicalName: $0.canonicalName)
             },
-            nativeReplacement: nativeReplacement
+            sourceBodyTransform: sourceBodyTransform,
+            nativeReplacement: isAsync ? nil : nativeReplacement
         )
         let bridge: ShellBuildReceipt.Bridge?
         let writebackCount = bridgedParameterConventions.filter {
@@ -2197,7 +2308,8 @@ extension FrontendReceipt.Adapter {
                 parameterSwiftTypes: bridgeParameterSwiftTypes,
                 resultSwiftType: generatedResultType,
                 originalInvocation: "\(baseName)(\(originalArguments))",
-                bridgeInvocation: bridgedInvocation
+                bridgeInvocation: bridgedInvocation,
+                sourceSupplementalDeclaration: asyncOriginalThunk
             )
         } else {
             bridge = nil

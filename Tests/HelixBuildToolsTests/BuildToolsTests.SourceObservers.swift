@@ -170,8 +170,8 @@ extension BuildToolsTests.FrontendReceiptPipeline {
                         declarations:
                           - "*ReferenceBox*"
                         visibility: public
-                        profile: bounded-read-write
-                        maximumDurationMicroseconds: 500
+                        profile: read-write
+                        maximumBoundedDurationMicroseconds: 500
                         allowsMainThread: true
                 """
         )
@@ -222,7 +222,8 @@ extension BuildToolsTests.FrontendReceiptPipeline {
         #expect(observerRoots.allSatisfy { $0.bridge?.bridgeInvocation == nil })
         #expect(observerRoots.allSatisfy { $0.nativeReplacement == nil })
         #expect(observerRoots.allSatisfy {
-            $0.sourceBodyTransform != nil && $0.declarationInsertion == nil
+            $0.sourceBodyTransform?.kind == .propertyObserver
+                && $0.declarationInsertion == nil
         })
         #expect(observerRoots.allSatisfy {
             $0.sourceDeclaration.kind == .propertyObservers
@@ -232,6 +233,12 @@ extension BuildToolsTests.FrontendReceiptPipeline {
         missingTransform.roots[0].sourceBodyTransform = nil
         #expect(throws: ShellBuildReceipt.Error.self) {
             try missingTransform.validate()
+        }
+        var wrongTransformKind = receipt
+        wrongTransformKind.roots[0].sourceBodyTransform?.kind =
+            .asynchronousFunction
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try wrongTransformKind.validate()
         }
         var callableObserver = receipt
         var callableRoot = callableObserver.roots[0]

@@ -74,6 +74,28 @@ iOS 进程不会接收或执行 Swift 编译器、linker、JIT、dylib 或源文
 
 标准库 API 也遵循同一执行边界。受管集合算法使用通用、Verifier 可见的 HLBC 语义计划与 callback，不会按源码 API 一项配一个 opcode；状态属于原生 Runtime 的具体 framework member 使用实测得到的精确 NativeImport；patch-local Swift 实现仍是普通同 image 调用。表示转换、ownership、effect、重入和资源预算都会在这些明确边界上验证，而不会隐藏到按名字分发的原生调用后面。没有 payload 的 `nil` 会从已经验证的 bytecode 上下文恢复 wrapped type，因此同一套 Array/Dictionary builder、mutation/sort/split state 与 VM equality 可直接服务所有可表示的 `Optional<T>`，不需要类型特例。泛型间接结果也统一写入 compiler address，包括尚在构造中的 Array 字面量整体 element 与 Tuple 字段。
 
+顺序异步执行沿用同一分层。完全具体的 `async`/`async throws` root 可以包含多个 suspension point，调用精确 patch-local async function 与生成式 async NativeImport。永久 Shell Bridge 是绑定 hash 的精确源码 body wrapper：没有 route 时，它会在第一次可能挂起前选择词法 original；命中 route 时，则为整条恢复调用固定一个不可变 generation 和只能消费一次的 dispatch plan。`nonisolated`/`MainActor` 恢复语义、取消检查、已声明错误与确定性清理都会保留。Task 创建、`async let`、TaskGroup、continuation、async closure value、AsyncSequence、TaskLocal、custom actor/global actor，以及跨 suspension 仍存活的 `inout`/address access 继续 fail closed。
+
+源码发现的 NativeImport 使用一个访问 profile，但同步与挂起调用分别配置 deadline。例如：
+
+```yaml
+nativeImports:
+  candidateIndex: source-and-catalog
+  emit: scoped
+  sourceScope:
+    include:
+      - Sources/App/Services/**
+    declarations:
+      - App.*
+    visibility: public
+    profile: read
+    maximumBoundedDurationMicroseconds: 750
+    maximumSuspendingDurationMicroseconds: 5000000
+    allowsMainThread: true
+```
+
+`profile` 只能是 `pure`、`read` 或 `read-write`。bounded deadline 范围是 1...2,000 微秒，suspending deadline 范围是 1...60,000,000 微秒；延长 deadline 不会扩大访问 effect。
+
 Swift 泛型集合方法并不是安全的 NativeImport 捷径。它的物理 ABI 可能携带具体类型 metadata、protocol witness table、随 specialization 改变的 ownership、间接结果和私有 reabstraction 细节；closure 与集合值也不使用 HLVM 的 Runtime 表示。这些属于具体 toolchain 合同，并非稳定 Shell capability。因此 NativeImport 只承载精确生成的 Bridge、稳定的 C/Objective-C 形状原生操作，或包住原生语义 leaf 的固定表示适配层；最后一种必须在 dispatch 前擦除所有泛型参数，并独立校验类型、effect 与资源。受支持 Swift Sequence API 则由 frontend 识别，再降低到少量强类型 cursor、builder、mutation 与普通 closure 调用。
 
 VM-owned `Any` 也遵循这条分界。擦除与动态转换指令把闭合的递归逻辑类型描述符和物理 HLBC register shape 分开携带；Verifier 证明描述符与 storage 一致，VM 则校验递归 payload invariant、深度、分配和遍历 fuel。这样无需序列化 Swift metadata，也无需通过 NativeImport 调用泛型 cast，就能保留 `Int`/`Int64`、Character/String、Substring/Array、ArraySlice/Array 及其嵌套 Optional/Array/Dictionary/Set/Tuple 的区别。穿过 Swift Shell 边界时，递归组合的具体 codec 会物化受支持的标量、文本、Optional、Array、Dictionary 与 Set；无法精确重建的形状继续 fail closed。
@@ -98,9 +120,9 @@ Swift 失败 helper 也在同一边界归一化。当前 frontend 为 `precondit
 
 新 Dev Shell 会自动包含 `Swift.print`、`Swift.debugPrint`、`String(describing:)` 与 `String(reflecting:)` 的精确 NativeImport，因此在受支持 body 中新增这些操作不需要开发者配置 Catalog。Compiler 会把 variadic 参数降成 VM-owned `Array<Any>`，把省略的 separator/terminator 作为通用默认参数 generator 链入同一 image，并为两个泛型 String initializer 应用固定 `Any` 适配层。其他函数的完全具体默认参数使用同一机制；非 eligible 调用点、泛型 metadata 或跨 module public/package 默认值无法证明完整覆盖时，保存事务会明确失败并要求正常构建。
 
-受管 Debug Shell 还会审计所有“已经冻结 imported native type”所属 module 的公开成员。Helix 从捕获的同一 Swift toolchain 与精确 SDK 读取 symbol graph，按 Shell minimum OS 和声明隔离过滤候选，再把生成的探针送入项目源码共用的 typed AST 与 canonical SIL 流程。只有唯一测得且 Bridge-compatible 的 initializer、同步实例/静态 method、可读/可写 property，才会成为精确 NativeImport。这条通路同时覆盖 Swift 与 Objective-C API，包括 boundary type 已冻结时的 `UIColor.black`、`UIColor.init(white:alpha:)`、`UIView.isHidden`、`UIView.alpha`、`UIView.setNeedsLayout()`、`UIView.setAnimationsEnabled(_:)`、`URLCache.shared`、`Bundle.main` 与 `Bundle.path(forResource:ofType:)`。对于捕获 SIL 已证明为 canonical Clang-importer `NSError **` 形状的调用（例如 `FileManager.removeItem(atPath:)`），还会保留逻辑 Swift `throws`；任何陌生的 pointer、sentinel、cleanup 或错误转换形状都会 fail closed。`Bundle` 等 Swift overlay 名与 `CGFloat` 等物理 alias 都来自编译器 identity 和源码位置证据，而不是猜测 Objective-C runtime 拼写。这仍是有界的 Live Reload 便利能力：生产 Shell 不会得到这组扩张，它本身不会引入新的 boundary type，设备端也不会按字符串查 selector 或 symbol。
+受管 Debug Shell 还会审计所有“已经冻结 imported native type”所属 module 的公开成员。Helix 从捕获的同一 Swift toolchain 与精确 SDK 读取 symbol graph，按 Shell minimum OS 和声明隔离过滤候选，再把生成的探针送入项目源码共用的 typed AST 与 canonical SIL 流程。只有唯一测得且 Bridge-compatible 的同步 initializer、实例/静态 method、可读/可写 property，才会成为精确 NativeImport。这条通路同时覆盖 Swift 与 Objective-C API，包括 boundary type 已冻结时的 `UIColor.black`、`UIColor.init(white:alpha:)`、`UIView.isHidden`、`UIView.alpha`、`UIView.setNeedsLayout()`、`UIView.setAnimationsEnabled(_:)`、`URLCache.shared`、`Bundle.main` 与 `Bundle.path(forResource:ofType:)`。对于捕获 SIL 已证明为 canonical Clang-importer `NSError **` 形状的调用（例如 `FileManager.removeItem(atPath:)`），还会保留逻辑 Swift `throws`；任何陌生的 pointer、sentinel、cleanup 或错误转换形状都会 fail closed。`Bundle` 等 Swift overlay 名与 `CGFloat` 等物理 alias 都来自编译器 identity 和源码位置证据，而不是猜测 Objective-C runtime 拼写。这仍是有界的 Live Reload 便利能力：生产 Shell 不会得到这组扩张，它本身不会引入新的 boundary type，设备端也不会按字符串查 selector 或 symbol。
 
-对于受支持的源码 `class` 实例方法，隐藏 Bridge 会把 `self` 作为冻结的引用 `TypeID` 传入。生成的 `NativeTypeOperations` 负责 retain、identity 与类型验证，不把进程指针写进 HLBC。这条路径解决了 class method receiver；具体属性或方法操作仍必须拥有受支持的 Shell Entry 或精确 NativeImport。上面的实测成员路径会为已经证明的形状提供这种精确 import。async 或 generic SDK 成员、超出精确同步 callback profile 的带 closure 成员、subscript、actor executor hop，以及超出冻结 Bridge 类型面的参数/结果都不会被猜测模拟，当前需要正常构建。
+对于受支持的源码 `class` 实例方法，隐藏 Bridge 会把 `self` 作为冻结的引用 `TypeID` 传入。生成的 `NativeTypeOperations` 负责 retain、identity 与类型验证，不把进程指针写进 HLBC。这条路径解决了 class method receiver；具体属性或方法操作仍必须拥有受支持的 Shell Entry 或精确 NativeImport。上面的实测成员路径会为已经证明的形状提供这种精确 import。async 或 generic SDK 成员、超出精确同步 callback profile 的带 closure 成员、subscript、actor executor hop，以及超出冻结 Bridge 类型面的参数/结果都不会被猜测模拟，当前需要正常构建。本阶段的 suspending NativeImport 来自精确的项目源码发现或显式 catalog；受管 SDK 测量路径不会推断 async 声明，也不会把 completion handler 自动转换为 async。
 
 Swift SIL 通常把 class receiver 写成 `@guaranteed self`，而 Entry/NativeImport Bridge 会拥有每一个跨设备边界的值。Helix 用物理 SIL convention 验证调用，再只对 borrowed→owned 的边界插入强类型 VM copy；同 image 的局部调用仍要求 ownership ABI 完全一致。这样既不会因无害的 borrow spelling 错误拒绝 private 实例 helper，也没有放宽类型、effect、address 或 capability 检查。
 
@@ -202,7 +224,7 @@ Tuple label 同样只属于编译期结构：frontend 若用 Array 或 Dictionar
 
 当前生成器会收集现有受监视源码文件中新增、且能从变化 root 或 hosted callback 到达的普通函数、class private 实例方法、计算 accessor 及其不导出的 patch-local 类型。补丁内非递归 struct/enum 可以随本次保存新增在文件/module scope，并可包含受支持的 stored field、实例/静态计算 accessor 与 mutating helper；pure `final class` 支持引用 identity、stored field、private/普通 method 和 computed accessor。它们不能跨 Shell Entry、NativeImport、generation 或原生存储边界；唯一例外是 hosted class 经 Verifier 证明后投影成冻结 superclass。函数内部 nominal 在当前 textual SIL 合同中没有稳定声明 identity，因此会用精确类型名拒绝；把它移到文件/module scope 即可。
 
-对已有源码 reference class，精确 Bridge 发现还会通过 canonical getter/setter SIL 覆盖受支持的 stored/computed 实例属性与 static 属性。closure 属性赋值因存储语义被权威判定为 escaping；直接或 Optional closure getter 使用上述原生 callable 结果合同。已有同步计算声明本身也会按父声明分组，并建立精确 getter/setter root：覆盖 global、实例、static/class 与源码 extension 属性，实例/static 下标，简写/显式 getter，自定义 setter value 名，`mutating get`、`nonmutating set`，以及 `private(set)` 等按 accessor 计算的可见性。Eligible 的 Shell 已有 struct/enum 会把可变 accessor receiver 作为唯一的同步逻辑 `inout` Entry 区域；normal 与已声明 error 出口（包括普通 `throws` getter）写回精确解码后的值，trap 不写回。显式 `_read`/`_modify`、async 或 typed-throws accessor、带 availability 的声明、泛型 accessor 声明或位于泛型 nominal/extension 上下文中的 accessor、生成的文件作用域代码无法命名 private 嵌套 receiver 的 accessor、递归 Native accessor replacement、多个/async `inout` 与不受支持的 callable 签名仍会 fail closed。
+对已有源码 reference class，精确 Bridge 发现还会通过 canonical getter/setter SIL 覆盖受支持的 stored/computed 实例属性与 static 属性。closure 属性赋值因存储语义被权威判定为 escaping；直接或 Optional closure getter 使用上述原生 callable 结果合同。已有同步计算声明本身也会按父声明分组，并建立精确 getter/setter root：覆盖 global、实例、static/class 与源码 extension 属性，实例/static 下标，简写/显式 getter，自定义 setter value 名，`mutating get`、`nonmutating set`，以及 `private(set)` 等按 accessor 计算的可见性。Eligible 的 Shell 已有 struct/enum 会把可变 accessor receiver 作为唯一的同步逻辑 `inout` Entry 区域；normal 与已声明 error 出口（包括普通 `throws` getter）写回精确解码后的值，trap 不写回。显式 `_read`/`_modify`、async 或 typed-throws Shell accessor、带 availability 的声明、泛型 accessor 声明或位于泛型 nominal/extension 上下文中的 accessor、生成的文件作用域代码无法命名 private 嵌套 receiver 的 accessor、递归 Native accessor replacement、多个/async `inout` 与不受支持的 callable 签名仍会 fail closed。完全具体的 async getter 可以改为精确 async NativeImport，但不会同时成为 Shell accessor root。
 
 直接声明的普通 stored property 上，显式 `willSet` 与 `didSet` body 会被独立索引。Shell build 在 derived source 中把每个绑定精确 hash 的 body 替换成永久 dispatch wrapper，并把词法位置中的 baseline body 保留为 fallback；它不依赖 observer dynamic replacement，也不会合成可调用 original。当前覆盖 global、eligible frozen struct receiver 与源码 reference class，包括隐式/自定义 old/new-value 名和同文件 private 访问；frozen value receiver 会得到事务性 self writeback。static/class、继承、lazy/wrapped、weak/unowned/Objective-C、availability/泛型、actor/global-actor、baseline magic literal 以及 old/new-value ABI shape 变化会 fail closed。补丁后的 reference observer 也不能直接给自身被观察属性赋值，因为普通 setter NativeImport 会错误地重入 observer；兄弟属性访问在 frozen source policy 允许时仍可使用。
 

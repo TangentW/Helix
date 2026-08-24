@@ -5,31 +5,15 @@ import HelixVerifier
 import Testing
 @testable import HelixVM
 
-private actor AsyncCallGate {
-    private var arrivalCount = 0
-    private var arrivalWaiters: [
-        (target: Int, continuation: CheckedContinuation<Void, Never>)
-    ] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+private actor AsyncCallTrace {
+    private var values: [Int64] = []
 
-    func suspend() async {
-        arrivalCount += 1
-        let ready = arrivalWaiters.filter { $0.target <= arrivalCount }
-        arrivalWaiters.removeAll { $0.target <= arrivalCount }
-        ready.forEach { $0.continuation.resume() }
-        await withCheckedContinuation { releaseWaiters.append($0) }
+    func append(_ value: Int64) {
+        values.append(value)
     }
 
-    func waitForArrival(_ target: Int) async {
-        guard arrivalCount < target else { return }
-        await withCheckedContinuation {
-            arrivalWaiters.append((target, $0))
-        }
-    }
-
-    func releaseOne() {
-        precondition(!releaseWaiters.isEmpty)
-        releaseWaiters.removeFirst().resume()
+    func snapshot() -> [Int64] {
+        values
     }
 }
 
@@ -51,7 +35,7 @@ extension VMTests {
 struct AsyncExecution {
     @Test("Multiple NativeImport awaits suspend and resume one VM frame in order")
     func executesMultipleSequentialAwaits() async throws {
-        let gate = AsyncCallGate()
+        let trace = AsyncCallTrace()
         let function = Bytecode.Function(
             id: .init(rawValue: 0),
             name: "twiceAsync",
@@ -80,7 +64,14 @@ struct AsyncExecution {
             ],
             effects: .init(isAsync: true)
         )
-        let fixture = try makeAsyncFixture(function: function)
+        let fixture = try makeAsyncFixture(
+            function: function,
+            limits: .init(
+                maxWallTimeMainThreadMilliseconds: 60_000,
+                maxWallTimeBackgroundMilliseconds: 60_000
+            ),
+            importMaximumDurationMicroseconds: 60_000_000
+        )
         let invoker = VM.ClosureAsyncNativeInvoker(
             id: fixture.importID,
             key: fixture.importKey,
@@ -89,10 +80,11 @@ struct AsyncExecution {
             effects: fixture.importEffects,
             contract: fixture.importContract
         ) { arguments, _ in
-            await gate.suspend()
             guard case let .integer(value) = arguments.first else {
                 return .businessError("expected Int")
             }
+            await trace.append(value.signedValue)
+            await Task.yield()
             return .returned(
                 .integer(
                     try VM.Integer(
@@ -107,22 +99,13 @@ struct AsyncExecution {
             asyncNativeCatalog: try .init([invoker])
         )
         let input = try VM.Value.integerValue(40)
-        let invocation = Task {
-            await interpreter.invokeAsync(
-                entry: .init(rawValue: 0),
-                image: fixture.image,
-                arguments: [input]
-            )
-        }
-
-        await gate.waitForArrival(1)
-        await gate.releaseOne()
-        await gate.waitForArrival(2)
-        await gate.releaseOne()
-
-        #expect(
-            await invocation.value == .returned(try .integerValue(42))
+        let result = await interpreter.invokeAsync(
+            entry: .init(rawValue: 0),
+            image: fixture.image,
+            arguments: [input]
         )
+        #expect(result == .returned(try .integerValue(42)))
+        #expect(await trace.snapshot() == [40, 41])
     }
 
     @Test("Async try_apply resumes its typed error continuation")
@@ -207,8 +190,11 @@ struct AsyncExecution {
 
     @Test("Cancellation wins over a suspended NativeImport result")
     func cancelsSuspendedExecution() async throws {
-        let gate = AsyncCallGate()
         let fixture = try makeAsyncFixture(function: Self.oneAwaitFunction())
+        let budget = VM.InvocationBudget(
+            limits: fixture.image.effectiveResourceLimits,
+            isMainThread: false
+        )
         let invoker = VM.ClosureAsyncNativeInvoker(
             id: fixture.importID,
             key: fixture.importKey,
@@ -217,34 +203,24 @@ struct AsyncExecution {
             effects: fixture.importEffects,
             contract: fixture.importContract
         ) { arguments, _ in
-            await gate.suspend()
+            await Task.yield()
+            budget.cancel()
             return .returned(arguments[0])
         }
-        let budget = VM.InvocationBudget(
-            limits: fixture.image.effectiveResourceLimits,
-            isMainThread: false
+
+        let result = await VM.Interpreter(
+            asyncNativeCatalog: try .init([invoker])
+        ).invokeAsync(
+            entry: .init(rawValue: 0),
+            image: fixture.image,
+            arguments: [try .integerValue(7)],
+            budget: budget
         )
-        let invocation = Task {
-            await VM.Interpreter(
-                asyncNativeCatalog: try! .init([invoker])
-            ).invokeAsync(
-                entry: .init(rawValue: 0),
-                image: fixture.image,
-                arguments: [try! .integerValue(7)],
-                budget: budget
-            )
-        }
-
-        await gate.waitForArrival(1)
-        budget.cancel()
-        await gate.releaseOne()
-
-        #expect(await invocation.value == .trapped(.executionCancelled))
+        #expect(result == .trapped(.executionCancelled))
     }
 
     @Test("Suspended host time pauses only the root active-time deadline")
     func pausesRootDeadlineDuringNativeSuspension() async throws {
-        let gate = AsyncCallGate()
         let clock = AsyncManualClock()
         let limits = Core.ResourceLimits(
             maxWallTimeMainThreadMilliseconds: 10,
@@ -263,7 +239,8 @@ struct AsyncExecution {
             effects: fixture.importEffects,
             contract: fixture.importContract
         ) { arguments, _ in
-            await gate.suspend()
+            await Task.yield()
+            clock.advance(milliseconds: 50)
             return .returned(arguments[0])
         }
         let budget = VM.InvocationBudget(
@@ -271,29 +248,19 @@ struct AsyncExecution {
             isMainThread: false,
             nowNanoseconds: clock.now
         )
-        let invocation = Task {
-            await VM.Interpreter(
-                asyncNativeCatalog: try! .init([invoker])
-            ).invokeAsync(
-                entry: .init(rawValue: 0),
-                image: fixture.image,
-                arguments: [try! .integerValue(8)],
-                budget: budget
-            )
-        }
-
-        await gate.waitForArrival(1)
-        clock.advance(milliseconds: 50)
-        await gate.releaseOne()
-
-        #expect(
-            await invocation.value == .returned(try .integerValue(8))
+        let result = await VM.Interpreter(
+            asyncNativeCatalog: try .init([invoker])
+        ).invokeAsync(
+            entry: .init(rawValue: 0),
+            image: fixture.image,
+            arguments: [try .integerValue(8)],
+            budget: budget
         )
+        #expect(result == .returned(try .integerValue(8)))
     }
 
     @Test("An async NativeImport keeps its exact wall-clock deadline")
     func enforcesAsyncNativeDeadline() async throws {
-        let gate = AsyncCallGate()
         let clock = AsyncManualClock()
         let limits = Core.ResourceLimits(
             maxWallTimeMainThreadMilliseconds: 100,
@@ -312,7 +279,8 @@ struct AsyncExecution {
             effects: fixture.importEffects,
             contract: fixture.importContract
         ) { arguments, _ in
-            await gate.suspend()
+            await Task.yield()
+            clock.advance(milliseconds: 50)
             return .returned(arguments[0])
         }
         let budget = VM.InvocationBudget(
@@ -320,30 +288,23 @@ struct AsyncExecution {
             isMainThread: false,
             nowNanoseconds: clock.now
         )
-        let invocation = Task {
-            await VM.Interpreter(
-                asyncNativeCatalog: try! .init([invoker])
-            ).invokeAsync(
-                entry: .init(rawValue: 0),
-                image: fixture.image,
-                arguments: [try! .integerValue(8)],
-                budget: budget
-            )
-        }
-
-        await gate.waitForArrival(1)
-        clock.advance(milliseconds: 50)
-        await gate.releaseOne()
-
+        let result = await VM.Interpreter(
+            asyncNativeCatalog: try .init([invoker])
+        ).invokeAsync(
+            entry: .init(rawValue: 0),
+            image: fixture.image,
+            arguments: [try .integerValue(8)],
+            budget: budget
+        )
         #expect(
-            await invocation.value
-                == .trapped(.nativeImportDeadlineExceeded(fixture.importID))
+            result == .trapped(
+                .nativeImportDeadlineExceeded(fixture.importID)
+            )
         )
     }
 
     @Test("Swift Task cancellation is observed after native resumption")
     func observesTaskCancellation() async throws {
-        let gate = AsyncCallGate()
         let fixture = try makeAsyncFixture(function: Self.oneAwaitFunction())
         let invoker = VM.ClosureAsyncNativeInvoker(
             id: fixture.importID,
@@ -353,7 +314,8 @@ struct AsyncExecution {
             effects: fixture.importEffects,
             contract: fixture.importContract
         ) { arguments, _ in
-            await gate.suspend()
+            await Task.yield()
+            withUnsafeCurrentTask { $0?.cancel() }
             return .returned(arguments[0])
         }
         let invocation = Task {
@@ -365,10 +327,6 @@ struct AsyncExecution {
                 arguments: [try! .integerValue(9)]
             )
         }
-
-        await gate.waitForArrival(1)
-        invocation.cancel()
-        await gate.releaseOne()
 
         #expect(await invocation.value == .trapped(.executionCancelled))
     }
@@ -432,13 +390,18 @@ struct AsyncExecution {
         let effects = Core.Effects(requiresMainActor: true, isAsync: true)
         let fixture = try makeAsyncFixture(
             function: Self.oneAwaitFunction(),
+            limits: .init(
+                maxWallTimeMainThreadMilliseconds: 60_000,
+                maxWallTimeBackgroundMilliseconds: 60_000
+            ),
             importEffects: effects,
             importSignature: .init(
                 parameters: ["Swift.Int"],
                 result: "Swift.Int",
                 isAsync: true,
                 isolation: "MainActor"
-            )
+            ),
+            importMaximumDurationMicroseconds: 60_000_000
         )
         let invoker = VM.ClosureAsyncNativeInvoker(
             id: fixture.importID,
@@ -455,15 +418,14 @@ struct AsyncExecution {
             }
         }
 
-        #expect(
-            await VM.Interpreter(
-                asyncNativeCatalog: try .init([invoker])
-            ).invokeAsync(
-                entry: .init(rawValue: 0),
-                image: fixture.image,
-                arguments: [try .integerValue(11)]
-            ) == .returned(try .integerValue(11))
+        let result = await VM.Interpreter(
+            asyncNativeCatalog: try .init([invoker])
+        ).invokeAsync(
+            entry: .init(rawValue: 0),
+            image: fixture.image,
+            arguments: [try .integerValue(11)]
         )
+        #expect(result == .returned(try .integerValue(11)))
     }
 
     @Test("A MainActor async NativeImport must enter through its actor gate")

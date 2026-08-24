@@ -13,6 +13,31 @@ import Testing
 extension BuildToolsTests {
 @Suite("Real Swift frontend receipt adapter")
 struct FrontendReceiptPipeline {
+    @Test("Source locations use UTF-8 columns and all Swift line endings")
+    func mapsExactUTF8SourceLocations() throws {
+        let source = Data("é{\r\n  #column\rnext".utf8)
+        let locations = SourceTransform.LocationMap(source)
+        let brace = try #require(source.range(of: Data("{".utf8)))
+        let column = try #require(source.range(of: Data("#column".utf8)))
+        let next = try #require(source.range(of: Data("next".utf8)))
+
+        #expect(locations.location(atUTF8Offset: brace.lowerBound)?.line == 1)
+        #expect(locations.location(atUTF8Offset: brace.lowerBound)?.column == 3)
+        #expect(locations.location(atUTF8Offset: column.lowerBound)?.line == 2)
+        #expect(locations.location(atUTF8Offset: column.lowerBound)?.column == 3)
+        #expect(locations.location(atUTF8Offset: next.lowerBound)?.line == 3)
+        #expect(locations.location(atUTF8Offset: next.lowerBound)?.column == 1)
+        #expect(locations.location(atUTF8Offset: source.count + 1) == nil)
+
+        let prefixed = Data("xxé{\rnext".utf8)
+        let slice = prefixed[prefixed.index(prefixed.startIndex, offsetBy: 2)...]
+        let slicedLocations = SourceTransform.LocationMap(slice)
+        #expect(slicedLocations.location(atUTF8Offset: 0)?.line == 1)
+        #expect(slicedLocations.location(atUTF8Offset: 2)?.column == 3)
+        #expect(slicedLocations.location(atUTF8Offset: 4)?.line == 2)
+        #expect(slicedLocations.location(atUTF8Offset: 4)?.column == 1)
+    }
+
     @Test("SIL resolver falls back to an exact source declaration location")
     func resolvesOverlayMangledFunctionByLocation() throws {
         let physical = "$s7Fixture5probeyyF"
@@ -396,6 +421,7 @@ struct FrontendReceiptPipeline {
         public actor Worker {
             public nonisolated func identifier(_ value: Int) -> Int { value }
             public func isolated(_ value: Int) async -> Int { value }
+            public static func staticValue(_ value: Int) async -> Int { value }
         }
 
         @globalActor
@@ -436,6 +462,19 @@ struct FrontendReceiptPipeline {
           \(moduleName):
             include:
               - Sources/**/*.swift
+            nativeImports:
+              candidateIndex: source-and-catalog
+              emit: scoped
+              sourceScope:
+                include:
+                  - Sources/**/*.swift
+                declarations:
+                  - \(moduleName).Worker.*
+                visibility: public
+                profile: pure
+                maximumBoundedDurationMicroseconds: 500
+                maximumSuspendingDurationMicroseconds: 5000000
+                allowsMainThread: true
         """)
         let metadata = InterfaceArchive.ReleaseMetadata(
             bundleID: "dev.helix.frontend-advanced",
@@ -471,13 +510,15 @@ struct FrontendReceiptPipeline {
                 compilerURL: compilerURL
             )
         )
-        #expect(output.receipt.declarations.count == 20)
-        #expect(output.receipt.roots.count == 20)
+        #expect(output.receipt.declarations.count == 21)
+        #expect(output.receipt.roots.count == 17)
         #expect(output.receipt.roots.filter { $0.bridge != nil }.count == 12)
-        #expect(output.receipt.roots.allSatisfy { $0.nativeReplacement != nil })
+        #expect(output.receipt.roots.filter {
+            $0.nativeReplacement != nil
+        }.count == 16)
         #expect(output.diagnostics.contains { $0.code == "HLXIDX012" })
         #expect(output.diagnostics.contains { $0.code == "HLXIDX007" })
-        #expect(output.diagnostics.filter { $0.code == "HLXIDX020" }.count == 4)
+        #expect(output.diagnostics.filter { $0.code == "HLXIDX020" }.count == 5)
         #expect(output.diagnostics.filter { $0.code == "HLXIDX006" }.count == 1)
         let snapshot = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "snapshot"
@@ -531,6 +572,15 @@ struct FrontendReceiptPipeline {
         #expect(output.receipt.roots.first {
             $0.declarationMangledName == asynchronous.mangledName
         }?.sourceDeclaration.replacementHeader.contains(" async ") == true)
+        let asynchronousRoot = try #require(output.receipt.roots.first {
+            $0.declarationMangledName == asynchronous.mangledName
+        })
+        #expect(
+            asynchronousRoot.sourceBodyTransform?.kind
+                == .asynchronousFunction
+        )
+        #expect(asynchronousRoot.nativeReplacement == nil)
+        #expect(asynchronousRoot.declarationInsertion == nil)
         let escapedAsyncLabel = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "escapedAsyncLabel"
         })
@@ -541,15 +591,28 @@ struct FrontendReceiptPipeline {
         })
         #expect(isolatedActorMethod.effects.isAsync)
         #expect(isolatedActorMethod.forcedPatchability?.reasonCode == "HLXIDX020")
+        let staticActorMethod = try #require(output.receipt.declarations.first {
+            $0.interface.baseName == "staticValue"
+        })
+        #expect(staticActorMethod.effects.isAsync)
+        #expect(staticActorMethod.forcedPatchability?.reasonCode == "HLXIDX020")
+        #expect(!staticActorMethod.hasCompleteDynamicCoverage)
+        #expect(!output.receipt.roots.contains {
+            $0.declarationMangledName == staticActorMethod.mangledName
+        })
+        #expect(!output.receipt.nativeImportCandidates.contains {
+            $0.canonicalCallee.contains(".Worker.")
+        })
+        #expect(output.diagnostics.contains {
+            $0.message.contains("custom calling or isolation attributes")
+        })
         let customActorFunction = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "actorBound"
         })
         #expect(customActorFunction.effects.isAsync)
         #expect(customActorFunction.forcedPatchability?.reasonCode == "HLXIDX012")
-        #expect(output.receipt.roots.contains {
-            $0.nativeReplacement != nil && $0.sourceDeclaration.replacementHeader.contains(
-                "@\(moduleName).FeatureActor"
-            )
+        #expect(!output.receipt.roots.contains {
+            $0.declarationMangledName == customActorFunction.mangledName
         })
         let classMethod = try #require(output.receipt.roots.first {
             $0.declarationMangledName.contains("FactoryC7doubled")
@@ -762,6 +825,301 @@ struct FrontendReceiptPipeline {
         #expect(adjusted.writebacks == [
             .init(parameterIndex: 0, value: try integer(15)),
         ])
+    }
+
+    @Test("Async source-body bridges preserve lexical class context")
+    func asyncSourceBodyBridgesPreserveLexicalClassContext() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-frontend-async-lexical-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let sourceDirectory = directory.appendingPathComponent("Sources", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: sourceDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = sourceDirectory.appendingPathComponent("Lexical.swift")
+        let source = #"""
+        open class Parent {
+            open func describe(_ value: Int) async -> String { defer { _ = #function }; let closure = { #function }; func local() -> String { #function }; return "parent:\(value):\(#function):\(closure()):\(local()):\(#line):\(#column):\(#fileID):\(#filePath)" }
+        }
+
+        public final class Child: Parent {
+            private let suffix = "child"
+
+            public override func describe(_ value: Int) async -> String {
+                let inherited = await super.describe(value)
+                return "\(inherited):\(suffix):\(#function)"
+            }
+        }
+
+        @MainActor
+        public final class MainActorModel {
+            public func calculate(_ value: Int) async -> Int {
+                value + 3
+            }
+
+            nonisolated public func calculateAnywhere(_ value: Int) async -> Int {
+                value + 4
+            }
+        }
+
+        public enum PrivateContainer {
+            private final class Hidden {
+                func hiddenDescription(_ value: Int) async -> String {
+                    "hidden:\(value)"
+                }
+            }
+        }
+
+        @available(iOS 99, *)
+        public func futureDescription(_ value: Int) async -> String {
+            "future:\(value)"
+        }
+
+        @available(iOS 99, *)
+        extension Parent {
+            public func futureExtensionDescription(_ value: Int) async -> String {
+                "future-extension:\(value)"
+            }
+        }
+        """# + """
+
+        public func oversizedDescription(_ value: Int) async -> Int {
+            /*\(String(repeating: "x", count: 66 * 1_024))*/
+            return value
+        }
+        """
+        try Data(source.utf8).write(to: sourceURL)
+
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let sdk = try SwiftFrontend.Driver(compilerURL: compilerURL).sdkIdentity(
+            name: "iphonesimulator"
+        )
+        let moduleName = "FrontendAsyncLexicalFixture"
+        let target = "arm64-apple-ios15.0-simulator"
+        let configuration = try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          \(moduleName):
+            include:
+              - Sources/**/*.swift
+            entrypoints: all
+            nativeImports:
+              candidateIndex: source-and-catalog
+              emit: scoped
+              sourceScope:
+                include:
+                  - Sources/**/*.swift
+                declarations:
+                  - "*future*"
+                visibility: public
+                profile: pure
+        """)
+        let metadata = InterfaceArchive.ReleaseMetadata(
+            bundleID: "dev.helix.frontend-async-lexical",
+            buildNumber: "1",
+            shellNamespaceID: .derive(
+                bundleID: "dev.helix.frontend-async-lexical",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            machOUUIDs: [],
+            targetTriple: target,
+            minimumOS: .init(15),
+            xcodeBuild: "integration-test",
+            sdkBuild: sdk.buildVersion,
+            frontendInvocation: .init(
+                moduleName: moduleName,
+                targetTriple: target,
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: ["-parse-as-library"]
+            ),
+            transformPipelineHash: ShellBuild.transformPipelineHash,
+            sourceBaselineHash: .sha256("computed by the indexer")
+        )
+        let adapterOutput = try FrontendReceipt.Adapter().generate(
+            .init(
+                metadata: metadata,
+                configuration: configuration,
+                sources: [
+                    .init(logicalPath: "Sources/Lexical.swift", url: sourceURL),
+                ],
+                compilerURL: compilerURL
+            )
+        )
+        let receipt = adapterOutput.receipt
+        let asyncRoots = receipt.roots.filter {
+            $0.sourceBodyTransform?.kind == .asynchronousFunction
+        }
+        #expect(asyncRoots.count == 3)
+        let inheritedMainActor = try #require(receipt.declarations.first {
+            $0.interface.baseName == "calculate"
+        })
+        #expect(inheritedMainActor.effects.isAsync)
+        #expect(inheritedMainActor.effects.requiresMainActor)
+        #expect(inheritedMainActor.loweredSignature.isolation == "MainActor")
+        #expect(receipt.roots.contains {
+            $0.declarationMangledName == inheritedMainActor.mangledName
+        })
+        let inheritedNonisolated = try #require(receipt.declarations.first {
+            $0.interface.baseName == "calculateAnywhere"
+        })
+        #expect(inheritedNonisolated.effects.isAsync)
+        #expect(!inheritedNonisolated.effects.requiresMainActor)
+        #expect(inheritedNonisolated.loweredSignature.isolation == nil)
+        #expect(!receipt.roots.contains {
+            $0.declarationMangledName == inheritedNonisolated.mangledName
+        })
+        #expect(adapterOutput.diagnostics.contains {
+            $0.code == "HLXIDX021"
+                && $0.message.contains("calculateAnywhere")
+        })
+        let future = try #require(receipt.declarations.first {
+            $0.interface.baseName == "futureDescription"
+        })
+        #expect(!future.hasCompleteDynamicCoverage)
+        #expect(!receipt.roots.contains {
+            $0.declarationMangledName == future.mangledName
+        })
+        let futureExtension = try #require(receipt.declarations.first {
+            $0.interface.baseName == "futureExtensionDescription"
+        })
+        #expect(!futureExtension.hasCompleteDynamicCoverage)
+        #expect(!receipt.roots.contains {
+            $0.declarationMangledName == futureExtension.mangledName
+        })
+        let oversized = try #require(receipt.declarations.first {
+            $0.interface.baseName == "oversizedDescription"
+        })
+        #expect(!oversized.hasCompleteDynamicCoverage)
+        #expect(!receipt.roots.contains {
+            $0.declarationMangledName == oversized.mangledName
+        })
+        let hidden = try #require(receipt.declarations.first {
+            $0.interface.baseName == "hiddenDescription"
+        })
+        #expect(hidden.forcedPatchability?.reasonCode == "HLXIDX020")
+        #expect(!receipt.roots.contains {
+            $0.declarationMangledName == hidden.mangledName
+        })
+        #expect(adapterOutput.diagnostics.contains {
+            $0.code == "HLXIDX020"
+                && $0.message.contains("private nested receiver")
+        })
+        #expect(adapterOutput.diagnostics.contains {
+            $0.code == "HLXIDX010"
+                && $0.message.contains("oversizedDescription")
+                && $0.message.contains("metadata limits")
+        })
+        #expect(!receipt.nativeImportCandidates.contains {
+            $0.canonicalCallee.lowercased().contains("future")
+        })
+        #expect(adapterOutput.diagnostics.filter {
+            $0.code == "HLXNID004"
+                && $0.message.lowercased().contains("future")
+        }.count == 2)
+        #expect(asyncRoots.allSatisfy {
+            $0.declarationInsertion == nil && $0.nativeReplacement == nil
+        })
+
+        let shell = try ShellBuild.Materializer().materialize(
+            receipt: receipt,
+            sourceRoot: directory
+        )
+        let transformed = String(
+            decoding: try #require(shell.transformedSources["Sources/Lexical.swift"]),
+            as: UTF8.self
+        )
+        #expect(
+            transformed.components(
+                separatedBy: "Runtime.Bridge.shared.prepareAsyncDispatch"
+            ).count == 4
+        )
+        #expect(transformed.contains("await super.describe(value)"))
+        #expect(transformed.contains(#"\(inherited):\(suffix):\(#function)"#))
+        try typeCheckGeneratedBridge(
+            shell: shell,
+            directory: directory,
+            moduleName: moduleName
+        )
+
+        let parentRoot = try #require(asyncRoots.first {
+            $0.nominalType?.canonicalName == "Parent"
+        })
+        let childRoot = try #require(asyncRoots.first {
+            $0.nominalType?.canonicalName == "Child"
+        })
+        let parentInvocation = try #require(parentRoot.bridge?.bridgeInvocation)
+        let childInvocation = try #require(childRoot.bridge?.bridgeInvocation)
+        let thunks = try asyncRoots.map {
+            try #require($0.bridge?.sourceSupplementalDeclaration)
+        }.joined(separator: "\n\n")
+        #expect(parentInvocation.contains("helixReload_"))
+        #expect(!parentInvocation.contains(".describe("))
+        #expect(thunks.contains(#""describe(_:)""#))
+        #expect(thunks.contains(#"defer { _ = "describe(_:)" }"#))
+        #expect(thunks.components(separatedBy:
+            #"#sourceLocation(file: "Sources/Lexical.swift", line: 1)"#
+        ).count == 4)
+        #expect(shell.bridge.sourceFiles.values.contains {
+            $0.contains("invokeMainActorAsync: { arguments in")
+        })
+
+        let executableSourceURL = directory.appendingPathComponent("AsyncThunkProbe.swift")
+        let executableURL = directory.appendingPathComponent("AsyncThunkProbe")
+        let executableSource = """
+        #sourceLocation(file: "Sources/Lexical.swift", line: 1)
+        """ + "\n" + source + "\n\n" + thunks + """
+
+        #sourceLocation()
+
+        @main
+        enum AsyncThunkProbe {
+            static func main() async {
+                let child = Child()
+                let parent: Parent = child
+                let baseline = await Parent().describe(7)
+                let virtual = await parent.describe(7)
+                guard virtual == baseline + ":child:describe(_:)",
+                      await {
+                          let argument0 = 7
+                          let argument1: Parent = child
+                          return await \(parentInvocation)
+                      }() == baseline,
+                      await {
+                          let argument0 = 7
+                          let argument1: Child = child
+                          return await \(childInvocation)
+                      }() == virtual
+                else {
+                    fatalError("async exact-original thunk dispatched virtually")
+                }
+                print("HELIX_ASYNC_EXACT_ORIGINAL_OK")
+            }
+        }
+        """
+        try Data(executableSource.utf8).write(to: executableSourceURL)
+        try requireFrontendSuccess(
+            SwiftFrontend.Driver().run(
+                arguments: [
+                    executableSourceURL.path,
+                    "-parse-as-library", "-warnings-as-errors",
+                    "-o", executableURL.path,
+                ],
+                workingDirectory: directory
+            )
+        )
+        let execution = try SwiftFrontend.Driver(compilerURL: executableURL).run(
+            arguments: [],
+            workingDirectory: directory
+        )
+        try requireFrontendSuccess(execution)
+        #expect(execution.standardOutput.contains("HELIX_ASYNC_EXACT_ORIGINAL_OK"))
     }
 
     @Test("Frozen Shell struct and enum receivers use generated structural codecs")
@@ -999,7 +1357,7 @@ struct FrontendReceiptPipeline {
             )
         )
         let receipt = output.receipt
-        #expect(receipt.roots.count == 20)
+        #expect(receipt.roots.count == 19)
         #expect(receipt.roots.compactMap(\.bridge).count == 14)
         #expect(output.diagnostics.contains {
             $0.code == "HLXIDX011" && $0.message.contains("Pinned")
@@ -1017,7 +1375,9 @@ struct FrontendReceiptPipeline {
             $0.code == "HLXIDX011" && $0.message.contains("FutureMode")
         })
         #expect(output.diagnostics.contains {
-            $0.code == "HLXIDX011" && $0.message.contains("FutureRecord")
+            $0.code == "HLXIDX010"
+                && $0.message.contains("FutureRecord")
+                && $0.message.contains("availability-constrained")
         })
         let pinned = try #require(receipt.declarations.first {
             $0.interface.baseName == "value"
@@ -1323,9 +1683,47 @@ struct FrontendReceiptPipeline {
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
         let privateImportSourceFile = URL(fileURLWithPath: logicalPath).lastPathComponent
         let transformedURL = output.appendingPathComponent(privateImportSourceFile)
-        try #require(shell.transformedSources[logicalPath]).write(
-            to: transformedURL
+        let sourceRecord = try #require(receipt.sources.first {
+            $0.logicalPath == logicalPath
+        })
+        let functionByMangledName = Dictionary(
+            uniqueKeysWithValues: shell.archive.functions.map { ($0.mangledName, $0) }
         )
+        let declarationGroups = Dictionary(
+            grouping: receipt.roots.filter { root in
+                receipt.declarations.contains {
+                    $0.mangledName == root.declarationMangledName
+                        && $0.sourceFileLogicalID == logicalPath
+                }
+            },
+            by: { $0.sourceDeclaration.identity }
+        ).values
+        let edits = try declarationGroups.compactMap {
+            roots -> SourceTransform.Edit? in
+            let root = try #require(roots.first)
+            guard let insertion = root.declarationInsertion else { return nil }
+            let keys = try roots.map {
+                try #require(functionByMangledName[$0.declarationMangledName]).key
+            }
+            return .init(
+                utf8Offset: root.declarationUTF8Offset,
+                expectedDeclarationPrefix: root.expectedDeclarationPrefix,
+                insertion: insertion,
+                functionKeys: keys
+            )
+        }
+        // Native replacements only require declaration-level `dynamic`
+        // insertion. Permanent body dispatch is compiled separately by
+        // `typeCheckGeneratedBridge`, with its Runtime dependencies present.
+        let insertionOnlySource = try SourceTransform.Transformer().transform(
+            source: originalSource,
+            logicalPath: logicalPath,
+            expectedSourceHash: sourceRecord.contentHash,
+            edits: edits,
+            replacements: [],
+            supplementalDeclarations: ""
+        ).contents
+        try insertionOnlySource.write(to: transformedURL)
         let moduleURL = output.appendingPathComponent("\(moduleName).swiftmodule")
         let imageURL = output.appendingPathComponent("lib\(moduleName).dylib")
         let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)

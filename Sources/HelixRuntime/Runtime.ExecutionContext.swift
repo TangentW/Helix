@@ -93,8 +93,13 @@ final class ExecutionContextStorage: @unchecked Sendable {
         // A thread-local synchronous context must be promoted into TaskLocal
         // storage before the first await; otherwise executor migration would
         // silently lose its generation lease and root budget.
-        if asyncCurrent != nil {
-            return try await body()
+        if let current = asyncCurrent {
+            guard current !== context else { return try await body() }
+            return try await AsyncScope.$binding.withValue(
+                .init(storageID: storageID, context: context)
+            ) {
+                try await body()
+            }
         }
         return try await AsyncScope.$binding.withValue(
             .init(storageID: storageID, context: context)

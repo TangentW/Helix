@@ -40,8 +40,8 @@ struct ProjectIndexTests {
               sourceScope:
                 include:
                   - Account/Native/**
-                profile: bounded-read-write
-                maximumDurationMicroseconds: 400
+                profile: read-write
+                maximumBoundedDurationMicroseconds: 400
           CheckoutFeature:
             include:
               - Checkout/Patch/**
@@ -51,8 +51,8 @@ struct ProjectIndexTests {
               sourceScope:
                 include:
                   - Checkout/Native/**
-                profile: bounded-pure
-                maximumDurationMicroseconds: 300
+                profile: pure
+                maximumBoundedDurationMicroseconds: 300
         """
         let configuration = try PatchConfiguration.Document.parse(yaml: configurationText)
         let configurationURL = directory.appendingPathComponent("Helix.yml")

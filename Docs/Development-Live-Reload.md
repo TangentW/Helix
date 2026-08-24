@@ -142,6 +142,41 @@ Representation conversion, ownership, effects, re-entrancy, and resource
 budgeting are therefore checked at one of those explicit boundaries rather than
 hidden behind a name-based native dispatch.
 
+Sequential async execution follows the same split. A fully concrete
+`async`/`async throws` root may contain multiple suspension points, call exact
+patch-local async functions, and call exact generated async NativeImports. Its
+permanent Shell bridge is an exact hashed source-body wrapper: it chooses the
+lexical original before any possible suspension when no route exists, or pins
+one immutable generation and one-shot dispatch plan for the complete resumed
+call. `nonisolated` and `MainActor` resume semantics, cancellation checkpoints,
+declared errors, and deterministic cleanup are preserved. Task creation,
+`async let`, task groups, continuations, async closure values, AsyncSequence,
+TaskLocal, custom actors/global actors, and live `inout`/address access across a
+suspension remain fail-closed.
+
+Source-discovered NativeImports use one access profile but separate execution
+deadlines for synchronous and suspending calls. For example:
+
+```yaml
+nativeImports:
+  candidateIndex: source-and-catalog
+  emit: scoped
+  sourceScope:
+    include:
+      - Sources/App/Services/**
+    declarations:
+      - App.*
+    visibility: public
+    profile: read
+    maximumBoundedDurationMicroseconds: 750
+    maximumSuspendingDurationMicroseconds: 5000000
+    allowsMainThread: true
+```
+
+The profile is exactly `pure`, `read`, or `read-write`. Bounded deadlines must
+be 1...2,000 microseconds and suspending deadlines 1...60,000,000 microseconds;
+neither deadline authorizes a broader access effect.
+
 A Swift generic collection method is not a safe NativeImport shortcut. Its
 physical ABI may carry concrete-type metadata, protocol witness tables,
 specialization-dependent ownership, indirect results, and private reabstraction
@@ -284,8 +319,9 @@ contributes an already-frozen imported native type. Helix reads the symbol graph
 from the captured Swift toolchain and exact SDK, filters declarations against
 the Shell minimum OS and declaration isolation, then sends generated probes
 through the same typed AST and canonical SIL pipeline used for project source.
-Only uniquely measured, Bridge-compatible initializers, synchronous instance or
-static methods, and readable or writable properties become exact NativeImports.
+Only uniquely measured, Bridge-compatible synchronous initializers, instance
+or static methods, and readable or writable properties become exact
+NativeImports.
 This covers Swift and Objective-C APIs through one path, including
 `UIColor.black`, `UIColor.init(white:alpha:)`, `UIView.isHidden`,
 `UIView.alpha`, `UIView.setNeedsLayout()`,
@@ -310,7 +346,10 @@ The measured member path above supplies those exact imports for its proven
 shapes. Async or generic SDK members, closure-bearing members outside the exact
 synchronous callback profile, subscripts, actor executor hops, and any
 parameter/result shape outside the frozen Bridge surface are not silently
-approximated and currently require a normal build.
+approximated and currently require a normal build. Suspending NativeImports in
+this stage come from exact project-source discovery or an explicit catalog;
+the managed SDK measurement path does not infer async declarations or convert
+completion handlers.
 
 Swift commonly spells a class receiver as `@guaranteed self` in SIL, while an
 Entry/NativeImport Bridge owns each value that crosses the device boundary.
@@ -690,12 +729,14 @@ and per-accessor visibility such as `private(set)`. An eligible existing Shell
 struct or enum uses one synchronous logical `inout` entry region for a mutable
 accessor receiver. Normal and declared-error exits—including an ordinary
 `throws` getter—write back the exact decoded value; traps write back nothing.
-Explicit `_read`/`_modify`, async or typed-throws accessors,
+Explicit `_read`/`_modify`, async or typed-throws Shell accessors,
 availability-constrained declarations, generic accessor declarations or
 accessors in generic nominal/extension contexts, accessors on private nested
 receivers that generated file-scope code cannot name, recursive
 Native accessor replacement, multiple/async `inout`, and unsupported callable
-signatures still fail closed rather than being inferred from names.
+signatures still fail closed rather than being inferred from names. A fully
+concrete async getter may instead become an exact async NativeImport; it is not
+also exposed as a Shell accessor root.
 
 Explicit `willSet` and `didSet` bodies on directly declared ordinary stored
 properties are indexed independently. The Shell build replaces each exact,

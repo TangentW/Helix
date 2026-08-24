@@ -583,10 +583,12 @@ struct Routing {
             interfaceHash: shellHash,
             registrationCount: 1
         )
-        let decision: Runtime.BridgeDispatchResult<Int64> = try await bridge
-            .dispatchAsync(
+        let prepared = try #require(try bridge.prepareAsyncDispatch(
             entry: entry,
-            arguments: { encoder in [try encoder.encode(Int64(9))] },
+            arguments: { encoder in [try encoder.encode(Int64(9))] }
+        ))
+        let result: Int64 = try await bridge.dispatchAsync(
+            prepared: prepared,
             decodeResult: { value in
                 guard let value else {
                     throw VM.RuntimeTrap.typeMismatch(expected: .int64, actual: nil)
@@ -594,10 +596,6 @@ struct Routing {
                 return try Runtime.BridgeValueCodec.decode(value, as: Int64.self)
             }
         )
-        guard case let .returned(result) = decision else {
-            Issue.record("the generated Bridge path did not execute the async entry")
-            return
-        }
         #expect(result == 41)
     }
 

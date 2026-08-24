@@ -129,16 +129,29 @@ extension NativeImportDiscovery {
                     mayThrow: declaration.inferredEffects.mayThrow,
                     mayAllocate: true,
                     hasExternalSideEffects: operationAccess.hasExternalSideEffects,
-                    requiresMainActor: declaration.inferredEffects.requiresMainActor
+                    requiresMainActor: declaration.inferredEffects.requiresMainActor,
+                    isAsync: declaration.inferredEffects.isAsync
                 )
-                let contract = Core.NativeImportContract.bounded(
-                    kind: contractKind(for: declaration.dispatch),
-                    domain: .application,
-                    access: operationAccess,
-                    maximumDurationMicroseconds: scope.maximumDurationMicroseconds,
-                    allowsMainThread: scope.allowsMainThread,
-                    callbacks: declaration.callbacks
-                )
+                let contract = if effects.isAsync {
+                    Core.NativeImportContract.suspending(
+                        kind: contractKind(for: declaration.dispatch),
+                        domain: .application,
+                        access: operationAccess,
+                        maximumDurationMicroseconds:
+                            scope.maximumSuspendingDurationMicroseconds,
+                        allowsMainThread: scope.allowsMainThread
+                    )
+                } else {
+                    Core.NativeImportContract.bounded(
+                        kind: contractKind(for: declaration.dispatch),
+                        domain: .application,
+                        access: operationAccess,
+                        maximumDurationMicroseconds:
+                            scope.maximumBoundedDurationMicroseconds,
+                        allowsMainThread: scope.allowsMainThread,
+                        callbacks: declaration.callbacks
+                    )
+                }
                 try contract.validate(effects: effects)
                 let key = try Core.NativeImportKey.derive(
                     namespace: metadata.shellNamespaceID,
@@ -226,7 +239,21 @@ extension NativeImportDiscovery {
                 }
             }
             if declaration.inferredEffects.isAsync {
-                return ("HLXNID002", "async NativeImport requires a suspension-aware contract")
+                guard supportsAsyncDispatch(declaration.dispatch) else {
+                    return (
+                        "HLXNID002",
+                        "async NativeImport dispatch has no exact generated adapter"
+                    )
+                }
+                guard declaration.callbacks.isEmpty,
+                      !declaration.parameterTypes.contains(where: \.containsClosureValue),
+                      !declaration.resultType.containsClosureValue
+                else {
+                    return (
+                        "HLXNID002",
+                        "closure values cannot cross a suspending NativeImport boundary"
+                    )
+                }
             }
             if declaration.isGeneric || declaration.hasInOut || declaration.hasTypedThrows {
                 return (
@@ -305,9 +332,22 @@ extension NativeImportDiscovery {
             case .globalFunction, .initializer, .staticMethod, .instanceMethod: break
             }
             return switch profile {
-            case .boundedPure: .pure
-            case .boundedRead: .read
-            case .boundedReadWrite: .readWrite
+            case .pure: .pure
+            case .read: .read
+            case .readWrite: .readWrite
+            }
+        }
+
+        private func supportsAsyncDispatch(
+            _ dispatch: NativeImportDiscovery.Dispatch
+        ) -> Bool {
+            switch dispatch {
+            case .globalFunction, .initializer, .staticMethod, .staticGetter,
+                 .instanceMethod, .instanceGetter:
+                true
+            case .nativeUpcast, .anyObjectBridge, .staticSetter, .instanceSetter,
+                 .instanceValueSetter:
+                false
             }
         }
 

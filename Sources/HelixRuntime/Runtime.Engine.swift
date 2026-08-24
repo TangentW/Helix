@@ -230,39 +230,67 @@ public final class Engine: @unchecked Sendable {
         }
     }
 
-    func routeEncodedFromBridgeAsync(
-        isolation: isolated (any Actor)? = #isolation,
+    func prepareEncodedFromBridgeAsync(
+        bridgeID: UUID,
         entry: Core.EntryIndex,
         arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value]
-    ) async throws -> Runtime.BridgeRoutingResult {
-        _ = isolation
+    ) throws -> Runtime.PreparedAsyncBridgeDispatch? {
         if let context = contexts.current {
-            return try await contexts.withContext(
-                isolation: isolation,
-                context
-            ) {
-                try await routeEncodedFromBridgePinnedAsync(
-                    isolation: isolation,
-                    entry: entry,
-                    arguments: arguments,
-                    context: context
-                )
-            }
-        }
-        guard let lease = registry.activeLease() else {
-            return .originalRequired
-        }
-        let context = Runtime.ExecutionContext(lease: lease)
-        return try await contexts.withContext(
-            isolation: isolation,
-            context
-        ) {
-            try await routeEncodedFromBridgePinnedAsync(
-                isolation: isolation,
+            return try prepareEncodedFromBridgePinnedAsync(
+                bridgeID: bridgeID,
                 entry: entry,
                 arguments: arguments,
                 context: context
             )
+        }
+        guard let lease = registry.activeLease() else { return nil }
+        let context = Runtime.ExecutionContext(lease: lease)
+        return try contexts.withContext(context) {
+            try prepareEncodedFromBridgePinnedAsync(
+                bridgeID: bridgeID,
+                entry: entry,
+                arguments: arguments,
+                context: context
+            )
+        }
+    }
+
+    func routePreparedFromBridgeAsync(
+        isolation: isolated (any Actor)? = #isolation,
+        payload: Runtime.PreparedAsyncBridgeDispatch.Payload
+    ) async -> VM.EntryInvocationResult {
+        await contexts.withContext(isolation: isolation, payload.context) {
+            guard let original = originals[payload.entry] else {
+                return .trapped(.unknownEntry(payload.entry))
+            }
+            guard original.effects.isAsync else {
+                return .trapped(.explicit(
+                    "synchronous HLBC entry reached prepared async Bridge dispatch"
+                ))
+            }
+            guard let route = payload.context.lease.route(for: payload.entry) else {
+                return .trapped(.nativeFailure(
+                    "prepared async Bridge route disappeared from an immutable generation"
+                ))
+            }
+            markNestedEntrySideEffectsIfNeeded(
+                entry: payload.entry,
+                context: payload.context
+            )
+            switch await invokePatchedAsync(
+                route: route,
+                entry: payload.entry,
+                arguments: payload.arguments,
+                context: payload.context,
+                originalResolution: .catalog
+            ) {
+            case let .executed(result):
+                return result
+            case .originalRequired:
+                return .trapped(.nativeFailure(
+                    "prepared async Bridge leaked an original-routing signal"
+                ))
+            }
         }
     }
 
@@ -917,24 +945,23 @@ public final class Engine: @unchecked Sendable {
         }
     }
 
-    private func routeEncodedFromBridgePinnedAsync(
-        isolation: isolated (any Actor)?,
+    private func prepareEncodedFromBridgePinnedAsync(
+        bridgeID: UUID,
         entry: Core.EntryIndex,
         arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value],
         context: Runtime.ExecutionContext
-    ) async throws -> Runtime.BridgeRoutingResult {
-        _ = isolation
+    ) throws -> Runtime.PreparedAsyncBridgeDispatch? {
         guard let original = originals[entry] else {
-            return .executed(.trapped(.unknownEntry(entry)))
+            throw VM.RuntimeTrap.unknownEntry(entry)
         }
         guard original.effects.isAsync else {
-            return .executed(.trapped(.explicit(
+            throw VM.RuntimeTrap.explicit(
                 "synchronous HLBC entry requires the synchronous Swift Bridge"
-            )))
+            )
         }
-        guard let route = context.lease.route(for: entry) else {
+        guard context.lease.route(for: entry) != nil else {
             markNestedEntrySideEffectsIfNeeded(entry: entry, context: context)
-            return .originalRequired
+            return nil
         }
 
         let budget = context.budget(
@@ -952,27 +979,22 @@ public final class Engine: @unchecked Sendable {
             try encoder.finalize(arguments: encoded)
         } catch let error as Runtime.BridgeInputError {
             guard original.fallbackAllowed else { throw error }
-            return .originalRequired
+            markNestedEntrySideEffectsIfNeeded(entry: entry, context: context)
+            return nil
         } catch VM.RuntimeTrap.wallTimeExceeded {
             guard original.fallbackAllowed else {
                 throw VM.RuntimeTrap.wallTimeExceeded
             }
-            return .originalRequired
+            markNestedEntrySideEffectsIfNeeded(entry: entry, context: context)
+            return nil
         }
-
-        markNestedEntrySideEffectsIfNeeded(entry: entry, context: context)
-        switch await invokePatchedAsync(
-            route: route,
-            entry: entry,
-            arguments: encoded,
+        return Runtime.PreparedAsyncBridgeDispatch(
+            bridgeID: bridgeID,
+            runtime: self,
             context: context,
-            originalResolution: .signalBridge
-        ) {
-        case .originalRequired:
-            return .originalRequired
-        case let .executed(result):
-            return .executed(result)
-        }
+            entry: entry,
+            arguments: encoded
+        )
     }
 
     private func markNestedEntrySideEffectsIfNeeded(

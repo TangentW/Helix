@@ -646,12 +646,26 @@ does not by itself certify a physical device or distribution channel.
   including multiple awaits, `async throws` propagation or handling, and exact
   nonisolated/MainActor transitions. Compiler accepts only statically bound
   `@async` `apply`/`try_apply` forms and VM rejects address, access, or
-  address-borrowing state live across a suspension point. The patch-local
-  suspension graph is executable through verified async image invocation, and
-  top-level async declarations retain their frozen Swift ABI. Patched routing
-  from an app-facing generated Shell async wrapper, including a leaf entry, and
-  generated async NativeImport adapters are still pending the next boundary
-  stage.
+  address-borrowing state live across a suspension point. Exact async Shell
+  function and method roots route through a permanent hashed source-body
+  wrapper. It prepares and pins the immutable generation before the first
+  suspension, preserves the lexical original for the no-route path, and uses
+  the async OriginalCatalog for safe fallback after suspension. Each exact
+  source body is capped at 64 KiB; an oversized declaration is indexed but
+  remains ineligible instead of aborting the module index. An async instance
+  root whose private nested receiver cannot be named by the source-local
+  original thunk is likewise rejected. Generated
+  suspending NativeImports cover exact direct nonisolated/MainActor global and
+  static/instance functions and getters, including untyped throws. An explicit
+  async catalog factory can also expose a predeclared initializer. Bounded and
+  suspending imports have separate configured deadlines.
+  Async computed accessors remain NativeImport-only rather than Shell roots;
+  async closure transport and completion-handler-to-async inference remain
+  unsupported. A source scope selects the effect-independent access profile
+  `pure`, `read`, or `read-write`, with
+  `maximumBoundedDurationMicroseconds` (1...2,000) and
+  `maximumSuspendingDurationMicroseconds` (1...60,000,000) configuring the two
+  deadline classes independently.
 - VM-owned `Any`, `is`, `as?`, and `as!`. A closed recursive logical descriptor
   distinguishes source types that deliberately share HLBC storage, including
   `Int`/`Int64`, `UInt`/`UInt64`, `Double`/`CGFloat`, String/Character,
@@ -714,10 +728,11 @@ contract passes the checks above; the examples do not form an API allowlist.
 | Formation and references | Closure literals and shorthand arguments; local/global functions; operators and overloads; local bound/unbound methods, including proven concrete conditional and immutable closed-existential protocol witnesses; enum/Optional/Result cases; patch-local initializers/static factories; eligible Shell entries; representation-preserving NativeImport free/global functions, bound instance methods, and initializers | A direct-call-only default-argument projection cannot become a function value; unresolved or unproven conditional, open-world, mutable-existential, or ambiguous witness dispatch remains rejected |
 | Storage and higher order | Optional, tuple, Array, Dictionary value, concrete Result, patch-local struct/enum/class fields, mutable closure variables, and closure parameter/result positions; nested, recursive, and returned closures | Closure values do not enter Set keys/elements, VM-owned `Any`, Shell entries, or the general native boundary codec |
 | Captures and ownership | Immutable snapshots, shared mutable cells, strong capture, safe `weak`, checked `unowned`, captured closures, copyable imported owners, and caller-owned `inout` borrowed by a verified lexical nonescaping closure | `unowned(unsafe)`, noncopyable captures, linear `inout` captures, and escaping capture of caller-owned `inout` are rejected |
-| Invocation and errors | Synchronous nonthrowing/throwing calls, concrete typed throws, concrete rethrows specializations, normal/error inout cleanup, autoclosures, default generators, optional invocation, and `callAsFunction` | Async closure ABI, suspension, arbitrary runtime specialization, and general unwind cleanup are not implemented |
+| Invocation and errors | Synchronous nonthrowing/throwing calls, concrete typed throws, concrete rethrows specializations, normal/error inout cleanup, autoclosures, default generators, optional invocation, `callAsFunction`, and fully concrete sequential async/async-throws calls | Async closure values/ABI, arbitrary runtime specialization, and general unwind cleanup are not implemented |
 | Compiler-managed scopes | Direct-only `defer`, dynamically checked `withoutActuallyEscaping`, and type-generic synchronous `withExtendedLifetime`, including throwing and closure-valued results | `autoreleasepool`, `withUnsafe...`, and contiguous-storage scopes require their real native runtime or pointer lifetime semantics and are not approximated |
 | Native callback parameters | Direct or Optional Swift closures and Objective-C blocks; nonescaping or escaping lifetime; synchronous nonthrowing parameters/results; MainActor provenance; checked defaults; bounded `Error` argument proxies; deterministic failure values | Throwing, async, or `inout` callback ABIs; C function pointers/context-pointer pairs; recursive or nonescaping nested callables; callable containers; results without a deterministic failure value |
 | Native-origin callables | One direct or Optional escaping callable may arrive as an outer callback argument or NativeImport result and is invoked through the same typed closure path with identity, ownership, actor, deadline, and resource checks | A second callable layer, callable aggregates, or substituting an image-local closure for a native result is rejected |
+| Async NativeImports | Generated exact direct global/static/instance functions and getters; explicit catalog initializers; nonisolated or MainActor; untyped throwing or nonthrowing; continuous suspending deadline | Automatically discovering async initializers, closure parameters/results, callbacks, setters, generic or indirect ABI, completion-handler conversion, custom actors, and async callable values are rejected |
 | Common SDK use | UIKit animations/transitions/actions/presentation/configuration; `DispatchQueue.async`/`asyncAfter`; `DispatchGroup.notify`; Operation/OperationQueue; Timer; URLSession; NotificationCenter; `NSPredicate`; FileManager enumeration | Generic or throwing SDK closure declarations outside the exact profile, including generic `DispatchQueue.sync` closure overloads, require a normal build until a representation-erasing generated wrapper exists |
 | Isolation and concurrency | Synchronous `@MainActor` closure values and callbacks; same-thread re-entry; escaping callbacks retain their original image/generation lease; callback execution is serialized | No general `Sendable` guarantee, overlapping cross-thread callback execution, custom global actors, actor-isolated `self`, or arbitrary executor hop |
 
@@ -747,9 +762,6 @@ contract passes the checks above; the examples do not form an API allowlist.
   instance roots, custom global actors, and arbitrary executor hops. Exact
   nonisolated/MainActor transitions between concrete image functions are the
   bounded exception.
-- Generated Shell suspension dispatch and generated exact async NativeImport
-  adapters. Until that boundary stage lands, a normal App integration cannot
-  use the patch-local suspension graph to cross either generated boundary.
 - A closure crossing a Shell Entry, or crossing NativeImport outside the exact
   callable profile above. Ordinary native values and the general boundary
   codec cannot contain closures; only an exact callback parameter or a direct
@@ -802,7 +814,8 @@ contract passes the checks above; the examples do not form an API allowlist.
   and general unwind cleanup. Eligible synchronous Shell value mutation is
   limited to exactly one logical `inout` region, including mutable `self`;
   multiple or async `inout` regions, explicit `_read`/`_modify`, async or
-  typed-throws accessors, availability-constrained accessor declarations,
+  typed-throws accessors, availability-constrained function or accessor
+  declarations and contexts,
   generic accessor declarations or generic declaration contexts,
   accessors with an unnameable private nested receiver, and mutable existential
   opening remain fail-closed. The supported region does include nested
@@ -839,14 +852,14 @@ machine code.
 
 | Edit | Current result |
 | --- | --- |
-| Change an indexed global function body | Supported when its canonical SIL is in the documented subset |
-| Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM |
+| Change an indexed global function body | Supported when its canonical SIL is in the documented subset, including fully concrete sequential async/async-throws roots |
+| Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM, and nonisolated/MainActor async methods use the permanent source-body Bridge |
 | Change an instance method on an eligible existing Shell struct or enum | Nonmutating ordinary, `borrowing`, and `consuming` receivers are supported; a synchronous `mutating` receiver is supported as the entry's one logical `inout` region. This includes extension methods, nested/COW mutation, enum transitions, and exact normal/declared-error writeback; a VM trap writes nothing |
 | Change an existing computed property or subscript | Supported for exact synchronous getter/setter roots when the receiver, parameters, result, effects, and body are representable. This includes `mutating get`, `nonmutating set`, static/class/global forms, source extensions, per-accessor access control, and normal/declared-error value writeback. Explicit `_read`/`_modify`, async, typed throws, availability-constrained or generic declarations/contexts, unnameable private nested receivers, and recursive Native accessor replacement remain fail-closed |
 | Change an existing stored-property `willSet` or `didSet` body | Directly declared synchronous global, eligible frozen struct, and source reference-class observers are independently patchable through an exact hashed in-place wrapper in the derived source. Implicit/custom old/new-value names, baseline fallback, private same-file access, direct value-storage mutation, and transactional value-receiver writeback are preserved. Static/class, inherited, lazy/wrapped, weak/unowned/Objective-C, availability/generic, actor/global-actor, baseline-magic-literal, old/new-value ABI-shape changes, and direct self-property assignment from a reference observer fail closed; observer Native replacement is never emitted |
 | Use explicit `inout`, mutate an actor root, or change an existing native static/class method | One synchronous eligible Shell `inout` parameter is supported. Multiple/async regions remain rejected; actor executors and native metatype ABI are not implemented |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
-| First use a public SDK member in a managed Debug body | Supported for a uniquely measured synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. Closure-bearing methods are supported when every callback fits the exact synchronous, nonthrowing bridge-and-failure-value profile above; unfamiliar error bridges, async/generic callbacks or declarations, subscripts, and unrepresentable signatures require a full build |
+| First use a public SDK member in a managed Debug body | Supported for a uniquely measured synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. Closure-bearing methods require the exact synchronous, nonthrowing bridge-and-failure-value profile above. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or an explicit catalog |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |

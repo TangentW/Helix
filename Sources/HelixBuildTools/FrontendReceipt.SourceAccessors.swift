@@ -144,10 +144,11 @@ extension FrontendReceipt.Adapter {
         }
         guard
             memberPlans.allSatisfy({
-                !$0.sil.loweredType.contains("@async")
-                    && supportedIsolation($0.sil.isolation)
+                supportedIsolation($0.sil.isolation)
                     && !$0.syntax.hasTypedThrows
                     && ($0.role == .getter || !$0.syntax.mayThrow)
+                    && ($0.role == .getter
+                        || !$0.sil.loweredType.contains("@async"))
             })
         else { return nil }
         let declarationRequiresMainActor = accessorRequiresMainActor(
@@ -371,9 +372,14 @@ extension FrontendReceipt.Adapter {
             }
             let requiresMainActor = declarationRequiresMainActor
             let isolation = requiresMainActor ? "MainActor" : nil
+            let isAsync = sil.loweredType.range(
+                of: #"(?:^|\s)@async(?:\s|$)"#,
+                options: .regularExpression
+            ) != nil
             let effects = Core.Effects(
                 mayThrow: syntax.mayThrow,
-                requiresMainActor: requiresMainActor
+                requiresMainActor: requiresMainActor,
+                isAsync: isAsync
             )
             let interfaceLabels: [String]
             if kind == "var_decl" {
@@ -391,6 +397,20 @@ extension FrontendReceipt.Adapter {
                 (context.map { "\($0.canonicalName)." } ?? "")
                 + "\(canonicalReference)."
                 + (memberRole == .getter ? "getter" : "setter")
+            let forcedPatchability: InterfaceArchive.Patchability?
+            if selectedByConfiguration && isAsync {
+                forcedPatchability = .rejected(
+                    "HLXIDX005",
+                    explanation: "async computed accessors are NativeImport-only in sequential async v1"
+                )
+            } else if context != nil && !isStatic && receiver == nil {
+                forcedPatchability = .rejected(
+                    "HLXIDX020",
+                    explanation: "this accessor receiver has no ABI-safe HLBC self Bridge"
+                )
+            } else {
+                forcedPatchability = nil
+            }
             let interface = ReleaseCompiler.DeclarationInterface(
                 declarationKind: memberRole == .getter
                     ? "source-accessor-getter" : "source-accessor-setter",
@@ -416,6 +436,7 @@ extension FrontendReceipt.Adapter {
                     parameters: explicitSwiftTypes,
                     result: resultSwiftType,
                     isThrowing: syntax.mayThrow,
+                    isAsync: isAsync,
                     isolation: isolation
                 ),
                 parameterTypes: parameterTypes,
@@ -424,18 +445,14 @@ extension FrontendReceipt.Adapter {
                 interface: interface,
                 canonicalSILBody: sil.body,
                 effects: effects,
+                isAsync: isAsync,
                 hasInOut: parameterConventions.contains(.inout),
                 hasCompleteDynamicCoverage: true,
-                forcedPatchability: context != nil && !isStatic && receiver == nil
-                    ? .rejected(
-                        "HLXIDX020",
-                        explanation: "this accessor receiver has no ABI-safe HLBC self Bridge"
-                    )
-                    : nil
+                forcedPatchability: forcedPatchability
             )
 
             let root: ShellBuildReceipt.Root? =
-                if selectedByConfiguration {
+                if selectedByConfiguration && !isAsync {
                     try makeAccessorRoot(
                         accessor: accessor,
                         memberRole: memberRole,
@@ -451,7 +468,7 @@ extension FrontendReceipt.Adapter {
                 } else {
                     nil
                 }
-            let bridge = makeAccessorBridge(
+            let bridge = isAsync ? nil : makeAccessorBridge(
                 declarationKind: kind,
                 memberRole: memberRole,
                 replacementName: replacementName,

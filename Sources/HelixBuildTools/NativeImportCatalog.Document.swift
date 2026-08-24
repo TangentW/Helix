@@ -179,6 +179,7 @@ public struct Document: Codable, Hashable, Sendable {
                   !signatureParameters.contains(where: { $0 == nil }),
                   signatureResult != nil,
                   candidate.signature.isThrowing == candidate.effects.mayThrow,
+                  candidate.signature.isAsync == candidate.effects.isAsync,
                   (normalizedIsolation == "MainActor")
                       == candidate.effects.requiresMainActor,
                   normalizedIsolation == nil || normalizedIsolation == "MainActor",
@@ -197,7 +198,14 @@ public struct Document: Codable, Hashable, Sendable {
                       parameterSpellings: candidate.signature.parameters,
                       parameterTypes: signatureParameters.compactMap { $0 },
                       authoritativeLifetimes: callbackLifetimes
-                  ) == candidate.contract.callbacks
+                  ) == candidate.contract.callbacks,
+                  !candidate.effects.isAsync || (
+                      candidate.contract.callbacks.isEmpty
+                          && !signatureParameters.compactMap { $0 }.contains(
+                              where: \.containsClosureValue
+                          )
+                          && !signatureResult!.containsClosureValue
+                  )
             else {
                 throw NativeImportCatalog.Error.invalid(
                     "candidate \(candidate.canonicalCallee) has an invalid symbol, signature, factory, or type"

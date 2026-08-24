@@ -340,6 +340,7 @@ extension FrontendReceipt.Adapter {
             fallbackBody: text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "do {}" : text,
             transform: .init(
+                kind: .propertyObserver,
                 openingBraceUTF8Offset: range.start,
                 closingBraceUTF8Offset: range.end,
                 expectedBodyHash: .sha256(completeBody)

@@ -72,6 +72,35 @@ struct AsyncRouting {
         #expect(storage.current == nil)
     }
 
+    @Test("Async context installation overrides and restores another task context")
+    func isolatesTransferredAsyncContext() async throws {
+        let generation = try Runtime.Generation(
+            id: .init(rawValue: 1),
+            parentID: nil,
+            packageID: "HLX-runtime-async-context-transfer",
+            packageHash: .sha256("runtime-async-context-transfer"),
+            images: [],
+            removedEntries: [.init(rawValue: 0)],
+            estimatedByteCount: 0
+        )
+        let lease = Runtime.GenerationLease(
+            snapshot: .init(generation: generation, parent: nil)
+        )
+        let outer = Runtime.ExecutionContext(lease: lease)
+        let transferred = Runtime.ExecutionContext(lease: lease)
+        let storage = Runtime.ExecutionContextStorage()
+
+        await storage.withContext(outer) {
+            #expect(storage.current === outer)
+            await storage.withContext(transferred) {
+                await Task.yield()
+                #expect(storage.current === transferred)
+            }
+            #expect(storage.current === outer)
+        }
+        #expect(storage.current == nil)
+    }
+
     @Test("A suspended call pins its generation and task-local nested routing")
     func pinsGenerationAcrossSuspension() async throws {
         let gate = RuntimeAsyncGate()
@@ -95,7 +124,8 @@ struct AsyncRouting {
             parameterTypes: [],
             resultType: .int64,
             contract: fixture.nestedContract
-        ) { _, _ in
+        ) { _, context in
+            try context.checkpoint(workUnits: 1)
             let decision: Runtime.BridgeDispatchResult<Int64> = try bridge
                 .dispatch(
                     entry: fixture.nestedEntry,
@@ -113,6 +143,7 @@ struct AsyncRouting {
                         )
                     }
                 )
+            try context.checkpoint(workUnits: 1)
             let value: Int64 = switch decision {
             case .originalRequired: 2
             case let .returned(value): value
@@ -157,25 +188,17 @@ struct AsyncRouting {
             registrationCount: 2
         )
 
-        let bypass = try await bridge.withOriginalBypassAsync(
-            entry: fixture.asyncEntry
-        ) {
-            await Task.yield()
-            return try await bridge.dispatchAsync(
-                entry: fixture.asyncEntry,
-                arguments: { _ in [] },
-                decodeResult: { _ in Int64(0) }
-            )
-        }
-        guard case .originalRequired = bypass else {
-            Issue.record("async original bypass did not survive suspension")
-            return
-        }
-
         let invocation = Task {
-            try await bridge.dispatchAsync(
+            guard let prepared = try bridge.prepareAsyncDispatch(
                 entry: fixture.asyncEntry,
-                arguments: { _ in [] },
+                arguments: { _ in [] }
+            ) else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "active async route was not prepared"
+                )
+            }
+            return try await bridge.dispatchAsync(
+                prepared: prepared,
                 decodeResult: { value in
                     guard let value else {
                         throw VM.RuntimeTrap.typeMismatch(
@@ -197,13 +220,149 @@ struct AsyncRouting {
         #expect(runtime.registry.lease(for: generation.id) != nil)
         await gate.release()
 
-        let decision = try await invocation.value
-        guard case let .returned(value) = decision else {
-            Issue.record("async route unexpectedly selected its original")
-            return
-        }
+        let value = try await invocation.value
         #expect(value == 77)
         #expect(runtime.registry.lease(for: generation.id) == nil)
+    }
+
+    @Test("Prepared async dispatch is installation-bound and one-shot")
+    func preparedDispatchOwnershipAndReplay() async throws {
+        let fixture = try makeFixture()
+        let runtime = try makeRuntime(
+            fixture: fixture,
+            fallbackAllowed: false,
+            original: { _ in .returned(try! .integerValue(11)) },
+            asyncInvoke: { _, _ in .returned(try .integerValue(1)) }
+        )
+        let generation = try generation(fixture: fixture, package: "ownership")
+        try runtime.activate(generation, expectedActiveID: nil)
+        let owner = Runtime.Bridge()
+        let foreign = Runtime.Bridge()
+        for bridge in [owner, foreign] {
+            try bridge.install(
+                runtime: runtime,
+                interfaceHash: fixture.shellHash,
+                registrationCount: 2
+            )
+        }
+        let prepared = try #require(try owner.prepareAsyncDispatch(
+            entry: fixture.asyncEntry,
+            arguments: { _ in [] }
+        ))
+
+        await #expect(throws: VM.RuntimeTrap.nativeFailure(
+            "prepared async Bridge dispatch belongs to another installation"
+        )) {
+            let _: Int64 = try await foreign.dispatchAsync(
+                prepared: prepared,
+                decodeResult: decodeInt64
+            )
+        }
+        #expect(
+            try await owner.dispatchAsync(
+                prepared: prepared,
+                decodeResult: decodeInt64
+            ) == 77
+        )
+        await #expect(throws: VM.RuntimeTrap.nativeFailure(
+            "prepared async Bridge dispatch was reused"
+        )) {
+            let _: Int64 = try await owner.dispatchAsync(
+                prepared: prepared,
+                decodeResult: decodeInt64
+            )
+        }
+    }
+
+    @Test("Async preparation pins nested synchronous argument encoding")
+    func pinsNestedRoutingDuringAsyncPreparation() async throws {
+        let fixture = try makeFixture()
+        let runtime = try makeRuntime(
+            fixture: fixture,
+            fallbackAllowed: false,
+            original: { _ in .returned(try! .integerValue(11)) },
+            asyncInvoke: { _, _ in .returned(try .integerValue(1)) }
+        )
+        let generation = try generation(
+            fixture: fixture,
+            package: "preparation-context"
+        )
+        try runtime.activate(generation, expectedActiveID: nil)
+        let bridge = Runtime.Bridge()
+        try bridge.install(
+            runtime: runtime,
+            interfaceHash: fixture.shellHash,
+            registrationCount: 2
+        )
+
+        var nestedValue: Int64?
+        let prepared = try #require(try bridge.prepareAsyncDispatch(
+            entry: fixture.asyncEntry,
+            arguments: { _ in
+                try runtime.rollback(
+                    expectedActiveID: generation.id,
+                    to: nil
+                )
+                let decision: Runtime.BridgeDispatchResult<Int64> = try bridge
+                    .dispatch(
+                        entry: fixture.nestedEntry,
+                        arguments: { _ in [] },
+                        decodeResult: decodeInt64
+                    )
+                nestedValue = switch decision {
+                case .originalRequired: -1
+                case let .returned(value): value
+                }
+                return []
+            }
+        ))
+
+        #expect(nestedValue == 77)
+        #expect(runtime.registry.snapshot().activeGenerationID == nil)
+        #expect(
+            try await bridge.dispatchAsync(
+                prepared: prepared,
+                decodeResult: decodeInt64
+            ) == 77
+        )
+    }
+
+    @Test("Safe async patch failure falls back through OriginalCatalog")
+    func preparedDispatchUsesCatalogFallback() async throws {
+        let fixture = try makeFixture(fallbackAllowed: true)
+        let originalCalls = RuntimeAsyncCounter()
+        let runtime = try makeRuntime(
+            fixture: fixture,
+            fallbackAllowed: true,
+            original: { _ in
+                await originalCalls.increment()
+                return .returned(try! .integerValue(99))
+            },
+            asyncInvoke: { _, _ in
+                await Task.yield()
+                throw VM.RuntimeTrap.explicit("recoverable async patch failure")
+            }
+        )
+        let generation = try generation(fixture: fixture, package: "fallback")
+        try runtime.activate(generation, expectedActiveID: nil)
+        let bridge = Runtime.Bridge()
+        try bridge.install(
+            runtime: runtime,
+            interfaceHash: fixture.shellHash,
+            registrationCount: 2
+        )
+        let prepared = try #require(try bridge.prepareAsyncDispatch(
+            entry: fixture.asyncEntry,
+            arguments: { _ in [] }
+        ))
+
+        #expect(
+            try await bridge.dispatchAsync(
+                prepared: prepared,
+                decodeResult: decodeInt64
+            ) == 99
+        )
+        #expect(await originalCalls.value() == 1)
     }
 
     @Test("OriginalCatalog preserves MainActor on an async erased adapter")
@@ -305,7 +464,10 @@ struct AsyncRouting {
             parameterTypes: [],
             resultType: .int64,
             contract: fixture.nestedContract
-        ) { _, _ in .returned(try .integerValue(77)) }
+        ) { _, context in
+            try context.checkpoint(workUnits: 1)
+            return .returned(try .integerValue(77))
+        }
         let runtime = Runtime.Engine(
             originals: try .init([
                 .init(
@@ -409,15 +571,15 @@ struct AsyncRouting {
             kind: .globalFunction,
             domain: .application,
             access: .pure,
-            maximumDurationMicroseconds: 1_000_000,
+            maximumDurationMicroseconds: 60_000_000,
             allowsMainThread: true
         )
-        let nestedContract = Core.NativeImportContract.bounded(
+        let nestedContract = Core.NativeImportContract.cooperative(
             kind: .globalFunction,
             domain: .application,
             access: .pure,
-            maximumDurationMicroseconds: 2_000,
-            allowsMainThread: true
+            maximumDurationMicroseconds: 1_000_000,
+            allowsMainThread: false
         )
         let asyncImportID = Core.NativeImportID(rawValue: 0)
         let nestedImportID = Core.NativeImportID(rawValue: 1)
@@ -593,6 +755,77 @@ struct AsyncRouting {
             asyncContract: asyncContract,
             nestedContract: nestedContract
         )
+    }
+
+    private func makeRuntime(
+        fixture: Fixture,
+        fallbackAllowed: Bool,
+        original: @escaping Runtime.AsyncOriginalInvocation,
+        asyncInvoke: @escaping @Sendable (
+            [VM.Value],
+            VM.NativeInvocationContext
+        ) async throws -> VM.NativeInvocationResult
+    ) throws -> Runtime.Engine {
+        let asyncInvoker = VM.ClosureAsyncNativeInvoker(
+            id: fixture.asyncImportID,
+            key: fixture.asyncImportKey,
+            parameterTypes: [],
+            resultType: .int64,
+            effects: .init(isAsync: true),
+            contract: fixture.asyncContract,
+            invoke: asyncInvoke
+        )
+        let nestedInvoker = VM.ClosureNativeInvoker(
+            id: fixture.nestedImportID,
+            key: fixture.nestedImportKey,
+            parameterTypes: [],
+            resultType: .int64,
+            contract: fixture.nestedContract
+        ) { _, context in
+            try context.checkpoint(workUnits: 1)
+            return .returned(try .integerValue(77))
+        }
+        return Runtime.Engine(
+            originals: try .init([
+                .init(
+                    index: fixture.asyncEntry,
+                    parameterTypes: [],
+                    resultType: .int64,
+                    effects: .init(isAsync: true),
+                    fallbackAllowed: fallbackAllowed,
+                    invokeAsync: original
+                ),
+                .init(
+                    index: fixture.nestedEntry,
+                    parameterTypes: [],
+                    resultType: .int64
+                ) { _ in .returned(try! .integerValue(2)) },
+            ]),
+            shellInterfaceHash: fixture.shellHash,
+            nativeCatalog: try .init([nestedInvoker]),
+            asyncNativeCatalog: try .init([asyncInvoker])
+        )
+    }
+
+    private func generation(
+        fixture: Fixture,
+        package: String
+    ) throws -> Runtime.Generation {
+        try Runtime.Generation(
+            id: .init(rawValue: 1),
+            parentID: nil,
+            packageID: "HLX-runtime-async-\(package)",
+            packageHash: .sha256(fixture.bytes),
+            images: [fixture.image],
+            estimatedByteCount: fixture.bytes.count
+        )
+    }
+
+    private func decodeInt64(_ value: VM.Value?) throws -> Int64 {
+        guard let value else {
+            throw VM.RuntimeTrap.typeMismatch(expected: .int64, actual: nil)
+        }
+        return try Runtime.BridgeValueCodec.decode(value, as: Int64.self)
     }
 }
 }

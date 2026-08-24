@@ -81,6 +81,52 @@ struct NativeImportCatalogPipeline {
         )
     }
 
+    @Test("Catalog freezes exact suspending factories and rejects async closure transport")
+    func validatesAsyncFactories() throws {
+        var candidate = makeCandidate(
+            canonicalCallee: "Fixture.fetch(_:)",
+            symbol: "$s7Fixture5fetchyS2iYaF",
+            factoryType: "FixtureSupport.FetchFactory",
+            module: "FixtureSupport"
+        )
+        candidate.signature = .init(
+            parameters: ["Swift.Int"],
+            result: "Swift.Int",
+            isAsync: true
+        )
+        candidate.effects.isAsync = true
+        candidate.contract = .suspending(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 5_000_000,
+            allowsMainThread: true
+        )
+        let document = NativeImportCatalog.Document(candidates: [candidate])
+        try document.validate()
+        #expect(
+            try NativeImportCatalog.Codec.decode(
+                NativeImportCatalog.Codec.encode(document)
+            ) == document
+        )
+
+        var mismatched = candidate
+        mismatched.signature.isAsync = false
+        #expect(throws: NativeImportCatalog.Error.invalid(
+            "candidate Fixture.fetch(_:) has an invalid symbol, signature, factory, or type"
+        )) {
+            try NativeImportCatalog.Document(candidates: [mismatched]).validate()
+        }
+
+        var closureResult = candidate
+        closureResult.signature.result = "(Swift.Int) -> Swift.Int"
+        #expect(throws: NativeImportCatalog.Error.invalid(
+            "candidate Fixture.fetch(_:) has an invalid symbol, signature, factory, or type"
+        )) {
+            try NativeImportCatalog.Document(candidates: [closureResult]).validate()
+        }
+    }
+
     @Test("Catalog validates authoritative native callback lifetimes")
     func validatesCallbackLifetimeAuthority() throws {
         var candidate = makeCandidate(

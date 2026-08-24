@@ -21,7 +21,8 @@ private extension BridgeGeneration.Root {
         originalInvocation: String,
         bridgeInvocation: String,
         enclosingPrefix: String = "",
-        enclosingSuffix: String = ""
+        enclosingSuffix: String = "",
+        installation: BridgeGeneration.Installation = .dynamicReplacement
     ) {
         self.init(
             functionKey: functionKey,
@@ -47,7 +48,8 @@ private extension BridgeGeneration.Root {
             parameterSwiftTypes: parameterSwiftTypes,
             resultSwiftType: resultSwiftType,
             originalInvocation: originalInvocation,
-            bridgeInvocation: bridgeInvocation
+            bridgeInvocation: bridgeInvocation,
+            installation: installation
         )
     }
 }
@@ -136,6 +138,22 @@ struct ReleasePipeline {
                 isAsync: true
             )
         }
+        var asyncInOut = candidate(leaf, name: "asyncInOut")
+        asyncInOut.canonicalDeclaration =
+            "func asyncInOut(_: inout Int) async"
+        asyncInOut.mangledName = "$s7Fixture10asyncInOutyySizYaF"
+        asyncInOut.loweredSignature = .init(
+            parameters: ["Swift.Int"],
+            result: "Swift.Void",
+            isAsync: true
+        )
+        asyncInOut.parameterConventions = [.inout]
+        asyncInOut.resultType = .void
+        asyncInOut.interface.canonicalFormalType =
+            "(inout Swift.Int) async -> Swift.Void"
+        asyncInOut.interface.loweredSILType =
+            "$@convention(thin) @async (@inout Int) -> ()"
+        asyncInOut.hasInOut = true
         let configuration = PatchConfiguration.Document(
             modules: ["Fixture": .init(include: ["Patch.swift"])]
         )
@@ -153,12 +171,13 @@ struct ReleasePipeline {
                 candidate(leaf, name: "leaf"),
                 candidate(suspending, name: "suspending"),
                 candidate(taskBased, name: "taskBased"),
+                asyncInOut,
             ]
         )
 
         let report = try ReleaseCompiler.Indexer().index(request)
         #expect(report.eligibleCount == 2)
-        #expect(report.rejectedCount == 1)
+        #expect(report.rejectedCount == 2)
         #expect(report.archive.capabilities.contains(.sequentialAsyncV1))
         #expect(report.archive.capabilities.contains(.anyValuesV1))
         #expect(report.archive.functions.first(where: {
@@ -173,6 +192,118 @@ struct ReleasePipeline {
         #expect(report.diagnostics.contains(where: {
             $0.code == "HLXIDX005" && $0.message.contains("sequential async profile")
         }))
+        #expect(report.diagnostics.contains(where: {
+            $0.code == "HLXIDX006"
+                && $0.message.contains("cannot cross an async suspension boundary")
+        }))
+    }
+
+    @Test("Sequential async rejects task, continuation, stream, and async-closure families")
+    func rejectsConcurrentAsyncFamilies() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("helix-async-exclusion-matrix-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("Patch.swift")
+        try Data(
+            """
+            @inline(never)
+            public func asyncHelper(_ value: Int) async -> Int { value + 1 }
+
+            public func taskValue(_ value: Int) async -> Int {
+                await Task { value }.value
+            }
+
+            public func detachedValue(_ value: Int) async -> Int {
+                await Task.detached { value }.value
+            }
+
+            public func asyncLetValue(_ value: Int) async -> Int {
+                async let result = asyncHelper(value)
+                return await result
+            }
+
+            public func taskGroupValue(_ value: Int) async -> Int {
+                await withTaskGroup(of: Int.self, returning: Int.self) { group in
+                    group.addTask { value }
+                    return await group.next() ?? 0
+                }
+            }
+
+            public func continuationValue(_ value: Int) async -> Int {
+                await withCheckedContinuation { continuation in
+                    continuation.resume(returning: value)
+                }
+            }
+
+            public func streamValue(_ value: Int) async -> Int {
+                let stream = AsyncStream<Int> { continuation in
+                    continuation.yield(value)
+                    continuation.finish()
+                }
+                for await element in stream { return element }
+                return 0
+            }
+
+            public func asyncClosureValue(_ value: Int) async -> Int {
+                let operations: [@Sendable () async -> Int] = [
+                    { await asyncHelper(value) },
+                    { value + 2 },
+                ]
+                return await operations[value & 1]()
+            }
+            """.utf8
+        ).write(to: source)
+        let file = try CanonicalSIL.File(
+            text: SwiftFrontend.Driver().emitCanonicalSIL(
+                sourceFiles: [source],
+                moduleName: "HelixAsyncExclusionFixture"
+            )
+        )
+        for name in [
+            "taskValue", "detachedValue", "asyncLetValue", "taskGroupValue",
+            "continuationValue", "streamValue", "asyncClosureValue",
+        ] {
+            let matches = file.functions.filter {
+                $0.mangledName.contains(name)
+                    && $0.mangledName.hasSuffix("F")
+            }
+            let matchingInventory = file.functions.filter {
+                $0.mangledName.contains(name)
+            }.map { "\($0.mangledName) :: \($0.loweredType)" }
+            #expect(
+                matches.count == 1,
+                Comment(rawValue: "\(name): \(matchingInventory)")
+            )
+            let function = try #require(matches.first, Comment(rawValue: name))
+            var rejected = false
+            do {
+                try CanonicalSIL.SequentialAsync.validate(
+                    function,
+                    effects: .init(isAsync: true)
+                )
+            } catch is CanonicalSIL.LoweringError {
+                rejected = true
+            }
+            #expect(
+                rejected,
+                Comment(rawValue: "\(name):\n\(function.body)")
+            )
+        }
+        let taskLocal = CanonicalSIL.Function(
+            mangledName: "$s20TaskLocalSyntheticF",
+            loweredType: "$@convention(thin) @async () -> ()",
+            body: "%0 = metatype $@thin TaskLocal<Swift.Int>.Type"
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.SequentialAsync.validate(
+                taskLocal,
+                effects: .init(isAsync: true)
+            )
+        }
     }
 
     @Test("HLXI 1.0 derives leaf fingerprints and requires generated dependency fingerprints")
@@ -503,6 +634,35 @@ struct ReleasePipeline {
         #expect(bodyTransformedText.contains("return x + 28"))
         #expect(bodyTransformedText.contains(
             "#sourceLocation(file: \"Sources/Patch.swift\", line: 1)\n}"
+        ))
+        let carriageReturnSource = Data(
+            "func value() {\r    return 1\r}\rfunc next() {}".utf8
+        )
+        let carriageReturnBody = try #require(
+            carriageReturnSource.range(of: Data("{\r    return 1\r}".utf8))
+        )
+        let carriageReturnTransform = try SourceTransform.Transformer().transform(
+            source: carriageReturnSource,
+            logicalPath: "Sources/CarriageReturn.swift",
+            expectedSourceHash: .sha256(carriageReturnSource),
+            edits: [],
+            replacements: [
+                .init(
+                    utf8Range: carriageReturnBody,
+                    expectedContentHash: .sha256(
+                        carriageReturnSource.subdata(in: carriageReturnBody)
+                    ),
+                    replacement: "{\n    return 2\n}",
+                    functionKey: eligible.key,
+                    restoresSourceLocationBeforeFinalBrace: true
+                ),
+            ]
+        )
+        #expect(String(
+            decoding: carriageReturnTransform.contents,
+            as: UTF8.self
+        ).contains(
+            "#sourceLocation(file: \"Sources/CarriageReturn.swift\", line: 3)\n}"
         ))
         var staleBodyReplacement = bodyReplacement
         staleBodyReplacement.expectedContentHash = .sha256("stale body")
@@ -1085,12 +1245,28 @@ struct ReleasePipeline {
             roots: roots
         )
         let entrySource = bridge.sourceFiles.values.joined(separator: "\n")
-        #expect(entrySource.contains("let decision = try Runtime.Bridge.shared.dispatch"))
-        #expect(entrySource.contains("arguments: { encoder in"))
-        #expect(entrySource.contains("encoder.encodeArguments(count:"))
-        #expect(entrySource.contains("encoder.encodeArray"))
-        #expect(entrySource.contains("encoder.encodeDictionary"))
-        #expect(entrySource.contains("encoder.encodeSet"))
+        let generatedCall: (String) -> Bool = { method in
+            entrySource.range(
+                of: #"helixEncoder_[0-9a-f]+\."# + method,
+                options: .regularExpression
+            ) != nil
+        }
+        #expect(
+            entrySource.range(
+                of: #"let helixDecision_[0-9a-f]+ = try Runtime\.Bridge\.shared\.dispatch"#,
+                options: .regularExpression
+            ) != nil
+        )
+        #expect(
+            entrySource.range(
+                of: #"arguments: \{ helixEncoder_[0-9a-f]+ in"#,
+                options: .regularExpression
+            ) != nil
+        )
+        #expect(generatedCall("encodeArguments\\(count:"))
+        #expect(generatedCall("encodeArray"))
+        #expect(generatedCall("encodeDictionary"))
+        #expect(generatedCall("encodeSet"))
         #expect(entrySource.contains("return try risky(x)"))
         #expect(entrySource.contains("MainActor.assumeIsolated"))
         #expect(entrySource.contains("outcome: .businessError"))
@@ -1100,7 +1276,7 @@ struct ReleasePipeline {
         #expect(entrySource.contains("BridgeValueCodec.decodeDictionary"))
         #expect(entrySource.contains("BridgeValueCodec.encodeSet"))
         #expect(entrySource.contains("BridgeValueCodec.decodeSet"))
-        #expect(entrySource.contains("encoder.encodeAny"))
+        #expect(generatedCall("encodeAny"))
         #expect(entrySource.contains("BridgeValueCodec.encodeAny"))
         #expect(entrySource.contains("BridgeValueCodec.decodeAny"))
         #expect(
@@ -1121,8 +1297,8 @@ struct ReleasePipeline {
         )
     }
 
-    @Test("Generated async leaf Bridges preserve async, throws, isolation, and fail-closed catalog routing")
-    func typeChecksAsyncLeafBridges() throws {
+    @Test("Generated sequential async Bridges route patches and exact original fallbacks")
+    func typeChecksSequentialAsyncBridges() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-bridge-async-\(UUID().uuidString)",
             isDirectory: true
@@ -1133,10 +1309,21 @@ struct ReleasePipeline {
         let source = """
         public enum AsyncFailure: Error { case rejected }
 
-        public func refresh(_ value: Int) async -> Int { value + 1 }
+        public func refresh(_ encoder: Int) async -> Int { encoder + 1 }
+
+        func helixExactOriginal_refresh(_ encoder: Int) async -> Int {
+            return encoder + 1
+        }
 
         @MainActor public func renderAsync(_ value: Int) async throws -> Int {
             guard value >= 0 else { throw AsyncFailure.rejected }
+            return value + 2
+        }
+
+        @MainActor func helixExactOriginal_renderAsync(
+            _ value: Int
+        ) async throws -> Int {
+            if value < 0 { throw AsyncFailure.rejected }
             return value + 2
         }
         """
@@ -1177,6 +1364,15 @@ struct ReleasePipeline {
             requiresMainActor: true,
             isAsync: true
         )
+        let refreshInterface = ReleaseCompiler.DeclarationInterface(
+            declarationKind: "function",
+            baseName: "refresh",
+            argumentLabels: ["_"],
+            accessLevel: "public",
+            canonicalFormalType: "(Swift.Int) async -> Swift.Int",
+            loweredSILType: refresh.loweredType,
+            effects: asyncEffects
+        )
         let report = try ReleaseCompiler.Indexer().index(
             .init(
                 metadata: metadata,
@@ -1209,15 +1405,7 @@ struct ReleasePipeline {
                         ),
                         parameterTypes: [.int64],
                         resultType: .int64,
-                        interface: .init(
-                            declarationKind: "function",
-                            baseName: "refresh",
-                            argumentLabels: ["_"],
-                            accessLevel: "public",
-                            canonicalFormalType: "(Swift.Int) async -> Swift.Int",
-                            loweredSILType: refresh.loweredType,
-                            effects: asyncEffects
-                        ),
+                        interface: refreshInterface,
                         canonicalSILBody: refresh.body,
                         effects: asyncEffects,
                         isAsync: true
@@ -1274,7 +1462,8 @@ struct ReleasePipeline {
                     parameterSwiftTypes: ["Swift.Int"],
                     resultSwiftType: "Swift.Int",
                     originalInvocation: "renderAsync(value)",
-                    bridgeInvocation: "helixBridge_renderAsync(argument0)"
+                    bridgeInvocation: "helixExactOriginal_renderAsync(argument0)",
+                    installation: .sourceBody
                 )
             }
             return .init(
@@ -1284,29 +1473,106 @@ struct ReleasePipeline {
                 privateImportSourceFile: "AsyncBridge.swift",
                 originalReference: "refresh(_:)",
                 replacementDeclaration:
-                    "public func helixBridge_refresh(_ value: Int) async -> Int",
-                parameterExpressions: ["value"],
+                    "public func helixBridge_refresh(_ encoder: Int) async -> Int",
+                parameterExpressions: ["encoder"],
                 parameterSwiftTypes: ["Swift.Int"],
                 resultSwiftType: "Swift.Int",
-                originalInvocation: "refresh(value)",
-                bridgeInvocation: "helixBridge_refresh(argument0)"
+                originalInvocation: "refresh(encoder)",
+                bridgeInvocation: "helixExactOriginal_refresh(argument0)",
+                installation: .sourceBody
             )
         }
-        let bridge = try BridgeGeneration.Generator().generate(
+        let bridgeGenerator = BridgeGeneration.Generator()
+        let bridge = try bridgeGenerator.generate(
             archive: report.archive,
             moduleName: "Fixture",
             roots: roots
         )
+        let sourceBodyTransform = try bridgeGenerator.renderSourceBodyTransform(
+            archive: report.archive,
+            roots: roots
+        )
         let generated = bridge.sourceFiles.values.joined(separator: "\n")
-        #expect(generated.contains("return await refresh(value)"))
-        #expect(generated.contains("return try await renderAsync(value)"))
-        #expect(generated.contains("async Shell entry requires its generated async Bridge"))
-        #expect(!generated.contains("Runtime.Bridge.shared.withOriginalBypass"))
-        try typeCheckGeneratedBridge(
+        let generatedBodies = sourceBodyTransform.bodies.values.map {
+            switch $0 {
+            case let .replacement(value): value
+            case let .preservingOriginal(prefix, suffix): prefix + suffix
+            }
+        }.joined(separator: "\n")
+        #expect(generatedBodies.contains("Runtime.Bridge.shared.prepareAsyncDispatch"))
+        #expect(generatedBodies.contains("return try await Runtime.Bridge.shared.dispatchAsync"))
+        #expect(!generated.contains("@_dynamicReplacement"))
+        #expect(generated.contains("await helixExactOriginal_refresh(argument0)"))
+        #expect(generated.contains("try await helixExactOriginal_renderAsync(argument0)"))
+        #expect(generated.contains("invokeAsync: { arguments in"))
+        #expect(generated.contains("invokeMainActorAsync: { arguments in"))
+        #expect(!generated.contains("withOriginalBypassAsync"))
+        #expect(!generated.contains("async Shell entry requires its generated async Bridge"))
+        let refreshRecord = try #require(report.archive.functions.first {
+            $0.mangledName == refresh.mangledName
+        })
+        let renderRecord = try #require(report.archive.functions.first {
+            $0.mangledName == render.mangledName
+        })
+        let refreshEntry = try #require(refreshRecord.entryIndex)
+        let changedSource = """
+        public enum AsyncFailure: Error { case rejected }
+
+        @inline(never)
+        private func step(_ value: Int) async -> Int { value + 9 }
+
+        public func refresh(_ encoder: Int) async -> Int {
+            await step(encoder)
+        }
+
+        @MainActor public func renderAsync(_ value: Int) async throws -> Int {
+            guard value >= 0 else { throw AsyncFailure.rejected }
+            return value + 2
+        }
+        """
+        try Data(changedSource.utf8).write(to: sourceURL, options: .atomic)
+        let changedSIL = try SwiftFrontend.Driver().emitCanonicalSIL(
+            sourceFiles: [sourceURL],
+            moduleName: "Fixture"
+        )
+        let compiled = try PatchCompiler.Driver().compile(
+            canonicalSIL: changedSIL,
+            functionKey: refreshRecord.key,
+            currentInterface: refreshInterface,
+            archive: report.archive
+        )
+        #expect(compiled.module.functions.count == 2)
+        #expect(compiled.disassembly.contains("hlbc_apply"))
+        let transformedSource = try applySourceBodyTransform(
+            sourceBodyTransform,
+            source: source,
+            logicalPath: "Sources/AsyncBridge.swift",
+            bodies: [
+                refreshRecord.key: "{ encoder + 1 }",
+                renderRecord.key: """
+                {
+                    guard value >= 0 else { throw AsyncFailure.rejected }
+                    return value + 2
+                }
+                """,
+            ]
+        )
+        let transformedSourceURL = directory.appendingPathComponent(
+            "HelixGenerated.AsyncBridge.swift"
+        )
+        try transformedSource.write(to: transformedSourceURL, options: .atomic)
+        let fixtureObject = try typeCheckGeneratedAsyncBridge(
             bridge,
-            baseSourceURL: sourceURL,
+            baseSourceURL: transformedSourceURL,
+            directory: directory
+        )
+        try executeGeneratedAsyncBridge(
+            bridge,
             directory: directory,
-            additionalSource: nil
+            fixtureObject: fixtureObject,
+            patchBytecode: compiled.bytecode,
+            patchCapabilities: compiled.module.capabilities,
+            refreshEntry: refreshEntry
         )
     }
 
@@ -1437,6 +1703,113 @@ struct ReleasePipeline {
         )
     }
 
+    private func applySourceBodyTransform(
+        _ transform: BridgeGeneration.SourceBodyTransform,
+        source: String,
+        logicalPath: String,
+        bodies: [Core.FunctionKey: String]
+    ) throws -> Data {
+        let sourceData = Data(source.utf8)
+        let replacements = try bodies.map { key, bracedBody in
+            let bodyData = Data(bracedBody.utf8)
+            guard bodyData.count >= 2,
+                  bodyData.first == UInt8(ascii: "{"),
+                  bodyData.last == UInt8(ascii: "}"),
+                  let range = sourceData.range(of: bodyData),
+                  sourceData.range(
+                      of: bodyData,
+                      in: range.upperBound..<sourceData.endIndex
+                  ) == nil,
+                  let generated = transform.bodies[key],
+                  let original = String(
+                      data: bodyData.subdata(in: 1..<(bodyData.count - 1)),
+                      encoding: .utf8
+                  )
+            else {
+                throw BridgeGeneration.Error.invalidRoot(key)
+            }
+            var openingBraceLine = 1
+            var openingLineStart = sourceData.startIndex
+            for index in sourceData.startIndex..<range.lowerBound {
+                if sourceData[index] == UInt8(ascii: "\n") {
+                    openingBraceLine += 1
+                    openingLineStart = index + 1
+                }
+            }
+            return SourceTransform.Replacement(
+                utf8Range: range,
+                expectedContentHash: .sha256(bodyData),
+                replacement: generated.render(
+                    originalBody: original,
+                    logicalPath: logicalPath,
+                    openingBraceLine: openingBraceLine,
+                    openingBraceColumn: range.lowerBound - openingLineStart + 1
+                ),
+                functionKey: key,
+                restoresSourceLocationBeforeFinalBrace: true
+            )
+        }
+        return try SourceTransform.Transformer().transform(
+            source: sourceData,
+            logicalPath: logicalPath,
+            expectedSourceHash: .sha256(sourceData),
+            edits: [],
+            replacements: replacements,
+            supplementalDeclarations:
+                transform.supplementalDeclarations[logicalPath] ?? ""
+        ).contents
+    }
+
+    private func typeCheckGeneratedAsyncBridge(
+        _ bridge: BridgeGeneration.Output,
+        baseSourceURL: URL,
+        directory: URL
+    ) throws -> URL {
+        let driver = SwiftFrontend.Driver()
+        let modules = try swiftPMModulesDirectory()
+        let fixtureModule = directory.appendingPathComponent("Fixture.swiftmodule")
+        let fixtureObject = directory.appendingPathComponent("Fixture.o")
+        try requireSuccess(
+            driver.run(
+                arguments: [
+                    baseSourceURL.path,
+                    "-emit-object", "-emit-module", "-parse-as-library",
+                    "-module-name", "Fixture",
+                    "-Xfrontend", "-enable-private-imports",
+                    "-emit-module-path", fixtureModule.path,
+                    "-I", modules.path,
+                ] + (try runtimeSupportCompilerArguments(modules: modules)) + [
+                    "-warnings-as-errors", "-o", fixtureObject.path,
+                ],
+                workingDirectory: directory
+            )
+        )
+
+        let generatedURLs = try bridge.sourceFiles.sorted(by: {
+            $0.key < $1.key
+        }).map { item in
+            let url = directory.appendingPathComponent(
+                URL(fileURLWithPath: item.key).lastPathComponent
+            )
+            try Data(item.value.utf8).write(to: url, options: .atomic)
+            return url
+        }
+        try requireSuccess(
+            driver.run(
+                arguments: generatedURLs.map(\.path) + [
+                    "-typecheck", "-parse-as-library",
+                    "-module-name", "FixtureGeneratedAsyncBridge",
+                    "-I", directory.path, "-I", modules.path,
+                ] + (try runtimeSupportCompilerArguments(modules: modules)) + [
+                    "-Xfrontend", "-enable-private-imports",
+                    "-warnings-as-errors",
+                ],
+                workingDirectory: directory
+            )
+        )
+        return fixtureObject
+    }
+
     private func executeGeneratedBridge(
         _ bridge: BridgeGeneration.Output,
         directory: URL,
@@ -1545,6 +1918,126 @@ struct ReleasePipeline {
         )
         try requireSuccess(execution)
         #expect(execution.standardOutput.contains("HELIX_GENERATED_BRIDGE_OK"))
+    }
+
+    private func executeGeneratedAsyncBridge(
+        _ bridge: BridgeGeneration.Output,
+        directory: URL,
+        fixtureObject: URL,
+        patchBytecode: Data,
+        patchCapabilities: Set<Core.Capability>,
+        refreshEntry: Core.EntryIndex
+    ) throws {
+        var sourceURLs: [URL] = []
+        for (path, contents) in bridge.sourceFiles.sorted(by: { $0.key < $1.key }) {
+            let url = directory.appendingPathComponent(
+                URL(fileURLWithPath: path).lastPathComponent
+            )
+            try Data(contents.utf8).write(to: url, options: .atomic)
+            sourceURLs.append(url)
+        }
+        let hostURL = directory.appendingPathComponent("FixtureAsyncBridgeHost.swift")
+        let bytecodeLiteral = patchBytecode.map(String.init).joined(separator: ", ")
+        let capabilityLiteral = patchCapabilities.sorted().map {
+            "Core.Capability(rawValue: \(String(reflecting: $0.rawValue)))"
+        }.joined(separator: ", ")
+        let host = """
+        import Foundation
+        import Fixture
+        import HelixCore
+        import HelixRuntime
+        import HelixVerifier
+
+        @main
+        enum FixtureAsyncBridgeHost {
+            static func mark(_ value: String) {
+                FileHandle.standardError.write(Data((value + "\\n").utf8))
+            }
+
+            static func main() async throws {
+                mark("start")
+                let runtime = try FixtureBridge.makeRuntime()
+                mark("runtime")
+                try FixtureBridge.bootstrap(using: runtime)
+                mark("bootstrap")
+                guard await refresh(3) == 4 else {
+                    fatalError("async replacement did not reach its lexical previous implementation")
+                }
+                mark("direct")
+
+                let entry = Core.EntryIndex(rawValue: \(refreshEntry.rawValue))
+                guard let original = runtime.originals[entry] else {
+                    fatalError("generated async OriginalCatalog is incomplete")
+                }
+                let input = try Runtime.BridgeValueCodec.encode(Int(3))
+                mark("catalog-start")
+                let originalResult = await original.invokeAsync([input])
+                mark("catalog-end")
+                guard case let .returned(value) = originalResult.outcome,
+                      let value,
+                      try Runtime.BridgeValueCodec.decode(value, as: Int.self) == 4
+                else {
+                    fatalError("async OriginalCatalog did not call its exact-original thunk")
+                }
+
+                let patchBytes = Data([\(bytecodeLiteral)])
+                let image = try Verification.Engine().verify(
+                    bytes: patchBytes,
+                    shell: try FixtureBridge.makeShellInterface(),
+                    policy: .init(
+                        acceptedCapabilities: Set([\(capabilityLiteral)])
+                    )
+                )
+                mark("verified")
+                let generation = try Runtime.Generation(
+                    id: .init(rawValue: 1),
+                    parentID: nil,
+                    packageID: "HLX-generated-async-bridge-probe",
+                    packageHash: .sha256(patchBytes),
+                    images: [image],
+                    estimatedByteCount: patchBytes.count
+                )
+                try runtime.activate(generation, expectedActiveID: nil)
+                mark("activated")
+                guard await refresh(3) == 12 else {
+                    fatalError("async replacement did not route through the suspended HLVM graph")
+                }
+                mark("patched")
+                try runtime.rollback(expectedActiveID: generation.id, to: nil)
+                guard await refresh(3) == 4 else {
+                    fatalError("async rollback did not restore the lexical previous implementation")
+                }
+                mark("rolled-back")
+                print("HELIX_GENERATED_ASYNC_BRIDGE_OK")
+            }
+        }
+        """
+        try Data(host.utf8).write(to: hostURL, options: .atomic)
+        sourceURLs.append(hostURL)
+
+        let modules = try swiftPMModulesDirectory()
+        let executable = directory.appendingPathComponent("FixtureAsyncBridgeHost")
+        let objects = try runtimeObjectFiles(modules: modules)
+        let link = try SwiftFrontend.Driver().run(
+            arguments: sourceURLs.map(\.path) + [fixtureObject.path]
+                + objects.map(\.path) + [
+                "-parse-as-library", "-module-name", "FixtureAsyncBridgeHost",
+                "-I", directory.path, "-I", modules.path,
+            ] + (try runtimeSupportCompilerArguments(modules: modules)) + [
+                "-Xfrontend", "-enable-private-imports",
+                "-warnings-as-errors", "-o", executable.path,
+            ],
+            workingDirectory: directory
+        )
+        try requireSuccess(link)
+        let execution = try SwiftFrontend.Driver(compilerURL: executable).run(
+            arguments: [],
+            workingDirectory: directory
+        )
+        try requireSuccess(execution)
+        #expect(
+            execution.standardOutput.contains("HELIX_GENERATED_ASYNC_BRIDGE_OK")
+        )
     }
 
     @Test("Generated Bridge link input excludes stale SwiftPM object files")

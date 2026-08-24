@@ -6,6 +6,14 @@ import HelixInterface
 public enum BridgeGeneration {}
 
 extension BridgeGeneration {
+/// Location in which a permanent Shell entry dispatch site is emitted.
+public enum Installation: Hashable, Sendable {
+    /// Emits a generated declaration that replaces the original dynamically.
+    case dynamicReplacement
+    /// Rewrites the exact body in the derived copy of its defining source.
+    case sourceBody
+}
+
 public struct Root: Hashable, Sendable {
     public var functionKey: Core.FunctionKey
     public var entryIndex: Core.EntryIndex
@@ -18,6 +26,7 @@ public struct Root: Hashable, Sendable {
     public var resultSwiftType: String
     public var originalInvocation: String
     public var bridgeInvocation: String?
+    public var installation: BridgeGeneration.Installation
 
     public init(
         functionKey: Core.FunctionKey,
@@ -30,7 +39,8 @@ public struct Root: Hashable, Sendable {
         parameterSwiftTypes: [String],
         resultSwiftType: String,
         originalInvocation: String,
-        bridgeInvocation: String?
+        bridgeInvocation: String?,
+        installation: BridgeGeneration.Installation = .dynamicReplacement
     ) {
         self.functionKey = functionKey
         self.entryIndex = entryIndex
@@ -43,6 +53,7 @@ public struct Root: Hashable, Sendable {
         self.resultSwiftType = resultSwiftType
         self.originalInvocation = originalInvocation
         self.bridgeInvocation = bridgeInvocation
+        self.installation = installation
     }
 }
 
@@ -277,6 +288,7 @@ public struct Generator: Sendable {
                   values.allSatisfy({
                       $0.sourceFileLogicalID == first.sourceFileLogicalID
                           && $0.sourceDeclaration == first.sourceDeclaration
+                          && $0.installation == first.installation
                   }),
                   Set(values.map(\.memberRole)).count == values.count
             else {
@@ -396,7 +408,7 @@ public struct Generator: Sendable {
                 $0[0].sourceDeclaration.identity < $1[0].sourceDeclaration.identity
             }
             for replacementGroup in replacementGroups
-            where replacementGroup[0].sourceDeclaration.kind != .propertyObservers {
+            where replacementGroup[0].installation == .dynamicReplacement {
                 lines.append("")
                 lines.append(try renderReplacementDeclaration(
                     replacementGroup,
@@ -452,8 +464,9 @@ public struct Generator: Sendable {
         let originalCatalogFactory = renderOriginalCatalogFactory(
             entryGroupNames: entryGroupNames
         )
-        let nativeCatalogFactory = renderNativeCatalogFactory(
+        let nativeCatalogFactory = try renderNativeCatalogFactory(
             imports: nativeImports,
+            records: archive.nativeImports,
             types: nativeTypes
         )
         let nativeImportStatements = Array(
@@ -621,9 +634,12 @@ public struct Generator: Sendable {
             + (root.bridgeInvocation.map { [$0] } ?? [])
         let isObserver = root.sourceDeclaration.kind == .propertyObservers
             && [.willSet, .didSet].contains(root.memberRole)
+        let expectedInstallation: BridgeGeneration.Installation =
+            isObserver || record.effects.isAsync ? .sourceBody : .dynamicReplacement
         guard !root.privateImportSourceFile.isEmpty,
               root.sourceDeclaration.isWellFormed,
               root.sourceDeclaration.member(root.memberRole) != nil,
+              root.installation == expectedInstallation,
               !root.resultSwiftType.isEmpty,
               !root.originalInvocation.isEmpty,
               (root.bridgeInvocation == nil) == isObserver,
@@ -639,7 +655,11 @@ public struct Generator: Sendable {
             throw BridgeGeneration.Error.invalidRoot(root.functionKey)
         }
         guard record.effects.mayThrow == record.loweredSignature.isThrowing,
-              record.effects.isAsync == record.loweredSignature.isAsync
+              record.effects.isAsync == record.loweredSignature.isAsync,
+              !record.effects.isAsync || (
+                  !isObserver
+                      && !record.parameterConventions.contains(.inout)
+              )
         else {
             throw BridgeGeneration.Error.invalidRoot(root.functionKey)
         }
@@ -1242,6 +1262,64 @@ public struct Generator: Sendable {
         }
     }
 
+    private struct BoundaryRendering {
+        var shapes: [SwiftTypeShape]
+        var writebackIndex: Int?
+        var writebackName: String?
+        var encoderName: String
+        var arguments: [String]
+        var argumentArray: String
+        var resultShape: SwiftTypeShape
+        var decodeResult: String
+    }
+
+    private func renderBoundary(
+        _ root: BridgeGeneration.Root,
+        record: InterfaceArchive.FunctionRecord,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
+    ) throws -> BoundaryRendering {
+        let shapes = try root.parameterSwiftTypes.map(parseSwiftType)
+        let writebackIndex = record.parameterConventions.firstIndex(of: .inout)
+        let writebackName = writebackIndex.map {
+            generatedLocalIdentifier("Writeback\($0)", root: root)
+        }
+        let encoderName = generatedLocalIdentifier("Encoder", root: root)
+        let boundaryExpressions = root.parameterExpressions.indices.map { index in
+            index == writebackIndex
+                ? writebackName! : root.parameterExpressions[index]
+        }
+        let arguments = zip(
+            zip(boundaryExpressions, shapes),
+            record.parameterTypes
+        ).map {
+            renderEncode(
+                expression: $0.0.0,
+                shape: $0.0.1,
+                type: $0.1,
+                nativeCatalog: "try Runtime.Bridge.shared.requireNativeTypeCatalog()",
+                inputEncoder: encoderName,
+                frozenValueTypes: frozenValueTypes
+            )
+        }
+        let resultShape = try parseSwiftType(root.resultSwiftType)
+        return .init(
+            shapes: shapes,
+            writebackIndex: writebackIndex,
+            writebackName: writebackName,
+            encoderName: encoderName,
+            arguments: arguments,
+            argumentArray: renderArray(arguments, indentation: 20),
+            resultShape: resultShape,
+            decodeResult: renderDecodeResult(
+                shape: resultShape,
+                type: record.resultType,
+                frozenValueTypes: frozenValueTypes
+            )
+        )
+    }
+
     package func renderReplacementBody(
         _ root: BridgeGeneration.Root,
         record: InterfaceArchive.FunctionRecord,
@@ -1249,70 +1327,65 @@ public struct Generator: Sendable {
             Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
         ]
     ) throws -> String {
-        let shapes = try root.parameterSwiftTypes.map(parseSwiftType)
-        let writebackIndex = record.parameterConventions.firstIndex(of: .inout)
-        let boundaryExpressions = root.parameterExpressions.indices.map { index in
-            index == writebackIndex ? "helixWriteback\(index)" : root.parameterExpressions[index]
+        guard !record.effects.isAsync else {
+            throw BridgeGeneration.Error.invalidRoot(root.functionKey)
         }
-        let arguments = zip(zip(boundaryExpressions, shapes), record.parameterTypes).map {
-            renderEncode(
-                expression: $0.0.0,
-                shape: $0.0.1,
-                type: $0.1,
-                nativeCatalog: "try Runtime.Bridge.shared.requireNativeTypeCatalog()",
-                inputEncoder: "encoder",
-                frozenValueTypes: frozenValueTypes
-            )
-        }
-        let resultShape = try parseSwiftType(root.resultSwiftType)
-        let decodeResult = renderDecodeResult(
-            shape: resultShape,
-            type: record.resultType,
+        let boundary = try renderBoundary(
+            root,
+            record: record,
             frozenValueTypes: frozenValueTypes
         )
-        let array = renderArray(arguments, indentation: 20)
-        let originalAttempt = (record.effects.mayThrow ? "try " : "")
-            + (record.effects.isAsync ? "await " : "")
-        let writebackDeclaration = writebackIndex.map { index in
-            "let helixWriteback\(index): \(shapes[index].rendered) = "
+        let originalAttempt = record.effects.mayThrow ? "try " : ""
+        let writebackDeclaration = boundary.writebackIndex.map { index in
+            "let \(boundary.writebackName!): \(boundary.shapes[index].rendered) = "
                 + root.parameterExpressions[index]
         }
-        let applyWritebacks = writebackIndex.map { index -> String in
+        let applyWritebacks = boundary.writebackIndex.map { index -> String in
+            let writebacksName = generatedLocalIdentifier(
+                "Writebacks",
+                root: root
+            )
+            let decodedName = generatedLocalIdentifier(
+                "DecodedWriteback\(index)",
+                root: root
+            )
             let decoded = renderDecode(
-                expression: "writebacks[0].value",
-                shape: shapes[index],
+                expression: "\(writebacksName)[0].value",
+                shape: boundary.shapes[index],
                 type: record.parameterTypes[index],
                 frozenValueTypes: frozenValueTypes
             )
             return """
             ,
-            applyWritebacks: { writebacks in
-                guard writebacks.count == 1,
-                      writebacks[0].parameterIndex == \(index)
+            applyWritebacks: { \(writebacksName) in
+                guard \(writebacksName).count == 1,
+                      \(writebacksName)[0].parameterIndex == \(index)
                 else {
                     throw VM.RuntimeTrap.nativeFailure("generated Bridge received an invalid writeback set")
                 }
-                let decodedWriteback: \(shapes[index].rendered) = \(decoded)
-                \(root.parameterExpressions[index]) = decodedWriteback
+                let \(decodedName): \(boundary.shapes[index].rendered) = \(decoded)
+                \(root.parameterExpressions[index]) = \(decodedName)
             }
             """
         } ?? ""
         let originalFallback = record.resultType == .void
             ? "\(originalAttempt)\(root.originalInvocation)\n    return ()"
             : "return \(originalAttempt)\(root.originalInvocation)"
+        let decisionName = generatedLocalIdentifier("Decision", root: root)
+        let resultName = generatedLocalIdentifier("Result", root: root)
         let dispatch = (writebackDeclaration.map { $0 + "\n" } ?? "") + """
-        let decision = try Runtime.Bridge.shared.dispatch(
+        let \(decisionName) = try Runtime.Bridge.shared.dispatch(
             entry: .init(rawValue: \(root.entryIndex.rawValue)),
-            arguments: { encoder in
-                try encoder.encodeArguments(count: \(arguments.count)) { \(array) }
+            arguments: { \(boundary.encoderName) in
+                try \(boundary.encoderName).encodeArguments(count: \(boundary.arguments.count)) { \(boundary.argumentArray) }
             },
-            decodeResult: \(decodeResult)\(applyWritebacks)
+            decodeResult: \(boundary.decodeResult)\(applyWritebacks)
         )
-        switch decision {
+        switch \(decisionName) {
         case .originalRequired:
             \(originalFallback)
-        case let .returned(result):
-            return result
+        case let .returned(\(resultName)):
+            return \(resultName)
         }
         """
         let body: String
@@ -1323,6 +1396,75 @@ public struct Generator: Sendable {
                 + "\n} catch {\n    Runtime.Bridge.terminate(error)\n}"
         }
         return body
+    }
+
+    package func renderAsyncSourceBodyTemplate(
+        _ root: BridgeGeneration.Root,
+        record: InterfaceArchive.FunctionRecord,
+        frozenValueTypes: [
+            Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
+        ]
+    ) throws -> BridgeGeneration.SourceBodyTransform.Body {
+        guard record.effects.isAsync,
+              !record.parameterConventions.contains(.inout)
+        else {
+            throw BridgeGeneration.Error.invalidRoot(root.functionKey)
+        }
+        let boundary = try renderBoundary(
+            root,
+            record: record,
+            frozenValueTypes: frozenValueTypes
+        )
+        let originalAttempt = record.effects.mayThrow ? "try await " : "await "
+        let closureEffects = record.effects.mayThrow ? "async throws" : "async"
+        let preparedName = generatedLocalIdentifier("PreparedDispatch", root: root)
+        var prefix = """
+        let \(preparedName) = try Runtime.Bridge.shared.prepareAsyncDispatch(
+            entry: .init(rawValue: \(root.entryIndex.rawValue)),
+            arguments: { \(boundary.encoderName) in
+                try \(boundary.encoderName).encodeArguments(count: \(boundary.arguments.count)) { \(boundary.argumentArray) }
+            }
+        )
+        guard let \(preparedName) else {
+            return \(originalAttempt){ () \(closureEffects) -> \(boundary.resultShape.rendered) in
+        """
+        var suffix = """
+            }()
+        }
+        return try await Runtime.Bridge.shared.dispatchAsync(
+            prepared: \(preparedName),
+            decodeResult: \(boundary.decodeResult)
+        )
+        """
+        if !record.effects.mayThrow {
+            prefix = "do {\n" + indent(prefix, spaces: 4)
+            suffix = indent(suffix, spaces: 4)
+                + "\n} catch {\n    Runtime.Bridge.terminate(error)\n}"
+        }
+        return .preservingOriginal(
+            prefix: "{\n" + indent(prefix, spaces: 4) + "\n",
+            suffix: "\n" + indent(suffix, spaces: 4) + "\n}"
+        )
+    }
+
+    private func generatedLocalIdentifier(
+        _ role: String,
+        root: BridgeGeneration.Root
+    ) -> String {
+        let occupied = Set(root.parameterExpressions.map { expression in
+            expression.trimmingCharacters(in: CharacterSet(
+                charactersIn: "&` \t\r\n"
+            ))
+        })
+        let base = "helix\(role)_"
+            + String(root.functionKey.description.prefix(16))
+        var candidate = base
+        var discriminator = 0
+        while occupied.contains(candidate) {
+            discriminator += 1
+            candidate = "\(base)_\(discriminator)"
+        }
+        return candidate
     }
 
     private func renderReplacementDeclaration(
@@ -1423,25 +1565,6 @@ public struct Generator: Sendable {
             )
             """
         }
-        if record.effects.isAsync {
-            // Async entries can only be reached through their exact Swift async
-            // wrapper. The synchronous catalog descriptor exists for identity,
-            // fallback policy, and activation checks; nested HLVM calls are
-            // rejected by the Verifier and fail closed here as defense in depth.
-            return """
-            Runtime.OriginalEntry(
-                index: .init(rawValue: \(root.entryIndex.rawValue)),
-                parameterTypes: \(renderValueTypes(record.parameterTypes)),
-                parameterConventions: \(renderParameterConventions(record.parameterConventions)),
-                resultType: \(render(record.resultType)),
-                effects: \(render(record.effects)),
-                fallbackAllowed: \(record.fallbackAllowed),
-                invoke: { _ in
-                    .trapped(.nativeFailure("async Shell entry requires its generated async Bridge"))
-                }
-            )
-            """
-        }
         let shapes = try root.parameterSwiftTypes.map(parseSwiftType)
         let decoded = zip(
             zip(shapes, record.parameterTypes),
@@ -1498,12 +1621,19 @@ public struct Generator: Sendable {
                 + "\nreturn .init(outcome: .returned(\(encoded)), "
                 + "writebacks: \(writebacks))"
         }
-        let actorGuard = record.effects.requiresMainActor
+        let actorGuard = record.effects.requiresMainActor && !record.effects.isAsync
             ? ["guard Thread.isMainThread else {",
                "    return .trapped(.nativeFailure(\"MainActor original entry ran off the main thread\"))",
                "}"]
             : []
         let body = (decoded + actorGuard + [invocation]).joined(separator: "\n")
+        let invocationLabel: String
+        if record.effects.isAsync {
+            invocationLabel = record.effects.requiresMainActor
+                ? "invokeMainActorAsync" : "invokeAsync"
+        } else {
+            invocationLabel = "invoke"
+        }
         return """
         Runtime.OriginalEntry(
             index: .init(rawValue: \(root.entryIndex.rawValue)),
@@ -1512,7 +1642,7 @@ public struct Generator: Sendable {
             resultType: \(render(record.resultType)),
             effects: \(render(record.effects)),
             fallbackAllowed: \(record.fallbackAllowed),
-            invoke: { arguments in
+            \(invocationLabel): { arguments in
                 guard arguments.count == \(record.parameterTypes.count) else {
                     return .trapped(.nativeFailure("generated original entry argument count mismatch"))
                 }
@@ -1533,17 +1663,25 @@ public struct Generator: Sendable {
         bridgeInvocation: String,
         record: InterfaceArchive.FunctionRecord
     ) -> String {
-        let attempt = record.effects.mayThrow ? "try " : ""
+        let callAttempt = (record.effects.mayThrow ? "try " : "")
+            + (record.effects.isAsync ? "await " : "")
+        if record.effects.isAsync {
+            // Async source-body roots call a unique source-local thunk. Unlike
+            // a wrapper re-entry, that call is statically resolved and must
+            // not suppress legitimate recursive calls made by the original.
+            return "\(callAttempt)\(bridgeInvocation)"
+        }
+        let bypassAttempt = record.effects.mayThrow ? "try " : ""
         let bypass = """
-        \(attempt)Runtime.Bridge.shared.withOriginalBypass(
+        \(bypassAttempt)Runtime.Bridge.shared.withOriginalBypass(
             entry: .init(rawValue: \(root.entryIndex.rawValue))
         ) {
-            \(attempt)\(bridgeInvocation)
+            \(callAttempt)\(bridgeInvocation)
         }
         """
         guard record.effects.requiresMainActor else { return bypass }
         return """
-        \(attempt)MainActor.assumeIsolated {
+        \(record.effects.mayThrow ? "try " : "")MainActor.assumeIsolated {
         \(indent(bypass, spaces: 4))
         }
         """
@@ -2051,9 +2189,11 @@ public struct Generator: Sendable {
             if record.effects.requiresMainActor {
                 // Keep potentially non-Sendable native values actor-isolated;
                 // only their Sendable VM representation crosses the boundary.
+                let actorAttempt = record.effects.isAsync
+                    ? "try await " : "try "
                 if record.effects.mayThrow {
                     invocation = """
-                    return try context.withMainActor {
+                    return \(actorAttempt)context.withMainActor {
                         let result: \(resultShape.rendered)
                         do {
                             result = \(directCall)
@@ -2067,7 +2207,7 @@ public struct Generator: Sendable {
                     """
                 } else {
                     invocation = """
-                    return try context.withMainActor {
+                    return \(actorAttempt)context.withMainActor {
                         let result: \(resultShape.rendered) = \(directCall)
                         return .returned(\(encoded))
                     }
@@ -2084,12 +2224,16 @@ public struct Generator: Sendable {
         }
         let body = (decoded + [invocation]).joined(separator: "\n")
         let factoryName = BridgeGeneration.GeneratedNativeImport.factoryName(key: binding.key)
+        let invokerProtocol = record.effects.isAsync
+            ? "VM.AsyncNativeInvoker" : "VM.NativeInvoker"
+        let invokerType = record.effects.isAsync
+            ? "VM.ClosureAsyncNativeInvoker" : "VM.ClosureNativeInvoker"
         return """
         static func \(factoryName)(
             id: Core.NativeImportID,
             key: Core.NativeImportKey
-        ) -> any VM.NativeInvoker {
-            VM.ClosureNativeInvoker(
+        ) -> any \(invokerProtocol) {
+            \(invokerType)(
                 id: id,
                 key: key,
                 parameterTypes: \(renderValueTypes(record.parameterTypes)),
@@ -2362,7 +2506,10 @@ public struct Generator: Sendable {
             let owner = generated.ownerType!.split(separator: ".").map {
                 escapedSwiftIdentifier(String($0))
             }.joined(separator: ".")
-            return owner + "." + escapedSwiftIdentifier(generated.baseName)
+            return renderEffectfulNativeCall(
+                owner + "." + escapedSwiftIdentifier(generated.baseName),
+                effects: effects
+            )
         case .staticSetter:
             let owner = generated.ownerType!.split(separator: ".").map {
                 escapedSwiftIdentifier(String($0))
@@ -2373,7 +2520,10 @@ public struct Generator: Sendable {
             target = "argument\(generated.parameterSwiftTypes.count - 1)."
                 + escapedSwiftIdentifier(generated.baseName)
         case .instanceGetter:
-            return "argument0." + escapedSwiftIdentifier(generated.baseName)
+            return renderEffectfulNativeCall(
+                "argument0." + escapedSwiftIdentifier(generated.baseName),
+                effects: effects
+            )
         case .instanceSetter:
             return "argument1." + escapedSwiftIdentifier(generated.baseName)
                 + " = argument0"
@@ -2387,14 +2537,26 @@ public struct Generator: Sendable {
                 ? "argument\(offset)"
                 : "\(label): argument\(offset)"
         }.joined(separator: ", ")
-        let direct = (effects.mayThrow ? "try " : "") + "\(target)(\(arguments))"
-        return direct
+        return renderEffectfulNativeCall(
+            "\(target)(\(arguments))",
+            effects: effects
+        )
+    }
+
+    private func renderEffectfulNativeCall(
+        _ expression: String,
+        effects: Core.Effects
+    ) -> String {
+        (effects.mayThrow ? "try " : "")
+            + (effects.isAsync ? "await " : "")
+            + expression
     }
 
     private func renderMainActorCall(_ directCall: String, effects: Core.Effects) -> String {
         guard effects.requiresMainActor else { return directCall }
+        let attempt = effects.isAsync ? "try await " : "try "
         return """
-        try context.withMainActor {
+        \(attempt)context.withMainActor {
         \(indent(directCall, spaces: 4))
         }
         """
@@ -2909,6 +3071,8 @@ public struct Generator: Sendable {
             id: binding.id,
             key: binding.key
         )
+        let expectedDeadlineMode: Core.NativeImportDeadlineMode =
+            record.effects.isAsync ? .suspending : .bounded
         guard binding.invokerExpression == expectedExpression,
               record.silMangledNames.contains(generated.declarationMangledName),
               isSafeLogicalPath(generated.sourceFileLogicalID),
@@ -2922,10 +3086,15 @@ public struct Generator: Sendable {
               generated.argumentLabels.allSatisfy({
                   $0 == "_" || isValidSwiftIdentifier($0)
               }),
-              !record.effects.isAsync,
               record.capability == .nativeImportsV1,
               record.contract.domain == .application,
-              record.contract.execution.deadlineMode == .bounded,
+              record.contract.execution.deadlineMode == expectedDeadlineMode,
+              !record.effects.isAsync || (
+                  record.abiAdapter == .direct
+                      && record.contract.callbacks.isEmpty
+                      && !record.resultType.containsClosureValue
+                      && supportsAsyncGeneratedDispatch(generated.dispatch)
+              ),
               areGeneratedNativeImportParameters(
                   record.parameterTypes,
                   callbacks: record.contract.callbacks
@@ -3081,6 +3250,19 @@ public struct Generator: Sendable {
         case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
              .anyObjectBridge,
              .staticGetter, .staticSetter: false
+        }
+    }
+
+    private func supportsAsyncGeneratedDispatch(
+        _ dispatch: BridgeGeneration.GeneratedNativeImport.Dispatch
+    ) -> Bool {
+        switch dispatch {
+        case .globalFunction, .initializer, .staticMethod, .staticGetter,
+             .instanceMethod, .instanceGetter:
+            true
+        case .nativeUpcast, .anyObjectBridge, .staticSetter, .instanceSetter,
+             .instanceValueSetter:
+            false
         }
     }
 
@@ -3242,14 +3424,35 @@ public struct Generator: Sendable {
 
     private func renderNativeCatalogFactory(
         imports: [BridgeGeneration.NativeImportBinding],
+        records: [InterfaceArchive.NativeImportRecord],
         types: [BridgeGeneration.NativeTypeBinding]
-    ) -> String {
-        let importExpressions = imports.sorted(by: { $0.id < $1.id }).map(\.invokerExpression)
+    ) throws -> String {
+        let recordsByID = Dictionary(
+            uniqueKeysWithValues: records.compactMap { record in
+                record.id.map { ($0, record) }
+            }
+        )
+        var synchronousImportExpressions: [String] = []
+        var asynchronousImportExpressions: [String] = []
+        for binding in imports.sorted(by: { $0.id < $1.id }) {
+            guard let record = recordsByID[binding.id], record.isEmittedToDevice else {
+                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            }
+            if record.effects.isAsync {
+                asynchronousImportExpressions.append(binding.invokerExpression)
+            } else {
+                synchronousImportExpressions.append(binding.invokerExpression)
+            }
+        }
         let typeExpressions = types.sorted(by: { $0.id.rawValue < $1.id.rawValue })
             .map(\.operationsExpression)
         return """
             public static func makeNativeCatalog() throws -> VM.NativeCatalog {
-                try VM.NativeCatalog(\(renderArray(importExpressions, indentation: 16)))
+                try VM.NativeCatalog(\(renderArray(synchronousImportExpressions, indentation: 16)))
+            }
+
+            public static func makeAsyncNativeCatalog() throws -> VM.AsyncNativeCatalog {
+                try VM.AsyncNativeCatalog(\(renderArray(asynchronousImportExpressions, indentation: 16)))
             }
 
             public static func makeNativeTypeCatalog() throws -> VM.NativeTypeCatalog {
@@ -3261,12 +3464,14 @@ public struct Generator: Sendable {
                 observer: any Runtime.Observing = Runtime.NoopObserver()
             ) throws -> Runtime.Engine {
                 let nativeCatalog = try makeNativeCatalog()
+                let asyncNativeCatalog = try makeAsyncNativeCatalog()
                 let nativeTypeCatalog = try makeNativeTypeCatalog()
                 return Runtime.Engine(
                     registry: registry,
                     originals: try makeOriginalCatalog(nativeTypeCatalog: nativeTypeCatalog),
                     shellInterfaceHash: interfaceHash,
                     nativeCatalog: nativeCatalog,
+                    asyncNativeCatalog: asyncNativeCatalog,
                     nativeTypeCatalog: nativeTypeCatalog,
                     observer: observer
                 )
@@ -3529,7 +3734,7 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
         case let .frozenValueTypeMismatch(key):
             "bridge codec metadata disagrees with frozen Shell value \(key)"
         case let .unsupportedIsolatedRoot(key):
-            "bridge root \(key) uses an unsupported actor isolation; v1 accepts MainActor only for synchronous or non-suspending async entries"
+            "bridge root \(key) uses an unsupported actor isolation; v1 accepts nonisolated and MainActor entries"
         case .incompleteNativeImportBindings:
             "native import bindings do not exactly cover the emitted HLXI imports"
         case let .nativeImportBindingMismatch(id):

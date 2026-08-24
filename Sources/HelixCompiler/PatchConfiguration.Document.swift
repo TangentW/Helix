@@ -32,9 +32,9 @@ public enum NativeImportEmission: String, Codable, Hashable, Sendable {
 }
 
 public enum NativeImportSourceProfile: String, Codable, Hashable, Sendable {
-    case boundedPure = "bounded-pure"
-    case boundedRead = "bounded-read"
-    case boundedReadWrite = "bounded-read-write"
+    case pure
+    case read
+    case readWrite = "read-write"
 }
 
 public struct NativeImportSourceScope: Codable, Hashable, Sendable {
@@ -43,7 +43,8 @@ public struct NativeImportSourceScope: Codable, Hashable, Sendable {
     public var declarations: [String]
     public var visibility: PatchConfiguration.EntrypointVisibility
     public var profile: PatchConfiguration.NativeImportSourceProfile?
-    public var maximumDurationMicroseconds: UInt32
+    public var maximumBoundedDurationMicroseconds: UInt32
+    public var maximumSuspendingDurationMicroseconds: UInt32
     public var allowsMainThread: Bool
 
     public init(
@@ -52,7 +53,8 @@ public struct NativeImportSourceScope: Codable, Hashable, Sendable {
         declarations: [String] = ["*"],
         visibility: PatchConfiguration.EntrypointVisibility = .publicOnly,
         profile: PatchConfiguration.NativeImportSourceProfile? = nil,
-        maximumDurationMicroseconds: UInt32 = 2_000,
+        maximumBoundedDurationMicroseconds: UInt32 = 2_000,
+        maximumSuspendingDurationMicroseconds: UInt32 = 30_000_000,
         allowsMainThread: Bool = true
     ) {
         self.include = include
@@ -60,7 +62,10 @@ public struct NativeImportSourceScope: Codable, Hashable, Sendable {
         self.declarations = declarations
         self.visibility = visibility
         self.profile = profile
-        self.maximumDurationMicroseconds = maximumDurationMicroseconds
+        self.maximumBoundedDurationMicroseconds =
+            maximumBoundedDurationMicroseconds
+        self.maximumSuspendingDurationMicroseconds =
+            maximumSuspendingDurationMicroseconds
         self.allowsMainThread = allowsMainThread
     }
 
@@ -82,10 +87,13 @@ public struct NativeImportSourceScope: Codable, Hashable, Sendable {
               !declarations.isEmpty,
               declarations.allSatisfy({ !$0.isEmpty }),
               profile != nil,
-              (1...2_000).contains(maximumDurationMicroseconds)
+              (1...Core.NativeImportExecutionPolicy.maximumBoundedDurationMicroseconds)
+                .contains(maximumBoundedDurationMicroseconds),
+              (1...Core.NativeImportExecutionPolicy.maximumSuspendingDurationMicroseconds)
+                .contains(maximumSuspendingDurationMicroseconds)
         else {
             throw PatchConfiguration.Error.invalid(
-                "module \(moduleName) sourceScope needs nonempty patterns, an explicit bounded profile, and a 1...2000 us deadline"
+                "module \(moduleName) sourceScope needs nonempty patterns, an explicit access profile, a 1...2000 us bounded deadline, and a 1...60000000 us suspending deadline"
             )
         }
     }
@@ -415,14 +423,22 @@ private struct Parser {
                         )
                     }
                     scope.profile = value
-                } else if content.hasPrefix("maximumDurationMicroseconds:") {
+                } else if content.hasPrefix("maximumBoundedDurationMicroseconds:") {
                     guard let value = UInt32(value(afterColon: content)) else {
                         throw PatchConfiguration.Error.syntax(
                             line: lineNumber,
-                            message: "NativeImport source deadline must be an integer"
+                            message: "NativeImport bounded deadline must be an integer"
                         )
                     }
-                    scope.maximumDurationMicroseconds = value
+                    scope.maximumBoundedDurationMicroseconds = value
+                } else if content.hasPrefix("maximumSuspendingDurationMicroseconds:") {
+                    guard let value = UInt32(value(afterColon: content)) else {
+                        throw PatchConfiguration.Error.syntax(
+                            line: lineNumber,
+                            message: "NativeImport suspending deadline must be an integer"
+                        )
+                    }
+                    scope.maximumSuspendingDurationMicroseconds = value
                 } else if content.hasPrefix("allowsMainThread:") {
                     guard let value = Bool(value(afterColon: content)) else {
                         throw PatchConfiguration.Error.syntax(

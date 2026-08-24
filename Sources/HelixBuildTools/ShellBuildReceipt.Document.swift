@@ -70,6 +70,9 @@ public struct Bridge: Codable, Hashable, Sendable {
     /// exact Bridge fallback is carried by `originalInvocation` while this is
     /// nil and the unreachable nested-original path fails closed.
     public var bridgeInvocation: String?
+    /// Declaration emitted back into the defining source file. Async entries
+    /// use this for a uniquely named exact-original thunk whose call cannot
+    /// redispatch through an override.
     public var sourceSupplementalDeclaration: String?
 
     public init(
@@ -100,8 +103,8 @@ public struct Root: Codable, Hashable, Sendable {
     public var memberRole: Core.DynamicReplacement.MemberRole
     public var reloadRole: ReloadIndex.FunctionRole
     public var nominalType: ShellBuildReceipt.NominalType?
-    /// Present only for stored-property observer roots whose permanent Bridge
-    /// is installed by replacing the exact body in the derived source.
+    /// Present when a permanent Bridge must be installed by replacing the
+    /// exact declaration body in the derived Shell source.
     public var sourceBodyTransform: ShellBuildReceipt.SourceBodyTransform?
     public var bridge: ShellBuildReceipt.Bridge?
     public var nativeReplacement: ShellBuildReceipt.NativeReplacement?
@@ -439,10 +442,17 @@ public struct Document: Codable, Hashable, Sendable {
                 "bridge roots are duplicated, unordered, or reference unknown declarations"
             )
         }
-        try roots.forEach(Self.validateRoot)
         let declarationByName = Dictionary(
             uniqueKeysWithValues: declarations.map { ($0.mangledName, $0) }
         )
+        for root in roots {
+            guard let declaration = declarationByName[root.declarationMangledName] else {
+                throw ShellBuildReceipt.Error.invalid(
+                    "bridge root references an unknown declaration"
+                )
+            }
+            try Self.validateRoot(root, declaration: declaration)
+        }
         for values in Dictionary(grouping: roots, by: { $0.sourceDeclaration.identity }).values {
             guard let first = values.first,
                   values.allSatisfy({
@@ -561,9 +571,24 @@ public struct Document: Codable, Hashable, Sendable {
         try factories.forEach { try Self.validateNominal($0.controllerType) }
     }
 
-    private static func validateRoot(_ root: ShellBuildReceipt.Root) throws {
+    private static func validateRoot(
+        _ root: ShellBuildReceipt.Root,
+        declaration: ReleaseCompiler.DeclarationCandidate
+    ) throws {
         let isObserver = root.sourceDeclaration.kind == .propertyObservers
             && [.willSet, .didSet].contains(root.memberRole)
+        let isAsyncFunction = declaration.effects.isAsync
+            && root.sourceDeclaration.kind == .function
+            && root.memberRole == .functionBody
+        let expectedTransformKind: ShellBuildReceipt.SourceBodyTransform.Kind? =
+            if isObserver {
+                .propertyObserver
+            } else if isAsyncFunction {
+                .asynchronousFunction
+            } else {
+                nil
+            }
+        let hasSourceBodyInstallation = expectedTransformKind != nil
         guard root.declarationUTF8Offset >= 0,
               !root.expectedDeclarationPrefix.isEmpty,
               Self.isBoundText(root.declarationMangledName),
@@ -573,9 +598,14 @@ public struct Document: Codable, Hashable, Sendable {
               } ?? true),
               root.sourceDeclaration.isWellFormed,
               root.sourceDeclaration.member(root.memberRole) != nil,
-              (root.sourceBodyTransform != nil) == isObserver,
-              !isObserver || (root.declarationInsertion == nil
-                  && root.nativeReplacement == nil),
+              root.sourceBodyTransform?.kind == expectedTransformKind,
+              !isAsyncFunction
+                  || !declaration.parameterConventions.contains(.inout),
+              !hasSourceBodyInstallation || (
+                  root.declarationInsertion == nil
+                      && root.nativeReplacement == nil
+                      && root.bridge != nil
+              ),
               root.bridge != nil || root.nativeReplacement != nil
         else {
             throw ShellBuildReceipt.Error.invalid(
@@ -590,7 +620,8 @@ public struct Document: Codable, Hashable, Sendable {
                 + (bridge.bridgeInvocation.map { [$0] } ?? [])
             guard requiredStrings.allSatisfy(Self.isBoundText),
                   (bridge.bridgeInvocation == nil) == isObserver,
-                  bridge.sourceSupplementalDeclaration.map(Self.isBoundText) ?? true
+                  bridge.sourceSupplementalDeclaration.map(Self.isBoundText) ?? true,
+                  (bridge.sourceSupplementalDeclaration != nil) == isAsyncFunction
             else {
                 throw ShellBuildReceipt.Error.invalid(
                     "HLBC Bridge metadata for \(root.declarationMangledName) is invalid"
@@ -600,10 +631,12 @@ public struct Document: Codable, Hashable, Sendable {
         if let transform = root.sourceBodyTransform {
             let span = transform.closingBraceUTF8Offset
                 .subtractingReportingOverflow(transform.openingBraceUTF8Offset)
+            let maximumSpan = isAsyncFunction
+                ? 64 * 1_024 - 1 : 64 * 1_024 + 1
             guard transform.openingBraceUTF8Offset >= 0,
                   !span.overflow,
                   span.partialValue >= 1,
-                  span.partialValue <= 64 * 1_024 + 1
+                  span.partialValue <= maximumSpan
             else {
                 throw ShellBuildReceipt.Error.invalid(
                     "source body transform for \(root.declarationMangledName) is invalid"

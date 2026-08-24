@@ -111,7 +111,7 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
         case let .nativeImportThreadViolation(importID):
             "native import \(importID) is not qualified for main-thread execution"
         case let .nativeImportDeadlineExceeded(importID):
-            "native import \(importID) exceeded its declared synchronous deadline"
+            "native import \(importID) exceeded its declared deadline"
         case let .nativeImportCooperationViolation(importID):
             "cooperative native import \(importID) returned without a deadline checkpoint"
         case let .unknownNativeType(typeID): "unknown native type \(typeID)"
