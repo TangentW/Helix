@@ -24,7 +24,7 @@ enum FrozenValueHooks {
             let body = assignments.isEmpty ? "" : "\n" + assignments.joined(separator: "\n") + "\n    "
             return """
             extension \(type) {
-                private init(
+                fileprivate init(
                     \(parameters.joined(separator: ",\n        "))
                 ) {\(body)}
             }

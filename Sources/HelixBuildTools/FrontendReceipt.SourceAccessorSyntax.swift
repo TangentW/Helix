@@ -696,7 +696,17 @@ extension FrontendReceipt.Adapter {
                 "\(sil.mangledName) has no exact accessor syntax"
             )
         }
-        let keyword = role == .getter ? "get" : "set"
+        let keyword: String
+        switch role {
+        case .getter: keyword = "get"
+        case .setter: keyword = "set"
+        case .willSet: keyword = "willSet"
+        case .didSet: keyword = "didSet"
+        case .functionBody:
+            throw FrontendReceipt.Error.malformedAST(
+                "\(sil.mangledName) has a non-accessor member role"
+            )
+        }
         let rawHeader: String
         if accessorRange.start == bodyRange.start {
             rawHeader = keyword
@@ -755,7 +765,7 @@ extension FrontendReceipt.Adapter {
             header: ownership + rawHeader,
             mayThrow: sil.loweredType.contains("@error"),
             hasTypedThrows: (accessor["thrown_type"] as? String)?.isEmpty == false,
-            setterValueName: role == .setter
+            valueParameterName: [.setter, .willSet, .didSet].contains(role)
                 ? ((accessor["params"] as? FrontendReceipt.TypedAST.Object)?["params"]
                     as? [FrontendReceipt.TypedAST.Object])?.first.flatMap {
                         baseName(in: $0)
@@ -790,7 +800,7 @@ extension FrontendReceipt.Adapter {
             )
         ]
         if let setter {
-            guard let rawValue = setter.setterValueName, rawValue != "_",
+            guard let rawValue = setter.valueParameterName, rawValue != "_",
                 Core.SwiftName.isIdentifier(rawValue)
             else {
                 throw FrontendReceipt.Error.malformedAST(

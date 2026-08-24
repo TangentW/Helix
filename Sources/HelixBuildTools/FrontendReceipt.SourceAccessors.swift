@@ -520,7 +520,7 @@ extension FrontendReceipt.Adapter {
         var header: String
         var mayThrow: Bool
         var hasTypedThrows: Bool
-        var setterValueName: String?
+        var valueParameterName: String?
     }
 
     struct SourceAccessorMemberPlan {

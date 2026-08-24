@@ -99,6 +99,8 @@ public enum FunctionRole: String, Codable, Hashable, Sendable {
     case method
     case getter
     case setter
+    case willSet
+    case didSet
     case initializer
     case deinitializer
 }

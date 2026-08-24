@@ -668,7 +668,8 @@ extension ReleaseCompiler {
                     displayName: item.record.canonicalDeclaration,
                     directCalls: directCalls,
                     expectedEffects: item.record.effects,
-                    hasDistinctSemanticFallback: hasDistinctSemanticFallback
+                    hasDistinctSemanticFallback: hasDistinctSemanticFallback,
+                    nativePropertyAccessPolicy: .forRoot(item.record)
                 )
                 let actualParameters = lowered.parameterRegisters.compactMap { register in
                     lowered.registerTypes.indices.contains(Int(register.rawValue))
@@ -1206,7 +1207,8 @@ extension ReleaseCompiler {
             displayName: String,
             directCalls: CanonicalSIL.DirectCallTable,
             expectedEffects: Core.Effects,
-            hasDistinctSemanticFallback: Bool
+            hasDistinctSemanticFallback: Bool,
+            nativePropertyAccessPolicy: CanonicalSIL.NativePropertyAccessPolicy
         ) throws -> IntermediateRepresentation.Function {
             do {
                 return try CanonicalSIL.Lowerer(
@@ -1216,7 +1218,8 @@ extension ReleaseCompiler {
                     optimized,
                     displayName: displayName,
                     directCalls: directCalls,
-                    expectedEffects: expectedEffects
+                    expectedEffects: expectedEffects,
+                    nativePropertyAccessPolicy: nativePropertyAccessPolicy
                 )
             } catch let error as CanonicalSIL.LoweringError
                 where hasDistinctSemanticFallback && permitsSemanticFallback(error) {
@@ -1227,7 +1230,8 @@ extension ReleaseCompiler {
                     semantic,
                     displayName: displayName,
                     directCalls: directCalls,
-                    expectedEffects: expectedEffects
+                    expectedEffects: expectedEffects,
+                    nativePropertyAccessPolicy: nativePropertyAccessPolicy
                 )
             }
         }

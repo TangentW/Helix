@@ -693,9 +693,24 @@ accessor receiver. Normal and declared-error exits—including an ordinary
 Explicit `_read`/`_modify`, async or typed-throws accessors,
 availability-constrained declarations, generic accessor declarations or
 accessors in generic nominal/extension contexts, accessors on private nested
-receivers that generated file-scope code cannot name, observers, recursive
+receivers that generated file-scope code cannot name, recursive
 Native accessor replacement, multiple/async `inout`, and unsupported callable
 signatures still fail closed rather than being inferred from names.
+
+Explicit `willSet` and `didSet` bodies on directly declared ordinary stored
+properties are indexed independently. The Shell build replaces each exact,
+hashed body in the derived source with a permanent dispatch wrapper and keeps
+the lexical baseline body as fallback; it does not depend on an observer
+dynamic replacement or synthesize a callable original. This covers globals,
+eligible frozen struct receivers, and source reference classes, including
+implicit/custom old/new-value names and private same-file access. Frozen value
+receivers receive transactional self writeback. Static/class, inherited,
+lazy/wrapped, weak/unowned/Objective-C, availability/generic, actor/global-actor,
+baseline-magic-literal, and old/new-value ABI-shape changes fail closed. A
+patched reference observer also cannot directly assign its own observed
+property because an ordinary setter NativeImport would incorrectly re-enter
+the observer; sibling property access remains available under the frozen
+source policy.
 
 An unrelated declaration is not collected merely because it exists, and this
 feature does not add source files or native ABI. Changes to an existing native

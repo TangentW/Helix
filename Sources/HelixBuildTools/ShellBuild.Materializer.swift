@@ -8,7 +8,7 @@ import HelixLiveReloadAPI
 public enum ShellBuild {
     /// Changes whenever the source-to-Shell transformation changes semantics.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks"
+        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:observer-body-dispatch"
     )
 }
 
@@ -152,6 +152,15 @@ public struct Materializer: Sendable {
         let functionByMangledName = Dictionary(
             uniqueKeysWithValues: initial.archive.functions.map { ($0.mangledName, $0) }
         )
+        let initialBridgeRoots = try makeBridgeRoots(
+            archive: initial.archive,
+            descriptors: rootsByMangledName
+        )
+        let observerTransform = try BridgeGeneration.Generator()
+            .renderObserverTransform(
+                archive: initial.archive,
+                roots: initialBridgeRoots
+            )
         let candidateByMangledName = Dictionary(
             uniqueKeysWithValues: receipt.declarations.map { ($0.mangledName, $0) }
         )
@@ -162,6 +171,17 @@ public struct Materializer: Sendable {
         let moduleName = initial.archive.metadata.frontendInvocation.moduleName
         var transformedSources: [String: Data] = [:]
         var indexedSources: [InterfaceArchive.SourceRecord] = []
+        var transformedSourceBytes = 0
+        func accountForTransformedSource(_ byteCount: Int) throws {
+            let total = transformedSourceBytes.addingReportingOverflow(byteCount)
+            guard byteCount <= limits.maximumSourceBytes,
+                  !total.overflow,
+                  total.partialValue <= limits.maximumTotalSourceBytes
+            else {
+                throw ShellBuild.Error.sourceSetTooLarge
+            }
+            transformedSourceBytes = total.partialValue
+        }
         for source in receipt.sources {
             guard let contents = sourceContents[source.logicalPath] else {
                 throw ShellBuild.Error.invalidInput("source loader omitted \(source.logicalPath)")
@@ -171,7 +191,10 @@ public struct Materializer: Sendable {
                     == source.logicalPath
             }
             let frozenValues = frozenValuesBySource[source.logicalPath] ?? []
-            if descriptors.isEmpty, frozenValues.isEmpty {
+            let observerSupplemental = observerTransform
+                .supplementalDeclarations[source.logicalPath] ?? ""
+            if descriptors.isEmpty, frozenValues.isEmpty, observerSupplemental.isEmpty {
+                try accountForTransformedSource(contents.count)
                 transformedSources[source.logicalPath] = contents
                 indexedSources.append(
                     .init(logicalPath: source.logicalPath, contentHash: source.contentHash)
@@ -203,6 +226,28 @@ public struct Materializer: Sendable {
                     functionKeys: keys
                 )
             }
+            let replacements = try descriptors.compactMap {
+                descriptor -> SourceTransform.Replacement? in
+                guard let transform = descriptor.sourceBodyTransform else { return nil }
+                guard let function = functionByMangledName[
+                    descriptor.declarationMangledName
+                ], let body = observerTransform.bodies[function.key]
+                else {
+                    throw ShellBuild.Error.rootSetMismatch
+                }
+                let upperBound = transform.closingBraceUTF8Offset
+                    .addingReportingOverflow(1)
+                guard !upperBound.overflow else {
+                    throw ShellBuild.Error.rootSetMismatch
+                }
+                return .init(
+                    utf8Range: transform.openingBraceUTF8Offset..<upperBound.partialValue,
+                    expectedContentHash: transform.expectedBodyHash,
+                    replacement: body,
+                    functionKey: function.key,
+                    restoresSourceLocationBeforeFinalBrace: true
+                )
+            }
             let frozenValueDeclarations = ShellBuild.FrozenValueHooks.render(
                 frozenValues,
                 moduleName: moduleName
@@ -210,8 +255,10 @@ public struct Materializer: Sendable {
             let bridgeDeclarations = Array(Set(descriptors.compactMap {
                 $0.bridge?.sourceSupplementalDeclaration
             })).sorted()
-            let supplementalDeclarations = ([frozenValueDeclarations]
-                + bridgeDeclarations)
+            let supplementalDeclarations = (
+                [frozenValueDeclarations] + bridgeDeclarations
+                    + [observerSupplemental]
+            )
                 .filter { !$0.isEmpty }
                 .joined(separator: "\n\n")
             let transformed = try SourceTransform.Transformer().transform(
@@ -219,8 +266,10 @@ public struct Materializer: Sendable {
                 logicalPath: source.logicalPath,
                 expectedSourceHash: source.contentHash,
                 edits: edits,
+                replacements: replacements,
                 supplementalDeclarations: supplementalDeclarations
             )
+            try accountForTransformedSource(transformed.contents.count)
             transformedSources[source.logicalPath] = transformed.contents
             indexedSources.append(
                 .init(

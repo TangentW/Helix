@@ -98,7 +98,7 @@ extension FrontendReceipt.Adapter {
         }
 
         if let writeImplementation,
-           ["setter", "stored"].contains(writeImplementation),
+           ["setter", "stored", "stored_with_observers"].contains(writeImplementation),
            let setter = accessors.first(where: { $0["set"] as? Bool == true }) {
             let canonical = "\(moduleName).\(context.canonicalName).\(name).set"
             if scope.includes(
@@ -111,7 +111,9 @@ extension FrontendReceipt.Adapter {
                     canonicalCallee: canonical,
                     silSymbols: sourcePropertySymbols(
                         operation: .setter,
-                        isStored: writeImplementation == "stored",
+                        isStored: ["stored", "stored_with_observers"].contains(
+                            writeImplementation
+                        ),
                         isStatic: isStatic,
                         context: context,
                         name: name

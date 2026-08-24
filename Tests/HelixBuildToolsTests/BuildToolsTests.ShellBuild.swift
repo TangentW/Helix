@@ -195,6 +195,22 @@ struct ShellBuildPipeline {
         }
     }
 
+    @Test("Only property observers may omit a source-callable OriginalEntry")
+    func rejectsMissingOrdinaryBridgeInvocation() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        var forged = fixture.receipt
+        var root = try #require(forged.roots.first)
+        var bridge = try #require(root.bridge)
+        bridge.bridgeInvocation = nil
+        root.bridge = bridge
+        forged.roots[0] = root
+
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try forged.validate()
+        }
+    }
+
     @Test("The current receipt rejects an Entry and NativeImport identity overlap")
     func rejectsEntryNativeImportOverlap() throws {
         let fixture = try makeFixture()
@@ -247,6 +263,25 @@ struct ShellBuildPipeline {
 
         #expect(throws: ShellBuild.Error.sourceHashMismatch("Sources/Patch.swift")) {
             try ShellBuild.Materializer().materialize(
+                receipt: fixture.receipt,
+                sourceRoot: fixture.directory
+            )
+        }
+    }
+
+    @Test("Source limits include generated transform expansion")
+    func rejectsExpandedSourceBeyondLimit() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let materializer = ShellBuild.Materializer(
+            limits: .init(
+                maximumSourceBytes: fixture.sourceData.count,
+                maximumTotalSourceBytes: fixture.sourceData.count
+            )
+        )
+
+        #expect(throws: ShellBuild.Error.sourceSetTooLarge) {
+            try materializer.materialize(
                 receipt: fixture.receipt,
                 sourceRoot: fixture.directory
             )

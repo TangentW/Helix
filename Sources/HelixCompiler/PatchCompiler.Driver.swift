@@ -27,6 +27,9 @@ public struct Request: Sendable {
     /// introduced patch-local class method.
     public var shellDeclarationSymbols: Set<String>
     public var effects: Core.Effects?
+    /// Restrictions that apply only to the selected root. Newly discovered
+    /// helpers retain their own ordinary Swift property-access semantics.
+    public var nativePropertyAccessPolicy: CanonicalSIL.NativePropertyAccessPolicy
     /// The only source path permitted in emitted HLBC diagnostics. When nil,
     /// the compiler drops all source locations instead of retaining host paths.
     public var sourceFileLogicalID: String?
@@ -48,6 +51,7 @@ public struct Request: Sendable {
         frozenValueTypes: [InterfaceArchive.FrozenValueTypeRecord] = [],
         shellDeclarationSymbols: Set<String> = [],
         effects: Core.Effects? = nil,
+        nativePropertyAccessPolicy: CanonicalSIL.NativePropertyAccessPolicy = .unrestricted,
         sourceFileLogicalID: String? = nil
     ) {
         self.canonicalSIL = canonicalSIL
@@ -66,6 +70,7 @@ public struct Request: Sendable {
         self.frozenValueTypes = frozenValueTypes
         self.shellDeclarationSymbols = shellDeclarationSymbols
         self.effects = effects
+        self.nativePropertyAccessPolicy = nativePropertyAccessPolicy
         self.sourceFileLogicalID = sourceFileLogicalID
     }
 }
@@ -115,7 +120,8 @@ public struct Driver: Sendable {
             silFunction,
             displayName: request.displayName,
             directCalls: imagePlan.directCalls,
-            expectedEffects: request.effects
+            expectedEffects: request.effects,
+            nativePropertyAccessPolicy: request.nativePropertyAccessPolicy
         )
         root = IntermediateRepresentation.SourceMapping.retainingLogicalPaths(
             root,
@@ -268,6 +274,7 @@ public struct Driver: Sendable {
                 frozenValueTypes: archive.frozenValueTypes,
                 shellDeclarationSymbols: Set(archive.functions.map(\.mangledName)),
                 effects: record.effects,
+                nativePropertyAccessPolicy: .forRoot(record),
                 sourceFileLogicalID: record.sourceFileLogicalID
             )
         )

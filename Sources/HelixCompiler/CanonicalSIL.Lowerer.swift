@@ -649,7 +649,8 @@ public struct Lowerer: Sendable {
         kind: Bytecode.FunctionKind = .ordinary,
         directCalls: CanonicalSIL.DirectCallTable = .empty,
         expectedEffects: Core.Effects? = nil,
-        expectedResultType: Bytecode.ValueType? = nil
+        expectedResultType: Bytecode.ValueType? = nil,
+        nativePropertyAccessPolicy: CanonicalSIL.NativePropertyAccessPolicy = .unrestricted
     ) throws -> IntermediateRepresentation.Function {
         let function = sourceFile?.rewritingClosedProtocolDispatch(
             in: function,
@@ -668,7 +669,8 @@ public struct Lowerer: Sendable {
                 displayName: displayName,
                 kind: kind,
                 directCalls: directCalls,
-                preparation: preparation
+                preparation: preparation,
+                nativePropertyAccessPolicy: nativePropertyAccessPolicy
             )
         }
     }
@@ -758,7 +760,8 @@ public struct Lowerer: Sendable {
         displayName: String,
         kind: Bytecode.FunctionKind,
         directCalls: CanonicalSIL.DirectCallTable,
-        preparation: PreparedLowering
+        preparation: PreparedLowering,
+        nativePropertyAccessPolicy: CanonicalSIL.NativePropertyAccessPolicy
     ) throws -> IntermediateRepresentation.Function {
         let signature = preparation.signature
         let hostedMethodContext = preparation.hostedMethodContext
@@ -28731,6 +28734,12 @@ public struct Lowerer: Sendable {
                 guard case let .nativeImport(requirement) = binding.target else {
                     throw CanonicalSIL.LoweringError.invalidCallTable(
                         "stored property setter is not a NativeImport"
+                    )
+                }
+                guard nativePropertyAccessPolicy.permitsSetter(binding.mangledName) else {
+                    throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                        line: sourceLine,
+                        text: "a native property setter would violate lexical storage semantics"
                     )
                 }
                 let value = try resolve(store[0], line: sourceLine)

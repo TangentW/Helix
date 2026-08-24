@@ -39,8 +39,9 @@ public struct Member: Codable, Hashable, Sendable {
     /// Empty only for a function body. Accessors retain source-level modifiers
     /// such as `mutating get` and custom observer parameter names.
     public var header: String
-    /// A complete accessor body used when another member of the same Swift
-    /// declaration is replaced. It must call the previous implementation.
+    /// A complete lexical fallback body. Getter/setter companions call the
+    /// previous implementation; stored-property observers retain their exact
+    /// baseline body in the derived original source.
     public var fallbackBody: String
 
     public init(

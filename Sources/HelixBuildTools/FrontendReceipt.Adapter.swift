@@ -354,6 +354,13 @@ public struct Adapter: Sendable {
         var roots: [ShellBuildReceipt.Root] = []
         for draft in drafts {
             guard var root = draft.root else { continue }
+            if root.sourceDeclaration.kind == .propertyObservers,
+                !eligibleNames.contains(draft.candidate.mangledName) {
+                // Observers have no independently useful Native replacement
+                // descriptor. Keep their rejection diagnostic, but do not
+                // persist a source-body transform that can never dispatch.
+                continue
+            }
             if eligibleNames.contains(draft.candidate.mangledName) {
                 guard let bridge = draft.bridge else {
                     throw FrontendReceipt.Error.unsupportedDeclaration(
@@ -1518,6 +1525,22 @@ extension FrontendReceipt.Adapter {
                 ) {
                     drafts.append(contentsOf: accessorDrafts)
                 } else {
+                    if let observerDrafts = try makeReloadableObserverDrafts(
+                        item,
+                        context: context,
+                        source: source,
+                        importedModules: imports,
+                        moduleName: moduleName,
+                        configuration: configuration,
+                        demangled: demangled,
+                        silFile: silFile,
+                        typeEnvironment: typeEnvironment,
+                        nativeTypes: nativeTypes,
+                        localValueTypes: localValueTypes,
+                        importedSwiftTypeAliases: importedSwiftTypeAliases
+                    ) {
+                        drafts.append(contentsOf: observerDrafts)
+                    }
                     drafts.append(contentsOf: try makeSourcePropertyDrafts(
                         item,
                         context: context,

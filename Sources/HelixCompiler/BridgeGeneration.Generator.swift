@@ -17,7 +17,7 @@ public struct Root: Hashable, Sendable {
     public var parameterSwiftTypes: [String]
     public var resultSwiftType: String
     public var originalInvocation: String
-    public var bridgeInvocation: String
+    public var bridgeInvocation: String?
 
     public init(
         functionKey: Core.FunctionKey,
@@ -30,7 +30,7 @@ public struct Root: Hashable, Sendable {
         parameterSwiftTypes: [String],
         resultSwiftType: String,
         originalInvocation: String,
-        bridgeInvocation: String
+        bridgeInvocation: String?
     ) {
         self.functionKey = functionKey
         self.entryIndex = entryIndex
@@ -395,7 +395,8 @@ public struct Generator: Sendable {
             ).values.sorted {
                 $0[0].sourceDeclaration.identity < $1[0].sourceDeclaration.identity
             }
-            for replacementGroup in replacementGroups {
+            for replacementGroup in replacementGroups
+            where replacementGroup[0].sourceDeclaration.kind != .propertyObservers {
                 lines.append("")
                 lines.append(try renderReplacementDeclaration(
                     replacementGroup,
@@ -588,7 +589,7 @@ public struct Generator: Sendable {
         }
     }
 
-    private func validateRoot(
+    package func validateRoot(
         _ root: BridgeGeneration.Root,
         record: InterfaceArchive.FunctionRecord,
         archive: InterfaceArchive.Archive,
@@ -599,7 +600,7 @@ public struct Generator: Sendable {
         let hasExactLogicalParameters =
             root.parameterSwiftTypes.count == record.loweredSignature.parameters.count
         let hasBridgedReceiver: Bool = {
-            guard [.method, .getter, .setter].contains(record.role),
+            guard [.method, .getter, .setter, .willSet, .didSet].contains(record.role),
                   root.parameterSwiftTypes.count
                     == record.loweredSignature.parameters.count + 1,
                   let receiver = record.parameterTypes.last
@@ -615,14 +616,17 @@ public struct Generator: Sendable {
         }()
         let strings = [
             root.resultSwiftType, root.originalInvocation,
-            root.bridgeInvocation, root.privateImportSourceFile,
+            root.privateImportSourceFile,
         ] + root.parameterExpressions + root.parameterSwiftTypes
+            + (root.bridgeInvocation.map { [$0] } ?? [])
+        let isObserver = root.sourceDeclaration.kind == .propertyObservers
+            && [.willSet, .didSet].contains(root.memberRole)
         guard !root.privateImportSourceFile.isEmpty,
               root.sourceDeclaration.isWellFormed,
               root.sourceDeclaration.member(root.memberRole) != nil,
               !root.resultSwiftType.isEmpty,
               !root.originalInvocation.isEmpty,
-              !root.bridgeInvocation.isEmpty,
+              (root.bridgeInvocation == nil) == isObserver,
               root.parameterExpressions.count == record.parameterTypes.count,
               root.parameterSwiftTypes.count == record.parameterTypes.count,
               hasExactLogicalParameters || hasBridgedReceiver,
@@ -1238,7 +1242,7 @@ public struct Generator: Sendable {
         }
     }
 
-    private func renderReplacementBody(
+    package func renderReplacementBody(
         _ root: BridgeGeneration.Root,
         record: InterfaceArchive.FunctionRecord,
         frozenValueTypes: [
@@ -1369,13 +1373,9 @@ public struct Generator: Sendable {
                     return "\(member.header) {\n"
                         + indent(body, spaces: 4) + "\n}"
                 }
-                // An observer can be omitted independently. A setter cannot,
-                // because Swift requires its replacement declaration to carry
-                // a getter; companion get/set accessors therefore chain to the
-                // previous implementation explicitly.
-                guard ![Core.DynamicReplacement.MemberRole.willSet, .didSet]
-                    .contains(member.role)
-                else { return nil }
+                // Swift requires a setter replacement declaration to carry a
+                // getter, so unchanged companions chain to the previous
+                // implementation explicitly.
                 return "\(member.header) {\n"
                     + indent(member.fallbackBody, spaces: 4) + "\n}"
             }
@@ -1408,6 +1408,21 @@ public struct Generator: Sendable {
             Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
         ]
     ) throws -> String {
+        guard let bridgeInvocation = root.bridgeInvocation else {
+            return """
+            Runtime.OriginalEntry(
+                index: .init(rawValue: \(root.entryIndex.rawValue)),
+                parameterTypes: \(renderValueTypes(record.parameterTypes)),
+                parameterConventions: \(renderParameterConventions(record.parameterConventions)),
+                resultType: \(render(record.resultType)),
+                effects: \(render(record.effects)),
+                fallbackAllowed: \(record.fallbackAllowed),
+                invoke: { _ in
+                    .trapped(.nativeFailure("a Swift property observer has no source-callable original entry"))
+                }
+            )
+            """
+        }
         if record.effects.isAsync {
             // Async entries can only be reached through their exact Swift async
             // wrapper. The synchronous catalog descriptor exists for identity,
@@ -1447,7 +1462,11 @@ public struct Generator: Sendable {
             shapes: shapes,
             frozenValueTypes: frozenValueTypes
         )
-        let call = renderOriginalCall(root, record: record)
+        let call = renderOriginalCall(
+            root,
+            bridgeInvocation: bridgeInvocation,
+            record: record
+        )
         let invocation: String
         if record.resultType == .void {
             let callBody = renderThrowingOriginalCall(
@@ -1511,6 +1530,7 @@ public struct Generator: Sendable {
 
     private func renderOriginalCall(
         _ root: BridgeGeneration.Root,
+        bridgeInvocation: String,
         record: InterfaceArchive.FunctionRecord
     ) -> String {
         let attempt = record.effects.mayThrow ? "try " : ""
@@ -1518,7 +1538,7 @@ public struct Generator: Sendable {
         \(attempt)Runtime.Bridge.shared.withOriginalBypass(
             entry: .init(rawValue: \(root.entryIndex.rawValue))
         ) {
-            \(attempt)\(root.bridgeInvocation)
+            \(attempt)\(bridgeInvocation)
         }
         """
         guard record.effects.requiresMainActor else { return bypass }
@@ -1576,7 +1596,7 @@ public struct Generator: Sendable {
         return "[.init(parameterIndex: \(index), value: \(encoded))]"
     }
 
-    private func renderFrozenValueCodec(
+    package func renderFrozenValueCodec(
         _ record: InterfaceArchive.FrozenValueTypeRecord,
         frozenValueTypes: [
             Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord

@@ -65,7 +65,11 @@ public struct Bridge: Codable, Hashable, Sendable {
     public var parameterSwiftTypes: [String]
     public var resultSwiftType: String
     public var originalInvocation: String
-    public var bridgeInvocation: String
+    /// Source-callable expression used by the OriginalEntry catalog. Swift
+    /// property observers have no source-level callable spelling, so their
+    /// exact Bridge fallback is carried by `originalInvocation` while this is
+    /// nil and the unreachable nested-original path fails closed.
+    public var bridgeInvocation: String?
     public var sourceSupplementalDeclaration: String?
 
     public init(
@@ -74,7 +78,7 @@ public struct Bridge: Codable, Hashable, Sendable {
         parameterSwiftTypes: [String],
         resultSwiftType: String,
         originalInvocation: String,
-        bridgeInvocation: String,
+        bridgeInvocation: String?,
         sourceSupplementalDeclaration: String? = nil
     ) {
         self.privateImportSourceFile = privateImportSourceFile
@@ -96,6 +100,9 @@ public struct Root: Codable, Hashable, Sendable {
     public var memberRole: Core.DynamicReplacement.MemberRole
     public var reloadRole: ReloadIndex.FunctionRole
     public var nominalType: ShellBuildReceipt.NominalType?
+    /// Present only for stored-property observer roots whose permanent Bridge
+    /// is installed by replacing the exact body in the derived source.
+    public var sourceBodyTransform: ShellBuildReceipt.SourceBodyTransform?
     public var bridge: ShellBuildReceipt.Bridge?
     public var nativeReplacement: ShellBuildReceipt.NativeReplacement?
 
@@ -108,6 +115,7 @@ public struct Root: Codable, Hashable, Sendable {
         memberRole: Core.DynamicReplacement.MemberRole,
         reloadRole: ReloadIndex.FunctionRole = .unknown,
         nominalType: ShellBuildReceipt.NominalType? = nil,
+        sourceBodyTransform: ShellBuildReceipt.SourceBodyTransform? = nil,
         bridge: ShellBuildReceipt.Bridge? = nil,
         nativeReplacement: ShellBuildReceipt.NativeReplacement? = nil
     ) {
@@ -119,6 +127,7 @@ public struct Root: Codable, Hashable, Sendable {
         self.memberRole = memberRole
         self.reloadRole = reloadRole
         self.nominalType = nominalType
+        self.sourceBodyTransform = sourceBodyTransform
         self.bridge = bridge
         self.nativeReplacement = nativeReplacement
     }
@@ -553,6 +562,8 @@ public struct Document: Codable, Hashable, Sendable {
     }
 
     private static func validateRoot(_ root: ShellBuildReceipt.Root) throws {
+        let isObserver = root.sourceDeclaration.kind == .propertyObservers
+            && [.willSet, .didSet].contains(root.memberRole)
         guard root.declarationUTF8Offset >= 0,
               !root.expectedDeclarationPrefix.isEmpty,
               Self.isBoundText(root.declarationMangledName),
@@ -562,6 +573,9 @@ public struct Document: Codable, Hashable, Sendable {
               } ?? true),
               root.sourceDeclaration.isWellFormed,
               root.sourceDeclaration.member(root.memberRole) != nil,
+              (root.sourceBodyTransform != nil) == isObserver,
+              !isObserver || (root.declarationInsertion == nil
+                  && root.nativeReplacement == nil),
               root.bridge != nil || root.nativeReplacement != nil
         else {
             throw ShellBuildReceipt.Error.invalid(
@@ -571,13 +585,28 @@ public struct Document: Codable, Hashable, Sendable {
         if let bridge = root.bridge {
             let requiredStrings = [
                 bridge.privateImportSourceFile, bridge.resultSwiftType,
-                bridge.originalInvocation, bridge.bridgeInvocation,
+                bridge.originalInvocation,
             ] + bridge.parameterExpressions + bridge.parameterSwiftTypes
+                + (bridge.bridgeInvocation.map { [$0] } ?? [])
             guard requiredStrings.allSatisfy(Self.isBoundText),
+                  (bridge.bridgeInvocation == nil) == isObserver,
                   bridge.sourceSupplementalDeclaration.map(Self.isBoundText) ?? true
             else {
                 throw ShellBuildReceipt.Error.invalid(
                     "HLBC Bridge metadata for \(root.declarationMangledName) is invalid"
+                )
+            }
+        }
+        if let transform = root.sourceBodyTransform {
+            let span = transform.closingBraceUTF8Offset
+                .subtractingReportingOverflow(transform.openingBraceUTF8Offset)
+            guard transform.openingBraceUTF8Offset >= 0,
+                  !span.overflow,
+                  span.partialValue >= 1,
+                  span.partialValue <= 64 * 1_024 + 1
+            else {
+                throw ShellBuildReceipt.Error.invalid(
+                    "source body transform for \(root.declarationMangledName) is invalid"
                 )
             }
         }

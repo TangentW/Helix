@@ -49,6 +49,49 @@ public struct Edit: Codable, Hashable, Sendable {
     }
 }
 
+/// Replaces an exact UTF-8 source range while binding the operation to the
+/// indexed bytes. A declaration-body replacement can restore the following
+/// logical line from inside its final brace, where Swift permits line control.
+public struct Replacement: Hashable, Sendable {
+    public var utf8Range: Range<Int>
+    public var expectedContentHash: Core.Digest
+    public var replacement: String
+    public var functionKeys: [Core.FunctionKey]
+    public var restoresSourceLocationBeforeFinalBrace: Bool
+
+    public init(
+        utf8Range: Range<Int>,
+        expectedContentHash: Core.Digest,
+        replacement: String,
+        functionKeys: [Core.FunctionKey],
+        restoresSourceLocationBeforeFinalBrace: Bool = false
+    ) {
+        self.utf8Range = utf8Range
+        self.expectedContentHash = expectedContentHash
+        self.replacement = replacement
+        self.functionKeys = functionKeys.sorted { $0.description < $1.description }
+        self.restoresSourceLocationBeforeFinalBrace =
+            restoresSourceLocationBeforeFinalBrace
+    }
+
+    public init(
+        utf8Range: Range<Int>,
+        expectedContentHash: Core.Digest,
+        replacement: String,
+        functionKey: Core.FunctionKey,
+        restoresSourceLocationBeforeFinalBrace: Bool = false
+    ) {
+        self.init(
+            utf8Range: utf8Range,
+            expectedContentHash: expectedContentHash,
+            replacement: replacement,
+            functionKeys: [functionKey],
+            restoresSourceLocationBeforeFinalBrace:
+                restoresSourceLocationBeforeFinalBrace
+        )
+    }
+}
+
 public struct Result: Sendable {
     public var logicalPath: String
     public var contents: Data
@@ -65,6 +108,7 @@ public struct Transformer: Sendable {
         logicalPath: String,
         expectedSourceHash: Core.Digest,
         edits: [SourceTransform.Edit],
+        replacements: [SourceTransform.Replacement] = [],
         supplementalDeclarations: String = ""
     ) throws -> SourceTransform.Result {
         guard Core.Digest.sha256(source) == expectedSourceHash else {
@@ -85,9 +129,19 @@ public struct Transformer: Sendable {
         else {
             throw SourceTransform.Error.invalidSupplementalDeclarations
         }
-        let sorted = edits.sorted { $0.utf8Offset < $1.utf8Offset }
-        let allFunctionKeys = sorted.flatMap(\.functionKeys)
-        guard sorted.allSatisfy({
+        let sortedEdits = edits.sorted { $0.utf8Offset < $1.utf8Offset }
+        let sortedReplacements = replacements.sorted {
+            $0.utf8Range.lowerBound < $1.utf8Range.lowerBound
+        }
+        let allFunctionKeys = sortedEdits.flatMap(\.functionKeys)
+            + sortedReplacements.flatMap(\.functionKeys)
+        guard sortedEdits.allSatisfy({
+                  !$0.functionKeys.isEmpty
+                      && $0.functionKeys == $0.functionKeys.sorted(by: {
+                          $0.description < $1.description
+                      })
+                      && Set($0.functionKeys).count == $0.functionKeys.count
+              }), sortedReplacements.allSatisfy({
                   !$0.functionKeys.isEmpty
                       && $0.functionKeys == $0.functionKeys.sorted(by: {
                           $0.description < $1.description
@@ -98,8 +152,17 @@ public struct Transformer: Sendable {
         else {
             throw SourceTransform.Error.duplicateFunction
         }
+        guard sortedReplacements.allSatisfy({
+            !$0.replacement.isEmpty
+                && $0.replacement.utf8.count <= 16 * 1_024 * 1_024
+                && !$0.replacement.unicodeScalars.contains(where: { $0.value == 0 })
+                && (!$0.restoresSourceLocationBeforeFinalBrace
+                    || $0.replacement.utf8.last == UInt8(ascii: "}"))
+        }) else {
+            throw SourceTransform.Error.invalidReplacementContent
+        }
         var lastOffset = -1
-        for edit in sorted {
+        for edit in sortedEdits {
             guard edit.utf8Offset >= 0, edit.utf8Offset <= source.count,
                   edit.utf8Offset > lastOffset, !edit.insertion.isEmpty
             else {
@@ -113,10 +176,89 @@ public struct Transformer: Sendable {
             }
             lastOffset = edit.utf8Offset
         }
+        var lastUpperBound = -1
+        var editIndex = 0
+        for replacement in sortedReplacements {
+            let range = replacement.utf8Range
+            guard range.lowerBound >= 0,
+                  range.lowerBound < range.upperBound,
+                  range.upperBound <= source.count,
+                  range.lowerBound >= lastUpperBound
+            else {
+                throw SourceTransform.Error.invalidReplacementRange(range)
+            }
+            let content = source.subdata(in: range)
+            guard Core.Digest.sha256(content) == replacement.expectedContentHash else {
+                throw SourceTransform.Error.replacementMismatch(
+                    replacement.functionKeys[0]
+                )
+            }
+            while editIndex < sortedEdits.count,
+                  sortedEdits[editIndex].utf8Offset < range.lowerBound {
+                editIndex += 1
+            }
+            guard editIndex == sortedEdits.count
+                    || sortedEdits[editIndex].utf8Offset > range.upperBound
+            else {
+                throw SourceTransform.Error.invalidReplacementRange(range)
+            }
+            lastUpperBound = range.upperBound
+        }
 
         var transformed = source
-        for edit in sorted.reversed() {
-            transformed.insert(contentsOf: edit.insertion.utf8, at: edit.utf8Offset)
+        var continuationLineByOffset: [Int: Int] = [:]
+        var scannedOffset = 0
+        var logicalLine = 1
+        for replacement in sortedReplacements {
+            for byte in source[scannedOffset..<replacement.utf8Range.upperBound]
+            where byte == UInt8(ascii: "\n") {
+                logicalLine += 1
+            }
+            continuationLineByOffset[replacement.utf8Range.lowerBound] = logicalLine
+            scannedOffset = replacement.utf8Range.upperBound
+        }
+        enum Operation {
+            case insertion(SourceTransform.Edit)
+            case replacement(SourceTransform.Replacement)
+
+            var offset: Int {
+                switch self {
+                case let .insertion(edit): edit.utf8Offset
+                case let .replacement(replacement): replacement.utf8Range.lowerBound
+                }
+            }
+        }
+        let operations = (
+            sortedEdits.map(Operation.insertion)
+                + sortedReplacements.map(Operation.replacement)
+        ).sorted { $0.offset > $1.offset }
+        for operation in operations {
+            switch operation {
+            case let .insertion(edit):
+                transformed.insert(contentsOf: edit.insertion.utf8, at: edit.utf8Offset)
+            case let .replacement(replacement):
+                guard let logicalLine = continuationLineByOffset[
+                    replacement.utf8Range.lowerBound
+                ] else {
+                    throw SourceTransform.Error.invalidReplacementRange(
+                        replacement.utf8Range
+                    )
+                }
+                let restore = "#sourceLocation(file: "
+                    + String(reflecting: logicalPath)
+                    + ", line: \(logicalLine))\n"
+                let rendered: String
+                if replacement.restoresSourceLocationBeforeFinalBrace {
+                    rendered = String(replacement.replacement.dropLast())
+                        + "\n" + restore + "}"
+                } else {
+                    rendered = replacement.replacement
+                }
+                transformed.replaceSubrange(
+                    replacement.utf8Range,
+                    with: Data(rendered.utf8)
+                )
+            }
         }
         let prologue = Data("#sourceLocation(file: \(String(reflecting: logicalPath)), line: 1)\n".utf8)
         let epilogue = Data("\n#sourceLocation()\n".utf8)
@@ -147,7 +289,10 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case invalidSupplementalDeclarations
     case duplicateFunction
     case invalidEditOffset(Int)
+    case invalidReplacementRange(Range<Int>)
+    case invalidReplacementContent
     case declarationMismatch(Core.FunctionKey)
+    case replacementMismatch(Core.FunctionKey)
 
     public var description: String {
         switch self {
@@ -158,7 +303,13 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
             "supplemental Swift declarations are oversized or contain NUL"
         case .duplicateFunction: "a function has more than one transform edit"
         case let .invalidEditOffset(value): "invalid or duplicate UTF-8 edit offset \(value)"
+        case let .invalidReplacementRange(range):
+            "invalid or overlapping UTF-8 replacement range \(range)"
+        case .invalidReplacementContent:
+            "replacement Swift source is empty, oversized, malformed, or contains NUL"
         case let .declarationMismatch(key): "declaration bytes no longer match function \(key)"
+        case let .replacementMismatch(key):
+            "source body bytes no longer match function \(key)"
         }
     }
 }

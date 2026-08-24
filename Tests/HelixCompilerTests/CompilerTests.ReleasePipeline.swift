@@ -459,6 +459,100 @@ struct ReleasePipeline {
                 supplementalDeclarations: "private let invalid = \"\0\""
             )
         }
+        let bodyRange = try #require(sourceText.range(of: "{ x + 27 }"))
+        let bodyLowerBound = sourceText.utf8.distance(
+            from: sourceText.utf8.startIndex,
+            to: bodyRange.lowerBound.samePosition(in: sourceText.utf8)!
+        )
+        let bodyUpperBound = sourceText.utf8.distance(
+            from: sourceText.utf8.startIndex,
+            to: bodyRange.upperBound.samePosition(in: sourceText.utf8)!
+        )
+        let bodyBytes = sourceData.subdata(in: bodyLowerBound..<bodyUpperBound)
+        let bodyReplacement = SourceTransform.Replacement(
+            utf8Range: bodyLowerBound..<bodyUpperBound,
+            expectedContentHash: .sha256(bodyBytes),
+            replacement: "{\n    return x + 28\n}",
+            functionKey: eligible.key,
+            restoresSourceLocationBeforeFinalBrace: true
+        )
+        let bodyTransformed = try SourceTransform.Transformer().transform(
+            source: sourceData,
+            logicalPath: "Sources/Patch.swift",
+            expectedSourceHash: .sha256(sourceData),
+            edits: [],
+            replacements: [bodyReplacement]
+        )
+        let bodyTransformedText = String(
+            decoding: bodyTransformed.contents,
+            as: UTF8.self
+        )
+        #expect(bodyTransformed.appliedFunctionKeys == [eligible.key])
+        #expect(bodyTransformedText.contains("return x + 28"))
+        #expect(bodyTransformedText.contains(
+            "#sourceLocation(file: \"Sources/Patch.swift\", line: 1)\n}"
+        ))
+        var staleBodyReplacement = bodyReplacement
+        staleBodyReplacement.expectedContentHash = .sha256("stale body")
+        #expect(throws: SourceTransform.Error.replacementMismatch(eligible.key)) {
+            try SourceTransform.Transformer().transform(
+                source: sourceData,
+                logicalPath: "Sources/Patch.swift",
+                expectedSourceHash: .sha256(sourceData),
+                edits: [],
+                replacements: [staleBodyReplacement]
+            )
+        }
+        var malformedBodyReplacement = bodyReplacement
+        malformedBodyReplacement.replacement = "{ return x + 29"
+        #expect(throws: SourceTransform.Error.invalidReplacementContent) {
+            try SourceTransform.Transformer().transform(
+                source: sourceData,
+                logicalPath: "Sources/Patch.swift",
+                expectedSourceHash: .sha256(sourceData),
+                edits: [],
+                replacements: [malformedBodyReplacement]
+            )
+        }
+        let overlappingKey = Core.FunctionKey(rawValue: .sha256("overlapping body"))
+        #expect(throws: SourceTransform.Error.self) {
+            try SourceTransform.Transformer().transform(
+                source: sourceData,
+                logicalPath: "Sources/Patch.swift",
+                expectedSourceHash: .sha256(sourceData),
+                edits: [],
+                replacements: [
+                    bodyReplacement,
+                    .init(
+                        utf8Range: bodyLowerBound..<bodyUpperBound,
+                        expectedContentHash: .sha256(bodyBytes),
+                        replacement: "{ x + 29 }",
+                        functionKey: overlappingKey
+                    ),
+                ]
+            )
+        }
+        let collidingEditKey = Core.FunctionKey(
+            rawValue: .sha256("colliding declaration edit")
+        )
+        #expect(throws: SourceTransform.Error.invalidReplacementRange(
+            bodyLowerBound..<bodyUpperBound
+        )) {
+            try SourceTransform.Transformer().transform(
+                source: sourceData,
+                logicalPath: "Sources/Patch.swift",
+                expectedSourceHash: .sha256(sourceData),
+                edits: [
+                    .init(
+                        utf8Offset: bodyUpperBound,
+                        expectedDeclarationPrefix: "\n",
+                        insertion: "/* collision */",
+                        functionKey: collidingEditKey
+                    ),
+                ],
+                replacements: [bodyReplacement]
+            )
+        }
 
         let bridgeRoots: [BridgeGeneration.Root] = [
             .init(

@@ -360,10 +360,38 @@ mutation on both paths, while a VM trap commits nothing. Explicit coroutine
 accessors (`_read`/`_modify`), async or typed-throws accessors,
 availability-constrained declarations, generic accessor declarations or
 accessors in generic nominal/extension contexts, accessors whose private nested
-receiver cannot be named by generated file-scope code, observers,
+receiver cannot be named by generated file-scope code,
 multiple/async `inout`, and mutable-existential writeback remain fail-closed.
 This extends the same v1 contracts and does not introduce a compatibility
 version.
+
+Directly declared ordinary stored-property observers use a separate exact
+source-body path because Swift has no source-callable observer spelling and
+observer-only `@_dynamicReplacement` declarations are not reliable in normal
+multi-file builds. During Shell materialization, Helix binds each explicit
+`willSet` or `didSet` body to its indexed UTF-8 range and hash, then replaces
+that body in the derived copy of its original source file with a permanent
+HLBC dispatch wrapper. The lexical baseline body remains the wrapper's normal
+fallback, so private/fileprivate access, implicit or custom `newValue`/
+`oldValue` names, direct observed-storage access, and Swift's observer
+recursion rules stay in their original context. Global observers, eligible
+frozen struct receivers, and source reference-class receivers are
+independently selectable. A mutable value receiver uses the same single
+transactional `inout` region and exact writeback as other Shell value entries;
+transitive frozen-value codecs stay in each defining source file. Reference
+observers may use source-property NativeImports only when the normal frozen
+source scope and policy explicitly admit those fields. A patched reference
+observer cannot directly assign its own observed property: routing that access
+through its ordinary setter would recursively re-enter the observer, unlike
+Swift's lexical storage rule, so this shape fails closed instead.
+
+This observer profile is synchronous, nongeneric, nonisolated, nonstatic, and
+directly declared. Static/class observers, inherited overrides, lazy or wrapped
+storage, weak/unowned or Objective-C storage, availability-constrained and
+generic contexts, actor/global-actor isolation, baseline magic literals, and
+changes that alter whether the observer has a logical old/new-value parameter
+fail closed. No observer Native replacement or callable OriginalEntry is
+emitted; nested-original resolution is unreachable and traps defensively.
 
 Native text rendering is a deliberately narrow exception to keeping generic
 standard-library APIs inside HLVM. The compiler recognizes the generic
@@ -472,7 +500,7 @@ nominal declarations, hosted stored properties/custom initializers/arbitrary
 callback ABIs, changes to existing native stored layout, multiple or async
 `inout` regions, explicit coroutine/async/typed-throws,
 availability-constrained, generic-context, or unnameable-private-nested-receiver
-Shell accessors, observers, closure crossing a
+Shell accessors, unsupported stored-property observer profiles, closure crossing a
 Shell Entry or a NativeImport position outside the exact callable profile,
 throwing/async/inout callback ABIs, recursive or nonescaping nested callable
 arguments, callback results without a

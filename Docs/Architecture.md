@@ -716,8 +716,13 @@ declaration even when several function keys share it. Release Bridge and the
 explicit Native differential backend consume the same closed declaration
 shape; generator code never reconstructs property/subscript grouping from
 names or offsets. Required but unchanged getter/setter companions chain to the
-previous implementation, while independently replaceable observer members may
-be omitted. Ordinary functions are the one-member case of this model.
+previous implementation. Ordinary functions are the one-member case of this
+model. Stored-property observers share the declaration/member identity model,
+but use an exact hashed body replacement in the derived original source: the
+permanent wrapper dispatches to HLBC and keeps its lexical body as baseline
+fallback. This avoids observer-only dynamic replacement and preserves storage
+and source access semantics; observer roots therefore have neither a Native
+replacement nor a source-callable OriginalEntry.
 
 When a defect is fixed, the patch builder type-checks the complete module in
 the archived environment, confirms that only eligible implementations changed,

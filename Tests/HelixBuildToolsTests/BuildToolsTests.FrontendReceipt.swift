@@ -513,7 +513,7 @@ struct FrontendReceiptPipeline {
             $0.declarationMangledName == adjust.mangledName
         }?.bridge)
         #expect(adjustBridge.originalInvocation == "adjust(&value, by: amount)")
-        #expect(adjustBridge.bridgeInvocation.hasSuffix(
+        #expect(try #require(adjustBridge.bridgeInvocation).hasSuffix(
             "_adjust(&argument0, by: argument1)"
         ))
         let exchange = try #require(output.receipt.declarations.first {
@@ -1165,7 +1165,8 @@ struct FrontendReceiptPipeline {
     func typeCheckGeneratedBridge(
         shell: ShellBuild.Output,
         directory: URL,
-        moduleName: String
+        moduleName: String,
+        emitEntryObjects: Bool = false
     ) throws {
         let output = directory.appendingPathComponent(
             "GeneratedBridgeTypecheck",
@@ -1180,15 +1181,16 @@ struct FrontendReceiptPipeline {
             try contents.write(to: url)
         }
         let frontend = SwiftFrontend.Driver()
+        let modules = try swiftPMModulesDirectory()
         try requireFrontendSuccess(
             frontend.run(
                 arguments: shell.transformedSources.keys.sorted() + [
-                    "-emit-library", "-emit-module", "-parse-as-library",
+                    "-emit-module", "-parse-as-library",
                     "-module-name", moduleName,
                     "-Xfrontend", "-enable-private-imports",
                     "-emit-module-path", "\(moduleName).swiftmodule",
-                    "-o", "lib\(moduleName).dylib",
-                ],
+                    "-I", modules.path,
+                ] + (try runtimeSupportCompilerArguments(modules: modules)),
                 workingDirectory: output
             )
         )
@@ -1201,7 +1203,6 @@ struct FrontendReceiptPipeline {
             try Data(item.value.utf8).write(to: url)
             return url
         }
-        let modules = try swiftPMModulesDirectory()
         try requireFrontendSuccess(
             frontend.run(
                 arguments: generatedURLs.map(\.path) + [
@@ -1217,6 +1218,47 @@ struct FrontendReceiptPipeline {
                 workingDirectory: output
             )
         )
+        if emitEntryObjects {
+            try requireFrontendSuccess(
+                frontend.run(
+                    arguments: shell.transformedSources.keys.sorted() + [
+                        "-emit-object", "-parse-as-library",
+                        "-whole-module-optimization",
+                        "-module-name", moduleName,
+                        "-Xfrontend", "-enable-private-imports",
+                        "-I", modules.path,
+                    ] + (try runtimeSupportCompilerArguments(modules: modules)) + [
+                        "-o", output.appendingPathComponent(
+                            "TransformedModule.o"
+                        ).path,
+                    ],
+                    workingDirectory: output
+                )
+            )
+            for (index, url) in generatedURLs.filter({
+                $0.lastPathComponent.hasPrefix("HelixBridge.Entry_")
+            }).enumerated() {
+                try requireFrontendSuccess(
+                    frontend.run(
+                        arguments: [
+                            url.path,
+                            "-emit-object", "-parse-as-library",
+                            "-module-name", "FrontendReceiptGeneratedEntry\(index)",
+                            "-I", output.path,
+                            "-I", modules.path,
+                        ] + (try runtimeSupportCompilerArguments(modules: modules)) + [
+                            "-Xfrontend", "-enable-private-imports",
+                            "-Xfrontend", "-enable-dynamic-replacement-chaining",
+                            "-warnings-as-errors",
+                            "-o", output.appendingPathComponent(
+                                "GeneratedEntry\(index).o"
+                            ).path,
+                        ],
+                        workingDirectory: output
+                    )
+                )
+            }
+        }
     }
 
     private func swiftPMModulesDirectory() throws -> URL {
