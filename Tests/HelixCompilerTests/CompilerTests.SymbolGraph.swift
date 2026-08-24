@@ -28,7 +28,14 @@ struct SymbolGraph {
             sdkName: sdk.name,
             sdkBuild: sdk.buildVersion,
             optimization: "-Onone",
-            semanticArguments: ["-parse-as-library"]
+            semanticArguments: [
+                "-parse-as-library", "-swift-version", "6",
+                "-D", "DEBUG", "-DHELIX_DEMO",
+                "-Xfrontend", "-enable-private-imports",
+                "-Xfrontend", "-enable-implicit-dynamic",
+                "-Xfrontend", "-enable-dynamic-replacement-chaining",
+                "-cxx-interoperability-mode=off",
+            ]
         )
 
         let uikit = try frontend.emitSymbolGraph(
@@ -94,6 +101,52 @@ struct SymbolGraph {
         #expect(parameters[1].declarationFragments.contains {
             $0.spelling.contains("->")
         })
+    }
+
+    @Test("Symbol graphs receive only supported module-loading arguments")
+    func projectsSymbolGraphImportArguments() throws {
+        let frontend = SwiftFrontend.Driver()
+        let projected = try frontend.symbolGraphImportArguments([
+            "-parse-as-library",
+            "-swift-version", "6",
+            "-D", "DEBUG",
+            "-DHELIX_DEMO",
+            "-Xfrontend", "-enable-private-imports",
+            "-enable-upcoming-feature", "ExistentialAny",
+            "-module-alias", "Alias=Real",
+            "-package-name", "Feature",
+            "-enable-library-evolution",
+            "-I", "/Build/Includes",
+            "-F/Build/Frameworks",
+            "-Fsystem", "/SDK/System/Frameworks",
+            "-Isystem", "/SDK/System/Headers",
+            "-L", "/Build/Libraries",
+            "-Xcc", "-fmodule-map-file=/Build/module.modulemap",
+            "-language-mode", "6",
+            "-module-cache-path", "/Build/ModuleCache",
+            "-resource-dir", "/Toolchain/usr/lib/swift",
+            "-cxx-interoperability-mode", "off",
+            "-cxx-interoperability-mode=default",
+        ])
+
+        #expect(projected == [
+            "-swift-version", "6",
+            "-I", "/Build/Includes",
+            "-F/Build/Frameworks",
+            "-Fsystem", "/SDK/System/Frameworks",
+            "-Isystem", "/SDK/System/Headers",
+            "-L", "/Build/Libraries",
+            "-Xcc", "-fmodule-map-file=/Build/module.modulemap",
+            "-language-mode", "6",
+            "-module-cache-path", "/Build/ModuleCache",
+            "-resource-dir", "/Toolchain/usr/lib/swift",
+            "-cxx-interoperability-mode=default",
+        ])
+        #expect(throws: SwiftFrontend.Error.invalidSymbolGraph(
+            "symbol graph option -I is missing its value"
+        )) {
+            _ = try frontend.symbolGraphImportArguments(["-I"])
+        }
     }
 
     @Test("Symbol graph module names are code-generation safe")

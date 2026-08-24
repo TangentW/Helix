@@ -693,8 +693,9 @@ does not by itself certify a physical device or distribution channel.
   new opcode, or contract version is required.
 - Managed Debug measurement of public members for every module contributing an
   already-frozen imported native type. The captured toolchain's symbol graph
-  nominates minimum-OS-valid APIs, and the same typed AST/canonical SIL pipeline
-  freezes only unique, Bridge-compatible initializers, synchronous instance or
+  nominates minimum-OS-valid, nondeprecated APIs, and the same typed
+  AST/canonical SIL pipeline freezes only unique, Bridge-compatible
+  initializers, synchronous instance or
   static methods, and readable or writable properties. The generic path covers
   Swift and Objective-C declarations, Swift-overlay/physical aliases, SDK
   isolation, and the exact canonical `NSError **` bridge for an Objective-C
@@ -702,6 +703,10 @@ does not by itself certify a physical device or distribution channel.
   `UIColor.black`, `UIColor.init(white:alpha:)`, `UIView.alpha`, `UIView.setNeedsLayout()`,
   `UIView.setAnimationsEnabled(_:)`, `URLCache.shared`,
   `Bundle.path(forResource:ofType:)`, and `FileManager.removeItem(atPath:)`.
+  Frontend-synthesized inherited constructors do not expand the source-authored
+  boundary. Proven Objective-C protocol inputs retain the frozen `AnyObject`
+  ABI while the generated invoker decodes the exact existential type, inside
+  MainActor isolation when required.
   Production Shells do not receive this convenience surface, and it does not
   introduce a new boundary type by itself.
 - Objective-C superclass dispatch and address-form Optional control flow when
@@ -859,7 +864,7 @@ machine code.
 | Change an existing stored-property `willSet` or `didSet` body | Directly declared synchronous global, eligible frozen struct, and source reference-class observers are independently patchable through an exact hashed in-place wrapper in the derived source. Implicit/custom old/new-value names, baseline fallback, private same-file access, direct value-storage mutation, and transactional value-receiver writeback are preserved. Static/class, inherited, lazy/wrapped, weak/unowned/Objective-C, availability/generic, actor/global-actor, baseline-magic-literal, old/new-value ABI-shape changes, and direct self-property assignment from a reference observer fail closed; observer Native replacement is never emitted |
 | Use explicit `inout`, mutate an actor root, or change an existing native static/class method | One synchronous eligible Shell `inout` parameter is supported. Multiple/async regions remain rejected; actor executors and native metatype ABI are not implemented |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
-| First use a public SDK member in a managed Debug body | Supported for a uniquely measured synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. Closure-bearing methods require the exact synchronous, nonthrowing bridge-and-failure-value profile above. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or an explicit catalog |
+| First use a public SDK member in a managed Debug body | Supported for a uniquely measured, nondeprecated synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. Inherited implicit constructors do not expand the source boundary. Closure-bearing methods require the exact synchronous, nonthrowing bridge-and-failure-value profile above. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or an explicit catalog |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |

@@ -35,6 +35,11 @@ extension FrontendReceipt.Adapter {
         var baseName: String
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
+        /// Exact Swift parameter spellings used inside the generated invoker
+        /// when a compiler-proven foreign boundary has a narrower source type
+        /// than its frozen logical ABI (currently Objective-C protocols erased
+        /// to AnyObject). Nil means the logical spellings are used directly.
+        var invocationParameterSwiftTypes: [String]? = nil
         var parameterProjection: InterfaceArchive.NativeImportParameterProjection? = nil
         var resultSwiftType: String
         var requiresMainActor: Bool
@@ -50,6 +55,7 @@ extension FrontendReceipt.Adapter {
         var baseName: String
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
+        var invocationParameterSwiftTypes: [String]
         var parameterProjection: InterfaceArchive.NativeImportParameterProjection
         var resultSwiftType: String
 
@@ -59,6 +65,8 @@ extension FrontendReceipt.Adapter {
             baseName = operation.baseName
             argumentLabels = operation.argumentLabels
             parameterSwiftTypes = operation.parameterSwiftTypes
+            invocationParameterSwiftTypes = operation.invocationParameterSwiftTypes
+                ?? operation.parameterSwiftTypes
             parameterProjection = operation.parameterProjection
                 ?? .identity(parameterCount: operation.parameterSwiftTypes.count)
             resultSwiftType = operation.resultSwiftType
@@ -88,11 +96,14 @@ extension FrontendReceipt.Adapter {
     private struct ImportedOperationLogicalABI: Hashable {
         var physical: ImportedOperationPhysicalABI
         var parameterSwiftTypes: [String]
+        var invocationParameterSwiftTypes: [String]
         var parameterProjection: InterfaceArchive.NativeImportParameterProjection
 
         init(_ operation: ImportedOperation) {
             physical = .init(operation)
             parameterSwiftTypes = operation.parameterSwiftTypes
+            invocationParameterSwiftTypes = operation.invocationParameterSwiftTypes
+                ?? operation.parameterSwiftTypes
             parameterProjection = operation.parameterProjection
                 ?? .identity(parameterCount: operation.parameterSwiftTypes.count)
         }
@@ -302,6 +313,27 @@ extension FrontendReceipt.Adapter {
             }
             let generatedOwnerType = generatedSpelling(operation.ownerType)
             let generatedParameterTypes = bridgeParameterTypes.map(generatedSpelling)
+            let logicalInvocationParameterTypes = operation
+                .invocationParameterSwiftTypes ?? operation.parameterSwiftTypes
+            guard logicalInvocationParameterTypes.count
+                    == operation.parameterSwiftTypes.count
+            else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "imported operation \(operation.ownerType).\(operation.baseName) "
+                        + "has an invalid invocation parameter adapter"
+                )
+            }
+            var generatedInvocationParameterTypes = generatedParameterTypes
+            for index in logicalInvocationParameterTypes.indices
+            where logicalInvocationParameterTypes[index]
+                    != operation.parameterSwiftTypes[index] {
+                generatedInvocationParameterTypes[index] = generatedSpelling(
+                    logicalInvocationParameterTypes[index]
+                )
+            }
+            let invocationParameterSwiftTypes =
+                generatedInvocationParameterTypes == generatedParameterTypes
+                ? nil : generatedInvocationParameterTypes
             let generatedResultType = generatedSpelling(operation.resultSwiftType)
             let prefix = [moduleName, "HelixExternal", operation.ownerType]
             let callableReference = operation.baseName + "("
@@ -338,6 +370,7 @@ extension FrontendReceipt.Adapter {
                 baseName: operation.baseName,
                 argumentLabels: operation.argumentLabels,
                 parameterSwiftTypes: generatedParameterTypes,
+                invocationParameterSwiftTypes: invocationParameterSwiftTypes,
                 parameterProjection: operation.parameterProjection
                     ?? .identity(parameterCount: parameterTypes.count),
                 resultSwiftType: generatedResultType,
@@ -504,12 +537,16 @@ extension FrontendReceipt.Adapter {
             lhs.dispatch.rawValue, lhs.ownerType, lhs.baseName,
             lhs.argumentLabels.joined(separator: ":"),
             lhs.parameterSwiftTypes.joined(separator: ","), lhs.resultSwiftType,
+            (lhs.invocationParameterSwiftTypes ?? lhs.parameterSwiftTypes)
+                .joined(separator: ","),
             lhs.sourceFileLogicalID,
         ]
         let right = [
             rhs.dispatch.rawValue, rhs.ownerType, rhs.baseName,
             rhs.argumentLabels.joined(separator: ":"),
             rhs.parameterSwiftTypes.joined(separator: ","), rhs.resultSwiftType,
+            (rhs.invocationParameterSwiftTypes ?? rhs.parameterSwiftTypes)
+                .joined(separator: ","),
             rhs.sourceFileLogicalID,
         ]
         return left.lexicographicallyPrecedes(right)
@@ -1238,10 +1275,21 @@ extension FrontendReceipt.Adapter {
             explicitParameterIndices.append(index)
             argumentLabels.append(argument["label"] as? String ?? "_")
         }
+        var declaredParameterTypes = formalParameterTypes
+        let declaredObjectiveCProtocols = Set(
+            (functionExpression["type"] as? String).map {
+                Self.objectiveCProtocolNames(inMangledType: $0)
+            } ?? []
+        )
         if let formalFunctionType = importedSwiftType(
             functionExpression["type"],
             demangled: demangled
         ) {
+            if let declared = FrontendReceipt.FunctionTypeSpelling
+                .parameterSpellings(in: formalFunctionType),
+               declared.count == formalParameterTypes.count {
+                declaredParameterTypes = declared
+            }
             // Closure expression types do not carry the callee parameter's
             // `@escaping` lifetime. The applied declaration's formal type is
             // the authoritative source for callback boundary annotations.
@@ -1253,6 +1301,9 @@ extension FrontendReceipt.Adapter {
         }
         var parameterTypes = explicitParameterIndices.map {
             formalParameterTypes[$0]
+        }
+        var sourceInvocationParameterTypes = explicitParameterIndices.map {
+            declaredParameterTypes[$0]
         }
 
         let dispatch: NativeImportDiscovery.Dispatch
@@ -1281,6 +1332,7 @@ extension FrontendReceipt.Adapter {
                 ownerType = owner
                 receiver = implicit
                 parameterTypes.append(owner)
+                sourceInvocationParameterTypes.append(owner)
             }
         } else {
             dispatch = .globalFunction
@@ -1292,6 +1344,7 @@ extension FrontendReceipt.Adapter {
         else { return }
 
         let call: ImportedSILCall
+        var invocationParameterOverrides: [Int: String] = [:]
         if usr.hasPrefix("s:") {
             let symbol = "$s" + usr.dropFirst(2)
             let expectedLocation = sourceRange(in: expression).flatMap {
@@ -1335,9 +1388,17 @@ extension FrontendReceipt.Adapter {
                 guard alignedPhysicalParameters.indices.contains(index) else {
                     return logical
                 }
+                let physical = alignedPhysicalParameters[index]
+                if let invocationType = objectiveCProtocolInvocationType(
+                    sourceInvocationParameterTypes[index],
+                    physicalSpelling: physical,
+                    declaredProtocolNames: declaredObjectiveCProtocols
+                ) {
+                    invocationParameterOverrides[index] = invocationType
+                }
                 return objcLogicalType(
                     logical,
-                    physicalSpelling: alignedPhysicalParameters[index]
+                    physicalSpelling: physical
                 )
             }
             if let physicalResult = physicalResultSpelling(in: foreign.loweredType) {
@@ -1406,6 +1467,13 @@ extension FrontendReceipt.Adapter {
             }
         ) else { return }
         parameterTypes = callbackParameters
+        var invocationParameterTypes = parameterTypes
+        for (index, spelling) in invocationParameterOverrides
+        where invocationParameterTypes.indices.contains(index) {
+            invocationParameterTypes[index] = spelling
+        }
+        let invocationParameterSwiftTypes = invocationParameterTypes == parameterTypes
+            ? nil : invocationParameterTypes
 
         // Default argument values stay in the type environment so canonical
         // SIL can validate their compiler-only storage, but they do not cross
@@ -1464,9 +1532,21 @@ extension FrontendReceipt.Adapter {
                 types: &types
             )
         }
+        let resultSurfaceSpelling: String = {
+            guard let mangled = expression["type"] as? String,
+                  Self.objectiveCNominalIdentity(inMangledType: mangled) != nil,
+                  let physicalResult = physicalResultSpelling(
+                      in: call.loweredType
+                  ),
+                  let physicalNominal = importedPhysicalNominalSpelling(
+                      physicalResult
+                  )
+            else { return resultType }
+            return physicalNominal
+        }()
         recordImportedTypeSurface(
             rawMangledType: expression["type"],
-            spelling: resultType,
+            spelling: resultSurfaceSpelling,
             source: source,
             importedModules: importedModules,
             requiresMainActor: requiresMainActor,
@@ -1502,6 +1582,7 @@ extension FrontendReceipt.Adapter {
                 baseName: dispatch == .initializer ? "init" : baseName,
                 argumentLabels: argumentLabels,
                 parameterSwiftTypes: parameterTypes,
+                invocationParameterSwiftTypes: invocationParameterSwiftTypes,
                 parameterProjection: parameterProjection,
                 resultSwiftType: resultType,
                 requiresMainActor: requiresMainActor,
@@ -1944,20 +2025,7 @@ extension FrontendReceipt.Adapter {
             return callback.declaredSpelling
         }
         let logical = swiftType.replacingOccurrences(of: "Swift.", with: "")
-        var physical = rawPhysical.trimmingCharacters(in: .whitespaces)
-        var changed = true
-        while changed {
-            changed = false
-            for prefix in [
-                "$", "@owned ", "@guaranteed ", "@unowned ",
-                "@autoreleased ", "@in_guaranteed ", "@out ",
-            ] where physical.hasPrefix(prefix) {
-                physical.removeFirst(prefix.count)
-                physical = physical.trimmingCharacters(in: .whitespaces)
-                changed = true
-                break
-            }
-        }
+        let physical = strippingPhysicalOwnership(rawPhysical)
         if physical == "()" { return "Swift.Void" }
         if physical.hasPrefix("any ") {
             // Objective-C protocol existentials are class-bound. Their dynamic
@@ -1996,6 +2064,90 @@ extension FrontendReceipt.Adapter {
             return swiftType
         }
         return normalizeImportedTypeSpelling(physical)
+    }
+
+    /// Keeps the source-level Objective-C protocol type only inside the
+    /// generated Swift invoker. The artifact ABI remains AnyObject, while the
+    /// typed decoder performs the dynamic conformance check before the call.
+    private func objectiveCProtocolInvocationType(
+        _ swiftType: String,
+        physicalSpelling rawPhysical: String,
+        declaredProtocolNames: Set<String>
+    ) -> String? {
+        let physical = strippingPhysicalOwnership(rawPhysical)
+        for prefix in ["Optional<", "Swift.Optional<"]
+        where physical.hasPrefix(prefix) && physical.hasSuffix(">") {
+            let body = String(physical.dropFirst(prefix.count).dropLast())
+            guard let logicalBody = optionalWrappedSwiftType(swiftType),
+                  let invocation = objectiveCProtocolInvocationType(
+                      logicalBody,
+                      physicalSpelling: body,
+                      declaredProtocolNames: declaredProtocolNames
+                  )
+            else { return nil }
+            return "Swift.Optional<\(invocation)>"
+        }
+        guard physical.hasPrefix("any ")
+                || ["AnyObject", "Swift.AnyObject"].contains(physical)
+        else { return nil }
+        var logical = swiftType.trimmingCharacters(in: .whitespacesAndNewlines)
+        if logical.hasPrefix("("), logical.hasSuffix(")") {
+            logical.removeFirst()
+            logical.removeLast()
+            logical = logical.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let body = logical.hasPrefix("any ")
+            ? String(logical.dropFirst("any ".count)) : logical
+        let protocols = body.split(separator: "&").map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !protocols.isEmpty,
+              protocols.allSatisfy({ protocolName in
+                  let unqualified = protocolName.split(separator: ".").last
+                    .map(String.init) ?? protocolName
+                  return declaredProtocolNames.contains(unqualified)
+              })
+        else { return nil }
+        let existential = "any \(body)"
+        return FrontendReceipt.SwiftTypeSpelling.isGeneratedType(existential)
+            ? existential : nil
+    }
+
+    private func optionalWrappedSwiftType(_ raw: String) -> String? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasSuffix("?") {
+            var wrapped = String(value.dropLast())
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if wrapped.hasPrefix("("), wrapped.hasSuffix(")") {
+                wrapped.removeFirst()
+                wrapped.removeLast()
+            }
+            return wrapped.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        for prefix in ["Optional<", "Swift.Optional<"]
+        where value.hasPrefix(prefix) && value.hasSuffix(">") {
+            return String(value.dropFirst(prefix.count).dropLast())
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
+
+    private func strippingPhysicalOwnership(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespaces)
+        var changed = true
+        while changed {
+            changed = false
+            for prefix in [
+                "$", "@owned ", "@guaranteed ", "@unowned ",
+                "@autoreleased ", "@in_guaranteed ", "@out ",
+            ] where value.hasPrefix(prefix) {
+                value.removeFirst(prefix.count)
+                value = value.trimmingCharacters(in: .whitespaces)
+                changed = true
+                break
+            }
+        }
+        return value
     }
 
     private func physicalParameterSpellings(in loweredType: String) -> [String] {
@@ -2958,7 +3110,9 @@ extension FrontendReceipt.Adapter {
     /// Ownership attributes, functions, collections, and arbitrary generic
     /// surfaces cannot become source-level aliases through this path.
     private func importedPhysicalNominalSpelling(_ raw: String) -> String? {
-        let spelling = normalizeImportedTypeSpelling(raw)
+        let spelling = normalizeImportedTypeSpelling(
+            strippingPhysicalOwnership(raw)
+        )
         guard let nominal = importedNativeNominal(in: spelling) else {
             return nil
         }
@@ -3259,11 +3413,15 @@ extension FrontendReceipt.Adapter {
         return byIdentity.values.sorted {
             let lhs = ($0.dispatch.rawValue, $0.ownerType, $0.baseName,
                        $0.argumentLabels.joined(separator: ":") + "|"
-                           + $0.parameterSwiftTypes.joined(separator: ","),
+                           + $0.parameterSwiftTypes.joined(separator: ",") + "|"
+                           + ($0.invocationParameterSwiftTypes
+                                ?? $0.parameterSwiftTypes).joined(separator: ","),
                        $0.sourceFileLogicalID)
             let rhs = ($1.dispatch.rawValue, $1.ownerType, $1.baseName,
                        $1.argumentLabels.joined(separator: ":") + "|"
-                           + $1.parameterSwiftTypes.joined(separator: ","),
+                           + $1.parameterSwiftTypes.joined(separator: ",") + "|"
+                           + ($1.invocationParameterSwiftTypes
+                                ?? $1.parameterSwiftTypes).joined(separator: ","),
                        $1.sourceFileLogicalID)
             return lhs < rhs
         }
@@ -3282,6 +3440,13 @@ extension FrontendReceipt.Adapter {
                 aliases: aliases
             )
         }
+        result.invocationParameterSwiftTypes = operation
+            .invocationParameterSwiftTypes?.map {
+                FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
+                    in: $0,
+                    aliases: aliases
+                )
+            }
         result.resultSwiftType = FrontendReceipt.SwiftTypeSpelling
             .replacingNominalAliases(
                 in: operation.resultSwiftType,

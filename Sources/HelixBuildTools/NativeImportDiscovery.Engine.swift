@@ -34,6 +34,7 @@ extension NativeImportDiscovery {
         var baseName: String
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
+        var invocationParameterSwiftTypes: [String]? = nil
         var parameterProjection: InterfaceArchive.NativeImportParameterProjection
         var resultSwiftType: String
         var importedModules: [String] = []
@@ -57,6 +58,7 @@ extension NativeImportDiscovery {
         var baseName: String
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
+        var invocationParameterSwiftTypes: [String]?
         var resultSwiftType: String
         var importedModules: [String]
     }
@@ -187,6 +189,8 @@ extension NativeImportDiscovery {
                             baseName: declaration.baseName,
                             argumentLabels: declaration.argumentLabels,
                             parameterSwiftTypes: declaration.parameterSwiftTypes,
+                            invocationParameterSwiftTypes:
+                                declaration.invocationParameterSwiftTypes,
                             resultSwiftType: declaration.resultSwiftType,
                             importedModules: declaration.importedModules
                         )
@@ -279,6 +283,17 @@ extension NativeImportDiscovery {
             let explicitParameterTypes = isInstanceDispatch(declaration.dispatch)
                 ? Array(declaration.parameterTypes.dropLast())
                 : declaration.parameterTypes
+            let invocationParameterSwiftTypes = declaration
+                .invocationParameterSwiftTypes ?? declaration.parameterSwiftTypes
+            let invocationAdapterIsValid: Bool = {
+                guard let invocationTypes = declaration
+                    .invocationParameterSwiftTypes
+                else { return true }
+                return invocationTypes != declaration.parameterSwiftTypes
+                    && invocationTypes.allSatisfy(
+                        FrontendReceipt.SwiftTypeSpelling.isGeneratedType
+                    )
+            }()
             guard let callbackLifetimes = FrontendReceipt.NativeBridgeProfile
                 .authoritativeLifetimes(declaration.callbacks)
             else {
@@ -294,6 +309,12 @@ extension NativeImportDiscovery {
             )
             guard declaration.argumentLabels.count == explicitParameterTypes.count,
                   declaration.parameterSwiftTypes.count == declaration.parameterTypes.count,
+                  invocationParameterSwiftTypes.count
+                    == declaration.parameterTypes.count,
+                  invocationAdapterIsValid,
+                  !isInstanceDispatch(declaration.dispatch)
+                    || invocationParameterSwiftTypes.last
+                        == declaration.ownerType,
                   declaration.parameterProjection.isValid(
                       logicalParameterCount: declaration.parameterTypes.count
                   ),

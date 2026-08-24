@@ -1071,6 +1071,8 @@ extension FrontendReceipt.Adapter {
                     baseName: generated.baseName,
                     argumentLabels: generated.argumentLabels,
                     parameterSwiftTypes: generated.parameterSwiftTypes,
+                    invocationParameterSwiftTypes:
+                        generated.invocationParameterSwiftTypes,
                     resultSwiftType: generated.resultSwiftType
                 )
             )
@@ -1166,6 +1168,20 @@ extension FrontendReceipt.Adapter {
                         "cataloged imported type \(imported.canonicalName) disagrees with its kind or MainActor semantics"
                     )
                 }
+                guard let recordIndex = records.firstIndex(where: {
+                    $0.canonicalName == catalogType.canonicalName
+                }) else {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "cataloged imported type \(imported.canonicalName) has no frozen TypeRecord"
+                    )
+                }
+                records[recordIndex].swiftTypeAliases = Array(Set(
+                    records[recordIndex].swiftTypeAliases
+                        + nativeTypeAliases(
+                            for: imported,
+                            excluding: catalogType.canonicalName
+                        )
+                )).sorted()
                 continue
             }
             records.append(
@@ -1175,6 +1191,10 @@ extension FrontendReceipt.Adapter {
                         canonicalType: imported.canonicalName
                     ),
                     canonicalName: imported.canonicalName,
+                    swiftTypeAliases: nativeTypeAliases(
+                        for: imported,
+                        excluding: imported.canonicalName
+                    ),
                     kind: imported.kind,
                     layoutFingerprint: .sha256(
                         "HLX.ImportedNativeType.v1:\(metadata.frontendInvocation.targetTriple):"
@@ -1193,6 +1213,19 @@ extension FrontendReceipt.Adapter {
             )
         }
         return records.sorted { $0.id.rawValue < $1.id.rawValue }
+    }
+
+    /// The typed AST and mangled ABI jointly prove these spellings denote the
+    /// same imported nominal. Persist that proof for patch-time SIL parsing;
+    /// guessing overlay names from Foundation's `NS` convention is unsound.
+    private func nativeTypeAliases(
+        for imported: ImportedNativeType,
+        excluding canonicalName: String
+    ) -> [String] {
+        Array(Set(imported.aliases + [
+            imported.canonicalName,
+            imported.swiftType,
+        ])).filter { $0 != canonicalName }.sorted()
     }
 
     func makeLocalValueTypeLookup(

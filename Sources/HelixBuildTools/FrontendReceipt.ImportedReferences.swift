@@ -81,6 +81,14 @@ extension FrontendReceipt.Adapter {
                 continue
             }
             guard let item = next.value as? [String: Any] else { continue }
+            if item["implicit"] as? Bool == true,
+               let kind = item["_kind"] as? String,
+               Self.implicitDeclarationContexts.contains(kind) {
+                // Synthesized declarations inherit framework signatures from
+                // a superclass without making those types part of the
+                // source-authored patch boundary.
+                continue
+            }
             let requiresMainActor = next.requiresMainActor
                 || itemRequiresMainActor(item, demangled: demangled)
 
@@ -150,6 +158,10 @@ extension FrontendReceipt.Adapter {
             }
         }
     }
+
+    private static let implicitDeclarationContexts: Set<String> = [
+        "constructor_decl", "destructor_decl",
+    ]
 
     func importedNativeType(
         rawMangledType: Any?,
@@ -490,7 +502,7 @@ extension FrontendReceipt.Adapter {
     static func objectiveCClassNames(inMangledType mangledType: String) -> [String] {
         objectiveCNames(
             inMangledType: mangledType,
-            terminator: UInt8(ascii: "C")
+            terminator: "C"
         )
     }
 
@@ -499,7 +511,20 @@ extension FrontendReceipt.Adapter {
     ) -> [String] {
         objectiveCNames(
             inMangledType: mangledType,
-            terminator: UInt8(ascii: "a")
+            terminator: "a"
+        )
+    }
+
+    /// Finds Clang-imported protocol identities in a mangled type. Requiring
+    /// the exact `So..._p` production distinguishes protocol existentials from
+    /// source-level `Any` and `AnyObject`, which share an AnyObject-shaped
+    /// foreign calling convention.
+    static func objectiveCProtocolNames(
+        inMangledType mangledType: String
+    ) -> [String] {
+        objectiveCNames(
+            inMangledType: mangledType,
+            terminator: "_p"
         )
     }
 
@@ -571,9 +596,11 @@ extension FrontendReceipt.Adapter {
 
     private static func objectiveCNames(
         inMangledType mangledType: String,
-        terminator: UInt8
+        terminator: String
     ) -> [String] {
         let bytes = Array(mangledType.utf8)
+        let terminatorBytes = Array(terminator.utf8)
+        guard !terminatorBytes.isEmpty else { return [] }
         var names: Set<String> = []
         var index = 0
         while index + 3 < bytes.count {
@@ -596,8 +623,9 @@ extension FrontendReceipt.Adapter {
                       as: UTF8.self
                   )),
                   length > 0,
-                  cursor + length < bytes.count,
-                  bytes[cursor + length] == terminator
+                  cursor + length + terminatorBytes.count <= bytes.count,
+                  bytes[(cursor + length)..<(cursor + length
+                    + terminatorBytes.count)].elementsEqual(terminatorBytes)
             else {
                 index += 2
                 continue
@@ -609,7 +637,7 @@ extension FrontendReceipt.Adapter {
             if Self.isSwiftIdentifier(name) {
                 names.insert(name)
             }
-            index = cursor + length + 1
+            index = cursor + length + terminatorBytes.count
         }
         return names.sorted()
     }

@@ -32,6 +32,36 @@ struct ImportedFrameworks {
         #expect(try extended.resolve("Notification") == .native(notification))
     }
 
+    @Test("Compiler-proven native aliases resolve without name heuristics")
+    func resolvesCompilerProvenNativeAliases() throws {
+        let task = Core.TypeID(
+            rawValue: .sha256("Foundation.NSURLSessionDataTask")
+        )
+        let other = Core.TypeID(rawValue: .sha256("Fixture.OtherTask"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                [
+                    "NSURLSessionDataTask": task,
+                    "Fixture.OtherTask": other,
+                ],
+                aliases: [
+                    "URLSessionDataTask": [task],
+                    "AmbiguousTask": [task, other],
+                ]
+            )
+
+        #expect(
+            try environment.resolve("@autoreleased URLSessionDataTask")
+                == .native(task)
+        )
+        #expect(
+            try environment.resolve("NSURLSessionDataTask") == .native(task)
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            _ = try environment.resolve("AmbiguousTask")
+        }
+    }
+
     @Test("AnyObject bridge discovery requires an exact SIL instruction")
     func validatesAnyObjectBridgeReferenceInstruction() {
         let symbol = CanonicalSIL.AnyObjectBridge.silMangledName

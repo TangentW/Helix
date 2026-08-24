@@ -316,8 +316,12 @@ receipt cannot prove that every precompiled caller was replaced.
 
 A managed Debug Shell also audits public members for every module that
 contributes an already-frozen imported native type. Helix reads the symbol graph
-from the captured Swift toolchain and exact SDK, filters declarations against
-the Shell minimum OS and declaration isolation, then sends generated probes
+from the captured Swift toolchain and exact SDK. The extractor receives only
+the captured module-loading/search arguments it supports; source-only flags
+such as compilation conditions and frontend transforms remain on the typed
+AST/SIL path. Helix filters declarations against
+the Shell minimum OS and declaration isolation, excludes deprecated or
+unavailable declarations, then sends generated probes
 through the same typed AST and canonical SIL pipeline used for project source.
 Only uniquely measured, Bridge-compatible synchronous initializers, instance
 or static methods, and readable or writable properties become exact
@@ -332,10 +336,20 @@ Clang-importer `NSError **` bridge proven by the captured SIL, such as
 `FileManager.removeItem(atPath:)`; an unfamiliar pointer, sentinel, cleanup, or
 error-conversion shape fails closed. Swift-overlay names such as `Bundle` and
 physical aliases such as `CGFloat` are resolved from compiler identity and
-source evidence instead of guessed from Objective-C runtime spelling. This
-bounded convenience surface is not added to production Shells, does not
-introduce a new boundary type by itself, and never performs runtime selector or
-symbol lookup.
+source evidence instead of guessed from Objective-C runtime spelling. Those
+compiler-proven Swift/SIL spellings are retained as server-side aliases of the
+same frozen native identity for later patch compilation; ambiguous aliases are
+omitted and none enter the device interface. This
+source boundary also ignores inherited implicit constructors that the frontend
+synthesizes for a project subclass; their `Bundle`/`Coder` parameters do not
+become frozen merely because a superclass declares them. A compiler-proven
+Objective-C protocol parameter keeps the v1 `AnyObject` boundary identity but
+records its exact Swift existential spelling for the generated invoker. The
+invoker performs that conformance-checked decode inside `MainActor` when the
+operation is actor-isolated. Plain `Any` and `AnyObject` are not inferred to be
+protocols. This bounded convenience surface is not added to production Shells,
+does not introduce a new boundary type by itself, and never performs runtime
+selector or symbol lookup.
 
 For a supported source `class` instance method, the hidden Bridge carries
 `self` as a frozen reference `TypeID`. Generated `NativeTypeOperations` retain,

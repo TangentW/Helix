@@ -18,6 +18,9 @@ public struct Request: Sendable {
     public var requestedResources: Core.ResourceLimits
     public var directCalls: CanonicalSIL.DirectCallTable
     public var nativeTypes: [String: Core.TypeID]
+    /// Compiler-proven alternate Swift/SIL spellings, grouped so ambiguous
+    /// aliases can be omitted instead of guessed.
+    public var nativeTypeAliases: [String: Set<Core.TypeID>]
     public var nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind]
     /// Frozen native types whose values and hosted subclasses are MainActor-bound.
     public var mainActorNativeTypes: Set<Core.TypeID>
@@ -46,6 +49,7 @@ public struct Request: Sendable {
         requestedResources: Core.ResourceLimits = .init(),
         directCalls: CanonicalSIL.DirectCallTable = .empty,
         nativeTypes: [String: Core.TypeID] = [:],
+        nativeTypeAliases: [String: Set<Core.TypeID>] = [:],
         nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:],
         mainActorNativeTypes: Set<Core.TypeID> = [],
         frozenValueTypes: [InterfaceArchive.FrozenValueTypeRecord] = [],
@@ -65,6 +69,7 @@ public struct Request: Sendable {
         self.requestedResources = requestedResources
         self.directCalls = directCalls
         self.nativeTypes = nativeTypes
+        self.nativeTypeAliases = nativeTypeAliases
         self.nativeTypeKinds = nativeTypeKinds
         self.mainActorNativeTypes = mainActorNativeTypes
         self.frozenValueTypes = frozenValueTypes
@@ -89,6 +94,7 @@ public struct Driver: Sendable {
         let file = try CanonicalSIL.File(text: request.canonicalSIL)
         let typeEnvironment = try file.typeEnvironment.includingNativeTypes(
             request.nativeTypes,
+            aliases: request.nativeTypeAliases,
             kinds: request.nativeTypeKinds,
             requiresMainActor: request.mainActorNativeTypes
         )

@@ -381,6 +381,7 @@ public struct TypeEnvironment: Sendable {
     private var requiresTypedErrors: Bool
     private var nativeTypes: [String: Core.TypeID]
     private var canonicalNativeTypes: [String: Core.TypeID]
+    private var nativeAliasCandidates: [String: Set<Core.TypeID>]
     private var nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind]
     private var mainActorNativeTypes: Set<Core.TypeID>
 
@@ -412,6 +413,7 @@ public struct TypeEnvironment: Sendable {
         requiresTypedErrors = false
         nativeTypes = [:]
         canonicalNativeTypes = [:]
+        nativeAliasCandidates = [:]
         nativeTypeKinds = [:]
         mainActorNativeTypes = []
     }
@@ -432,6 +434,7 @@ public struct TypeEnvironment: Sendable {
         classAllocators = [:]
         nativeTypes = [:]
         canonicalNativeTypes = [:]
+        nativeAliasCandidates = [:]
         nativeTypeKinds = [:]
         mainActorNativeTypes = []
         // Payload-free throws use the lightweight String error representation.
@@ -451,17 +454,27 @@ public struct TypeEnvironment: Sendable {
     }
 
     /// Returns an environment that resolves the exact native types frozen in
-    /// the target Shell. Both exact SIL spellings and an unambiguous
-    /// module-relative form are accepted. Ambiguous shorthand is omitted so
+    /// the target Shell. Exact compiler-proven aliases and unambiguous
+    /// module-relative forms are accepted. Ambiguous shorthand is omitted so
     /// nested SDK types with the same terminal name retain their identities.
     public func includingNativeTypes(
         _ records: [String: Core.TypeID],
+        aliases: [String: Set<Core.TypeID>] = [:],
         kinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:],
         requiresMainActor: Set<Core.TypeID> = []
     ) throws -> Self {
         let frozenTypeIDs = Set(records.values)
         guard Set(kinds.keys).isSubset(of: frozenTypeIDs),
-              requiresMainActor.isSubset(of: frozenTypeIDs)
+              requiresMainActor.isSubset(of: frozenTypeIDs),
+              aliases.allSatisfy({ alias, ids in
+                  !alias.isEmpty
+                      && alias.utf8.count <= 1_024
+                      && alias == alias.trimmingCharacters(
+                          in: .whitespacesAndNewlines
+                      )
+                      && !ids.isEmpty
+                      && ids.isSubset(of: frozenTypeIDs)
+              })
         else {
             throw CanonicalSIL.LoweringError.invalidCallTable(
                 "native type metadata references an unknown TypeID"
@@ -507,6 +520,9 @@ public struct TypeEnvironment: Sendable {
             }
             result.canonicalNativeTypes[canonicalName] = id
         }
+        for (alias, ids) in aliases {
+            result.nativeAliasCandidates[alias, default: []].formUnion(ids)
+        }
         result.rebuildNativeTypeAliases()
         try result.rebuildFactoryTables(allowingUnresolvedTypes: false)
         return result
@@ -514,7 +530,7 @@ public struct TypeEnvironment: Sendable {
 
     private mutating func rebuildNativeTypeAliases() {
         nativeTypes = canonicalNativeTypes
-        var candidates: [String: Set<Core.TypeID>] = [:]
+        var candidates = nativeAliasCandidates
         for (canonicalName, id) in canonicalNativeTypes {
             guard let separator = canonicalName.firstIndex(of: ".") else {
                 continue

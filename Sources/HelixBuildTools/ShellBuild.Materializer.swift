@@ -602,6 +602,8 @@ public struct Materializer: Sendable {
                         baseName: generated.baseName,
                         argumentLabels: generated.argumentLabels,
                         parameterSwiftTypes: generated.parameterSwiftTypes,
+                        invocationParameterSwiftTypes:
+                            generated.invocationParameterSwiftTypes,
                         resultSwiftType: generated.resultSwiftType
                     )
                 }

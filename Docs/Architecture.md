@@ -283,10 +283,18 @@ Both workflows depend on stable, build-specific identities:
   `Any -> AnyObject` NativeImport. An Objective-C overlay alias is admitted
   only when the mangled type is that exact top-level nominal; a nested Swift
   type such as `Timer.TimerPublisher` cannot collapse into its enclosing
-  Objective-C class identity. Imported trivial values remain borrowed in
-  physical SIL even though their HLBC native handles are managed owners; the
-  compiler materializes and retires those owners at generic value/address
-  lifetime edges rather than by SDK-type special cases.
+  Objective-C class identity. The foreign protocol spelling is retained only
+  by the generated invoker and must be proven by the exact `So..._p` mangling;
+  plain `Any` and `AnyObject` cannot acquire it. For a MainActor operation,
+  decoding and the native call occur within the same actor-isolated closure so
+  a non-Sendable existential is never transferred across that boundary.
+  Compiler-proven Swift/SIL spellings for one imported nominal are persisted as
+  server-side aliases of its frozen native identity. Ambiguous aliases are not
+  resolved, and aliases never enter the device interface projection. Imported
+  trivial values remain borrowed in physical SIL even though their HLBC native
+  handles are managed owners; the compiler materializes and retires those
+  owners at generic value/address lifetime edges rather than by SDK-type
+  special cases.
 - Array, Dictionary, and Set are typed VM values rather than projections of
   private Swift runtime layouts. One bounded recursive value-semantics model
   supplies VM-defined Equatable and Hashable behavior for supported scalars and
@@ -792,7 +800,10 @@ an App phase reconstructs the captured Feature invocation and compiles all
 generated Bridge sources into one validated relocatable object. App linking
 retains its stable C provider symbol, so `ApplicationSession` discovers the
 generated contract without a Bridge framework, generated source target, or
-generated Swift import.
+generated Swift import. Large generated descriptor and invoker collections are
+emitted as deterministic, explicitly typed bounded chunks; this preserves
+ordering and the single-object contract while bounding Swift constraint-solver
+memory during the hidden compilation.
 
 The Xcode integration captures the frontend, link, SDK, module, source, and
 target facts from a real Debug build. A source monitor turns editor writes and

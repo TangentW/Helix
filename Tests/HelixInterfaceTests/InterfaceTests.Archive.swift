@@ -134,6 +134,58 @@ struct Archive {
         #expect(try first.computeShellInterfaceHash() != changed.computeShellInterfaceHash())
     }
 
+    @Test("Swift native aliases remain server-side compiler metadata")
+    func nativeAliasesDoNotChangeDeviceInterface() throws {
+        var original = try fixture()
+        let canonicalName = "NSURLSessionDataTask"
+        let typeID = Core.TypeID.derive(
+            namespace: original.metadata.shellNamespaceID,
+            canonicalType: canonicalName
+        )
+        original.capabilities.append(.nativeTypesV1)
+        original.nativeTypes = [
+            .init(
+                id: typeID,
+                canonicalName: canonicalName,
+                kind: .reference,
+                layoutFingerprint: .sha256("NSURLSessionDataTask.layout"),
+                isCopyable: true,
+                isEmittedToDevice: true,
+                estimatedSize: 8
+            ),
+        ]
+        original.shellInterfaceHash = try original.computeShellInterfaceHash()
+
+        var aliased = original
+        aliased.nativeTypes[0].swiftTypeAliases = [
+            "URLSessionDataTask", "URLSessionDataTask", canonicalName,
+        ]
+        aliased = aliased.normalized()
+        aliased.shellInterfaceHash = try aliased.computeShellInterfaceHash()
+
+        #expect(aliased.nativeTypes[0].swiftTypeAliases == [
+            "URLSessionDataTask",
+        ])
+        #expect(aliased.shellInterfaceHash == original.shellInterfaceHash)
+        try aliased.validate()
+        let decoded = try InterfaceArchive.Codec.decode(
+            InterfaceArchive.Codec.encode(aliased)
+        ).archive
+        #expect(decoded.nativeTypes[0].swiftTypeAliases == [
+            "URLSessionDataTask",
+        ])
+
+        var oversized = aliased
+        oversized.nativeTypes[0].swiftTypeAliases = [
+            String(repeating: "A", count: 1_025),
+        ]
+        #expect(throws: InterfaceArchive.Error.invalidArchive(
+            "native type identity or alias metadata is invalid"
+        )) {
+            try oversized.validate()
+        }
+    }
+
     @Test("Fallback policy participates in the device interface hash")
     func fallbackPolicyChangesInterfaceHash() throws {
         let original = try fixture()

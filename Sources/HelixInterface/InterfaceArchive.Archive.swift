@@ -162,6 +162,10 @@ public enum TypeKind: String, Codable, Hashable, Sendable {
 public struct TypeRecord: Codable, Hashable, Sendable {
     public var id: Core.TypeID
     public var canonicalName: String
+    /// Compiler-proven Swift/SIL spellings for the same native identity.
+    /// These are patch-compiler metadata and are intentionally excluded from
+    /// the device projection.
+    public var swiftTypeAliases: [String]
     public var kind: InterfaceArchive.TypeKind
     public var layoutFingerprint: Core.Digest
     public var isCopyable: Bool
@@ -172,6 +176,7 @@ public struct TypeRecord: Codable, Hashable, Sendable {
     public init(
         id: Core.TypeID,
         canonicalName: String,
+        swiftTypeAliases: [String] = [],
         kind: InterfaceArchive.TypeKind,
         layoutFingerprint: Core.Digest,
         isCopyable: Bool,
@@ -181,6 +186,7 @@ public struct TypeRecord: Codable, Hashable, Sendable {
     ) {
         self.id = id
         self.canonicalName = canonicalName
+        self.swiftTypeAliases = swiftTypeAliases
         self.kind = kind
         self.layoutFingerprint = layoutFingerprint
         self.isCopyable = isCopyable
@@ -386,6 +392,14 @@ public struct Archive: Codable, Hashable, Sendable {
             ).sorted()
         }
         value.nativeTypes.sort { $0.id.rawValue < $1.id.rawValue }
+        for index in value.nativeTypes.indices {
+            let canonicalName = value.nativeTypes[index].canonicalName
+            value.nativeTypes[index].swiftTypeAliases = Array(Set(
+                value.nativeTypes[index].swiftTypeAliases.filter {
+                    $0 != canonicalName
+                }
+            )).sorted()
+        }
         value.frozenValueTypes.sort { $0.key < $1.key }
         return value
     }
@@ -722,11 +736,21 @@ public struct Archive: Codable, Hashable, Sendable {
         }
         for type in nativeTypes {
             guard !type.canonicalName.isEmpty,
+                  type.swiftTypeAliases.count <= 32,
+                  type.swiftTypeAliases == Array(Set(
+                      type.swiftTypeAliases
+                  )).sorted(),
+                  !type.swiftTypeAliases.contains(type.canonicalName),
+                  type.swiftTypeAliases.allSatisfy(
+                      Self.isValidNativeTypeAlias
+                  ),
                   Core.TypeID.derive(
-                namespace: metadata.shellNamespaceID,
-                canonicalType: type.canonicalName
-            ) == type.id else {
-                throw InterfaceArchive.Error.invalidArchive("native type key derivation mismatch")
+                      namespace: metadata.shellNamespaceID,
+                      canonicalType: type.canonicalName
+                  ) == type.id else {
+                throw InterfaceArchive.Error.invalidArchive(
+                    "native type identity or alias metadata is invalid"
+                )
             }
         }
         if nativeTypes.contains(where: \.isEmittedToDevice),
@@ -1033,6 +1057,13 @@ public struct Archive: Codable, Hashable, Sendable {
             && value.utf8.allSatisfy { byte in
                 byte > 0x20 && byte != 0x3a && byte != 0x40
             }
+    }
+
+    private static func isValidNativeTypeAlias(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.utf8.count <= 1_024
+            && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+            && value.utf8.allSatisfy { $0 > 0x20 && $0 != 0x7f }
     }
 }
 

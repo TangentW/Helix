@@ -101,6 +101,7 @@ public struct GeneratedNativeImport: Hashable, Sendable {
     public var baseName: String
     public var argumentLabels: [String]
     public var parameterSwiftTypes: [String]
+    public var invocationParameterSwiftTypes: [String]?
     public var resultSwiftType: String
 
     public init(
@@ -111,6 +112,7 @@ public struct GeneratedNativeImport: Hashable, Sendable {
         baseName: String,
         argumentLabels: [String],
         parameterSwiftTypes: [String],
+        invocationParameterSwiftTypes: [String]? = nil,
         resultSwiftType: String
     ) {
         self.declarationMangledName = declarationMangledName
@@ -120,6 +122,7 @@ public struct GeneratedNativeImport: Hashable, Sendable {
         self.baseName = baseName
         self.argumentLabels = argumentLabels
         self.parameterSwiftTypes = parameterSwiftTypes
+        self.invocationParameterSwiftTypes = invocationParameterSwiftTypes
         self.resultSwiftType = resultSwiftType
     }
 
@@ -1148,14 +1151,15 @@ public struct Generator: Sendable {
                    "CoreGraphics.CGFloat"]
             return names.contains(name)
         case let (.named(name), .native(typeID)):
-            guard let canonicalName = archive.nativeTypes.first(where: {
+            guard let record = archive.nativeTypes.first(where: {
                 $0.id == typeID
-            })?.canonicalName else { return false }
+            }) else { return false }
             let modulePrefix = archive.metadata.frontendInvocation.moduleName + "."
-            let moduleRelativeName = canonicalName.hasPrefix(modulePrefix)
-                ? String(canonicalName.dropFirst(modulePrefix.count))
-                : canonicalName
-            return name == canonicalName || name == moduleRelativeName
+            let names = Set([record.canonicalName] + record.swiftTypeAliases)
+            return names.contains(name) || names.contains { candidate in
+                candidate.hasPrefix(modulePrefix)
+                    && name == String(candidate.dropFirst(modulePrefix.count))
+            }
         case let (.named(name), .local(key)):
             let record = frozenValueTypes?[key]
                 ?? archive.frozenValueTypes.first(where: { $0.key == key })
@@ -1259,6 +1263,51 @@ public struct Generator: Sendable {
             return ["Void", "Swift.Void", "()"].contains(name)
         default:
             return false
+        }
+    }
+
+    private func invocationSwiftTypeMatches(
+        boundary: SwiftTypeShape,
+        invocation: SwiftTypeShape,
+        type: Bytecode.ValueType,
+        archive: InterfaceArchive.Archive
+    ) -> Bool {
+        if swiftTypeMatches(invocation, type: type, archive: archive) {
+            return true
+        }
+        switch (boundary, invocation, type) {
+        case let (.named(boundaryName), .named(invocationName), .native(typeID)):
+            guard ["AnyObject", "Swift.AnyObject"].contains(boundaryName),
+                  archive.nativeTypes.first(where: { $0.id == typeID })?
+                    .canonicalName == "Swift.AnyObject"
+            else { return false }
+            return isForeignProtocolExistentialSpelling(invocationName)
+        case let (
+            .optional(boundaryWrapped),
+            .optional(invocationWrapped),
+            .optional(typeWrapped)
+        ):
+            return invocationSwiftTypeMatches(
+                boundary: boundaryWrapped,
+                invocation: invocationWrapped,
+                type: typeWrapped,
+                archive: archive
+            )
+        default:
+            return false
+        }
+    }
+
+    private func isForeignProtocolExistentialSpelling(_ raw: String) -> Bool {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value.hasPrefix("any ") else { return false }
+        let protocols = value.dropFirst("any ".count).split(separator: "&")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let erasedBuiltins = Set([
+            "Any", "Swift.Any", "AnyObject", "Swift.AnyObject",
+        ])
+        return !protocols.isEmpty && protocols.allSatisfy {
+            isValidModulePath($0) && !erasedBuiltins.contains($0)
         }
     }
 
@@ -2131,7 +2180,9 @@ public struct Generator: Sendable {
         generated: BridgeGeneration.GeneratedNativeImport,
         record: InterfaceArchive.NativeImportRecord
     ) throws -> String {
-        let shapes = try generated.parameterSwiftTypes.map(parseSwiftType)
+        let invocationParameterSwiftTypes = generated
+            .invocationParameterSwiftTypes ?? generated.parameterSwiftTypes
+        let shapes = try invocationParameterSwiftTypes.map(parseSwiftType)
         let callbackByParameter = Dictionary(
             uniqueKeysWithValues: record.contract.callbacks.map {
                 (Int($0.parameterIndex), $0)
@@ -2160,9 +2211,24 @@ public struct Generator: Sendable {
             generated: generated,
             effects: record.effects
         )
+        let decodedBody = decoded.joined(separator: "\n")
         let invocation: String
         if record.resultType == .void {
-            let call = renderMainActorCall(directCall, effects: record.effects)
+            let call: String
+            if record.effects.requiresMainActor {
+                // Decode actor-bound protocol existentials after entering the
+                // actor. Moving a task-isolated existential into this closure
+                // is rejected by Swift 6 even though the closure is
+                // nonescaping and the generated adapter never reuses it.
+                let attempt = record.effects.isAsync ? "try await " : "try "
+                call = """
+                \(attempt)context.withMainActor {
+                \(indent(decodedBody + "\n" + directCall, spaces: 4))
+                }
+                """
+            } else {
+                call = directCall
+            }
             let callBody = renderGeneratedThrowingCall(
                 call,
                 resultDeclaration: nil,
@@ -2194,6 +2260,7 @@ public struct Generator: Sendable {
                 if record.effects.mayThrow {
                     invocation = """
                     return \(actorAttempt)context.withMainActor {
+                    \(indent(decodedBody, spaces: 4))
                         let result: \(resultShape.rendered)
                         do {
                             result = \(directCall)
@@ -2208,6 +2275,7 @@ public struct Generator: Sendable {
                 } else {
                     invocation = """
                     return \(actorAttempt)context.withMainActor {
+                    \(indent(decodedBody, spaces: 4))
                         let result: \(resultShape.rendered) = \(directCall)
                         return .returned(\(encoded))
                     }
@@ -2222,7 +2290,8 @@ public struct Generator: Sendable {
                 invocation = callBody + "\nreturn .returned(\(encoded))"
             }
         }
-        let body = (decoded + [invocation]).joined(separator: "\n")
+        let body = record.effects.requiresMainActor
+            ? invocation : (decoded + [invocation]).joined(separator: "\n")
         let factoryName = BridgeGeneration.GeneratedNativeImport.factoryName(key: binding.key)
         let invokerProtocol = record.effects.isAsync
             ? "VM.AsyncNativeInvoker" : "VM.NativeInvoker"
@@ -2552,16 +2621,6 @@ public struct Generator: Sendable {
             + expression
     }
 
-    private func renderMainActorCall(_ directCall: String, effects: Core.Effects) -> String {
-        guard effects.requiresMainActor else { return directCall }
-        let attempt = effects.isAsync ? "try await " : "try "
-        return """
-        \(attempt)context.withMainActor {
-        \(indent(directCall, spaces: 4))
-        }
-        """
-    }
-
     private func renderGeneratedThrowingCall(
         _ call: String,
         resultDeclaration: String?,
@@ -2866,7 +2925,9 @@ public struct Generator: Sendable {
                 && ["Substring", "Swift.Substring"].contains(name):
             return "try Runtime.BridgeValueCodec.decode(\(expression), as: \(name).self)"
         case let (.named(name), .native(typeID)):
-            return "try Runtime.BridgeValueCodec.decodeNative(\(expression), as: \(name).self, "
+            let metatype = name.hasPrefix("any ")
+                ? "(\(name)).self" : "\(name).self"
+            return "try Runtime.BridgeValueCodec.decodeNative(\(expression), as: \(metatype), "
                 + "typeID: \(render(typeID)))"
         case let (.named, .local(key)):
             guard let record = frozenValueTypes[key] else {
@@ -3073,6 +3134,8 @@ public struct Generator: Sendable {
         )
         let expectedDeadlineMode: Core.NativeImportDeadlineMode =
             record.effects.isAsync ? .suspending : .bounded
+        let invocationParameterSwiftTypes = generated
+            .invocationParameterSwiftTypes ?? generated.parameterSwiftTypes
         guard binding.invokerExpression == expectedExpression,
               record.silMangledNames.contains(generated.declarationMangledName),
               isSafeLogicalPath(generated.sourceFileLogicalID),
@@ -3080,6 +3143,9 @@ public struct Generator: Sendable {
                 || generated.dispatch == .globalFunction
                     && Core.SwiftName.isOperator(generated.baseName),
               generated.parameterSwiftTypes.count == record.parameterTypes.count,
+              invocationParameterSwiftTypes.count == record.parameterTypes.count,
+              generated.invocationParameterSwiftTypes == nil
+                || invocationParameterSwiftTypes != generated.parameterSwiftTypes,
               !isReceiverDispatch(generated.dispatch) || !record.parameterTypes.isEmpty,
               generated.argumentLabels.count == record.parameterTypes.count
                 - (isReceiverDispatch(generated.dispatch) ? 1 : 0),
@@ -3182,6 +3248,7 @@ public struct Generator: Sendable {
                   isValidGeneratedSwiftTypeSpelling(owner),
                   record.parameterTypes.last.map(isNativeType) == true,
                   generated.parameterSwiftTypes.last == owner,
+                  invocationParameterSwiftTypes.last == owner,
                   isGeneratedResultType(record.resultType)
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
@@ -3194,6 +3261,7 @@ public struct Generator: Sendable {
                   record.parameterTypes.count == 1,
                   isNativeType(record.parameterTypes[0]),
                   generated.parameterSwiftTypes == [owner],
+                  invocationParameterSwiftTypes == [owner],
                   record.resultType != .void,
                   isGeneratedResultType(record.resultType)
             else {
@@ -3208,6 +3276,7 @@ public struct Generator: Sendable {
                   record.parameterTypes.count == 2,
                   isNativeType(record.parameterTypes[1]),
                   generated.parameterSwiftTypes.last == owner,
+                  invocationParameterSwiftTypes.last == owner,
                   record.resultType == .void
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
@@ -3221,6 +3290,7 @@ public struct Generator: Sendable {
                   record.parameterTypes.count == 2,
                   isNativeType(record.parameterTypes[1]),
                   generated.parameterSwiftTypes.last == owner,
+                  invocationParameterSwiftTypes.last == owner,
                   record.resultType == record.parameterTypes[1],
                   generated.resultSwiftType == owner
             else {
@@ -3229,9 +3299,21 @@ public struct Generator: Sendable {
         }
         do {
             let parameterShapes = try generated.parameterSwiftTypes.map(parseSwiftType)
+            let invocationParameterShapes = try invocationParameterSwiftTypes
+                .map(parseSwiftType)
             let resultShape = try parseSwiftType(generated.resultSwiftType)
             guard zip(parameterShapes, record.parameterTypes).allSatisfy({
                 swiftTypeMatches($0.0, type: $0.1, archive: archive)
+            }), zip(
+                zip(parameterShapes, invocationParameterShapes),
+                record.parameterTypes
+            ).allSatisfy({ pair, type in
+                invocationSwiftTypeMatches(
+                    boundary: pair.0,
+                    invocation: pair.1,
+                    type: type,
+                    archive: archive
+                )
             }), swiftTypeMatches(resultShape, type: record.resultType, archive: archive)
             else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
@@ -3381,16 +3463,47 @@ public struct Generator: Sendable {
         let frozenValueTypes = archive.frozenValueTypes
             .sorted { $0.key < $1.key }
             .map(renderFrozenValueType)
+        let renderedEntries = renderGeneratedArray(
+            entries,
+            elementType: "Verification.ResolvedEntry",
+            factoryName: "makeResolvedEntries",
+            directIndentation: 20
+        )
+        let renderedImports = renderGeneratedArray(
+            imports,
+            elementType: "Verification.ResolvedNativeImport",
+            factoryName: "makeResolvedNativeImports",
+            directIndentation: 20
+        )
+        let renderedTypes = renderGeneratedArray(
+            types,
+            elementType: "Verification.ResolvedNativeType",
+            factoryName: "makeResolvedNativeTypes",
+            directIndentation: 20
+        )
+        let renderedFrozenValueTypes = renderGeneratedArray(
+            frozenValueTypes,
+            elementType: "Verification.ResolvedFrozenValueType",
+            factoryName: "makeResolvedFrozenValueTypes",
+            directIndentation: 20
+        )
+        let helpers = [
+            renderedEntries.declarations,
+            renderedImports.declarations,
+            renderedTypes.declarations,
+            renderedFrozenValueTypes.declarations,
+        ].filter { !$0.isEmpty }.joined(separator: "\n\n")
         return """
+        \(helpers.isEmpty ? "" : helpers + "\n\n")
             public static func makeShellInterface() throws -> Verification.ShellInterface {
                 try Verification.ShellInterface(
                     interfaceHash: interfaceHash,
                     compatibility: \(render(archive.compatibility)),
                     capabilities: \(renderCapabilities(archive.capabilities)),
-                    entries: \(renderArray(entries, indentation: 20)),
-                    imports: \(renderArray(imports, indentation: 20)),
-                    types: \(renderArray(types, indentation: 20)),
-                    frozenValueTypes: \(renderArray(frozenValueTypes, indentation: 20))
+                    entries: \(renderedEntries.expression),
+                    imports: \(renderedImports.expression),
+                    types: \(renderedTypes.expression),
+                    frozenValueTypes: \(renderedFrozenValueTypes.expression)
                 )
             }
         """
@@ -3403,7 +3516,15 @@ public struct Generator: Sendable {
             guard record.isEmittedToDevice, let id = record.id else { return nil }
             return "Core.NativeImportID(rawValue: \(id.rawValue))"
         }.sorted()
+        let renderedImports = renderGeneratedArray(
+            imports,
+            elementType: "Core.NativeImportID",
+            factoryName: "makePatchNativeImportIDs",
+            directIndentation: 24
+        )
         return """
+        \(renderedImports.declarations.isEmpty
+            ? "" : renderedImports.declarations + "\n\n")
             public static func makePatchBuildContract() throws -> PatchRuntime.BuildContract {
                 try PatchRuntime.BuildContract(
                     bundleID: \(quoted(archive.metadata.bundleID)),
@@ -3415,7 +3536,7 @@ public struct Generator: Sendable {
                     minimumOSVersion: \(render(archive.metadata.minimumOS)),
                     compatibility: \(render(archive.compatibility)),
                     capabilities: \(renderCapabilities(archive.capabilities)),
-                    nativeImportIDs: Set(\(renderArray(imports, indentation: 24))),
+                    nativeImportIDs: Set(\(renderedImports.expression)),
                     runtimeImageIdentity: .current
                 )
             }
@@ -3446,17 +3567,41 @@ public struct Generator: Sendable {
         }
         let typeExpressions = types.sorted(by: { $0.id.rawValue < $1.id.rawValue })
             .map(\.operationsExpression)
+        let synchronousInvokers = renderGeneratedArray(
+            synchronousImportExpressions,
+            elementType: "any VM.NativeInvoker",
+            factoryName: "makeSynchronousNativeInvokers",
+            directIndentation: 16
+        )
+        let asynchronousInvokers = renderGeneratedArray(
+            asynchronousImportExpressions,
+            elementType: "any VM.AsyncNativeInvoker",
+            factoryName: "makeAsynchronousNativeInvokers",
+            directIndentation: 16
+        )
+        let nativeTypeOperations = renderGeneratedArray(
+            typeExpressions,
+            elementType: "VM.NativeTypeOperations",
+            factoryName: "makeNativeTypeOperations",
+            directIndentation: 16
+        )
+        let helpers = [
+            synchronousInvokers.declarations,
+            asynchronousInvokers.declarations,
+            nativeTypeOperations.declarations,
+        ].filter { !$0.isEmpty }.joined(separator: "\n\n")
         return """
+        \(helpers.isEmpty ? "" : helpers + "\n\n")
             public static func makeNativeCatalog() throws -> VM.NativeCatalog {
-                try VM.NativeCatalog(\(renderArray(synchronousImportExpressions, indentation: 16)))
+                try VM.NativeCatalog(\(synchronousInvokers.expression))
             }
 
             public static func makeAsyncNativeCatalog() throws -> VM.AsyncNativeCatalog {
-                try VM.AsyncNativeCatalog(\(renderArray(asynchronousImportExpressions, indentation: 16)))
+                try VM.AsyncNativeCatalog(\(asynchronousInvokers.expression))
             }
 
             public static func makeNativeTypeCatalog() throws -> VM.NativeTypeCatalog {
-                try VM.NativeTypeCatalog(\(renderArray(typeExpressions, indentation: 16)))
+                try VM.NativeTypeCatalog(\(nativeTypeOperations.expression))
             }
 
             public static func makeRuntime(
@@ -3666,6 +3811,62 @@ public struct Generator: Sendable {
 
     private func render(_ digest: Core.Digest) -> String {
         "try! Core.Digest(hex: \(quoted(digest.hex)))"
+    }
+
+    private struct GeneratedArrayRendering {
+        var declarations: String
+        var expression: String
+    }
+
+    /// Large heterogeneous-looking array literals make Swift's constraint
+    /// solver retain a disproportionate amount of state. Split only large
+    /// generated collections into explicitly typed, bounded functions; the
+    /// logical ordering and runtime collection remain unchanged.
+    private func renderGeneratedArray(
+        _ elements: [String],
+        elementType: String,
+        factoryName: String,
+        directIndentation: Int
+    ) -> GeneratedArrayRendering {
+        let chunkSize = 32
+        guard elements.count > chunkSize else {
+            return .init(
+                declarations: "",
+                expression: renderArray(
+                    elements,
+                    indentation: directIndentation
+                )
+            )
+        }
+        let chunks = stride(from: 0, to: elements.count, by: chunkSize).map {
+            start in
+            Array(elements[start..<min(start + chunkSize, elements.count)])
+        }
+        var declarations: [String] = []
+        var collector = [
+            "    private static func \(factoryName)() -> [\(elementType)] {",
+            "        var result: [\(elementType)] = []",
+            "        result.reserveCapacity(\(elements.count))",
+        ]
+        for index in chunks.indices {
+            collector.append(
+                "        result.append(contentsOf: \(factoryName)_\(index)())"
+            )
+        }
+        collector.append("        return result")
+        collector.append("    }")
+        declarations.append(collector.joined(separator: "\n"))
+        for (index, chunk) in chunks.enumerated() {
+            declarations.append([
+                "    private static func \(factoryName)_\(index)() -> [\(elementType)] {",
+                "        return " + renderArray(chunk, indentation: 12),
+                "    }",
+            ].joined(separator: "\n"))
+        }
+        return .init(
+            declarations: declarations.joined(separator: "\n\n"),
+            expression: "\(factoryName)()"
+        )
     }
 
     private func renderArray(_ elements: [String], indentation: Int) -> String {

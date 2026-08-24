@@ -282,6 +282,12 @@ extension ReleaseCompiler {
                     ($0.canonicalName, $0.id)
                 }
             )
+            var frozenNativeTypeAliases: [String: Set<Core.TypeID>] = [:]
+            for record in frozenNativeTypeRecords {
+                for alias in record.swiftTypeAliases {
+                    frozenNativeTypeAliases[alias, default: []].insert(record.id)
+                }
+            }
             let frozenNativeTypeKinds = Dictionary(
                 uniqueKeysWithValues: frozenNativeTypeRecords.map { ($0.id, $0.kind) }
             )
@@ -290,6 +296,7 @@ extension ReleaseCompiler {
             )
             let silTypeEnvironment = try silFile.typeEnvironment.includingNativeTypes(
                 frozenNativeTypes,
+                aliases: frozenNativeTypeAliases,
                 kinds: frozenNativeTypeKinds,
                 requiresMainActor: mainActorNativeTypes
             )
@@ -465,6 +472,7 @@ extension ReleaseCompiler {
             let loweringTypeEnvironment = try loweringSILFile.typeEnvironment
                 .includingNativeTypes(
                     frozenNativeTypes,
+                    aliases: frozenNativeTypeAliases,
                     kinds: frozenNativeTypeKinds,
                     requiresMainActor: mainActorNativeTypes
                 )

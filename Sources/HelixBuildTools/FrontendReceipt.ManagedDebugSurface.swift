@@ -622,6 +622,13 @@ extension FrontendReceipt.ManagedDebugSurface {
                     aliases: swiftAliases
                 )
             }
+            measured.invocationParameterSwiftTypes = operation
+                .invocationParameterSwiftTypes?.map {
+                    FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
+                        in: $0,
+                        aliases: swiftAliases
+                    )
+                }
             for index in candidate.parameterTypes.indices
             where measured.parameterSwiftTypes.indices.contains(index) {
                 let formal = FrontendReceipt.SwiftTypeSpelling
@@ -632,6 +639,10 @@ extension FrontendReceipt.ManagedDebugSurface {
                 if let boundary = FrontendReceipt.FunctionTypeSpelling
                     .callbackBoundary(in: formal) {
                     measured.parameterSwiftTypes[index] = boundary.declaredSpelling
+                    if measured.invocationParameterSwiftTypes != nil {
+                        measured.invocationParameterSwiftTypes?[index] =
+                            boundary.declaredSpelling
+                    }
                 }
             }
             measured.resultSwiftType = FrontendReceipt.SwiftTypeSpelling
@@ -793,25 +804,39 @@ extension FrontendReceipt.ManagedDebugSurface {
         _ symbol: SwiftFrontend.SymbolGraph.Symbol,
         minimumOS: Core.SemanticVersion
     ) -> Bool {
-        let values = symbol.availability ?? []
-        if values.contains(where: {
-            $0.domain == "Swift" && $0.isUnconditionallyUnavailable == true
-        }) {
-            return false
-        }
-        guard let ios = values.first(where: { $0.domain == "iOS" }) else {
-            return true
-        }
-        guard ios.isUnconditionallyUnavailable != true else { return false }
+        supportsAvailability(
+            symbol.availability ?? [],
+            minimumOS: minimumOS
+        )
+    }
+
+    static func supportsAvailability(
+        _ values: [SwiftFrontend.SymbolGraph.Availability],
+        minimumOS: Core.SemanticVersion
+    ) -> Bool {
+        let swift = values.filter { $0.domain == "Swift" }
+        guard !swift.contains(where: {
+            $0.isUnconditionallyUnavailable == true
+                || $0.isUnconditionallyDeprecated == true
+        }) else { return false }
+        let ios = values.filter { $0.domain == "iOS" }
+        // Generated bridges compile against the captured current SDK with the
+        // host project's warning policy. Deprecated and obsoleted declarations
+        // are therefore not stable candidates even when the Shell minimum OS
+        // predates those releases.
+        guard !ios.contains(where: {
+            $0.isUnconditionallyUnavailable == true
+                || $0.isUnconditionallyDeprecated == true
+                || $0.deprecated != nil
+                || $0.obsoleted != nil
+        }) else { return false }
         let required = (
             Int(minimumOS.major), Int(minimumOS.minor), Int(minimumOS.patch)
         )
-        if let introduced = ios.introduced,
-           (introduced.major, introduced.minor, introduced.patch) > required {
-            return false
-        }
-        if let obsoleted = ios.obsoleted,
-           (obsoleted.major, obsoleted.minor, obsoleted.patch) <= required {
+        if ios.contains(where: {
+            guard let introduced = $0.introduced else { return false }
+            return (introduced.major, introduced.minor, introduced.patch) > required
+        }) {
             return false
         }
         return true

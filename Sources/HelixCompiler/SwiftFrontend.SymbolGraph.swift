@@ -155,7 +155,7 @@ extension SwiftFrontend.Driver {
             "-skip-synthesized-members",
             "-skip-protocol-implementations",
             "-skip-inherited-docs",
-        ] + (try symbolGraphSemanticArguments(invocation.semanticArguments))
+        ] + (try symbolGraphImportArguments(invocation.semanticArguments))
         let output = try SwiftFrontend.Driver(
             compilerURL: tool.executable,
             environment: environment
@@ -252,22 +252,22 @@ extension SwiftFrontend.Driver {
         ])
     }
 
-    private func symbolGraphSemanticArguments(
+    /// Projects consumer compilation arguments onto the symbol-graph tool's
+    /// narrower module-loading contract. The graph only nominates candidates;
+    /// later probes replay every captured source semantic, so dropping
+    /// source-only flags is a safe under-approximation while forwarding them
+    /// would make the independent extractor reject otherwise valid builds.
+    func symbolGraphImportArguments(
         _ arguments: [String]
     ) throws -> [String] {
         let values = try directFrontendArguments(arguments)
         let pairedOptions: Set<String> = [
-            "-D", "-F", "-Fsystem", "-I", "-Isystem", "-L", "-Xcc",
-            "-cxx-interoperability-mode", "-enable-experimental-feature",
-            "-enable-upcoming-feature", "-module-alias", "-package-name",
-            "-resource-dir", "-swift-version",
-        ]
-        let standaloneOptions: Set<String> = [
-            "-enable-library-evolution",
+            "-F", "-Fsystem", "-I", "-Isystem", "-L", "-Xcc",
+            "-language-mode", "-module-cache-path", "-resource-dir",
+            "-swift-version",
         ]
         let attachedPrefixes = [
-            "-D", "-F", "-I", "-L", "-cxx-interoperability-mode=",
-            "-module-alias=",
+            "-F", "-I", "-L", "-cxx-interoperability-mode=",
         ]
         var result: [String] = []
         var index = 0
@@ -284,10 +284,9 @@ extension SwiftFrontend.Driver {
                 index += 2
                 continue
             }
-            if standaloneOptions.contains(argument)
-                || attachedPrefixes.contains(where: {
-                    argument.hasPrefix($0) && argument != $0
-                }) {
+            if attachedPrefixes.contains(where: {
+                argument.hasPrefix($0) && argument != $0
+            }) {
                 result.append(argument)
             }
             index += 1

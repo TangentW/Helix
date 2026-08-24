@@ -146,6 +146,76 @@ struct NativeImportDiscoveryTests {
         ) == nil)
     }
 
+    @Test("Objective-C protocol manglings are distinguished from Any")
+    func recognizesObjectiveCProtocolMangledTypes() {
+        #expect(FrontendReceipt.Adapter.objectiveCProtocolNames(
+            inMangledType: "$syySo13UIInteraction_pScMYccD"
+        ) == ["UIInteraction"])
+        #expect(FrontendReceipt.Adapter.objectiveCProtocolNames(
+            inMangledType: "$sSo13UIInteraction_pSgD"
+        ) == ["UIInteraction"])
+        #expect(FrontendReceipt.Adapter.objectiveCProtocolNames(
+            inMangledType: "$sypSgD"
+        ).isEmpty)
+        #expect(FrontendReceipt.Adapter.objectiveCProtocolNames(
+            inMangledType: "$syXlSgD"
+        ).isEmpty)
+    }
+
+    @Test("Managed SDK availability rejects unstable generated candidates")
+    func filtersManagedSDKAvailability() throws {
+        func availability(
+            _ json: String
+        ) throws -> [SwiftFrontend.SymbolGraph.Availability] {
+            try JSONDecoder().decode(
+                [SwiftFrontend.SymbolGraph.Availability].self,
+                from: Data(json.utf8)
+            )
+        }
+
+        let minimumOS = Core.SemanticVersion(15)
+        #expect(FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+            [],
+            minimumOS: minimumOS
+        ))
+        #expect(FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+            try availability(#"[{"domain":"iOS","introduced":{"major":15}}]"#),
+            minimumOS: minimumOS
+        ))
+        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+            try availability(#"[{"domain":"iOS","introduced":{"major":16}}]"#),
+            minimumOS: minimumOS
+        ))
+        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+            try availability(#"[{"domain":"iOS","deprecated":{"major":18}}]"#),
+            minimumOS: minimumOS
+        ))
+        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+            try availability(#"[{"domain":"iOS","obsoleted":{"major":15}}]"#),
+            minimumOS: minimumOS
+        ))
+        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+            try availability(#"[{"domain":"iOS","obsoleted":{"major":18}}]"#),
+            minimumOS: minimumOS
+        ))
+        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+            try availability(
+                #"[{"domain":"Swift","isUnconditionallyDeprecated":true}]"#
+            ),
+            minimumOS: minimumOS
+        ))
+        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+            try availability(
+                #"[{"domain":"iOS","isUnconditionallyUnavailable":true}]"#
+            ),
+            minimumOS: minimumOS
+        ))
+        #expect(FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+            try availability(#"[{"domain":"macOS","deprecated":{"major":12}}]"#),
+            minimumOS: minimumOS
+        ))
+    }
+
     @Test("Function spelling derives exact native callback lifetimes")
     func derivesNativeCallbackProfiles() throws {
         let direct = try #require(FrontendReceipt.ValueTypeParser.parse(
@@ -444,6 +514,46 @@ struct NativeImportDiscoveryTests {
             .init(parameterIndex: 0, lifetime: .escaping),
         ])
         #expect(declaration.parameterTypes[0].directClosureShape != nil)
+    }
+
+    @Test("Objective-C protocols keep an AnyObject ABI and typed invocation")
+    func preservesObjectiveCProtocolInvocationType() throws {
+        let interaction = Core.TypeID(rawValue: .sha256("Swift.AnyObject"))
+        let view = Core.TypeID(rawValue: .sha256("UIKit.UIView"))
+        let operation = FrontendReceipt.Adapter.ImportedOperation(
+            silReferences: ["$hlx_native_foreign_add_interaction"],
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            importedModules: ["UIKit"],
+            dispatch: .instanceMethod,
+            ownerType: "UIView",
+            baseName: "addInteraction",
+            argumentLabels: ["_"],
+            parameterSwiftTypes: ["Swift.AnyObject", "UIView"],
+            invocationParameterSwiftTypes: ["any UIInteraction", "UIView"],
+            resultSwiftType: "Swift.Void",
+            requiresMainActor: true
+        )
+
+        let declaration = try #require(
+            FrontendReceipt.Adapter().makeImportedOperationDeclarations(
+                [operation],
+                moduleName: "ProtocolInvocationFixture",
+                nativeTypes: [
+                    "Swift.AnyObject": interaction,
+                    "UIView": view,
+                ]
+            ).first
+        )
+
+        #expect(declaration.parameterTypes == [
+            .native(interaction), .native(view),
+        ])
+        #expect(declaration.parameterSwiftTypes == [
+            "Swift.AnyObject", "UIView",
+        ])
+        #expect(declaration.invocationParameterSwiftTypes == [
+            "any UIInteraction", "UIView",
+        ])
     }
 
     @Test("Managed SDK probing preserves NSError-backed Swift throws")
@@ -868,7 +978,7 @@ struct NativeImportDiscoveryTests {
         ])
         #expect(callbacksByName["async"]?.parameterSwiftTypes == [
             "@escaping @Swift.MainActor @Sendable @convention(block) () -> ()",
-            "OS_dispatch_queue",
+            "DispatchQueue",
         ])
         let asyncProjection = try #require(
             callbacksByName["async"]?.parameterProjection
@@ -893,7 +1003,7 @@ struct NativeImportDiscoveryTests {
         #expect(callbacksByName["scheduledTimer"]?.parameterSwiftTypes == [
             "Swift.Double",
             "Swift.Bool",
-            "@escaping @Sendable (NSTimer) -> ()",
+            "@escaping @Sendable (Timer) -> ()",
         ])
         #expect(callbacksByName["dataTask"]?.parameterSwiftTypes.contains(
             "@escaping @Sendable (Foundation.Data?, NSURLResponse?, Swift.Error?) -> ()"
@@ -1858,6 +1968,24 @@ struct NativeImportDiscoveryTests {
                 && $0.message.contains("invalidAsyncCallback")
         })
 
+        var redundantInvocationAdapter = output.receipt
+        let invokeNowBindingIndex = try #require(
+            redundantInvocationAdapter.nativeImportBindings.firstIndex {
+                $0.generated?.baseName == "invokeNow"
+            }
+        )
+        var invokeNowBinding = redundantInvocationAdapter
+            .nativeImportBindings[invokeNowBindingIndex]
+        var invokeNowGenerated = try #require(invokeNowBinding.generated)
+        invokeNowGenerated.invocationParameterSwiftTypes =
+            invokeNowGenerated.parameterSwiftTypes
+        invokeNowBinding.generated = invokeNowGenerated
+        redundantInvocationAdapter.nativeImportBindings[invokeNowBindingIndex] =
+            invokeNowBinding
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try redundantInvocationAdapter.validate()
+        }
+
         let adjustDeclaration = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "adjust"
         })
@@ -2763,6 +2891,29 @@ struct NativeImportDiscoveryTests {
         #expect(globalFunction.generated?.dispatch == .globalFunction)
         #expect(globalFunction.generated?.ownerType == nil)
         #expect(globalFunction.importedModules.contains("Foundation"))
+        let importedNativeNames = Set(
+            output.receipt.nativeTypes.map(\.canonicalName)
+        )
+        #expect(!importedNativeNames.contains("NSBundle"))
+        #expect(!importedNativeNames.contains("NSCoder"))
+        let generatedOperations = output.receipt.nativeImportBindings
+            .compactMap(\.generated)
+        #expect(!generatedOperations.contains {
+            [
+                "commitAnimations",
+                "setAnimationDidStopSelector",
+                "groupTableViewBackgroundColor",
+            ].contains($0.baseName)
+        })
+        let interaction = try #require(generatedOperations.first {
+            $0.ownerType == "UIView" && $0.baseName == "addInteraction"
+        })
+        #expect(interaction.parameterSwiftTypes == [
+            "Swift.AnyObject", "UIView",
+        ])
+        #expect(interaction.invocationParameterSwiftTypes == [
+            "any UIInteraction", "UIView",
+        ])
 
         let typeBindings = output.receipt.nativeTypeBindings.compactMap(\.generated)
         #expect(typeBindings.contains {
@@ -2800,6 +2951,16 @@ struct NativeImportDiscoveryTests {
             receipt: output.receipt,
             sourceRoot: directory
         )
+        let sessionTaskType = try #require(shell.archive.nativeTypes.first {
+            Set([$0.canonicalName] + $0.swiftTypeAliases)
+                .contains("URLSessionDataTask")
+        })
+        let sessionTaskSpellings = Set(
+            [sessionTaskType.canonicalName] + sessionTaskType.swiftTypeAliases
+        )
+        #expect(sessionTaskSpellings.isSuperset(of: [
+            "NSURLSessionDataTask", "URLSessionDataTask",
+        ]))
         let generated = try #require(shell.bridge.sourceFiles.values.first {
             $0.contains("estimatedByteCount: { (_: UILabel)")
         })
@@ -2836,6 +2997,15 @@ struct NativeImportDiscoveryTests {
         #expect(generatedBridge.contains("enumerator"))
         #expect(generatedBridge.contains(".invokeResult("))
         #expect(generatedBridge.contains("failureResult: {"))
+        #expect(generatedBridge.contains("let argument0: any UIInteraction"))
+        #expect(generatedBridge.contains("as: (any UIInteraction).self"))
+        #expect(generatedBridge.contains(
+            "try context.withMainActor {\n"
+                + "                            let argument0: any UIInteraction"
+        ))
+        #expect(!generatedBridge.contains("any Any"))
+        #expect(generatedBridge.contains("makeResolvedNativeImports_0()"))
+        #expect(generatedBridge.contains("makeSynchronousNativeInvokers_0()"))
         let changed = baseline
             .replacingOccurrences(of: "interval + 1", with: "interval + 2")
             .replacingOccurrences(of: "seed + 1", with: "seed + 2")
@@ -3093,9 +3263,11 @@ struct NativeImportDiscoveryTests {
         let managedNames = Set(
             managed.receipt.nativeImportCandidates.map(\.canonicalCallee)
         )
+        let deprecatedScreenMain =
+            "\(moduleName).HelixExternal.UIScreen.main.get"
+        #expect(!managedNames.contains(deprecatedScreenMain))
         let firstUseNames = [
             "\(moduleName).HelixExternal.UIColor.black.get",
-            "\(moduleName).HelixExternal.UIScreen.main.get",
             "\(moduleName).HelixExternal.UIDevice.current.get",
             "\(moduleName).HelixExternal.UIApplication.shared.get",
             "\(moduleName).HelixExternal.UIView.areAnimationsEnabled.get",
@@ -3136,12 +3308,12 @@ struct NativeImportDiscoveryTests {
                 == "\(moduleName).HelixExternal.UIColor.systemBlue.get"
         })
         #expect(!systemBlue.effects.requiresMainActor)
-        let screen = try #require(managed.receipt.nativeImportCandidates.first {
-            $0.canonicalCallee == firstUseNames[1]
+        let application = try #require(managed.receipt.nativeImportCandidates.first {
+            $0.canonicalCallee == firstUseNames[2]
         })
-        #expect(screen.effects.requiresMainActor)
+        #expect(application.effects.requiresMainActor)
         let bundle = try #require(managed.receipt.nativeImportCandidates.first {
-            $0.canonicalCallee == firstUseNames[5]
+            $0.canonicalCallee == firstUseNames[4]
         })
         #expect(!bundle.effects.requiresMainActor)
         let throwingRemoval = try #require(
@@ -3190,7 +3362,7 @@ struct NativeImportDiscoveryTests {
         #expect(!generated.contains("NSProcessInfo"))
         #expect(generated.contains("UIColor.black"))
         #expect(generated.contains("UIColor.systemMint"))
-        #expect(generated.contains("UIScreen.main"))
+        #expect(!generated.contains("UIScreen.main"))
         #expect(generated.contains("UIDevice.current"))
         #expect(generated.contains("UIApplication.shared"))
         #expect(generated.contains("UIView.areAnimationsEnabled"))
@@ -3211,7 +3383,6 @@ struct NativeImportDiscoveryTests {
                 of: "UIColor(red: 0.2, green: 0.4, blue: 0.8, alpha: 1)",
                 with: "UIColor(white: 0.2, alpha: 1)"
             )
-            .replacingOccurrences(of: "return baselineScreen", with: "return .main")
             .replacingOccurrences(of: "return baselineDevice", with: "return .current")
             .replacingOccurrences(
                 of: "return baselineApplication",

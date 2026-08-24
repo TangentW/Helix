@@ -180,6 +180,7 @@ public struct GeneratedNativeImport: Codable, Hashable, Sendable {
     public var baseName: String
     public var argumentLabels: [String]
     public var parameterSwiftTypes: [String]
+    public var invocationParameterSwiftTypes: [String]?
     public var resultSwiftType: String
 
     public init(
@@ -190,6 +191,7 @@ public struct GeneratedNativeImport: Codable, Hashable, Sendable {
         baseName: String,
         argumentLabels: [String],
         parameterSwiftTypes: [String],
+        invocationParameterSwiftTypes: [String]? = nil,
         resultSwiftType: String
     ) {
         self.declarationMangledName = declarationMangledName
@@ -199,6 +201,7 @@ public struct GeneratedNativeImport: Codable, Hashable, Sendable {
         self.baseName = baseName
         self.argumentLabels = argumentLabels
         self.parameterSwiftTypes = parameterSwiftTypes
+        self.invocationParameterSwiftTypes = invocationParameterSwiftTypes
         self.resultSwiftType = resultSwiftType
     }
 }
@@ -702,6 +705,16 @@ public struct Document: Codable, Hashable, Sendable {
             ($0.loweredSignature.parameters + [$0.loweredSignature.result])
                 .contains { $0.contains("__C.") }
         } == true
+        let invocationParameterSwiftTypes = generated
+            .invocationParameterSwiftTypes ?? generated.parameterSwiftTypes
+        let invocationAdapterIsValid: Bool = {
+            guard let invocationTypes = generated.invocationParameterSwiftTypes
+            else { return true }
+            return invocationTypes != generated.parameterSwiftTypes
+                && invocationTypes.allSatisfy(
+                    FrontendReceipt.SwiftTypeSpelling.isGeneratedType
+                )
+        }()
         guard sourcePaths.contains(generated.sourceFileLogicalID),
               !requiresImportedType || !importedModules.isEmpty,
               isBoundText(generated.declarationMangledName),
@@ -712,6 +725,9 @@ public struct Document: Codable, Hashable, Sendable {
                   $0 == "_" || isSwiftIdentifier($0)
               }),
               generated.parameterSwiftTypes.allSatisfy(isBoundText),
+              invocationParameterSwiftTypes.count
+                == generated.parameterSwiftTypes.count,
+              invocationAdapterIsValid,
               isBoundText(generated.resultSwiftType)
         else { return false }
         switch generated.dispatch {
@@ -756,17 +772,20 @@ public struct Document: Codable, Hashable, Sendable {
             else { return false }
             return generated.argumentLabels.count + 1 == generated.parameterSwiftTypes.count
                 && generated.parameterSwiftTypes.last == owner
+                && invocationParameterSwiftTypes.last == owner
                 && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(owner)
         case .instanceGetter:
             guard let owner = generated.ownerType else { return false }
             return generated.argumentLabels.isEmpty
                 && generated.parameterSwiftTypes == [owner]
+                && invocationParameterSwiftTypes == [owner]
                 && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(owner)
         case .instanceSetter, .instanceValueSetter:
             guard let owner = generated.ownerType else { return false }
             return generated.argumentLabels == ["_"]
                 && generated.parameterSwiftTypes.count == 2
                 && generated.parameterSwiftTypes.last == owner
+                && invocationParameterSwiftTypes.last == owner
                 && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(owner)
         }
     }
