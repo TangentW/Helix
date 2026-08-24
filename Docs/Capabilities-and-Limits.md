@@ -401,6 +401,18 @@ does not by itself certify a physical device or distribution channel.
   synchronous logical `inout` region may cross an entry. When present, its normal and
   declared-error continuations return one exact typed writeback; a trap returns
   none. Multiple or async regions remain rejected.
+- Existing synchronous computed properties and subscripts are indexed as one
+  parent replacement declaration with an exact root per accessor. Supported
+  forms include shorthand/explicit getters, get/set pairs, custom setter value
+  names, `mutating get`, `nonmutating set`, global/instance/static/class
+  properties, instance/static subscripts, source extensions, and
+  accessor-specific visibility such as `private(set)`. A mutable frozen-value
+  receiver consumes the one logical `inout` region and writes back on both
+  normal and declared-error exits, including an ordinary `throws` getter. The
+  generated fallback keeps unselected sibling accessors on the previous
+  implementation. Generic accessor declarations and accessors in generic
+  nominal/extension contexts remain fail-closed, as do accessors whose private
+  nested receiver cannot be named from generated file-scope code.
 - Newly introduced ordinary functions, private methods, and computed accessors
   are transitively linked as same-image functions, getters, or setters without
   requiring a pre-existing Shell EntryIndex. A patch-local `final class` has
@@ -774,9 +786,12 @@ contract passes the checks above; the examples do not form an API allowlist.
   `rethrows` outside the concrete standard-library operations listed above;
   and general unwind cleanup. Eligible synchronous Shell value mutation is
   limited to exactly one logical `inout` region, including mutable `self`;
-  multiple or async `inout` regions, writable accessors and subscripts,
-  observers, and mutable existential opening remain fail-closed. The supported
-  region does include nested projection and enum-state writeback, with no
+  multiple or async `inout` regions, explicit `_read`/`_modify`, async or
+  typed-throws accessors, availability-constrained accessor declarations,
+  generic accessor declarations or generic declaration contexts, observers,
+  accessors with an unnameable private nested receiver, and mutable existential
+  opening remain fail-closed. The supported region does include nested
+  projection and enum-state writeback, with no
   writeback exposed after a VM trap. Frozen stored properties
   may not contain closures, protocol existentials, `AnyObject`, native values,
   a private nested nominal that generated file-scope code cannot name,
@@ -812,7 +827,8 @@ machine code.
 | Change an indexed global function body | Supported when its canonical SIL is in the documented subset |
 | Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM |
 | Change an instance method on an eligible existing Shell struct or enum | Nonmutating ordinary, `borrowing`, and `consuming` receivers are supported; a synchronous `mutating` receiver is supported as the entry's one logical `inout` region. This includes extension methods, nested/COW mutation, enum transitions, and exact normal/declared-error writeback; a VM trap writes nothing |
-| Use explicit `inout`, writable accessors/subscripts/observers, mutate an actor root, or change an existing native static/class method | One synchronous eligible Shell `inout` parameter is supported. Multiple/async regions and writable accessors/subscripts/observers remain rejected; actor executors and native metatype ABI are not implemented |
+| Change an existing computed property or subscript | Supported for exact synchronous getter/setter roots when the receiver, parameters, result, effects, and body are representable. This includes `mutating get`, `nonmutating set`, static/class/global forms, source extensions, per-accessor access control, and normal/declared-error value writeback. Explicit `_read`/`_modify`, async, typed throws, availability-constrained or generic declarations/contexts, unnameable private nested receivers, observers, and recursive Native accessor replacement remain fail-closed |
+| Use explicit `inout`, property observers, mutate an actor root, or change an existing native static/class method | One synchronous eligible Shell `inout` parameter is supported. Multiple/async regions and observers remain rejected; actor executors and native metatype ABI are not implemented |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
 | First use a public SDK member in a managed Debug body | Supported for a uniquely measured synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. Closure-bearing methods are supported when every callback fits the exact synchronous, nonthrowing bridge-and-failure-value profile above; unfamiliar error bridges, async/generic callbacks or declarations, subscripts, and unrepresentable signatures require a full build |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |

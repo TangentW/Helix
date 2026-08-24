@@ -342,10 +342,28 @@ copies the region into invocation-scoped HLVM storage, returns one exact typed
 writeback on the normal or declared-error continuation, and applies it only
 after the return/error payload has decoded successfully. VM traps expose no
 writeback, so field mutation, nested projection, COW collection edits, and enum
-state transitions are transactional at the Shell boundary. Multiple or async
-`inout` regions, writable accessors/subscripts, observers, and mutable
-existential writeback remain fail-closed. This extends the same v1 contracts
-and does not introduce a compatibility version.
+state transitions are transactional at the Shell boundary.
+
+The same exact-entry model covers existing synchronous computed properties and
+subscripts. The frontend groups every selected getter/setter under its parent
+declaration identity while retaining a distinct SIL ABI and source anchor per
+accessor. This includes shorthand and explicit getters, read/write pairs,
+`mutating get`, `nonmutating set`, global and instance properties,
+static/class properties, instance/static subscripts, and members declared in
+source extensions when their receiver and body are representable. Access
+control is evaluated per accessor, so a `private(set)` declaration can expose
+only its eligible getter while the generated replacement retains an exact
+fallback setter. A value-receiver accessor uses the entry's one synchronous
+logical `inout` region and commits the same typed writeback on normal and
+declared-error exits; ordinary synchronous `throws` getters therefore preserve
+mutation on both paths, while a VM trap commits nothing. Explicit coroutine
+accessors (`_read`/`_modify`), async or typed-throws accessors,
+availability-constrained declarations, generic accessor declarations or
+accessors in generic nominal/extension contexts, accessors whose private nested
+receiver cannot be named by generated file-scope code, observers,
+multiple/async `inout`, and mutable-existential writeback remain fail-closed.
+This extends the same v1 contracts and does not introduce a compatibility
+version.
 
 Native text rendering is a deliberately narrow exception to keeping generic
 standard-library APIs inside HLVM. The compiler recognizes the generic
@@ -452,7 +470,9 @@ Shell or ordinary NativeImport boundary, a patch concrete Swift type identity
 visible to native code, function-local
 nominal declarations, hosted stored properties/custom initializers/arbitrary
 callback ABIs, changes to existing native stored layout, multiple or async
-`inout` regions, writable Shell accessors/subscripts/observers, closure crossing a
+`inout` regions, explicit coroutine/async/typed-throws,
+availability-constrained, generic-context, or unnameable-private-nested-receiver
+Shell accessors, observers, closure crossing a
 Shell Entry or a NativeImport position outside the exact callable profile,
 throwing/async/inout callback ABIs, recursive or nonescaping nested callable
 arguments, callback results without a

@@ -93,6 +93,12 @@ struct NativeRecursion {
             public dynamic func asyncFactorial(_ n: Int) async throws -> Int {
                 n < 2 ? 1 : n * (try await asyncFactorial(n - 1))
             }
+
+            public dynamic var stableValue: Int { 1 }
+
+            public dynamic var recursiveValue: Int { recursiveValue + 1 }
+
+            public dynamic subscript(index: Int) -> Int { self[index] + 1 }
         }
         """
         let sourceData = Data(source.utf8)
@@ -135,13 +141,34 @@ struct NativeRecursion {
             selectFunction("genericFactorial", from: declarations),
             selectFunction("asyncFactorial", from: declarations),
         ]
-        let targets = try selected.map { declaration -> NativeGeneration.SelfReferenceTarget in
+        func target(
+            _ declaration: [String: Any]
+        ) throws -> NativeGeneration.SelfReferenceTarget {
             let usr = try #require(declaration["usr"] as? String)
+            let baseName = try functionBaseName(declaration)
+            let replacementName = SwiftFrontend.DynamicReplacement.replacementBaseName(
+                usr: usr,
+                baseName: baseName
+            )
             return .init(
                 mangledName: "$s" + usr.dropFirst(2),
-                sourceFilePath: sourceURL.path
+                sourceFilePath: sourceURL.path,
+                sourceDeclaration: .init(
+                    identity: usr,
+                    kind: .function,
+                    originalReference: "\(baseName)(_:)",
+                    replacementHeader: "func \(replacementName)(_ value: Int) -> Int",
+                    members: [
+                        .init(
+                            role: .functionBody,
+                            fallbackBody: "return \(baseName)(value)"
+                        ),
+                    ]
+                ),
+                memberRole: .functionBody
             )
         }
+        let targets = try selected.map(target)
         let rebinder = NativeGeneration.SelfReferenceRebinder()
         let plans = try rebinder.analyze(
             astOutput: ast.standardOutput,
@@ -173,21 +200,93 @@ struct NativeRecursion {
             ("invalidForeignPrevious", "does not reference the function being replaced"),
         ] {
             let declaration = try selectFunction(name, from: declarations)
-            let usr = try #require(declaration["usr"] as? String)
             do {
                 _ = try rebinder.analyze(
                     astOutput: ast.standardOutput,
                     sources: [sourceURL.path: sourceData],
-                    targets: [
-                        .init(
-                            mangledName: "$s" + usr.dropFirst(2),
-                            sourceFilePath: sourceURL.path
-                        ),
-                    ]
+                    targets: [try target(declaration)]
                 )
                 Issue.record("expected invalid previous marker for \(name)")
             } catch let error as NativeGeneration.SelfReferenceError {
                 #expect(error.description.contains(expected))
+            }
+        }
+
+        func accessorTarget(
+            name: String,
+            kind: Core.DynamicReplacement.DeclarationKind,
+            originalReference: String,
+            replacementHeader: (String) -> String
+        ) throws -> NativeGeneration.SelfReferenceTarget {
+            let parent = try #require(typedObjects(in: document).first {
+                let expectedKind =
+                    kind == .property ? "var_decl" : "subscript_decl"
+                guard $0["_kind"] as? String == expectedKind,
+                      $0["usr"] as? String != nil,
+                      let declarationName = $0["name"] as? [String: Any],
+                      let base = declarationName["base_name"] as? [String: Any]
+                else { return false }
+                return base["name"] as? String == name
+                    || base["special"] as? String == name
+            })
+            let parentUSR = try #require(parent["usr"] as? String)
+            let accessors = try #require(parent["accessors"] as? [[String: Any]])
+            let getter = try #require(accessors.first { $0["get"] as? Bool == true })
+            let getterUSR = try #require(getter["usr"] as? String)
+            let replacementName = SwiftFrontend.DynamicReplacement.replacementBaseName(
+                usr: parentUSR,
+                baseName: name
+            )
+            return .init(
+                mangledName: "$s" + getterUSR.dropFirst(2),
+                sourceFilePath: sourceURL.path,
+                sourceDeclaration: .init(
+                    identity: parentUSR,
+                    kind: kind,
+                    originalReference: originalReference,
+                    replacementHeader: replacementHeader(replacementName),
+                    members: [
+                        .init(role: .getter, header: "get", fallbackBody: "return 0"),
+                    ],
+                    enclosingPrefix: "extension Recursor {",
+                    enclosingSuffix: "}"
+                ),
+                memberRole: .getter
+            )
+        }
+        let stableAccessor = try accessorTarget(
+            name: "stableValue",
+            kind: .property,
+            originalReference: "stableValue",
+            replacementHeader: { "var \($0): Int" }
+        )
+        let stablePlan = try #require(rebinder.analyze(
+            astOutput: ast.standardOutput,
+            sources: [sourceURL.path: sourceData],
+            targets: [stableAccessor]
+        )[stableAccessor.mangledName])
+        #expect(stablePlan.edits.isEmpty)
+
+        for recursiveAccessor in [
+            try accessorTarget(
+                name: "recursiveValue",
+                kind: .property,
+                originalReference: "recursiveValue",
+                replacementHeader: { "var \($0): Int" }
+            ),
+            try accessorTarget(
+                name: "subscript",
+                kind: .subscriptDeclaration,
+                originalReference: "subscript(index:)",
+                replacementHeader: { "subscript(\($0) index: Int) -> Int" }
+            ),
+        ] {
+            #expect(throws: NativeGeneration.SelfReferenceError.self) {
+                _ = try rebinder.analyze(
+                    astOutput: ast.standardOutput,
+                    sources: [sourceURL.path: sourceData],
+                    targets: [recursiveAccessor]
+                )
             }
         }
 

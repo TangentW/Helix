@@ -1162,7 +1162,7 @@ struct FrontendReceiptPipeline {
         }
     }
 
-    private func typeCheckGeneratedBridge(
+    func typeCheckGeneratedBridge(
         shell: ShellBuild.Output,
         directory: URL,
         moduleName: String
@@ -1266,7 +1266,7 @@ struct FrontendReceiptPipeline {
         return ["-Xcc", "-fmodule-map-file=\(moduleMap.path)"]
     }
 
-    private func typeCheckNativeReplacements(
+    func typeCheckNativeReplacements(
         receipt: ShellBuildReceipt.Document,
         shell: ShellBuild.Output,
         originalSource: Data,
@@ -1279,7 +1279,8 @@ struct FrontendReceiptPipeline {
     ) throws {
         let output = directory.appendingPathComponent("NativeTypecheck", isDirectory: true)
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
-        let transformedURL = output.appendingPathComponent("Patch.swift")
+        let privateImportSourceFile = URL(fileURLWithPath: logicalPath).lastPathComponent
+        let transformedURL = output.appendingPathComponent(privateImportSourceFile)
         try #require(shell.transformedSources[logicalPath]).write(
             to: transformedURL
         )
@@ -1329,6 +1330,7 @@ struct FrontendReceiptPipeline {
             units: [
                 .init(
                     sourceFileLogicalPath: logicalPath,
+                    privateImportSourceFile: privateImportSourceFile,
                     roots: roots
                 ),
             ]

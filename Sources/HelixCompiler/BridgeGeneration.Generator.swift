@@ -599,7 +599,7 @@ public struct Generator: Sendable {
         let hasExactLogicalParameters =
             root.parameterSwiftTypes.count == record.loweredSignature.parameters.count
         let hasBridgedReceiver: Bool = {
-            guard record.role == .method,
+            guard [.method, .getter, .setter].contains(record.role),
                   root.parameterSwiftTypes.count
                     == record.loweredSignature.parameters.count + 1,
                   let receiver = record.parameterTypes.last
@@ -1293,6 +1293,9 @@ public struct Generator: Sendable {
             }
             """
         } ?? ""
+        let originalFallback = record.resultType == .void
+            ? "\(originalAttempt)\(root.originalInvocation)\n    return ()"
+            : "return \(originalAttempt)\(root.originalInvocation)"
         let dispatch = (writebackDeclaration.map { $0 + "\n" } ?? "") + """
         let decision = try Runtime.Bridge.shared.dispatch(
             entry: .init(rawValue: \(root.entryIndex.rawValue)),
@@ -1303,7 +1306,7 @@ public struct Generator: Sendable {
         )
         switch decision {
         case .originalRequired:
-            return \(originalAttempt)\(root.originalInvocation)
+            \(originalFallback)
         case let .returned(result):
             return result
         }

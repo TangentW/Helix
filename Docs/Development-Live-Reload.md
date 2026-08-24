@@ -682,12 +682,20 @@ supported stored or computed instance properties and supported static
 properties through their canonical getter/setter SIL. A closure-valued setter
 is authoritatively escaping because assignment stores the value; direct and
 Optional closure-valued getters use the native callable-result contract above.
-An eligible existing Shell struct or enum may instead use one synchronous
-logical `inout` entry region, including mutable `self`. Normal and declared
-error exits write back the exact decoded value; traps write back nothing.
-Multiple or async `inout` regions, writable value-type accessors/subscripts,
-observers, async or throwing accessors, and unsupported callable signatures
-still fail closed rather than being inferred from names.
+Existing synchronous computed declarations are also indexed as parent groups
+with exact getter/setter roots. This covers global, instance, static/class and
+source-extension properties; instance/static subscripts; shorthand or explicit
+getters; setters with custom value names; `mutating get`; `nonmutating set`;
+and per-accessor visibility such as `private(set)`. An eligible existing Shell
+struct or enum uses one synchronous logical `inout` entry region for a mutable
+accessor receiver. Normal and declared-error exits—including an ordinary
+`throws` getter—write back the exact decoded value; traps write back nothing.
+Explicit `_read`/`_modify`, async or typed-throws accessors,
+availability-constrained declarations, generic accessor declarations or
+accessors in generic nominal/extension contexts, accessors on private nested
+receivers that generated file-scope code cannot name, observers, recursive
+Native accessor replacement, multiple/async `inout`, and unsupported callable
+signatures still fail closed rather than being inferred from names.
 
 An unrelated declaration is not collected merely because it exists, and this
 feature does not add source files or native ABI. Changes to an existing native

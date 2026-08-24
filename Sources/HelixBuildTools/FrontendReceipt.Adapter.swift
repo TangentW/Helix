@@ -505,6 +505,9 @@ extension FrontendReceipt.Adapter {
         var kind: SourceNominalKind?
         var referenceTypeID: Core.TypeID?
         var localValueTypeKey: Bytecode.LocalTypeKey?
+        var isFileScopeNameable: Bool
+        var isAvailabilityConstrained: Bool
+        var isGenericContext: Bool
     }
 
     struct SourceNominalAliasIndex: Sendable {
@@ -623,7 +626,10 @@ extension FrontendReceipt.Adapter {
         var candidate: ReleaseCompiler.DeclarationCandidate
         var root: ShellBuildReceipt.Root?
         var bridge: ShellBuildReceipt.Bridge?
-        var nativeImportDeclaration: NativeImportDiscovery.Declaration
+        /// A declaration may be a Shell root without also being a legal native
+        /// import. Frozen value receivers are the important case: their ABI is
+        /// represented by the Shell codec, not by a process-native Swift type.
+        var nativeImportDeclaration: NativeImportDiscovery.Declaration?
         var referenceReceiverType: String?
     }
 
@@ -698,7 +704,7 @@ extension FrontendReceipt.Adapter {
                 // A declaration inside a generic context has no single concrete
                 // Swift runtime type that can back a frozen TypeID.
                 let entersGenericContext = isInsideGenericContext
-                    || item["generic_sig"] != nil
+                    || Self.hasGenericSignature(item)
                 let entersPrivateMemberScope = isInsidePrivateMemberScope
                     || (parentCanonicalName != nil
                         && (item["access"] as? String) == "private")
@@ -782,7 +788,7 @@ extension FrontendReceipt.Adapter {
                     items: members,
                     parentCanonicalName: relativeName,
                     isInsideGenericContext: isInsideGenericContext
-                        || item["generic_sig"] != nil
+                        || Self.hasGenericSignature(item)
                         || fullName.contains("<"),
                     isInsidePrivateMemberScope: isInsidePrivateMemberScope,
                     isInsideAvailabilityConstrainedScope:
@@ -1496,7 +1502,7 @@ extension FrontendReceipt.Adapter {
                     drafts.append(draft)
                 }
             case "var_decl":
-                drafts.append(contentsOf: try makeSourcePropertyDrafts(
+                if let accessorDrafts = try makeReloadableAccessorDrafts(
                     item,
                     context: context,
                     source: source,
@@ -1505,9 +1511,43 @@ extension FrontendReceipt.Adapter {
                     configuration: configuration,
                     demangled: demangled,
                     silFile: silFile,
+                    typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
+                    localValueTypes: localValueTypes,
                     importedSwiftTypeAliases: importedSwiftTypeAliases
-                ))
+                ) {
+                    drafts.append(contentsOf: accessorDrafts)
+                } else {
+                    drafts.append(contentsOf: try makeSourcePropertyDrafts(
+                        item,
+                        context: context,
+                        source: source,
+                        importedModules: imports,
+                        moduleName: moduleName,
+                        configuration: configuration,
+                        demangled: demangled,
+                        silFile: silFile,
+                        nativeTypes: nativeTypes,
+                        importedSwiftTypeAliases: importedSwiftTypeAliases
+                    ))
+                }
+            case "subscript_decl":
+                if let accessorDrafts = try makeReloadableAccessorDrafts(
+                    item,
+                    context: context,
+                    source: source,
+                    importedModules: imports,
+                    moduleName: moduleName,
+                    configuration: configuration,
+                    demangled: demangled,
+                    silFile: silFile,
+                    typeEnvironment: typeEnvironment,
+                    nativeTypes: nativeTypes,
+                    localValueTypes: localValueTypes,
+                    importedSwiftTypeAliases: importedSwiftTypeAliases
+                ) {
+                    drafts.append(contentsOf: accessorDrafts)
+                }
             case "class_decl", "struct_decl", "enum_decl", "actor_decl":
                 guard let name = baseName(in: item),
                       let members = item["members"] as? [Any]
@@ -1525,7 +1565,13 @@ extension FrontendReceipt.Adapter {
                         referenceTypeID: nominal?.kind == .reference
                             ? nativeTypes[moduleQualifiedName] : nil,
                         localValueTypeKey: nominal?.kind.isValue == true
-                            ? nominal?.localTypeKey : nil
+                            ? nominal?.localTypeKey : nil,
+                        isFileScopeNameable:
+                            nominal?.isFileScopeNameable != false,
+                        isAvailabilityConstrained:
+                            nominal?.isAvailabilityConstrained == true,
+                        isGenericContext: context?.isGenericContext == true
+                            || Self.hasGenericSignature(item)
                     ),
                     source: source,
                     imports: imports,
@@ -1562,7 +1608,14 @@ extension FrontendReceipt.Adapter {
                         referenceTypeID: nominal?.kind == .reference
                             ? nativeTypes[moduleQualifiedName] : nil,
                         localValueTypeKey: nominal?.kind.isValue == true
-                            ? nominal?.localTypeKey : nil
+                            ? nominal?.localTypeKey : nil,
+                        isFileScopeNameable:
+                            nominal?.isFileScopeNameable != false,
+                        isAvailabilityConstrained:
+                            nominal?.isAvailabilityConstrained == true
+                                || Self.hasAvailabilityAttribute(item),
+                        isGenericContext: Self.hasGenericSignature(item)
+                            || fullName.contains("<")
                     ),
                     source: source,
                     imports: imports,
@@ -1768,7 +1821,7 @@ extension FrontendReceipt.Adapter {
             )...
         ]
             .hasPrefix("\(replacementName)<")
-            || item["generic_sig"] != nil
+            || Self.hasGenericSignature(item)
         let hasInOut = parameterItems.contains { $0["inout"] as? Bool == true }
             || (item["implicit_self_decl"] as? [String: Any])?["inout"] as? Bool == true
         let forbiddenAttributes: Set<String> = [
@@ -2209,6 +2262,10 @@ extension FrontendReceipt.Adapter {
         (item["attrs"] as? [[String: Any]])?.contains {
             $0["_kind"] as? String == "available_attr"
         } == true
+    }
+
+    static func hasGenericSignature(_ item: [String: Any]) -> Bool {
+        item["generic_signature"] != nil
     }
 
     static func customAttributeName(_ demangledType: String) -> String? {

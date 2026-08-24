@@ -1,14 +1,24 @@
 import Foundation
 import HelixCompiler
+import HelixCore
 
 extension NativeGeneration {
 public struct SelfReferenceTarget: Hashable, Sendable {
     public var mangledName: String
     public var sourceFilePath: String
+    public var sourceDeclaration: Core.DynamicReplacement.Declaration
+    public var memberRole: Core.DynamicReplacement.MemberRole
 
-    public init(mangledName: String, sourceFilePath: String) {
+    public init(
+        mangledName: String,
+        sourceFilePath: String,
+        sourceDeclaration: Core.DynamicReplacement.Declaration,
+        memberRole: Core.DynamicReplacement.MemberRole
+    ) {
         self.mangledName = mangledName
         self.sourceFilePath = sourceFilePath
+        self.sourceDeclaration = sourceDeclaration
+        self.memberRole = memberRole
     }
 }
 
@@ -190,11 +200,27 @@ private extension NativeGeneration.SelfReferenceRebinder {
         document: Object,
         source: Data
     ) throws -> NativeGeneration.SelfReferencePlan {
+        guard target.sourceDeclaration.isWellFormed,
+              target.sourceDeclaration.member(target.memberRole) != nil
+        else {
+            throw NativeGeneration.SelfReferenceError.malformedTypedAST(
+                "Native target has an invalid replacement declaration"
+            )
+        }
+        if target.sourceDeclaration.kind != .function {
+            return try analyzeAccessor(
+                target: target,
+                document: document
+            )
+        }
         guard let usr = SwiftFrontend.DynamicReplacement.declarationUSR(
             mangledName: target.mangledName
-        ) else {
+        ), target.memberRole == .functionBody,
+            target.sourceDeclaration.identity == usr
+        else {
             throw NativeGeneration.SelfReferenceError.malformedTypedAST(
-                "Native target is not a Swift symbol: \(target.mangledName)"
+                "Native function target does not match its replacement declaration: "
+                    + target.mangledName
             )
         }
         let declarations = objects(in: document).filter {
@@ -278,6 +304,92 @@ private extension NativeGeneration.SelfReferenceRebinder {
             replacementBaseName: replacementName,
             edits: edits
         )
+    }
+
+    func analyzeAccessor(
+        target: NativeGeneration.SelfReferenceTarget,
+        document: Object
+    ) throws -> NativeGeneration.SelfReferencePlan {
+        guard let accessorUSR = SwiftFrontend.DynamicReplacement.declarationUSR(
+            mangledName: target.mangledName
+        ) else {
+            throw NativeGeneration.SelfReferenceError.malformedTypedAST(
+                "Native accessor target is not a Swift symbol: \(target.mangledName)"
+            )
+        }
+        let parents = objects(in: document).filter {
+            guard $0["usr"] as? String == target.sourceDeclaration.identity,
+                accessorParentKind($0) == target.sourceDeclaration.kind,
+                let accessors = $0["accessors"] as? [Object]
+            else { return false }
+            return accessors.contains { $0["usr"] as? String == accessorUSR }
+        }
+        guard parents.count == 1, let parent = parents.first,
+              let accessors = parent["accessors"] as? [Object],
+              let accessor = accessors.first(where: {
+                  $0["usr"] as? String == accessorUSR
+              }), accessorMatchesRole(accessor, target.memberRole),
+              let body = accessor["body"] as? Object
+        else {
+            throw NativeGeneration.SelfReferenceError.missingDeclaration(
+                target.mangledName
+            )
+        }
+        let targetUSRs = Set([
+            target.sourceDeclaration.identity,
+            accessorUSR,
+        ])
+        for object in objects(in: body) {
+            if object["_kind"] as? String == "call_expr", isPreviousCall(object) {
+                throw NativeGeneration.SelfReferenceError.unsupportedReference(
+                    "LiveReload.previous in an accessor"
+                )
+            }
+            guard let declaration = object["decl"] as? Object,
+                  let referencedUSR = declaration["decl_usr"] as? String,
+                  targetUSRs.contains(referencedUSR)
+            else { continue }
+            // A property reference would need its replacement name rebound;
+            // a subscript reference would additionally require a typed label
+            // insertion. Until both are modeled as source edits, reject the
+            // uncommon recursive accessor instead of silently calling the
+            // previous implementation from generated replacement syntax.
+            throw NativeGeneration.SelfReferenceError.unsupportedReference(
+                object["_kind"] as? String ?? "accessor reference"
+            )
+        }
+        return .init(
+            mangledName: target.mangledName,
+            replacementBaseName: "",
+            edits: []
+        )
+    }
+
+    func accessorParentKind(
+        _ parent: Object
+    ) -> Core.DynamicReplacement.DeclarationKind? {
+        switch parent["_kind"] as? String {
+        case "var_decl":
+            return parent["readImpl"] as? String == "stored"
+                ? .propertyObservers : .property
+        case "subscript_decl":
+            return .subscriptDeclaration
+        default:
+            return nil
+        }
+    }
+
+    func accessorMatchesRole(
+        _ accessor: Object,
+        _ role: Core.DynamicReplacement.MemberRole
+    ) -> Bool {
+        switch role {
+        case .getter: accessor["get"] as? Bool == true
+        case .setter: accessor["set"] as? Bool == true
+        case .willSet: accessor["willSet"] as? Bool == true
+        case .didSet: accessor["didSet"] as? Bool == true
+        case .functionBody: false
+        }
     }
 
     func previousMarkers(

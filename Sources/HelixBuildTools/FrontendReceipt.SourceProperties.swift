@@ -17,6 +17,11 @@ extension FrontendReceipt.Adapter {
         importedSwiftTypeAliases: [String: String]
     ) throws -> [Draft] {
         guard let context,
+              context.isFileScopeNameable,
+              !context.isAvailabilityConstrained,
+              !context.isGenericContext,
+              !Self.hasAvailabilityAttribute(item),
+              !Self.hasGenericSignature(item),
               let name = baseName(in: item),
               Self.isSwiftIdentifier(name),
               let access = item["access"] as? String,
@@ -298,7 +303,7 @@ extension FrontendReceipt.Adapter {
         }
     }
 
-    private func propertyRequiresMainActor(
+    func propertyRequiresMainActor(
         _ item: [String: Any],
         demangled: [String: String]
     ) -> Bool {

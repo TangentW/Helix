@@ -2113,6 +2113,11 @@ struct NativeImportDiscoveryTests {
             receipt: output.receipt,
             sourceRoot: directory
         )
+        let incrementerImportID = try #require(
+            shell.archive.nativeImports.first {
+                $0.canonicalCallee == "\(moduleName).Counter.incrementer.get"
+            }?.id
+        )
         let generated = try #require(shell.bridge.sourceFiles.values.first {
             $0.contains("argument1.value = argument0")
         })
@@ -2142,7 +2147,9 @@ struct NativeImportDiscoveryTests {
         #expect(
             patch.disassembly.components(separatedBy: "native_apply").count - 1 >= 6
         )
-        #expect(patch.module.imports.count == 5)
+        #expect(patch.module.imports.count == 4)
+        #expect(!patch.module.imports.contains { $0.id == incrementerImportID })
+        #expect(patch.disassembly.contains("hlbc_apply"))
         _ = try Verification.Engine().verify(
             bytes: patch.bytecode,
             shell: Verification.ShellInterface(archive: shell.archive),

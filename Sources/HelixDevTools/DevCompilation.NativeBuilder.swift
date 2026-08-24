@@ -171,7 +171,9 @@ public actor NativeBuilder {
                     }
                     return .init(
                         mangledName: record.mangledName,
-                        sourceFilePath: source.source.absolutePath
+                        sourceFilePath: source.source.absolutePath,
+                        sourceDeclaration: descriptor.sourceDeclaration,
+                        memberRole: descriptor.memberRole
                     )
                 }
             )

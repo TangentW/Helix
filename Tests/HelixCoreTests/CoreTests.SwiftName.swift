@@ -14,6 +14,16 @@ struct SwiftName {
         #expect(Core.SwiftName.normalizedIdentifier("`value\n`") == nil)
     }
 
+    @Test("Compiler-normalized keywords render as safe source identifiers")
+    func rendersEscapedIdentifiers() {
+        #expect(Core.SwiftName.escapedIdentifier("value") == "value")
+        #expect(Core.SwiftName.escapedIdentifier("default") == "`default`")
+        #expect(Core.SwiftName.escapedIdentifier("in") == "`in`")
+        #expect(Core.SwiftName.escapedIdentifier("set") == "`set`")
+        #expect(Core.SwiftName.escapedIdentifier("1value") == nil)
+        #expect(Core.SwiftName.escapedIdentifier("value.other") == nil)
+    }
+
     @Test("Operator validation accepts source operators but rejects delimiters")
     func validatesOperators() {
         for value in ["+", "...", "..<", "??", "<=>"] {
